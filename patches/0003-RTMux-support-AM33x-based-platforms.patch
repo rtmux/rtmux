@@ -1,0 +1,150 @@
+From 72516180ad19c6dd92c5d2de4bd94cfb0fb5b572 Mon Sep 17 00:00:00 2001
+From: Jim Huang <jserv@0xlab.org>
+Date: Tue, 14 Oct 2014 14:30:55 +0800
+Subject: [PATCH 3/4] RTMux: support AM33x based platforms
+
+---
+ arch/arm/mach-omap2/irq.c     | 11 ++++++++++
+ arch/arm/vmm/Makefile         |  1 +
+ arch/arm/vmm/am33xx/intc.h    | 13 ++++++++++++
+ arch/arm/vmm/am33xx/softirq.c | 14 +++++++++++++
+ arch/arm/vmm/am33xx/virq.c    | 47 +++++++++++++++++++++++++++++++++++++++++++
+ 5 files changed, 86 insertions(+)
+ create mode 100644 arch/arm/vmm/am33xx/intc.h
+ create mode 100644 arch/arm/vmm/am33xx/softirq.c
+ create mode 100644 arch/arm/vmm/am33xx/virq.c
+
+diff --git a/arch/arm/mach-omap2/irq.c b/arch/arm/mach-omap2/irq.c
+index 3926f37..804b50d 100644
+--- a/arch/arm/mach-omap2/irq.c
++++ b/arch/arm/mach-omap2/irq.c
+@@ -23,6 +23,10 @@
+ #include <linux/of_address.h>
+ #include <linux/of_irq.h>
+ 
++#ifdef CONFIG_ARM_VMM
++#include <vmm/vmm.h>
++#endif
++
+ #include "soc.h"
+ #include "iomap.h"
+ #include "common.h"
+@@ -223,6 +227,13 @@ static inline void omap_intc_handle_irq(void __iomem *base_addr, struct pt_regs
+ {
+ 	u32 irqnr;
+ 
++#ifdef CONFIG_ARM_VMM
++	if (vmm_get_status()) {
++		vmm_irq_handle(base_addr, domain, regs);
++		return;
++	}
++#endif
++
+ 	do {
+ 		irqnr = readl_relaxed(base_addr + 0x98);
+ 		if (irqnr)
+diff --git a/arch/arm/vmm/Makefile b/arch/arm/vmm/Makefile
+index 9b3b3a8..9f25ef4 100644
+--- a/arch/arm/vmm/Makefile
++++ b/arch/arm/vmm/Makefile
+@@ -6,4 +6,5 @@ obj-$(CONFIG_ARM_VMM) += vmm.o vmm_traps.o vmm_virq.o
+ 
+ ifeq ($(CONFIG_ARM_VMM),y)
+ obj-$(CONFIG_MACH_REALVIEW_PBA8) += realview_a8/softirq.o
++obj-$(CONFIG_SOC_AM33XX) += am33xx/softirq.o am33xx/virq.o
+ endif
+diff --git a/arch/arm/vmm/am33xx/intc.h b/arch/arm/vmm/am33xx/intc.h
+new file mode 100644
+index 0000000..28b9b8e
+--- /dev/null
++++ b/arch/arm/vmm/am33xx/intc.h
+@@ -0,0 +1,13 @@
++#ifndef __INTC_H__
++#define __INTC_H__
++
++#define OMAP34XX_IC_BASE	0x48200000
++
++#define INTC_SIR_SET0		0x0090
++#define INTC_MIR_CLEAR0		0x0088
++
++#define OMAP2_L4_IO_OFFSET	0xb2000000
++#define OMAP2_L4_IO_ADDRESS(pa) IOMEM((pa) + OMAP2_L4_IO_OFFSET) /* L4 */
++#define OMAP3_IRQ_BASE		OMAP2_L4_IO_ADDRESS(OMAP34XX_IC_BASE)
++
++#endif
+diff --git a/arch/arm/vmm/am33xx/softirq.c b/arch/arm/vmm/am33xx/softirq.c
+new file mode 100644
+index 0000000..873c491
+--- /dev/null
++++ b/arch/arm/vmm/am33xx/softirq.c
+@@ -0,0 +1,14 @@
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <asm/io.h>
++
++#include <vmm/vmm.h>
++#include "../vmm_virhw.h"
++#include "intc.h"
++
++void vmm_raise_softirq(int irq)
++{
++	writel_relaxed(1 << (irq % 32),
++	               OMAP3_IRQ_BASE + INTC_SIR_SET0 + (irq / 32) * 4);
++}
++EXPORT_SYMBOL(vmm_raise_softirq);
+diff --git a/arch/arm/vmm/am33xx/virq.c b/arch/arm/vmm/am33xx/virq.c
+new file mode 100644
+index 0000000..4b9ffe2
+--- /dev/null
++++ b/arch/arm/vmm/am33xx/virq.c
+@@ -0,0 +1,47 @@
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/irqdomain.h>
++
++#include <asm/io.h>
++#include <asm/irq.h>
++
++#include <vmm/vmm.h>
++#include "../vmm_virhw.h"
++#include "intc.h"
++
++void vmm_irq_handle(void __iomem *base_addr, struct irq_domain *domain,
++                    struct pt_regs *regs)
++{
++	unsigned long flags;
++	struct vmm_context *_vmm_context;
++
++	_vmm_context = vmm_context_get();
++
++	while (_vmm_context->virq_pended) {
++		int index;
++
++		flags = vmm_irq_save();
++		_vmm_context->virq_pended = 0;
++		vmm_irq_restore(flags);
++
++		/* get the pending interrupt */
++		for (index = 0; index < IRQS_NR_32; index++) {
++			int pdbit;
++			for (pdbit = __builtin_ffs(_vmm_context->virq_pending[index]);
++			     pdbit != 0;
++			     pdbit = __builtin_ffs(_vmm_context->virq_pending[index])) {
++				unsigned long inner_flag;
++				int irqnr;
++
++				pdbit--;
++
++				inner_flag = vmm_irq_save();
++				_vmm_context->virq_pending[index] &= ~(1 << pdbit);
++				vmm_irq_restore(inner_flag);
++
++				irqnr = irq_find_mapping(domain, pdbit + index * 32);
++				handle_IRQ(irqnr, regs);
++			}
++		}
++	}
++}
+-- 
+1.8.5.1
+

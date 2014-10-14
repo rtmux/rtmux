@@ -1,0 +1,4 @@
+0001-RTMux-implement-dual-kernel-approach-in-minimal-chan.patch
+0002-RTMux-support-Realview-Platform-Baseboard-for-Cortex.patch
+0003-RTMux-support-AM33x-based-platforms.patch
+0004-arm-gic-correct-the-cpu-map-on-gic_raise_softirq-for.patch

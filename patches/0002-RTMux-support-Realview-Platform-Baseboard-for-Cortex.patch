@@ -1,0 +1,66 @@
+From f090e187095ba02fe22e2f192f7ec566215537d5 Mon Sep 17 00:00:00 2001
+From: Jim Huang <jserv@0xlab.org>
+Date: Tue, 14 Oct 2014 14:22:06 +0800
+Subject: [PATCH 2/4] RTMux: support Realview Platform Baseboard for Cortex-A8
+
+---
+ arch/arm/vmm/Kconfig               | 12 +++++++++++-
+ arch/arm/vmm/Makefile              |  4 ++++
+ arch/arm/vmm/realview_a8/softirq.c | 12 ++++++++++++
+ 3 files changed, 27 insertions(+), 1 deletion(-)
+ create mode 100644 arch/arm/vmm/realview_a8/softirq.c
+
+diff --git a/arch/arm/vmm/Kconfig b/arch/arm/vmm/Kconfig
+index 21bf7f1..51e83e1 100644
+--- a/arch/arm/vmm/Kconfig
++++ b/arch/arm/vmm/Kconfig
+@@ -10,6 +10,16 @@ config ARM_VMM
+ 	  Say Y if you want support for the RTMux VMM.
+ 	  Otherwise, say N.
+ 
++if MACH_REALVIEW_PBA8
++config HOST_VMM_ADDR_END
++	hex "End address of VMM"
++	depends on ARM_VMM
++	default 0xE0000000
++	help
++	  The end address of VMM space. Normally, it is the
++	  end address of DDR memory.
++endif
++
+ config HOST_VMM_SIZE
+ 	hex "Size of VMM space"
+ 	depends on ARM_VMM
+diff --git a/arch/arm/vmm/Makefile b/arch/arm/vmm/Makefile
+index 833dd1f..9b3b3a8 100644
+--- a/arch/arm/vmm/Makefile
++++ b/arch/arm/vmm/Makefile
+@@ -3,3 +3,7 @@
+ #
+ 
+ obj-$(CONFIG_ARM_VMM) += vmm.o vmm_traps.o vmm_virq.o
++
++ifeq ($(CONFIG_ARM_VMM),y)
++obj-$(CONFIG_MACH_REALVIEW_PBA8) += realview_a8/softirq.o
++endif
+diff --git a/arch/arm/vmm/realview_a8/softirq.c b/arch/arm/vmm/realview_a8/softirq.c
+new file mode 100644
+index 0000000..a52b79c
+--- /dev/null
++++ b/arch/arm/vmm/realview_a8/softirq.c
+@@ -0,0 +1,12 @@
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <asm/io.h>
++#include <asm/hardware/gic.h>
++
++#include <vmm/vmm.h>
++
++void vmm_raise_softirq(int irq)
++{
++	gic_raise_softirq(cpumask_of(0),  irq);
++}
++EXPORT_SYMBOL(vmm_raise_softirq);
+-- 
+1.8.5.1
+
