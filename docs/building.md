@@ -115,10 +115,16 @@ points are `tests/userland/syscall_testing` (boot and exec it) and
 
 ## Continuous integration
 
-GitHub Actions workflows in `.github/workflows/`:
+GitHub Actions workflows in `.github/workflows/`. Independent jobs run in
+parallel, and a job that needs another (an LKL gate needs the built archives)
+waits for it. Toolchains, apt packages, Kconfiglib, the opam switch, and the
+built LKL archives are cached.
 
 | Workflow | Covers |
 |----------|--------|
-| `build-rtmux.yml` | Static gates (including the advertised option surface of every POSIX profile); a build and QEMU boot probe per profile |
-| `build-lkl.yml` | RV64 `lkl-fsd`/`lkl-netd` archives built from `lkl/linux` |
-| `lkl-qemu.yml` | RTMux+LKL on QEMU: containment, smoke modes, differential oracles |
+| `build-rtmux.yml` | `static` host gates (run with `make -j`, including the advertised option surface of every POSIX profile); `formal` (CBMC, Spin, Z3); `litmus` (herd7); `host` tests; `runtime` QEMU gates, one leg each; a build and QEMU boot probe per POSIX profile |
+| `build-lkl.yml` | RV64 `lkl-fsd`/`lkl-netd` archives built from `lkl/linux`; also reused by `lkl-qemu.yml` |
+| `lkl-qemu.yml` | RTMux+LKL on QEMU, one leg per gate: containment and libc floor, smoke modes, differential oracles, traced latency windows, LKL profile boot |
+
+`make check-ci-coverage` fails when a test target in the Makefile is run by no
+workflow and has no reasoned waiver in `scripts/check-ci-coverage.py`.

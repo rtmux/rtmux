@@ -1,32 +1,25 @@
 # Build the RV64 LKL archives (fsd / netd personalities) from lkl/linux.
 #
-# Runs on changes to the build script/configs and nightly, and publishes the
-# archives as workflow artifacts (3-day retention).  The upstream commit is
-# resolved once, so all personalities build the same tree.
+# Runs nightly and on demand, and publishes the archives as workflow artifacts
+# (3-day retention).  Also a reusable workflow: lkl-qemu.yml, which runs on
+# every push and pull request, calls it and boots RTMux against the archives it
+# makes.  The upstream commit is resolved once, so both personalities build the
+# same tree, and the finished archives are cached by commit and build inputs.
 name: Build LKL (rv64)
 
 on:
-  push:
-    branches: [main, cicd]
-    paths:
-      - scripts/build-lkl-rv64.sh
-      - scripts/lkl/**
-      - configs/lkl-*.config
-      - .github/workflows/build-lkl.yml
-      - .github/actions/setup-rtmux/action.yml
-  pull_request:
-    paths:
-      - scripts/build-lkl-rv64.sh
-      - scripts/lkl/**
-      - configs/lkl-*.config
-      - .github/workflows/build-lkl.yml
-      - .github/actions/setup-rtmux/action.yml
   schedule:
     - cron: '30 0 * * *'
   workflow_dispatch:
     inputs:
       lkl_ref:
         description: 'lkl/linux branch, tag or commit (default: HEAD)'
+        default: ''
+  workflow_call:
+    inputs:
+      lkl_ref:
+        description: 'lkl/linux branch, tag or commit (default: HEAD)'
+        type: string
         default: ''
 
 permissions:
@@ -38,7 +31,7 @@ jobs:
     outputs:
       commit: ${{ steps.head.outputs.commit }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           sparse-checkout: scripts/lkl
       - id: head
@@ -56,31 +49,47 @@ jobs:
       fail-fast: false
       matrix:
         personality: [fsd, netd]
+    env:
+      OUT: prebuilt/lkl-rv64/out-${{ matrix.personality }}
     steps:
-      - uses: actions/checkout@v6
-      - uses: ./.github/actions/setup-rtmux
+      - uses: actions/checkout@v7
+
+      # The cross compiler and binutils come from apt, so the runner image
+      # version (which moves with those packages) is part of the cache key.
+      - id: image
+        run: echo "version=${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
+
+      - name: Cache built archive
+        id: arch-cache
+        uses: actions/cache@v6
         with:
+          path: prebuilt/lkl-rv64/out-${{ matrix.personality }}
+          key: lkl-rv64-${{ matrix.personality }}-${{ steps.image.outputs.version }}-${{ needs.resolve.outputs.commit }}-${{ hashFiles('scripts/build-lkl-rv64.sh', 'configs/lkl-*.config', 'scripts/lkl/**', '.github/actions/setup-rtmux/action.yml') }}
+
+      - uses: ./.github/actions/setup-rtmux
+        if: steps.arch-cache.outputs.cache-hit != 'true'
+        with:
+          qemu: 'false'
           lkl: 'true'
 
       - name: Fetch LKL source
+        if: steps.arch-cache.outputs.cache-hit != 'true'
         run: scripts/lkl/fetch-source.sh "$PWD/lkl-src" ${{ needs.resolve.outputs.commit }}
 
       - name: Build liblkl-rtmux.a (${{ matrix.personality }})
+        if: steps.arch-cache.outputs.cache-hit != 'true'
         run: |
           LKL_SRC="$PWD/lkl-src" LKL_PERSONALITY=${{ matrix.personality }} \
-          LKL_RTMUX_OUT=prebuilt/lkl-rv64/out-${{ matrix.personality }} \
-            ./scripts/build-lkl-rv64.sh --build-from-source
+          LKL_RTMUX_OUT="$OUT" ./scripts/build-lkl-rv64.sh --build-from-source
 
       - name: Re-verify archive
         run: |
-          LKL_LIB=prebuilt/lkl-rv64/out-${{ matrix.personality }}/liblkl-rtmux.a \
-          LKL_RTMUX_OUT=prebuilt/lkl-rv64/out-${{ matrix.personality }} \
+          LKL_LIB="$OUT/liblkl-rtmux.a" LKL_RTMUX_OUT="$OUT" \
             ./scripts/build-lkl-rv64.sh --check-only
 
       - name: Package
         run: |
-          tar czf liblkl-rv64-${{ matrix.personality }}.tar.gz \
-            -C prebuilt/lkl-rv64/out-${{ matrix.personality }} .
+          tar czf liblkl-rv64-${{ matrix.personality }}.tar.gz -C "$OUT" .
 
       - uses: actions/upload-artifact@v7
         with:

@@ -1,0 +1,21 @@
+name: Upload failure logs
+description: "Upload QEMU and build logs as an artifact (call with if: failure())."
+inputs:
+  name:
+    description: Artifact name.
+    required: true
+  extra:
+    description: Additional newline-separated paths to upload.
+    default: ''
+runs:
+  using: composite
+  steps:
+    - uses: actions/upload-artifact@v7
+      with:
+        name: ${{ inputs.name }}
+        retention-days: 3
+        path: |
+          build/**/*.log
+          /tmp/rtmux-*
+          ${{ inputs.extra }}
+        if-no-files-found: ignore

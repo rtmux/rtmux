@@ -6,6 +6,7 @@ set -eu
 
 dir=${1:?usage: fetch-source.sh DIR COMMIT}
 commit=${2:?usage: fetch-source.sh DIR COMMIT}
+# Same default as resolve-ref.sh; keep the two in sync.
 upstream=${LKL_UPSTREAM:-https://github.com/lkl/linux.git}
 here=$(CDPATH='' cd "$(dirname "$0")" && pwd -P)
 

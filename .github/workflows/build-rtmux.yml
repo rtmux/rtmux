@@ -1,17 +1,26 @@
-# Build and verify RTMux.
+# Build and verify RTMux.  All jobs run in parallel.
 #
-#   static    -- host-side gates that need no boot (`make check-*` subset)
-#   boot      -- per POSIX conformance profile (minimal / realtime / lkl / full):
-#                full build + QEMU boot + syscall_testing probe
-#                (scripts/probe-posix-profiles.sh); the advertised option
-#                surface of every profile is checked in `static`
+#   static   -- host-side gates that need no boot, run with make -j
+#   formal   -- CBMC / Spin / Z3 model checks (make check-formal)
+#   litmus   -- herd7 memory-model litmus tests (cached opam switch)
+#   host     -- host-built unit tests of kernel/libc pieces
+#   runtime  -- QEMU gates, one leg per gate so they run side by side
+#   boot     -- per POSIX conformance profile (minimal / realtime / lkl / full):
+#               full build + QEMU boot + syscall_testing probe; the advertised
+#               option surface of every profile is checked in `static`
+#
+# `static` runs its gates with make -j (checked: the same list passes serially
+# and in parallel).  `formal` runs one gate after another; it has only been
+# verified serially.  Jobs run in parallel either way.
 #
 # LKL itself is covered by build-lkl.yml and lkl-qemu.yml.
+# scripts/check-ci-coverage.py (run in `static`) fails when a test target in
+# the Makefile is run by no workflow and has no waiver.
 name: Build and Test RTMux
 
 on:
   push:
-    branches: [main, cicd]
+    branches: [main]
   pull_request:
     branches: [main]
 
@@ -26,26 +35,133 @@ jobs:
   static:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-rtmux
+        with:
+          qemu: 'false'
       - name: Configure
         run: make defconfig
       - name: Build
         run: make -j"$(nproc)"
       - name: POSIX / ABI / contract gates
         run: |
-          make check-posix-matrix check-posix-matrix-strict-ignore \
-               check-posix-matrix-options check-pse51 check-make-target-names \
+          make -j"$(nproc)" \
+               check-ci-coverage check-lkl-scripts check-make-target-names \
+               check-posix-matrix check-posix-matrix-strict-ignore \
+               check-posix-matrix-options check-pse51 \
                check-posix-profile-header check-posix-profile-config \
                check-posix-profile-surface check-lkl-profile \
                check-syscall-abi check-libc-abi \
                check-porting-contract check-kernel-nofp check-formal-claims \
                check-gate-cert check-rt-budgets check-irq-contract \
                check-platform-boundary-contracts check-lock-rank \
-               check-preempt-inventory
+               check-preempt-inventory check-assumptions \
+               check-evidence-claims check-memory-safety-inventory \
+               check-map-phys-inventory check-rcu-sched check-cap-v1 \
+               check-trace-export check-fu740-smoke-scripts driver-gate
+
+  formal:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-rtmux
+        with:
+          formal: 'true'
+      - run: make defconfig
+      - name: Formal gates
+        run: make check-formal
+
+  litmus:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-rtmux
+        with:
+          qemu: 'false'
+          packages: opam ocaml-nox libgmp-dev
+      - name: Cache opam switch
+        id: opam-cache
+        uses: actions/cache@v6
+        with:
+          path: ~/.opam
+          key: opam-rtmux-herd-${{ runner.os }}-herdtools7-7.58
+      - name: Build herdtools7 (cache miss)
+        if: steps.opam-cache.outputs.cache-hit != 'true'
+        run: |
+          opam init --bare -y --disable-sandboxing --no-setup
+          opam switch create rtmux-herd ocaml-system -y
+          eval "$(opam env --switch=rtmux-herd)"
+          opam install -y herdtools7.7.58
+      - run: make defconfig
+      - name: Litmus gates
+        run: |
+          eval "$(opam env --switch=rtmux-herd)"
+          make check-rcu-litmus check-ipc-litmus
+
+  host:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-rtmux
+        with:
+          qemu: 'false'
+      - run: make defconfig
+      - name: Host tests
+        run: |
+          make -j"$(nproc)" host-tests host-lkl-fence-asm \
+               RISCV_CC='riscv-none-elf-gcc -march=rv64g -mabi=lp64d'
+
+  runtime:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    continue-on-error: ${{ matrix.experimental || false }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: realtime
+            run: make check-rt
+          - name: smp-invariants
+            run: make check-smp-invariants
+          - name: fault-recovery
+            run: make check-fault-recovery
+          - name: loader-negative
+            run: make check-loader-negative
+          - name: boot-manifest
+            run: make check-boot-manifest
+          - name: toolbox
+            run: make check-toolbox
+          - name: emu-headless
+            run: make check-emu-headless
+          - name: races
+            run: |
+              make check-channel-teardown-race check-reply-timeout-race \
+                   check-debug-blocked-on check-opts-pse51
+          - name: block-and-pci
+            run: |
+              make -j"$(nproc)" startup initramfs
+              ./scripts/qemu-regress.sh --mode syscall-testing-disk --timeout 900
+              ./scripts/qemu-regress.sh --mode pci-nvme-smoke --timeout 300
+          - name: qemu-regress
+            run: make qemu-regress
+          - name: tty-smoke
+            run: make tty-smoke
+            experimental: true
+    name: runtime (${{ matrix.name }})
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-rtmux
+      - run: make defconfig
+      - name: ${{ matrix.name }}
+        run: ${{ matrix.run }}
+      - if: failure()
+        uses: ./.github/actions/upload-logs
+        with:
+          name: runtime-logs-${{ matrix.name }}
 
   boot:
-    needs: static
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
@@ -53,27 +169,22 @@ jobs:
       matrix:
         profile: [minimal, realtime, lkl, full]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-rtmux
-      - name: Configure
-        run: make defconfig
+      - run: make defconfig
       - name: Boot probe (${{ matrix.profile }})
         env:
           PROBE_TIMEOUT: '900'
         run: |
           if [ "${{ matrix.profile }}" = full ]; then
+            # The probe restores the full profile on exit by rebuilding it, so
+            # for full itself build once and boot.
             make -j"$(nproc)"
             ./scripts/qemu-regress.sh --mode syscall-testing --timeout "$PROBE_TIMEOUT"
           else
-            ./scripts/probe-posix-profiles.sh ${{ matrix.profile }}
+            make posix-profile-boot-probe ARGS=${{ matrix.profile }}
           fi
-      - name: Upload logs
-        if: failure()
-        uses: actions/upload-artifact@v7
+      - if: failure()
+        uses: ./.github/actions/upload-logs
         with:
           name: boot-logs-${{ matrix.profile }}
-          retention-days: 3
-          path: |
-            build/**/*.log
-            /tmp/rtmux-*
-          if-no-files-found: ignore
