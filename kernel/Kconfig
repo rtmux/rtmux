@@ -1,0 +1,193 @@
+menu "Kernel"
+
+config PROCESSORS_MAX
+    int "Maximum number of CPUs"
+    default 8
+
+config TIMER_HZ
+    int "Timer tick rate (Hz)"
+    default 1000
+    help
+      Frequency of the kernel timer tick in Hz. This controls the
+      scheduling granularity and timeslice length.
+
+        1000 = 1 ms tick (default, good for interactive/debug)
+         250 = 4 ms tick (lower overhead)
+         100 = 10 ms tick (traditional Unix)
+
+config SMP_MSGOPT
+    bool "SMP lockless message transfer optimization"
+    default y
+    depends on SMP
+    help
+      Allow cross-CPU message transfers without holding the kernel lock.
+      Threads in mid-transfer are marked with RTMUX_ITF_MSG_DELIVERY so
+      other CPUs skip them.
+
+      Default flipped to y in P2.1e (May 2026) — the IPC calls are
+      transitioning off the BKL (the "inkernel lock relaxed" condition
+      the option was waiting for).  See arch/riscv/calls.c's
+      kcall_no_bkl[] table and kernel/ipc/fastmsg.c::kcall_msg_receivev
+      for the consumers.
+
+config INSTRUMENTATION
+    bool "Kernel instrumentation (trace events)"
+    default n
+    help
+      Enable the kernel instrumentation framework for trace event
+      logging.  Used by tracelogger and performance analysis tools.
+
+config STALL_DETECTOR
+    bool "Kernel stall detector (boot-hang watchdog)"
+    default n
+    help
+      Add a lightweight watchdog that fires from clock_handler when
+      roottask's heartbeat stops advancing for more than ~15 seconds.
+      On fire, dumps per-CPU active thread (pid/tid/state/pc/ra/sp/
+      syscall/blocked_on) + every process's thread states + the
+      inkernel lock value, then disarms.
+
+      Useful for debugging silent daemon-spawn hangs where the kernel
+      deadlocks without any crash output.  Runs on every CPU's clock
+      ISR *before* the in_kernel_context() bailout, so it still fires
+      when the current CPU is stuck inside a kernel critical section.
+      a short check per timer tick.  Safe to leave on; turn off when
+      chasing microbenchmark regressions or shipping a release build.
+
+      Also enables the per-hart neighbour watchdog (kernel/debug/
+      hartwatch.c): every hart watches the next one's timer-interrupt
+      counter and logs one "hartwatch:" line naming a hart that has
+      taken no timer interrupt for 2 seconds.  Unlike the heartbeat
+      check it does not depend on the boot hart's clock.
+
+config MONITORING_KTHREAD
+    bool "Dedicate the last hart to a kernel monitoring thread"
+    default n
+    help
+      Reserve the last hart for a dedicated monitoring kthread.  The
+      kthread runs in S-mode on that hart, never enters the dispatcher,
+      never takes any kspinlock, and is invisible to RTMux: from the
+      scheduler's perspective the system has (num_cpu - 1) harts.
+
+      The thread snapshots the state of every global kspinlock in the
+      kernel once per second and prints the result via the SBI console.
+      Its purpose is post-mortem visibility into stuck-lock conditions:
+      because it never participates in any locking, it cannot itself
+      be wedged by a kernel deadlock and its prints continue to flow
+      even when the rest of the system is silent.
+
+      With -smp 4 in QEMU, enabling this means RTMux runs on 3 CPUs and
+      the 4th hart is the monitor.
+
+menu "Debugging"
+
+config DEBUG_INJECT
+    bool "Debug fault-injection private call"
+    default n
+    help
+      Build the DEBUG_INJECT private call (RTMUX_PRIV_CAP_INJECT): stall or
+      hang another hart on demand, and make the next allocation from a
+      chosen kernel pool fail once. Lets tests produce a deterministic fault
+      instead of waiting for a race; used by the hang-hunting harness.
+
+      Off in the default configuration: the call is unbound (ENOSYS) and no
+      code is built. Never enable it on a deployed system.
+
+config LOCK_DEBUG
+    bool "Kernel lock debug (lock-rank checker)"
+    default n
+    depends on SMP
+    help
+      Track every fine-grained kernel lock as it is acquired and
+      released, and verify that the acquisition order matches the
+      static rank declared by its LOCK_CLASS_*.  Detects cycles
+      (potential deadlocks) at runtime and flags rank inversions.
+
+      Pure correctness aid — adds per-acquire bookkeeping and is meant
+      for development builds, not production.
+
+config TRACE_SYSCALLS
+    bool "Trace all syscalls (very verbose)"
+    default n
+    help
+      Print every syscall (number, name, a0-a2) to the kernel console,
+      both from U-mode ecalls and S-mode __kcall.  Extremely verbose —
+      use only for debugging the syscall dispatch path.
+
+config TRACE_ROOTTASK_MSGS
+    bool "Trace roottask IPC message dispatch (very verbose)"
+    default n
+    help
+      Print every message/notification received by roottask's dispatch loop,
+      and every reply sent via proc_status().  Shows rcvid, pid, tid,
+      message type on receive; rcvid and status on reply.
+      Extremely verbose — use only for debugging the IPC dispatch path.
+
+config TRACE_RING
+    bool "Per-CPU function-entry trace ring"
+    default n
+    help
+      Enable the low-level per-CPU trace ring used to reconstruct recent
+      kernel function entries when a crash path calls trace_ring_dump().
+      Instrumented call sites must use TRACE_FN().
+
+config UMODE_VERBOSE_FAULT_REPORT
+    bool "Verbose user-space fault report"
+    default n
+    help
+      On a fatal user-space fault, dump a rich diagnostic before the
+      process is torn down: the exact scause, the page-table state of
+      both the fault IP and the fault address, the full register file,
+      and a fault-safe scan of the user stack for candidate return
+      addresses.  When disabled (the default) only the one-line
+      "user fault: pid=... ip=..." summary is printed.
+
+      Useful for hunting memory corruption / control-flow faults (e.g.
+      the FU740 I-cache investigation).  Costs nothing at runtime when
+      off; the dump itself only runs on an already-fatal fault.
+
+config DEBUG_PRIL
+    bool "Priority list debugging"
+    default n
+    help
+      Use function calls instead of inline macros for pril_first/pril_next,
+      enabling breakpoints and tracing in the priority list code.
+
+config DEBUG_VECTOR
+    bool "Vector table validation"
+    default n
+    help
+      Enable extra validation in the kernel vector table operations.
+
+config COUNT_CYCLES
+    bool "CPU cycle counting"
+    default n
+
+config PSP_STARTUP
+    bool "Print syspage during startup"
+    default n
+
+config TRACKPMEM
+    bool "Track physical memory allocations"
+    default n
+    help
+      Enable allocation tracking in the physical memory allocator.
+
+config FDT_DEBUG
+    bool "FDT (device tree) debug output"
+    default n
+
+config KPRINTF_MAX_LIMIT
+    int "kprintf maximum output length"
+    default 256
+
+config KPRINTF_PAD_HEX_WITH_ZEROS
+    bool "Pad hex values with zeros"
+    default y
+
+config MAX_BOOTLINE_SIZE
+    int "Maximum boot command line size"
+    default 256
+
+endmenu
+endmenu

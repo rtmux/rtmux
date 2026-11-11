@@ -1,0 +1,31 @@
+# RTMux IPC Transfer Contracts
+
+This is the live contract for message payload ownership across `MsgSend*`,
+`MsgReceive*`, I/O-service helpers, and endpoint-cap paths.  Sender
+identity and endpoint authority are kernel-derived: servers must use
+`_msg_info.pid`, `_msg_info.scoid`, `_msg_info.coid`, and endpoint caps produced
+by the kernel, not identifiers embedded in message bodies.
+
+| Message family | Payload contract | Authority / identity | Timeout, cancel, death, revoke |
+| --- | --- | --- | --- |
+| `MsgSendv` with a waiting receiver | Copied from sender iovs into receiver iovs during the kcall. Short sends are first copied into the sender thread's kernel buffer; long sends are copied by `xfermsg()` while both threads are claimed. Native endpoint-cap headers are patched/rolled back atomically with the copy. | Send authority comes from the sender's `connect_t` or generation-tagged endpoint cap with `RTMUX_CAP_ENDPOINT_SEND`. Receive info is stuffed from `connect_t` / sender thread state, not user payload. | Immediate timeout returns `ETIMEDOUT` before transfer. Cancel restarts before final state change. Source/destination faults return `EFAULT` and roll back cap installs. Channel/connection teardown defers through `MSG_DELIVERY` / `WAIT_PENDING` and stale endpoints fail closed. |
+| `MsgSendv` with no waiting receiver | Short payloads are copied into the sender thread's kernel buffer before blocking. Long payloads remain a borrowed sender userspace range described by saved iovs until a receiver claims the sender and copies it. | The queued sender is pinned by channel send-queue membership and `blocked_on = connect_t`; `rcvid` later encodes the server-visible sender thread and server connection. | Sender timeout/cancel/death is observed by `force_ready()` and the receive path. Endpoint/channel destroy wakes queued senders with failure; revoked endpoint caps no longer look up. |
+| `MsgReceivev` consuming a queued sender | Copies the queued sender payload into receiver iovs, or consumes the sender's kernel short buffer. The sender is claimed with `MSG_DELIVERY` under the channel lock before any mutable state or saved iovs are inspected. | `_msg_info` is filled by `STUFF_RCVINFO()` from kernel `thread_t` and `connect_t`. `endpoint_cap` is installed by kernel cap code when present. | Receiver cancel/timeout returns before queueing or restarts after dropping claims. If sender was force-ready during transfer, the receive restarts. Faults leave the non-faulting side in a defined blocked or failed state. |
+| `MsgReplyv` / `MsgError` | Reply data is copied from server iovs to the client's reply iovs while the reply-blocked client is claimed. Short replies may stage through the client's kernel buffer for special-return copyout. `MsgError` carries only status. | `rcvid` lookup resolves to the original `connect_t` and client thread; state and `blocked_on` are rechecked under the channel lock before unlinking from reply queue. | Stale `rcvid` returns `ESRCH`/no-op. Concurrent unblock, channel destroy, or server death cannot remove the same queue node while `MSG_DELIVERY` is held. Reply status is capped to the client's receive length. |
+| `MsgReadv` / `MsgWritev` / `MsgReadWritev` | Server-side follow-up copies against the reply-blocked client. `MsgReadv` copies from the client's original send payload; `MsgWritev` copies into the client's reply buffer. No borrow survives after reply/error/unblock. | `rcvid` is resolved by kernel lookup and revalidated against reply state. The server cannot name an arbitrary process buffer without a live reply-blocked client. | Stale `rcvid`, completed reply, unblock, or owner death returns `ESRCH`/fault status. `MSG_DELIVERY` prevents concurrent reply/error from mutating the same client during copy. |
+| Notifications (`MsgSendNotification*`, IRQ/event delivery) | Value payload is copied into a kernel notification object and queued; receive copies the scalar notification into the receiver buffer. No userspace payload is borrowed. | Notification source `scoid`, code, value, and priority are kernel-generated or checked at enqueue. Virtual notifications copy receive info from the origin thread. | Queued notification remains owned by the channel queue until receive removes it. Channel/process teardown frees queued notifications; receive timeout/cancel leaves the object queued unless already removed under the channel lock. |
+| I/O-service dispatch | The request header is copied into `ioserv_context_t::msg` by `MsgReceive*`. Handler helpers use `ioserv_msgread*()` / `ioserv_msgwrite*()` for explicit follow-up copies against the live `rcvid`; replies use `msg_replyv()` / `msg_error()`. | OCB lookup is keyed by kernel `_msg_info` fields (`scoid`, `coid`, `pid`). Access checks call `connect_client_info()` / key verification instead of trusting request body identity. | `_IO_CLOSE`, disconnect, unblock, and stale handle paths remove or find OCBs through the I/O-service binding table; stale rcvid/handle returns `EBADF`, `ESRCH`, or the handler's errno. |
+| Path service, system logger, `dev-nvme`, `romfs` I/O servers | Requests and replies follow the I/O-service copy contract. File data uses explicit read/write iovs; mmap and fd/cap delegation are carried by kernel-produced handles or native cap headers. | Servers use `ctp->info` and I/O-service bindings for peer identity and open state. Path strings and request payloads are names/data only, not authority. | Close/unblock/disconnect release OCB state through I/O-service callbacks. Endpoint detach/revoke is covered by stale endpoint tests; server exit causes client send/reply paths to fail closed. |
+
+Regression evidence:
+
+- `tests/userland/vfs.c::test_endpoint_revoke_concurrent_senders()` covers
+  stale endpoint teardown under sender churn.
+- `tests/userland/vfs.c::test_endpoint_sender_identity_from_kernel()` covers a
+  forged pid in the payload and proves servers must trust receive-time kernel
+  identity instead.
+- `tests/userland/vfs.c::test_name_detach_savedpp_preserves_channel()` covers
+  stale name detach behavior without dereferencing a destroyed dispatch.
+
+The SMP queue/lifetime details are in `docs/smp-contract.md`, especially the
+Message Bridge Bits and Sender Identity sections.

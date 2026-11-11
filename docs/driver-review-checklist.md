@@ -1,0 +1,11 @@
+# Driver Review Checklist
+
+Every U-mode driver that calls `interrupt_attach*` must keep one row here.
+
+| Driver | Priority | Attach / unmask order | Bounded drain | Fan-out | Authority | Failure cleanup test | No kernel softirq/workqueue |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `userland/dev-nvme/nvme-ist.c` | IST raises to RR 21 before attach | `interrupt_attach_thread`, wait, drain, `__interrupt_unmask` | drains admin and I/O CQs until quiet | condvar wake to driver waiters | I/O privilege plus IRQ vector from PCI discovery | `make qemu` interactive boot with NVMe `/usr` mount; `make check` syscall suite | policy stays in U-mode IST; no kernel bottom half |
+| `userland/dev-serial-8250/main.c` | IST raises above dispatch thread | I/O-service notification state ready, `interrupt_attach_thread`, pre-unmask RX drain, `__interrupt_unmask`, wait loop | drains UART status before every unmask | I/O-service thread handles file API | I/O privilege plus UART vector | `make qemu` interactive login smoke | policy stays in U-mode IST; no kernel bottom half |
+| `userland/dev-serial-sifive/main.c` | IST raises above dispatch thread | I/O-service notification state ready, `interrupt_attach_thread`, pre-unmask RX drain, `__interrupt_unmask`, wait loop | drains UART status before every unmask | I/O-service thread handles file API | I/O privilege plus UART vector | `make qemu` interactive login smoke | policy stays in U-mode IST; no kernel bottom half |
+| `servers/pci/dwmsi.c` | MSI demux thread owns IRQ wait | `interrupt_attach_thread`, wait, demux, `__interrupt_unmask` | drains pending MSI bits before unmask | notification/message fan-out to clients | PCI server owns MSI controller mapping | `make check` boot and PCI server startup | demux stays in U-mode server; no kernel bottom half |
+| `servers/lkl/virtio.c` | virtio-net IST raises above the LKL server caller | `interrupt_attach_thread`, ACK `VIRTIO_MMIO_INTERRUPT_ACK`, broadcast netdev waiters, `__interrupt_unmask` | ACKs virtio-mmio interrupt status before unmask | LKL netdev poll/TX/RX paths consume the wake | delegated virtio-mmio range plus PLIC vector from hwinfo | `scripts/qemu-regress.sh --mode lkl-netd-http` and interactive `make qemu` on the reference host | LKL stays in U-mode server; native IST only acknowledges and wakes, no kernel bottom half |

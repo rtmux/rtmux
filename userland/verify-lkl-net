@@ -1,0 +1,82 @@
+#!/bin/sh
+
+step() {
+    echo "verify-lkl-net: $1"
+    eval "$2"
+}
+
+dns_server_assert() {
+    want="$1 $2"
+    read got < /net/dns || exit 1
+    got=${got#nameserver }
+    if test "$got" != "$want"; then
+        echo "verify-lkl-net: nameserver is $got" >&2
+        exit 1
+    fi
+    echo "verify-lkl-net: nameserver ok $want"
+}
+
+dns_a_assert() {
+    nslookup --expect rtmux.test 10.0.2.2 || exit 1
+    host --expect rtmux.test 10.0.2.2 || exit 1
+    echo "verify-lkl-net: rtmux.test A ok 10.0.2.2"
+}
+
+http_step() {
+    name=$1
+    echo "verify-lkl-net: $name"
+    eval "$2" || exit 1
+    echo "verify-lkl-net: $name body length ok"
+}
+
+udp_assert() {
+    nc -u 10.0.2.2 8001 udp-smoke --expect udp:udp-smoke || exit 1
+    echo "verify-lkl-net: udp payload ok udp-smoke"
+}
+
+if test "$2" != ""; then
+    echo "usage: verify-lkl-net [--helpers]" >&2
+    exit 1
+fi
+
+case "$1" in
+    "") helpers=0 ;;
+    --helpers) helpers=1 ;;
+    *) echo "usage: verify-lkl-net [--helpers]" >&2; exit 1 ;;
+esac
+
+step "ifconfig" "ifconfig" &&
+step "ip addr" "ip addr" &&
+step "ip route" "ip route" &&
+step "route" "route" &&
+step "netstat -rn" "netstat -rn" &&
+step "netstat -l" "netstat -l" &&
+step "dns" "dns" &&
+step "inherited /net dirfd" "syscall_testing --selftest-inherited-atfd /net dns" &&
+step "dns nameserver default" "dns nameserver 8.8.8.8" &&
+echo "verify-lkl-net: dns default assert" &&
+dns_server_assert 8.8.8.8 53 &&
+step "nslookup external" "nslookup www.google.com" &&
+step "ping" "ping 10.0.2.2" &&
+step "ping expect-fail" "ping --expect-fail 10.0.2.254" &&
+step "clone probe" "nc --probe-clones" &&
+step "owner probe" "nc --probe-owners" &&
+step "stale-clone probe" "nc --probe-stale-clones" || exit 1
+
+test "$helpers" = 1 || exit 0
+
+step "dns nameserver" "dns nameserver 10.0.2.2 8002" &&
+echo "verify-lkl-net: dns nameserver assert" &&
+dns_server_assert 10.0.2.2 8002 &&
+step "dns" "dns" &&
+step "nslookup" "nslookup rtmux.test" &&
+step "host" "host rtmux.test" &&
+echo "verify-lkl-net: dns A assert" &&
+dns_a_assert &&
+step "ping dns" "ping -c1 rtmux.test" &&
+http_step "httpget" "httpget --require-content-length" &&
+http_step "wget" "wget http://rtmux.test:8000/ --require-content-length" &&
+http_step "nc http" "nc 10.0.2.2 8000 --http-get --require-content-length" &&
+step "nc udp" "nc -u 10.0.2.2 8001 udp-smoke" &&
+echo "verify-lkl-net: udp payload assert" &&
+udp_assert

@@ -1,0 +1,5 @@
+# Planted fixture: the table lists no send for romfs, but its source has an annotated
+# msg_send call site to utils (a lower rank).  Must be rejected without any table edge.
+# node	paths	rank	sends_to
+utils	userland/utils	0	-
+romfs	userland/romfs	1	-

@@ -1,0 +1,35 @@
+RISCV IPC-WAIT-PENDING-MP-WEAK
+(*
+ * Narrowing proof for the WAIT_PENDING handshake in kernel/ipc/fastmsg.c.  The
+ * real code uses a full `cpu_smp_mb()` (fence rw,rw) on both the waiter publish
+ * side and the waker observe side.  This variant replaces them with the minimal
+ * message-passing fences: `fence w,w` on the waiter (StoreStore: data stores
+ * before the flag clear) and `fence r,r` on the waker (LoadLoad: flag load
+ * before the state loads).  It proves the lost-wakeup outcome stays `Never`
+ * under RVWMO, i.e. the ISOLATED WAIT_PENDING bridge-bit handshake could use
+ * w,w / r,r instead of the full rw,rw.
+ *
+ * Scope: this licenses narrowing the publish-side fence to `fence w,w`.  It does
+ * NOT license narrowing the observe-side fences in the code, because several of
+ * those sites also order a prior MSG_DELIVERY claim store (`START_SMP_XFER`)
+ * that a bare `fence r,r` would not; that handoff is outside this MP model.  See
+ * the barrier-audit table in docs/smp-contract.md.
+ *
+ * Even the proven publish narrowing is intentionally NOT applied: `cpu_smp_mb()`
+ * is one shared macro used across the tree, and `measure or revert` (docs
+ * Standing Gate) requires a measured throughput/latency win before trading
+ * uniformity for a bespoke narrower fence; none has been shown.
+ *)
+{
+0:x1=data; 0:x2=flag;
+1:x1=flag; 1:x2=data;
+flag=1; data=0;
+}
+
+P0            | P1            ;
+li x5,1       | lw x7,0(x1)   ;
+sw x5,0(x1)   | fence r,r     ;
+fence w,w     | lw x8,0(x2)   ;
+sw x0,0(x2)   |               ;
+
+exists (1:x7=0 /\ 1:x8=0)

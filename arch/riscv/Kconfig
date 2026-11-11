@@ -1,0 +1,15 @@
+if ARCH_RISCV
+
+config PAGE_OFFSET
+    hex "Kernel virtual address base (PAGE_OFFSET)"
+    default 0xffffffe000000000
+
+config PA_BITS
+    int "Physical address bits"
+    default 56
+
+config VA_BITS
+    int "Virtual address bits"
+    default 39
+
+endif

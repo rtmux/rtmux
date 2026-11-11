@@ -1,0 +1,5 @@
+# RTMux/LKL ext4 optional xfstests exclusions.
+#
+# Keep GPL xfstests itself out of tree.  Add case IDs here only after a wrapper
+# run proves the case is unsupported by the current RTMux/LKL facade rather than
+# failed.

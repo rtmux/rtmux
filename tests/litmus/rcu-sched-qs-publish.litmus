@@ -1,0 +1,15 @@
+RISCV RCU-SCHED-QS-PUBLISH
+
+{
+0:x1=x; 0:x2=qs;
+1:x1=x; 1:x2=qs;
+x=0; qs=0;
+}
+
+P0          | P1          ;
+lw x5,0(x1) | lw x7,0(x2) ;
+fence rw,w  | fence r,rw  ;
+li x6,1     | li x8,2     ;
+sw x6,0(x2) | sw x8,0(x1) ;
+
+exists (1:x7=1 /\ 0:x5=2)

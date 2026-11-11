@@ -1,0 +1,34 @@
+/*
+ * RTMux is freely redistributable under the Apache License. See the file
+ * "LICENSE" for information on usage and redistribution of this file.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#include <unistd.h>
+#include <errno.h>
+#include <inttypes.h>
+#include <sys/iomsg.h>
+#include "signal-state.h"
+
+ssize_t read(int fd, void *buff, size_t nbytes)
+{
+    io_read_t msg;
+    libc_waiter_t w;
+    ssize_t r;
+
+    if (nbytes > INT32_MAX) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    msg.i.type = _IO_READ;
+    msg.i.combine_len = sizeof msg.i;
+    msg.i.nbytes = nbytes;
+    msg.i.xtype = _IO_XTYPE_NONE;
+    msg.i.zero = 0;
+    __libc_wait_enter(&w);
+    r = msg_send(fd, &msg.i, sizeof msg.i, buff, nbytes);
+    __libc_wait_exit(&w);
+    return r;
+}

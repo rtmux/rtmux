@@ -1,0 +1,111 @@
+# RTMux + LKL on QEMU (riscv64).
+#
+#   gates    -- LKL domain/profile/containment static gates and the LKL
+#               archive checks, with LKL built from lkl/linux
+#   qemu     -- LKL smoke modes (`make check-lkl-qemu`)
+#   diff     -- LKL differential oracles against Linux (`check-lkl-differential`)
+#
+# The LKL tree is fetched once per upstream commit and cached; RTMux's
+# Makefile builds the fsd/netd archives from it (LKL_SRC).
+name: RTMux + LKL on QEMU
+
+on:
+  push:
+    branches: [main, cicd]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      lkl_ref:
+        description: 'lkl/linux branch, tag or commit (default: HEAD)'
+        default: ''
+
+concurrency:
+  group: lkl-qemu-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  qemu:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: gates+smoke
+            target: check-lkl-containment check-lkl-qemu
+          - name: differential
+            target: check-lkl-differential
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-rtmux
+        with:
+          lkl: 'true'
+
+      - name: Resolve LKL commit
+        id: lkl
+        env:
+          LKL_REF: ${{ inputs.lkl_ref }}
+        run: |
+          commit=$(scripts/lkl/resolve-ref.sh "$LKL_REF")
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+
+      - name: Cache LKL source
+        id: src-cache
+        uses: actions/cache@v5
+        with:
+          path: lkl-src
+          key: lkl-src-${{ steps.lkl.outputs.commit }}-${{ hashFiles('scripts/lkl/**') }}
+
+      - name: Fetch LKL source
+        if: steps.src-cache.outputs.cache-hit != 'true'
+        run: scripts/lkl/fetch-source.sh "$PWD/lkl-src" ${{ steps.lkl.outputs.commit }}
+
+      - name: Cache built LKL archives
+        id: arch-cache
+        uses: actions/cache@v5
+        with:
+          path: prebuilt/lkl-rv64
+          key: lkl-rv64-${{ runner.os }}-${{ steps.lkl.outputs.commit }}-${{ hashFiles('scripts/build-lkl-rv64.sh', 'configs/lkl-*.config', 'scripts/lkl/**', '.github/actions/setup-rtmux/action.yml') }}
+
+      # check-lkl inspects both archives before any server is built, so they
+      # must exist up front.
+      - name: Build LKL archives (fsd, netd)
+        if: steps.arch-cache.outputs.cache-hit != 'true'
+        run: |
+          for p in fsd netd; do
+            LKL_SRC="$PWD/lkl-src" LKL_PERSONALITY=$p \
+            LKL_RTMUX_OUT=prebuilt/lkl-rv64/out-$p \
+              ./scripts/build-lkl-rv64.sh --build-from-source
+          done
+
+      - name: Configure (full profile, LKL servers)
+        run: make defconfig
+
+      - name: Build missing LKL archives
+        run: |
+          for personality in fsd netd; do
+            out="prebuilt/lkl-rv64/out-$personality"
+            if [ ! -f "$out/liblkl-rtmux.a" ]; then
+              LKL_SRC="$PWD/lkl-src" LKL_PERSONALITY="$personality" \
+                LKL_RTMUX_OUT="$out" ./scripts/build-lkl-rv64.sh --build-from-source
+            fi
+          done
+
+      - name: ${{ matrix.name }}
+        run: make ${{ matrix.target }} LKL_SRC="$PWD/lkl-src"
+
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: lkl-qemu-logs-${{ matrix.name }}
+          retention-days: 3
+          path: |
+            build/**/lkl-logs/
+            build/lkl-regress/**/*.log
+            /tmp/rtmux-*
+          if-no-files-found: ignore

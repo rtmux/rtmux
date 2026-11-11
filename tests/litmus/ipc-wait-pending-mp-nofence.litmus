@@ -1,0 +1,21 @@
+RISCV IPC-WAIT-PENDING-MP-NOFENCE
+(*
+ * Control for ipc-wait-pending-mp.litmus: the SAME message-passing handoff with
+ * the two ordering fences removed (the waiter's publish fence before the clear
+ * and the waker's fence after observing the clear).  Under RVWMO the forbidden
+ * lost-wakeup outcome (waker sees WAIT_PENDING clear but reads stale state) then
+ * becomes ALLOWED, proving those fences in fastmsg.c are load-bearing, not
+ * decorative.  The gate asserts this litmus shows the outcome reachable.
+ *)
+{
+0:x1=data; 0:x2=flag;
+1:x1=flag; 1:x2=data;
+flag=1; data=0;
+}
+
+P0            | P1            ;
+li x5,1       | lw x7,0(x1)   ;
+sw x5,0(x1)   | lw x8,0(x2)   ;
+sw x0,0(x2)   |               ;
+
+exists (1:x7=0 /\ 1:x8=0)

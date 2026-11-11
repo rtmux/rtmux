@@ -1,0 +1,89 @@
+# Build the RV64 LKL archives (fsd / netd personalities) from lkl/linux.
+#
+# Runs on changes to the build script/configs and nightly, and publishes the
+# archives as workflow artifacts (3-day retention).  The upstream commit is
+# resolved once, so all personalities build the same tree.
+name: Build LKL (rv64)
+
+on:
+  push:
+    branches: [main, cicd]
+    paths:
+      - scripts/build-lkl-rv64.sh
+      - scripts/lkl/**
+      - configs/lkl-*.config
+      - .github/workflows/build-lkl.yml
+      - .github/actions/setup-rtmux/action.yml
+  pull_request:
+    paths:
+      - scripts/build-lkl-rv64.sh
+      - scripts/lkl/**
+      - configs/lkl-*.config
+      - .github/workflows/build-lkl.yml
+      - .github/actions/setup-rtmux/action.yml
+  schedule:
+    - cron: '30 0 * * *'
+  workflow_dispatch:
+    inputs:
+      lkl_ref:
+        description: 'lkl/linux branch, tag or commit (default: HEAD)'
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    runs-on: ubuntu-24.04
+    outputs:
+      commit: ${{ steps.head.outputs.commit }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          sparse-checkout: scripts/lkl
+      - id: head
+        env:
+          LKL_REF: ${{ inputs.lkl_ref }}
+        run: |
+          commit=$(scripts/lkl/resolve-ref.sh "$LKL_REF")
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: resolve
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        personality: [fsd, netd]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-rtmux
+        with:
+          lkl: 'true'
+
+      - name: Fetch LKL source
+        run: scripts/lkl/fetch-source.sh "$PWD/lkl-src" ${{ needs.resolve.outputs.commit }}
+
+      - name: Build liblkl-rtmux.a (${{ matrix.personality }})
+        run: |
+          LKL_SRC="$PWD/lkl-src" LKL_PERSONALITY=${{ matrix.personality }} \
+          LKL_RTMUX_OUT=prebuilt/lkl-rv64/out-${{ matrix.personality }} \
+            ./scripts/build-lkl-rv64.sh --build-from-source
+
+      - name: Re-verify archive
+        run: |
+          LKL_LIB=prebuilt/lkl-rv64/out-${{ matrix.personality }}/liblkl-rtmux.a \
+          LKL_RTMUX_OUT=prebuilt/lkl-rv64/out-${{ matrix.personality }} \
+            ./scripts/build-lkl-rv64.sh --check-only
+
+      - name: Package
+        run: |
+          tar czf liblkl-rv64-${{ matrix.personality }}.tar.gz \
+            -C prebuilt/lkl-rv64/out-${{ matrix.personality }} .
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: lkl-rv64-${{ matrix.personality }}
+          path: liblkl-rv64-${{ matrix.personality }}.tar.gz
+          retention-days: 3

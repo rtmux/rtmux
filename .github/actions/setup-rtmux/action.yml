@@ -1,0 +1,52 @@
+name: Set up RTMux build environment
+description: Install the RISC-V bare-metal toolchain, QEMU, lld and host tools.
+inputs:
+  lkl:
+    description: Also install the riscv64-linux-gnu cross toolchain and ext4 tools for LKL.
+    default: 'false'
+runs:
+  using: composite
+  steps:
+    - name: Cache apt packages
+      uses: actions/cache@v5
+      with:
+        path: ~/apt-cache
+        key: apt-rtmux-${{ runner.os }}-lkl-${{ inputs.lkl }}-${{ hashFiles('.github/actions/setup-rtmux/action.yml') }}
+
+    - name: Install packages
+      shell: bash
+      run: |
+        mkdir -p ~/apt-cache
+        pkgs="build-essential lld qemu-system-misc opensbi python3 git e2fsprogs"
+        if [ "${{ inputs.lkl }}" = "true" ]; then
+          pkgs="$pkgs gcc-riscv64-linux-gnu binutils-riscv64-linux-gnu flex bison bc libelf-dev"
+        fi
+        sudo apt-get update
+        sudo apt-get install -y -o Dir::Cache::Archives=$HOME/apt-cache $pkgs
+
+    - name: Cache xPack RISC-V toolchain
+      id: tc-cache
+      uses: actions/cache@v5
+      with:
+        path: ~/toolchains/riscv-none-elf
+        key: xpack-riscv-none-elf-gcc-15.2.0-1-linux-x64
+
+    - name: Install xPack riscv-none-elf toolchain
+      if: steps.tc-cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        v=15.2.0-1
+        sha=aaaa8060c914851a3e5ee1ba82cc3d6f80972f90638a05c6e823a37557a33758
+        mkdir -p ~/toolchains/riscv-none-elf
+        curl -fsSL --retry 3 -o "$RUNNER_TEMP/tc.tgz" \
+          "https://github.com/xpack-dev-tools/riscv-none-elf-gcc-xpack/releases/download/v${v}/xpack-riscv-none-elf-gcc-${v}-linux-x64.tar.gz"
+        echo "$sha  $RUNNER_TEMP/tc.tgz" | sha256sum -c -
+        tar -xzf "$RUNNER_TEMP/tc.tgz" -C ~/toolchains/riscv-none-elf --strip-components=1
+        rm -f "$RUNNER_TEMP/tc.tgz"
+
+    - name: Export toolchain path
+      shell: bash
+      run: |
+        echo "$HOME/toolchains/riscv-none-elf/bin" >> "$GITHUB_PATH"
+        "$HOME/toolchains/riscv-none-elf/bin/riscv-none-elf-gcc" --version | head -1
+        qemu-system-riscv64 --version | head -1

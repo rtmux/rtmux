@@ -1,0 +1,23 @@
+# interface tag reason
+clock_getcpuclockid upstream-compile OPTS rows are not clean under RTMux flags; 1-1 uses clock() without the required time.h declaration.
+clock_settime clock-set-authority OPTS clock_settime/1-1 needs clock-set authority; the injected unprivileged OPTS runner correctly receives EPERM under RTMux's capability model.
+getppid no-opts-case OPTS has no conformance/interfaces/getppid runtime case.
+mlock unresolved-fixture OPTS mlock rows are not currently RTMux-applicable runtime evidence; the success row resolves as UNRESOLVED with unexpected EMFILE under the current libc/kernel contract.
+mlockall file-mmap-fixture OPTS mlockall rows require file-backed ftruncate/mmap fixtures outside the adopted single-process PSE51 slice.
+munlock unresolved-fixture OPTS munlock success coverage depends on the unresolved mlock fixture, so native RTMux regressions remain the evidence for now.
+pthread_cond_broadcast usleep-fixture OPTS condition broadcast rows depend on usleep/alarm-style timing fixtures not exposed by RTMux libc.
+pthread_cond_signal usleep-fixture OPTS condition signal rows depend on usleep/alarm-style timing fixtures not exposed by RTMux libc.
+pthread_cond_wait usleep-fixture OPTS condition wait rows depend on usleep/alarm-style timing fixtures not exposed by RTMux libc.
+pthread_getcpuclockid upstream-compile OPTS pthread_getcpuclockid/1-1 includes sys/param.h, which RTMux libc does not provide.
+sched_yield linux-affinity-fork OPTS sched_yield rows require Linux affinity APIs and fork(), outside the RTMux PSE51 single-process slice.
+sem_trywait no-opts-case OPTS has no conformance/interfaces/sem_trywait runtime case.
+shm_open file-growth-fixture OPTS shm_open rows require ftruncate/file-growth or invalid POSIX-shm names that RTMux correctly rejects.
+shm_unlink invalid-name-fixture OPTS shm_unlink rows use invalid POSIX-shm names or depend on the excluded shm_open file-growth fixture.
+sigprocmask sigpending-fixture OPTS sigprocmask rows rely on sigpending(), which is outside the RTMux PSE51-required surface.
+sysconf no-opts-case OPTS has no conformance/interfaces/sysconf runtime case.
+timer_create sigev-signal-fixture OPTS timer_create rows require SIGEV_SIGNAL timers or fork(); RTMux POSIX timers intentionally use SIGEV_NONE/SIGEV_NOTIFICATION and reject SIGEV_SIGNAL.
+timer_delete sigev-signal-fixture OPTS timer_delete rows require SIGEV_SIGNAL timer setup, which RTMux intentionally rejects for POSIX timers.
+timer_getoverrun sigev-signal-fixture OPTS timer_getoverrun rows require SIGEV_SIGNAL timer setup, which RTMux intentionally rejects for POSIX timers.
+timer_gettime sigev-signal-fixture OPTS timer_gettime rows require SIGEV_SIGNAL timer setup, which RTMux intentionally rejects for POSIX timers.
+timer_settime sigev-signal-fixture OPTS timer_settime rows require SIGEV_SIGNAL and/or sigwait fixtures outside the adopted RTMux timer contract.
+umask no-opts-case OPTS has no conformance/interfaces/umask runtime case.

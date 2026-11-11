@@ -1,0 +1,38 @@
+BasedOnStyle: Chromium
+Language: Cpp
+SortIncludes: Never
+MaxEmptyLinesToKeep: 3
+IndentCaseLabels: false
+AllowShortIfStatementsOnASingleLine: false
+AllowShortCaseLabelsOnASingleLine: false
+AllowShortLoopsOnASingleLine: false
+DerivePointerAlignment: false
+PointerAlignment: Right
+SpaceAfterCStyleCast: true
+TabWidth: 4
+UseTab: Never
+IndentWidth: 4
+BreakBeforeBraces: Linux
+AccessModifierOffset: -4
+ForEachMacros:
+  - list_for_each_entry
+  - list_for_each_entry_safe
+  - hlist_for_each_entry
+  - THREAD_FOR_EACH
+  - THREAD_FOR_EACH_ACTIVE
+  - THREAD_FOR_EACH_ACTIVE_RELAXED
+  - SHM_FOR_EACH
+  - NL_FOR_EACH
+AttributeMacros:
+  - UNUSED
+  - __ALIGNED
+  - PACKED
+  - MUST_TAIL
+  - FORCE_INLINE
+StatementAttributeLikeMacros:
+  - IIF
+StatementMacros:
+  - __UNREACHABLE
+---
+Language: ObjC
+BasedOnStyle: Chromium

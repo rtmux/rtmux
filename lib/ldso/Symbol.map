@@ -1,0 +1,32 @@
+/*
+ * Version script for ld-rtmux.so
+ *
+ * Only listed symbols are exported; everything else (including ldso_bootstrap,
+ * ldso_bind) becomes local, so the linker emits direct calls instead
+ * of PLT stubs — essential for self-bootstrapping.
+ */
+
+RTMUX_1.0 {
+    global:
+        _ldso_error;
+        dlclose;
+        dlerror;
+        dlopen;
+        dlsym;
+        dlvsym;
+        dlinfo;
+        dl_iterate_phdr;
+        r_debug_state;
+        __tls_get_addr;
+    local:
+        *;
+};
+
+RTMUXprivate_1.0 {
+    global:
+        _ldso_allocate_tls;
+        _ldso_free_tls;
+        _ldso_addr_phdr;
+        _ldso_get_stack_prot;
+        _ldso_is_dlopened;
+};

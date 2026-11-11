@@ -1,0 +1,5 @@
+# Planted fixture: romfs and dev-nvme send to each other.  Must be rejected.
+# node	dirs	rank	sends_to
+client	userland/utils	0	romfs
+romfs	userland/romfs	1	dev-nvme
+dev-nvme	userland/dev-nvme	1	romfs

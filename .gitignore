@@ -1,0 +1,83 @@
+.gdb_history
+.gdbinit
+*~
+*.o
+*.so
+*.a
+*.d
+*.sym
+*.img
+*.cpio
+*.bin
+__pycache__/
+*.pyc
+
+*.qkx
+*.qrl
+*.qre
+
+*.dis
+*.map
+!lib/ldso/Symbol.map
+!lib/libc/libc.map
+
+*.aux
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.pdf
+*.toc
+
+obj/
+arch/riscv/rtmux-kernel
+
+# Legacy source-tree build outputs. The normal build regenerates these.
+/kernel/arch/riscv/rtmux-kernel
+/servers/pci/pci-server
+/servers/slogger/slogger
+/taskman/taskman
+/userland/devb-nvme/devb-nvme
+/userland/devb-virtio/devb-virtio
+/userland/devc-ser8250/devc-ser8250
+/userland/devc-sersifive/devc-sersifive
+/userland/esh/esh
+/userland/fs-rtmux/fs-rtmux
+/userland/getty/getty
+/userland/login/login
+/userland/lspci/lspci
+/userland/mount/mount
+/userland/pidin/pidin
+/userland/pipe/pipe
+/userland/sh/mksh
+/userland/sloginfo/sloginfo
+/tests/userland/syscall_testing
+/userland/utils/authtest
+/userland/utils/cat
+/userland/utils/crypttest
+/userland/utils/ls
+/userland/utils/shutdown
+/userland/utils/syscmd
+
+.config
+.config.old
+include/arch
+internal/include/generated/
+internal/include/rtmux-version.h
+
+# Consolidated out-of-source build tree (per-component .o files, the
+# kernel ELF, initramfs staging tree, initramfs.cpio, libc.so,
+# ld-rtmux.so, drivers, and host tools). Every Makefile drops outputs
+# under $(BUILD_DIR), mirroring the source-tree layout.
+/build/
+
+# Kconfiglib (cloned on demand by 'make defconfig' / 'make menuconfig')
+/tools/kconfig/
+
+# Prebuilt LKL artifacts (rv64 toolchain output). Built or extracted by
+# scripts/build-lkl-rv64.sh (--build-from-source an LKL tree, or --extract a
+# tarball), never committed.
+/prebuilt/
+
+# Script for U-Boot (generated)
+boot/boot.scr

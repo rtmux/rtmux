@@ -1,0 +1,16 @@
+#
+# Commands for U-Boot to start RTMux
+#
+
+ext4load nvme 0:6 0x80200000 /boot/rtmux/rtmux-kernel.bin
+ext4load nvme 0:6 0x90000000 /boot/rtmux/initramfs.cpio
+setenv initrd_size ${filesize}
+# mainfs=/dev/nvme0n1p8 is the romfs partition that /sbin/init
+# mounts on /usr.  Same canonical layout as scripts/emu.sh writes for QEMU;
+# on bare metal you populate p8 by `dd`'ing build/images/nvme-p8.dat to
+# /dev/nvme0n1p8.
+setenv bootargs -Dsbi mainfs=/dev/nvme0n1p8
+booti 0x80200000 0x90000000:${initrd_size} ${fdtaddr}
+
+# To run:
+# nvme scan; ext4load nvme 0:6 0x82000000 /boot/rtmux/boot.scr; source 0x82000000

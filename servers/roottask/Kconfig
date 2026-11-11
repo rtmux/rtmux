@@ -1,0 +1,35 @@
+menu "Roottask"
+
+config ROOTTASK_HEAP_SIZE
+    int "Roottask malloc heap size (bytes)"
+    default 524288
+    range 131072 16777216
+    help
+      Size of the fixed arena that backs roottask's malloc. Roottask is the
+      mmap server, so unlike every other process it cannot grow its heap
+      by mapping memory. Must be a multiple of 4096.
+
+      Default: 524288 (512 KiB).
+
+config ROOTTASK_SYSLOG_SIZE
+    int "Roottask log buffer size (bytes)"
+    default 1048576
+    help
+      Size of the roottask ring buffer for diagnostic messages.
+      All root_log/root_dbg/root_trace output is stored here and can
+      be read as /sys/log (mode 0400, root only).
+
+      Default: 1048576 (1 MiB).
+
+config ROOTTASK_SYSLOG_STDOUT
+    bool "Echo roottask log to console"
+    default y
+    help
+      When enabled, roottask log messages are also printed to the
+      system console via kprintf.  Debug and trace messages are
+      filtered by the kernel's loglevel (-v / -vv).
+
+      Disable this to suppress all roottask console output and
+      rely solely on the ring buffer.
+
+endmenu

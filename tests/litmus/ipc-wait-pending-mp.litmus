@@ -1,0 +1,30 @@
+RISCV IPC-WAIT-PENDING-MP
+(*
+ * Message-passing proof for the WAIT_PENDING bridge-bit handoff in
+ * kernel/ipc/fastmsg.c.  A blocking waiter (receiver/sender) publishes its
+ * coherent state (state, blocked_on, on-queue) and then clears WAIT_PENDING; a
+ * waker spins until WAIT_PENDING is clear and then reads that state.  The
+ * forbidden lost-wakeup / half-blocked observation is: the waker sees the bit
+ * cleared yet reads stale state.
+ *
+ * Waiter (P0): store state; cpu_smp_mb() (fence rw,rw); clear WAIT_PENDING.
+ *   Matches fastmsg.c ~1985: "cpu_smp_mb(); ITF_CLR(act, WAIT_PENDING)".
+ * Waker  (P1): load WAIT_PENDING; cpu_smp_mb() (fence rw,rw); load state.
+ *   Matches fastmsg.c ~1611: "while (flags & WAIT_PENDING) ...; cpu_smp_mb()".
+ *
+ * data = the receiver's published state; flag = WAIT_PENDING (1 = pending).
+ * The waker observes flag going to 0.  Forbidden: flag seen 0 with stale data.
+ *)
+{
+0:x1=data; 0:x2=flag;
+1:x1=flag; 1:x2=data;
+flag=1; data=0;
+}
+
+P0            | P1            ;
+li x5,1       | lw x7,0(x1)   ;
+sw x5,0(x1)   | fence rw,rw   ;
+fence rw,rw   | lw x8,0(x2)   ;
+sw x0,0(x2)   |               ;
+
+exists (1:x7=0 /\ 1:x8=0)

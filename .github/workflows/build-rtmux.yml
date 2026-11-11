@@ -1,0 +1,79 @@
+# Build and verify RTMux.
+#
+#   static    -- host-side gates that need no boot (`make check-*` subset)
+#   boot      -- per POSIX conformance profile (minimal / realtime / lkl / full):
+#                full build + QEMU boot + syscall_testing probe
+#                (scripts/probe-posix-profiles.sh); the advertised option
+#                surface of every profile is checked in `static`
+#
+# LKL itself is covered by build-lkl.yml and lkl-qemu.yml.
+name: Build and Test RTMux
+
+on:
+  push:
+    branches: [main, cicd]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: rtmux-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  static:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-rtmux
+      - name: Configure
+        run: make defconfig
+      - name: Build
+        run: make -j"$(nproc)"
+      - name: POSIX / ABI / contract gates
+        run: |
+          make check-posix-matrix check-posix-matrix-strict-ignore \
+               check-posix-matrix-options check-pse51 check-make-target-names \
+               check-posix-profile-header check-posix-profile-config \
+               check-posix-profile-surface check-lkl-profile \
+               check-syscall-abi check-libc-abi \
+               check-porting-contract check-kernel-nofp check-formal-claims \
+               check-gate-cert check-rt-budgets check-irq-contract \
+               check-platform-boundary-contracts check-lock-rank \
+               check-preempt-inventory
+
+  boot:
+    needs: static
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [minimal, realtime, lkl, full]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-rtmux
+      - name: Configure
+        run: make defconfig
+      - name: Boot probe (${{ matrix.profile }})
+        env:
+          PROBE_TIMEOUT: '900'
+        run: |
+          if [ "${{ matrix.profile }}" = full ]; then
+            make -j"$(nproc)"
+            ./scripts/qemu-regress.sh --mode syscall-testing --timeout "$PROBE_TIMEOUT"
+          else
+            ./scripts/probe-posix-profiles.sh ${{ matrix.profile }}
+          fi
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: boot-logs-${{ matrix.profile }}
+          retention-days: 3
+          path: |
+            build/**/*.log
+            /tmp/rtmux-*
+          if-no-files-found: ignore

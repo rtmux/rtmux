@@ -1,0 +1,92 @@
+mainmenu "RTMux Configuration"
+
+config ARCH_RISCV
+    bool
+    default y
+    help
+      RTMux is currently RISC-V only.  This symbol still gates arch-specific
+      Kconfig entries and the include/arch symlink, so flattening it requires
+      a coordinated build-system cleanup.
+
+config SMP
+    bool "Symmetric Multi-Processing (SMP)"
+    default y
+
+choice
+    prompt "POSIX conformance profile"
+    default POSIX_PROFILE_FULL
+    help
+      Selects which POSIX option macros the public headers and sysconf()
+      advertise.  scripts/posix_profile.py defines each profile's option set;
+      a smaller profile de-advertises the options outside it (via the generated
+      include/sys/posix-profile-trim.h).  FULL is the current behavior -- every
+      implemented option advertised -- and trims nothing.  The order is a
+      partial one: minimal is a subset of both realtime and lkl, which are
+      subsets of full, but realtime and lkl are incomparable.
+
+config POSIX_PROFILE_MINIMAL
+    bool "minimal (PSE51 mandatory realtime)"
+
+config POSIX_PROFILE_REALTIME
+    bool "realtime (PSE52 filesystem + PSE53 process)"
+
+config POSIX_PROFILE_LKL
+    bool "lkl (the measured LKL-domain floor)"
+
+config POSIX_PROFILE_FULL
+    bool "full (every advertised option)"
+
+endchoice
+
+config LKL_SERVERS
+    bool "LKL Linux-domain servers (lkl-fsd, lkl-netd)"
+    default n
+    depends on POSIX_PROFILE_LKL || POSIX_PROFILE_FULL
+    help
+      Build and ship the Linux Kernel Library personality servers in
+      initramfs.  These link a large prebuilt LKL archive extracted from
+      externals/lkl-rv64/, so the default build leaves them off; enable
+      this once the LKL artifacts are present.
+
+      This option is valid only when the POSIX conformance profile is lkl or
+      full.  The servers pull the libc surface in
+      scripts/posix_profile.LKL_FLOOR, which smaller profiles do not
+      advertise.  scripts/check-lkl-profile.py additionally rejects a stale
+      hand-edited pairing that bypasses this dependency.
+
+config ULOCK_DEBUG
+    bool "Userspace lock-rank checker for threaded servers"
+    default n
+    help
+      Debug-only lockdep-style checker for userspace pthread mutexes.  Each
+      thread keeps a stack of the mutexes it currently holds; every acquire
+      records a directed "held-before" edge between lock addresses in a global
+      graph.  If the reverse edge already exists the checker has seen both
+      A-then-B and B-then-A orderings across threads -- a classic AB/BA
+      deadlock -- so it prints the two lock addresses, the two acquire-site
+      program counters (feed them to addr2line for file:line), and the tid,
+      then abort()s.
+
+      This adds a malloc'd per-thread held-stack and a global edge table, so
+      leave it off for production builds; it is meant for debugging threaded
+      servers.  With this off the hooks compile to nothing (zero cost).
+
+config SERVER_POOL_CANARY
+    bool "Redzone canaries on fixed server object pools"
+    default n
+    help
+      Debug-only redzone canaries around the fixed-size object pools that
+      servers keep for open contexts and requests (for example the lkl-fsd
+      OCB pool and the roottask capfs/cpiofs/sysfs pools).  Each pooled object
+      gets a magic value before its first and after its last member; the pool
+      arms them on alloc and verifies them on free and before replying with
+      pooled data.  An overflow that runs past one object corrupts the next
+      object's canary, so the checker aborts with the pool name and slot index.
+
+      With this off the canary members and hooks compile to nothing, so a
+      normal build has no layout or runtime change; leave it off for
+      production builds.
+
+source "arch/riscv/Kconfig"
+source "kernel/Kconfig"
+source "servers/roottask/Kconfig"

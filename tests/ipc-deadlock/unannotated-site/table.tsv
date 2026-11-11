@@ -1,0 +1,4 @@
+# Planted fixture: romfs has a msg_send call site with no ipc-send annotation.
+# node	paths	rank	sends_to
+utils	userland/utils	0	-
+romfs	userland/romfs	1	-

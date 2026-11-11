@@ -1,0 +1,1125 @@
+#! /bin/sh
+#
+# RTMux cpio-stage init.
+#
+# Role: bring up the bare minimum needed to find the disk, mount /usr,
+# and hand control over to the on-disk staged init.
+#
+# Modeled on Linux's initramfs/root-fs split:
+#   * initramfs.cpio      - brings up I/O services, mounts /usr, then exits
+#   * /usr/sbin/sysinit/levelN.sh - the real system init lives here,
+#                                    editable without rebuilding the cpio
+#
+# If /usr cannot be mounted (no disk, no partition, wrong type), we
+# drop to a rescue shell rather than the on-disk script.
+#
+
+PATH=/bin:/sbin
+export PATH
+
+# Parse the kernel cmdline early so rtmux.run modes can dispatch before the
+# I/O services come up.  mainfs= is consumed later by the mount stage.
+mainfs=/dev/nvme0n1p8
+rtmux_run=
+rtmux_laps=
+if read cmdline < /sys/cmdline; then
+    for arg in $cmdline; do
+        case "$arg" in
+            mainfs=*) mainfs=${arg#mainfs=} ;;
+            rtmux.run=*) rtmux_run=${arg#rtmux.run=} ;;
+            rtmux.laps=*) rtmux_laps=${arg#rtmux.laps=} ;;
+        esac
+    done
+fi
+
+# Userspace lock-rank checker demonstration.  Under CONFIG_ULOCK_DEBUG the libc
+# runs the lockdep-style checker, so the AB/BA mutex stress records an A,B and a
+# B,A edge across its workers and the checker reports the cycle and aborts.  With
+# a normal libc the trylock-based stress simply completes.
+if test "$rtmux_run" = "ulock-rank"; then
+    echo "RTMux ulock-rank: BEGIN"
+    /bin/lock-rank-stress 200
+    echo "RTMux ulock-rank: END rc=$?"
+    shutdown -h
+    sleep 1
+    exec /bin/sh -i
+fi
+
+# Native IPC round-trip driver in isolation (no disk needed): the probe only
+# uses channel/connect/spawn, so it dispatches before the mount stage. Plain
+# mode is a functional smoke; the WCET baseline comes from the traced mode below.
+if test "$rtmux_run" = "ipc-roundtrip"; then
+    echo "RTMux ipc-roundtrip: BEGIN"
+    if /bin/ipc-roundtrip 500; then
+        echo "RTMux ipc-roundtrip: PASS"
+    else
+        echo "RTMux ipc-roundtrip: FAIL"
+    fi
+    shutdown -h
+    sleep 1
+    exec /bin/sh -i
+fi
+
+# IPC priority donation regression (no disk needed): a high-priority client
+# sends to a low-priority server, which reports its donated sched_curpriority.
+if test "$rtmux_run" = "ipc-priority-donation"; then
+    echo "RTMux ipc-priority-donation: BEGIN"
+    if /bin/ipc-priority-donation; then
+        echo "RTMux ipc-priority-donation: PASS"
+    else
+        echo "RTMux ipc-priority-donation: FAIL"
+    fi
+    shutdown -h
+    sleep 1
+    exec /bin/sh -i
+fi
+
+# Tickless-idle probe: no servers needed, it just sleeps quietly so the kernel
+# can drop the periodic tick, then checks one-shot deadlines still fire.
+if test "$rtmux_run" = "tickless-idle"; then
+    echo "RTMux tickless-idle: BEGIN"
+    if /bin/tickless-idle; then
+        echo "RTMux tickless-idle: PASS"
+    else
+        echo "RTMux tickless-idle: FAIL"
+    fi
+    shutdown -h
+    sleep 1
+    exec /bin/sh -i
+fi
+
+if test "$rtmux_run" = "hang-inject"; then
+    echo "RTMux hang-inject: BEGIN"
+    # Hang every other hart with interrupts off (the call refuses the caller's
+    # own hart, so one stays up). The run then never finishes by design; the
+    # harness's hang dump is what is under test.
+    for h in 1 2 3; do
+        /bin/inject hang-hart $h
+    done
+    sleep 100000
+    exec /bin/sh -i
+fi
+
+if test "$rtmux_run" = "debug-inject"; then
+    echo "RTMux debug-inject: BEGIN"
+    # Stall one hart for three seconds with interrupts off. The guest must keep
+    # running on the others and the call must report success. The call refuses
+    # the hart its caller is running on, and each /bin/inject is a new process
+    # that can start on any hart, so one refusal proves nothing: try each hart
+    # in turn.
+    stalled=0
+    for h in 1 2 3 0; do
+        if test "$stalled" = 0 && /bin/inject spin-irqoff $h 3000; then
+            stalled=1
+        fi
+    done
+    ok=0
+    if test "$stalled" = 1; then
+        if /bin/inject alloc-status && echo INJECT-OK; then
+            ok=1
+        fi
+    fi
+    # A client's disconnect notice must survive a failing notification alloc.
+    # Starts once the stall is over: the test's own cross-hart traffic would
+    # otherwise trip the kernel's spin watchdog on the stalled hart.
+    if test "$ok" = 1; then
+        sleep 4
+        if /bin/syscall_testing --disconnect-alloc-failure; then
+            ok=2
+        fi
+    fi
+    if test "$ok" = 2; then
+        echo "RTMux debug-inject: PASS"
+    else
+        echo "RTMux debug-inject: FAIL"
+    fi
+    shutdown -h
+    sleep 1
+    exec /bin/sh -i
+fi
+
+# Neighbour watchdog (CONFIG_STALL_DETECTOR + CONFIG_DEBUG_INJECT): stall one
+# hart for three seconds with interrupts off; the host harness then requires exactly
+# one "hartwatch:" report naming the stalled hart (zero for the idle variant,
+# which only sleeps so every hart wakes on its idle timer for a minute; the
+# -console variant makes the stalled hart hold the console lock as well).
+if test "$rtmux_run" = "hart-watchdog"; then
+    echo "RTMux hart-watchdog: BEGIN"
+    # Hart 2 by preference; the call refuses its caller's own hart (QEMU's boot
+    # hart varies run to run), so fall back to the others. The host reads the hart
+    # back from the INJECT line.
+    stalled=
+    for h in 2 1 3 0; do
+        if test -z "$stalled" && /bin/inject spin-irqoff $h 3000; then
+            stalled=$h
+            echo "RTMux hart-watchdog: INJECT hart=$h"
+        fi
+    done
+    if test -n "$stalled"; then
+        sleep 5
+        echo "RTMux hart-watchdog: PASS"
+    else
+        echo "RTMux hart-watchdog: FAIL"
+    fi
+    shutdown -h
+    sleep 1
+    exec /bin/sh -i
+fi
+
+if test "$rtmux_run" = "hart-watchdog-console"; then
+    echo "RTMux hart-watchdog-console: BEGIN"
+    # The stalled hart also owns the console lock for the whole stall, so the
+    # watchdog report must come out without it. Hart 2 by preference; the call refuses its caller's own hart (QEMU's boot
+    # hart varies run to run), so fall back to the others. The host reads the hart
+    # back from the INJECT line.
+    stalled=
+    for h in 2 1 3 0; do
+        if test -z "$stalled" && /bin/inject spin-console $h 3000; then
+            stalled=$h
+            echo "RTMux hart-watchdog-console: INJECT hart=$h"
+        fi
+    done
+    if test -n "$stalled"; then
+        sleep 5
+        echo "RTMux hart-watchdog-console: PASS"
+    else
+        echo "RTMux hart-watchdog-console: FAIL"
+    fi
+    shutdown -h
+    sleep 1
+    exec /bin/sh -i
+fi
+
+# Roottask wait scan (CONFIG_STALL_DETECTOR): slow-server holds each of its
+# first two DEVCTL_FS_SYNC requests for 8 s, so the roottask sweep worker that
+# sent it stays reply-blocked on the server. sync() gives up on the mount after
+# its 2 s budget, which leaves that worker blocked; the next sync, once the
+# first has been answered, leaves another. The host harness requires one
+# "liveness:" line per held sync.
+if test "$rtmux_run" = "roottask-wait-watch"; then
+    echo "RTMux roottask-wait-watch: BEGIN"
+    /bin/slow-server &
+    waitfor /slow-mount 10
+    /bin/sync
+    sleep 9
+    /bin/sync
+    sleep 9
+    echo "RTMux roottask-wait-watch: PASS"
+    shutdown -h
+    sleep 1
+    exec /bin/sh -i
+fi
+
+if test "$rtmux_run" = "hart-watchdog-idle"; then
+    echo "RTMux hart-watchdog-idle: BEGIN"
+    sleep 60
+    echo "RTMux hart-watchdog-idle: PASS"
+    shutdown -h
+    sleep 1
+    exec /bin/sh -i
+fi
+
+# Monotonic-time probe: pins to a non-boot hart and checks CLOCK_MONOTONIC stays
+# continuous while the boot CPU idles under tickless idle.
+if test "$rtmux_run" = "monotonic-time"; then
+    echo "RTMux monotonic-time: BEGIN"
+    if /bin/monotonic-time; then
+        echo "RTMux monotonic-time: PASS"
+    else
+        echo "RTMux monotonic-time: FAIL"
+    fi
+    shutdown -h
+    sleep 1
+    exec /bin/sh -i
+fi
+
+# RR fairness probe: two equal-priority SCHED_RR workers on one hart must get a
+# fair share, and a higher-priority thread must still preempt them.
+if test "$rtmux_run" = "rr-fairness"; then
+    echo "RTMux rr-fairness: BEGIN"
+    if /bin/rr-fairness; then
+        echo "RTMux rr-fairness: PASS"
+    else
+        echo "RTMux rr-fairness: FAIL"
+    fi
+    shutdown -h
+    sleep 1
+    exec /bin/sh -i
+fi
+
+# Preempt-latency probe: a timer wake of a high-priority thread must preempt a
+# busy same-hart low-priority thread; a watchdog on another hart names the gap
+# if it does not, instead of hanging.
+if test "$rtmux_run" = "preempt-latency"; then
+    # The IRQ-notification source needs the virtio-mmio resource server for the
+    # goldfish-rtc delegation, so bring the bus up first (as irq-notify does).
+    /sbin/virtio-mmio
+    /sbin/virtio-mmio --register-boot
+    echo "RTMux preempt-latency: BEGIN"
+    if /bin/preempt-latency; then
+        echo "RTMux preempt-latency: PASS"
+    else
+        echo "RTMux preempt-latency: FAIL"
+    fi
+    shutdown -h
+    sleep 1
+    exec /bin/sh -i
+fi
+
+# Contended PRIO_INHERIT mutex wake latency: a low-priority holder on one hart,
+# a high-priority waiter on another; measure the unlock-to-acquire handoff.
+if test "$rtmux_run" = "mutex-wake"; then
+    echo "RTMux mutex-wake: BEGIN"
+    if /bin/mutex-wake; then
+        echo "RTMux mutex-wake: PASS"
+    else
+        echo "RTMux mutex-wake: FAIL"
+    fi
+    shutdown -h
+    sleep 1
+    exec /bin/sh -i
+fi
+
+# Uncontended mutex lock/unlock latency: a single thread times the lock-then-
+# unlock pair for the default userland fast path and the PRIO_PROTECT kernel path.
+if test "$rtmux_run" = "mutex-uncontended"; then
+    echo "RTMux mutex-uncontended: BEGIN"
+    if /bin/mutex-uncontended; then
+        echo "RTMux mutex-uncontended: PASS"
+    else
+        echo "RTMux mutex-uncontended: FAIL"
+    fi
+    shutdown -h
+    sleep 1
+    exec /bin/sh -i
+fi
+
+# High-priority IPC round trip under a low-priority backlog: prove the priority-
+# ordered receive queue keeps the high-priority client bounded under contention.
+if test "$rtmux_run" = "ipc-contention"; then
+    echo "RTMux ipc-contention: BEGIN"
+    if /bin/ipc-contention; then
+        echo "RTMux ipc-contention: PASS"
+    else
+        echo "RTMux ipc-contention: FAIL"
+    fi
+    shutdown -h
+    sleep 1
+    exec /bin/sh -i
+fi
+
+if test "$rtmux_run" = "smp-invariants"; then
+    /sbin/virtio-mmio
+    /sbin/virtio-mmio --register-boot
+    echo "RTMux smp-invariants: BEGIN"
+    smp_fail=0
+
+    echo "RTMux smp-invariants: lock-rank-stress"
+    /bin/lock-rank-stress 100 || smp_fail=1
+
+    echo "RTMux smp-invariants: rcu-lookup-measure"
+    /bin/rcu-lookup-measure 100 || smp_fail=1
+
+    echo "RTMux smp-invariants: revoke-stress"
+    /bin/revoke-stress 2 8 1 || smp_fail=1
+
+    echo "RTMux smp-invariants: preempt-latency"
+    /bin/preempt-latency || smp_fail=1
+
+    echo "RTMux smp-invariants: ipc-contention"
+    /bin/ipc-contention || smp_fail=1
+
+    if test "$smp_fail" = "0"; then
+        echo "RTMux smp-invariants: PASS"
+    else
+        echo "RTMux smp-invariants: FAIL"
+    fi
+    shutdown -h
+    sleep 1
+    exec /bin/sh -i
+fi
+
+# Sporadic-server budget probe: a SPORADIC thread must drop to its low priority
+# when its budget is spent so a mid-priority competitor on the same hart runs.
+if test "$rtmux_run" = "sporadic-budget"; then
+    echo "RTMux sporadic-budget: BEGIN"
+    if /bin/sporadic-budget; then
+        echo "RTMux sporadic-budget: PASS"
+    else
+        echo "RTMux sporadic-budget: FAIL"
+    fi
+    shutdown -h
+    sleep 1
+    exec /bin/sh -i
+fi
+
+# Channel-routed IRQ unified-wait fixture (needs the virtio-mmio resource
+# server for the goldfish-rtc delegation, so it runs after the bus is up).
+if test "$rtmux_run" = "irq-notify"; then
+    /sbin/logger
+    /sbin/virtio-mmio
+    /sbin/virtio-mmio --register-boot
+    echo "RTMux irq-notify: BEGIN"
+    if /bin/irq-notify; then
+        echo "RTMux irq-notify: PASS"
+    else
+        echo "RTMux irq-notify: FAIL"
+    fi
+    shutdown -h
+    sleep 1
+    exec /bin/sh -i
+fi
+
+# Same fixture with one seeded attempt's IRQ gated off: the wait must hit its 1 s
+# deadline exactly once (rtc-probe.h), proving a lost IRQ is a counted timeout.
+if test "$rtmux_run" = "irq-notify-suppress"; then
+    /sbin/logger
+    /sbin/virtio-mmio
+    /sbin/virtio-mmio --register-boot
+    echo "RTMux irq-notify-suppress: BEGIN"
+    if /bin/irq-notify --suppress-one; then
+        echo "RTMux irq-notify-suppress: PASS"
+    else
+        echo "RTMux irq-notify-suppress: FAIL"
+    fi
+    shutdown -h
+    sleep 1
+    exec /bin/sh -i
+fi
+
+# Trace payload cases (user pointer width, payload caps) need an instrumented
+# kernel, so the harness builds one for this mode.
+if test "$rtmux_run" = "trace-negative"; then
+    echo "RTMux trace-negative: BEGIN"
+    if /bin/syscall_testing --trace-negative; then
+        echo "RTMux trace-negative: PASS"
+    else
+        echo "RTMux trace-negative: FAIL"
+    fi
+    shutdown -h
+    sleep 1
+    exec /bin/sh -i
+fi
+
+# Serial reader-death regression: the driver must drop a parked reader that was
+# SIGKILLed.  The host writes one byte to the UART once the test prints
+# "serial-unblock: WAITING".
+if test "$rtmux_run" = "serial-unblock"; then
+    /sbin/logger
+    /sbin/virtio-mmio
+    /sbin/virtio-mmio --register-boot
+    echo "RTMux serial-unblock: BEGIN"
+    /bin/dev-serial-8250 &
+    if waitfor /dev/ser1 5 && /bin/syscall_testing --serial-unblock; then
+        echo "RTMux serial-unblock: PASS"
+    else
+        echo "RTMux serial-unblock: FAIL"
+    fi
+    shutdown -h
+    sleep 1
+    exec /bin/sh -i
+fi
+
+# SiFive GPIO pin-IRQ delegation fixture. On QEMU virt there is no sifive,gpio0,
+# so the probe reports a clean UNSUPPORTED skip and exits 0; on a SiFive board it
+# delegates the GPIO controller. The bus must be up first so the delegation
+# request reaches the virtio-mmio resource server (as irq-notify does).
+if test "$rtmux_run" = "gpio-latency"; then
+    /sbin/logger
+    /sbin/virtio-mmio
+    /sbin/virtio-mmio --register-boot
+    echo "RTMux gpio-latency: BEGIN"
+    if /bin/gpio-latency; then
+        echo "RTMux gpio-latency: PASS"
+    else
+        echo "RTMux gpio-latency: FAIL"
+    fi
+    shutdown -h
+    sleep 1
+    exec /bin/sh -i
+fi
+
+# Hard-IRQ to IST-dispatch span probe: drives the goldfish-rtc IST while draining
+# the kernel trace ring so rt-trace-sched can report the IRQ_CLAIM to IST_DISPATCH
+# span. Needs the instrumented build and the virtio-mmio bus for delegation.
+if test "$rtmux_run" = "tracelogger-irq"; then
+    /sbin/logger
+    /sbin/virtio-mmio
+    /sbin/virtio-mmio --register-boot
+    echo "RTMux tracelogger-irq: BEGIN"
+    if /bin/irq-latency; then
+        echo "RTMux tracelogger-irq: PASS"
+    else
+        echo "RTMux tracelogger-irq: FAIL"
+    fi
+    shutdown -h
+    sleep 1
+    exec /bin/sh -i
+fi
+
+# Capture priority-inheritance boost spans. The trace drainer runs windowed in the
+# background, then mutex-wake contends a PRIO_INHERIT mutex so the low-priority
+# holder is boosted on every handoff. rt-trace-sched pairs each boost with its
+# restore into a span. Needs three harts for mutex-wake.
+if test "$rtmux_run" = "tracelogger-pi"; then
+    echo "RTMux tracelogger-pi: BEGIN"
+    /bin/tracelogger 0 4000 windowed &
+    sleep 1
+    /bin/mutex-wake
+    sleep 3
+    echo "RTMux tracelogger-pi: PASS"
+    shutdown -h
+    sleep 1
+    exec /bin/sh -i
+fi
+
+echo
+echo "[ Welcome to RTMux ]"
+echo
+# ----------------------------------------------------------------------
+# Bring up logging and the bus.  Keep the cpio-stage critical path minimal:
+# the pipe server is not needed until interactive/user scripts run.
+# ----------------------------------------------------------------------
+if test "$rtmux_run" = "logger-restart"; then
+    /sbin/logger -C -x
+else
+    /sbin/logger
+fi
+
+if test "$rtmux_run" = "logger-restart"; then
+    echo "RTMux logger-restart: BEGIN"
+    if /bin/logger-restart; then
+        echo "RTMux logger-restart: PASS"
+    else
+        echo "RTMux logger-restart: FAIL"
+    fi
+    shutdown -h
+    sleep 1
+    exec /bin/sh -i
+fi
+
+if test "$rtmux_run" = "fault-recovery"; then
+    echo "RTMux fault-recovery: BEGIN"
+    if /bin/syscall_testing --fault-recovery; then
+        echo "RTMux fault-recovery: PASS"
+    else
+        echo "RTMux fault-recovery: FAIL"
+    fi
+    shutdown -h
+    sleep 1
+    exec /bin/sh -i
+fi
+
+if test "$rtmux_run" = "loader-negative"; then
+    echo "RTMux loader-negative: BEGIN"
+    if /bin/syscall_testing --loader-negative; then
+        echo "RTMux loader-negative: PASS"
+    else
+        echo "RTMux loader-negative: FAIL"
+    fi
+    shutdown -h
+    sleep 1
+    exec /bin/sh -i
+fi
+
+/sbin/virtio-mmio
+/sbin/virtio-mmio --register-boot
+/sbin/pci-server
+
+# ----------------------------------------------------------------------
+# Mount /usr from the partition specified by mainfs= on the kernel
+# cmdline.  Use read rather than command substitution so we don't depend on the
+# pipe service being fully up yet.
+# ----------------------------------------------------------------------
+run_lkl_selftest() {
+    echo
+    echo "RTMux $1: BEGIN"
+    if eval "$2"; then
+        echo "RTMux $1: PASS"
+    else
+        echo "RTMux $1: FAIL"
+    fi
+    shutdown -h
+    sleep 1
+    exec /bin/sh -i
+}
+
+lkl_start_pipe() {
+    /bin/pipe &
+    waitfor /dev/pipe 10
+}
+
+lkl_start_fsd() {
+    /bin/mount -t lkl-ext4 /dev/nvme0n1p1 /fs/root &&
+        waitfor /fs/root 10
+}
+
+lkl_start_fsd_isolated() {
+    /bin/lkl-runmask 0x2 /sbin/lkl-fsd --serve-ext4 /dev/nvme0n1p1 /fs/root &&
+        waitfor /fs/root 10
+}
+
+lkl_start_net() {
+    /sbin/lkl-netd --serve-net &&
+        waitfor /net/ipifc 10
+}
+
+lkl_start_net_isolated() {
+    /bin/lkl-runmask 0x2 /sbin/lkl-netd --serve-net &&
+        waitfor /net/ipifc 10
+}
+
+lkl_start_net_crash() {
+    /sbin/lkl-netd --serve-net-crash-on-ping &&
+        waitfor "$1" 10
+}
+
+# shutdown-sync: copy a file on the LKL ext4 mount, without an fsync, and power
+# off at once.  The host oracle (qemu-regress.sh) checks whether the sentinel
+# reached the disk: $2 empty (the roottask sweep must flush it) or "nosync"
+# (the negative control, which runs shutdown -n and must lose it).
+run_shutdown_sync() {
+    echo
+    echo "RTMux $1: BEGIN"
+    # One line: the shell drops the last command of an if-list continued with
+    # "&&" at a line end.
+    if lkl_start_pipe && lkl_start_fsd && /bin/cp /fs/root/hello.txt /fs/root/sync-sentinel.txt; then
+        echo "RTMux $1: PASS"
+    else
+        echo "RTMux $1: FAIL"
+    fi
+    if test "$2" = "nosync"; then
+        shutdown -n -h
+    else
+        shutdown -h
+    fi
+    sleep 1
+    exec /bin/sh -i
+}
+
+# shutdown-sync-ignore: a mount that never answers DEVCTL_FS_SYNC, visited
+# before a healthy LKL ext4 mount that holds an un-fsynced sentinel.  Shutdown
+# must still happen, after the sweep gives up on the wedged mount, and must
+# still flush the ext4 one.  The host oracle owns the verdict: a fixture that
+# failed to attach leaves no "sync timeout" line, and a sweep that stopped at
+# the wedged mount leaves no sentinel on the disk.
+start_sync_ignore() {
+    /bin/sync-ignore &
+    sleep 1
+}
+
+run_shutdown_sync_ignore() {
+    echo
+    echo "RTMux shutdown-sync-ignore: BEGIN"
+    # The ignoring mount is attached last, as the newest top-level node, so the
+    # sweep visits it before the ext4 mount.
+    if lkl_start_pipe && lkl_start_fsd && /bin/cp /fs/root/hello.txt /fs/root/sync-sentinel.txt && start_sync_ignore; then
+        echo "RTMux shutdown-sync-ignore: PASS"
+    else
+        echo "RTMux shutdown-sync-ignore: FAIL"
+    fi
+    shutdown -h
+    sleep 1
+    exec /bin/sh -i
+}
+
+# shutdown-sync-wedge: the mount's only dispatch thread parks inside the sync
+# handler, so the kernel unblock request is never taken and the client stays
+# reply-blocked.  The sweep must give up on its own worker after the 2 s budget.
+run_shutdown_sync_wedge() {
+    echo
+    echo "RTMux shutdown-sync-wedge: BEGIN"
+    /bin/sync-ignore -w &
+    sleep 1
+    echo "RTMux shutdown-sync-wedge: PASS"
+    shutdown -h
+    sleep 1
+    exec /bin/sh -i
+}
+
+# syslog-wrap: /sys/log on a 4096-byte roottask ring (CONFIG_ROOTTASK_SYSLOG_SIZE).
+run_syslog_wrap() {
+    echo
+    echo "RTMux syslog-wrap: BEGIN"
+    if /bin/syscall_testing --sys-log-wrap; then
+        echo "RTMux syslog-wrap: PASS"
+    else
+        echo "RTMux syslog-wrap: FAIL"
+    fi
+    shutdown -h
+    sleep 1
+    exec /bin/sh -i
+}
+
+run_lkl_regress() {
+    case "$1" in
+        lkl-fsd-crash) run_lkl_selftest lkl-fsd-crash '/bin/not /sbin/lkl-fsd --crash-after-start && /bin/lkl-gate' ;;
+        lkl-fsd-tree) run_lkl_selftest lkl-fsd-tree 'lkl_start_pipe && lkl_start_fsd && /bin/ls /fs/root && /bin/stat /fs/root/hello.txt && /bin/df /fs/root && /bin/cat /fs/root/hello.txt && /bin/cp /fs/root/hello.txt /fs/root/copy.txt && /bin/sync /fs/root/copy.txt && /bin/cat /fs/root/copy.txt && /bin/cp /fs/root/hello.txt /fs/root/pipe.txt && /bin/more /fs/root/pipe.txt && /bin/less /fs/root/pipe.txt && /bin/touch /fs/root/touched.txt && /bin/stat /fs/root/touched.txt && /bin/mv /fs/root/copy.txt /fs/root/moved.txt && /bin/cat /fs/root/moved.txt && /bin/rm /fs/root/moved.txt /fs/root/touched.txt /fs/root/pipe.txt && /bin/cp /fs/root/hello.txt /dev/text && /bin/cat /ctl && /bin/cat /mounts && /bin/lkl-native-test && /bin/lkl-measure fs 25 trace && /bin/lkl-measure fs-rt 100 trace && /bin/timer-jitter 20 60 && /bin/cat /stats' ;;
+        lkl-fsd-tree-isolated) run_lkl_selftest lkl-fsd-tree-isolated 'lkl_start_fsd_isolated && /bin/cat /fs/root/hello.txt && /bin/lkl-measure fs 25 trace && /bin/lkl-measure fs-rt 100 trace split && /bin/timer-jitter 20 60 && /bin/cat /stats' ;;
+        lkl-fsd-tree-split) run_lkl_selftest lkl-fsd-tree-split 'lkl_start_fsd && /bin/cat /fs/root/hello.txt && /bin/lkl-measure fs 25 trace && /bin/lkl-measure fs-rt 100 trace split && /bin/timer-jitter 20 60 && /bin/cat /stats' ;;
+        lkl-host-selftest) run_lkl_selftest lkl-host-selftest '/sbin/lkl-fsd --host-selftest' ;;
+        lkl-fsd-tricky) run_lkl_selftest lkl-fsd-tricky 'lkl_start_pipe && lkl_start_fsd && /bin/ls /fs/root && /bin/lkl-fsd-read-test' ;;
+        lkl-fsd-restart) run_lkl_selftest lkl-fsd-restart '/bin/lkl-supervisor /fs/root 1 /fs/root/crashme /sbin/lkl-fsd --serve-ext4-crash-on-open /dev/nvme0n1p1 /fs/root' ;;
+        lkl-netd-crash) run_lkl_selftest lkl-netd-crash '/bin/not /sbin/lkl-netd --delegate-crash-after-start && /bin/lkl-gate' ;;
+        lkl-netd-direct-denied) run_lkl_selftest lkl-netd-direct-denied '/sbin/lkl-netd --boot-only && /bin/lkl-gate' ;;
+        lkl-netd-http) run_lkl_selftest lkl-netd-http 'lkl_start_net && /bin/verify-lkl-net --helpers && /bin/lkl-backpressure-test && /bin/lkl-measure net 10 trace && /bin/lkl-measure net-blocked 3 && /bin/lkl-measure net-rt 100 trace && /bin/timer-jitter 20 60 && /bin/cat /net/stats && /bin/echo' ;;
+        lkl-netd-http-isolated) run_lkl_selftest lkl-netd-http-isolated 'lkl_start_net_isolated && /bin/verify-lkl-net --helpers && /bin/lkl-measure net 10 trace && /bin/lkl-measure net-rt 100 trace split && /bin/timer-jitter 20 60 && /bin/cat /net/stats && /bin/echo' ;;
+        lkl-netd-http-split) run_lkl_selftest lkl-netd-http-split 'lkl_start_net && /bin/verify-lkl-net --helpers && /bin/lkl-measure net 10 trace && /bin/lkl-measure net-rt 100 trace split && /bin/timer-jitter 20 60 && /bin/cat /net/stats && /bin/echo' ;;
+        lkl-netd-revoke) run_lkl_selftest lkl-netd-revoke 'lkl_start_net_crash /net/ping && /bin/lkl-measure net-revoke 1 && /bin/lkl-gate' ;;
+        lkl-netd-restart) run_lkl_selftest lkl-netd-restart '/bin/lkl-supervisor /net/ipifc 1 /net/ping /sbin/lkl-netd --serve-net-crash-on-ping' ;;
+        lkl-netd-stale) run_lkl_selftest lkl-netd-stale 'lkl_start_net_crash /net/dns && /bin/lkl-stale-handle-test' ;;
+        lkl-multi) run_lkl_selftest lkl-multi 'lkl_start_pipe && lkl_start_net && lkl_start_fsd && /bin/ls /fs/root && /bin/cat /fs/root/hello.txt && /bin/verify-lkl-net --helpers && /bin/cat /net/stats && /bin/lkl-multi-test && /bin/cat /stats' ;;
+        lkl-multi-crash) run_lkl_selftest lkl-multi-crash 'lkl_start_pipe && lkl_start_net_crash /net/ping && lkl_start_fsd && /bin/cat /fs/root/hello.txt && /bin/lkl-measure net-revoke 1 && /bin/cat /fs/root/hello.txt && /bin/lkl-gate /net /net/ping /net/stats /net/tcp/clone /net/udp/clone /net/dns' ;;
+        lkl-multi-stress) run_lkl_selftest lkl-multi-stress 'lkl_start_pipe && lkl_start_net && lkl_start_fsd && /bin/lkl-multi-test 10 && /bin/timer-jitter 20 60' ;;
+        lkl-contain) run_lkl_selftest lkl-contain '/bin/lkl-contain-test' ;;
+        lkl-iommu-probe) run_lkl_selftest lkl-iommu-probe '/bin/lkl-iommu-probe' ;;
+        lkl-iommu-sys-probe) run_lkl_selftest lkl-iommu-sys-probe '/bin/lkl-iommu-probe --system' ;;
+        lkl-iommu-metadata) run_lkl_selftest lkl-iommu-metadata '/bin/lkl-contain-test --virtio-iommu-metadata' ;;
+        lkl-iommu-domain-preflight) run_lkl_selftest lkl-iommu-domain-preflight '/bin/lkl-contain-test --virtio-iommu-domain-preflight' ;;
+        lkl-netd-iommu-fail-closed) run_lkl_selftest lkl-netd-iommu-fail-closed '/bin/not /sbin/lkl-netd --serve-net' ;;
+        tracelogger) run_lkl_selftest tracelogger '/bin/tracelogger' ;;
+        tracelogger-kcall) run_lkl_selftest tracelogger-kcall '/bin/tracelogger 0 0 kcall' ;;
+        tracelogger-lkl-fsd) run_lkl_selftest tracelogger-lkl-fsd 'lkl_start_fsd && /bin/cat /fs/root/hello.txt; rc=$?; test "$rc" = "0" && /bin/tracelogger 0 700 windowed & sleep 1 && test "$rc" = "0" && /bin/lkl-measure fs 3 trace split && /bin/lkl-measure fs-rt 5 trace split; rc=$?; sleep 15; test "$rc" = "0"' ;;
+        tracelogger-lkl-netd) run_lkl_selftest tracelogger-lkl-netd 'lkl_start_net && /bin/verify-lkl-net --helpers; rc=$?; test "$rc" = "0" && /bin/tracelogger 0 700 windowed & sleep 1 && test "$rc" = "0" && /bin/lkl-measure net 3 trace split && /bin/lkl-measure net-rt 5 trace split; rc=$?; sleep 15; test "$rc" = "0"' ;;
+        tracelogger-lkl-netd-default) run_lkl_selftest tracelogger-lkl-netd-default 'lkl_start_net && /bin/verify-lkl-net --helpers; rc=$?; test "$rc" = "0" && /bin/tracelogger 0 3000 windowed 1000000 & sleep 1 && test "$rc" = "0" && /bin/lkl-measure net 10 trace && /bin/lkl-measure net-rt 100 trace; rc=$?; sleep 3; test "$rc" = "0"' ;;
+    esac
+}
+
+echo
+echo "Probing for NVMe..."
+if test "$rtmux_run" = "lkl-iommu-sys-probe"; then
+    run_lkl_regress "$rtmux_run"
+fi
+if test "$rtmux_run" = "lkl-iommu-metadata"; then
+    run_lkl_regress "$rtmux_run"
+fi
+if test "$rtmux_run" = "lkl-iommu-domain-preflight"; then
+    run_lkl_regress "$rtmux_run"
+fi
+if test "$rtmux_run" = "lkl-netd-iommu-fail-closed"; then
+    run_lkl_regress "$rtmux_run"
+fi
+if waitfor /dev/pci 10; then
+    if test "$rtmux_run" = "lkl-iommu-probe"; then
+        run_lkl_regress "$rtmux_run"
+    fi
+    /bin/dev-nvme &
+else
+    echo "WARNING: /dev/pci did not appear"
+fi
+
+# Keep the interactive console on /dev/text for now.  dev-serial-8250 uses the same
+# QEMU UART as the SBI console, and starting it here can consume input before
+# getty reads it.
+
+# ----------------------------------------------------------------------
+# Storage drivers.
+# ----------------------------------------------------------------------
+mount_ok=0
+if test -n "$mainfs"; then
+    echo
+    echo "Mounting $mainfs on /usr..."
+    if waitfor "$mainfs" 20; then
+        # Under SMP the device node can resolve (waitfor's access() succeeds) a
+        # beat before its I/O service is fully serving opens, so a single mount can
+        # race and see ENOENT. Retry a few times; the window closes within ~1s.
+        for try in 1 2 3 4 5; do
+            if test "$mount_ok" = "0"; then
+                if /bin/romfs "$mainfs" /usr; then
+                    mount_ok=1
+                else
+                    sleep 1
+                fi
+            fi
+        done
+        if test "$mount_ok" = "0"; then
+            echo "WARNING: romfs failed to mount /usr after retries"
+        fi
+    else
+        echo "WARNING: $mainfs did not appear"
+    fi
+else
+    echo
+    echo "WARNING: no mainfs= on kernel cmdline"
+fi
+
+# ----------------------------------------------------------------------
+# Hand off.  On success: /usr/sbin/sysinit/level1.sh takes over.
+# On failure: rescue shell straight from the cpio.
+# ----------------------------------------------------------------------
+if test "$mount_ok" = "1"; then
+    if test "$rtmux_run" = "rt-check"; then
+        echo
+        echo "RTMux rt-check: BEGIN"
+        rt_fail=0
+
+        echo "RTMux rt-check: rt-latency"
+        if /bin/rt-latency 100 1000000 60; then
+            true
+        else
+            rt_fail=1
+        fi
+
+        echo "RTMux rt-check: timer-jitter"
+        if /bin/timer-jitter 50 60; then
+            true
+        else
+            rt_fail=1
+        fi
+
+        echo "RTMux rt-check: ipc-roundtrip"
+        if /bin/ipc-roundtrip 500; then
+            true
+        else
+            rt_fail=1
+        fi
+
+        echo "RTMux rt-check: ipc-priority-donation"
+        if /bin/ipc-priority-donation; then
+            true
+        else
+            rt_fail=1
+        fi
+
+        echo "RTMux rt-check: lock-rank-stress"
+        if /bin/lock-rank-stress 100; then
+            true
+        else
+            rt_fail=1
+        fi
+
+        echo "RTMux rt-check: namespace-roundtrip"
+        if /bin/namespace-roundtrip 25; then
+            true
+        else
+            rt_fail=1
+        fi
+
+        echo "RTMux rt-check: lkl-gate"
+        if /bin/lkl-gate; then
+            true
+        else
+            rt_fail=1
+        fi
+
+        # Runs last: it drives the system into memory-pressure OOM to prove
+        # admission control is bounded and protected memory is never reclaimed,
+        # then frees its hog so it does not starve any later stage.
+        echo "RTMux rt-check: mem-pressure"
+        if /bin/mem-pressure; then
+            true
+        else
+            rt_fail=1
+        fi
+
+        if [[ "$rt_fail" = "0" ]]; then
+            echo "RTMux rt-check: PASS"
+        else
+            echo "RTMux rt-check: FAIL"
+        fi
+        shutdown -h
+        sleep 1
+        exec /bin/sh -i
+    fi
+    if test "$rtmux_run" = "pi-inversion-xfail"; then
+        echo
+        echo "RTMux pi-inversion-xfail: BEGIN"
+        # Distinct exit codes from pi-inversion-xfail.c let the rt-check gate
+        # tell a runtime PI regression from a setup failure.
+        /bin/pi-inversion-xfail
+        rc=$?
+        case "$rc" in
+            0)  echo "RTMux pi-inversion-xfail: PASS" ;;
+            1)  echo "RTMux pi-inversion-xfail: FAIL starvation" ;;
+            77) echo "RTMux pi-inversion-xfail: QUARANTINED" ;;
+            *)  echo "RTMux pi-inversion-xfail: FAIL rc=$rc" ;;
+        esac
+        shutdown -h
+        sleep 1
+        exec /bin/sh -i
+    fi
+    if test "$rtmux_run" = "rcu-lookup-measure"; then
+        echo
+        echo "RTMux rcu-lookup-measure: BEGIN"
+        if /bin/rcu-lookup-measure 1000; then
+            echo "RTMux rcu-lookup-measure: PASS"
+        else
+            echo "RTMux rcu-lookup-measure: FAIL"
+        fi
+        shutdown -h
+        sleep 1
+        exec /bin/sh -i
+    fi
+    if test "$rtmux_run" = "revoke-stress"; then
+        echo
+        echo "RTMux revoke-stress: BEGIN"
+        if /bin/revoke-stress; then
+            echo "RTMux revoke-stress: PASS"
+        else
+            echo "RTMux revoke-stress: FAIL"
+        fi
+        shutdown -h
+        sleep 1
+        exec /bin/sh -i
+    fi
+    case "$rtmux_run" in
+        shutdown-sync) run_shutdown_sync shutdown-sync "" ;;
+        shutdown-sync-negative) run_shutdown_sync shutdown-sync-negative nosync ;;
+        shutdown-sync-ignore) run_shutdown_sync_ignore ;;
+        shutdown-sync-wedge) run_shutdown_sync_wedge ;;
+        syslog-wrap) run_syslog_wrap ;;
+        lkl-*) run_lkl_regress "$rtmux_run" ;;
+        tracelogger*) run_lkl_regress "$rtmux_run" ;;
+    esac
+    if test "$rtmux_run" = "syscall-testing"; then
+        echo
+        echo "RTMux syscall-testing: BEGIN"
+        /bin/pipe &
+        if test -n "$rtmux_laps"; then
+            /bin/syscall_testing --laps "$rtmux_laps" && st_ok=1 || st_ok=0
+        else
+            /bin/syscall_testing && st_ok=1 || st_ok=0
+        fi
+        if test "$st_ok" = "1"; then
+            echo "RTMux syscall-testing: PASS"
+        else
+            echo "RTMux syscall-testing: FAIL"
+        fi
+        shutdown -h
+        sleep 1
+        exec /bin/sh -i
+    fi
+    if test "$rtmux_run" = "leak-gate"; then
+        # Opt-in leak gate: killspawn rounds, then rtmux.laps (default 3) suite
+        # laps with the live-count growth check.
+        echo
+        echo "RTMux leak-gate: BEGIN"
+        /bin/pipe &
+        # The init shell does not run the laps after "if A && B; then" with
+        # ${var:-default}: the lap phase silently never started and the gate
+        # reported PASS on killspawn alone. Use the forms that work above.
+        if test -n "$rtmux_laps"; then
+            leak_laps=$rtmux_laps
+        else
+            leak_laps=3
+        fi
+        /bin/syscall_testing --killspawn &&
+            /bin/syscall_testing --laps "$leak_laps" && st_ok=1 || st_ok=0
+        if test "$st_ok" = "1"; then
+            echo "RTMux leak-gate: PASS"
+        else
+            echo "RTMux leak-gate: FAIL"
+        fi
+        shutdown -h
+        sleep 1
+        exec /bin/sh -i
+    fi
+    if test "$rtmux_run" = "spawn-storm"; then
+        echo
+        echo "RTMux spawn-storm: BEGIN"
+        /bin/pipe &
+        if /bin/syscall_testing --spawn-storm; then
+            echo "RTMux spawn-storm: PASS"
+        else
+            echo "RTMux spawn-storm: FAIL"
+        fi
+        shutdown -h
+        sleep 1
+        exec /bin/sh -i
+    fi
+    if test "$rtmux_run" = "posix-cap-boundary"; then
+        echo
+        echo "RTMux posix-cap-boundary: BEGIN"
+        /bin/pipe &
+        if /bin/syscall_testing --posix-cap-boundary; then
+            echo "RTMux posix-cap-boundary: PASS"
+        else
+            echo "RTMux posix-cap-boundary: FAIL"
+        fi
+        shutdown -h
+        sleep 1
+        exec /bin/sh -i
+    fi
+    if test "$rtmux_run" = "least-privilege-manifest"; then
+        echo
+        echo "RTMux least-privilege-manifest: BEGIN"
+        /bin/pipe &
+        if /bin/syscall_testing; then
+            echo "RTMux least-privilege-manifest: PASS"
+        else
+            echo "RTMux least-privilege-manifest: FAIL"
+        fi
+        shutdown -h
+        sleep 1
+        exec /bin/sh -i
+    fi
+    if test "$rtmux_run" = "boot-manifest"; then
+        echo
+        echo "RTMux boot-manifest: BEGIN"
+        /bin/pipe &
+        if /bin/syscall_testing; then
+            echo "RTMux boot-manifest: PASS"
+        else
+            echo "RTMux boot-manifest: FAIL"
+        fi
+        shutdown -h
+        sleep 1
+        exec /bin/sh -i
+    fi
+    # Same suite, but exec'd from the mounted /usr romfs (the NVMe block device)
+    # instead of /bin in the cpio — proves the block filesystem can host and run
+    # the conformance suite without initramfs.cpio.
+    if test "$rtmux_run" = "syscall-testing-disk"; then
+        echo
+        echo "RTMux syscall-testing-disk: BEGIN"
+        /bin/pipe &
+        if /usr/bin/syscall_testing; then
+            echo "RTMux syscall-testing-disk: PASS"
+        else
+            echo "RTMux syscall-testing-disk: FAIL"
+        fi
+        shutdown -h
+        sleep 1
+        exec /bin/sh -i
+    fi
+    # NVMe IST drain-before-unmask measurement: read a /usr file backed by the
+    # NVMe partition many times so the interrupt service thread drains a stream
+    # of read completions, which the CONFIG_MEASURE_IST_DRAIN hook in dev-nvme
+    # reports as a drain-latency histogram on the serial log. Needs /usr mounted,
+    # so it lives in the post-mount block.
+    if test "$rtmux_run" = "ist-drain"; then
+        echo
+        echo "RTMux ist-drain: BEGIN"
+        if /bin/ist-drain-load; then
+            echo "RTMux ist-drain: PASS"
+        else
+            echo "RTMux ist-drain: FAIL"
+        fi
+        shutdown -h
+        sleep 1
+        exec /bin/sh -i
+    fi
+    if test "$rtmux_run" = "interactive-smoke"; then
+        echo
+        echo "RTMux interactive-smoke: BEGIN"
+        smoke_fail=0
+        /bin/pipe &
+
+        echo "RTMux interactive-smoke: pwd"
+        if /bin/pwd; then
+            true
+        else
+            smoke_fail=1
+        fi
+
+        echo "RTMux interactive-smoke: ps"
+        if /bin/ps; then
+            true
+        else
+            smoke_fail=1
+        fi
+
+        echo "RTMux interactive-smoke: ls"
+        if /bin/ls; then
+            true
+        else
+            smoke_fail=1
+        fi
+
+        echo "RTMux interactive-smoke: env"
+        /bin/env
+
+        echo "RTMux interactive-smoke: env command"
+        if /bin/env RTMUX_ENV_SMOKE=1 /bin/printenv RTMUX_ENV_SMOKE; then
+            true
+        else
+            smoke_fail=1
+        fi
+
+        echo "RTMux interactive-smoke: printenv"
+        if /bin/printenv PATH; then
+            true
+        else
+            smoke_fail=1
+        fi
+
+        # Shell parser features the RTMux shell already implements.  Each sh -c
+        # exits 0 only if the feature parses correctly and prints a marker, so a
+        # wrong result sets smoke_fail via ||.  Calls are grouped to keep the
+        # fork/exec count (and boot time under single-vCPU QEMU) low.  Covered:
+        # && chaining, double quotes preserving a space and a ; metachar, ||
+        # fallback, ;-sequencing, $VAR expansion, and -- since run_line() now
+        # expands each statement as it runs -- an assignment and $? that are
+        # visible to a later command in the same ; sequence.
+        echo "RTMux interactive-smoke: shell parser"
+        /bin/sh -c 'test "a b" = "a b" && test "x;y" = "x;y"' && echo smk-quotes-ok || smoke_fail=1
+        /bin/sh -c 'false || true' && echo smk-oror-ok || smoke_fail=1
+        /bin/sh -c 'true; true' && echo smk-semi-ok || smoke_fail=1
+        /bin/sh -c 'test "$PATH" != ""' && echo smk-dollar-ok || smoke_fail=1
+        /bin/sh -c 'X=hi; test "$X" = hi' && echo smk-var-ok || smoke_fail=1
+        /bin/sh -c 'false; test "$?" = 1' && echo smk-status-ok || smoke_fail=1
+        /bin/sh -c 'echo ok # ; false' && echo smk-comment-ok || smoke_fail=1
+        /bin/sh -c 'echo x 2>&1' && echo smk-redir-ok || smoke_fail=1
+
+        # Toolbox applets, chained with && so any non-zero exit fails the smoke:
+        # pipe into wc, seq, head/tail -n, and basename/dirname path handling.
+        echo "RTMux interactive-smoke: toolbox applets"
+        /bin/sh -c 'echo hi | wc && seq 1 3 && head -n 1 /etc/passwd && tail -n 1 /etc/passwd && basename /a/b/c && dirname /a/b/c' && echo smk-applets-ok || smoke_fail=1
+
+        if test "$smoke_fail" = "0"; then
+            echo "RTMux interactive-smoke: PASS"
+        else
+            echo "RTMux interactive-smoke: FAIL"
+        fi
+        shutdown -h
+        sleep 1
+        exec /bin/sh -i
+    fi
+    if test "$rtmux_run" = "toolbox"; then
+        echo
+        echo "RTMux toolbox: BEGIN"
+        /bin/pipe &
+        if /bin/sh /bin/toolbox-test; then
+            echo "RTMux toolbox: PASS"
+        else
+            echo "RTMux toolbox: FAIL"
+        fi
+        shutdown -h
+        sleep 1
+        exec /bin/sh -i
+    fi
+    if test "$rtmux_run" = "sh-posix"; then
+        echo
+        echo "RTMux sh-posix: BEGIN"
+        /bin/pipe &
+        if /bin/sh /bin/sh-posix-test; then
+            echo "RTMux sh-posix: PASS"
+        else
+            echo "RTMux sh-posix: FAIL"
+        fi
+        shutdown -h
+        sleep 1
+        exec /bin/sh -i
+    fi
+    if test "$rtmux_run" = "opts-pse51"; then
+        echo
+        echo "RTMux opts-pse51: BEGIN"
+        /bin/pipe &
+        if /bin/opts-pse51-run; then
+            echo "RTMux opts-pse51: PASS"
+        else
+            echo "RTMux opts-pse51: FAIL"
+        fi
+        shutdown -h
+        sleep 1
+        exec /bin/sh -i
+    fi
+    echo "Sysinit: level1 running."
+    echo
+    /sbin/getty
+fi
+
+echo "*** /usr unavailable — dropping to rescue shell ***"
+echo "Use 'shutdown' to power off."
+echo
+exec /bin/sh -i
