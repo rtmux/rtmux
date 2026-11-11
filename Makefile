@@ -160,13 +160,13 @@ servers/roottask: userland userland-tests servers/logger servers/pci servers/vir
 servers: $(SERVER_DIRS)
 lkl-servers: $(LKL_SERVER_DIRS)
 host-tools: $(HOST_TOOL_DIRS)
-host-tests:
+host-tests: $(AUTOCONF_H) $(VER_FILE)
 	$(Q)$(MAKE) -C tools/host host-tests
 host-lkl-fence-asm:
 	$(Q)$(MAKE) -C tools/host host-lkl-fence-asm RISCV_CC='$(RISCV_CC)'
-host-sanitize:
+host-sanitize: $(AUTOCONF_H) $(VER_FILE)
 	$(Q)$(MAKE) -C tools/host host-sanitize
-host-fuzz:
+host-fuzz: $(AUTOCONF_H) $(VER_FILE)
 	$(Q)$(MAKE) -C tools/host host-fuzz
 .PHONY: host-tools host-tests host-lkl-fence-asm host-sanitize host-fuzz
 
@@ -269,6 +269,7 @@ LKL_HOST_AUTHORED_MODES = \
     lkl-fsd-tricky:180
 LKL_TRACE_TIMEOUT ?= 360
 QEMU_SYSCALL_TIMEOUT ?= 300
+QEMU_SMP_TIMEOUT ?= 180
 LKL_TRACE_MODES = \
     tracelogger-lkl-fsd:$(LKL_TRACE_TIMEOUT) \
     tracelogger-lkl-netd:$(LKL_TRACE_TIMEOUT)
@@ -379,7 +380,7 @@ check-loader-negative: check-qemu-deps $(AUTOCONF_H) $(VER_FILE) startup initram
 check-smp-invariants: check-qemu-deps $(AUTOCONF_H) $(VER_FILE) startup initramfs
 	$(msg) CHECK "SMP invariant ledger"
 	$(Q)$(PYTHON) scripts/check-smp-invariants.py
-	$(Q)scripts/qemu-regress.sh --mode smp-invariants --timeout 180
+	$(Q)scripts/qemu-regress.sh --mode smp-invariants --timeout $(QEMU_SMP_TIMEOUT)
 
 check-memory-safety-inventory:
 	$(msg) CHECK "memory-safety inventory"
@@ -778,7 +779,7 @@ lkl-profile-smoke:
 # -Bj rebuild plus a boot.  Always restores the full profile on exit.  Override
 # the profile list with args, e.g. `make posix-profile-boot-probe ARGS=minimal`.
 posix-profile-boot-probe:
-	$(msg) PROBE POSIX profiles (build + boot)
+	$(msg) PROBE "POSIX profiles (build + boot)"
 	$(Q)scripts/probe-posix-profiles.sh $(ARGS)
 
 check-syscall-abi:

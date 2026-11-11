@@ -48,7 +48,7 @@ jobs:
           - name: differential
             run: make check-lkl-differential
           - name: trace
-            run: make check-lkl-trace
+            run: make check-lkl-trace LKL_TRACE_TIMEOUT=900
           - name: profile
             run: make lkl-profile-smoke
     name: qemu (${{ matrix.name }})

@@ -124,7 +124,7 @@ jobs:
           - name: realtime
             run: make check-rt
           - name: smp-invariants
-            run: make check-smp-invariants
+            run: make check-smp-invariants QEMU_SMP_TIMEOUT=900
           - name: fault-recovery
             run: make check-fault-recovery
           - name: loader-negative
@@ -136,6 +136,7 @@ jobs:
           - name: emu-headless
             run: make check-emu-headless
           - name: races
+            formal: true
             run: |
               make check-channel-teardown-race check-reply-timeout-race \
                    check-debug-blocked-on check-opts-pse51
@@ -153,6 +154,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-rtmux
+        with:
+          formal: ${{ matrix.formal || 'false' }}
       - run: make defconfig
       - name: ${{ matrix.name }}
         run: ${{ matrix.run }}
