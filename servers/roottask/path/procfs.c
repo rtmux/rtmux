@@ -2145,10 +2145,9 @@ static const ioserv_ops_t procfs_io_funcs = {
  * _IO_OPENFD that names the target's connection, plus a key minted for the
  * opener's own thread over exactly those bytes (msg_key_data CALCULATE, which
  * only roottask may do), so the service admits that one thread's one message.
- * The service still applies its own checks (no wider access than the source).
- * A second mint for the same thread replaces the first key, so the caller
- * follows each link in turn (libc does).
- * Parameters:
+ * The service still applies its own checks (no wider access than the source). A
+ * second mint for the same thread replaces the first key, so the caller follows
+ * each link in turn (libc does). Parameters:
  *   ctp : request context (ctp->rcvid is the opener)
  *   msg : the open request, rewritten in place as the link reply
  *   pid : target process

@@ -5,7 +5,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/* Shared struct layout for the __KSYS_PRIV_PROC_QUERY kernel extension: the
+/*
+ * Shared struct layout for the __KSYS_PRIV_PROC_QUERY kernel extension: the
  * kernel fills this U-mode buffer from the kernel-half process_t fields the
  * U-mode roottask would otherwise dereference directly (now illegal with the
  * kernel heap mapped PTE_U=0).

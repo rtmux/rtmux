@@ -286,7 +286,10 @@ static int vi_load(struct vi *vi)
 
     if (vi->path[0] == '\0')
         return vi_insert_line(vi, 0, "", 0);
-    /* ipc-send: utils -> roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring */
+
+    /* ipc-send: utils ->
+     * roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring
+     */
     fp = fopen(vi->path, "r");
     if (!fp) {
         if (errno == ENOENT)
@@ -356,9 +359,9 @@ static int vi_save(struct vi *vi)
 
     /* TODO: switch to a temp + rename() once libc grows a rename() wrapper.
      * Today this truncates in place; a half-written file replaces the original.
-     * Acceptable until RTMux libc lands rename().
+     * Acceptable until RTMux libc lands rename(). ipc-send: utils ->
+     * roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring
      */
-    /* ipc-send: utils -> roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring */
     fp = fopen(vi->path, "w");
     if (!fp) {
         snprintf(vi->status, sizeof(vi->status), "%s: %s", vi->path,

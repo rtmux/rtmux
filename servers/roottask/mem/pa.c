@@ -16,7 +16,8 @@
  * specially by reading the embedded paddr.
  */
 
-/* EXTERN-to-empty turns mm-internal.h's EXTERN-prefixed declarations
+/*
+ * EXTERN-to-empty turns mm-internal.h's EXTERN-prefixed declarations
  * (restrict_proc, restrict_user, last_paddr, va_rover, mm_flags,
  * system_heap_vaddr, pgszlist) into definitions in this TU. pa.c is the sole
  * owner of these roottask-side globals and populates them from the OUT fields

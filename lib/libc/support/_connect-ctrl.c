@@ -5,7 +5,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/* Core connection control logic — manages symlink resolution, server discovery,
+/*
+ * Core connection control logic — manages symlink resolution, server discovery,
  * and message routing.
  */
 

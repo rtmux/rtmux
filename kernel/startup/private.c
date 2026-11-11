@@ -28,8 +28,7 @@ void init_system_private()
      * results, such as ROUND() returning zero value and mem routines silently
      * stop working.
      */
-private
-    ->pagesize = __PAGESIZE;
+    private->pagesize = __PAGESIZE;
 
     /* kcall moved to dedicated trampoline page (cpu-syspage-memory.c) */
 

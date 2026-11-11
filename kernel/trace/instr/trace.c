@@ -15,8 +15,8 @@
 
 /* Ceiling on RTMUX_TRACE_ALLOCBUFFER's buffer count. 1024 * 16 KiB = 16 MiB of
  * physically contiguous RAM, which is already far past what pa_alloc will hand
- * out in practice (the in-tree tracers ask for 16) and keeps the header's
- * `i << 13` buffer number inside 32 bits with room to spare. See the
+ * out in practice (the in-tree tracers ask for 16) and keeps the header's `i <<
+ * 13` buffer number inside 32 bits with room to spare. See the
  * `_TRACE_MAX_BUFFERS` row in docs/assumptions.md.
  */
 #define _TRACE_MAX_BUFFERS 1024
@@ -266,9 +266,9 @@ static unsigned trace_cmd_words(uint32_t opcode, unsigned max)
     return words;
 }
 
-/* Copy a caller word payload named by the pointer pair at ptr[0..1] into
- * `out`, then point that pair at `out`. A zero count names no payload and
- * leaves the pair alone (add_trace_buffer reads nothing for it). Parameters:
+/* Copy a caller word payload named by the pointer pair at ptr[0..1] into `out`,
+ * then point that pair at `out`. A zero count names no payload and leaves the
+ * pair alone (add_trace_buffer reads nothing for it). Parameters:
  *   ptr    : the pointer-word pair in the kernel copy of the command
  *   nwords : caller's word count, at most TRACE_USRSTR_MAX / 4
  *   out    : kernel buffer of at least nwords + 2 words
@@ -351,6 +351,7 @@ int kdecl ksys_trace_event(thread_t *act, struct kcall_args_trace_event *kap)
         return EFAULT;
 
     c_p = cmd;
+
     /* Caller payloads are copied here, with no lock held, and the command's
      * pointer words are overwritten with the kernel copy's address, so the
      * trace_event() arms never touch user memory and cannot fault under a
@@ -2332,6 +2333,7 @@ int kdecl ksys_trace_event(thread_t *act, struct kcall_args_trace_event *kap)
         }
         }
     }
+
     /* One arm: the two modes differed only in the flag word they stamp into
      * each buffer header, and duplicating the walk duplicated the locking too.
      */
@@ -2345,13 +2347,13 @@ int kdecl ksys_trace_event(thread_t *act, struct kcall_args_trace_event *kap)
         tracebuf_t *l_b_p;
         tracebuf_t *b_p;
 
-        /* Same authority as ALLOCBUFFER and DEALLOCBUFFER. These two arms
-         * reset every buffer in the ring and flip global trace state, which is
-         * the tracer's authority, not any caller's; the asymmetry where the
-         * freer needed RTMUX_PRIV_CAP_TRACE and these did not was itself the
-         * bug. It also bounds who can hold the interrupts-off window below: the
-         * walk is O(buff_num), so an ungated caller could keep interrupts off
-         * on its hart for a full 1024-buffer ring on every call and blow the
+        /* Same authority as ALLOCBUFFER and DEALLOCBUFFER. These two arms reset
+         * every buffer in the ring and flip global trace state, which is the
+         * tracer's authority, not any caller's; the asymmetry where the freer
+         * needed RTMUX_PRIV_CAP_TRACE and these did not was itself the bug. It
+         * also bounds who can hold the interrupts-off window below: the walk is
+         * O(buff_num), so an ungated caller could keep interrupts off on its
+         * hart for a full 1024-buffer ring on every call and blow the
          * interrupt-latency figures in docs/rt-budgets.md. No in-tree caller
          * issues these opcodes without the cap; tracelogger already holds it.
          */
@@ -2510,8 +2512,8 @@ int kdecl ksys_trace_event(thread_t *act, struct kcall_args_trace_event *kap)
         }
         (--ptbuf)->h.next = base;
 
-        /* Publish under the same lock the readers hold, so a reader either
-         * sees no ring or sees a fully linked one.
+        /* Publish under the same lock the readers hold, so a reader either sees
+         * no ring or sees a fully linked one.
          */
         interrupt_lock(&trace_masks.state_spin);
         privateptr->tracebuf = base;
@@ -2581,9 +2583,9 @@ int kdecl ksys_trace_event(thread_t *act, struct kcall_args_trace_event *kap)
             !(act->process->priv_caps & RTMUX_PRIV_CAP_TRACE))
             return EPERM;
 
-        /* Same race as the mode setters above: the read of
-         * privateptr->tracebuf and the dereference that follows it must be one
-         * critical section against DEALLOCBUFFER's store of NULL.
+        /* Same race as the mode setters above: the read of privateptr->tracebuf
+         * and the dereference that follows it must be one critical section
+         * against DEALLOCBUFFER's store of NULL.
          */
         interrupt_lock(&trace_masks.state_spin);
         tracebuf = privateptr->tracebuf;

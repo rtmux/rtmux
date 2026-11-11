@@ -5,7 +5,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/* Hardware resource service.
+/*
+ * Hardware resource service.
  *
  * Maintains a database of resources which can be requested by other processes.
  */

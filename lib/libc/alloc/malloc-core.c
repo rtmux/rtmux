@@ -8,13 +8,12 @@
  * of different sizes, and keeps free lists of each size. Blocks that don't
  * exactly fit are passed up to the next larger size.
  *
- * Adapted for RTMux. Backing store comes from two weak hooks,
- * __crt_morecore(n) and __crt_lesscore(p, n). The libc default maps and unmaps
- * anonymous memory, so a process heap grows on demand. Roottask is the mmap
- * server and cannot use that, so servers/roottask/sys/heap.c overrides both
- * with a static arena. A request of LARGE_MIN bytes or more gets its own
- * mapping and is returned to the system on free. malloc is not
- * async-signal-safe.
+ * Adapted for RTMux. Backing store comes from two weak hooks, __crt_morecore(n)
+ * and __crt_lesscore(p, n). The libc default maps and unmaps anonymous memory,
+ * so a process heap grows on demand. Roottask is the mmap server and cannot use
+ * that, so servers/roottask/sys/heap.c overrides both with a static arena. A
+ * request of LARGE_MIN bytes or more gets its own mapping and is returned to
+ * the system on free. malloc is not async-signal-safe.
  */
 
 #include <stddef.h>
@@ -28,9 +27,9 @@
 #include "malloc-core.h"
 
 #define RTMUX_PAGE_SIZE 4096
-#define CHUNK_SIZE (256 * 1024)  /* backing requested per refill */
-#define LARGE_MIN (128 * 1024)   /* requests this big are mapped directly */
-#define LARGE_HDR 16             /* size_t mapping length + overhead word */
+#define CHUNK_SIZE (256 * 1024) /* backing requested per refill */
+#define LARGE_MIN (128 * 1024)  /* requests this big are mapped directly */
+#define LARGE_HDR 16            /* size_t mapping length + overhead word */
 
 static char *pagepool_start; /* unused tail of the current chunk */
 static char *pagepool_end;
@@ -42,7 +41,8 @@ static int pagesz = RTMUX_PAGE_SIZE;
  */
 __attribute__((weak)) void *__crt_morecore(size_t n)
 {
-    void *p = mmap(NULL, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    void *p =
+        mmap(NULL, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
 
     return p == MAP_FAILED ? NULL : p;
 }
@@ -83,9 +83,9 @@ static union overhead *nextf[NBUCKETS];
  * A priority-inheritance mutex, not a spinlock: a spinner never yields, so a
  * higher-priority thread spinning on a lock held by a preempted lower-priority
  * thread on the same hart starves the holder forever (roottask hung exactly
- * this way). The mutex blocks the waiter and boosts the holder. It is statically
- * initialized, so no allocation is needed to take it, and PRIONONE is left
- * clear, which selects priority inheritance. It must not use
+ * this way). The mutex blocks the waiter and boosts the holder. It is
+ * statically initialized, so no allocation is needed to take it, and PRIONONE
+ * is left clear, which selects priority inheritance. It must not use
  * CONFIG_ULOCK_DEBUG tracking, whose acquire hook allocates and would recurse.
  */
 static pthread_mutex_t alloc_mutex = {RTMUX_SYNC_NONRECURSIVE,
@@ -212,8 +212,8 @@ void *__crt_aligned_alloc_offset(size_t align, size_t size, size_t offset)
     return (void *) x;
 }
 
-/* Push [p, p + len) onto the free lists as the largest power-of-two blocks
- * that fit. Caller holds the lock.
+/* Push [p, p + len) onto the free lists as the largest power-of-two blocks that
+ * fit. Caller holds the lock.
  */
 static void donate(char *p, size_t len)
 {
@@ -235,7 +235,9 @@ static void donate(char *p, size_t len)
 }
 
 /* Make nextf[bucket] non-empty. Called and returns with the lock held, but
- * drops it while asking for backing memory. Returns 0 if memory ran out.
+ * drops it while asking for backing memory.
+ *
+ * Returns 0 if memory ran out.
  */
 static int refill(int bucket)
 {
@@ -328,7 +330,8 @@ void *__crt_realloc(void *cp, size_t nbytes)
         if (op->ov_magic == LMAGIC) {
             char *base = (char *) op - (LARGE_HDR - sizeof(*op));
 
-            usable = (size_t) ((base + *(size_t *) (void *) base) - (char *) cp);
+            usable =
+                (size_t) ((base + *(size_t *) (void *) base) - (char *) cp);
         } else if (op->ov_magic == MAGIC) {
             size_t blksz = (size_t) FIRST_BUCKET_SIZE << op->ov_index;
 
@@ -349,8 +352,9 @@ void *__crt_realloc(void *cp, size_t nbytes)
         char *base = (char *) op - (LARGE_HDR - sizeof(*op));
         size_t cap = *(size_t *) (void *) base - LARGE_HDR;
 
-        /* Keep the mapping while the new size still belongs in a mapped
-         * block; shrinking below LARGE_MIN moves to the bucketed heap. */
+        /* Keep the mapping while the new size still belongs in a mapped block;
+         * shrinking below LARGE_MIN moves to the bucketed heap.
+         */
         if (nbytes >= LARGE_MIN && nbytes <= cap)
             return cp;
         if (!(res = __crt_malloc(nbytes)))

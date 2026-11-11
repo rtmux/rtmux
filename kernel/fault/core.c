@@ -5,7 +5,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/* Fault handling routines.
+/*
+ * Fault handling routines.
  *
  * RTMux has no signals — a fault either notifies an attached debugger or kills
  * the faulting thread directly.

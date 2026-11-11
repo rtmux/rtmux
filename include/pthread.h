@@ -48,6 +48,7 @@ __BEGIN_DECLS
 #define RTMUX_SYNC_WAITING 0x80000000U    /* Top bit used with mutexes */
 #define RTMUX_SYNC_OWNER_MASK 0x7fffffffU /* Owner used with mutexes */
 #define RTMUX_SYNC_OWNER_PID_SHIFT 16     /* owner word: pid in bits 16..30 */
+
 /* Pid bits kept in the owner word. Pids are generation-tagged, so one process
  * slot is ambiguous across eight generations; only a stale word left in shared
  * memory by an owner that died holding the mutex can alias, and the effect is a

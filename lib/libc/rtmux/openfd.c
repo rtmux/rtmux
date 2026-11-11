@@ -110,8 +110,9 @@ int __rtmux_procfd_open(const char *path, int oflag, int sflag, int *matched)
     fdstr = parse_procfd_pid(path, &pid);
     if (!fdstr)
         return -1;
-    /* Another process's descriptor is reopened by roottask, which mints the
-     * key an I/O service demands; libc has none to attach.
+
+    /* Another process's descriptor is reopened by roottask, which mints the key
+     * an I/O service demands; libc has none to attach.
      */
     if (pid != getpid())
         return -1;

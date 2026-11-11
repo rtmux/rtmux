@@ -111,7 +111,7 @@ int em_event(tracebuf_t *t_b_p)
          * as first argument ASSUMPTION: kernel trace buffers are contiguous
          */
         if ((r_vlocal = _TRACE_EH_INVOKE(
-                 (uint32_t (*)(int)) itp->handler,
+                 (uint32_t(*)(int)) itp->handler,
                  (int) (t_b_p->h.ls13_rb_num | (t_b_p->h.seq_buff_num & 0x7ff)),
                  itp->cpu))) {
             /* Deliver inline via sigevent_deliver_inline(). The trace handler
@@ -1500,26 +1500,27 @@ int trace_event(uint32_t *a_p)
             add_trace_buffer(
                 _TRACE_MAKE_CODE(get_cpunum(), 0, _TRACE_USER_C, code),
                 TRACE_UNPACK_PTR(uint32_t *, *(a_p + 2), *(a_p + 3)),
-                (uint32_t) *(a_p + 4));
+                (uint32_t) * (a_p + 4));
         }
 
         return EOK;
     }
-    /* The class is _TRACE_USER_C, not the caller's word shifted left by 10.
-     * The event code was masked but the class was not, so any process could
-     * shift an arbitrary value into the class, struct, and CPU fields of the
-     * header and inject a record that reads back as a kernel-call sample:
-     * a fabricated duration in scripts/rt-trace-sched.py output and hence in
-     * the per-kernel-call rows of docs/rt-budgets.md. These two opcodes only
-     * ever emit user records, so the class is a constant, not caller data.
+
+    /* The class is _TRACE_USER_C, not the caller's word shifted left by 10. The
+     * event code was masked but the class was not, so any process could shift
+     * an arbitrary value into the class, struct, and CPU fields of the header
+     * and inject a record that reads back as a kernel-call sample: a fabricated
+     * duration in scripts/rt-trace-sched.py output and hence in the
+     * per-kernel-call rows of docs/rt-budgets.md. These two opcodes only ever
+     * emit user records, so the class is a constant, not caller data.
      */
     case _TRACE_GET_FLAG(RTMUX_TRACE_INSERTSCLASSEVENT): {
         code = *(a_p + 2) & RTMUX_TRACE_USERLAST;
         if (trace_masks.user_mask[code]) {
-            (void) add_trace_event(_TRACE_MAKE_CODE(get_cpunum(),
-                                                    _TRACE_STRUCT_S,
-                                                    _TRACE_USER_C, code),
-                                   0, *(a_p + 3), *(a_p + 4));
+            (void) add_trace_event(
+                _TRACE_MAKE_CODE(get_cpunum(), _TRACE_STRUCT_S, _TRACE_USER_C,
+                                 code),
+                0, *(a_p + 3), *(a_p + 4));
         }
 
         return EOK;
@@ -1530,7 +1531,7 @@ int trace_event(uint32_t *a_p)
             add_trace_buffer(
                 _TRACE_MAKE_CODE(get_cpunum(), 0, _TRACE_USER_C, code),
                 TRACE_UNPACK_PTR(uint32_t *, *(a_p + 3), *(a_p + 4)),
-                (uint32_t) *(a_p + 5));
+                (uint32_t) * (a_p + 5));
         }
 
         return EOK;

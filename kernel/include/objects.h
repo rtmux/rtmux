@@ -628,9 +628,10 @@ typedef struct thread_entry { /* Also used for vthread_entry */
             void (*exitfunc)(void *status);
             const struct _thread_attr *real_attr;
             int not_sigev_thread;
-            /* Caller's attr, copied at create. Like the rest of wa it lives
-             * in the args union and is valid only until thread_specret
-             * finishes; the new thread does not run other kcalls before that.
+
+            /* Caller's attr, copied at create. Like the rest of wa it lives in
+             * the args union and is valid only until thread_specret finishes;
+             * the new thread does not run other kcalls before that.
              */
             struct _thread_attr kattr;
         } wa;
@@ -639,7 +640,7 @@ typedef struct thread_entry { /* Also used for vthread_entry */
     uint32_t runmask;
     uint32_t default_runmask;
     char *name;
-    uint64_t key; /* msg_key_data secret; 0 = unset, never verifies */
+    uint64_t key;      /* msg_key_data secret; 0 = unset, never verifies */
     uint32_t key_fail; /* failed VERIFYs against key since it was minted */
     int32_t last_chid;
     void *status;
@@ -743,6 +744,7 @@ typedef struct thread_entry { /* Also used for vthread_entry */
     unsigned held_ceiling_n; /* wide enough that no realizable nesting wraps */
     uint8_t held_ceiling_floor;
     bool held_ceiling_saturated;
+
     /* timestamp_last_block value the stall detector has already reported for
      * this thread (stall_scan_roottask_waiters, CONFIG_STALL_DETECTOR). Written
      * only by that scan, which runs on the boot hart alone; 0 = never reported.

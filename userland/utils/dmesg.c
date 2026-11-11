@@ -63,7 +63,9 @@ int toolbox_dmesg_main(int argc, char *argv[])
     if (optind < argc)
         path = argv[optind];
 
-    /* ipc-send: utils -> roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring */
+    /* ipc-send: utils ->
+     * roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring
+     */
     fd = open(path, O_RDONLY | O_NONBLOCK);
     if (fd == -1) {
         fprintf(stderr, "dmesg: %s: %s\n", path, strerror(errno));

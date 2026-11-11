@@ -10,8 +10,12 @@
  * /sys/log — roottask's log ring, root only (mode 0400). Streamed from the ring
  * by absolute sequence, not snapshotted: it is larger than roottask's arena.
  *
- * Initial entries: /sys/cmdline — kernel boot command line (read from syspage)
+ * Initial entries:
+ *
+ * /sys/cmdline — kernel boot command line (read from syspage)
+ *
  * /sys/version — RTMUX_VERSION_STRING " " RTMUX_BUILD_DATE
+ *
  * /sys/kernelversion — kernel release and build id (read from syspage)
  *
  * SPDX-License-Identifier: Apache-2.0
@@ -59,7 +63,10 @@
 #define SYSFS_BOARD_BUFSZ (128 + 2)
 #define SYSFS_IOSERV_ACCOUNTING_BUFSZ 2048
 #define SYSFS_NAMESPACE_STATS_BUFSZ 512
-/* 3 lines per pool (~40 B each) + pa.free_bytes + a line per hart, with headroom. */
+
+/* 3 lines per pool (~40 B each) + pa.free_bytes + a line per hart, with
+ * headroom.
+ */
 #define SYSFS_KSTATS_BUFSZ 4096
 
 static dev_t sysfs_devno;
@@ -105,11 +112,13 @@ static size_t synth_kstats(char *buf, size_t cap)
     size_t len = 0;
     int n, rc; /* n: snprintf result; rc: soul_stats status */
 
-    rc = soul_stats(recs, KSTAT_SOUL_COUNT, &count, &live_threads, &live_timeouts, timer_intr,
-                    CONFIG_PROCESSORS_MAX, &timer_count);
+    rc = soul_stats(recs, KSTAT_SOUL_COUNT, &count, &live_threads,
+                    &live_timeouts, timer_intr, CONFIG_PROCESSORS_MAX,
+                    &timer_count);
     if (rc != EOK) {
         /* Say so rather than return a file that looks healthy but has no pool
-         * gauges. */
+         * gauges.
+         */
         count = 0;
         len = (size_t) snprintf(buf, cap, "soul.error=%d\n", rc);
     }
@@ -123,8 +132,8 @@ static size_t synth_kstats(char *buf, size_t cap)
         len += (size_t) n;
     }
     if (len < cap) {
-        n = snprintf(buf + len, cap - len, "thread.live=%u\ntimeout.live=%u\n", live_threads,
-                     live_timeouts);
+        n = snprintf(buf + len, cap - len, "thread.live=%u\ntimeout.live=%u\n",
+                     live_threads, live_timeouts);
         if (n > 0 && (size_t) n < cap - len)
             len += (size_t) n;
     }
@@ -194,9 +203,9 @@ static int ocb_inuse[SYSFS_MAX_OCBS];
  * A *stream* entry (stream_read non-NULL) is too big to snapshot. Open records
  * the window the ring holds, and each read pulls at most dyn_bufsz bytes from
  * it through stream_read into the per-open dyn_buf. mode is the permission
- * bits; open fails with EACCES for a non-root caller unless others may read. stat
- * reaches the same open path, so it fails the same way: intended, there is no
- * separate metadata gate.
+ * bits; open fails with EACCES for a non-root caller unless others may read.
+ * stat reaches the same open path, so it fails the same way: intended, there is
+ * no separate metadata gate.
  */
 struct sysfs_entry {
     const char *name;
@@ -275,7 +284,8 @@ static int resolve_path(const char *path, int *idx_out)
     return 0;
 }
 
-/* Take a fresh ring window for a stream entry: everything the ring holds now. */
+/* Take a fresh ring window for a stream entry: everything the ring holds now.
+ */
 static void stream_resample(struct sysfs_ocb *ocb)
 {
     root_log_bounds(&ocb->start_seq, &ocb->end_seq);
@@ -443,8 +453,8 @@ static int sysfs_read(ioserv_context_t *ctp, io_read_t *msg, void *handle)
 
     if (sysfs_entries[ocb->idx].stream_read) {
         uint64_t seq = ocb->start_seq + (uint64_t) ocb->pos;
-        ssize_t got = sysfs_entries[ocb->idx].stream_read(ocb->dyn_buf, &seq, ocb->end_seq,
-                                                          nbytes);
+        ssize_t got = sysfs_entries[ocb->idx].stream_read(ocb->dyn_buf, &seq,
+                                                          ocb->end_seq, nbytes);
 
         /* The ring wrapped past this open's window: the caller must reopen. */
         if (got < 0)

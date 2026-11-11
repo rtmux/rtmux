@@ -829,8 +829,10 @@ int ProcessFlagsOp(pid_t pid, uint32_t set, uint32_t clear)
 }
 
 /* ProcessSetRlimitCpu — install RLIMIT_CPU (soft/hard, seconds) for a process
- * kernel-side; the kernel derives the nanosecond max_cpu_time the tick enforces.
- * Wraps __KSYS_PRIV_PROC_SET_RLIMIT. Return value: EOK, or ESRCH if pid is gone.
+ * kernel-side; the kernel derives the nanosecond max_cpu_time the tick
+ * enforces. Wraps __KSYS_PRIV_PROC_SET_RLIMIT.
+ *
+ * Return value: EOK, or ESRCH if pid is gone.
  */
 struct kcall_args_proc_set_rlimit {
     pid_t pid;

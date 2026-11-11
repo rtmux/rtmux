@@ -308,7 +308,9 @@ static int fastmsg_native_cap_install_long(thread_t *sender,
     if (ret != 0)
         return ret;
     if (copied < sizeof(hdr))
-        return reply ? EOK : EINVAL; /* a short reply is data, as in the buffer path */
+        return reply
+                   ? EOK
+                   : EINVAL; /* a short reply is data, as in the buffer path */
     if (fastmsg_native_hdr_is_data(&hdr, reply))
         return EOK;
     if (hdr.nxfers == 0)
@@ -334,7 +336,8 @@ static int fastmsg_native_cap_install_long(thread_t *sender,
  * has internal_flags. A notification overlays that field with its value/id, so
  * testing RTMUX_ITF_MSG_DELIVERY on one reads payload bits: a disconnect notice
  * whose scoid was odd looked "claimed" and was skipped by every receive, then
- * sat in the queue holding its soul forever. Only thread entries can be claimed.
+ * sat in the queue holding its soul forever. Only thread entries can be
+ * claimed.
  */
 static inline int send_entry_claimed(const thread_t *thp)
 {
@@ -344,8 +347,9 @@ static inline int send_entry_claimed(const thread_t *thp)
            (thp->internal_flags & RTMUX_ITF_MSG_DELIVERY);
 }
 
-/* Called with chp->lock held. Notifications share the queue with senders, but
- * a notification-only receiver must not retry for an ordinary message. */
+/* Called with chp->lock held. Notifications share the queue with senders, but a
+ * notification-only receiver must not retry for an ordinary message.
+ */
 static thread_t *receive_candidate(channel_t *chp, int notification_only)
 {
     thread_t *thp = pril_first(&chp->send_queue);
@@ -366,8 +370,8 @@ static thread_t *receive_candidate(channel_t *chp, int notification_only)
 /* internal_flags is written from several harts (see ITF_SET in macros.h): the
  * peer's word may take a concurrent WAIT_PENDING / MSG_FORCE_RDY update from
  * another hart while a transfer runs, so every update here is an atomic RMW. A
- * plain |= or &= ~ reads the word, then writes it back, discarding that
- * update (a lost MSG_FORCE_RDY leaves the aborted thread waiting forever).
+ * plain |= or &= ~ reads the word, then writes it back, discarding that update
+ * (a lost MSG_FORCE_RDY leaves the aborted thread waiting forever).
  */
 #define START_SMP_XFER(thp1, thp2)                          \
     {                                                       \
@@ -414,9 +418,8 @@ static
      *   coid : connection id (RTMUX_SIDE_CHANNEL bit selects chancons)
      * Return value: the connect_t, or NULL if the slot is empty/invalid.
      */
-    connect_t *rdecl inline_lookup_connect(process_t *prp,
-                                           uint64_t coid,
-                                           uint64_t *context)
+    connect_t *rdecl
+    inline_lookup_connect(process_t *prp, uint64_t coid, uint64_t *context)
 {
     vector_t *vec;
     connect_t *cop = NULL;
@@ -551,10 +554,10 @@ static int sendv_body(thread_t *act,
     }
 
     /* Take the sender's reference before the sender is published on any queue
-     * (the publishing sites below hand it to the queue by clearing *heldp).
-     * The wrapper drops it again on every path that does not publish. A
-     * sibling's ConnectDetach of the last fd then either sees our reference
-     * (its drop is not the last) or ran first, and links == 0 fails the send.
+     * (the publishing sites below hand it to the queue by clearing *heldp). The
+     * wrapper drops it again on every path that does not publish. A sibling's
+     * ConnectDetach of the last fd then either sees our reference (its drop is
+     * not the last) or ran first, and links == 0 fails the send.
      */
     if (!connect_link_get(cop))
         return EBADF;
@@ -825,8 +828,8 @@ static int sendv_body(thread_t *act,
             sender->args.ms.sparts = kap->sparts;
             thp->args.ms.rmsg = thp->args.ri.rmsg;
             thp->args.ms.rparts = thp->args.ri.rparts;
-            xferstat = fastmsg_native_cap_install_long(sender, thp, false, &captx,
-                                                       &cap_patched);
+            xferstat = fastmsg_native_cap_install_long(sender, thp, false,
+                                                       &captx, &cap_patched);
             if (xferstat) {
                 if (xferstat & XFER_SRC_FAULT)
                     goto send_fault;
@@ -1849,9 +1852,8 @@ restart_recv:
             act->args.ri.rmsg = kap->rmsg;
             act->args.ri.rparts = kap->rparts;
 
-            capstat =
-                fastmsg_native_cap_install_long(thp, act, false, &captx,
-                                                &cap_patched);
+            capstat = fastmsg_native_cap_install_long(thp, act, false, &captx,
+                                                      &cap_patched);
             if (capstat == EOK) {
                 xferstat = xfermsg(
                     act, thp, cap_patched ? sizeof(struct _io_native_hdr) : 0,
@@ -2007,8 +2009,8 @@ restart_recv:
          * the thread blocks in). It is reply-blocked now: arm it, or a timed
          * wait whose server was busy at send time waits for the reply forever.
          * A sender that already armed a SEND|REPLY timeout keeps its timer
-         * (TIMEOUT_ACTIVE guard). thp is on reply_queue with WAIT_PENDING
-         * clear and no lock is held, so an expired deadline may fire inline.
+         * (TIMEOUT_ACTIVE guard). thp is on reply_queue with WAIT_PENDING clear
+         * and no lock is held, so an expired deadline may fire inline.
          */
         if (thp->timeout_flags & RTMUX_TIMEOUT_REPLY)
             timeout_start(thp);
@@ -2102,7 +2104,8 @@ restart_recv:
     }
     {
         /* Match the first probe: ordinary senders cannot wake a
-         * notification-only receive, and notification payload is not a claim. */
+         * notification-only receive, and notification payload is not a claim.
+         */
         thread_t *thp_recheck = receive_candidate(chp, notification_only);
         if (thp_recheck) {
             kspinlock_unlock(&chp->lock);
@@ -2286,6 +2289,7 @@ int kdecl ksys_msg_replyv(thread_t *act, struct kcall_args_msg_replyv *kap)
 
     if (kap->sparts != 0) {
         fastmsg_native_cap_tx_t captx;
+
         /* Only a client that opted in (RTMUX_ITF_NATIVE_REPLY, set by the
          * client before its send, so ordered before this reply by the
          * rendezvous) gets its reply parsed as a native cap header. Any other
@@ -2416,11 +2420,9 @@ int kdecl ksys_msg_replyv(thread_t *act, struct kcall_args_msg_replyv *kap)
 
             act->args.ms.smsg = kap->smsg;
             act->args.ms.sparts = kap->sparts;
-            xferstat = native_reply
-                           ? fastmsg_native_cap_install_long(act, thp, true,
-                                                             &captx,
-                                                             &cap_patched)
-                           : 0;
+            xferstat = native_reply ? fastmsg_native_cap_install_long(
+                                          act, thp, true, &captx, &cap_patched)
+                                    : 0;
             if (xferstat) {
                 if ((xferstat & (XFER_SRC_FAULT | XFER_DST_FAULT)) == 0)
                     xferstat = XFER_SRC_FAULT;
@@ -2437,6 +2439,7 @@ int kdecl ksys_msg_replyv(thread_t *act, struct kcall_args_msg_replyv *kap)
 #if CONFIG_PROCESSORS_MAX > 1 && defined(CONFIG_SMP_MSGOPT)
             if (thp->internal_flags & RTMUX_ITF_MSG_FORCE_RDY) {
                 _TRACE_COMM_EMIT_REPLY(thp, cop, thp->tid + 1);
+
                 /* it could be channel destroy: drop our claim and the flag
                  * together under chp->lock, then complete the abort.
                  */
@@ -2455,11 +2458,10 @@ int kdecl ksys_msg_replyv(thread_t *act, struct kcall_args_msg_replyv *kap)
             /* Short message. We only do something if there is no target as --
              * reply to proc case. Else, this is handled in specret.
              */
-            xferstat = native_reply
-                           ? fastmsg_native_cap_install_buffer(
-                                 act, thp, thp->args.msbuff.buff,
-                                 thp->args.msbuff.msglen, true, &captx)
-                           : 0;
+            xferstat = native_reply ? fastmsg_native_cap_install_buffer(
+                                          act, thp, thp->args.msbuff.buff,
+                                          thp->args.msbuff.msglen, true, &captx)
+                                    : 0;
             if (xferstat) {
                 xferstat = XFER_SRC_FAULT;
                 goto xfer_err;
@@ -2471,7 +2473,8 @@ int kdecl ksys_msg_replyv(thread_t *act, struct kcall_args_msg_replyv *kap)
             } else {
                 xferstat = 0;
                 thp->blocked_on = thp;
-                atomic_or(&thp->flags, (RTMUX_FLG_THR_BUFF_MSG | RTMUX_FLG_THR_SHORT_MSG));
+                atomic_or(&thp->flags,
+                          (RTMUX_FLG_THR_BUFF_MSG | RTMUX_FLG_THR_SHORT_MSG));
             }
             if (xferstat) {
                 fastmsg_native_cap_rollback(thp, &captx);
@@ -2516,9 +2519,10 @@ int kdecl ksys_msg_replyv(thread_t *act, struct kcall_args_msg_replyv *kap)
      */
     kspinlock_lock(&chp->lock);
     LINKPRIL_REM(thp);
-    /* Completed under the lock: a force_ready (ConnectDetach's EBADF sweep) that
-     * wins the lock after our release sees blocked_on != cop and leaves thp,
-     * and its link, alone; thp stays STATE_REPLY until ready() below. (The
+
+    /* Completed under the lock: a force_ready (ConnectDetach's EBADF sweep)
+     * that wins the lock after our release sees blocked_on != cop and leaves
+     * thp, and its link, alone; thp stays STATE_REPLY until ready() below. (The
      * short-reply copy above already set blocked_on to thp itself, which the
      * client's special return needs.)
      */
@@ -2554,8 +2558,8 @@ xfer_err:
      */
     status = (xferstat & XFER_SRC_FAULT) ? EFAULT : EFAULT;
     kcall_err(thp, status);
-    /* Same LINKPRIL_REM + claim/flag clear under chp->lock as the success
-     * path.
+
+    /* Same LINKPRIL_REM + claim/flag clear under chp->lock as the success path.
      */
     kspinlock_lock(&chp->lock);
     LINKPRIL_REM(thp);
@@ -2687,7 +2691,8 @@ int kdecl ksys_msg_error(thread_t *act, struct kcall_args_msg_error *kap)
         thp->args.ms.server = 0;
     }
 
-    atomic_clr(&thp->flags, (RTMUX_FLG_THR_BUFF_MSG | RTMUX_FLG_THR_UNBLOCK_REQ));
+    atomic_clr(&thp->flags,
+               (RTMUX_FLG_THR_BUFF_MSG | RTMUX_FLG_THR_UNBLOCK_REQ));
     if (kap->err == ERESTART) {
         CRASHCHECK(TYPE_MASK(thp->type) != TYPE_THREAD);
         SETKIP(thp, KIP(thp) - KSYS_ENTRY_SIZE);

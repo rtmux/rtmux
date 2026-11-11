@@ -5,7 +5,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/* proc_signal — deliver a signal as a notification to a target process.
+/*
+ * proc_signal — deliver a signal as a notification to a target process.
  *
  * In RTMux, signals are not handled by the kernel. Instead, kill() sends a
  * _PROC_KILL message to roottask, which delivers a _NOTIFICATION_CODE_SIGNAL
@@ -33,9 +34,9 @@ struct signal_sender {
 
 /* proc_may_signal — POSIX kill() permission rule.
  *
- * Allowed when the sender is privileged, when its real or effective uid
- * matches the target's real or saved uid, or for SIGCONT within one session.
- * Signal 0 is checked the same way.
+ * Allowed when the sender is privileged, when its real or effective uid matches
+ * the target's real or saved uid, or for SIGCONT within one session. Signal 0
+ * is checked the same way.
  */
 static int proc_may_signal(const struct _cred_info *s,
                            const struct _cred_info *t,
@@ -57,9 +58,11 @@ enum kill_scope { KILL_ONE, KILL_PGRP, KILL_ALL };
 /* signal_one — deliver (or permission-check) a signal to one process.
  *
  * Re-validates under the target's lock that the slot still holds a live process
- * that matches the requested scope. Returns ESRCH when it does not match (the
- * caller does not count it), EPERM when it matches but the sender may not
- * signal it, EOK on delivery, or another errno on a delivery failure.
+ * that matches the requested scope.
+ *
+ * Returns ESRCH when it does not match (the caller does not count it), EPERM
+ * when it matches but the sender may not signal it, EOK on delivery, or another
+ * errno on a delivery failure.
  */
 static int signal_one(const struct signal_sender *snd,
                       pid_t target_pid,

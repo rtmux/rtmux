@@ -5,7 +5,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/* module/initramfs-elf.h — ELF64 parsing for CPIO modules
+/*
+ * module/initramfs-elf.h — ELF64 parsing for CPIO modules
  *
  * License: Apache 2.0
  */

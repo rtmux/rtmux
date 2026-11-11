@@ -5,7 +5,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/* rtmux-libc-local.h — local libc build definitions.
+/*
+ * rtmux-libc-local.h — local libc build definitions.
  *
  * Included via -include rtmux-libc-local.h in the Makefile so every translation
  * unit sees the same LP64 build contract.

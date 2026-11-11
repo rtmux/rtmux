@@ -5,7 +5,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/* RISC-V Sv39 VMM cpu-dependent functions.
+/*
+ * RISC-V Sv39 VMM cpu-dependent functions.
  *
  * Manages per-process root page tables and the global page table list. All
  * VA/PA conversions go through PA_TO_VA / VA_TO_PA — no assumption that PA ==

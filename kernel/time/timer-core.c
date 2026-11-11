@@ -299,8 +299,8 @@ static void timer_fire_deferred_flush(void)
  * releases that lock. At most one is pending per CPU: timeout_start arms once
  * per kernel call (RTMUX_FLG_TIMEOUT_ACTIVE guard) and the same kernel call
  * drains it before any context switch. The IPC send/reply/receive and join
- * paths also defer (WAIT_PENDING set: force_ready would spin on the thread's own
- * bit) and drain right after clearing it.
+ * paths also defer (WAIT_PENDING set: force_ready would spin on the thread's
+ * own bit) and drain right after clearing it.
  */
 struct timeout_fire_defer {
     struct sigevent event;

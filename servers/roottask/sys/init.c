@@ -44,7 +44,7 @@ static const long roottask_internal_table[] = {
 
 
 /* The syspage build_info record, or NULL when the section is absent, shorter
- * than this roottask expects, or outside the syspage.  The strings are NOT
+ * than this roottask expects, or outside the syspage. The strings are NOT
  * guaranteed to terminate: callers must bound them (%.63s / %.15s, memcpy).
  */
 const struct build_info_entry *syspage_build_info(void)
@@ -54,7 +54,7 @@ const struct build_info_entry *syspage_build_info(void)
 
 /* Kernel and roottask are linked from one tree, so a differing build id means
  * the boot image mixes builds (a kernel from one tree, an initramfs from
- * another).  Say so once, naming both ids.
+ * another). Say so once, naming both ids.
  */
 static void roottask_version_check(void)
 {

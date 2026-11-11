@@ -5,7 +5,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/* namespace_link — register a pathname in the roottask namespace.
+/*
+ * namespace_link — register a pathname in the roottask namespace.
  *
  * The default (IPC) implementation sends a _connect message to proc. Roottask
  * overrides this by setting _namespace_link_hook to its own function that

@@ -246,7 +246,7 @@ int rcu_sched_synchronize_detail(struct rcu_sched_busy *busy)
     uint64_t t3 = 0;
 
     if (busy)
-        *busy = (struct rcu_sched_busy) {0};
+        *busy = (struct rcu_sched_busy){0};
 #ifdef CONFIG_LOCK_DEBUG
     if (lock_debug_held_depth() != 0) {
         kprintf("RCU-sched: rcu_sched_synchronize while holding a kspinlock\n");

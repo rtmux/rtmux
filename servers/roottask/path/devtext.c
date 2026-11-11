@@ -28,9 +28,11 @@ static pid_t text_sid; /* leader of the session this is the terminal of, or 0 */
  * background process; a write is policed only under TOSTOP.
  *
  * A background read gets EIO when its group is orphaned or it blocks/ignores
- * SIGTTIN; otherwise the group is sent SIGTTIN and the read fails with EINTR.
- * A write gets the same with SIGTTOU, except that a blocked/ignored SIGTTOU lets
- * it through. Returns EOK to proceed, else the errno to reply.
+ * SIGTTIN; otherwise the group is sent SIGTTIN and the read fails with EINTR. A
+ * write gets the same with SIGTTOU, except that a blocked/ignored SIGTTOU lets
+ * it through.
+ *
+ * Returns EOK to proceed, else the errno to reply.
  */
 static int text_jobctl_gate(ioserv_context_t *ctp, int is_write)
 {
@@ -77,16 +79,20 @@ static int text_signal_char(int c)
 #define TEXT_AHEAD 128
 static int text_ahead[TEXT_AHEAD];
 static unsigned text_ahead_head, text_ahead_tail;
-/* Static stack: the watcher is made with __thread_create before the message pool
- * runs, as pthread_create cannot get a stack from a roottask worker. */
+
+/* Static stack: the watcher is made with __thread_create before the message
+ * pool runs, as pthread_create cannot get a stack from a roottask worker.
+ */
 #define TEXT_WATCHER_STACK 8192
 static alignas(16) char text_watcher_stack[TEXT_WATCHER_STACK];
 
 /* Take the next input character: from the ring (to_ring = 0), else from the
  * console. With to_ring set, data characters are queued instead of returned and
  * the call ends when the console is empty or the ring full. A signal character
- * is echoed, flushes what was typed ahead (unless NOFLSH), signals the session's
- * foreground group, and is never returned. Returns the character, or -1.
+ * is echoed, flushes what was typed ahead (unless NOFLSH), signals the
+ * session's foreground group, and is never returned.
+ *
+ * Returns the character, or -1.
  */
 static int text_next(int to_ring)
 {
@@ -369,6 +375,7 @@ static int text_devctl(ioserv_context_t *ctp, io_devctl_t *msg, void *ocb)
 
         if (msg->i.nbytes < (int32_t) sizeof(pid_t))
             return EINVAL;
+
         /* Roottask checks that this is the caller's controlling terminal and
          * that the group is in the caller's session, and records it.
          */

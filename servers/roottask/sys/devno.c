@@ -5,7 +5,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/* Minor operations.
+/*
+ * Minor operations.
  *
  * Device numbers use 10 minor bits and 6 major bits, encoded by the internal
  * hwres_dev_* helpers.

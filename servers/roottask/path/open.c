@@ -234,13 +234,14 @@ static int complete_open(ioserv_context_t *ctp, struct open_entry *oep, int ret)
         chk = pending_opens;
         while (chk) {
             next = chk->next;
-            /* Restart only the operations that were parked behind another op
-             * on this node. An entry that is not deferred belongs to an
-             * operation still running on another roottask thread: it owns its
-             * entry and will complete it itself. Stealing it here replayed the
-             * request a second time and freed the entry under its owner, whose
-             * later LINK2_REM then corrupted pending_opens and dropped the
-             * parked operations, so their clients waited in MsgSend forever.
+
+            /* Restart only the operations that were parked behind another op on
+             * this node. An entry that is not deferred belongs to an operation
+             * still running on another roottask thread: it owns its entry and
+             * will complete it itself. Stealing it here replayed the request a
+             * second time and freed the entry under its owner, whose later
+             * LINK2_REM then corrupted pending_opens and dropped the parked
+             * operations, so their clients waited in MsgSend forever.
              */
             if (chk->node == nop && chk->deferred) {
                 LINK2_REM(chk);

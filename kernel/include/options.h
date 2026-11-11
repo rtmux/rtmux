@@ -5,7 +5,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/* kernel/options.h — Boot-time kernel options.
+/*
+ * kernel/options.h — Boot-time kernel options.
  *
  * All command-line tunables live in "struct kernel_options kopt". Any code
  * referencing kopt.foo immediately shows it's a boot tunable.
@@ -21,9 +22,10 @@
 #include <sys/rtmux-core.h> /* LIMITS_NUM */
 
 struct kernel_options {
-    /* Startup options (set during early boot, before kernel_init) */
-    /* Timebase (RISC-V rdtime) tick rate from FDT cpus/timebase-frequency,
-     * not the CPU clock. Feeds qtime->cycles_per_sec; see sys/syspage.h.
+    /* Startup options (set during early boot, before kernel_init). */
+
+    /* Timebase (RISC-V rdtime) tick rate from FDT cpus/timebase-frequency, not
+     * the CPU clock. Feeds qtime->cycles_per_sec; see sys/syspage.h.
      */
     unsigned long timebase_freq; /* -f <timebase>[,<timer>] */
     unsigned long timer_freq;    /* -f <timebase>,<timer> */

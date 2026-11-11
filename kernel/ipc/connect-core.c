@@ -72,17 +72,17 @@ void rdecl connect_detach(connect_t *cop, unsigned prio)
  *
  * links counts the fd slots and one reference per blocked or in-flight sender
  * (ksys_msg_sendv takes its reference with connect_link_get() before it
- * publishes the sender, so a running sibling's send either holds a reference
- * or sees links == 0 and fails). connect_links_drop() is therefore true for
+ * publishes the sender, so a running sibling's send either holds a reference or
+ * sees links == 0 and fails). connect_links_drop() is therefore true for
  * exactly one party: this call, or the reply-side drop of the last blocked
  * sender, which runs connect_detach(). What the last drop does:
- *  - channel already destroyed (cop->channel NULL): channel_destroy unpublished
+ * - channel already destroyed (cop->channel NULL): channel_destroy unpublished
  *    the server side and nothing else names cop, so return 1 and the caller
  *    frees the soul (connect_soul_free synchronizes, so not inside a read
  *    section);
- *  - CHF_DISCONNECT channel: send the disconnect notice; the server's
+ * - CHF_DISCONNECT channel: send the disconnect notice; the server's
  *    ConnectDetach of its scoid then frees the soul (links == 0);
- *  - anything else (no notice wanted, shared VCONNECT or remote connection):
+ * - anything else (no notice wanted, shared VCONNECT or remote connection):
  *    nothing, as before; channel_destroy / process exit reap it.
  *    connect_detach's vector_rem on the server's chancons is not safe from a
  *    live client.
@@ -104,16 +104,18 @@ int rdecl connect_client_drop(connect_t *cop, unsigned prio)
             reap = 1;
         } else if ((chp->flags & RTMUX_FLG_CHF_DISCONNECT) &&
                    !(chp->flags & RTMUX_FLG_CHF_GLOBAL)) {
-            _TRACE_COMM_EMIT_SNOTIFICATION_DIS(
-                cop, cop->scoid | RTMUX_SIDE_CHANNEL,
-                prio | _NOTIFICATION_PRIO_BOOST);
-            notification_deliver(chp, prio | _NOTIFICATION_PRIO_BOOST,
-                                 _NOTIFICATION_CODE_DISCONNECT, 0,
-                                 cop->scoid | (int) RTMUX_SIDE_CHANNEL,
-                                 cop->nresv ? NOTIFICATION_DELIVER_RESERVED_FLAG
-                                            : 0);
+            _TRACE_COMM_EMIT_SNOTIFICATION_DIS(cop,
+                                               cop->scoid | RTMUX_SIDE_CHANNEL,
+                                               prio | _NOTIFICATION_PRIO_BOOST);
+            notification_deliver(
+                chp, prio | _NOTIFICATION_PRIO_BOOST,
+                _NOTIFICATION_CODE_DISCONNECT, 0,
+                cop->scoid | (int) RTMUX_SIDE_CHANNEL,
+                cop->nresv ? NOTIFICATION_DELIVER_RESERVED_FLAG : 0);
             connect_unreserve(cop);
-            /* No longer associated with the client: lookup_rcvid() must fail. */
+
+            /* No longer associated with the client: lookup_rcvid() must fail.
+             */
             cop->process = 0;
         }
     }

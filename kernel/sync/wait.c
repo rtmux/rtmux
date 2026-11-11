@@ -320,8 +320,9 @@ static void sync_pi_owner_list_add_locked(thread_t *owner, turnstile_t *ts)
  * The truncation makes the word ambiguous across eight pid generations of one
  * process slot, and the tid check does not bound that (every process has a tid
  * 0). It only matters for a word left behind in shared memory by an owner that
- * died without releasing, and the effect is limited to a misplaced PI boost; the
- * full pid cannot be recovered from the 32-bit owner word without widening it.
+ * died without releasing, and the effect is limited to a misplaced PI boost;
+ * the full pid cannot be recovered from the 32-bit owner word without widening
+ * it.
  */
 static thread_t *sync_lookup_owner_pin(unsigned long owner_word)
 {

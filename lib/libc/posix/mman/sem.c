@@ -275,8 +275,8 @@ int sem_timedwait(sem_t *sem, const struct timespec *abs_timeout)
         ret = sem_wait(sem);
         (void) __timer_timeout_r(CLOCK_REALTIME, 0, NULL, NULL, NULL);
         if (ret == -1 && errno == EINTR) {
-            /* The timeout unblocks the wait with EINTR; so can a caught
-             * signal. Report a timeout only once the deadline has passed.
+            /* The timeout unblocks the wait with EINTR; so can a caught signal.
+             * Report a timeout only once the deadline has passed.
              */
             struct timespec now;
 

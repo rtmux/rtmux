@@ -5,7 +5,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/* check.c General function to check an iov range to make sure it is inside the
+/*
+ * check.c General function to check an iov range to make sure it is inside the
  * process boundary.
  */
 /** ***********************************************************************

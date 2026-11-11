@@ -214,17 +214,18 @@ process_t *root_proc_lock(pid_t pid)
          * A mismatch means roottask has released this process (its slot was
          * finished, or not yet claimed) while the kernel still lists the pid.
          * That window lasts until the kernel finishes destroying it, and the
-         * thread that closes it may be the very one this loop would starve on
-         * a single hart, so report the process gone instead of retrying.
-         * Callers already treat NULL as "gone or in a death transition"
+         * thread that closes it may be the very one this loop would starve on a
+         * single hart, so report the process gone instead of retrying. Callers
+         * already treat NULL as "gone or in a death transition"
          * (root_proc_lock_parent sleeps and retries).
          */
         if (tmp->pid == pid) {
             break;
         }
-        root_log("root_proc_lock: pid %d: kernel lists it but its roottask slot "
-                 "holds pid %d\n",
-                 pid, (int) tmp->pid);
+        root_log(
+            "root_proc_lock: pid %d: kernel lists it but its roottask slot "
+            "holds pid %d\n",
+            pid, (int) tmp->pid);
         release_lock(&tmp->lock);
         return NULL;
     }

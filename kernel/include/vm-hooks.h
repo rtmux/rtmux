@@ -59,14 +59,14 @@ struct fault_info;
         (pid_t pid, process_t * prp, uintptr_t addr, size_t len, int flags),  \
         extra)                                                                \
     MMF(unsigned, vaddrinfo,                                                  \
-        (pid_t pid, process_t * prp, uintptr_t vaddr, paddr_t *paddrp,        \
-         size_t *lenp, unsigned flags),                                       \
+        (pid_t pid, process_t * prp, uintptr_t vaddr, paddr_t * paddrp,       \
+         size_t * lenp, unsigned flags),                                      \
         extra)                                                                \
     MMF(path_object_t *, vaddr_to_memobj,                                     \
         (process_t * prp, void *vaddr, paddr_t *offset, int create), extra)   \
     MMF(size_t, mapinfo,                                                      \
         (pid_t pid, process_t * prp, uintptr_t vaddr,                         \
-         struct _procfs_map_info *info, struct _procfs_debug_info *debug,     \
+         struct _procfs_map_info * info, struct _procfs_debug_info * debug,   \
          size_t, path_object_t **, int *fd, size_t *contigp),                 \
         extra)                                                                \
     MMF(int, debuginfo,                                                       \
@@ -100,14 +100,14 @@ struct fault_info;
         (pid_t pid, process_t * prp, uintptr_t addr, size_t len, int flags),  \
         extra)                                                                \
     MMF(unsigned, vaddrinfo,                                                  \
-        (pid_t pid, process_t * prp, uintptr_t vaddr, paddr_t *paddrp,        \
-         size_t *lenp, unsigned flags),                                       \
+        (pid_t pid, process_t * prp, uintptr_t vaddr, paddr_t * paddrp,       \
+         size_t * lenp, unsigned flags),                                      \
         extra)                                                                \
     MMF(path_object_t *, vaddr_to_memobj,                                     \
         (process_t * prp, void *vaddr, paddr_t *offset, int create), extra)   \
     MMF(size_t, mapinfo,                                                      \
         (pid_t pid, process_t * prp, uintptr_t vaddr,                         \
-         struct _procfs_map_info *info, struct _procfs_debug_info *debug,     \
+         struct _procfs_map_info * info, struct _procfs_debug_info * debug,   \
          size_t, path_object_t **, int *fd, size_t *contigp),                 \
         extra)                                                                \
     MMF(int, debuginfo,                                                       \

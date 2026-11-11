@@ -5,7 +5,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/* roottask.c — Post-boot first-server initialization
+/*
+ * roottask.c — Post-boot first-server initialization
  *
  * License: Apache 2.0
  *

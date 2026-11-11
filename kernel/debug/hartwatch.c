@@ -5,13 +5,14 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/* hartwatch.c — per-hart neighbour watchdog (CONFIG_STALL_DETECTOR).
+/*
+ * hartwatch.c — per-hart neighbour watchdog (CONFIG_STALL_DETECTOR).
  *
- * The heartbeat stall detector (stall-detector.c) keys on the boot hart's
- * clock and goes blind if that hart wedges. Here every hart instead watches
- * the next online entry of hart_ids[] (the monitor hart is not in that list):
- * each supervisor timer interrupt a hart takes bumps its pc_timer_progress, and
- * the watcher names a neighbour whose counter has not moved for
+ * The heartbeat stall detector (stall-detector.c) keys on the boot hart's clock
+ * and goes blind if that hart wedges. Here every hart instead watches the next
+ * online entry of hart_ids[] (the monitor hart is not in that list): each
+ * supervisor timer interrupt a hart takes bumps its pc_timer_progress, and the
+ * watcher names a neighbour whose counter has not moved for
  * HARTWATCH_TIMEOUT_SEC of rdtime. An idle hart still wakes at least every
  * IDLE_MAX_SLEEP_NS (50 ms), so no idle exemption exists: a silent hart is
  * either spinning with interrupts off or dead.
@@ -48,9 +49,9 @@
 
 /* Each hart re-checks its neighbour at most this often (milliseconds of
  * rdtime). A busy hart takes a timer interrupt every tick (1 kHz at the default
- * CONFIG_TIMER_HZ), and the watch needs nothing like that resolution: the
- * rate limit keeps the common case to one rdtime read and a compare, which is
- * what holds the preempt-latency cost of the option down.
+ * CONFIG_TIMER_HZ), and the watch needs nothing like that resolution: the rate
+ * limit keeps the common case to one rdtime read and a compare, which is what
+ * holds the preempt-latency cost of the option down.
  */
 #define HARTWATCH_POLL_MS 50U
 
@@ -68,8 +69,8 @@ static struct {
 
 /* Indexed by the watched hart ID. */
 static _Atomic unsigned long hw_seen[CONFIG_PROCESSORS_MAX]; /* progress seen */
-static _Atomic uint64_t hw_stamp[CONFIG_PROCESSORS_MAX];     /* rdtime of that */
-static atomic_bool hw_latched[CONFIG_PROCESSORS_MAX];        /* reported */
+static _Atomic uint64_t hw_stamp[CONFIG_PROCESSORS_MAX]; /* rdtime of that */
+static atomic_bool hw_latched[CONFIG_PROCESSORS_MAX];    /* reported */
 
 /* hartwatch_report — name a silent hart. Parameters:
  *   target : hart ID that stopped taking timer interrupts.
@@ -98,17 +99,18 @@ static void hartwatch_report(unsigned target, uint64_t stamp, uint64_t now)
     rcu_read_unlock(&process_rcu);
     rcu_read_unlock(&tthread_rcu);
 
-    kprintf_emergency(HARTWATCH_LOCK_RETRIES,
-                      "hartwatch: hart %u silent for %lu ms, last timer progress "
-                      "at t=%lu ms, active pid=%d tid=%d\n",
-                      target, (unsigned long) ((now - stamp) * 1000 / cps),
-                      (unsigned long) (stamp * 1000 / cps), pid, tid);
+    kprintf_emergency(
+        HARTWATCH_LOCK_RETRIES,
+        "hartwatch: hart %u silent for %lu ms, last timer progress "
+        "at t=%lu ms, active pid=%d tid=%d\n",
+        target, (unsigned long) ((now - stamp) * 1000 / cps),
+        (unsigned long) (stamp * 1000 / cps), pid, tid);
 }
 
 /* hartwatch_tick — check this hart's neighbour. Called from every hart's
  * supervisor-timer trap (arch/riscv/trap-handler.c), SIE off, before the
- * in-kernel short-circuit. Lock-free; the report is the only slow step and
- * runs once per silent episode.
+ * in-kernel short-circuit. Lock-free; the report is the only slow step and runs
+ * once per silent episode.
  */
 void hartwatch_tick(void)
 {
@@ -125,6 +127,7 @@ void hartwatch_tick(void)
         return;
     hw_poll[self].next =
         now + qtimeptr->cycles_per_sec / 1000 * HARTWATCH_POLL_MS;
+
     /* A report parked behind a busy console lock goes out as soon as the lock
      * is free, not only on this hart's next unrelated print.
      */
@@ -148,8 +151,8 @@ void hartwatch_tick(void)
     cur = atomic_load_explicit(&pcpu_array[target].pc_timer_progress,
                                memory_order_relaxed);
     stamp = atomic_load_explicit(&hw_stamp[target], memory_order_relaxed);
-    if (!stamp || cur != atomic_load_explicit(&hw_seen[target],
-                                              memory_order_relaxed)) {
+    if (!stamp ||
+        cur != atomic_load_explicit(&hw_seen[target], memory_order_relaxed)) {
         /* First look, or the hart moved: restart its window and re-arm. */
         atomic_store_explicit(&hw_seen[target], cur, memory_order_relaxed);
         atomic_store_explicit(&hw_stamp[target], now ? now : 1,
@@ -158,7 +161,8 @@ void hartwatch_tick(void)
         return;
     }
 
-    if (now - stamp < (uint64_t) HARTWATCH_TIMEOUT_SEC * qtimeptr->cycles_per_sec)
+    if (now - stamp <
+        (uint64_t) HARTWATCH_TIMEOUT_SEC * qtimeptr->cycles_per_sec)
         return;
     if (atomic_exchange_explicit(&hw_latched[target], true,
                                  memory_order_relaxed))

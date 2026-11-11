@@ -123,6 +123,7 @@ static int tty_open(ioserv_context_t *ctp,
     new->i.info.scoid = info->scoid;
     new->i.info.coid = info->coid;
     SETIOV(ctp->iov + 0, new, offsetof(io_openfd_t, i.key));
+
     /* The key is the opener's thread secret over these bytes; a second open by
      * the same thread replaces it, so open and follow the link in turn.
      */

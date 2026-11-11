@@ -52,10 +52,9 @@ Elf_Addr reloc_jmpslot(Elf_Addr *where,
 
 extern unsigned long elf_hwcap;
 #define call_ifunc_resolver(ptr)                                               \
-    (((Elf_Addr (*)(unsigned long, unsigned long, unsigned long,               \
-                    unsigned long, unsigned long, unsigned long,               \
-                    unsigned long, unsigned long)) ptr)(elf_hwcap, 0, 0, 0, 0, \
-                                                        0, 0, 0))
+    (((Elf_Addr(*)(unsigned long, unsigned long, unsigned long, unsigned long, \
+                   unsigned long, unsigned long, unsigned long,                \
+                   unsigned long)) ptr)(elf_hwcap, 0, 0, 0, 0, 0, 0, 0))
 
 /* TLS */
 

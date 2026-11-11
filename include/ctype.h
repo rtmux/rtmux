@@ -5,7 +5,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/* <ctype.h> — Minimal character classification for RTMux libc.
+/*
+ * <ctype.h> — Minimal character classification for RTMux libc.
  *
  * Only the C/POSIX locale is supported (single-byte, ASCII).
  */

@@ -92,7 +92,8 @@ typedef struct root_process_entry {
     bool phys_contained;
 
     /* Set at spawn when the image is listed in the bootstrap capability
-     * manifest (a system server). kill(-1) skips such processes. */
+     * manifest (a system server). kill(-1) skips such processes.
+     */
     bool system;
 
     /* Address-space rwlock state, used to serialize roottask-side ops on a
@@ -154,8 +155,8 @@ typedef struct root_process_entry {
     siginfo_t siginfo;
 
     /* Job control: which of SIGTTIN/SIGTTOU the process blocks or ignores
-     * (_JOBCTL_HOLD_* bits), as its libc reports through _PROC_JOBCTL_STATE.
-     * A terminal server reads it to choose between EIO and a stop signal.
+     * (_JOBCTL_HOLD_* bits), as its libc reports through _PROC_JOBCTL_STATE. A
+     * terminal server reads it to choose between EIO and a stop signal.
      */
     uint32_t tty_hold;
 
@@ -214,7 +215,9 @@ void memcap_process_fini(root_process_t *tmp);
  */
 int process_query_info(pid_t pid, root_proc_info_t *info);
 
-/* Kernel object-pool gauges for /sys/kstats; see kernel/include/private/kstats.h. */
+/* Kernel object-pool gauges for /sys/kstats; see
+ * kernel/include/private/kstats.h.
+ */
 struct kstat_soul_rec;
 int soul_stats(struct kstat_soul_rec *out,
                unsigned n,

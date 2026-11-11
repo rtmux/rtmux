@@ -162,7 +162,7 @@ int hwres_claim_range(hwres_claim_t *claim,
         errno = EINVAL;
         return -1;
     }
-    *claim = (hwres_claim_t) {
+    *claim = (hwres_claim_t){
         .start = base,
         .end = base + size - 1,
         .length = size,

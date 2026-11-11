@@ -45,7 +45,7 @@ clock_t times(struct tms *buf)
         getrusage(RUSAGE_CHILDREN, &children) == -1)
         return (clock_t) -1;
 
-    *buf = (struct tms) {
+    *buf = (struct tms){
         .tms_utime = timeval_to_ticks(&self.ru_utime, hz),
         .tms_stime = timeval_to_ticks(&self.ru_stime, hz),
         .tms_cutime = timeval_to_ticks(&children.ru_utime, hz),

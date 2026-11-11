@@ -132,7 +132,7 @@ static void claim_from_handle(hwres_claim_t *claim,
                               const struct rtmux_resource_handle *handle,
                               size_t size)
 {
-    *claim = (hwres_claim_t) {
+    *claim = (hwres_claim_t){
         .start = handle->base,
         .end = handle->base + size - 1,
         .length = size,

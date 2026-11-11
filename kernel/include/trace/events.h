@@ -57,9 +57,12 @@ int em_event(tracebuf_t *);
 #include <arch/ktrace.h>
 
 #define _TRACEDATANUM (2)
+
 /* Size of the kernel-formatted name/string buffers (process and thread names);
- * independent of TRACE_USRSTR_MAX, which caps caller-supplied payloads. */
+ * independent of TRACE_USRSTR_MAX, which caps caller-supplied payloads.
+ */
 #define _TRACE_MAX_STR_SIZE (128)
+
 /* Byte cap on the kernel copy of a caller trace payload (user string with its
  * terminator, or word payload); see ksys_trace_event.
  */

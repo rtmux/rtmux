@@ -62,7 +62,10 @@ static int getty_open_tty(const char *path)
      * make it controlling.
      */
     setsid();
-    /* ipc-send: utils -> roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring */
+
+    /* ipc-send: utils ->
+     * roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring
+     */
     fd = open(path, O_RDWR);
     if (fd < 0) {
         perror(path);
@@ -76,6 +79,7 @@ static int getty_open_tty(const char *path)
         dup2(fd, STDERR_FILENO);
     if (fd > STDERR_FILENO)
         close(fd);
+
     /* open() already made the terminal ours when it could (a session leader's
      * first terminal), so EPERM from a repeat bind is expected; any other
      * failure means ^C/^Z will not reach the jobs, so say so.
@@ -146,6 +150,7 @@ int toolbox_getty_main(int argc, char **argv)
             sleep(1);
         }
         (void) status;
+
         /* A job-control shell hands the terminal back when it exits; make sure
          * of it, or the next login prompt would read as a background process.
          */

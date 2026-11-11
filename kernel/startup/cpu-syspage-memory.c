@@ -74,23 +74,20 @@ struct syspage_entry *cpu_alloc_syspage_memory(paddr_t *cpupagep,
         crash("could not allocate %#x bytes for syspage/cpupage\n", size);
     }
 
-private
-    = lsp.system_private.p;
+    private = lsp.system_private.p;
 
     /* Map syspage+cpupage as kernel RW (identity-mapped). */
-private
-    ->kern_syspageptr =
+    private->kern_syspageptr =
         TOPTR(riscv_map(~(uintptr_t) 0, sp_phys, size, RISCV_MAP_SYSPAGE));
-private
-    ->kern_cpupageptr = TOPTR((char *) private->kern_syspageptr + spsize);
+    private->kern_cpupageptr =
+        TOPTR((char *) private->kern_syspageptr + spsize);
 
     /* Map syspage read-only at a fixed user VA. VPN[2]=1 (0x40000000+) is
      * copied from the boot page table into every new process page table by
      * cpu_vmm_mcreate(), so no per-process setup is needed.
      */
     riscv_map(RTMUX_SYSPAGE_UADDR, sp_phys, spsize, RISCV_MAP_SYSPAGE_RO);
-private
-    ->user_syspageptr = TOPTR(RTMUX_SYSPAGE_UADDR);
+    private->user_syspageptr = TOPTR(RTMUX_SYSPAGE_UADDR);
 
     /* Map CPU 0 cpupage read-only at a fixed user VA. Only CPU 0's cpupage is
      * mapped here; per-CPU remapping (same VA, different PA per hart) will be
@@ -98,8 +95,7 @@ private
      */
     riscv_map(RTMUX_CPUPAGE_UADDR, sp_phys + spsize, spacing,
               RISCV_MAP_SYSPAGE_RO);
-private
-    ->user_cpupageptr = TOPTR(RTMUX_CPUPAGE_UADDR);
+    private->user_cpupageptr = TOPTR(RTMUX_CPUPAGE_UADDR);
 
     /* Allocate and map a single page for the kcall trampoline. Contains just
      * ecall + ebreak — used by cpu_force_thread_destroyall and similar to force
@@ -125,8 +121,7 @@ private
      * directory location for SMP page table synchronization.
      */
 
-private
-    ->cpupage_spacing = spacing;
+    private->cpupage_spacing = spacing;
 
     *syspagep = sp_phys;
     *cpupagep = sp_phys + spsize;

@@ -5,7 +5,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/* waitid — wait for a child process to change state.
+/*
+ * waitid — wait for a child process to change state.
  *
  * Uses the proc service _PROC_WAIT path for ECHILD, child enumeration, and
  * deferred replies for children that have not exited yet.

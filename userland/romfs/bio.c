@@ -32,8 +32,8 @@ int bio_init(const char *devpath)
 {
     /* Open read-only. Block-device I/O services (dev-nvme today) reject
      * anything other than O_RDONLY with EROFS in their direct open handler.
+     * ipc-send: romfs -> dev-nvme
      */
-    /* ipc-send: romfs -> dev-nvme */
     blkfd = open(devpath, O_RDONLY);
     if (blkfd < 0)
         return -1;

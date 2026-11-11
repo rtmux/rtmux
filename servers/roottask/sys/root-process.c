@@ -5,7 +5,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/* Backing storage for root_process[] — the roottask-side per-process state
+/*
+ * Backing storage for root_process[] — the roottask-side per-process state
  * array that holds fields previously parked in the kernel-half process_t (root,
  * cwd, events, wap, debug_waiting).
  *
@@ -86,10 +87,10 @@ void root_process_fini(pid_t pid)
     pthread_mutex_lock(&slot_lock);
     if (tmp->pid == pid) {
         free(tmp->debug_name); /* tolerates NULL */
-        if (tmp->session &&
-            atomic_sub_value(&tmp->session->links, 1) == 1) {
+        if (tmp->session && atomic_sub_value(&tmp->session->links, 1) == 1) {
             /* The last member is gone: release the controlling terminal
-             * descriptor, if one was bound, and the session itself. */
+             * descriptor, if one was bound, and the session itself.
+             */
             if (tmp->session->fd >= 0)
                 (void) close(tmp->session->fd);
             free(tmp->session);

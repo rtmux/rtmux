@@ -163,15 +163,15 @@ void virtio_mb(void)
 
 /* virtio_mb() is fence rw,rw: it orders normal memory, not MMIO (on RISC-V it
  * does not cover the I/O space). These helpers are scoped to the init handshake
- * and queue control, including kick. Reset and hardware completion ordering
- * are not covered. They order CPU-issued accesses only; no posted-write
- * completion is implied.
+ * and queue control, including kick. Reset and hardware completion ordering are
+ * not covered. They order CPU-issued accesses only; no posted-write completion
+ * is implied.
  *   w,o: staged ring/descriptor stores before an MMIO write that lets the
  *        device fetch them (Linux __io_bw).
  *   o,o: earlier MMIO writes before later MMIO writes (SEL->NUM, config->
  *        PFN/READY, READY->next SEL/STATUS, STATUS->first NOTIFY).
- *   before_sel (io,o): earlier MMIO reads/writes before a QUEUE_SEL write, so the
- *        previous queue's NUM_MAX read/config/READY cannot land on the new queue.
+ *   before_sel (io,o): earlier MMIO reads/writes before a QUEUE_SEL write, so
+ * the previous queue's NUM_MAX read/config/READY cannot land on the new queue.
  *   o,i: QUEUE_SEL write before the QUEUE_NUM_MAX read.
  */
 void virtio_fence_w_o(void)
@@ -623,7 +623,7 @@ static int virtio_mmio_probe_iommu_domain(
         goto out;
     }
     memset(pt_map, 0, VIRTIO_IOMMU_PT_BYTES);
-    pt = (struct virtio_iommu_pt) {
+    pt = (struct virtio_iommu_pt){
         .base = pt_map,
         .pa = pt_pa,
         .root_off = (size_t) (((uint64_t) pt_pa + RISCV_IOMMU_ROOT_BYTES - 1U) &
@@ -669,7 +669,7 @@ static int virtio_mmio_probe_iommu_domain(
 
     cq = cq_map;
     dc = ddt_map;
-    dc[did] = (struct riscv_iommu_dc) {
+    dc[did] = (struct riscv_iommu_dc){
         .tc = RISCV_IOMMU_DC_TC_V,
         .iohgatp =
             (RISCV_IOMMU_IOHGATP_MODE_SV39X4 << 60) |
@@ -715,7 +715,7 @@ static int virtio_mmio_probe_iommu_domain(
 out:
     if (ddt_programmed && mmio != MAP_FAILED) {
         if (dc)
-            dc[did] = (struct riscv_iommu_dc) {0};
+            dc[did] = (struct riscv_iommu_dc){0};
         __atomic_thread_fence(__ATOMIC_SEQ_CST);
         if (cq_enabled && cq) {
             (void) virtio_iommu_submit(mmio, cq, &cq_tail,
@@ -783,7 +783,7 @@ int virtio_mmio_discover(struct rtmux_virtio_mmio *vio,
         rc = virtio_mmio_query(device_id, cand, &count);
         if (rc == EOK || rc != ENODEV || retry == VIRTIO_DELEGATE_MAP_RETRIES)
             break;
-        (void) nanosleep(&(struct timespec) {.tv_sec = 0, .tv_nsec = 10000000},
+        (void) nanosleep(&(struct timespec){.tv_sec = 0, .tv_nsec = 10000000},
                          NULL);
     }
     if (rc != EOK)
@@ -803,7 +803,7 @@ int virtio_mmio_discover(struct rtmux_virtio_mmio *vio,
                 retry == VIRTIO_DELEGATE_MAP_RETRIES)
                 break;
             (void) nanosleep(
-                &(struct timespec) {.tv_sec = 0, .tv_nsec = 10000000}, NULL);
+                &(struct timespec){.tv_sec = 0, .tv_nsec = 10000000}, NULL);
         }
 
         if (error != EOK) {
@@ -1019,10 +1019,10 @@ struct rtmux_virtio_queue *virtio_queue_alloc(struct rtmux_virtio_mmio *vio,
 
 /* Program queue addresses and mark the queue live. Kept apart from allocation
  * so the caller can authorize the DMA ranges first; QUEUE_SEL is re-written
- * because a later alloc may have selected another queue. Cannot fail.
- * The leading virtio_fence_w_o() orders all prior ring/descriptor stores before
- * the first MMIO write that exposes the queue (QUEUE_PFN / QUEUE_READY); the
- * o,o fences order SEL -> config -> PFN/READY -> later MMIO writes.
+ * because a later alloc may have selected another queue. Cannot fail. The
+ * leading virtio_fence_w_o() orders all prior ring/descriptor stores before the
+ * first MMIO write that exposes the queue (QUEUE_PFN / QUEUE_READY); the o,o
+ * fences order SEL -> config -> PFN/READY -> later MMIO writes.
  */
 void virtio_queue_publish(struct rtmux_virtio_mmio *vio,
                           int version,
@@ -1054,6 +1054,7 @@ void virtio_queue_publish(struct rtmux_virtio_mmio *vio,
         virtio_fence_o_o();
         virtio_mmio_wr32(vio, VIRTIO_MMIO_QUEUE_READY, 1);
     }
+
     /* Publication of this queue precedes every later MMIO write (the next
      * queue's QUEUE_SEL, NOTIFY, STATUS/DRIVER_OK).
      */

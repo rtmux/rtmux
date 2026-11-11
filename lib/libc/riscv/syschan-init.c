@@ -29,7 +29,8 @@ static int __rtmux_syschan_chid = -1;
 
 /* Start of the auxiliary vector, for issetugid(). Any start file that sets
  * environ to the initial envp before calling __rtmux_syschan_init() gets it
- * recorded here: the vector follows envp's NULL terminator. */
+ * recorded here: the vector follows envp's NULL terminator.
+ */
 const uint64_t *__libc_auxv __hidden;
 extern char **environ __attribute__((weak));
 
@@ -57,7 +58,8 @@ static void __systhrd_entry(void)
 
         if (notification.code == _NOTIFICATION_CODE_SIGNAL) {
             /* Low 32 bits: signo; high 32 bits: sender pid (see
-             * kext_signal_deliver). */
+             * kext_signal_deliver).
+             */
             uint64_t val = (uint64_t) (uintptr_t) notification.value.sival_ptr;
             int signo = (int) (uint32_t) val;
             pid_t sender = (pid_t) (uint32_t) (val >> 32);
@@ -106,10 +108,9 @@ void __rtmux_syschan_init(void)
     if (getpid() == ROOTTASK_PID)
         return;
 
-    /* Create the system channel */
-    /* Fixed priority: a posted signal must not rewrite the system thread's
-     * priority, or every handler would run at the kernel's notification
-     * priority, behind every realtime thread.
+    /* Create the system channel Fixed priority: a posted signal must not
+     * rewrite the system thread's priority, or every handler would run at the
+     * kernel's notification priority, behind every realtime thread.
      */
     chid = channel_create(RTMUX_FLG_CHF_FIXED_PRIORITY);
     if (chid == -1)

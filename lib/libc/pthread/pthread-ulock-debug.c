@@ -5,7 +5,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/* Debug-only userspace lock-rank (lockdep-style) checker.
+/*
+ * Debug-only userspace lock-rank (lockdep-style) checker.
  *
  * Each thread keeps a stack of the mutexes it currently holds (in a per-process
  * table indexed by tid, malloc'd lazily). On every acquire we record a directed

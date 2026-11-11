@@ -274,7 +274,7 @@ static void fill_bar_handles(struct rtmux_resource_handle handles[6],
         if ((bar->Flags & (PCI_MEM_SPACE | PCI_MEM_PREFETCH)) == 0)
             continue;
 
-        handles[i] = (struct rtmux_resource_handle) {
+        handles[i] = (struct rtmux_resource_handle){
             .kind = RTMUX_RESOURCE_PCI_BAR,
             .base = PCI_MEM_ADDR(bar->Address),
             .length = bar->Size,

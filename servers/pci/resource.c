@@ -371,7 +371,7 @@ int find_ranges(void)
         }
     }
 
-    rreq = (hwres_claim_t) {
+    rreq = (hwres_claim_t){
         .length = 1,
         .start = 0,
         .end = 0,
@@ -391,7 +391,7 @@ int find_ranges(void)
     io_pci_low = map_addr;
     hwres_release(&rreq, 1);
 
-    rreq = (hwres_claim_t) {
+    rreq = (hwres_claim_t){
         .length = 1,
         .start = 0,
         .end = 0,

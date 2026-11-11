@@ -5,7 +5,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/* roottask_console_set() — set the system console device.
+/*
+ * roottask_console_set() — set the system console device.
  *
  * Sends _SYS_CONSOLE to roottask, which updates the /dev/console symlink to
  * point to the given path.

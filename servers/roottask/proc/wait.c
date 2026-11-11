@@ -234,6 +234,7 @@ int proc_wait_check(pid_t prp_pid,
     if (wap->options & WNOWAIT) {
         return WNOWAIT;
     }
+
     /* A stop or continue is reported once. Its siginfo must not outlive the
      * report, or the next waiter would see the same event and a later fault
      * would be masked by it.

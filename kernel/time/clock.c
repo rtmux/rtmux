@@ -68,8 +68,8 @@ int kdecl ksys_clock_time(thread_t *act, struct kcall_args_clock_time *kap)
             return ESRCH;
         }
         if ((tid + 1) == 0) {
-            /* Get process running time. The banked value lacks the caller's
-             * own unbilled stretch (it is running, on this hart), so add it;
+            /* Get process running time. The banked value lacks the caller's own
+             * unbilled stretch (it is running, on this hart), so add it;
              * threads of the process running on other harts contribute only
              * what they have banked.
              */

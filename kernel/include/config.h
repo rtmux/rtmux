@@ -5,7 +5,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/* Kernel and startup configuration. Auto-generated from Kconfig -- run 'make
+/*
+ * Kernel and startup configuration. Auto-generated from Kconfig -- run 'make
  * menuconfig' to change.
  */
 #ifndef _KERNEL_CONFIG_H

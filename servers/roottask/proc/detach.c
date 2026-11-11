@@ -5,7 +5,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/* proc_detach — detach a process from its parent ("stay resident").
+/*
+ * proc_detach — detach a process from its parent ("stay resident").
  *
  * The calling process's parent is notified as if the child exited (unblocking
  * waitpid), and the process is reparented to pid 1. The process continues

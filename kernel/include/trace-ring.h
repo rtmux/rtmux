@@ -5,7 +5,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/* trace-ring.h — Per-CPU function-entry trace ring buffer.
+/*
+ * trace-ring.h — Per-CPU function-entry trace ring buffer.
  *
  * Lockless single-writer ring; each CPU writes only its own slots. Used for
  * systematically tracing the function-call sequence that leads up to a kernel

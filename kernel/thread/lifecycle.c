@@ -1440,7 +1440,8 @@ void rdecl thread_destroy(thread_t *thp)
 
         if ((thp != get_active_thread(self) && state != STATE_DEAD) ||
             active_remote) {
-            atomic_or(&thp->flags, (RTMUX_FLG_THR_KILLSELF | RTMUX_FLG_THR_ONLYME));
+            atomic_or(&thp->flags,
+                      (RTMUX_FLG_THR_KILLSELF | RTMUX_FLG_THR_ONLYME));
             if (active_hart >= 0) {
                 SENDIPI((unsigned) active_hart, IPI_RESCHED);
             } else if (state == STATE_RUNNING) {
@@ -1476,7 +1477,8 @@ void rdecl thread_destroy(thread_t *thp)
                 if (FPUDATA_CPU(thp->fpudata) != get_cpunum()) {
                     /* Context still in use on another CPU; need to flush it out
                      */
-                    atomic_or(&thp->flags, (RTMUX_FLG_THR_KILLSELF | RTMUX_FLG_THR_ONLYME));
+                    atomic_or(&thp->flags,
+                              (RTMUX_FLG_THR_KILLSELF | RTMUX_FLG_THR_ONLYME));
                     SENDIPI(FPUDATA_CPU(thp->fpudata), IPI_CONTEXT_SAVE);
                     __atomic_store_n(&thp->destroy_claim, 0, __ATOMIC_RELEASE);
                     return;
@@ -1551,8 +1553,10 @@ void rdecl thread_destroy(thread_t *thp)
                     thp->state = STATE_STACK;
 
                     _TRACE_TH_EMIT_STATE(thp, STACK);
-                    atomic_or(&thp->flags, (RTMUX_FLG_THR_KILLSELF | RTMUX_FLG_THR_ONLYME));
-                    atomic_clr(&thp->flags, (RTMUX_FLG_THR_TO_BE_STOPPED | RTMUX_FLG_THR_WAAA));
+                    atomic_or(&thp->flags,
+                              (RTMUX_FLG_THR_KILLSELF | RTMUX_FLG_THR_ONLYME));
+                    atomic_clr(&thp->flags, (RTMUX_FLG_THR_TO_BE_STOPPED |
+                                             RTMUX_FLG_THR_WAAA));
 
                     /* Direct notification — see banner of
                      * sigevent_notification_roottask() in kernel/ipc/event.c.
@@ -1737,11 +1741,11 @@ void rdecl thread_destroy(thread_t *thp)
         tthread_unpin(jthp);
     }
 
-    /* A thread that exited on its own was already STATE_DEAD when it reached the
-     * cleanup above, so its FP save area can still be here. The thread is no
-     * longer running anywhere, so drop every hart's claim on its live registers
-     * (a compare-exchange: never clobber a hart that has since loaded another
-     * thread) and free the area.
+    /* A thread that exited on its own was already STATE_DEAD when it reached
+     * the cleanup above, so its FP save area can still be here. The thread is
+     * no longer running anywhere, so drop every hart's claim on its live
+     * registers (a compare-exchange: never clobber a hart that has since loaded
+     * another thread) and free the area.
      */
     if (thp->fpudata) {
         FPU_REGISTERS *fpudata = FPUDATA_PTR(thp->fpudata);
@@ -1948,6 +1952,7 @@ static void threadstack_fault(thread_t *thp, CPU_REGISTERS *reg, unsigned flags)
                       ? (void *) (uintptr_t) ENOMEM
                       : (void *) (uintptr_t) EINVAL;
     atomic_or(&thp->flags, (RTMUX_FLG_THR_KILLSELF | RTMUX_FLG_THR_ONLYME));
+
     /* Leave the special-return context, as xfer_preempt does: with the per-CPU
      * flag still set, the specialret that reaps this KILLSELF would hit its
      * re-entry crash().
@@ -2085,7 +2090,8 @@ void rdecl thread_specret(thread_t *thp)
                          */
                         thp->state = STATE_RUNNING;
                         thp->status = (void *) (uintptr_t) EAGAIN;
-                        atomic_or(&thp->flags, (RTMUX_FLG_THR_KILLSELF | RTMUX_FLG_THR_ONLYME));
+                        atomic_or(&thp->flags, (RTMUX_FLG_THR_KILLSELF |
+                                                RTMUX_FLG_THR_ONLYME));
                         return;
                     }
                 }
@@ -2097,7 +2103,8 @@ void rdecl thread_specret(thread_t *thp)
              */
             if (roottask_stack_alloc(thp) != EOK) {
                 thp->status = (void *) (uintptr_t) EAGAIN;
-                atomic_or(&thp->flags, (RTMUX_FLG_THR_KILLSELF | RTMUX_FLG_THR_ONLYME));
+                atomic_or(&thp->flags,
+                          (RTMUX_FLG_THR_KILLSELF | RTMUX_FLG_THR_ONLYME));
                 return;
             }
             atomic_or(&thp->flags, RTMUX_FLG_THR_ALLOCED_STACK);
@@ -2200,9 +2207,8 @@ void rdecl thread_specret(thread_t *thp)
         if (sched_thread(thp, attr->policy,
                          (struct sched_param *) &attr->sched_param) != EOK) {
             /* We should have some error handling if sched_thread() fails ...
-             * thp->status = (void *)EAGAIN;
-               atomic_or(&thp->flags, (RTMUX_FLG_THR_KILLSELF | RTMUX_FLG_THR_ONLYME));
-             * return;
+             * thp->status = (void *)EAGAIN; atomic_or(&thp->flags,
+             * (RTMUX_FLG_THR_KILLSELF | RTMUX_FLG_THR_ONLYME)); return;
              */
         }
     }
@@ -2234,9 +2240,11 @@ void rdecl thread_destroyall(thread_t *thp)
 
     for (tid = 0; tid < prp->threads.nentries; ++tid) {
         if (VECP(thp2, &prp->threads, tid)) {
-            atomic_or(&thp2->flags, RTMUX_FLG_THR_DETACHED | RTMUX_FLG_THR_KILLSELF);
+            atomic_or(&thp2->flags,
+                      RTMUX_FLG_THR_DETACHED | RTMUX_FLG_THR_KILLSELF);
             /* Knock down the stack flag, faster to do it when we unmap all */
-            atomic_clr(&thp2->flags, (RTMUX_FLG_THR_TO_BE_STOPPED | RTMUX_FLG_THR_ALLOCED_STACK));
+            atomic_clr(&thp2->flags, (RTMUX_FLG_THR_TO_BE_STOPPED |
+                                      RTMUX_FLG_THR_ALLOCED_STACK));
         }
     }
 

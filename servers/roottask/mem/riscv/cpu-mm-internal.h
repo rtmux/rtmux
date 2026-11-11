@@ -5,7 +5,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/* RISC-V VM internals for RTMux.
+/*
+ * RISC-V VM internals for RTMux.
  *
  * Sv39: 3-level page table, 39-bit virtual address space
  *   Levels: VPN[2] (root) -> VPN[1] -> VPN[0] -> page offset

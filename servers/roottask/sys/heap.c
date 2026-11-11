@@ -5,13 +5,13 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/* Roottask's malloc backing store.
+/*
+ * Roottask's malloc backing store.
  *
  * Roottask is the mmap server, so libc's default allocator backend (which maps
- * anonymous memory through roottask) cannot work here. These strong
- * definitions replace libc's weak __crt_morecore/__crt_lesscore with a fixed
- * arena carved at link time. Freed large blocks are reused, never returned to
- * the system.
+ * anonymous memory through roottask) cannot work here. These strong definitions
+ * replace libc's weak __crt_morecore/__crt_lesscore with a fixed arena carved
+ * at link time. Freed large blocks are reused, never returned to the system.
  */
 
 #include <stddef.h>
@@ -24,7 +24,8 @@
 _Static_assert(CONFIG_ROOTTASK_HEAP_SIZE % ROOTTASK_HEAP_PAGE == 0,
                "CONFIG_ROOTTASK_HEAP_SIZE must be a multiple of 4096");
 
-static alignas(ROOTTASK_HEAP_PAGE) char roottask_heap[CONFIG_ROOTTASK_HEAP_SIZE];
+static alignas(
+    ROOTTASK_HEAP_PAGE) char roottask_heap[CONFIG_ROOTTASK_HEAP_SIZE];
 static size_t roottask_heap_used;
 
 /* Directly mapped blocks (128 KiB and up) come back through __crt_lesscore.

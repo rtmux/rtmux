@@ -21,8 +21,8 @@
  *
  * Validation is O(1): a handful of compares, plus (for USER_SLICE_WR) a
  * one-byte read-back-write of the first and last byte so that an unwritable
- * output fails before the kcall has side effects. Bytes in between are
- * covered by the copy itself, which is fault-recovering.
+ * output fails before the kcall has side effects. Bytes in between are covered
+ * by the copy itself, which is fault-recovering.
  *
  * Build with USER_SLICE_MODEL (tests/cbmc/user-slice.c) to get just the pure
  * range predicate against a model WITHIN_BOUNDARY.
@@ -47,8 +47,10 @@ struct user_slice {
 };
 
 /* Range rule shared by init and the model checker. A zero-length range holds no
- * bytes and is always accepted. Returns 0, EFAULT (NULL, wrap, or out of
- * range), or EMSGSIZE (longer than max).
+ * bytes and is always accepted.
+ *
+ * Returns 0, EFAULT (NULL, wrap, or out of range), or EMSGSIZE (longer than
+ * max).
  */
 static inline int user_slice_check(uintptr_t base,
                                    size_t len,

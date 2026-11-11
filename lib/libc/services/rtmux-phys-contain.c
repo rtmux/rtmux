@@ -5,7 +5,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/* rtmux_phys_contain() — seal this process's physical-mapping rights.
+/*
+ * rtmux_phys_contain() — seal this process's physical-mapping rights.
  *
  * Sends _PROC_PHYS_CONTAIN to roottask. After it returns, every further
  * specific-address MAP_PHYS from this process is refused (MAP_ANON DMA buffers

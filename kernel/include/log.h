@@ -31,11 +31,14 @@ int kprintf(const char *fmt, ...);
 void kprintf_raw(const char *buf, size_t len);
 #ifdef CONFIG_STALL_DETECTOR
 /* kprintf that parks the line (flushed by this CPU's next kprintf) instead of
- * spinning for ever on a busy console lock. Interrupt-context callers only. */
+ * spinning for ever on a busy console lock. Interrupt-context callers only.
+ */
 int kprintf_bounded(unsigned spins, const char *fmt, ...);
 void kprintf_flush_parked(unsigned spins);
+
 /* kprintf_bounded() whose fallback is a lock-free console write, not a parked
- * line: for a report that must come out while the console owner is wedged. */
+ * line: for a report that must come out while the console owner is wedged.
+ */
 int kprintf_emergency(unsigned spins, const char *fmt, ...);
 #endif
 #ifdef CONFIG_DEBUG_INJECT
