@@ -82,7 +82,10 @@ jobs:
           LKL_SRC="$PWD/lkl-src" LKL_PERSONALITY=${{ matrix.personality }} \
           LKL_RTMUX_OUT="$OUT" ./scripts/build-lkl-rv64.sh --build-from-source
 
+      # A cached archive was verified before it was saved, and its toolchain
+      # is not installed on a cache hit, so only verify a fresh build.
       - name: Re-verify archive
+        if: steps.arch-cache.outputs.cache-hit != 'true'
         run: |
           LKL_LIB="$OUT/liblkl-rtmux.a" LKL_RTMUX_OUT="$OUT" \
             ./scripts/build-lkl-rv64.sh --check-only
