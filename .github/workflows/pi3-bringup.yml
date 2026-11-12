@@ -1,0 +1,83 @@
+name: Pi3 AArch64
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  pi3:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install cross-build and emulation tools
+        run: sudo apt-get update && sudo apt-get install -y clang lld llvm cpio qemu-system-arm
+      - name: Build and verify standalone Pi3 architecture bootstrap
+        run: make check-pi3-bringup
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: pi3-bringup-evidence
+          path: |
+            build/arch/aarch64/raspi3-bringup/qemu*.log
+            build/arch/aarch64/raspi3-bringup/qemu*.json
+            build/arch/aarch64/raspi3-bringup/rtmux-pi3-bringup.elf
+      - name: Configure native coverage image (no Linux domains)
+        run: |
+          make defconfig DEFCONFIG=configs/pi3_coverage_defconfig
+          make -j2 pi3 OUT=build/pi3
+      - name: Shared ABI and kernel contracts
+        run: |
+          make OUT=build/pi3 check-kernel-nofp check-syscall-abi check-libc-abi \
+               check-porting-contract check-posix-profile-surface check-irq-contract \
+               check-lock-rank check-preempt-inventory check-rcu-sched driver-gate \
+               host-tests HOST_CC=clang
+          python3 scripts/check-aarch64-kernel-nofp.py --self-test
+          python3 scripts/check-boot-manifest.py --image-root build/pi3/initramfs
+      - name: Native shell smoke
+        run: make check-pi3 OUT=build/pi3
+      - name: Shared conformance, block filesystem, IRQ and RT coverage
+        run: make check-pi3-coverage OUT=build/pi3
+      - name: Shared interactive login, vi and job-control tests
+        env:
+          RTMUX_TTY_PI3_OUT: build/pi3-tty
+        run: |
+          make defconfig DEFCONFIG=configs/pi3_defconfig
+          make -j2 pi3 OUT=build/pi3-tty
+          RTMUX_TTY_LOG=build/pi3-tty/vi-serial.log python3 scripts/vi-test.py
+          RTMUX_TTY_LOG=build/pi3-tty/job-control-serial.log python3 scripts/tty-jobctl-test.py
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: pi3-native-runtime-evidence
+          path: |
+            build/pi3/pi3-check/
+            build/pi3/pi3-coverage/
+            build/pi3/build.config
+            build/pi3/arch/aarch64/rtmux-kernel
+            build/pi3-tty/*serial.log
+            build/pi3-tty/build.config
+  profiles:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [minimal, realtime, lkl, syslog-wrap]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install cross-build and emulation tools
+        run: sudo apt-get update && sudo apt-get install -y clang lld llvm cpio qemu-system-arm
+      - name: Shared POSIX profile suite (LKL servers remain disabled)
+        run: |
+          make defconfig DEFCONFIG=configs/pi3_coverage_defconfig
+          make check-pi3-profiles ARGS='--profiles ${{ matrix.profile }}'
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: pi3-profile-${{ matrix.profile }}-evidence
+          path: |
+            build/pi3-profiles/**/*.log
+            build/pi3-profiles/**/*.json
+            build/pi3-profiles/**/build.config
