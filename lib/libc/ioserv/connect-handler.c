@@ -110,10 +110,15 @@ int _ioserv_connect_handler(ioserv_context_t *ctp, ioserv_msg_t *msg)
             }
         }
 
+        /* A failed combined operation has not delivered a usable descriptor
+         * to the client. Roll back its open binding as well: the client will
+         * detach and may immediately reuse the coid on the same connection.
+         * Leaving an OCB here makes that next open fail with EBUSY. */
+        int failed = n > EOK || n == IOSERV_DEFAULT;
         /* Finish the transaction calling the close message, but ignore its
-         * return value
+         * return value.
          */
-        if (subtype == _IO_CONNECT_COMBINE_CLOSE &&
+        if ((subtype == _IO_CONNECT_COMBINE_CLOSE || failed) &&
             _ioserv_handle(&ctp->info, 0, _IOSERV_HANDLE_FIND) != (void *) -1) {
             int status = ctp->status;
 
