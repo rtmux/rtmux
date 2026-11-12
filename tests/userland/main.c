@@ -866,6 +866,12 @@ int main(int argc, char *argv[])
     }
     if (argc == 3 && !strcmp(argv[1], "--serial-unblock-child"))
         return serial_unblock_child(!strcmp(argv[2], "announce"));
+    if (argc == 3 && !strcmp(argv[1], "--serial-unblock-driver")) {
+        test_serial_unblock_driver(argv[2]);
+        printf("\n=== Results: %d tests, %d passed, %d failed ===\n",
+               tests_run, tests_passed, tests_failed);
+        return tests_failed || !tests_passed ? EXIT_FAILURE : EXIT_SUCCESS;
+    }
     if (argc == 2 && !strcmp(argv[1], "--serial-unblock")) {
         printf("=== RTMux Serial Unblock Test ===\n\n");
         test_serial_unblock();

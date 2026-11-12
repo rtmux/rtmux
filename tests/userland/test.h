@@ -43,6 +43,7 @@ void test_posix_cap_boundary(void);
 int posix_cap_boundary_child(void);
 void test_notifications(void);
 void test_serial_unblock(void);
+void test_serial_unblock_driver(const char *driver);
 int serial_unblock_child(int announce);
 #define DISCONNECT_SKIP 77
 int disconnect_under_alloc_failure(void);

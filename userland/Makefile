@@ -13,7 +13,7 @@ CPPFLAGS += -DCONFIG_LKL_SERVERS=1
 endif
 
 CORE_DIRS = pipe waitfor
-DRIVER_DIRS = dev-serial-8250 dev-serial-sifive dev-nvme romfs ramblk
+DRIVER_DIRS = dev-serial-pl011 dev-serial-8250 dev-serial-sifive dev-nvme romfs ramblk
 # The syscall-conformance suite lives in tests/userland (built and installed by
 # the top-level Makefile), not here.
 
@@ -38,6 +38,7 @@ TOOLBOX_OBJS = $(TOOLBOX_SRCS:%.c=$(OBJDIR)/%.o)
 # in $(INITRAMFS_DIR)/bin/ is just the basename, so no src:dst pairs needed.
 INSTALL_BIN  = \
     toolbox \
+    dev-serial-pl011/dev-serial-pl011 \
     dev-serial-8250/dev-serial-8250 \
     dev-serial-sifive/dev-serial-sifive \
     dev-nvme/dev-nvme \
