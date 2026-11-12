@@ -11,6 +11,7 @@ roottask-fsio	servers/roottask	2	-
 lkl-netd	servers/lkl-netd,servers/lkl	3	roottask-core
 lkl-fsd	servers/lkl-fsd,servers/lkl	3	virtio-mmio,roottask-core
 romfs	userland/romfs	3	roottask-core
+ramblk	userland/ramblk	4	roottask-core
 dev-nvme	userland/dev-nvme	4	roottask-core
 virtio-mmio	servers/virtio-mmio	4	roottask-core
 pci	servers/pci	5	roottask-core

@@ -425,9 +425,16 @@ static void test_statvfs_wrappers(void)
 /* Child half of nvme_raw_perm: drop to an unprivileged uid and require that
  * every raw NVMe node refuses both read and write opens with EACCES.
  */
+static const char *block_node(unsigned index)
+{
+    const char *path = getenv(index ? "RTMUX_TEST_BLOCK_PART" :
+                                    "RTMUX_TEST_BLOCK_WHOLE");
+    return path && *path ? path : (index ? "/dev/nvme0n1p8" : "/dev/nvme0n1");
+}
+
 int nvme_raw_child(void)
 {
-    static const char *const nodes[] = {"/dev/nvme0n1", "/dev/nvme0n1p8"};
+    const char *nodes[] = {block_node(0), block_node(1)};
 
     if (setgid(1000) != 0 || setuid(1000) != 0)
         return 2;
@@ -714,33 +721,37 @@ static void test_malloc_growth(void)
 
 static void test_nvme_raw_perm(void)
 {
-    static const char *const nodes[] = {"/dev/nvme0n1", "/dev/nvme0n1p8"};
+    const char *nodes[] = {block_node(0), block_node(1)};
     char *argv[] = {"syscall_testing", "--nvme-raw-child", NULL};
     struct stat st;
     pid_t pid;
     int status = -1;
 
-    if (geteuid() != 0 || stat(nodes[0], &st) != 0)
-        return; /* needs root, and NVMe present */
+    if (geteuid() != 0 || stat(nodes[0], &st) != 0) {
+        test_fail("block permission fixture", "needs root and configured block device");
+        return;
+    }
+    printf("  block fixture: whole=%s part=%s\n", nodes[0], nodes[1]);
 
     for (size_t i = 0; i < sizeof(nodes) / sizeof(nodes[0]); i++) {
         int fd = open(nodes[i], O_RDONLY);
 
-        check(fd >= 0, "nvme_raw_perm root open", nodes[i]);
+        check(fd >= 0, "block_raw_perm root open", nodes[i]);
         if (fd >= 0)
             (void) close(fd);
-        check(stat(nodes[i], &st) == 0 && (st.st_mode & 07777) == 0600,
-              "nvme_raw_perm mode 0600", nodes[i]);
+        check(stat(nodes[i], &st) == 0 && S_ISBLK(st.st_mode) &&
+                  (st.st_mode & 07777) == 0600,
+              "block_raw_perm mode 0600", nodes[i]);
     }
 
     if (posix_spawn(&pid, "/bin/syscall_testing", NULL, NULL, argv, NULL) != 0) {
-        test_fail("nvme_raw_perm spawn", strerror(errno));
+        test_fail("block_raw_perm spawn", strerror(errno));
         return;
     }
     check(wait_child_exit(pid, &status, 500) && WIFEXITED(status) &&
               WEXITSTATUS(status) == 0,
-          "nvme_raw_perm unprivileged open is EACCES",
-          "uid 1000 must not open raw NVMe nodes for read or write");
+          "block_raw_perm unprivileged open is EACCES",
+          "uid 1000 must not open raw block nodes for read or write");
 }
 
 static void test_nvme_negative_lseek(void)
@@ -749,30 +760,30 @@ static void test_nvme_negative_lseek(void)
     off_t pos;
     int fd;
 
-    fd = open("/dev/nvme0n1p8", O_RDONLY);
+    fd = open(block_node(1), O_RDONLY);
     if (fd == -1) {
-        test_fail("nvme lseek setup", strerror(errno));
+        test_fail("block lseek setup", strerror(errno));
         return;
     }
     if (fstat(fd, &st) == -1) {
-        test_fail("nvme lseek stat", strerror(errno));
+        test_fail("block lseek stat", strerror(errno));
         (void) close(fd);
         return;
     }
     if (st.st_size < 1024) {
-        test_fail("nvme lseek stat", "device is shorter than test offset");
+        test_fail("block lseek stat", "device is shorter than test offset");
         (void) close(fd);
         return;
     }
 
     errno = 0;
     pos = lseek(fd, -512, SEEK_END);
-    check(pos == st.st_size - 512, "nvme negative SEEK_END",
+    check(pos == st.st_size - 512, "block negative SEEK_END",
           "block devices must accept signed end-relative seeks");
 
     errno = 0;
     pos = lseek(fd, -512, SEEK_CUR);
-    check(pos == st.st_size - 1024, "nvme negative SEEK_CUR",
+    check(pos == st.st_size - 1024, "block negative SEEK_CUR",
           "block devices must accept signed current-relative seeks");
 
     (void) close(fd);
@@ -849,9 +860,9 @@ static void test_posix_errno_corners(void)
     /* Seek validation on a real seekable object: a resulting negative offset
      * and an unknown whence are both EINVAL.
      */
-    fd = open("/dev/nvme0n1p8", O_RDONLY);
+    fd = open(block_node(1), O_RDONLY);
     if (fd == -1) {
-        test_fail("errno-corner nvme setup", strerror(errno));
+        test_fail("errno-corner block setup", strerror(errno));
         return;
     }
 

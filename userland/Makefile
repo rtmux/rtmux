@@ -13,7 +13,7 @@ CPPFLAGS += -DCONFIG_LKL_SERVERS=1
 endif
 
 CORE_DIRS = pipe waitfor
-DRIVER_DIRS = dev-serial-8250 dev-serial-sifive dev-nvme romfs
+DRIVER_DIRS = dev-serial-8250 dev-serial-sifive dev-nvme romfs ramblk
 # The syscall-conformance suite lives in tests/userland (built and installed by
 # the top-level Makefile), not here.
 
@@ -42,6 +42,7 @@ INSTALL_BIN  = \
     dev-serial-sifive/dev-serial-sifive \
     dev-nvme/dev-nvme \
     romfs/romfs \
+    ramblk/ramblk \
     pipe/pipe \
     waitfor/waitfor
 TOOLBOX_BIN_APPLETS = \
