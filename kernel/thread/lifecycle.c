@@ -25,8 +25,8 @@ extern void kernel_thread_exit_fallback(void *arg);
 
 static inline void thread_cpu_relax(void)
 {
-    /* RISC-V Zihintpause PAUSE encoding, kept raw for older assemblers. */
-    __asm__ volatile(".word 0x0100000f" ::: "memory");
+    /* Architecture-specific spin-wait hint. */
+    cpu_relax();
 }
 
 static void thread_recycle_reset(thread_t *thp)

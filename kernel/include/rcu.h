@@ -98,7 +98,7 @@ static inline void rcu_read_unlock(rcu_t *rcu)
 
 #define rcu_assign_pointer(ptr, val)                  \
     do {                                              \
-        __asm__ volatile("fence rw, w" ::: "memory"); \
+        __cpu_store_barrier(); \
         (ptr) = (val);                                \
     } while (0)
 

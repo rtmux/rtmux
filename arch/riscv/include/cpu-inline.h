@@ -440,4 +440,7 @@ static inline void cpu_tlb_flush(void)
     __asm__ volatile("sfence.vma" ::: "memory");
 }
 
+#define __cpu_store_barrier() __asm__ volatile("fence rw, w" ::: "memory")
+#define cpu_relax() __asm__ volatile(".word 0x0100000f" ::: "memory")
+
 #endif
