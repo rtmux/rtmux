@@ -157,7 +157,7 @@ all: $(ROOTTASK_BIN)
 $(ROOTTASK_BIN): $(OBJECTS) $(CRT0_O) $(LIBC_A)
 	@mkdir -p $(@D)
 	$(msg) LD $@
-	$(Q)$(LD) -nostdlib -static -Ttext-segment=0xC0000000 \
+	$(Q)$(LD) -nostdlib -static $(if $(filter aarch64,$(ARCH)),--image-base=0xC0000000,-Ttext-segment=0xC0000000) \
 	    -o $@ $(CRT0_O) $(OBJECTS) --start-group $(LIBC_A) --end-group
 	$(msg) SYM $@.sym
 	$(Q)$(OBJDUMP) -t $@ | sed '1,/SYMBOL TABLE/d; s/ .* / /; /^$$/d' | sort > $@.sym
