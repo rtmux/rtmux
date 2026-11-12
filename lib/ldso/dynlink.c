@@ -1195,13 +1195,17 @@ static void digest_dynamic1(Obj_Entry *obj,
     *dyn_runpath = NULL;
 
     obj->bind_now = false;
+    /* ET_EXEC has a zero relocation bias. Use integer address arithmetic
+     * below: adding an offset to a NULL C pointer lets Clang fold later
+     * pointer range checks to false, even for a valid mapped ELF table. */
     dynp = obj->dynamic;
     if (!dynp)
         return;
     for (; dynp->d_tag != DT_NULL; dynp++) {
         switch (dynp->d_tag) {
         case DT_REL:
-            obj->rel = (const Elf_Rel *) (obj->relocbase + dynp->d_un.d_ptr);
+            obj->rel = (const Elf_Rel *) ((uintptr_t) obj->relocbase +
+                                          dynp->d_un.d_ptr);
             break;
 
         case DT_RELSZ:
@@ -1213,7 +1217,8 @@ static void digest_dynamic1(Obj_Entry *obj,
             break;
 
         case DT_JMPREL:
-            obj->pltrel = (const Elf_Rel *) (obj->relocbase + dynp->d_un.d_ptr);
+            obj->pltrel = (const Elf_Rel *) ((uintptr_t) obj->relocbase +
+                                             dynp->d_un.d_ptr);
             break;
 
         case DT_PLTRELSZ:
@@ -1221,7 +1226,8 @@ static void digest_dynamic1(Obj_Entry *obj,
             break;
 
         case DT_RELA:
-            obj->rela = (const Elf_Rela *) (obj->relocbase + dynp->d_un.d_ptr);
+            obj->rela = (const Elf_Rela *) ((uintptr_t) obj->relocbase +
+                                            dynp->d_un.d_ptr);
             break;
 
         case DT_RELASZ:
@@ -1233,7 +1239,8 @@ static void digest_dynamic1(Obj_Entry *obj,
             break;
 
         case DT_RELR:
-            obj->relr = (const Elf_Relr *) (obj->relocbase + dynp->d_un.d_ptr);
+            obj->relr = (const Elf_Relr *) ((uintptr_t) obj->relocbase +
+                                            dynp->d_un.d_ptr);
             break;
 
         case DT_RELRSZ:
@@ -1250,7 +1257,8 @@ static void digest_dynamic1(Obj_Entry *obj,
             break;
 
         case DT_SYMTAB:
-            obj->symtab = (const Elf_Sym *) (obj->relocbase + dynp->d_un.d_ptr);
+            obj->symtab = (const Elf_Sym *) ((uintptr_t) obj->relocbase +
+                                             dynp->d_un.d_ptr);
             break;
 
         case DT_SYMENT:
@@ -1258,7 +1266,8 @@ static void digest_dynamic1(Obj_Entry *obj,
             break;
 
         case DT_STRTAB:
-            obj->strtab = (const char *) (obj->relocbase + dynp->d_un.d_ptr);
+            obj->strtab =
+                (const char *) ((uintptr_t) obj->relocbase + dynp->d_un.d_ptr);
             break;
 
         case DT_STRSZ:
@@ -1266,8 +1275,8 @@ static void digest_dynamic1(Obj_Entry *obj,
             break;
 
         case DT_VERNEED:
-            obj->verneed =
-                (const Elf_Verneed *) (obj->relocbase + dynp->d_un.d_val);
+            obj->verneed = (const Elf_Verneed *) ((uintptr_t) obj->relocbase +
+                                                  dynp->d_un.d_val);
             break;
 
         case DT_VERNEEDNUM:
@@ -1275,8 +1284,8 @@ static void digest_dynamic1(Obj_Entry *obj,
             break;
 
         case DT_VERDEF:
-            obj->verdef =
-                (const Elf_Verdef *) (obj->relocbase + dynp->d_un.d_val);
+            obj->verdef = (const Elf_Verdef *) ((uintptr_t) obj->relocbase +
+                                                dynp->d_un.d_val);
             break;
 
         case DT_VERDEFNUM:
@@ -1284,12 +1293,13 @@ static void digest_dynamic1(Obj_Entry *obj,
             break;
 
         case DT_VERSYM:
-            obj->versyms =
-                (const Elf_Versym *) (obj->relocbase + dynp->d_un.d_val);
+            obj->versyms = (const Elf_Versym *) ((uintptr_t) obj->relocbase +
+                                                 dynp->d_un.d_val);
             break;
 
         case DT_HASH: {
-            hashtab = (const Elf_Hashelt *) (obj->relocbase + dynp->d_un.d_ptr);
+            hashtab = (const Elf_Hashelt *) ((uintptr_t) obj->relocbase +
+                                             dynp->d_un.d_ptr);
 
             /* Validate the header, then the buckets/chains spans, against the
              * mapped object before trusting the counts — mirror DT_GNU_HASH.
@@ -1317,7 +1327,8 @@ static void digest_dynamic1(Obj_Entry *obj,
         } break;
 
         case DT_GNU_HASH: {
-            hashtab = (const Elf_Hashelt *) (obj->relocbase + dynp->d_un.d_ptr);
+            hashtab = (const Elf_Hashelt *) ((uintptr_t) obj->relocbase +
+                                             dynp->d_un.d_ptr);
             if (!obj_range_contains(obj, hashtab, 4 * sizeof(*hashtab)))
                 break;
             obj->nbuckets_gnu = hashtab[0];
@@ -1386,7 +1397,8 @@ static void digest_dynamic1(Obj_Entry *obj,
             break;
 
         case DT_PLTGOT:
-            obj->pltgot = (Elf_Addr *) (obj->relocbase + dynp->d_un.d_ptr);
+            obj->pltgot =
+                (Elf_Addr *) ((uintptr_t) obj->relocbase + dynp->d_un.d_ptr);
             break;
 
         case DT_TEXTREL:
@@ -1413,11 +1425,13 @@ static void digest_dynamic1(Obj_Entry *obj,
             break;
 
         case DT_INIT:
-            obj->init = (Elf_Addr) (obj->relocbase + dynp->d_un.d_ptr);
+            obj->init =
+                (Elf_Addr) ((uintptr_t) obj->relocbase + dynp->d_un.d_ptr);
             break;
 
         case DT_PREINIT_ARRAY:
-            obj->preinit_array = (Elf_Addr) (obj->relocbase + dynp->d_un.d_ptr);
+            obj->preinit_array =
+                (Elf_Addr) ((uintptr_t) obj->relocbase + dynp->d_un.d_ptr);
             break;
 
         case DT_PREINIT_ARRAYSZ:
@@ -1426,7 +1440,8 @@ static void digest_dynamic1(Obj_Entry *obj,
             break;
 
         case DT_INIT_ARRAY:
-            obj->init_array = (Elf_Addr) (obj->relocbase + dynp->d_un.d_ptr);
+            obj->init_array =
+                (Elf_Addr) ((uintptr_t) obj->relocbase + dynp->d_un.d_ptr);
             break;
 
         case DT_INIT_ARRAYSZ:
@@ -1434,11 +1449,13 @@ static void digest_dynamic1(Obj_Entry *obj,
             break;
 
         case DT_FINI:
-            obj->fini = (Elf_Addr) (obj->relocbase + dynp->d_un.d_ptr);
+            obj->fini =
+                (Elf_Addr) ((uintptr_t) obj->relocbase + dynp->d_un.d_ptr);
             break;
 
         case DT_FINI_ARRAY:
-            obj->fini_array = (Elf_Addr) (obj->relocbase + dynp->d_un.d_ptr);
+            obj->fini_array =
+                (Elf_Addr) ((uintptr_t) obj->relocbase + dynp->d_un.d_ptr);
             break;
 
         case DT_FINI_ARRAYSZ:
