@@ -104,7 +104,7 @@ int hardware_init(int argc, char **argv, char **envv)
     }
 
     /* Claim the RAM used by kernel + startup stack (16KB above _end) */
-    alloc_ram((paddr_t) _start, (paddr_t) (_end - _start) + 0x4000, 1);
+    alloc_ram(STARTUP_V2P(_start), (paddr_t) (_end - _start) + 0x4000, 1);
     if (initramfs_phys_start)
         alloc_ram(initramfs_phys_start,
                   initramfs_phys_end - initramfs_phys_start, 1);

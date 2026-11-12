@@ -44,7 +44,7 @@ void init_system_private()
 
     /* Record kernel location in the syspage */
     unsigned mem = as_find(AS_NULL_OFF, "cpu_addr_space", NULL);
-    as_add((paddr_t) _start, (paddr_t) _end, AS_ATTR_RAM, "kernel", mem);
+    as_add(STARTUP_V2P(_start), STARTUP_V2P(_end), AS_ATTR_RAM, "kernel", mem);
 
     /* Record FDT location also */
     as_add((paddr_t) fdt_addr, (paddr_t) fdt_addr + fdt_size, AS_ATTR_ROM,

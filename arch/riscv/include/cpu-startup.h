@@ -16,6 +16,7 @@
 
 /* Startup runs with MMU off — physical == virtual, no bias */
 #define STARTUP_PADDR_BIAS 0
+#define STARTUP_V2P(v) ((paddr_t)(v))
 
 #define RISCV_MAP_SYSPAGE 0xffffffffu    /* Syspage kernel RW */
 #define RISCV_MAP_SYSPAGE_RO 0xfffffffeu /* Syspage/CPUpage user R/O */
