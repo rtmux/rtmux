@@ -69,8 +69,8 @@ ALL_LINK_OBJS = $(OBJECTS) $(STARTUP_COMMON_OBJECTS) $(ARCH_OBJECTS) $(KER_OBJEC
 all: startup_common kernel_objects
 	$(Q)$(MAKE) $(KERNEL_BIN)
 
-# Keep the version header as a link prerequisite because header dependencies are
-# not tracked automatically; callers force a rebuild after header changes.
+# The version header is also a link prerequisite, so a regenerated header always
+# relinks the kernel (object-level tracking comes from the .d files below).
 $(KERNEL_BIN): $(ALL_LINK_OBJS) rtmux_kernel.ld $(abspath $(TOPDIR))/internal/include/rtmux-version.h
 	@mkdir -p $(@D)
 	$(msg) LD $@
@@ -90,32 +90,34 @@ kernel_objects:
 $(STARTUP_OBJDIR)/%.o: startup/%.c
 	@mkdir -p $(dir $@)
 	$(msg) CC $@
-	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
+	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) $(DEPFLAGS) -c -o $@ $<
 
 $(STARTUP_OBJDIR)/%.o: startup/%.S
 	@mkdir -p $(dir $@)
 	$(msg) AS $@
-	$(Q)$(CC) $(CPPFLAGS) $(ASFLAGS) $(CFLAGS) -c -o $@ $<
+	$(Q)$(CC) $(CPPFLAGS) $(ASFLAGS) $(CFLAGS) $(DEPFLAGS) -c -o $@ $<
 
 # Platform objects
 $(STARTUP_OBJDIR)/plat/%.o: $(PLAT)/%.c
 	@mkdir -p $(dir $@)
 	$(msg) CC $@
-	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
+	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) $(DEPFLAGS) -c -o $@ $<
 
 # Arch objects
 $(STARTUP_OBJDIR)/arch/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(msg) CC $@
-	$(Q)$(CC) $(KERFLAGS) -c -o $@ $<
+	$(Q)$(CC) $(KERFLAGS) $(DEPFLAGS) -c -o $@ $<
 
 $(STARTUP_OBJDIR)/arch/%.o: %.S
 	@mkdir -p $(dir $@)
 	$(msg) AS $@
-	$(Q)$(CC) $(CPPFLAGS) $(ASFLAGS) $(CFLAGS) -c -o $@ $<
+	$(Q)$(CC) $(CPPFLAGS) $(ASFLAGS) $(CFLAGS) $(DEPFLAGS) -c -o $@ $<
 
 clean:
 	$(Q)rm -rf $(BUILD_BASE)
 	$(Q)$(MAKE) -C $(KERDIR) clean
 
 .PHONY: all clean kernel_objects startup_common
+
+$(eval $(call dep-include,$(OBJECTS) $(ARCH_OBJECTS)))

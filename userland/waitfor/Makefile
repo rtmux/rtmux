@@ -13,7 +13,7 @@ all: $(PROG)
 $(OBJDIR)/waitfor.o: main.c
 	@mkdir -p $(@D)
 	$(msg) CC $@
-	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c -o $@ $<
+	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) $(DEPFLAGS) -c -o $@ $<
 
 $(PROG): $(OBJS) $(CRT0_O) $(LIBC_SO)
 	@mkdir -p $(@D)
@@ -25,6 +25,4 @@ clean:
 
 .PHONY: all clean
 
-# Auto-generated header deps (-MMD/-MP above) so a touched header — including
-# the generated autoconf.h — rebuilds objects instead of leaving them stale.
--include $(OBJS:.o=.d)
+$(eval $(call dep-include,$(OBJS)))

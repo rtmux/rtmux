@@ -165,7 +165,7 @@ $(ROOTTASK_BIN): $(OBJECTS) $(CRT0_O) $(LIBC_A)
 $(OBJDIR)/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(msg) CC $@
-	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c -o $@ $<
+	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) $(DEPFLAGS) -c -o $@ $<
 
 # Stateless leaf utilities shared with the kernel.  Both binaries
 # compile their own copy of these source files; the parser/walker is
@@ -180,25 +180,21 @@ $(OBJDIR)/%.o: %.c
 $(OBJDIR)/sys/cpio.o: ../../kernel/startup/lib/cpio.c
 	@mkdir -p $(dir $@)
 	$(msg) CC $@
-	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c -o $@ $<
+	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) $(DEPFLAGS) -c -o $@ $<
 
 $(OBJDIR)/sys/walk-asinfo.o: ../../kernel/lib/walk-asinfo.c
 	@mkdir -p $(dir $@)
 	$(msg) CC $@
-	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) -include root-log.h -MMD -MP -c -o $@ $<
+	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) -include root-log.h $(DEPFLAGS) -c -o $@ $<
 
 $(OBJDIR)/mem/cap-table.o: ../../kernel/cap/table.c
 	@mkdir -p $(dir $@)
 	$(msg) CC $@
-	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c -o $@ $<
+	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) $(DEPFLAGS) -c -o $@ $<
 
 clean:
 	$(Q)rm -rf $(BUILD_BASE)
 
 .PHONY: all clean
 
-# Auto-generated header deps (-MMD/-MP above) so a touched header — including
-# the generated autoconf.h / rtmux-version.h that externs.h and sysfs.c pull in
-# — rebuilds roottask objects instead of leaving them stale against a CONFIG or
-# version change.
--include $(OBJECTS:.o=.d)
+$(eval $(call dep-include,$(OBJECTS)))

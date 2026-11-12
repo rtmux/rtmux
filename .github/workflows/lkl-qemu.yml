@@ -60,6 +60,10 @@ jobs:
             experimental: true
           - name: profile
             run: make lkl-profile-smoke
+          # The LKL headers reach the servers through -isystem; this proves a
+          # change to one rebuilds them.
+          - name: header-deps
+            run: CONFIG_LKL_SERVERS=y make check-header-deps
     name: qemu (${{ matrix.name }})
     steps:
       - uses: actions/checkout@v7

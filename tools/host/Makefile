@@ -38,6 +38,20 @@ PROGS = $(BUILD_BASE)/mkasmoff $(BUILD_BASE)/mkromfs $(BUILD_BASE)/treeromfs \
         $(BUILD_BASE)/cpio-parser-test $(BUILD_BASE)/spawn-fd-policy-test \
         $(BUILD_BASE)/serial-reply-test
 
+# Each tool compiles and links its sources in one command, so -MMD cannot give a
+# per-tool dependency file (with several sources it writes one named after each
+# source, into the source directory). These tools are cheap to build, so every
+# one depends on every header in the trees they include from: a header edit
+# rebuilds them, and no header can be forgotten from a hand-written list.
+HOST_HDRS = $(wildcard $(TOPDIR)/include/*.h $(TOPDIR)/include/*/*.h \
+                       $(TOPDIR)/internal/include/*.h $(TOPDIR)/internal/include/*/*.h \
+                       $(TOPDIR)/kernel/include/*.h $(TOPDIR)/kernel/include/*/*.h \
+                       $(TOPDIR)/servers/roottask/include/*.h \
+                       $(TOPDIR)/lib/common/*.h $(TOPDIR)/lib/ldso/*.h \
+                       $(TOPDIR)/lib/ldso/*/*.h $(TOPDIR)/userland/romfs/*.h \
+                       $(TOPDIR)/userland/dev-serial-common/*.h \
+                       $(TOPDIR)/tests/userland/outcome.h)
+
 all: $(PROGS)
 
 $(BUILD_BASE)/spawn-fd-policy-test: $(TEST_DIR)/test-spawn-fd-policy.c \
@@ -328,3 +342,7 @@ clean:
 	$(Q)rm -rf $(FUZZ_OUT)
 
 .PHONY: all clean host-tests cap-table-test host-sanitize host-fuzz
+
+# After every recipe rule, so these extra prerequisites follow the sources and $< in
+# the recipes above still names the first source file.
+$(PROGS): $(HOST_HDRS)

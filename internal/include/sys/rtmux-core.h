@@ -511,11 +511,6 @@ struct _clockperiod {
 
 struct iovec;
 
-/* RTMUX_VERSION is defined in <rtmux-version.h> as (major<<16 | minor<<8 |
- * patch)
- */
-#include <rtmux-version.h>
-
 #define ROOTTASK_PID 1
 #define ROOTTASK_CHID 1
 /* Roottask connection is always the first side channel. */

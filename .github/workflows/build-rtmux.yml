@@ -65,6 +65,11 @@ jobs:
                check-map-phys-inventory check-rcu-sched check-cap-v1 \
                check-trace-export check-fu740-smoke-scripts driver-gate
 
+      # Alone, not in the parallel list above: it touches shared headers, and a
+      # target compiling at the same moment would see them rebuild.
+      - name: Header dependency tracking
+        run: make check-header-deps
+
   formal:
     runs-on: ubuntu-24.04
     timeout-minutes: 60

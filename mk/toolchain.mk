@@ -109,6 +109,12 @@ CFLAGS    = -O2 -Wconversion -fno-strict-aliasing
 CFLAGS   += -ffreestanding -fno-common -nostdlib
 CFLAGS   += -fno-pie -fno-builtin
 
+# Header dependency generation. Every object rule adds $(DEPFLAGS) so a touched
+# header (including the generated autoconf.h and rtmux-version.h) rebuilds its
+# dependents; each Makefile then does -include $(OBJS:.o=.d). -MP adds a phony
+# target per header so a deleted header cannot break the build.
+DEPFLAGS  = -MMD -MP
+
 # Arch-specific flags shared by every target.
 # -mabi=lp64d (hard-float, double precision) and -m elf64lriscv are
 # required when the cross-toolchain is multilib (e.g. xPack
