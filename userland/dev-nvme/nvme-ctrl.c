@@ -223,7 +223,12 @@ int nvme_exec_cmd(nvme_ctrl_t *c, uint32_t qid, nvme_sqe_t *cmd)
      * reads a stale SQ slot, and silently does nothing. No CQE, no IRQ, IST
      * never wakes, main hangs in cond_wait.
      */
+
+#ifdef __aarch64__
+    __asm__ volatile("dmb osh" ::: "memory");
+#else
     __asm__ __volatile__("fence w,o" ::: "memory");
+#endif
     nvme_wr32(c, nvme_sq_dbl(c, qid), *tail);
 
     if (c->ist_ready) {
@@ -256,7 +261,12 @@ int nvme_exec_cmd(nvme_ctrl_t *c, uint32_t qid, nvme_sqe_t *cmd)
         volatile nvme_cqe_t *cqe = &cq[*head];
         uint16_t status = cqe->status;
         if ((status & 1u) == *phase) {
-            __asm__ __volatile__("fence rw,rw" ::: "memory");
+
+#ifdef __aarch64__
+    __asm__ volatile("dmb osh" ::: "memory");
+#else
+    __asm__ __volatile__("fence rw,rw" ::: "memory");
+#endif
             uint16_t done_cid = cqe->cid;
             uint16_t sf = (uint16_t) (status >> 1);
 
