@@ -26,7 +26,8 @@ extern unsigned num_processors;
         while ((spin)->value) { /* nothing to do */ \
         }                                           \
     } while (_smp_xchg(&(spin)->value, 1) != 0)
-#define SPINUNLOCK(spin) ((spin)->value = 0)
+/* Match the acquire exchange on both weakly ordered architectures. */
+#define SPINUNLOCK(spin) __atomic_store_n(&(spin)->value, 0, __ATOMIC_RELEASE)
 #define SENDIPI(cpu, cmd) send_ipi(cpu, cmd)
 #define SMP_FLUSH_TLB()     \
     if (num_processors > 1) \
