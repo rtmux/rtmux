@@ -4414,6 +4414,19 @@ static void test_at_syscalls_at_fdcwd(void)
           "faccessat must reject an undefined AT_ flag with EINVAL");
 }
 
+/* Exercise deferred namespace replay repeatedly, then verify a combined stat
+ * and side-channel open still work in the same client. A premature open reply
+ * leaves an OCB bound to a recycled coid and poisons later stat/access calls. */
+void test_namespace_combined_race(void)
+{
+    for (int round = 0; round < 32; round++) {
+        printf("namespace-combined-race: round=%d\n", round);
+        test_namespace_open_race();
+        test_namespace_open_entry_generation_race();
+        test_at_syscalls_at_fdcwd();
+    }
+}
+
 static void test_namespace_sandbox_conformance(void)
 {
     const char hidden_name[] = "rtmux-sandbox-hidden";

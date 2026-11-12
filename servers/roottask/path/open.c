@@ -266,32 +266,27 @@ static int complete_open(ioserv_context_t *ctp, struct open_entry *oep, int ret)
             reserve_thread_fail = 1;
         }
 
-        /* We're going to be reusing ctp below to restart the deferred
-         * operations, so we need to do the reply for this op first to free up
-         * the message buffer.
-         */
-        switch ((unsigned) ret) {
-        case (unsigned) IOSERV_NOREPLY:
-            break;
-        case (unsigned) IOSERV_DEFAULT:
-            ret = ENOSYS;
-            /* Fall through */
-        default:
-            if (ret <= 0) {
-                (void) msg_replyv(ctp->rcvid, ctp->status, ctp->iov, -ret);
-            } else {
-                msg_error(ctp->rcvid, ret);
-            }
-            break;
-        }
-        ret = IOSERV_NOREPLY;
+        /* path_open is still inside the connect callback. In a combined
+         * open/stat/close request, returning success here would reply before
+         * stat and close ran, leaving an OCB bound to a recycled client coid.
+         * Replay deferred requests with their own context and let the outer
+         * I/O dispatcher finish the original transaction normally. */
+        ioserv_context_t *replay = ioserv_context_alloc(ctp->dpp);
         do {
             next = todo->next;
-            /* Restart the deferred operation on the node */
-            ioserv_msg_again(ctp, todo->rcvid);
+            if (replay) {
+                if (ioserv_msg_again(replay, todo->rcvid) == -1)
+                    (void) msg_error(todo->rcvid, errno);
+            } else {
+                (void) msg_error(todo->rcvid, ENOMEM);
+            }
             proc_object_free(&open_souls, todo);
             todo = next;
         } while (todo);
+        if (replay)
+            ioserv_context_free(replay);
+        /* msg_again selects each deferred sender for priority donation. */
+        (void) msg_current(ctp->rcvid);
 
         /* if the original thread pool reservation did not fail release the
          * reservation here

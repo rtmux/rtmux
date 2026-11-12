@@ -1205,6 +1205,13 @@ int main(int argc, char *argv[])
     }
     printf("=== RTMux Syscall Conformance Test Suite ===\n\n");
 
+    if (argc == 2 && !strcmp(argv[1], "--namespace-combined-race")) {
+        test_namespace_combined_race();
+        printf("\n=== Results: %d tests, %d passed, %d failed ===\n",
+               tests_run, tests_passed, tests_failed);
+        return tests_failed || !tests_passed ? EXIT_FAILURE : EXIT_SUCCESS;
+    }
+
     for (i = 0; i < sizeof test_suites / sizeof test_suites[0]; i++) {
         printf("%s[%s]\n", i == 0 ? "" : "\n", test_suites[i].name);
         test_suites[i].run();
