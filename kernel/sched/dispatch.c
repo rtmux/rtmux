@@ -2443,7 +2443,10 @@ static void rdecl block_and_ready_default(thread_t *thp)
     thp->link3_link.prev = NULL;
 
     SNAP_TIME_INLINE(act->timestamp_last_block, 0);
-    dpp = thp->dpp;
+    /* This mutation holds LOCAL_DPP's lock. The receiver may have blocked on
+     * another CPU; enqueue on the locked instance, as ready_default does. */
+    dpp = LOCAL_DPP;
+    thp->dpp = dpp;
     prio = thp->priority;
 
     /* We are blocking the active thread (externally) so stop the running Mark
