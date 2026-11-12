@@ -44,7 +44,7 @@ LKL_EXT4_IMG = $(IMAGE_DIR)/lkl-ext4.img
 .PHONY: check-boot-manifest check-loader-negative verify
 .PHONY: check-evidence-claims check-fault-recovery check-platform-boundary-contracts
 .PHONY: check-fu740-smoke-scripts check-make-target-names check-ci-coverage check-lkl-scripts
-.PHONY: check-header-deps
+.PHONY: check-header-deps check-gap-anchors
 .PHONY: footprint-report check-lkl check-lkl-containment check-lkl-iommu-preflight check-lkl-iommu-live check-lkl-qemu check-lkl-differential check-lkl-trace check-trace-export check-trace-overhead
 .PHONY: check-qemu-deps check-lkl-differential-deps check-map-phys-inventory check-rcu-sched driver-gate indent check-indent check-style-deps
 .PHONY: posix-matrix check-posix-matrix check-posix-matrix-strict-ignore check-posix-matrix-options check-pse51 check-opts-pse51 check-posix-profile-header check-posix-profile-config check-posix-profile-surface posix-profile-boot-probe check-lkl-floor check-lkl-profile lkl-profile-smoke check-syscall-abi check-libc-abi
@@ -476,6 +476,12 @@ check-lkl-scripts:
 check-ci-coverage:
 	$(msg) CHECK CI covers every test target
 	$(Q)$(PYTHON) scripts/check-ci-coverage.py
+
+# Every guest test_gap() anchor must be a well-formed tracking id.
+check-gap-anchors:
+	$(msg) CHECK "test gap anchors name open items"
+	$(Q)$(PYTHON) scripts/check-gap-anchors.py --self-test
+	$(Q)$(PYTHON) scripts/check-gap-anchors.py
 
 # Lint every Makefile for $(DEPFLAGS)/-include, then touch representative headers
 # on the built tree and require the dependent components to rebuild. Needs a

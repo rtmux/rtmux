@@ -25,6 +25,11 @@ struct pshared_region {
 void test_ok(const char *name);
 void test_fail(const char *name, const char *detail);
 void check(int cond, const char *name, const char *detail);
+/* A known failure: `expected` is its stable id, `observed` the id seen now (NULL
+ * when the case passed). Matching is a GAP; a pass or another failure is a FAIL. */
+void test_gap(const char *name, const char *anchor, const char *expected, const char *observed);
+/* A case that did not run; the reason is mandatory. */
+void test_skip(const char *name, const char *reason);
 
 void test_timers(void);
 int rlimit_cpu_child(void);

@@ -8296,8 +8296,8 @@ void test_spawn_concurrent(int force)
          * suite skips it; `qemu-regress.sh --mode spawn-storm` forces it.
          * Remove this gate when the SMP spawn/exit defect is fixed.
          */
-        printf("  SKIP  spawn_concurrent (SMP: open defect, see Q32; "
-               "--mode spawn-storm forces it)\n");
+        test_skip("spawn_concurrent",
+                  "SMP: known defect; --mode spawn-storm forces it");
         return;
     }
     fds_before = spawn_count_open_fds();

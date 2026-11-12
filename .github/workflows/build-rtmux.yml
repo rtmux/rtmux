@@ -52,6 +52,7 @@ jobs:
         run: |
           make -j"$(nproc)" \
                check-ci-coverage check-lkl-scripts check-make-target-names \
+               check-gap-anchors \
                check-posix-matrix check-posix-matrix-strict-ignore \
                check-posix-matrix-options check-pse51 \
                check-posix-profile-header check-posix-profile-config \
