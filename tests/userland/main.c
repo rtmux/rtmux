@@ -114,7 +114,7 @@ void test_fail(const char *name, const char *detail)
 {
     tests_run++;
     tests_failed++;
-    printf("  FAIL  %s: %s\n", name, detail);
+    printf("  FAIL  %s: %s (last errno=%d)\n", name, detail, errno);
 }
 
 void check(int cond, const char *name, const char *detail)
@@ -1222,6 +1222,20 @@ int main(int argc, char *argv[])
         printf("\n=== Results: %d tests, %d passed, %d failed ===\n",
                tests_run, tests_passed, tests_failed);
         return tests_failed || !tests_passed ? EXIT_FAILURE : EXIT_SUCCESS;
+    }
+
+    if (argc == 3 && !strcmp(argv[1], "--suite")) {
+        for (i = 0; i < sizeof test_suites / sizeof test_suites[0]; i++) {
+            if (strcmp(argv[2], test_suites[i].name))
+                continue;
+            printf("[%s]\n", test_suites[i].name);
+            test_suites[i].run();
+            printf("\n=== Results: %d tests, %d passed, %d failed ===\n",
+                   tests_run, tests_passed, tests_failed);
+            return tests_failed || !tests_passed ? EXIT_FAILURE : EXIT_SUCCESS;
+        }
+        fprintf(stderr, "Unknown test suite: %s\n", argv[2]);
+        return EXIT_FAILURE;
     }
 
     for (i = 0; i < sizeof test_suites / sizeof test_suites[0]; i++) {
