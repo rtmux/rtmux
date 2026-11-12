@@ -25,7 +25,7 @@ int *__get_errno_ptr(void)
 static inline uintptr_t read_sp(void)
 {
     uintptr_t sp;
-    __asm__("mv %0, sp" : "=r"(sp));
+    sp = r_sp();
     return sp;
 }
 

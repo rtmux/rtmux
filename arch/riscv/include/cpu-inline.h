@@ -8,6 +8,14 @@
 #ifndef _RISCV_CPUINLINE_H
 #define _RISCV_CPUINLINE_H
 
+static inline void *cpu_get_tls(void)
+{
+    void *tls;
+    __asm__("mv %0, tp" : "=r"(tls));
+    return tls;
+}
+
+
 #include <inttypes.h>
 #include <sys/spinlock.h>
 
