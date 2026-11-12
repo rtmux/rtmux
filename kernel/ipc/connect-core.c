@@ -45,8 +45,14 @@ void rdecl connect_detach(connect_t *cop, unsigned prio)
                 cop->process = 0;
                 return;
             } else {
-                /* Remove the connection from the servers channels vector. */
+                /* A reply can drop the last reference while another CPU
+                 * attaches a new connection to this server. Serialize the
+                 * slot/free-list update with connect_attach's vec_slocks;
+                 * otherwise a vector growth can copy the soon-to-be-removed
+                 * slot, leaving a stale connection in the replacement table. */
+                kspinlock_lock(&chp->process->vec_slock);
                 vector_rem(&chp->process->chancons, cop->scoid);
+                kspinlock_unlock(&chp->process->vec_slock);
             }
         }
     } else {

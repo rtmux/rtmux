@@ -458,21 +458,27 @@ send_done:
 
     if (!(chp->flags & RTMUX_FLG_CHF_GLOBAL)) {
         for (i = 0; i < prp->chancons.nentries; ++i) {
-            if ((cop = VECP2(cop, &prp->chancons, i))) {
-                if (cop->type == TYPE_CONNECTION && cop->channel == chp &&
-                    cop->scoid == i) {
-                    vector_rem(&prp->chancons, i);
-                    if (cop->links == 0) {
-                        connect_soul_free(prp, cop);
-                    } else {
-                        do {
-                            if (cop->process && cop->process->death_chp)
-                                connect_coid_disconnect(cop,
-                                                        cop->process->death_chp,
-                                                        prp->terming_priority);
-                            cop->channel = NULL;
-                        } while ((cop = cop->next));
-                    }
+            kspinlock_lock(&prp->vec_slock);
+            cop = VECP2(cop, &prp->chancons, i);
+            if (cop && cop->type == TYPE_CONNECTION && cop->channel == chp &&
+                cop->scoid == i) {
+                vector_rem(&prp->chancons, i);
+            } else {
+                cop = NULL;
+            }
+            kspinlock_unlock(&prp->vec_slock);
+
+            if (cop) {
+                if (cop->links == 0) {
+                    connect_soul_free(prp, cop);
+                } else {
+                    do {
+                        if (cop->process && cop->process->death_chp)
+                            connect_coid_disconnect(cop,
+                                                    cop->process->death_chp,
+                                                    prp->terming_priority);
+                        cop->channel = NULL;
+                    } while ((cop = cop->next));
                 }
             }
         }
@@ -778,30 +784,30 @@ int kdecl ksys_channel_destroy(thread_t *act,
     /* Find all server connections and mark their channels as NULL. */
     if (!(chp->flags & RTMUX_FLG_CHF_GLOBAL)) {
         for (i = 0; i < prp->chancons.nentries; ++i) {
-            if ((cop = VECP2(cop, &prp->chancons, i))) {
-                if (cop->type == TYPE_CONNECTION && cop->channel == chp &&
-                    cop->scoid == i) {
-                    /* Remove the server connection from the servers channels
-                     * vector.
-                     */
-                    vector_rem(&prp->chancons, i);
+            kspinlock_lock(&prp->vec_slock);
+            cop = VECP2(cop, &prp->chancons, i);
+            if (cop && cop->type == TYPE_CONNECTION && cop->channel == chp &&
+                cop->scoid == i) {
+                vector_rem(&prp->chancons, i);
+            } else {
+                cop = NULL;
+            }
+            kspinlock_unlock(&prp->vec_slock);
 
-                    if (cop->links == 0) {
-                        /* Server connection unpublished from chancons; recycle
-                         * it.
-                         */
-                        connect_soul_free(prp, cop);
-                    } else {
-                        do {
-                            if (cop->process && cop->process->death_chp) {
-                                connect_coid_disconnect(cop,
-                                                        cop->process->death_chp,
-                                                        act->priority);
-                            }
-                            /* Null channel pointer since it is gone. */
-                            cop->channel = NULL;
-                        } while ((cop = cop->next));
-                    }
+            if (cop) {
+                if (cop->links == 0) {
+                    /* Server connection unpublished from chancons; recycle it. */
+                    connect_soul_free(prp, cop);
+                } else {
+                    do {
+                        if (cop->process && cop->process->death_chp) {
+                            connect_coid_disconnect(cop,
+                                                    cop->process->death_chp,
+                                                    act->priority);
+                        }
+                        /* Null channel pointer since it is gone. */
+                        cop->channel = NULL;
+                    } while ((cop = cop->next));
                 }
             }
             KSYS_PREEMPT(act, ENOERROR);
