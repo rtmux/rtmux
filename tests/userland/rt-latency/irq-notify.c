@@ -74,7 +74,7 @@ static struct rtc_probe probe; /* shared RTC state (rtc-probe.h) */
 static int rtc_delegate(unsigned long *phys, int *irq)
 {
     struct rtmux_resource_handle h;
-    int rc = rtmux_delegate_device(RTMUX_DEVICE_GOLDFISH_RTC, 0x1000,
+    int rc = rtmux_delegate_device(TEST_ALARM_DEVICE, 0x1000,
                                    RTMUX_DELEGATE_ANY_BASE, &h);
 
     if (rc != EOK)

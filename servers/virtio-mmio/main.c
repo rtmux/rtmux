@@ -382,6 +382,15 @@ static int find_boot_devices(struct rtmux_resource_handle *handles,
                             RTMUX_DEVICE_SIFIVE_UART, irq->irq.vector);
     }
 
+    dev = hwinfo_find_device("bcm2835-system-timer", NULL);
+    if (dev && found < max_handles) {
+        hwi_tag *loc = hwinfo_find_tag_after(dev, HWI_TAG_NAME_location);
+        hwi_tag *irq = hwinfo_find_tag_after(dev, HWI_TAG_NAME_irq);
+        if (loc && irq)
+            ADD_BOOT_HANDLE(loc->location.base, 0x1000,
+                            RTMUX_DEVICE_BCM2835_TIMER, irq->irq.vector);
+    }
+
     dev = hwinfo_find_device("pl011", NULL);
     if (dev && found < max_handles) {
         hwi_tag *loc = hwinfo_find_tag_after(dev, HWI_TAG_NAME_location);

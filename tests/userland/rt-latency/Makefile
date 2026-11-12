@@ -148,7 +148,8 @@ $(BUILD_BASE)/mem-pressure: $(OBJDIR)/mem-pressure.o $(CRT0_O) $(LIBC_SO)
 	$(msg) LD $@
 	$(Q)$(LD) -nostdlib -o $@ $(CRT0_O) $< $(LIBC_SO)
 
-$(OBJDIR)/irq-notify.o $(OBJDIR)/irq-latency.o: rtc-probe.h
+$(OBJDIR)/irq-notify.o $(OBJDIR)/irq-latency.o: rtc-probe.h alarm-device.h
+$(OBJDIR)/preempt-latency.o: alarm-device.h
 
 $(BUILD_BASE)/irq-notify: $(OBJDIR)/irq-notify.o $(CRT0_O) $(LIBC_SO)
 	@mkdir -p $(@D)

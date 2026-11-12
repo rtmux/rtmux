@@ -39,14 +39,7 @@
 #include <time.h>
 #include <sys/rtmux-core.h>
 
-/* goldfish-rtc register offsets (google,goldfish-rtc). All 32-bit. */
-#define RTC_TIME_LOW 0x00        /* read latches the 64-bit time, returns low */
-#define RTC_TIME_HIGH 0x04       /* read returns the latched high half */
-#define RTC_ALARM_LOW 0x08       /* write sets low and arms the alarm */
-#define RTC_ALARM_HIGH 0x0c      /* write sets the high half */
-#define RTC_IRQ_ENABLED 0x10     /* write 1 to gate the alarm IRQ to the PLIC */
-#define RTC_CLEAR_ALARM 0x14     /* write disarms a pending alarm */
-#define RTC_CLEAR_INTERRUPT 0x1c /* write lowers the asserted IRQ */
+#include "alarm-device.h"
 
 #define RTC_PROBE_DELAY_MIN_NS 1000000ULL       /* 1 ms */
 #define RTC_PROBE_DELAY_MAX_NS 10000000ULL      /* 10 ms */
@@ -86,54 +79,21 @@ struct rtc_probe_ops {
     int (*wait)(void *ctx);
 };
 
-static inline uint32_t rtc_rd(const struct rtc_probe *p, unsigned off)
-{
-    return *(volatile uint32_t *) (p->base + off);
-}
-
-static inline void rtc_wr(const struct rtc_probe *p, unsigned off, uint32_t v)
-{
-    *(volatile uint32_t *) (p->base + off) = v;
-}
-
-/* Read the 64-bit RTC time in nanoseconds.  Reading TIME_LOW latches the high
- * half, so the two reads see one consistent snapshot.
- */
 static inline uint64_t rtc_now(const struct rtc_probe *p)
 {
-    uint32_t lo = rtc_rd(p, RTC_TIME_LOW);
-    uint32_t hi = rtc_rd(p, RTC_TIME_HIGH);
-
-    return ((uint64_t) hi << 32) | lo;
+    return alarm_now(p->base);
 }
-
-/* Program the alarm.  Write HIGH first, then LOW arms.  With enable_irq == 0
- * the alarm still runs but its IRQ is never gated to the PLIC (the line is
- * disabled before the alarm is written, so there is no window for it to fire).
- */
-static inline void rtc_arm(const struct rtc_probe *p,
-                           uint64_t when,
-                           int enable_irq)
+static inline void rtc_arm(const struct rtc_probe *p, uint64_t when, int enabled)
 {
-    rtc_wr(p, RTC_IRQ_ENABLED, enable_irq ? 1 : 0);
-    rtc_wr(p, RTC_ALARM_HIGH, (uint32_t) (when >> 32));
-    rtc_wr(p, RTC_ALARM_LOW, (uint32_t) when);
+    alarm_arm(p->base, when, enabled);
 }
-
-/* Lower an asserted IRQ. */
 static inline void rtc_clear(const struct rtc_probe *p)
 {
-    rtc_wr(p, RTC_CLEAR_INTERRUPT, 1);
+    alarm_clear(p->base);
 }
-
-/* Disarm any pending alarm and lower any asserted IRQ, so a stale alarm cannot
- * fire the instant an attach path unmasks.
- */
 static inline void rtc_reset(const struct rtc_probe *p)
 {
-    rtc_wr(p, RTC_IRQ_ENABLED, 0);
-    rtc_wr(p, RTC_CLEAR_ALARM, 1);
-    rtc_wr(p, RTC_CLEAR_INTERRUPT, 1);
+    alarm_reset(p->base);
 }
 
 static inline uint64_t rtc_probe_mono_ns(void)
