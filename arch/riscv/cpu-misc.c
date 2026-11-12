@@ -408,6 +408,7 @@ void rdecl smp_flush_tlb(void)
  */
 void cpu_idle(unsigned cpu)
 {
+    interrupt_disable();
     /* tp is invariant per hart (set once at bootstrap, never reassigned in
      * S-mode), so thread migration cannot leave it stale. ksys_exit's
      * idle-fallback path stamps tp = &pcpu_array[cpu] before tail-calling here.

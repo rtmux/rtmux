@@ -141,12 +141,16 @@ static int idle_unlink_ready(kdispatch_t *dpp, thread_t *thp)
  * The lock window ends inside this function — the dispatch lock is a leaf
  * spinlock and cannot straddle a context switch. The per-CPU bookkeeping
  * (set_active_thread, actives_prp) stays in cpu_idle() after this returns;
- * those slots are single-writer (this CPU only) and need no lock.
+ * those slots are single-writer (this CPU only) and need no lock. Preserve
+ * the caller's IRQ mask across every unlock: enabling a timer after selecting
+ * a thread but before cpu_idle installs it can overwrite the active slot and
+ * strand a RUNNING thread outside every run queue.
  */
 thread_t *idle_pick_thread(unsigned cpu)
 {
     kdispatch_t *dpp;
     thread_t *thp;
+    unsigned long irqstate;
     extern unsigned hart_ids[];
 
     /* Boot-once gates — set before APs come up, never cleared. */
@@ -162,7 +166,7 @@ thread_t *idle_pick_thread(unsigned cpu)
      *          order — so we don't risk overlap by construction).
      * Phase 3: orphan-scan fallback under LOCAL_DPP.
      */
-    SCHED_LOCK_LOCAL();
+    irqstate = kspinlock_lock_irqsave(&LOCAL_DPP->lock);
     dpp = pcpu_array[cpu].pc_dispatch;
     for (int pri = NUM_PRI - 1; pri >= 0; pri--) {
         if (!DISPATCH_ISSET(dpp, pri))
@@ -175,12 +179,12 @@ thread_t *idle_pick_thread(unsigned cpu)
                     continue;
                 thp->state = STATE_RUNNING;
                 thp->runcpu = cpu;
-                SCHED_UNLOCK_LOCAL();
+                kspinlock_unlock_irqrestore(&LOCAL_DPP->lock, irqstate);
                 return thp;
             }
         }
     }
-    SCHED_UNLOCK_LOCAL();
+    kspinlock_unlock_irqrestore(&LOCAL_DPP->lock, irqstate);
 
     /* Phase 2: try to steal from remote harts (each lock taken independently,
      * no nested holds).
@@ -192,7 +196,7 @@ thread_t *idle_pick_thread(unsigned cpu)
         dpp = pcpu_array[src_hart].pc_dispatch;
         if (!dpp)
             continue;
-        SCHED_LOCK(dpp);
+        irqstate = kspinlock_lock_irqsave(&dpp->lock);
         for (int pri = NUM_PRI - 1; pri >= 0; pri--) {
             if (!DISPATCH_ISSET(dpp, pri))
                 continue;
@@ -206,16 +210,16 @@ thread_t *idle_pick_thread(unsigned cpu)
                     thp->dpp = pcpu_array[cpu].pc_dispatch;
                     thp->state = STATE_RUNNING;
                     thp->runcpu = cpu;
-                    SCHED_UNLOCK(dpp);
+                    kspinlock_unlock_irqrestore(&dpp->lock, irqstate);
                     return thp;
                 }
             }
         }
-        SCHED_UNLOCK(dpp);
+        kspinlock_unlock_irqrestore(&dpp->lock, irqstate);
     }
 
     /* Phase 3: orphan-scan fallback. */
-    SCHED_LOCK_LOCAL();
+    irqstate = kspinlock_lock_irqsave(&LOCAL_DPP->lock);
     for (int t = 0; t < kernel_threads_prp->threads.nentries; t++) {
         thp = vector_lookup(&kernel_threads_prp->threads, (unsigned) t);
         if (thp && thp->state == STATE_READY &&
@@ -223,11 +227,11 @@ thread_t *idle_pick_thread(unsigned cpu)
             thp->dpp = pcpu_array[cpu].pc_dispatch;
             thp->state = STATE_RUNNING;
             thp->runcpu = cpu;
-            SCHED_UNLOCK_LOCAL();
+            kspinlock_unlock_irqrestore(&LOCAL_DPP->lock, irqstate);
             return thp;
         }
     }
-    SCHED_UNLOCK_LOCAL();
+    kspinlock_unlock_irqrestore(&LOCAL_DPP->lock, irqstate);
     return NULL;
 }
 
