@@ -3649,10 +3649,16 @@ static void test_namespace_open_entry_generation_race(void)
         int fd;
         int saw_access;
 
-        saw_access = access(path, F_OK) == 0;
         gen_before = gen_after = 0;
-        if (saw_access)
-            (void) read_namespace_counter("namespace_version", &gen_before);
+        /* Bracket BOTH lookups. Reading the initial generation after access()
+         * misses a legitimate unlink between access() and that snapshot and
+         * falsely reports a stale-cache failure on a faster second CPU. */
+        if (read_namespace_counter("namespace_version", &gen_before) == -1) {
+            bad++;
+            last_bad_errno = errno;
+            continue;
+        }
+        saw_access = access(path, F_OK) == 0;
         errno = 0;
         fd = name_open(name, 0);
         if (fd != -1) {
