@@ -73,7 +73,10 @@ ksys_interrupt_attach_thread(thread_t *act,
          * already be live by that point or the IST never sees its first IRQ.
          */
         interrupt_t *itp = vector_lookup(&interrupt_vector, (unsigned) id);
-        unsigned cpu = get_cpunum();
+        /* A controller may have a fixed delivery CPU (Pi3 routes all GPU
+         * sources together). cpu_intr_attach supplies that constraint. */
+        unsigned cpu = itp && itp->owner_hart != 0xff ?
+                           itp->owner_hart : get_cpunum();
         if (itp) {
             itp->owner_hart = (uint8_t) cpu;
         }
@@ -146,7 +149,8 @@ ksys_interrupt_attach_event(thread_t *act,
          * separately.
          */
         interrupt_t *itp = vector_lookup(&interrupt_vector, (unsigned) id);
-        unsigned cpu = get_cpunum();
+        unsigned cpu = itp && itp->owner_hart != 0xff ?
+                           itp->owner_hart : get_cpunum();
         if (itp) {
             itp->owner_hart = (uint8_t) cpu;
         }
