@@ -85,6 +85,7 @@ enum Elf_e_machine {
     EM_PPC,         /* Power PC */
     EM_ARM = 40,    /* ARM */
     EM_SH = 42,     /* Hitachi SH */
+    EM_AARCH64 = 183, /* ARM AArch64 */
     EM_RISCV = 243, /* RISC-V */
     EM_NUM
 };

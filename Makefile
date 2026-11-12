@@ -60,6 +60,15 @@ endif
 
 all: $(AUTOCONF_H) $(VER_FILE) startup initramfs
 
+# Experimental AArch64 platform bootstrap; intentionally not part of `all`.
+# Its private include path does not switch the RISC-V include/arch symlink.
+.PHONY: pi3-bringup check-pi3-bringup
+pi3-bringup:
+	$(Q)$(MAKE) -f mk/pi3-bringup.mk all
+
+check-pi3-bringup:
+	$(Q)$(MAKE) -f mk/pi3-bringup.mk check
+
 # Verify QEMU is available. OpenSBI ships with QEMU 11+ (and macOS
 # Homebrew packages it that way), so we only check for the QEMU binary
 # itself; scripts/emu.sh auto-detects opensbi (default = bundled, Debian path

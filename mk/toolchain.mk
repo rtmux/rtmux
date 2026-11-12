@@ -13,9 +13,11 @@ TOPDIR    := $(DEFMK_DIR)..
 # Pick up the Kconfig-generated .config (CONFIG_FOO=y → Make variables).
 -include $(TOPDIR)/.config
 
-# Architecture. RTMux currently supports only RISC-V.
-ifneq ($(filter defconfig menuconfig guiconfig oldconfig savedefconfig,$(MAKECMDGOALS)),)
-  # Kconfig-only targets work without .config — skip arch setup.
+# Architecture selected by Kconfig.
+_PI3_GOALS := pi3-bringup check-pi3-bringup
+_PI3_ONLY := $(if $(filter $(_PI3_GOALS),$(MAKECMDGOALS)),$(if $(filter-out $(_PI3_GOALS),$(MAKECMDGOALS)),,yes))
+ifneq ($(filter defconfig menuconfig guiconfig oldconfig savedefconfig,$(MAKECMDGOALS))$(_PI3_ONLY),)
+  # Kconfig and the standalone Pi3 bootstrap do not need RISC-V arch setup.
   ARCH = none
   CROSS_COMPILE ?= none-
 else
