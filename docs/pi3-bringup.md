@@ -110,9 +110,12 @@ The gate was run locally with Clang/LLD 18 and QEMU
 
 ## Relationship to the native port
 
-This is an isolated architecture diagnostic. The native kernel, roottask and
-user-space ABI are introduced separately. Its private SVC protocol and fixed
-memory map do not define the native kernel ABI.
+The architecture interfaces, syspage, process address spaces, syscall ABI,
+libc/ELF loader, roottask, shell and PL011 user-space driver are now implemented
+in the [native port](pi3.md). Its separate coverage gate runs the shared RISC-V
+suite and the native IRQ, scheduling, storage and serial contracts. This small
+bootstrap remains a diagnostic fixture; its private SVC protocol and fixed
+memory layout are not the full kernel's ABI or memory policy.
 
 Physical Pi3 validation remains separate: firmware handoff, device tree,
 reserved memory, GPIO alternate functions, UART clock, cache/coherency behavior

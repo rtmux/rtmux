@@ -70,6 +70,14 @@ make qemu          # build and boot; log in as root / RTMux
 Build commands, POSIX profile selection, LKL builds, QEMU options, and CI are in
 [docs/building.md](docs/building.md).
 
+The [AArch64 / Raspberry Pi 3B port](docs/pi3.md) boots the native kernel,
+roottask and interactive shell on four QEMU CPUs, without Linux or LKL.
+Select `configs/pi3_defconfig`, then use `make pi3`, `make qemu-pi3` or
+`make check-pi3`. For shared RISC-V syscall, POSIX profile, IRQ, serial, block/VFS
+and scheduling coverage, select `configs/pi3_coverage_defconfig` and run
+`make check-pi3-coverage` plus `make check-pi3-profiles`. The separate `make check-pi3-bringup` target retains the
+low-level architecture diagnostics.
+
 ## POSIX conformance profiles
 
 | Profile | Scope |

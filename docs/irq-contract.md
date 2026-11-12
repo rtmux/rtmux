@@ -71,7 +71,9 @@ IRQs on return would permit a handler to reacquire the interrupted lock.
 AArch64 asserts that peripheral masking and IRQ-claim tracing return masked.
 `tests/host/test-trace-irq-mask.py` exercises the real trace append function
 across 16 enabled/masked buffer paths and rejects an unconditional-enable
-mutation.
+mutation. The Pi3 coverage gate also runs all-class, syscall-only and IRQ-only
+tracers sequentially in the same boot, requiring the expected event classes and
+50 actual peripheral IRQ wakeups.
 
 ## Notification/Event Tradeoff
 

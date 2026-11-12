@@ -955,7 +955,7 @@ check-indent: check-style-deps
 	    fi
 
 # Native RTMux kernel + roottask + dynamically linked userland on QEMU Pi 3B.
-.PHONY: pi3 qemu-pi3 check-pi3
+.PHONY: pi3 qemu-pi3 check-pi3 check-pi3-coverage check-pi3-profiles
 pi3:
 ifeq ($(ARCH),aarch64)
 	$(Q)$(MAKE) all
@@ -967,3 +967,8 @@ qemu-pi3: pi3
 	$(Q)python3 scripts/run-pi3.py --out "$(OUT)"
 check-pi3: pi3
 	$(Q)python3 scripts/run-pi3.py --check --out "$(OUT)"
+check-pi3-coverage: pi3
+	$(Q)python3 tests/arch/aarch64/test-coverage-runner.py
+	$(Q)python3 scripts/check-pi3-coverage.py --out "$(OUT)" $(ARGS)
+check-pi3-profiles:
+	$(Q)python3 scripts/check-pi3-profiles.py --out "$(OUT)/pi3-profiles" $(ARGS)
