@@ -1214,3 +1214,8 @@ void rdecl cpu_free_perfregs(thread_t *thp)
 void rdecl cpu_debug_init_perfregs(void) {}
 
 extern unsigned hart_ids[];
+
+void cpu_console_write(const char *s, unsigned long n)
+{
+    sbi_dbcn_write(s, n);
+}

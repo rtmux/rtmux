@@ -420,27 +420,19 @@ static inline void debug_kdbreak(void)
     );
 }
 
-/* Preserve the caller's IRQ mask across common kernel critical sections. */
-static inline unsigned long cpu_irq_save(void)
-{
-    unsigned long value = r_sstatus();
-    w_sstatus(value & ~SSTATUS_SIE);
-    return value;
-}
 
-static inline void cpu_irq_restore(unsigned long value)
-{
-    if (value & SSTATUS_SIE)
-        interrupt_enable();
-}
-
+static inline unsigned long cpu_irq_save(void) { unsigned long v=r_sstatus(); w_sstatus(v & ~SSTATUS_SIE); return v; }
+static inline void cpu_irq_restore(unsigned long v) { if (v & SSTATUS_SIE) interrupt_enable(); }
 static inline uintptr_t cpu_page_table_root(void) { return r_satp(); }
+
+static inline uintptr_t cpu_exception_pc(void) { return r_sepc(); }
+
+/* Architecture-neutral hooks used by common kernel code. */
+#define __cpu_store_barrier() __asm__ volatile("fence rw, w" ::: "memory")
+#define cpu_relax() __asm__ volatile(".word 0x0100000f" ::: "memory")
 static inline void cpu_tlb_flush(void)
 {
     __asm__ volatile("sfence.vma" ::: "memory");
 }
-
-#define __cpu_store_barrier() __asm__ volatile("fence rw, w" ::: "memory")
-#define cpu_relax() __asm__ volatile(".word 0x0100000f" ::: "memory")
 
 #endif
