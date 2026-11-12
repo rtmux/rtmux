@@ -2147,7 +2147,8 @@ run_one()
     local runner=$!
     local terminal=0
     while kill -0 "$runner" 2>/dev/null; do
-        if grep -Fq "$FAIL_MARKER" "$log" || grep -Eq "$BAD_RE" "$log"; then
+        if grep -Fq "$FAIL_MARKER" "$log" || grep -Fq "RTMux ${MODE}: SKIP" "$log" ||
+           grep -Eq "$BAD_RE" "$log"; then
             terminal=1
             kill "$runner" 2>/dev/null || true
             break
@@ -2228,6 +2229,12 @@ run_one()
         echo "  FAIL     ${MODE} boot log contains crash/fault signature"
         grep -En "$BAD_RE" "$log" | tail -n 20
         tail -n 160 "$log"
+        return 1
+    fi
+
+    if grep -Fq "RTMux ${MODE}: SKIP" "$log"; then
+        echo "  FAIL     ${MODE} did not run (the guest skipped it); a mode that must run cannot pass by skipping:"
+        grep -E "^${MODE}: SKIP|RTMux ${MODE}: SKIP" "$log" | head -n 3
         return 1
     fi
 

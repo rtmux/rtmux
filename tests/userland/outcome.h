@@ -18,6 +18,14 @@
 #include <stdio.h>
 #include <string.h>
 
+/*
+ * Exit status of a program that ran nothing because its precondition is missing
+ * (too few harts, no counter). The init wrapper turns it into "RTMux <mode>:
+ * SKIP" and the harness fails a mode that must run, so a skip never reads as a
+ * pass.
+ */
+#define TC_EXIT_SKIP 77
+
 struct test_counts {
     int run;     /* cases that executed: passed + failed + gap */
     int passed;

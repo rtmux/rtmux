@@ -250,16 +250,25 @@ fi
 # Preempt-latency probe: a timer wake of a high-priority thread must preempt a
 # busy same-hart low-priority thread; a watchdog on another hart names the gap
 # if it does not, instead of hanging.
+# The benchmark wrappers below map the exit status to a marker: 0 is PASS, 77
+# (TC_EXIT_SKIP in tests/userland/outcome.h) means it ran nothing and is SKIP, and
+# anything else is FAIL. The toolbox sh has no elif, hence the nested if.
 if test "$rtmux_run" = "preempt-latency"; then
     # The IRQ-notification source needs the virtio-mmio resource server for the
     # goldfish-rtc delegation, so bring the bus up first (as irq-notify does).
     /sbin/virtio-mmio
     /sbin/virtio-mmio --register-boot
     echo "RTMux preempt-latency: BEGIN"
-    if /bin/preempt-latency; then
+    /bin/preempt-latency
+    rc=$?
+    if test "$rc" = 0; then
         echo "RTMux preempt-latency: PASS"
     else
-        echo "RTMux preempt-latency: FAIL"
+        if test "$rc" = 77; then
+            echo "RTMux preempt-latency: SKIP"
+        else
+            echo "RTMux preempt-latency: FAIL"
+        fi
     fi
     shutdown -h
     sleep 1
@@ -270,10 +279,16 @@ fi
 # a high-priority waiter on another; measure the unlock-to-acquire handoff.
 if test "$rtmux_run" = "mutex-wake"; then
     echo "RTMux mutex-wake: BEGIN"
-    if /bin/mutex-wake; then
+    /bin/mutex-wake
+    rc=$?
+    if test "$rc" = 0; then
         echo "RTMux mutex-wake: PASS"
     else
-        echo "RTMux mutex-wake: FAIL"
+        if test "$rc" = 77; then
+            echo "RTMux mutex-wake: SKIP"
+        else
+            echo "RTMux mutex-wake: FAIL"
+        fi
     fi
     shutdown -h
     sleep 1
@@ -284,10 +299,16 @@ fi
 # unlock pair for the default userland fast path and the PRIO_PROTECT kernel path.
 if test "$rtmux_run" = "mutex-uncontended"; then
     echo "RTMux mutex-uncontended: BEGIN"
-    if /bin/mutex-uncontended; then
+    /bin/mutex-uncontended
+    rc=$?
+    if test "$rc" = 0; then
         echo "RTMux mutex-uncontended: PASS"
     else
-        echo "RTMux mutex-uncontended: FAIL"
+        if test "$rc" = 77; then
+            echo "RTMux mutex-uncontended: SKIP"
+        else
+            echo "RTMux mutex-uncontended: FAIL"
+        fi
     fi
     shutdown -h
     sleep 1
@@ -298,10 +319,16 @@ fi
 # ordered receive queue keeps the high-priority client bounded under contention.
 if test "$rtmux_run" = "ipc-contention"; then
     echo "RTMux ipc-contention: BEGIN"
-    if /bin/ipc-contention; then
+    /bin/ipc-contention
+    rc=$?
+    if test "$rc" = 0; then
         echo "RTMux ipc-contention: PASS"
     else
-        echo "RTMux ipc-contention: FAIL"
+        if test "$rc" = 77; then
+            echo "RTMux ipc-contention: SKIP"
+        else
+            echo "RTMux ipc-contention: FAIL"
+        fi
     fi
     shutdown -h
     sleep 1
@@ -466,8 +493,17 @@ if test "$rtmux_run" = "tracelogger-pi"; then
     /bin/tracelogger 0 4000 windowed &
     sleep 1
     /bin/mutex-wake
+    rc=$?
     sleep 3
-    echo "RTMux tracelogger-pi: PASS"
+    if test "$rc" = 0; then
+        echo "RTMux tracelogger-pi: PASS"
+    else
+        if test "$rc" = 77; then
+            echo "RTMux tracelogger-pi: SKIP"
+        else
+            echo "RTMux tracelogger-pi: FAIL"
+        fi
+    fi
     shutdown -h
     sleep 1
     exec /bin/sh -i
