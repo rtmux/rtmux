@@ -1558,6 +1558,21 @@ if { [ "$MODE" = "rr-fairness" ] || [ "$MODE" = "sporadic-budget" ]; } && [ -z "
     export CPUS
 fi
 
+# The *-isolated LKL modes pin the LKL server to CPU1 and the *-split modes pin
+# the load and the probe to CPU1 and CPU0, so they need two harts. The one-vCPU
+# default has no CPU1: an isolated pin fails with EINVAL and the server never
+# starts, and a split run silently falls back to one CPU.
+case "$MODE" in
+lkl-fsd-tree-isolated|lkl-netd-http-isolated|lkl-fsd-tree-split|lkl-netd-http-split)
+    [ -n "${CPUS:-}" ] || CPUS=2
+    export CPUS
+    if [ "$CPUS" -lt 2 ]; then
+        echo "qemu-regress: $MODE needs CPUS >= 2" >&2
+        exit 2
+    fi
+    ;;
+esac
+
 # preempt-latency pins a waiter and hog to CPU0, a watchdog to CPU1, and the
 # controller to CPU2, and the timer-wake gap it probes only appears with more
 # than two harts. Default to four vCPUs when the caller did not set CPUS.
@@ -2263,10 +2278,11 @@ run_one()
 
     # lkl-multi-crash proves lkl-fsd survives an lkl-netd crash. The absence of
     # /net alone would also hold if lkl-netd merely exited cleanly, so require
-    # the crash path's own marker before trusting the isolation result.
+    # the crash path's own marker (the one --serve-net-crash-on-ping prints) before
+    # trusting the isolation result.
     if [ "$MODE" = "lkl-multi-crash" ] &&
-       ! grep -Fq 'lkl-netd: intentional crash after start' "$log"; then
-        echo "  FAIL     ${MODE} lkl-netd did not log its intentional crash"
+       ! grep -Fq 'lkl: virtio-net crash after bounced tx' "$log"; then
+        echo "  FAIL     ${MODE} lkl-netd did not crash after its first bounced TX"
         tail -n 160 "$log"
         return 1
     fi

@@ -44,7 +44,8 @@ LKL_EXT4_IMG = $(IMAGE_DIR)/lkl-ext4.img
 .PHONY: check-boot-manifest check-loader-negative verify
 .PHONY: check-evidence-claims check-fault-recovery check-platform-boundary-contracts
 .PHONY: check-fu740-smoke-scripts check-make-target-names check-ci-coverage check-lkl-scripts
-.PHONY: check-header-deps check-gap-anchors
+.PHONY: check-header-deps check-gap-anchors check-rt-extra check-irq-modes check-hart-watchdog
+.PHONY: check-guest-misc check-trace-modes check-leak-gate check-version-skew
 .PHONY: footprint-report check-lkl check-lkl-containment check-lkl-iommu-preflight check-lkl-iommu-live check-lkl-qemu check-lkl-differential check-lkl-trace check-trace-export check-trace-overhead
 .PHONY: check-qemu-deps check-lkl-differential-deps check-map-phys-inventory check-rcu-sched driver-gate indent check-indent check-style-deps
 .PHONY: posix-matrix check-posix-matrix check-posix-matrix-strict-ignore check-posix-matrix-options check-pse51 check-opts-pse51 check-posix-profile-header check-posix-profile-config check-posix-profile-surface posix-profile-boot-probe check-lkl-floor check-lkl-profile lkl-profile-smoke check-syscall-abi check-libc-abi
@@ -260,12 +261,23 @@ LKL_QEMU_MODES = \
     lkl-netd-crash:180 \
     lkl-netd-revoke:180 \
     lkl-netd-stale:180 \
-    lkl-netd-http:300
+    lkl-netd-http:300 \
+    lkl-fsd-restart:180 \
+    lkl-fsd-tree-split:180 \
+    lkl-fsd-tree-isolated:180 \
+    lkl-multi-crash:180 \
+    lkl-multi-stress:360 \
+    lkl-netd-http-split:300 \
+    lkl-netd-http-isolated:300 \
+    lkl-netd-restart:180
 
 LKL_DIFF_MODES = \
     lkl-fsd-tree:180 \
     lkl-netd-http:300 \
-    lkl-multi:180
+    lkl-multi:180 \
+    shutdown-sync:180 \
+    shutdown-sync-ignore:180 \
+    shutdown-sync-negative:180
 LKL_HOST_AUTHORED_MODES = \
     lkl-fsd-tricky:180
 LKL_TRACE_TIMEOUT ?= 360
@@ -273,6 +285,8 @@ QEMU_SYSCALL_TIMEOUT ?= 300
 QEMU_SMP_TIMEOUT ?= 180
 # Seconds a guest boot or mode may run; slower hosts (CI runners) raise it.
 QEMU_BOOT_TIMEOUT ?= 180
+# The tracelogger modes rebuild the kernel with instrumentation and run longer.
+QEMU_TRACE_TIMEOUT ?= 600
 LKL_TRACE_MODES = \
     tracelogger-lkl-fsd:$(LKL_TRACE_TIMEOUT) \
     tracelogger-lkl-netd:$(LKL_TRACE_TIMEOUT)
@@ -475,6 +489,7 @@ check-lkl-scripts:
 
 check-ci-coverage:
 	$(msg) CHECK CI covers every test target
+	$(Q)$(PYTHON) scripts/check-ci-coverage.py --self-test
 	$(Q)$(PYTHON) scripts/check-ci-coverage.py
 
 # Every guest test_gap() anchor must be a well-formed tracking id.
@@ -716,6 +731,62 @@ check-rt: check-rcu-sched check-rt-budgets check-qemu-deps $(AUTOCONF_H) $(VER_F
 	@echo "  CHECK    boot RTMux + realtime probes"
 	$(Q)scripts/qemu-regress.sh --mode rt-check --timeout $(QEMU_BOOT_TIMEOUT)
 	$(Q)scripts/qemu-regress.sh --mode pi-inversion-xfail --timeout 140
+
+# QEMU modes with no gate of their own, grouped by what they exercise. Each mode
+# boots the guest once. scripts/check-ci-coverage.py requires every mode listed in
+# scripts/qemu-regress.sh to be run by a target here (or by another gate) or to be
+# waived there with a reason.
+RT_EXTRA_MODES = ipc-priority-donation ipc-roundtrip logger-restart monotonic-time \
+                 mutex-uncontended mutex-wake rr-fairness sporadic-budget tickless-idle \
+                 preempt-latency ipc-contention rcu-lookup-measure revoke-stress
+IRQ_MODES = irq-notify irq-notify-suppress fdt-cpu-status
+HART_WATCHDOG_MODES = debug-inject hart-watchdog hart-watchdog-console \
+                      hart-watchdog-idle roottask-wait-watch
+GUEST_MISC_MODES = posix-cap-boundary sh-posix serial-unblock trace-negative syslog-wrap \
+                   shutdown-sync-wedge
+# Each rebuilds the kernel with instrumentation, so they are slower than the others.
+TRACE_MODES = tracelogger tracelogger-irq tracelogger-kcall tracelogger-pi
+
+# run-qemu-modes MODES TIMEOUT: boot every mode, then fail if any did, so one broken
+# mode does not hide how many of the group are broken.
+define run-qemu-modes
+	$(Q)rc=0; for m in $(1); do \
+	    echo "  QEMU     $$m"; \
+	    ./scripts/qemu-regress.sh --mode $$m --timeout $(2) || { echo "  FAILED   $$m"; rc=1; }; \
+	done; exit $$rc
+endef
+
+check-rt-extra: check-qemu-deps $(AUTOCONF_H) $(VER_FILE) startup initramfs
+	$(msg) CHECK "extra realtime modes"
+	$(call run-qemu-modes,$(RT_EXTRA_MODES),$(QEMU_BOOT_TIMEOUT))
+
+check-irq-modes: check-qemu-deps $(AUTOCONF_H) $(VER_FILE) startup initramfs
+	$(msg) CHECK "interrupt notification modes"
+	$(call run-qemu-modes,$(IRQ_MODES),$(QEMU_BOOT_TIMEOUT))
+
+check-hart-watchdog: check-qemu-deps $(AUTOCONF_H) $(VER_FILE) startup initramfs
+	$(msg) CHECK "stall detector and hart watchdog modes"
+	$(call run-qemu-modes,$(HART_WATCHDOG_MODES),$(QEMU_BOOT_TIMEOUT))
+
+check-guest-misc: check-qemu-deps $(AUTOCONF_H) $(VER_FILE) startup initramfs
+	$(msg) CHECK "capability, shell, serial and trace guest modes"
+	$(call run-qemu-modes,$(GUEST_MISC_MODES),$(QEMU_BOOT_TIMEOUT))
+
+check-trace-modes: check-qemu-deps $(AUTOCONF_H) $(VER_FILE) startup initramfs
+	$(msg) CHECK "tracelogger modes (instrumented kernel)"
+	$(call run-qemu-modes,$(TRACE_MODES),$(QEMU_TRACE_TIMEOUT))
+
+# Runs the whole suite three times in one boot after a kill-and-spawn storm: far
+# longer than the other modes.
+check-leak-gate: check-qemu-deps $(AUTOCONF_H) $(VER_FILE) startup initramfs
+	$(msg) CHECK "resource leak gate (kill storm and repeated suite laps)"
+	$(Q)./scripts/qemu-regress.sh --mode leak-gate --timeout 1800
+
+# Boots a kernel and an initramfs from two different trees and requires exactly
+# one version-skew report. Builds two trees, so it is slow.
+check-version-skew: check-qemu-deps
+	$(msg) CHECK "kernel/initramfs version skew is reported"
+	$(Q)scripts/qemu-regress.sh --mode version-skew --timeout $(QEMU_BOOT_TIMEOUT)
 
 POSIX_MATRIX_SCRIPT = scripts/gen-posix-matrix.py
 

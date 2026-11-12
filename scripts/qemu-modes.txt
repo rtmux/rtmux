@@ -1,0 +1,92 @@
+# The QEMU modes of scripts/qemu-regress.sh: the values of --mode.
+#
+# scripts/check-ci-coverage.py requires every mode listed here to be run by a CI
+# target, or to carry "# waived: <reason>" saying why CI does not run it. A waiver
+# on a mode that CI now runs, or a mode no longer handled by the script, is an
+# error, and so is a mode the script dispatches on that is not listed here.
+#
+# One mode per line.
+boot    # waived: the same ^login: and /usr-before-login checks run through pci-nvme-smoke
+boot-manifest
+debug-inject
+fault-recovery
+fdt-cpu-status
+gpio-latency    # waived: needs the FU740 GPIO loopback; under QEMU it only reports UNSUPPORTED (the preflight in scripts/fu740-gpio-latency.sh, which the board script runs unless given --skip-preflight)
+hang-inject    # waived: needs a gdb stub and a deliberately hung guest (--gdb-on-timeout); run on demand through scripts/hunt-hang.sh
+hart-watchdog
+hart-watchdog-console
+hart-watchdog-idle
+interactive-smoke
+ipc-contention
+ipc-priority-donation
+ipc-roundtrip
+irq-notify
+irq-notify-suppress
+leak-gate
+least-privilege-manifest
+lkl-contain
+lkl-fsd-crash
+lkl-fsd-restart
+lkl-fsd-tree
+lkl-fsd-tree-isolated
+lkl-fsd-tree-split
+lkl-fsd-tricky
+lkl-host-selftest
+lkl-iommu-dma-deny    # waived: run by check-lkl-iommu-live (waived: needs QEMU with riscv-iommu-sys; the runner ships 8.2); without it the mode prints UNSUPPORTED and exits 0
+lkl-iommu-domain    # waived: run by check-lkl-iommu-live (waived: needs QEMU with riscv-iommu-sys; the runner ships 8.2); without it the mode prints UNSUPPORTED and exits 0
+lkl-iommu-domain-preflight
+lkl-iommu-metadata
+lkl-iommu-probe
+lkl-iommu-revoke    # waived: run by check-lkl-iommu-live (waived: needs QEMU with riscv-iommu-sys; the runner ships 8.2); without it the mode prints UNSUPPORTED and exits 0
+lkl-iommu-sys-probe
+lkl-multi
+lkl-multi-crash
+lkl-multi-stress
+lkl-netd-crash
+lkl-netd-direct-denied
+lkl-netd-http
+lkl-netd-http-isolated
+lkl-netd-http-split
+lkl-netd-iommu-fail-closed
+lkl-netd-restart
+lkl-netd-revoke
+lkl-netd-stale
+loader-negative
+logger-restart
+monotonic-time
+mutex-uncontended
+mutex-wake
+opts-pse51
+pci-nvme-smoke
+pi-inversion-xfail
+posix-cap-boundary
+preempt-latency
+rcu-lookup-measure
+revoke-stress
+roottask-wait-watch
+rr-fairness
+rt-check
+rt-check-instr    # waived: run only by check-trace-overhead (waived: needs a quiet host) and by scripts/fu740-irqoff-budget.sh on the board
+serial-unblock
+sh-posix
+shutdown-sync
+shutdown-sync-ignore
+shutdown-sync-negative
+shutdown-sync-wedge
+smp-invariants
+spawn-storm    # waived: open SMP defect; wire it as check-spawn-storm when it passes
+sporadic-budget
+syscall-testing
+syscall-testing-disk
+syslog-wrap
+tickless-idle
+toolbox
+trace-negative
+tracelogger
+tracelogger-irq
+tracelogger-kcall
+tracelogger-lkl-fsd
+tracelogger-lkl-netd
+tracelogger-lkl-netd-default    # waived: its trace has no per-kernel-call rows, which check-lkl-trace requires of every mode; it needs its own assertions first
+tracelogger-pi
+version-skew
