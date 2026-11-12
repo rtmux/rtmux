@@ -87,6 +87,9 @@ static char *get_string(unsigned off)
 static void asinfo_string_name(struct asinfo_entry *curr)
 {
     struct asinfo_entry *base = _SYSPAGE_ENTRY(PSP_SYSPAGE, asinfo);
+    /* An owner chain is shorter than the table; a longer walk is a cycle, and
+     * each hop costs an alloca, so stop rather than overflow the stack. */
+    unsigned hops = (unsigned) (_SYSPAGE_ENTRY_SIZE(PSP_SYSPAGE, asinfo) / sizeof(*base));
     struct list {
         struct list *next;
         struct asinfo_entry *as;
@@ -98,7 +101,7 @@ static void asinfo_string_name(struct asinfo_entry *curr)
         new->next = chain;
         new->as = curr;
         chain = new;
-        if (curr->owner == PSP_NATIVE_ENDIAN16(AS_NULL_OFF))
+        if (curr->owner == PSP_NATIVE_ENDIAN16(AS_NULL_OFF) || hops-- == 0)
             break;
         curr = (struct asinfo_entry *) ((uint8_t *) base +
                                         PSP_NATIVE_ENDIAN16(curr->owner));

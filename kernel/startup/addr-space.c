@@ -207,10 +207,13 @@ static int match_name(struct asinfo_entry *base,
                       struct asinfo_entry *as,
                       const char *name)
 {
+    /* An owner chain is shorter than the table; a longer walk is a cycle. */
+    unsigned hops = (unsigned) (lsp.asinfo.size / sizeof(*as));
+
     for (;;) {
         if (!strcmp(__hwi_find_string(as->name), name))
             return 1;
-        if (as->owner == AS_NULL_OFF)
+        if (as->owner == AS_NULL_OFF || hops-- == 0)
             return 0;
         as = ((struct asinfo_entry *) ((uint8_t *) base + as->owner));
     }
