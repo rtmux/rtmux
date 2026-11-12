@@ -474,7 +474,7 @@ check-porting-contract: libc
 
 check-kernel-nofp:
 	$(msg) CHECK "kernel executes no FP instructions"
-	$(Q)OBJDUMP="$(OBJDUMP)" scripts/check-kernel-nofp.sh
+	$(Q)OBJDUMP="$(OBJDUMP)" KERNEL="$(OUT)/arch/$(ARCH)/rtmux-kernel" scripts/check-kernel-nofp.sh
 
 check-lkl-scripts:
 	$(msg) CHECK LKL source fetch and patch scripts

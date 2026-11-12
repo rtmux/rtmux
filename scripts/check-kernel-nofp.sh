@@ -11,6 +11,10 @@ KERNEL=${KERNEL:-$ROOT/build/arch/riscv/rtmux-kernel}
 
 [ -f "$KERNEL" ] || { echo "check-kernel-nofp: build the kernel first (make)" >&2; exit 1; }
 
+if "$OBJDUMP" -f "$KERNEL" | grep -q aarch64; then
+    exec python3 "$ROOT/scripts/check-aarch64-kernel-nofp.py" "$OBJDUMP" "$KERNEL"
+fi
+
 bad=$($OBJDUMP -d "$KERNEL" | awk '
     /^[0-9a-f]+ <[^>]+>:$/ { fn = $2; gsub(/[<>:]/, "", fn); next }
     $3 ~ /^csr[rw][sc]?i?$/ && $0 ~ /(fcsr|frm|fflags)/ {

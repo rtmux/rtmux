@@ -33,6 +33,21 @@ need_order arch/riscv/exit.c \
     'set_active_thread(cpu, NULL);' \
     'dead-thread exit loop must publish a quiescent state before clearing active thread'
 
+need_order arch/aarch64/cpu-misc.c \
+    'rcu_sched_quiescent();' \
+    '__asm__ volatile("wfi"' \
+    'AArch64 idle must publish a quiescent state before WFI'
+
+need_order arch/aarch64/exit.c \
+    'if ((thp->reg.pstate & 15) == 0)' \
+    'rcu_sched_quiescent();' \
+    'AArch64 EL0 return must publish a quiescent state'
+
+need_order arch/aarch64/exit.c \
+    'rcu_sched_quiescent();' \
+    'set_active_thread(cpu, NULL);' \
+    'AArch64 dead-thread exit must publish QS before clearing active thread'
+
 need_order kernel/sched/dispatch.c \
     'if (old != new)' \
     'rcu_sched_quiescent();' \
@@ -2441,12 +2456,14 @@ fi
 
 # Shared code delegates ordering and spin hints to the architecture layer.
 if ! grep -Fq 'cpu_relax();' kernel/sync/rcu.c ||
-   ! grep -Fq '#define cpu_relax() __asm__ volatile(".word 0x0100000f" ::: "memory")' arch/riscv/include/cpu-inline.h; then
+   ! grep -Fq '#define cpu_relax() __asm__ volatile(".word 0x0100000f" ::: "memory")' arch/riscv/include/cpu-inline.h ||
+   ! grep -Fq '#define cpu_relax() __asm__ volatile("yield" ::: "memory")' arch/aarch64/include/cpu-inline.h; then
     echo "RCU-sched: shared wait must use the RISC-V pause / AArch64 yield helper" >&2
     exit 1
 fi
 
-if ! grep -Fq '#define __cpu_store_barrier() __asm__ volatile("fence rw, w" ::: "memory")' arch/riscv/include/cpu-inline.h; then
+if ! grep -Fq '#define __cpu_store_barrier() __asm__ volatile("fence rw, w" ::: "memory")' arch/riscv/include/cpu-inline.h ||
+   ! grep -Fq '#define __cpu_store_barrier() __asm__ volatile("dmb ish" ::: "memory")' arch/aarch64/include/cpu-inline.h; then
     echo "RCU-sched: architecture publication barriers must order prior loads/stores before publication" >&2
     exit 1
 fi

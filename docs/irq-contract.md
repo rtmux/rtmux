@@ -62,6 +62,16 @@ Canonical examples:
   ISTs drain UART status and unmask.
 - `servers/pci/dwmsi.c`: MSI demultiplexing in user space.
 
+## IRQ state across shared trace and masking helpers
+
+`interrupt_mask()` and `add_trace_event()` preserve the caller's IRQ mask.
+They can run from a hard IRQ or while a scheduler/channel lock is held; enabling
+IRQs on return would permit a handler to reacquire the interrupted lock.
+AArch64 asserts that peripheral masking and IRQ-claim tracing return masked.
+`tests/host/test-trace-irq-mask.py` exercises the real trace append function
+across 16 enabled/masked buffer paths and rejects an unconditional-enable
+mutation.
+
 ## Notification/Event Tradeoff
 
 Use direct IST wakeup when one driver thread owns the device.  Use notifications when
