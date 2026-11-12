@@ -38,7 +38,7 @@ static void thread_recycle_reset(thread_t *thp)
     thp->internal_flags = 0;
     thp->timestamp_last_block = 0;
     thp->as_prp = NULL;
-    __atomic_store_n(&thp->async_flags, 0, __ATOMIC_RELAXED);
+    atomic_store_explicit(&thp->async_flags, 0, memory_order_relaxed);
     thp->dpp = NULL;
     thp->timeout_flags = 0;
     thp->flags = 0;
