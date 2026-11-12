@@ -307,3 +307,6 @@ clean:
 	$(Q)rm -rf $(BUILD_BASE)
 
 .PHONY: all clean
+
+# The system-channel implementation is shared by the arch startup wrappers.
+$(OBJDIR)/syschan-init.o: rtmux/syschan-init.c
