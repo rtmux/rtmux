@@ -868,7 +868,7 @@ static int sendv_body(thread_t *act,
                 kspinlock_lock(&chp->lock);
                 ITF_CLR(thp, RTMUX_ITF_MSG_DELIVERY | RTMUX_ITF_MSG_FORCE_RDY);
                 kspinlock_unlock(&chp->lock);
-                force_ready(thp, (unsigned) KSTATUS(thp));
+                force_ready(thp, MSG_FORCE_ERROR(thp));
                 KCALL_RESTART(act);
                 act->restart = 0;
                 return ENOERROR;
@@ -1876,7 +1876,7 @@ restart_recv:
                 END_SMP_XFER(act, thp);
                 ITF_CLR(thp, RTMUX_ITF_MSG_FORCE_RDY);
                 kspinlock_unlock(&chp->lock);
-                force_ready(thp, (unsigned) KSTATUS(thp));
+                force_ready(thp, MSG_FORCE_ERROR(thp));
                 KCALL_RESTART(act);
                 act->restart = 0;
                 return ENOERROR;
@@ -2446,7 +2446,7 @@ int kdecl ksys_msg_replyv(thread_t *act, struct kcall_args_msg_replyv *kap)
                 kspinlock_lock(&chp->lock);
                 ITF_CLR(thp, RTMUX_ITF_MSG_DELIVERY | RTMUX_ITF_MSG_FORCE_RDY);
                 kspinlock_unlock(&chp->lock);
-                force_ready(thp, (unsigned) KSTATUS(thp));
+                force_ready(thp, MSG_FORCE_ERROR(thp));
                 KCALL_RESTART(act);
                 act->restart = 0;
                 return ENOERROR;

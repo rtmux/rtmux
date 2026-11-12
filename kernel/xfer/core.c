@@ -52,7 +52,7 @@ static void xfer_restorestate(thread_t *act)
                 atomic_clr((volatile unsigned *) &thp->internal_flags,
                            RTMUX_ITF_MSG_DELIVERY);
                 if (thp->internal_flags & RTMUX_ITF_MSG_FORCE_RDY) {
-                    force_ready(thp, (unsigned) KSTATUS(thp));
+                    force_ready(thp, MSG_FORCE_ERROR(thp));
                     atomic_clr((volatile unsigned *) &thp->internal_flags,
                                RTMUX_ITF_MSG_FORCE_RDY);
                 }

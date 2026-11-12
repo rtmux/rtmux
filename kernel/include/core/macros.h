@@ -461,6 +461,11 @@ static __inline__ void __attribute__((__unused__)) atomic_boundary()
  */
 #define _FORCE_BITS (_FORCE_SET_ERROR | _FORCE_KILL_SELF | _FORCE_NO_UNBLOCK)
 
+/* force_ready_msgxfer stores -(errno | _FORCE_*). Decode as unsigned
+ * arithmetic: passing the saved negative status straight back to force_ready
+ * invents control flags (including KILL_SELF) and corrupts the errno. */
+#define MSG_FORCE_ERROR(thp) (0U - (unsigned) KSTATUS(thp))
+
 /* Smallest ticksize allowed (10 us for now) */
 #define RTMUX_TICKSIZE_MIN 10000
 /* Largest ticksize allowed */
