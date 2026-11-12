@@ -323,7 +323,8 @@ void plic_init(void);
 void plic_inithart(void);
 void cpu_force_fpu_save(thread_t *thp);
 #ifdef CONFIG_DEBUG_INJECT
-int inject_should_fail_alloc(process_t *prp, soul_t *soulp); /* debug/inject.c */
+int inject_should_fail_alloc(process_t *prp,
+                             soul_t *soulp); /* debug/inject.c */
 #endif
 void fpu_drop_claims(thread_t *thp);
 /* User FP context: save/restore f0-f31 and fcsr (arch/riscv/fpcontext.S). */

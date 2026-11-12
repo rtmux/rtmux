@@ -916,12 +916,12 @@ static uint16_t virtnet_used_pending(const struct rtmux_virtio_queue *q)
     return (uint16_t) (q->used->idx - q->last_used);
 }
 
-/* Stage one filled descriptor without notifying the device. The barrier
- * between the avail-ring write and the idx bump is the whole point: the device
- * must never observe a fresh avail->idx pointing at a stale descriptor. Both
- * queues go through here so that ordering lives in exactly one place. Virtio
- * 1.2 section 3.1 forbids buffer-available notifications before DRIVER_OK, so
- * init stages with this and kicks once afterwards.
+/* Stage one filled descriptor without notifying the device. The barrier between
+ * the avail-ring write and the idx bump is the whole point: the device must
+ * never observe a fresh avail->idx pointing at a stale descriptor. Both queues
+ * go through here so that ordering lives in exactly one place. Virtio 1.2
+ * section 3.1 forbids buffer-available notifications before DRIVER_OK, so init
+ * stages with this and kicks once afterwards.
  */
 static void virtnet_stage_locked(struct rtmux_virtio_queue *q,
                                  unsigned id,
@@ -1014,7 +1014,7 @@ static int virtnet_add_dma_range(struct rtmux_virtio_dma_range *ranges,
 {
     if (*count >= VIRTNET_IOMMU_RANGE_MAX)
         return EOVERFLOW;
-    ranges[*count] = (struct rtmux_virtio_dma_range) {
+    ranges[*count] = (struct rtmux_virtio_dma_range){
         .paddr = paddr,
         .size = size,
     };

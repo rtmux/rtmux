@@ -5,7 +5,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/* root-log.c -- Roottask logging subsystem implementation.
+/*
+ * root-log.c -- Roottask logging subsystem implementation.
  *
  * Provides a ring buffer for diagnostic messages and optional console echo.
  * This is the ONLY file in roottask that calls dbgprintf (the U-mode
@@ -72,7 +73,9 @@ static void ring_write(const char *buf, size_t len)
 /* Sequence of the oldest byte still in the ring. Caller must hold log_lock. */
 static uint64_t ring_oldest(void)
 {
-    return log_seq > CONFIG_ROOTTASK_SYSLOG_SIZE ? log_seq - CONFIG_ROOTTASK_SYSLOG_SIZE : 0;
+    return log_seq > CONFIG_ROOTTASK_SYSLOG_SIZE
+               ? log_seq - CONFIG_ROOTTASK_SYSLOG_SIZE
+               : 0;
 }
 
 /* root_log_bounds -- report the sequence range the ring currently holds.
@@ -91,8 +94,8 @@ void root_log_bounds(uint64_t *oldest, uint64_t *end)
 /* root_log_read -- copy ring bytes starting at absolute sequence *seq.
  *
  * Copies at most min(n, ROOT_LOG_READ_MAX, bytes up to @limit) bytes and
- * advances *seq by the amount copied. @limit is an absolute end sequence, so
- * a reader can bound itself to the data present when it opened.
+ * advances *seq by the amount copied. @limit is an absolute end sequence, so a
+ * reader can bound itself to the data present when it opened.
  * Return value: bytes copied (0 at @limit), -EOVERFLOW if *seq was already
  *               overwritten (the caller's window is lost; *seq is unchanged),
  *               -EINVAL if *seq is beyond the data written so far.

@@ -3014,7 +3014,7 @@ if ! awk '
 fi
 
 if ! awk '
-    /connect_t \*rdecl inline_lookup_connect\(process_t \*prp,/ {
+    /inline_lookup_connect\(process_t \*prp,/ {
         in_inline = 1
     }
     in_inline && /rtmux_cap_lookup_pin_context\(/ { saw_pin = NR }
@@ -3044,7 +3044,7 @@ if ! awk '
 fi
 
 if ! awk '
-    /connect_t \*rdecl lookup_connect\(uint64_t coid\)/ { in_lookup = 1 }
+    /lookup_connect\(uint64_t coid\)/ { in_lookup = 1 }
     in_lookup && /rtmux_cap_lookup_pin_context\(/ { saw_pin = NR }
     in_lookup && /kspinlock_lock\(&prp->vec_slock\);/ && !saw_lock {
         saw_lock = NR
@@ -3072,7 +3072,7 @@ if ! awk '
 fi
 
 if ! awk '
-    /process_t \*rdecl lookup_pid_rcu\(pid_t pid\)/ { in_pid = 1 }
+    /lookup_pid_rcu\(pid_t pid\)/ { in_pid = 1 }
     in_pid && /rcu_sched_read_lock\(\);/ { saw_pid_lock = NR }
     in_pid && /rcu_read_lock\(&process_rcu\);/ { saw_pid_old = NR }
     in_pid && /^}/ { in_pid = 0 }
@@ -3091,7 +3091,7 @@ if ! awk '
     in_open && /rcu_read_lock\(&connobj_rcu\);/ { saw_old_conn = NR }
     in_open && /rcu_read_lock\(&tthread_rcu\);/ { saw_old_thread = NR }
     in_open && /^}/ { in_open = 0 }
-    /connect_t \*rdecl lookup_rcvid\(kcall_args_t \*kap,/ { in_lookup = 1 }
+    /lookup_rcvid\(kcall_args_t \*kap,/ { in_lookup = 1 }
     in_lookup && /lookup_rcvid_open\(\);/ { saw_lookup_open = NR }
     in_lookup && /^}/ { in_lookup = 0 }
     /void rdecl lookup_rcvid_release\(void\)/ { in_release = 1 }

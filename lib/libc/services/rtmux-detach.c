@@ -5,7 +5,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/* rtmux_detach() — detach from parent process (stay resident).
+/*
+ * rtmux_detach() — detach from parent process (stay resident).
  *
  * Sends _PROC_DETACH to roottask. On success, the parent's waitpid() is
  * unblocked with the given status and this process is reparented to pid 1. The

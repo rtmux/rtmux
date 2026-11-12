@@ -5,7 +5,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/* sys/_intsup.h — printf format modifiers for fixed-width integer types
+/*
+ * sys/_intsup.h — printf format modifiers for fixed-width integer types
  *
  * Used by <inttypes.h> to define PRId32, PRIx64, etc. RTMux: LP64 only.
  *

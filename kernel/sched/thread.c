@@ -260,7 +260,8 @@ int kdecl ksys_thread_destroyall(thread_t *act, struct kcall_args_null *kap)
 
             if (thp && thp != act &&
                 !(prp->pid == ROOTTASK_PID && thp->tid < num_processors)) {
-                atomic_or(&thp->flags, (RTMUX_FLG_THR_DETACHED | RTMUX_FLG_THR_KILLSELF));
+                atomic_or(&thp->flags,
+                          (RTMUX_FLG_THR_DETACHED | RTMUX_FLG_THR_KILLSELF));
                 thp->status = 0;
                 thread_destroy(thp);
                 atomic_clr(&act->flags, RTMUX_FLG_THR_ONLYME);
@@ -412,14 +413,13 @@ retry:
     }
     target_dead = thp->state == STATE_DEAD;
 
-    /* Range-check and probe the status pointer here: after every predicate
-     * that can refuse the join, and before thread_reserve_destroy or the
-     * thp->join publication below. Both bounds on the placement matter.
+    /* Range-check and probe the status pointer here: after every predicate that
+     * can refuse the join, and before thread_reserve_destroy or the thp->join
+     * publication below. Both bounds on the placement matter.
      *
-     * Later and an EFAULT would orphan published state. The probe this
-     * replaces was a no-op WR_PROBE_OPT sitting after thp->join = act, so
-     * making it real in place would leave a target pointing at a caller that
-     * never blocks.
+     * Later and an EFAULT would orphan published state. The probe this replaces
+     * was a no-op WR_PROBE_OPT sitting after thp->join = act, so making it real
+     * in place would leave a target pointing at a caller that never blocks.
      *
      * Earlier and every refused join would touch the caller's buffer.
      * xfer_probe's write mode is a per-word read-modify-write, not a passive
@@ -483,10 +483,11 @@ retry:
         timeout_deferred_fire(); /* join timeout that expired while arming */
         return ENOERROR;
     }
+
     /* Return thread exit status to caller. Fault-safe, not a raw store: the
-     * probe ran under vec_slock above and the caller can unmap the page
-     * between there and here, and this kcall arms no fault handler. The target
-     * is reaped either way, because reporting EFAULT while leaving a
+     * probe ran under vec_slock above and the caller can unmap the page between
+     * there and here, and this kcall arms no fault handler. The target is
+     * reaped either way, because reporting EFAULT while leaving a
      * reserved-for-destroy thread behind would leak it, and the status has
      * already been consumed from the thread under the lock.
      */
@@ -523,9 +524,9 @@ int kdecl ksys_thread_cancel(thread_t *act,
      * + force_ready / thread_cancel because force_ready takes sched_slock
      * (rank-inversion if held under vec_slock).
      *
-     * A foreign target is never touched directly: RTMUX_ATF_CANCEL is posted
-     * on its async_flags and its owning hart rewrites its registers. The
-     * canstub write is single-pointer atomic with last-writer-wins semantics,
+     * A foreign target is never touched directly: RTMUX_ATF_CANCEL is posted on
+     * its async_flags and its owning hart rewrites its registers. The canstub
+     * write is single-pointer atomic with last-writer-wins semantics,
      * acceptable for a process-global config setting.
      */
 
@@ -582,8 +583,7 @@ int kdecl ksys_thread_cancel(thread_t *act,
      */
     if ((thp->flags & RTMUX_FLG_THR_WAAA) ||
         ((tlsflags & PTHREAD_CANCEL_DISABLE) == 0 &&
-         (STATE_CANCELABLE(thp) ||
-          (tlsflags & PTHREAD_CANCEL_ASYNCHRONOUS)))) {
+         (STATE_CANCELABLE(thp) || (tlsflags & PTHREAD_CANCEL_ASYNCHRONOUS)))) {
         if (thp == act) {
             force_ready(thp, EINTR);
             thread_cancel(thp);
@@ -702,6 +702,7 @@ int kcall_op_thread_ctl(thread_t *act,
     unsigned new[RMSK_MAX], inherit[RMSK_MAX], *uintp;
     int r, set_inherit, set_rmask;
     unsigned num;
+
     /* Kernel copies of the user structures; the user buffers are reached only
      * through user_slice copies, never dereferenced.
      */
@@ -771,12 +772,14 @@ int kcall_op_thread_ctl(thread_t *act,
                              RTMUX_FLG_THR_THREADS_HOLD, 0)) {
             return ESRCH;
         }
-        atomic_clr(&op->flags, (RTMUX_FLG_THR_TO_BE_STOPPED | RTMUX_FLG_THR_THREADS_HOLD));
+        atomic_clr(&op->flags,
+                   (RTMUX_FLG_THR_TO_BE_STOPPED | RTMUX_FLG_THR_THREADS_HOLD));
         break;
 
     case RTMUX_TCTL_THREADS_HOLD:
         stop_threads(op->process, RTMUX_FLG_THR_THREADS_HOLD, 0);
-        atomic_clr(&op->flags, (RTMUX_FLG_THR_TO_BE_STOPPED | RTMUX_FLG_THR_THREADS_HOLD));
+        atomic_clr(&op->flags,
+                   (RTMUX_FLG_THR_TO_BE_STOPPED | RTMUX_FLG_THR_THREADS_HOLD));
         break;
 
     case RTMUX_TCTL_ONE_THREAD_CONT:
@@ -804,14 +807,14 @@ int kcall_op_thread_ctl(thread_t *act,
 #endif
 
         /* Copy the whole extent in before any member is read: NULL, an
-         * out-of-range address and an in-range unmapped page are all refused
-         * by the slice, and this kcall arms no xfer fault handler of its own.
-         * The kernel then works on rm_copy, never on the user buffer.
+         * out-of-range address and an in-range unmapped page are all refused by
+         * the slice, and this kcall arms no xfer fault handler of its own. The
+         * kernel then works on rm_copy, never on the user buffer.
          */
-        if (user_slice_init(act, kap->data,
-                            sizeof(struct _thread_runmask) +
-                                2 * num * sizeof(unsigned),
-                            sizeof rm_copy, USER_SLICE_RD, &in_slice) ||
+        if (user_slice_init(
+                act, kap->data,
+                sizeof(struct _thread_runmask) + 2 * num * sizeof(unsigned),
+                sizeof rm_copy, USER_SLICE_RD, &in_slice) ||
             user_slice_copyin(&rm_copy, &in_slice))
             return EFAULT;
 
@@ -886,13 +889,14 @@ int kcall_op_thread_ctl(thread_t *act,
         if (new[0] != 0)
             set_rmask = 1;
 #endif
+
         /* Check the write extent now; the copy-out below runs before
          * set_runmask() so a refused buffer leaves the masks untouched.
          */
-        if (user_slice_init(act, kap->data,
-                            sizeof(struct _thread_runmask) +
-                                2 * num * sizeof(unsigned),
-                            sizeof rm_copy, USER_SLICE_WR, &out_slice))
+        if (user_slice_init(
+                act, kap->data,
+                sizeof(struct _thread_runmask) + 2 * num * sizeof(unsigned),
+                sizeof rm_copy, USER_SLICE_WR, &out_slice))
             return EFAULT;
 
         tr->size = num;
@@ -944,6 +948,7 @@ int kcall_op_thread_ctl(thread_t *act,
             atomic_clr(&op->flags, RTMUX_FLG_THR_ALIGN_FAULT);
         }
         cpu_thread_align_fault(op);
+
         /* The flag is already applied; a page unmapped by a sibling hart since
          * the check above reports EFAULT with the new setting in effect.
          */
@@ -968,21 +973,19 @@ int kcall_op_thread_ctl(thread_t *act,
          * the caller's own length (any int), as the old range check did.
          */
         {
-            const char *nb =
-                (const char *) kap->data + offsetof(struct _thread_name, name_buf);
+            const char *nb = (const char *) kap->data +
+                             offsetof(struct _thread_name, name_buf);
 
-            if (user_slice_init(act, nb,
-                                tn->new_name_len > 0
-                                    ? (size_t) tn->new_name_len
-                                    : 0,
-                                sizeof name_in, USER_SLICE_RD, &in_slice) ||
+            if (user_slice_init(
+                    act, nb,
+                    tn->new_name_len > 0 ? (size_t) tn->new_name_len : 0,
+                    sizeof name_in, USER_SLICE_RD, &in_slice) ||
                 user_slice_copyin(name_in, &in_slice))
                 return EFAULT;
-            if (user_slice_init(act, nb,
-                                tn->name_buf_len > 0
-                                    ? (size_t) tn->name_buf_len
-                                    : 0,
-                                (size_t) INT_MAX, USER_SLICE_WR, &out_slice))
+            if (user_slice_init(
+                    act, nb,
+                    tn->name_buf_len > 0 ? (size_t) tn->name_buf_len : 0,
+                    (size_t) INT_MAX, USER_SLICE_WR, &out_slice))
                 return EFAULT;
         }
 

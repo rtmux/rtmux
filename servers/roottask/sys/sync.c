@@ -103,12 +103,12 @@ static int sync_one(const struct sync_target *t, uint64_t deadline)
     return err;
 }
 
-/* sync_one() bounds itself with kernel send/reply timeouts, but the kernel keeps
- * a reply-blocked client until the server has seen the unblock request, so a
- * server with no free dispatch thread holds it past the deadline. Run each mount
- * from a short-lived detached worker and wait for it with a timed wait; past the
- * deadline plus SYNC_GRACE_MS the worker is abandoned (it frees itself if it ever
- * returns) and the sweep moves on.
+/* sync_one() bounds itself with kernel send/reply timeouts, but the kernel
+ * keeps a reply-blocked client until the server has seen the unblock request,
+ * so a server with no free dispatch thread holds it past the deadline. Run each
+ * mount from a short-lived detached worker and wait for it with a timed wait;
+ * past the deadline plus SYNC_GRACE_MS the worker is abandoned (it frees itself
+ * if it ever returns) and the sweep moves on.
  */
 #define SYNC_GRACE_MS 250
 #define SYNC_WORKER_STACK 16384
@@ -283,10 +283,11 @@ static int sync_one_bounded(const struct sync_target *t, uint64_t deadline)
 }
 
 /* One sweep over the mounts. Each mount gets its own SYNC_TIMEOUT_MS budget
- * (never more than what is left of SYNC_SWEEP_MAX_MS), and a mount that times out
- * is logged once and the sweep carries on, so a wedged mount early in the walk
- * cannot starve a healthy one after it. A server that never takes the kernel's
- * unblock request cannot hold the sweep either: sync_one_bounded() abandons it.
+ * (never more than what is left of SYNC_SWEEP_MAX_MS), and a mount that times
+ * out is logged once and the sweep carries on, so a wedged mount early in the
+ * walk cannot starve a healthy one after it. A server that never takes the
+ * kernel's unblock request cannot hold the sweep either: sync_one_bounded()
+ * abandons it.
  */
 static void sync_sweep(void)
 {
@@ -296,9 +297,9 @@ static void sync_sweep(void)
     int reserved = 1;
 
     if (proc_thread_pool_reserve() != 0) {
-        /* Retry once, then sweep on this worker: a flush without the spare
-         * only risks a server that calls back into roottask, and every send
-         * below is still timed.
+        /* Retry once, then sweep on this worker: a flush without the spare only
+         * risks a server that calls back into roottask, and every send below is
+         * still timed.
          */
         struct timespec ts = {0, 10000000};
 

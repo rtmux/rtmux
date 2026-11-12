@@ -28,8 +28,9 @@ memmove
     const char *src = src0;
     size_t t;
 
-    if (length == 0 || dst == src) /* nothing to do */
+    if (length == 0 || dst == src) { /* nothing to do */
         goto done;
+    }
 
     /* Macros: loop-t-times; and loop-t-times, t>0 */
 #define TLOOP(s) \

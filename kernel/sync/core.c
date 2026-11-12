@@ -518,8 +518,8 @@ void rdecl synchash_rem(paddr_t addr,
                      */
                     kspinlock_unlock(&sync_slock);
 
-                    /* An inaccessible owner word here just means the mapping
-                     * is already gone, which the walk below handles.
+                    /* An inaccessible owner word here just means the mapping is
+                     * already gone, which the walk below handles.
                      */
                     (void) xfer_atomic_or_user(
                         (volatile unsigned *) &sync->owner, 0);

@@ -18,10 +18,9 @@
  * Walks the node tree under path_mutex and records every OBJECT_SERVER mount
  * (NAMESPACE_FLAG_DIR: a server that resolves longer paths, _FTYPE_ANY: not a
  * typed service such as the FIFO directory) once per (nd, pid, chid), skipping
- * roottask's own. The label is the first path seen
- * for the endpoint. Nothing is sent here: the caller messages the endpoints
- * after the lock is dropped, because a server may call back into roottask.
- * Parameters:
+ * roottask's own. The label is the first path seen for the endpoint. Nothing is
+ * sent here: the caller messages the endpoints after the lock is dropped,
+ * because a server may call back into roottask. Parameters:
  *   out : array receiving the targets
  *   max : capacity of out
  * A mount past max is not stored; the walk goes on and the omission is logged
@@ -56,7 +55,8 @@ size_t namespace_sync_snapshot(struct sync_target *out, size_t max)
             if (i < count)
                 continue;
             if (count == max) {
-                /* Not recorded, so a skipped endpoint seen again counts again. */
+                /* Not recorded, so a skipped endpoint seen again counts again.
+                 */
                 if (!skipped++ &&
                     path_node_fullpath(n, first, sizeof first) <= 1)
                     strcpy(first, "/");
@@ -85,7 +85,9 @@ size_t namespace_sync_snapshot(struct sync_target *out, size_t max)
     }
     pthread_mutex_unlock(&path_mutex);
     if (skipped)
-        root_log("sync: %d mount(s) past the %d-target limit not flushed, first %s\n",
-                 (int) skipped, (int) max, first);
+        root_log(
+            "sync: %d mount(s) past the %d-target limit not flushed, first "
+            "%s\n",
+            (int) skipped, (int) max, first);
     return count;
 }

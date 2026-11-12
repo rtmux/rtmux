@@ -174,7 +174,8 @@ EXT unsigned boot_cpunum;
 void stall_detector_tick(void);
 
 /* Per-hart neighbour watchdog — kernel/debug/hartwatch.c. Called from the
- * supervisor-timer trap on every hart, on both the in-kernel and full paths. */
+ * supervisor-timer trap on every hart, on both the in-kernel and full paths.
+ */
 void hartwatch_tick(void);
 
 /* Absolute monotonic-ns deadline by which the heartbeat must advance before the
@@ -207,9 +208,9 @@ static inline int connect_links_drop(connect_t *cop)
 
 /* connect_link_get - take a sender's reference on a connection found by lookup.
  *
- * links counts client references only (the fd slots plus one per sender
- * blocked on the connection); it reaches 0 exactly once, at the last drop.
- * Fails when the count already is 0: the last client reference went away
+ * links counts client references only (the fd slots plus one per sender blocked
+ * on the connection); it reaches 0 exactly once, at the last drop. Fails when
+ * the count already is 0: the last client reference went away
  * (connect_client_drop sent the disconnect notice) between the caller's lookup
  * and now, so the connection may not be used. Succeeding while a concurrent
  * client drop is in flight is fine: that drop then is not the last, and the

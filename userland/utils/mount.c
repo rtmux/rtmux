@@ -154,7 +154,10 @@ static int mount_lkl_ext4(const char *spec, const char *name, unsigned flags)
 static int lkl_mount_attached(const char *name)
 {
     struct statvfs stv;
-    /* ipc-send: utils -> roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring */
+
+    /* ipc-send: utils ->
+     * roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring
+     */
     int fd = open(name, O_RDONLY);
     int ok = 0;
 
@@ -609,7 +612,9 @@ static int report_mount_dir(const char *proc_path,
     struct dirent *dent;
     int nd, pid, chid, handle, ftype;
 
-    /* ipc-send: utils -> roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring */
+    /* ipc-send: utils ->
+     * roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring
+     */
     dp = opendir(proc_path);
     if (!dp) {
         if (errno != ENOENT && errno != ENOTDIR)

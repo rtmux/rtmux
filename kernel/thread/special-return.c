@@ -152,13 +152,13 @@ void specialret_attr specialret(thread_t *thp)
             break;
         }
 
-        /* Both writebacks below go through xfer_memcpy rather than a raw
-         * store. The pointers were checked and probed by the kcall that parked
-         * them here, but that was arbitrarily long ago (the thread has since
-         * blocked and been woken), so the caller has had every opportunity to
-         * unmap the page. This path arms no fault handler of its own, so a raw
-         * store to a now-unmapped address was an unrecoverable S-mode fault
-         * from an unprivileged caller. xfer_memcpy is also what avoids the
+        /* Both writebacks below go through xfer_memcpy rather than a raw store.
+         * The pointers were checked and probed by the kcall that parked them
+         * here, but that was arbitrarily long ago (the thread has since blocked
+         * and been woken), so the caller has had every opportunity to unmap the
+         * page. This path arms no fault handler of its own, so a raw store to a
+         * now-unmapped address was an unrecoverable S-mode fault from an
+         * unprivileged caller. xfer_memcpy is also what avoids the
          * floating-point register traffic a plain struct assignment can emit,
          * which is why the nanosleep arm already used memcpy.
          *
@@ -171,9 +171,9 @@ void specialret_attr specialret(thread_t *thp)
             int status = 0;
 
             if (thp->args.to.timeptr) {
-                status = xfer_memcpy(thp->args.to.timeptr,
-                                     &thp->args.to.left.nsec,
-                                     sizeof(*thp->args.to.timeptr));
+                status =
+                    xfer_memcpy(thp->args.to.timeptr, &thp->args.to.left.nsec,
+                                sizeof(*thp->args.to.timeptr));
             }
 
             atomic_clr((volatile unsigned *) &thp->flags,
@@ -188,9 +188,9 @@ void specialret_attr specialret(thread_t *thp)
             int status = 0;
 
             if (thp->args.jo.statusptr) {
-                status = xfer_memcpy(thp->args.jo.statusptr,
-                                     &thp->args.jo.status,
-                                     sizeof(thp->args.jo.status));
+                status =
+                    xfer_memcpy(thp->args.jo.statusptr, &thp->args.jo.status,
+                                sizeof(thp->args.jo.status));
             }
 
             atomic_clr((volatile unsigned *) &thp->flags, RTMUX_FLG_THR_JOIN);

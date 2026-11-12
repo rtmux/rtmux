@@ -5,7 +5,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/* Macros that are private to the kernel itself.
+/*
+ * Macros that are private to the kernel itself.
  *
  * SMP kernel serialization uses the global "inkernel" variable as both state
  * tracker and mutex.
@@ -238,8 +239,8 @@
  * sigwaitinfo wait (libc-level here), an interrupt wait and a network send are
  * never interrupted by it.
  */
-#define STATE_INTERRUPT_BITS                                              \
-    ((1 << STATE_SEND) | (1 << STATE_RECEIVE) | (1 << STATE_REPLY) |      \
+#define STATE_INTERRUPT_BITS                                             \
+    ((1 << STATE_SEND) | (1 << STATE_RECEIVE) | (1 << STATE_REPLY) |     \
      (1 << STATE_NANOSLEEP) | (1 << STATE_CONDVAR) | (1 << STATE_JOIN) | \
      (1 << STATE_SEM))
 
@@ -540,8 +541,8 @@ static __inline__ void __attribute__((__unused__)) atomic_boundary()
 #define RTMUX_ITF_UNBLOCK_QUEUED 0x40U
 #define RTMUX_ITF_RCVNOTIFICATION 0x80U
 
-/* NATIVE_REPLY: the thread has opted in (thread_ctl RTMUX_TCTL_NATIVE_REPLY)
- * to a native capability header in the replies to its requests. ksys_msg_replyv
+/* NATIVE_REPLY: the thread has opted in (thread_ctl RTMUX_TCTL_NATIVE_REPLY) to
+ * a native capability header in the replies to its requests. ksys_msg_replyv
  * parses a reply as a struct _io_native_hdr, and installs the capabilities it
  * names, only while this bit is set on the client; otherwise the reply bytes
  * are opaque data. The client sets and clears the bit on itself, around the
@@ -576,8 +577,11 @@ static __inline__ void __attribute__((__unused__)) atomic_boundary()
 #define RTMUX_ATF_SMP_EXCEPTION 0x00000008
 #define RTMUX_ATF_WAIT_FOR_KER 0x00000010
 #define RTMUX_ATF_WATCHPOINT 0x00000020
-/* Cross-hart thread cancel: the owning hart turns it into RTMUX_FLG_THR_CANCELSELF
- * in kernel_exit, so only the owner ever rewrites the thread's registers. */
+
+/* Cross-hart thread cancel: the owning hart turns it into
+ * RTMUX_FLG_THR_CANCELSELF in kernel_exit, so only the owner ever rewrites the
+ * thread's registers.
+ */
 #define RTMUX_ATF_CANCEL 0x00000040
 #define RTMUX_ATF_REGCTX_ALLOC 0x40000000
 #define RTMUX_ATF_FORCED_KERNEL 0x80000000
@@ -666,16 +670,16 @@ static __inline__ void __attribute__((__unused__)) atomic_boundary()
 
 /* The same, for a caller that already holds the dispatch lock and has just
  * blocked thp. adjust_priority takes that lock itself and must not be entered
- * with it held, so a budget-exhausted drop is applied directly: thp is off every
- * ready queue, and only its priority field needs to change.
+ * with it held, so a budget-exhausted drop is applied directly: thp is off
+ * every ready queue, and only its priority field needs to change.
  */
-#define SS_STOP_RUNNING_LOCKED(thp, preempted)           \
-    do {                                                 \
-        if (IS_SCHED_SS((thp))) {                        \
-            (thp)->schedinfo.ss_info->sched_locked = 1;  \
-            sched_ss_block((thp), (preempted));          \
-            (thp)->schedinfo.ss_info->sched_locked = 0;  \
-        }                                                \
+#define SS_STOP_RUNNING_LOCKED(thp, preempted)          \
+    do {                                                \
+        if (IS_SCHED_SS((thp))) {                       \
+            (thp)->schedinfo.ss_info->sched_locked = 1; \
+            sched_ss_block((thp), (preempted));         \
+            (thp)->schedinfo.ss_info->sched_locked = 0; \
+        }                                               \
     } while (0)
 
 /* Note the time that this thread was first made ready/running. This is used for
@@ -777,7 +781,7 @@ static __inline__ void __attribute__((__unused__)) atomic_boundary()
         do {                                                       \
             _adj = qtimeptr->nsec_tod_adjust;                      \
             (tsp) = arch_timer_now_ns(qtimeptr);                   \
-            if ((tsp) == (uint64_t) -1) {                          \
+            if ((tsp) == (uint64_t) - 1) {                         \
                 snap_time_wakeup();                                \
             }                                                      \
         } while ((incl_tod) && _adj != qtimeptr->nsec_tod_adjust); \

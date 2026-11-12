@@ -31,23 +31,23 @@
         _KT(pref##_msg_current), _KT(pref##_msg_sendv), _KT(pref##_msg_sendv), \
         _KT(pref##_msg_error), _KT(pref##_msg_receivev),                       \
         _KT(pref##_msg_replyv), _KT(pref##_msg_readv), _KT(pref##_msg_writev), \
-        _KT(pref##_bad), /* msg_readwritev — removed, ENOSYS */                \
+        _KT(pref##_bad), /* msg_readwritev — removed, ENOSYS */              \
         _KT(pref##_msg_info), _KT(pref##_msg_sendnotification),                \
         _KT(pref##_msg_deliver_event), _KT(pref##_msg_keydata),                \
         _KT(pref##_msg_readiov), _KT(pref##_msg_receivev),                     \
         _KT(pref##_msg_verify_event),                                          \
                                                                                \
-        _KT(pref##_bad), /* signal_kill — removed */                           \
-        _KT(pref##_bad), /* signal_return — removed */                         \
-        _KT(pref##_bad), /* signal_fault — removed */                          \
-        _KT(pref##_bad), /* signal_action — removed */                         \
-        _KT(pref##_bad), /* signal_procmask — removed */                       \
-        _KT(pref##_bad), /* signal_suspend — removed */                        \
-        _KT(pref##_bad), /* signal_waitinfo — removed */                       \
+        _KT(pref##_bad), /* signal_kill — removed */                         \
+        _KT(pref##_bad), /* signal_return — removed */                       \
+        _KT(pref##_bad), /* signal_fault — removed */                        \
+        _KT(pref##_bad), /* signal_action — removed */                       \
+        _KT(pref##_bad), /* signal_procmask — removed */                     \
+        _KT(pref##_bad), /* signal_suspend — removed */                      \
+        _KT(pref##_bad), /* signal_waitinfo — removed */                     \
         _KT(pref##_bad), _KT(pref##_bad),                                      \
                                                                                \
         _KT(pref##_channel_create), _KT(pref##_channel_destroy),               \
-        _KT(pref##_bad), /* channel_connect_attr — removed */                  \
+        _KT(pref##_bad), /* channel_connect_attr — removed */                \
         _KT(pref##_bad),                                                       \
                                                                                \
         _KT(pref##_connect_attach), _KT(pref##_connect_detach),                \

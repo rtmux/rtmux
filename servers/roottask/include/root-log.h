@@ -5,7 +5,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/* root-log.h -- Roottask logging subsystem.
+/*
+ * root-log.h -- Roottask logging subsystem.
  *
  * All roottask diagnostic output goes through these functions. Messages are
  * stored in a ring buffer (CONFIG_ROOTTASK_SYSLOG_SIZE bytes) and optionally
@@ -49,8 +50,8 @@ void root_log(const char *fmt, ...);
 void root_dbg(const char *fmt, ...);
 void root_trace(const char *fmt, ...);
 
-/* The ring is also readable by absolute byte sequence (served as /sys/log).
- * A single root_log_read returns at most ROOT_LOG_READ_MAX bytes.
+/* The ring is also readable by absolute byte sequence (served as /sys/log). A
+ * single root_log_read returns at most ROOT_LOG_READ_MAX bytes.
  */
 #define ROOT_LOG_READ_MAX 4096
 #define ROOT_LOG_MARK_MAX 128 /* longest _SYS_CMD_LOG_MARK text */

@@ -5,7 +5,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/* RISC-V as_init_mem — initialize virtual memory.
+/*
+ * RISC-V as_init_mem — initialize virtual memory.
  *
  * Phase 0 (kernel init): set up physical allocator, page size list,
  *   user boundary address, and xfer slots.

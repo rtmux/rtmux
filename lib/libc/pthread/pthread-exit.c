@@ -25,8 +25,8 @@ void pthread_exit(void *value_ptr)
     atomic_or(&tls->__flags, PTHREAD_CANCEL_DISABLE);
     atomic_clr(&tls->__flags, PTHREAD_CANCEL_ASYNCHRONOUS); /* make defered */
 
-    /* A cancelled thread never returns through the blocking wrapper it was
-     * in; drop its wait registration before anything can run on its stack.
+    /* A cancelled thread never returns through the blocking wrapper it was in;
+     * drop its wait registration before anything can run on its stack.
      */
     __libc_wait_purge((int) pthread_self());
 

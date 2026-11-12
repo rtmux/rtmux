@@ -5,7 +5,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/* stall-detector.c — kernel-side watchdog that fires when the scheduler stops
+/*
+ * stall-detector.c — kernel-side watchdog that fires when the scheduler stops
  * making forward progress. Dumps per-CPU active threads and every
  * process/thread state, so a silent deadlock can be localized to a specific
  * pid/tid/blocked-on pair.
@@ -34,11 +35,11 @@
  * happens, gated to fire at most once per wedge.
  *
  * Roottask wait scan: a roottask pool thread that sends to a wedged user server
- * (lkl-fsd, a slow mount) does not stop the heartbeat thread, so the check above
- * never fires. Once per STALL_SCAN_NSEC the boot hart's tick therefore walks
- * pid 1's thread vector and prints one "liveness:" line for every thread that
- * has been blocked on another party longer than STALL_WAIT_TIMEOUT_NSEC; see
- * stall_scan_roottask_waiters().
+ * (lkl-fsd, a slow mount) does not stop the heartbeat thread, so the check
+ * above never fires. Once per STALL_SCAN_NSEC the boot hart's tick therefore
+ * walks pid 1's thread vector and prints one "liveness:" line for every thread
+ * that has been blocked on another party longer than STALL_WAIT_TIMEOUT_NSEC;
+ * see stall_scan_roottask_waiters().
  *
  * License: Apache-2.0
  */
@@ -75,7 +76,8 @@
 #define STALL_WAIT_TIMEOUT_NSEC (5ULL * 1000000000ULL)
 
 /* Period of the roottask wait scan. A named thread is reported between
- * STALL_WAIT_TIMEOUT_NSEC and STALL_WAIT_TIMEOUT_NSEC + STALL_SCAN_NSEC after it blocked.
+ * STALL_WAIT_TIMEOUT_NSEC and STALL_WAIT_TIMEOUT_NSEC + STALL_SCAN_NSEC after
+ * it blocked.
  */
 #define STALL_SCAN_NSEC (1ULL * 1000000000ULL)
 
@@ -84,8 +86,8 @@
  */
 #define STALL_WAIT_MAX 8U
 
-/* Console-lock attempts before a "liveness:" line is parked in the hart's
- * crash buffer, same bounded print as the neighbour watchdog.
+/* Console-lock attempts before a "liveness:" line is parked in the hart's crash
+ * buffer, same bounded print as the neighbour watchdog.
  */
 #define STALL_WAIT_LOCK_RETRIES 20000U
 
@@ -172,30 +174,30 @@ static int waits_on_party(unsigned s)
            s == STATE_CONDVAR || s == STATE_SEM || s == STATE_JOIN;
 }
 
-/* Name roottask threads blocked on another party for more than STALL_WAIT_TIMEOUT_NSEC.
- * Called from the boot hart's timer tick: interrupt context, lock-free, one
- * hart only.
+/* Name roottask threads blocked on another party for more than
+ * STALL_WAIT_TIMEOUT_NSEC. Called from the boot hart's timer tick: interrupt
+ * context, lock-free, one hart only.
  *
  * Concurrency rule. The scan holds tthread_rcu and process_rcu read sections
  * (RCU-sched: the hart cannot pass a quiescent state inside the trap) so pid
  * 1's process_t and its thread_t objects are not freed under it, and
  * connobj_rcu for the connect_t/channel_t reached through blocked_on. No lock
- * is taken: vec_slock may be held by the code this tick interrupted. The
- * thread vector is read lock-free in the order vector_add() publishes it (new
- * array first, nentries after, old array never reused for a larger count), so
+ * is taken: vec_slock may be held by the code this tick interrupted. The thread
+ * vector is read lock-free in the order vector_add() publishes it (new array
+ * first, nentries after, old array never reused for a larger count), so
  * nentries is read before the array pointer and no index past the array is
- * formed. The old array of a growing vector is freed at once, not after a
- * grace period (vector_add), so a scan that straddles a growth of pid 1's
- * thread vector may read the freed copy; the heap stays mapped and the copy
- * holds the same thread pointers, the same assumption the timer-wheel IRQ code
- * makes about vectors. Fields the owner updates without a lock (state,
- * timestamp_last_block) are re-read before blocked_on is typed and again
- * after the copy, and a thread that woke or re-blocked meanwhile is skipped
- * until the next scan. stall_reported_ts is
- * written only here. Output goes out after the read sections, through
- * kprintf_bounded(). The period is kept in arch_timer_now_ns() time, the same
- * clock stall_next_deadline() hands the idle timer, so the boot hart wakes for
- * each scan even when it would otherwise sleep until the heartbeat deadline.
+ * formed. The old array of a growing vector is freed at once, not after a grace
+ * period (vector_add), so a scan that straddles a growth of pid 1's thread
+ * vector may read the freed copy; the heap stays mapped and the copy holds the
+ * same thread pointers, the same assumption the timer-wheel IRQ code makes
+ * about vectors. Fields the owner updates without a lock (state,
+ * timestamp_last_block) are re-read before blocked_on is typed and again after
+ * the copy, and a thread that woke or re-blocked meanwhile is skipped until the
+ * next scan. stall_reported_ts is written only here. Output goes out after the
+ * read sections, through kprintf_bounded(). The period is kept in
+ * arch_timer_now_ns() time, the same clock stall_next_deadline() hands the idle
+ * timer, so the boot hart wakes for each scan even when it would otherwise
+ * sleep until the heartbeat deadline.
  */
 static void stall_scan_roottask_waiters(void)
 {
@@ -229,7 +231,8 @@ static void stall_scan_roottask_waiters(void)
             state = thp->state;
             ts = thp->timestamp_last_block;
             if (!waits_on_party(state) || !ts || now <= ts ||
-                now - ts <= STALL_WAIT_TIMEOUT_NSEC || ts == thp->stall_reported_ts)
+                now - ts <= STALL_WAIT_TIMEOUT_NSEC ||
+                ts == thp->stall_reported_ts)
                 continue;
             w->pid = prp->pid;
             w->tid = (int) thp->tid;
@@ -237,6 +240,7 @@ static void stall_scan_roottask_waiters(void)
             w->dur_ns = now - ts;
             w->chid = -1;
             w->obj = thp->blocked_on;
+
             /* blocked_on is only a connect_t while the thread is in SEND or
              * REPLY, and the owner changes both without a lock. Confirm the
              * wait is still the one read before the pointer is typed, and again
@@ -353,10 +357,10 @@ static void stall_dump(void)
     kprintf("!!! END STALL DUMP !!!\n");
 }
 
-/* Absolute monotonic-ns deadline the idle timer must not sleep past on the
- * boot hart: the next roottask wait scan, at most STALL_SCAN_NSEC away. Every
- * wake also runs the heartbeat check below, which is why the old heartbeat
- * deadline (15 s out) no longer needs to be offered separately. Read-only; see
+/* Absolute monotonic-ns deadline the idle timer must not sleep past on the boot
+ * hart: the next roottask wait scan, at most STALL_SCAN_NSEC away. Every wake
+ * also runs the heartbeat check below, which is why the old heartbeat deadline
+ * (15 s out) no longer needs to be offered separately. Read-only; see
  * clock_next_deadline().
  */
 uint64_t stall_next_deadline(void)

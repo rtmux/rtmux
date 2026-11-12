@@ -35,7 +35,7 @@ struct utsname {
 extern long SysCpupageGet_r(int index) __hidden;
 
 /* Bootstrap-safe uname(): the dynamic linker runs before libc.so is mapped, so
- * it cannot use the libc implementation.  The kernel's release is read straight
+ * it cannot use the libc implementation. The kernel's release is read straight
  * from the syspage build_info record through the raw cpupage syscall; no libc,
  * filesystem or allocation is involved.
  */
@@ -2471,10 +2471,11 @@ static Obj_Entry *load_object(const char *name,
     {
         if (obj->marker || obj->doomed)
             continue;
+
         /* st_ino == 0 means the filesystem does not number its files (the
-         * initramfs does not): every such file in one mount looks identical,
-         * so a match would alias unrelated libraries to the first object
-         * loaded from that mount. Identify those by name only.
+         * initramfs does not): every such file in one mount looks identical, so
+         * a match would alias unrelated libraries to the first object loaded
+         * from that mount. Identify those by name only.
          */
         if (sb.st_ino != 0 && obj->ino == sb.st_ino && obj->dev == sb.st_dev)
             break;

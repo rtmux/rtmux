@@ -5,7 +5,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/* kprintf.c — Unified kernel printf (startup + kernel, single binary)
+/*
+ * kprintf.c — Unified kernel printf (startup + kernel, single binary)
  *
  * Full kvsnprintf formatter with width, alignment, and LP64 support. Output
  * goes through a pluggable print_char function pointer, set early by board init
@@ -575,10 +576,12 @@ int kprintf(const char *fmt, ...)
 
 #ifdef CONFIG_STALL_DETECTOR
 /* kprintf_trylock_bounded — kprintf_lock() that gives up after "spins" failed
- * attempts instead of waiting for ever. Returns true with the lock held (the
- * caller must release it through kprintf_unlock), false with the lock NOT held
- * and the interrupt state restored. It never clears or steals another hart's
- * hold on kprintf_slock (contrast stall_dump()).
+ * attempts instead of waiting for ever.
+ *
+ * Returns true with the lock held (the caller must release it through
+ * kprintf_unlock), false with the lock NOT held and the interrupt state
+ * restored. It never clears or steals another hart's hold on kprintf_slock
+ * (contrast stall_dump()).
  */
 static bool kprintf_trylock_bounded(unsigned spins)
 {
@@ -588,9 +591,9 @@ static bool kprintf_trylock_bounded(unsigned spins)
     w_sstatus(s & ~SSTATUS_SIE);
     cpu = get_cpunum();
     if (in_kprintf[cpu]++ == 0) {
-        while (atomic_load_explicit(&kprintf_slock, memory_order_relaxed) ||
-               atomic_exchange_explicit(&kprintf_slock, 1,
-                                        memory_order_acquire)) {
+        while (
+            atomic_load_explicit(&kprintf_slock, memory_order_relaxed) ||
+            atomic_exchange_explicit(&kprintf_slock, 1, memory_order_acquire)) {
             if (spins-- == 0) {
                 in_kprintf[cpu]--;
                 if (s & SSTATUS_SIE)
@@ -650,13 +653,13 @@ int kprintf_bounded(unsigned spins, const char *fmt, ...)
 
 /* kprintf_emergency — kprintf_bounded() for a line that must reach the console
  * even if the lock owner never lets go (a hart wedged mid-print). With the lock
- * won in "spins" attempts it is an ordinary locked print. Otherwise the line goes
- * straight to the console in one SBI write, with a leading newline so it does not
- * continue the owner's half-written line and a "[cpu] " prefix, without the lock,
- * the parked buffer, or any shared console state (at_bol is the lock owner's to
- * update, so it is left alone): it can interleave with, but not corrupt, what the
- * owner prints, and does not allocate. Same context rules as kprintf_bounded().
- * Parameters:
+ * won in "spins" attempts it is an ordinary locked print. Otherwise the line
+ * goes straight to the console in one SBI write, with a leading newline so it
+ * does not continue the owner's half-written line and a "[cpu] " prefix,
+ * without the lock, the parked buffer, or any shared console state (at_bol is
+ * the lock owner's to update, so it is left alone): it can interleave with, but
+ * not corrupt, what the owner prints, and does not allocate. Same context rules
+ * as kprintf_bounded(). Parameters:
  *   spins : lock acquisition attempts before the lock-free write.
  *   fmt   : printf-style format string, followed by its arguments.
  * Return value: number of characters formatted.
@@ -696,9 +699,9 @@ int kprintf_emergency(unsigned spins, const char *fmt, ...)
 /* kprintf_inject_hold — hold the console lock for "ms" milliseconds with
  * interrupts off, then release it: the stalled-lock-owner fixture for
  * kprintf_emergency(). Runs in the IPI_DEBUG_SPIN handler (trap context, SIE
- * already off). The two "inject: console lock" lines bracket the hold, so a host
- * check can tell a report printed during it from one parked until after it.
- * A debug injection only; other harts that print meanwhile wait.
+ * already off). The two "inject: console lock" lines bracket the hold, so a
+ * host check can tell a report printed during it from one parked until after
+ * it. A debug injection only; other harts that print meanwhile wait.
  */
 void kprintf_inject_hold(unsigned ms)
 {

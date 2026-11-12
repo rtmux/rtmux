@@ -56,8 +56,8 @@ int __libc_sigaction(int signo,
 int __libc_sigprocmask(int how, const sigset_t *set, sigset_t *oset) __hidden;
 int __libc_signal_pause(void) __hidden;
 
-/* Interruptible-wait registry. A blocking libc wrapper (read, write,
- * nanosleep, sem_wait, ...) brackets its kernel call with
+/* Interruptible-wait registry. A blocking libc wrapper (read, write, nanosleep,
+ * sem_wait, ...) brackets its kernel call with
  * __libc_wait_enter()/__libc_wait_exit() on a libc_waiter_t that lives on its
  * own stack. While registered, the thread can be broken out of the call with
  * EINTR when a signal with a handler installed without SA_RESTART is delivered

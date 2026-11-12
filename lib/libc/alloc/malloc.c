@@ -5,7 +5,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/* RTMux libc — malloc/free/calloc/realloc wrappers
+/*
+ * RTMux libc — malloc/free/calloc/realloc wrappers
  *
  * Thin wrappers around the FreeBSD-derived __crt_* allocator. This keeps the
  * POSIX namespace separate from the allocator internals.

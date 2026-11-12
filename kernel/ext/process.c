@@ -234,9 +234,9 @@ void kext_process_create(void *data)
      * concurrent setrlimit in another parent thread cannot be seen half done.
      * max_cpu_time is derived from the copied soft limit, not copied: a parent
      * whose limit already fired has max_cpu_time == 0 (disarmed) but still
-     * reads back as set, and the child must inherit the limit, not the
-     * disarmed state. The child's running_time starts at 0 (POSIX: CPU times
-     * are not inherited, limits are).
+     * reads back as set, and the child must inherit the limit, not the disarmed
+     * state. The child's running_time starts at 0 (POSIX: CPU times are not
+     * inherited, limits are).
      */
     kspinlock_lock(&parent->vec_slock);
     for (i = 0; i < RLIM_NLIMITS; i++) {
@@ -427,6 +427,7 @@ void kext_process_destroy(void *data)
     }
 
     kspinlock_lock(&process_vector_slock);
+
     /* Advance the generation before the index is freed, under the same lock
      * kext_process_create reads it under, so a process created at this index
      * afterwards can never carry the old pid. Roottask tags its per-pid slot
@@ -1137,8 +1138,9 @@ void kext_thread_tls(void *data)
         }
 
         tsp = (struct _thread_local_storage *) (aligned_esp - tls_sz);
-        /* The destination is the new thread's stack, which the caller chose
-         * and can leave unmapped: copy through xfer_memcpy so a fault returns
+
+        /* The destination is the new thread's stack, which the caller chose and
+         * can leave unmapped: copy through xfer_memcpy so a fault returns
          * EFAULT instead of faulting the kernel, leaving the old TLS pointer
          * installed.
          */
@@ -1233,7 +1235,8 @@ struct kext_signal_args {
 /* kext_signal_deliver — deliver a signal notification to a channel.
  *
  * Packs the signal number and sender pid into the 64-bit notification value
- * (signo in the low 32 bits, sender pid in the high 32) and delivers it. Parameters:
+ * (signo in the low 32 bits, sender pid in the high 32) and delivers it.
+ * Parameters:
  *   arg : struct kext_signal_args * (chp, signo, sender_pid)
  */
 void kext_signal_deliver(void *arg)

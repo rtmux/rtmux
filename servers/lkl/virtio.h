@@ -121,11 +121,13 @@ uint32_t virtio_mmio_rd32(struct rtmux_virtio_mmio *vio, unsigned off);
 void virtio_mmio_wr32(struct rtmux_virtio_mmio *vio,
                       unsigned off,
                       uint32_t val);
-void virtio_mb(void); /* memory-vs-memory full fence (not ordered against I/O) */
+void virtio_mb(
+    void); /* memory-vs-memory full fence (not ordered against I/O) */
 void virtio_fence_w_o(void); /* prior memory stores before a later MMIO write */
 void virtio_fence_o_o(void); /* earlier MMIO writes before later MMIO writes */
-/* Scoped I/O fences for queue control (RISC-V fence io,o / o,i; w,o and o,o above).
- * They order CPU-issued MMIO accesses only; no posted-write completion is implied.
+/* Scoped I/O fences for queue control (RISC-V fence io,o / o,i; w,o and o,o
+ * above). They order CPU-issued MMIO accesses only; no posted-write completion
+ * is implied.
  */
 void virtio_io_fence_before_sel(void);
 void virtio_io_fence_oi(void);
@@ -142,20 +144,18 @@ int virtio_dma_pool_alloc(struct rtmux_virtio_dma_pool *pool,
                           unsigned count,
                           size_t size);
 void virtio_dma_pool_free(struct rtmux_virtio_dma_pool *pool);
+
 /* Queue setup is split so DMA ranges can be authorized before the device sees
  * them:
- *   virtio_queue_alloc()   selects the queue, reads QUEUE_NUM_MAX, allocates the
- *                          ring memory and validates it (v1 PFN must fit 32
- *                          bits). It writes only QUEUE_SEL; the device is not
- *                          given any address, QUEUE_PFN or QUEUE_READY. Returns
- *                          NULL on failure with nothing leaked.
- *   virtio_queue_publish() programs QUEUE_NUM and the addresses (v1: ALIGN/PFN,
- *                          v2: DESC/DRIVER/DEVICE + QUEUE_READY) for the same
- *                          version passed to alloc, after virtio_fence_w_o(). It
- *                          re-selects the queue and cannot fail.
- * The caller must publish only after the domain decision, and must issue
- * virtio_fence_w_o() itself before the DRIVER_OK status write if it stored to the
- * rings after publishing.
+ *   virtio_queue_alloc()   selects the queue, reads QUEUE_NUM_MAX, allocates
+ * the ring memory and validates it (v1 PFN must fit 32 bits). It writes only
+ * QUEUE_SEL; the device is not given any address, QUEUE_PFN or QUEUE_READY.
+ * Returns NULL on failure with nothing leaked. virtio_queue_publish() programs
+ * QUEUE_NUM and the addresses (v1: ALIGN/PFN, v2: DESC/DRIVER/DEVICE +
+ * QUEUE_READY) for the same version passed to alloc, after virtio_fence_w_o().
+ * It re-selects the queue and cannot fail. The caller must publish only after
+ * the domain decision, and must issue virtio_fence_w_o() itself before the
+ * DRIVER_OK status write if it stored to the rings after publishing.
  */
 struct rtmux_virtio_queue *virtio_queue_alloc(struct rtmux_virtio_mmio *vio,
                                               int version,

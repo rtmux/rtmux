@@ -5,7 +5,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/* Debug-only userspace lock-rank (lockdep-style) checker hooks.
+/*
+ * Debug-only userspace lock-rank (lockdep-style) checker hooks.
  *
  * The mutex acquire/release fast paths call these to record a per-thread stack
  * of held locks and a global graph of "held-before" edges keyed by lock

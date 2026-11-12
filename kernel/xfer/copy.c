@@ -89,8 +89,8 @@ int xfer_probe(void *loc, unsigned words, int write)
  * plain read-back-write would clobber a concurrent owner/count update from
  * another hart (see kernel/sync/core.c), so sync_t probes must use this form,
  * and a caller that needs the word's old value gets it from the same access.
- * OR-ing 0 probes writability without changing the word. Unlike xfer_probe
- * this cannot rely on the platform to emulate a misaligned access: an AMO to a
+ * OR-ing 0 probes writability without changing the word. Unlike xfer_probe this
+ * cannot rely on the platform to emulate a misaligned access: an AMO to a
  * misaligned address traps and is not recovered, so a misaligned address is
  * refused here. Parameters:
  *   uaddr : user address of the word

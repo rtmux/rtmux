@@ -123,11 +123,11 @@ static int run_function(struct sh *sh,
                         int argc);
 
 static const char *const sh_builtin_names[] = {
-    ":",    ".",      "break",   "cd",     "command", "continue", "echo",
-    "eval", "exec",   "exit",    "export", "false",   "help",     "pwd",
-    "read", "return", "set",     "shift",  "source",  "test",     "true",
-    "type", "unset",  "waitfor", "[",      "[[",      "jobs",     "fg",
-    "bg",   NULL,
+    ":",      ".",    "break", "cd",     "command", "continue",
+    "echo",   "eval", "exec",  "exit",   "export",  "false",
+    "help",   "pwd",  "read",  "return", "set",     "shift",
+    "source", "test", "true",  "type",   "unset",   "waitfor",
+    "[",      "[[",   "jobs",  "fg",     "bg",      NULL,
 };
 
 static void sh_free_history(struct sh *sh)
@@ -289,7 +289,9 @@ static int sh_complete_word(const char *prefix, char matches[][PATH_MAX])
         return count;
     for (dir = strtok_r(path, ":", &save); dir;
          dir = strtok_r(NULL, ":", &save)) {
-        /* ipc-send: utils -> roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring */
+        /* ipc-send: utils ->
+         * roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring
+         */
         DIR *dp = opendir(*dir != '\0' ? dir : ".");
         struct dirent *de;
 
@@ -333,7 +335,9 @@ static int sh_complete_path(const char *prefix, char matches[][PATH_MAX])
         name = prefix;
     }
 
-    /* ipc-send: utils -> roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring */
+    /* ipc-send: utils ->
+     * roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring
+     */
     dp = opendir(dir);
     if (!dp)
         return 0;
@@ -1593,7 +1597,10 @@ static int glob_word(const char *pat, struct sh_words *out)
         diropen[0] = '.';
         diropen[1] = '\0';
     }
-    /* ipc-send: utils -> roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring */
+
+    /* ipc-send: utils ->
+     * roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring
+     */
     dp = opendir(diropen);
     if (!dp)
         return 0;
@@ -2205,7 +2212,7 @@ static int sh_describe(struct sh *sh, const char *name, char mode)
     return 1;
 }
 
-/* ---- interactive job control ----
+/* interactive job control
  *
  * An interactive shell on its controlling terminal keeps itself in a process
  * group of its own and runs each pipeline in a group of its own, which it makes
@@ -2274,9 +2281,10 @@ static void sh_take_terminal(void)
         (void) tcsetpgrp(STDIN_FILENO, sh_shell_pgid);
 }
 
-/* Wait for a foreground job's last process. Returns its exit status as the shell
- * reports it; *stopped is set when the job stopped instead (^Z or a stop
- * signal), in which case it is in the job table.
+/* Wait for a foreground job's last process.
+ *
+ * Returns its exit status as the shell reports it; *stopped is set when the job
+ * stopped instead (^Z or a stop signal), in which case it is in the job table.
  */
 static int sh_wait_fg(pid_t pid, pid_t pgid, const char *cmd, bool *stopped)
 {
@@ -2294,6 +2302,7 @@ static int sh_wait_fg(pid_t pid, pid_t pgid, const char *cmd, bool *stopped)
                 j->pid = 0;
             return WIFEXITED(st) ? WEXITSTATUS(st) : 128;
         }
+
         /* A job that read or wrote before it was handed the terminal was
          * stopped by SIGTTIN/SIGTTOU; it is the foreground group now, so let it
          * go on.
@@ -2311,7 +2320,9 @@ static int sh_wait_fg(pid_t pid, pid_t pgid, const char *cmd, bool *stopped)
 }
 
 /* Pick the job a fg/bg/jobs argument names: "%N" or "N"; none means the most
- * recent one. Returns NULL (after a message) when there is no such job.
+ * recent one.
+ *
+ * Returns NULL (after a message) when there is no such job.
  */
 static struct sh_job *sh_job_arg(const char *name, const char *arg)
 {
@@ -2335,7 +2346,8 @@ static int builtin_jobs(void)
 {
     for (int i = 0; i < SH_JOBS; i++)
         if (sh_jobs[i].pid)
-            sh_job_report(&sh_jobs[i], sh_jobs[i].stopped ? "Stopped" : "Running");
+            sh_job_report(&sh_jobs[i],
+                          sh_jobs[i].stopped ? "Stopped" : "Running");
     return 0;
 }
 
@@ -2612,7 +2624,8 @@ static void sh_reap_zombies(void)
     int st;
     pid_t pid;
 
-    while ((pid = waitpid(-1, &st, sh_jc ? WNOHANG | WUNTRACED : WNOHANG)) > 0) {
+    while ((pid = waitpid(-1, &st, sh_jc ? WNOHANG | WUNTRACED : WNOHANG)) >
+           0) {
         struct sh_job *j = sh_job_find(pid);
 
         if (!j)
@@ -2677,7 +2690,8 @@ static int run_external(char **argv,
     }
 
     if (sh_jc) {
-        /* The first process of a pipeline starts its group; the rest join it. */
+        /* The first process of a pipeline starts its group; the rest join it.
+         */
         if (posix_spawnattr_init(&attr) == EOK) {
             attr_p = &attr;
             (void) posix_spawnattr_setpgroup(attr_p, sh_jc_pgid);
@@ -2697,15 +2711,16 @@ static int run_external(char **argv,
         sh_jc_pgid = pid;
         if (!background) {
             (void) tcsetpgrp(STDIN_FILENO, pid);
-            /* It may have read the terminal before it was ours and been
-             * stopped by SIGTTIN; it is foreground now, so let it go on.
+
+            /* It may have read the terminal before it was ours and been stopped
+             * by SIGTTIN; it is foreground now, so let it go on.
              */
             (void) kill(-pid, SIGCONT);
         }
     }
     if (background) {
-        struct sh_job *j = sh_jc ? sh_job_add(sh_jc_pgid, pid, argv[0], false)
-                                 : NULL;
+        struct sh_job *j =
+            sh_jc ? sh_job_add(sh_jc_pgid, pid, argv[0], false) : NULL;
 
         if (j)
             printf("[%d] %d\n", sh_job_number(j), pid);
@@ -2826,7 +2841,10 @@ static int command_from_tokens(struct sh *sh,
                 /* `cmd <a <b` keeps the last input; close the prior open. */
                 close_if_needed(own_in);
                 own_in = -1;
-                /* ipc-send: utils -> roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring */
+
+                /* ipc-send: utils ->
+                 * roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring
+                 */
                 own_in = open(tok[i + 1].s, O_RDONLY);
                 if (own_in < 0)
                     goto open_fail;
@@ -2846,7 +2864,10 @@ static int command_from_tokens(struct sh *sh,
                         ((tok[i].op == SH_GTGT || tok[i].op == SH_ERRGTGT)
                              ? O_APPEND
                              : O_TRUNC);
-                /* ipc-send: utils -> roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring */
+
+                /* ipc-send: utils ->
+                 * roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring
+                 */
                 fd = open(tok[i + 1].s, flags, 0666);
                 if (fd < 0)
                     goto open_fail;
@@ -3027,7 +3048,9 @@ wait_and_return:
                 last_status = 128;
         }
     }
-    /* A stopped job's other stages are stopped with it; do not wait for them. */
+
+    /* A stopped job's other stages are stopped with it; do not wait for them.
+     */
     for (int i = 0; i < npids && !stopped; i++) {
         int st;
         if (pids[i] == last_pid)
@@ -4378,7 +4401,9 @@ static int run_file(struct sh *sh, const char *path)
     int rc;
     int fd;
 
-    /* ipc-send: utils -> roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring */
+    /* ipc-send: utils ->
+     * roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring
+     */
     fd = open(path, O_RDONLY);
     if (fd < 0) {
         fprintf(stderr, "sh: %s: %s\n", path, strerror(errno));
@@ -4444,7 +4469,8 @@ static int run_interactive(struct sh *sh)
         rc = run_line(sh, line);
     }
     if (sh_jc) {
-        /* Hand the terminal back to the group we took it from (login, getty). */
+        /* Hand the terminal back to the group we took it from (login, getty).
+         */
         (void) tcsetpgrp(STDIN_FILENO, old_pgid);
         sh_jc = false;
     }

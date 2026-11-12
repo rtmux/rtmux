@@ -370,7 +370,10 @@ static int bytes_equal_constant_time(const char *a, const char *b, size_t len)
 static const char *shadow_hash_for(const char *name)
 {
     static char hash[TOOLBOX_LINE_MAX];
-    /* ipc-send: utils -> roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring */
+
+    /* ipc-send: utils ->
+     * roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring
+     */
     FILE *fp = fopen(SHADOW_PATH, "r");
     char line[TOOLBOX_LINE_MAX];
 
@@ -440,7 +443,10 @@ static int read_proc_name(pid_t pid, char *buf, size_t len)
         return -1;
     buf[0] = '\0';
     snprintf(path, sizeof(path), "/proc/%d", (int) pid);
-    /* ipc-send: utils -> roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring */
+
+    /* ipc-send: utils ->
+     * roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring
+     */
     fd = open(path, O_RDONLY);
     if (fd >= 0) {
         memset(&debug, 0, sizeof(debug));
@@ -455,7 +461,10 @@ static int read_proc_name(pid_t pid, char *buf, size_t len)
     }
 
     snprintf(path, sizeof(path), "/proc/%d/name", (int) pid);
-    /* ipc-send: utils -> roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring */
+
+    /* ipc-send: utils ->
+     * roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring
+     */
     fd = open(path, O_RDONLY);
     if (fd < 0) {
         snprintf(buf, len, "?");
@@ -528,7 +537,10 @@ static int read_proc_row(pid_t pid, struct proc_row *row)
     int have_status;
 
     snprintf(path, sizeof(path), "/proc/%d", (int) pid);
-    /* ipc-send: utils -> roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring */
+
+    /* ipc-send: utils ->
+     * roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring
+     */
     fd = open(path, O_RDONLY);
     if (fd < 0)
         return -1;
@@ -711,7 +723,9 @@ static int ls_one(const char *path, int all_mode, int long_mode)
         return 0;
     }
 
-    /* ipc-send: utils -> roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring */
+    /* ipc-send: utils ->
+     * roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring
+     */
     dp = opendir(path);
     if (!dp) {
         fprintf(stderr, "ls: %s: %s\n", path, strerror(errno));
@@ -760,7 +774,10 @@ static int find_one(const char *path, int depth)
                 FIND_MAX_DEPTH);
         return 1;
     }
-    /* ipc-send: utils -> roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring */
+
+    /* ipc-send: utils ->
+     * roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring
+     */
     dp = opendir(path);
     if (!dp) {
         fprintf(stderr, "find: %s: %s\n", path, strerror(errno));
@@ -1047,7 +1064,10 @@ static int stream_files(const char *applet, int argc, char **argv)
                 rc = 1;
             continue;
         }
-        /* ipc-send: utils -> roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring */
+
+        /* ipc-send: utils ->
+         * roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring
+         */
         fd = open(argv[i], O_RDONLY);
         if (fd < 0) {
             fprintf(stderr, "%s: %s: %s\n", applet, argv[i], strerror(errno));
@@ -1085,7 +1105,9 @@ static int applet_hello(int argc, char **argv)
 
 static int print_file(const char *applet, const char *path)
 {
-    /* ipc-send: utils -> roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring */
+    /* ipc-send: utils ->
+     * roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring
+     */
     int fd = open(path, O_RDONLY);
     int rc;
 
@@ -1169,7 +1191,10 @@ static int fetch_http(const char *applet,
         goto out;
     }
     snprintf(file, sizeof(file), "/net/tcp/%s/ctl", id);
-    /* ipc-send: utils -> roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring */
+
+    /* ipc-send: utils ->
+     * roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring
+     */
     ctl_fd = open(file, O_WRONLY);
     if (ctl_fd < 0) {
         fprintf(stderr, "%s: %s: %s\n", applet, file, strerror(errno));
@@ -1183,7 +1208,10 @@ static int fetch_http(const char *applet,
     }
     close(ctl_fd);
     snprintf(file, sizeof(file), "/net/tcp/%s/data", id);
-    /* ipc-send: utils -> roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring */
+
+    /* ipc-send: utils ->
+     * roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring
+     */
     data_fd = open(file, O_RDWR);
     if (data_fd < 0) {
         fprintf(stderr, "%s: %s: %s\n", applet, file, strerror(errno));
@@ -1431,7 +1459,10 @@ static void net_close_id(const char *proto, const char *id)
     int fd;
 
     snprintf(path, sizeof(path), "/net/%s/%s/ctl", proto, id);
-    /* ipc-send: utils -> roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring */
+
+    /* ipc-send: utils ->
+     * roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring
+     */
     fd = open(path, O_WRONLY);
     if (fd < 0)
         return;
@@ -1446,7 +1477,10 @@ static int net_clone_id(const char *proto, char *id, size_t idsz)
     ssize_t n;
 
     snprintf(path, sizeof(path), "/net/%s/clone", proto);
-    /* ipc-send: utils -> roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring */
+
+    /* ipc-send: utils ->
+     * roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring
+     */
     fd = open(path, O_RDONLY);
     if (fd < 0) {
         fprintf(stderr, "nc: %s: %s\n", path, strerror(errno));
@@ -1537,7 +1571,10 @@ static int net_try_owner(const char *proto, const char *id)
     int fd;
 
     snprintf(path, sizeof(path), "/net/%s/%s/ctl", proto, id);
-    /* ipc-send: utils -> roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring */
+
+    /* ipc-send: utils ->
+     * roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring
+     */
     fd = open(path, O_WRONLY);
     if (fd != -1) {
         close(fd);
@@ -1602,7 +1639,10 @@ static int net_udp_exchange(const char *host,
     if (net_clone_id("udp", id, sizeof(id)) != 0)
         return -1;
     snprintf(path, sizeof(path), "/net/udp/%s/ctl", id);
-    /* ipc-send: utils -> roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring */
+
+    /* ipc-send: utils ->
+     * roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring
+     */
     fd = open(path, O_WRONLY);
     if (fd < 0)
         goto fail;
@@ -1617,7 +1657,10 @@ static int net_udp_exchange(const char *host,
     }
     close(fd);
     snprintf(path, sizeof(path), "/net/udp/%s/data", id);
-    /* ipc-send: utils -> roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring */
+
+    /* ipc-send: utils ->
+     * roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring
+     */
     fd = open(path, O_RDWR);
     if (fd < 0)
         goto fail;
@@ -2107,7 +2150,10 @@ static int applet_nc(int argc, char **argv)
         goto done_id;
     }
     snprintf(out, sizeof(out), "/net/%s/%s/ctl", proto, id);
-    /* ipc-send: utils -> roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring */
+
+    /* ipc-send: utils ->
+     * roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring
+     */
     ctl_fd = open(out, O_WRONLY);
     if (ctl_fd < 0) {
         fprintf(stderr, "nc: %s: %s\n", out, strerror(errno));
@@ -2120,7 +2166,10 @@ static int applet_nc(int argc, char **argv)
     }
     close(ctl_fd);
     snprintf(out, sizeof(out), "/net/%s/%s/data", proto, id);
-    /* ipc-send: utils -> roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring */
+
+    /* ipc-send: utils ->
+     * roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring
+     */
     data_fd = open(out, O_RDWR);
     if (data_fd < 0) {
         fprintf(stderr, "nc: %s: %s\n", out, strerror(errno));
@@ -2321,7 +2370,10 @@ static int applet_cp(int argc, char **argv)
         fprintf(stderr, "usage: cp SRC DST\n");
         return 1;
     }
-    /* ipc-send: utils -> roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring */
+
+    /* ipc-send: utils ->
+     * roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring
+     */
     in = open(argv[1], O_RDONLY);
     if (in < 0) {
         fprintf(stderr, "cp: %s: %s\n", argv[1], strerror(errno));
@@ -2344,7 +2396,10 @@ static int applet_cp(int argc, char **argv)
         close(in);
         return 1;
     }
-    /* ipc-send: utils -> roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring */
+
+    /* ipc-send: utils ->
+     * roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring
+     */
     out = open(argv[2], O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (out < 0) {
         fprintf(stderr, "cp: %s: %s\n", argv[2], strerror(errno));
@@ -2423,7 +2478,10 @@ static int applet_df(int argc, char **argv)
         unsigned long frsize;
         unsigned long long blocks;
         unsigned long long free_blocks;
-        /* ipc-send: utils -> roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring */
+
+        /* ipc-send: utils ->
+         * roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring
+         */
         int fd = open(argv[i], O_RDONLY);
 
         if (fd < 0) {
@@ -2607,7 +2665,9 @@ static int applet_head(int argc, char **argv)
         char buf[TOOLBOX_LINE_MAX];
         long n = 0;
 
-        /* ipc-send: utils -> roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring */
+        /* ipc-send: utils ->
+         * roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring
+         */
         fp = !strcmp(argv[i], "-") ? stdin : fopen(argv[i], "r");
         if (!fp) {
             fprintf(stderr, "head: %s: %s\n", argv[i], strerror(errno));
@@ -2699,7 +2759,9 @@ static int applet_sync(int argc, char **argv)
         return 0;
     }
     for (int i = 1; i < argc; i++) {
-        /* ipc-send: utils -> roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring */
+        /* ipc-send: utils ->
+         * roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring
+         */
         int fd = open(argv[i], O_RDONLY);
 
         if (fd < 0) {
@@ -3028,7 +3090,8 @@ static int inject_call(unsigned op, unsigned long a0, unsigned long a1)
     long rc = syscall_priv(__KSYS_PRIV_DEBUG_INJECT, &args);
 
     if (rc != 0) {
-        fprintf(stderr, "inject: call refused: %s\n", strerror((int) (rc < 0 ? -rc : rc)));
+        fprintf(stderr, "inject: call refused: %s\n",
+                strerror((int) (rc < 0 ? -rc : rc)));
         return -1;
     }
     return args.ret;
@@ -3061,15 +3124,17 @@ static int applet_inject(int argc, char **argv)
             fprintf(stderr, "inject: unknown pool %s\n", argv[2]);
             return 2;
         }
-        rc = inject_call(INJECT_OP_FAIL_NEXT_ALLOC, id, strtoul(argv[3], NULL, 0));
+        rc = inject_call(INJECT_OP_FAIL_NEXT_ALLOC, id,
+                         strtoul(argv[3], NULL, 0));
     } else if (argc == 2 && !strcmp(argv[1], "alloc-status")) {
         rc = inject_call(INJECT_OP_ALLOC_STATUS, 0, 0);
         if (rc >= 0)
             printf("alloc-consumed=%d\n", rc);
         return rc < 0 ? 1 : 0;
     } else {
-        fprintf(stderr, "usage: inject spin-irqoff HART MS | spin-console HART MS | "
-                        "hang-hart HART | fail-alloc POOL PID | alloc-status\n");
+        fprintf(stderr,
+                "usage: inject spin-irqoff HART MS | spin-console HART MS | "
+                "hang-hart HART | fail-alloc POOL PID | alloc-status\n");
         return 2;
     }
     return rc == 0 ? 0 : 1;
@@ -3103,7 +3168,10 @@ static int applet_tail(int argc, char **argv)
             fprintf(stderr, "tail: no memory\n");
             return 1;
         }
-        /* ipc-send: utils -> roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring */
+
+        /* ipc-send: utils ->
+         * roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring
+         */
         fp = !strcmp(argv[i], "-") ? stdin : fopen(argv[i], "r");
         if (!fp) {
             fprintf(stderr, "tail: %s: %s\n", argv[i], strerror(errno));
@@ -3159,7 +3227,9 @@ static int applet_tee(int argc, char **argv)
     if (!fps)
         return 1;
     for (int i = 0; i < files; i++) {
-        /* ipc-send: utils -> roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring */
+        /* ipc-send: utils ->
+         * roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring
+         */
         fps[i] = fopen(argv[arg + i], append ? "a" : "w");
         if (!fps[i]) {
             fprintf(stderr, "tee: %s: %s\n", argv[arg + i], strerror(errno));
@@ -3299,7 +3369,9 @@ static int applet_touch(int argc, char **argv)
         return 1;
     }
     for (int i = 1; i < argc; i++) {
-        /* ipc-send: utils -> roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring */
+        /* ipc-send: utils ->
+         * roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring
+         */
         int fd = open(argv[i], O_WRONLY | O_CREAT, 0666);
         if (fd < 0) {
             fprintf(stderr, "touch: %s: %s\n", argv[i], strerror(errno));
@@ -3351,7 +3423,9 @@ static int applet_wc(int argc, char **argv)
     if (argc == 1)
         return wc_one(stdin, "-", 0);
     for (int i = 1; i < argc; i++) {
-        /* ipc-send: utils -> roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring */
+        /* ipc-send: utils ->
+         * roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring
+         */
         FILE *fp = fopen(argv[i], "r");
         if (!fp) {
             fprintf(stderr, "wc: %s: %s\n", argv[i], strerror(errno));
@@ -3534,7 +3608,9 @@ static int applet_grep(int argc, char **argv)
     nfiles = argc - arg;
 
     for (int i = arg; i < argc; i++) {
-        /* ipc-send: utils -> roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring */
+        /* ipc-send: utils ->
+         * roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring
+         */
         FILE *fp = !strcmp(argv[i], "-") ? stdin : fopen(argv[i], "r");
         char buf[TOOLBOX_LINE_MAX];
         long nmatch = 0, lineno = 0;
@@ -3756,7 +3832,9 @@ static int applet_cut(int argc, char **argv)
         argv[--arg] = "-";
 
     for (int i = arg; i < argc; i++) {
-        /* ipc-send: utils -> roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring */
+        /* ipc-send: utils ->
+         * roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring
+         */
         FILE *fp = !strcmp(argv[i], "-") ? stdin : fopen(argv[i], "r");
         char buf[TOOLBOX_LINE_MAX];
 
@@ -3865,7 +3943,9 @@ static int applet_sort(int argc, char **argv)
     if (arg == argc)
         argv[--arg] = "-";
     for (int i = arg; i < argc; i++) {
-        /* ipc-send: utils -> roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring */
+        /* ipc-send: utils ->
+         * roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring
+         */
         FILE *fp = !strcmp(argv[i], "-") ? stdin : fopen(argv[i], "r");
         char buf[TOOLBOX_LINE_MAX];
 
@@ -3964,7 +4044,10 @@ static int applet_uniq(int argc, char **argv)
             }
         }
     }
-    /* ipc-send: utils -> roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring */
+
+    /* ipc-send: utils ->
+     * roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring
+     */
     fp = (arg >= argc || !strcmp(argv[arg], "-")) ? stdin
                                                   : fopen(argv[arg], "r");
     if (!fp) {

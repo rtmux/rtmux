@@ -183,7 +183,7 @@ static int remember_delegation(pid_t pid,
         if (handles[i].owner_pid != pid || handles[i].device_id != device_id ||
             handles[i].kind != RTMUX_RESOURCE_MMIO)
             return EINVAL;
-        delegations[delegation_count++] = (struct virtio_mmio_delegation) {
+        delegations[delegation_count++] = (struct virtio_mmio_delegation){
             .handle = handles[i],
         };
     }
@@ -347,17 +347,17 @@ static int find_boot_devices(struct rtmux_resource_handle *handles,
     hwi_tag *dev = NULL;
     unsigned found = 0;
 
-#define ADD_BOOT_HANDLE(_base, _size, _device_id, _irq)   \
-    do {                                                  \
-        handles[found] = (struct rtmux_resource_handle) { \
-            .kind = RTMUX_RESOURCE_MMIO,                  \
-            .base = (_base),                              \
-            .length = (_size),                            \
-            .device_id = (_device_id),                    \
-            .generation = found + 1,                      \
-            .irq_vector = (int32_t) (_irq),               \
-        };                                                \
-        found++;                                          \
+#define ADD_BOOT_HANDLE(_base, _size, _device_id, _irq)  \
+    do {                                                 \
+        handles[found] = (struct rtmux_resource_handle){ \
+            .kind = RTMUX_RESOURCE_MMIO,                 \
+            .base = (_base),                             \
+            .length = (_size),                           \
+            .device_id = (_device_id),                   \
+            .generation = found + 1,                     \
+            .irq_vector = (int32_t) (_irq),              \
+        };                                               \
+        found++;                                         \
     } while (0)
 
     dev = hwinfo_find_device("ns16550", NULL);

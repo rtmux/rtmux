@@ -155,8 +155,8 @@ process_t *process_create(pid_t parent_pid, void *lcp, pid_t *out_pid)
 
         /* POSIX: a child starts in its parent's process group and session. A
          * parent that never joined a group is its own group (pgrp 0 is unset),
-         * so its children are in group parent_pid. Each member holds one link on
-         * the session; root_process_fini drops it.
+         * so its children are in group parent_pid. Each member holds one link
+         * on the session; root_process_fini drops it.
          */
         child_tmp->pgrp = parent_tmp->pgrp ? parent_tmp->pgrp : parent_pid;
         if (parent_tmp->session) {

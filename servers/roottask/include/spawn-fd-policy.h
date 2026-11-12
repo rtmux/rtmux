@@ -16,16 +16,16 @@
 #include <sys/rtmux-core.h>
 #include <sys/procmsg.h>
 
-/* Verdict of spawn_fd_offer(): the parent's request does not offer this fd, does
- * offer it, or offers it only if the parent's fd at that number is live and
- * inheritable (the caller checks, with spawn_fd_scan_ok()).
+/* Verdict of spawn_fd_offer(): the parent's request does not offer this fd,
+ * does offer it, or offers it only if the parent's fd at that number is live
+ * and inheritable (the caller checks, with spawn_fd_scan_ok()).
  */
 enum { SPAWN_OFFER_NO = 0, SPAWN_OFFER_YES = 1, SPAWN_OFFER_SCAN = 2 };
 
 /* Does the spawn request (nfds list entries, list[], SPAWN_* flags) let the
  * child's fd `base` inherit the parent's fd `parent_fd`? An explicit list entry
- * is honored, SPAWN_FDCLOSED never is. Past the list (or with no list) only
- * the scan-tail/scan modes apply, and only at the fd's own number.
+ * is honored, SPAWN_FDCLOSED never is. Past the list (or with no list) only the
+ * scan-tail/scan modes apply, and only at the fd's own number.
  */
 static inline int spawn_fd_offer(unsigned nfds,
                                  const int32_t *list,

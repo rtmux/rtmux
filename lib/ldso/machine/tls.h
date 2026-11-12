@@ -5,7 +5,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/* machine/tls.h for RTMux ldso (RISC-V)
+/*
+ * machine/tls.h for RTMux ldso (RISC-V)
  *
  * RISC-V uses TLS Variant I (TCB before TLS data, tp points past TCB).
  */

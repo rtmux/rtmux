@@ -72,15 +72,18 @@ void kext_debug_inject(void *data)
 
         for (unsigned c = 0; c < CONFIG_PROCESSORS_MAX; c++)
             live += pcpu_array[c].pc_alive ? 1u : 0u;
+
         /* Refuse the caller's own hart, a hart that is not alive, and the last
          * live hart: any of them would turn a test into an unrecoverable stop
-         * rather than a stall to be diagnosed. */
+         * rather than a stall to be diagnosed.
+         */
         if (hart == self || !pcpu_array[hart].pc_alive || live < 2) {
             ret = EINVAL;
             break;
         }
         pcpu_array[hart].pc_inject_spin_ms = ms;
-        pcpu_array[hart].pc_inject_hold_console = kap->op == INJECT_OP_SPIN_CONSOLE;
+        pcpu_array[hart].pc_inject_hold_console =
+            kap->op == INJECT_OP_SPIN_CONSOLE;
         SENDIPI(hart, IPI_DEBUG_SPIN);
         break;
     }
@@ -90,7 +93,8 @@ void kext_debug_inject(void *data)
             break;
         }
         atomic_store_explicit(&consumed, 0, memory_order_relaxed);
-        atomic_store_explicit(&armed_pid, (int) kap->arg1, memory_order_relaxed);
+        atomic_store_explicit(&armed_pid, (int) kap->arg1,
+                              memory_order_relaxed);
         atomic_store_explicit(&armed_soul, (unsigned) kap->arg0,
                               memory_order_release);
         break;
@@ -102,7 +106,9 @@ void kext_debug_inject(void *data)
         break;
     }
     kap->ret = ret;
+
     /* ALLOC_STATUS answers through kap->ret; a nonzero status would read as a
-     * refused call to syscall_priv callers. */
+     * refused call to syscall_priv callers.
+     */
     SETKSTATUS(act, kap->op == INJECT_OP_ALLOC_STATUS ? EOK : ret);
 }

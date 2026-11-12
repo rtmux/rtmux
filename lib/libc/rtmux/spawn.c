@@ -108,10 +108,11 @@ static pid_t spawn_common(const char *path,
         *proc_cap = 0;
         memset(&reply, 0, sizeof reply);
         SETIOV(&riov, &reply, sizeof reply);
-        /* Only a client that opts in gets a native cap header parsed out of
-         * the reply; scope the opt-in to exactly this request. If the opt-in
-         * is refused, do not ask for a cap: the reply would arrive unparsed,
-         * with the proc service's own handle in xfers[0].id.
+
+        /* Only a client that opts in gets a native cap header parsed out of the
+         * reply; scope the opt-in to exactly this request. If the opt-in is
+         * refused, do not ask for a cap: the reply would arrive unparsed, with
+         * the proc service's own handle in xfers[0].id.
          */
         if (thread_ctl(RTMUX_TCTL_NATIVE_REPLY, (void *) 1) == -1) {
             if (mmapped_len != 0)

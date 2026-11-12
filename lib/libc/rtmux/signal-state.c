@@ -21,12 +21,13 @@
  * A blocking libc wrapper registers its thread (__libc_wait_enter) for the
  * duration of the kernel call. After a handler installed without SA_RESTART
  * returns, deliver_one picks ONE registered waiter, the lowest tid that has not
- * already been chosen, and breaks its wait with thread_ctl(RTMUX_TCTL_INTERRUPT),
- * so the call returns EINTR. A handler with SA_RESTART interrupts nothing: the
- * call just keeps blocking. The mask is process-wide, so a blocked signal never
- * reaches deliver_one and interrupts nobody; it does so when unblocked. Only
- * threads already inside a wrapper when the signal is delivered are eligible: a
- * handler installed while a call is already blocked does not interrupt it.
+ * already been chosen, and breaks its wait with
+ * thread_ctl(RTMUX_TCTL_INTERRUPT), so the call returns EINTR. A handler with
+ * SA_RESTART interrupts nothing: the call just keeps blocking. The mask is
+ * process-wide, so a blocked signal never reaches deliver_one and interrupts
+ * nobody; it does so when unblocked. Only threads already inside a wrapper when
+ * the signal is delivered are eligible: a handler installed while a call is
+ * already blocked does not interrupt it.
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -81,6 +82,7 @@ static struct {
     struct sigaction handlers[LIBC_NSIG + 1]; /* index 1..LIBC_NSIG */
     sigset_t mask;
     sigset_t pending;
+
     /* Sender of the pending (or last coalesced) instance of each signal; for a
      * coalesced standard signal the last sender wins. Guarded by lock.
      */
@@ -89,6 +91,7 @@ static struct {
     pthread_cond_t wait;
     int pselect_coid;
     unsigned delivered;
+
     /* Interruptible-wait registry (see signal-state.h). `waiters` and
      * `wait_seq` are guarded by lock. `intr_armed` counts the handlers that can
      * interrupt a blocked call (real handler, no SA_RESTART); it is written
@@ -98,6 +101,7 @@ static struct {
     libc_waiter_t *waiters;
     unsigned wait_seq;
     int intr_armed;
+
     /* Job control. `stopped` is written only by the system thread (stop and
      * continue are both done there). While it is set the system thread keeps
      * `lock` locked: the other threads are held at arbitrary points, and one
@@ -167,7 +171,9 @@ static void jobctl_report(int event, int arg2)
 /* Hand a stop or continue request that came in on an application thread (raise,
  * kill of oneself, a sigprocmask that unblocked a stop signal) to the system
  * thread through roottask: only it may hold the others, as it is the one thread
- * that must stay runnable to take SIGCONT. Returns 0 when posted.
+ * that must stay runnable to take SIGCONT.
+ *
+ * Returns 0 when posted.
  */
 static int jobctl_post(int signo)
 {
@@ -181,11 +187,11 @@ static int jobctl_post(int signo)
 }
 
 /* Stop the process: hold every other thread (this one, the system thread, stays
- * runnable to receive SIGCONT and SIGKILL), then report it so waitpid(WUNTRACED)
- * sees the stop only once it has taken effect. Runs on the system thread with
- * state.lock held, which it keeps until the process is continued (see the
- * comment on `stopped`): no other thread can be inside the table when held, and
- * those waiting for the lock are stopped waiting.
+ * runnable to receive SIGCONT and SIGKILL), then report it so
+ * waitpid(WUNTRACED) sees the stop only once it has taken effect. Runs on the
+ * system thread with state.lock held, which it keeps until the process is
+ * continued (see the comment on `stopped`): no other thread can be inside the
+ * table when held, and those waiting for the lock are stopped waiting.
  */
 static void jobctl_stop_locked(int signo)
 {
@@ -225,8 +231,8 @@ static int signo_uncatchable(int signo)
  * suffices; 16 x 100 us rides out a preemption of the waiter by a higher
  * priority thread. Past it the waiter simply keeps waiting (a handler ran, the
  * call was not interrupted). The kernel also answers EAGAIN for a stable
- * uninterruptible state (a mutex wait), so the bound doubles as the limit on how
- * long the signal thread spends on such a target.
+ * uninterruptible state (a mutex wait), so the bound doubles as the limit on
+ * how long the signal thread spends on such a target.
  */
 #define LIBC_INTR_RETRY_MAX 16
 #define LIBC_INTR_RETRY_NS 100000ULL
@@ -354,6 +360,7 @@ static void interrupt_one_waiter(void)
 
         /* Registered but not blocked in the kernel yet: pause and re-offer. */
         pthread_mutex_unlock(&state.lock);
+
         /* Raw timer, not nanosleep(): that wrapper would register the signal
          * thread itself as a waiter.
          */
@@ -557,7 +564,9 @@ void __libc_signal_notification_recv(int signo, pid_t sender)
     }
 
     pthread_mutex_lock(&state.lock);
-    /* A stop signal discards a pending SIGCONT and the reverse (POSIX 2.4.3). */
+
+    /* A stop signal discards a pending SIGCONT and the reverse (POSIX 2.4.3).
+     */
     if (signo == SIGCONT) {
         sigset_clr(&state.pending, SIGTSTP);
         sigset_clr(&state.pending, SIGTTIN);
@@ -610,6 +619,7 @@ int __libc_signal_pause(void)
     delivered = state.delivered;
     if (!sigset_empty(&state.pending))
         drain();
+
     /* Raw condvar wait, not pthread_cond_wait(): that wrapper registers the
      * caller in the waiter list under state.lock, which pause holds here. A
      * caught signal still ends this wait through the cond_signal in

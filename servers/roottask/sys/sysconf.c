@@ -54,10 +54,9 @@ static const long roottask_sysconf_table[] = {
      */
     _CONF_VALUE_NUM | _CONF_FCN | _SC_CLK_TCK, (intptr_t) sc_clk_tck,
     _CONF_VALUE_MIN | _CONF_FCN | _SC_OPEN_MAX, (intptr_t) sc_open_max,
-    _CONF_VALUE_MIN | _SC_NGROUPS_MAX,
-    NGROUPS_MAX, _CONF_VALUE_NUM | _SC_SAVED_IDS, 1,
-    _CONF_VALUE_NUM | _SC_NZERO, 20, _CONF_VALUE_NUM | _SC_RTSIG_MAX,
-    (SIGRTMAX - SIGRTMIN) + 1,
+    _CONF_VALUE_MIN | _SC_NGROUPS_MAX, NGROUPS_MAX,
+    _CONF_VALUE_NUM | _SC_SAVED_IDS, 1, _CONF_VALUE_NUM | _SC_NZERO, 20,
+    _CONF_VALUE_NUM | _SC_RTSIG_MAX, (SIGRTMAX - SIGRTMIN) + 1,
 
     /* PID_MASK and VECTOR_MAX live in kernel/core/macros.h (kernel-internal).
      * Hardcoded here with the same values to avoid pulling macros.h into

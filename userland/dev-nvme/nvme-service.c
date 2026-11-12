@@ -497,9 +497,9 @@ static int register_region(dispatch_t *dpp,
     }
     nvme_region_t *rg = &regions[n_regions];
 
-    /* Mode must match what nvme_stat() reports. Raw access is root-only:
-     * raw block reads bypass file permissions (for example the 0600 shadow
-     * file on the romfs partition). lkl-fsd runs with root authority.
+    /* Mode must match what nvme_stat() reports. Raw access is root-only: raw
+     * block reads bypass file permissions (for example the 0600 shadow file on
+     * the romfs partition). lkl-fsd runs with root authority.
      */
     rg->nsid = nsid;
     rg->start_lba = start_lba;

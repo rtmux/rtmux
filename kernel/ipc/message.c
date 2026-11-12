@@ -702,12 +702,13 @@ int kdecl ksys_msg_info(thread_t *act, struct kcall_args_msg_info *kap)
         kspinlock_unlock(&cop->channel->lock);
         return ESRCH;
     }
-    /* Zeroed before the fill because the copy-out below moves the whole
-     * struct, padding included, not field by field the way the old direct
-     * write did. get_rcvinfo happens to set all fourteen members and the
-     * layout happens to have no holes today, so nothing leaks; a future field
-     * or a padding hole would leak kernel stack silently, and this costs 56
-     * bytes of zeroing on a diagnostic path.
+
+    /* Zeroed before the fill because the copy-out below moves the whole struct,
+     * padding included, not field by field the way the old direct write did.
+     * get_rcvinfo happens to set all fourteen members and the layout happens to
+     * have no holes today, so nothing leaks; a future field or a padding hole
+     * would leak kernel stack silently, and this costs 56 bytes of zeroing on a
+     * diagnostic path.
      */
     memset(&info, 0, sizeof info);
     get_rcvinfo(thp, -1, cop, &info);
@@ -831,9 +832,10 @@ int kdecl ksys_msg_verify_event(thread_t *act,
  */
 #define KEYDATA_MAX_PARTS 4
 #define KEYDATA_MAX_BYTES 256
+
 /* KEYDATA_MAX_FAILS (<sys/rtmux-core.h>): failed VERIFYs a minted secret
- * survives. VERIFY is open to any caller, so this bounds online guessing of
- * the 32-bit wire key to a handful of tries per minted secret instead of an
+ * survives. VERIFY is open to any caller, so this bounds online guessing of the
+ * 32-bit wire key to a handful of tries per minted secret instead of an
  * unthrottled 2^32 search.
  */
 
@@ -928,8 +930,9 @@ int kdecl ksys_msg_keydata(thread_t *act, struct kcall_args_msg_keydata *kap)
             newkey = 0;
         } else {
             newkey = ~0u;
-            /* Too many wrong guesses: retire the secret, but only the one
-             * this VERIFY read, so a racing re-mint is never zeroed.
+
+            /* Too many wrong guesses: retire the secret, but only the one this
+             * VERIFY read, so a racing re-mint is never zeroed.
              */
             if (secret != 0 &&
                 __atomic_add_fetch(&thp->key_fail, 1, __ATOMIC_RELAXED) >=

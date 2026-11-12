@@ -522,9 +522,9 @@ common:
             LINK1_BEG(cop_master->next, cop, connect_t);
             kspinlock_unlock(&cop_master->lock);
         } else {
-            /* Reserve the soul connect_detach will need to tell the server
-             * this client is gone, so the notice cannot be lost to an
-             * allocation failure at teardown. Fail the attach instead.
+            /* Reserve the soul connect_detach will need to tell the server this
+             * client is gone, so the notice cannot be lost to an allocation
+             * failure at teardown. Fail the attach instead.
              */
             if ((chp->flags & RTMUX_FLG_CHF_DISCONNECT) != 0) {
                 if (!object_reserve(&notification_souls)) {
@@ -821,6 +821,7 @@ int kdecl ksys_connect_detach(thread_t *act,
                 /* get rid of any event registered */
                 ((global_channel_t *) cop->channel)->ev_prp = NULL;
             }
+
             /* Global channels carry no sends (ksys_msg_sendv: ENOSYS), so
              * nothing can race this drop and the last one frees the soul, as
              * the process-exit path (_connect_detach) does. The old test was on

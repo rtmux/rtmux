@@ -205,6 +205,7 @@ const struct sigevent *clock_handler(void *dummy, int id)
                  * that leaves a SPORADIC thread without an ss_info.
                  */
                 sched_info_t *ss = act->schedinfo.ss_info;
+
                 /* consumed/curr_budget were already charged by
                  * sched_account_current() above; the tick only detects
                  * exhaustion (max one tick late, as before).
@@ -235,25 +236,26 @@ const struct sigevent *clock_handler(void *dummy, int id)
             }
 
             /* RLIMIT_CPU is checked for every ticking thread, not only when
-             * there is something to reschedule: a lone spinner has reschedl == 0
-             * and would otherwise never be stopped. SMP invariant: this hart
+             * there is something to reschedule: a lone spinner has reschedl ==
+             * 0 and would otherwise never be stopped. SMP invariant: this hart
              * writes only its own active thread's async_flags, and reads the
              * process's running_time (summed atomically by every hart that
-             * bills one of its threads, including the stretch billed just above)
-             * and max_cpu_time (stored atomically by kext_proc_set_rlimit), so
-             * a multi-hart process is stopped by whichever of its harts ticks
-             * first past the limit and no hart needs another's lock. The flag
-             * makes the thread enter resched_default, which sets KILLSELF.
+             * bills one of its threads, including the stretch billed just
+             * above) and max_cpu_time (stored atomically by
+             * kext_proc_set_rlimit), so a multi-hart process is stopped by
+             * whichever of its harts ticks first past the limit and no hart
+             * needs another's lock. The flag makes the thread enter
+             * resched_default, which sets KILLSELF.
              */
             {
                 uint64_t cpu_max = __atomic_load_n(&act->process->max_cpu_time,
                                                    __ATOMIC_RELAXED);
                 int cpu_over =
-                    cpu_max != 0 &&
-                    __atomic_load_n(&act->process->running_time,
-                                    __ATOMIC_RELAXED) > cpu_max;
+                    cpu_max != 0 && __atomic_load_n(&act->process->running_time,
+                                                    __ATOMIC_RELAXED) > cpu_max;
 
-                if (cpu_over || (reschedl & (RESCHED_SCHEDULE | RESCHED_THREAD))) {
+                if (cpu_over ||
+                    (reschedl & (RESCHED_SCHEDULE | RESCHED_THREAD))) {
                     if ((my_inkernel & INKERNEL_NOW) &&
                         (preempt_prio <= act->priority)) {
                         preempt_prio = act->priority;

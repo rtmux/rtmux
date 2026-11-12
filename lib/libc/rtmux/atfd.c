@@ -7,7 +7,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/* Descriptor -> absolute-path registry backing fd-relative *at resolution.
+/*
+ * Descriptor -> absolute-path registry backing fd-relative *at resolution.
  *
  * RTMux resolves paths textually through the roottask path server; there is no
  * resolve-relative-to-a-connection support, so openat() and its siblings cannot

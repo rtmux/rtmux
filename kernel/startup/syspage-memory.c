@@ -213,7 +213,7 @@ void set_syspage_board(const char *s)
     memcpy(dst, s, len);
 }
 
-/* Publish the kernel's release string and build identity.  The section is a
+/* Publish the kernel's release string and build identity. The section is a
  * fixed-size record (see struct build_info_entry), so it is sized with
  * set_syspage_section() before alloc_syspage_memory() freezes the layout.
  * Userland (libc uname(), ld-rtmux.so, roottask) reads it through

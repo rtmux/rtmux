@@ -5,7 +5,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/* Include the minimum needed so this TU is also compilable from roottask
+/*
+ * Include the minimum needed so this TU is also compilable from roottask
  * (servers/roottask/Makefile builds sys/walk_asinfo.o from this same source).
  * Pulling kernel/core/globals.h would drag in kopt / kprintf machinery that
  * roottask re-routes through root_log.

@@ -5,7 +5,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/* trace-ring.c — Per-CPU function-entry trace ring buffer.
+/*
+ * trace-ring.c — Per-CPU function-entry trace ring buffer.
  *
  * Storage + dump implementation. See <trace-ring.h> for the TRACE_FN macro and
  * the function-id enum.

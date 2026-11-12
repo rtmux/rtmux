@@ -41,11 +41,11 @@ int memref_add(struct mm_map *mm,
     owner = &obp->mem.mm.refs;
     for (;;) {
         or = *owner;
-        if (!or)
+        if (! or)
             break;
         if ((or->adp == adp) && (or->fd == fd))
             goto found_it;
-        owner = &or->next;
+        owner = & or->next;
     }
 
     /* RUSH3: object allocator is slightly slower than straight _smalloc RUSH3:
@@ -57,8 +57,8 @@ int memref_add(struct mm_map *mm,
      * } else {
      *      INTR_UNLOCK(&ref_spin);
      */
-    or = _smalloc(sizeof(*or));
-    if (!or)
+    or = _smalloc(sizeof(* or));
+    if (! or)
         return ENOMEM;
     /*  } */
     or->next = *owner;
@@ -76,7 +76,7 @@ found_it:
     if (next) {
         next->ref.owner = &mm->ref.next;
     }
-    mm->ref.owner = &or->first_ref;
+    mm->ref.owner = & or->first_ref;
     or->first_ref = mm;
     /* Walk-gen is in root_proc(pid)->map.walk_gen now. */
     {
@@ -107,7 +107,7 @@ void memref_del(struct mm_map *del_mm)
             mm->ref.owner = del_mm->ref.owner;
         }
 
-        if (!or->first_ref) {
+        if (! or->first_ref) {
             struct mm_object_ref **owner;
             struct mm_object_ref *chk;
             path_object_t *obp;
@@ -129,7 +129,7 @@ void memref_del(struct mm_map *del_mm)
             *owner = chk->next;
             del_mm->obj_ref = NULL;
             /*          proc_object_free(&or_souls, or); */
-            _sfree(or, sizeof(*or));
+            _sfree(or, sizeof(* or));
 
             /*          INTR_LOCK(&ref_spin);
              *          or->next = ref_free_list;

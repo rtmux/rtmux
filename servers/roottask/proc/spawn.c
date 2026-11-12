@@ -299,8 +299,9 @@ int proc_spawn(ioserv_context_t *ctp, void *vmsg)
             if (prp == (void *) -1) {
                 int err = errno ? errno : EAGAIN;
 
-                root_log("proc_spawn: process_create failed for parent %d: %s\n",
-                         (int) ppid, strerror(err));
+                root_log(
+                    "proc_spawn: process_create failed for parent %d: %s\n",
+                    (int) ppid, strerror(err));
                 loader_context_free(lcp);
                 return err;
             }

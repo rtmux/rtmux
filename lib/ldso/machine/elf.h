@@ -5,7 +5,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/* machine/elf.h shim for RTMux ldso (RISC-V 64-bit)
+/*
+ * machine/elf.h shim for RTMux ldso (RISC-V 64-bit)
  *
  * Maps FreeBSD's generic Elf_* aliases to RTMux's Elf64_* types.
  */

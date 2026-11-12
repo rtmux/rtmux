@@ -203,15 +203,15 @@ void kext_soul_stats(void *data)
 
     /* Threads that live in some process's thread vector. A server's dispatch
      * pool (roottask: low water 3, high water 10; the pipe server: 2 and 4)
-     * adds a thread when requests overlap and sheds one only past its high-water
-     * mark, so soul.thread.used legitimately rises by a few and stays. What a
-     * leak test wants is the souls NOT reachable from any live process: a
-     * thread that left its vector (thread_destroy's vector_rem) but whose soul
-     * was never freed, or whose process went away first. Each vector is read
-     * under its vec_slock, the lock vector_add/vector_rem in thread_create/
-     * thread_destroy hold, so nentries/nfree are consistent; the RCU-sched
-     * section keeps every process_t alive while walked (the pattern of
-     * lookup_pid_rcu). The sum is not atomic with the pool count below, so a
+     * adds a thread when requests overlap and sheds one only past its
+     * high-water mark, so soul.thread.used legitimately rises by a few and
+     * stays. What a leak test wants is the souls NOT reachable from any live
+     * process: a thread that left its vector (thread_destroy's vector_rem) but
+     * whose soul was never freed, or whose process went away first. Each vector
+     * is read under its vec_slock, the lock vector_add/vector_rem in
+     * thread_create/ thread_destroy hold, so nentries/nfree are consistent; the
+     * RCU-sched section keeps every process_t alive while walked (the pattern
+     * of lookup_pid_rcu). The sum is not atomic with the pool count below, so a
      * thread being created or reaped concurrently shows up as a +-1 that
      * settles; callers compare against a baseline.
      */
@@ -224,7 +224,9 @@ void kext_soul_stats(void *data)
         if (!VECP(prp, &process_vector, id))
             continue;
         kspinlock_lock(&prp->vec_slock);
-        kap->live_threads += (unsigned) (prp->threads.nentries - prp->threads.nfree);
+        kap->live_threads +=
+            (unsigned) (prp->threads.nentries - prp->threads.nfree);
+
         /* A thread's timeout timer is allocated on its first timed wait and
          * freed with the thread, so how many exist depends on which threads
          * happened to time out. Counting them lets a leak test subtract that
@@ -264,15 +266,17 @@ void kext_soul_stats(void *data)
                 ret = EFAULT;
         }
     }
-    /* Per-hart STIMER interrupt counts. Each hart bumps only its own slot with a
-     * relaxed add (arch/riscv/trap-handler.c), so a relaxed load here is
+
+    /* Per-hart STIMER interrupt counts. Each hart bumps only its own slot with
+     * a relaxed add (arch/riscv/trap-handler.c), so a relaxed load here is
      * race-free; the values are monotonic and not a cross-hart snapshot.
      * timer_count is always set; the copy is clipped to the caller's capacity.
      */
     kap->timer_count = num_processors;
     if (ret == EOK && kap->timer_intr && kap->timer_n) {
         uint64_t intr[CONFIG_PROCESSORS_MAX];
-        unsigned n = num_processors < kap->timer_n ? num_processors : kap->timer_n;
+        unsigned n =
+            num_processors < kap->timer_n ? num_processors : kap->timer_n;
 
         for (unsigned i = 0; i < n; i++)
             intr[i] = __atomic_load_n(&stimer_intr_count[i], __ATOMIC_RELAXED);
@@ -825,9 +829,9 @@ void kext_proc_flags_op(void *data)
 }
 
 /* kext_proc_set_rlimit — record RLIMIT_CPU for a process. Heap is PTE_U=0, so
- * roottask (which validated the soft/hard pair) hands it here. The soft limit is
- * seconds; max_cpu_time (what the tick and resched_default enforce against the
- * process's billed running_time) is nanoseconds, RLIM_INFINITY staying
+ * roottask (which validated the soft/hard pair) hands it here. The soft limit
+ * is seconds; max_cpu_time (what the tick and resched_default enforce against
+ * the process's billed running_time) is nanoseconds, RLIM_INFINITY staying
  * infinite and 0 meaning "kill at the next tick" (1 ns), since 0 in
  * max_cpu_time means no limit. max_cpu_time is read locklessly by every hart's
  * tick, so it is stored atomically; the soft/hard arrays are under vec_slock.
@@ -862,6 +866,7 @@ void kext_proc_set_rlimit(void *data)
         return;
     }
     kspinlock_lock(&prp->vec_slock);
+
     /* Validate against the stored hard limit under the lock that guards it:
      * roottask's pre-check is a separate read, so two threads of one process
      * could otherwise interleave a lower and a raise and end with the hard

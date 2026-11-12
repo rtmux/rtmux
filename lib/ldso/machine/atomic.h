@@ -5,7 +5,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/* Minimal machine/atomic.h for RTMux ldso (RISC-V)
+/*
+ * Minimal machine/atomic.h for RTMux ldso (RISC-V)
  *
  * ldso is single-threaded during bootstrap; these are simple stubs.
  */

@@ -5,11 +5,12 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/* uname() -- identify the running system.
+/*
+ * uname() -- identify the running system.
  *
- * release and version come from the kernel's syspage build_info record, so
- * they describe the kernel actually booted rather than the libc that was
- * linked against it.
+ * release and version come from the kernel's syspage build_info record, so they
+ * describe the kernel actually booted rather than the libc that was linked
+ * against it.
  */
 
 #include <sys/utsname.h>
@@ -46,8 +47,8 @@ static void uname_hostname(char *dst, size_t cap)
     close(fd);
     if (n <= 0)
         return;
-    for (i = 0; i < (size_t) n && buf[i] != '\n' && buf[i] != '\r' &&
-                buf[i] != '\0';
+    for (i = 0;
+         i < (size_t) n && buf[i] != '\n' && buf[i] != '\r' && buf[i] != '\0';
          i++)
         ;
     if (i == 0 || i >= cap)

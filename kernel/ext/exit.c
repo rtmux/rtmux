@@ -89,6 +89,7 @@ void kext_exit_destroy_threads(void *arg)
                     __asm__ volatile("" ::: "memory");
                 cpu_smp_mb();
                 cop = (connect_t *) thp->blocked_on;
+
                 /* The state read above is stale by now: a thread that moved on
                  * to STATE_RECEIVE has a channel_t in blocked_on, not a
                  * connect_t.
@@ -121,6 +122,7 @@ void kext_exit_destroy_threads(void *arg)
                             pril_rem(&chp->send_queue, thp);
                         } else {
                             LINKPRIL_REM(thp);
+
                             /* The server's next receive does
                              * client->args.ms.server = 0; do not leave it a
                              * pointer to this soon-freed thread.
@@ -134,6 +136,7 @@ void kext_exit_destroy_threads(void *arg)
                         thp->next.thread = NULL;
                         thp->prev.thread = NULL;
                         thp->blocked_on = NULL;
+
                         /* Stamp the thread dead in the same lock window that
                          * verified it is REPLY/SEND and unlinked it. A stamp
                          * outside the lock acts on the stale state read above:

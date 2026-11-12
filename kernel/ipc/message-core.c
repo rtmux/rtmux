@@ -9,16 +9,25 @@
 #include <unistd.h>
 
 #define SIP_ROTL(x, b) (((x) << (b)) | ((x) >> (64 - (b))))
-#define SIP_ROUND(v0, v1, v2, v3)                                        \
-    do {                                                                 \
-        v0 += v1; v1 = SIP_ROTL(v1, 13); v1 ^= v0; v0 = SIP_ROTL(v0, 32); \
-        v2 += v3; v3 = SIP_ROTL(v3, 16); v3 ^= v2;                       \
-        v0 += v3; v3 = SIP_ROTL(v3, 21); v3 ^= v0;                       \
-        v2 += v1; v1 = SIP_ROTL(v1, 17); v1 ^= v2; v2 = SIP_ROTL(v2, 32); \
+#define SIP_ROUND(v0, v1, v2, v3) \
+    do {                          \
+        v0 += v1;                 \
+        v1 = SIP_ROTL(v1, 13);    \
+        v1 ^= v0;                 \
+        v0 = SIP_ROTL(v0, 32);    \
+        v2 += v3;                 \
+        v3 = SIP_ROTL(v3, 16);    \
+        v3 ^= v2;                 \
+        v0 += v3;                 \
+        v3 = SIP_ROTL(v3, 21);    \
+        v3 ^= v0;                 \
+        v2 += v1;                 \
+        v1 = SIP_ROTL(v1, 17);    \
+        v1 ^= v2;                 \
+        v2 = SIP_ROTL(v2, 32);    \
     } while (0)
 
-/* SipHash-2-4 over a byte buffer under the 128-bit key (k0, k1).
- * Parameters:
+/* SipHash-2-4 over a byte buffer under the 128-bit key (k0, k1). Parameters:
  *   p, n   : the bytes
  *   k0, k1 : key halves
  * Return value: the 64-bit tag.
@@ -66,11 +75,11 @@ static uint64_t siphash24(const unsigned char *p,
  * lock-free: a lost race only costs a little pool state, and the per-call
  * sample (cycle counter, time base, cpu, caller) keeps concurrent draws apart.
  */
-static uint64_t keydata_pool[2] = {0x9e3779b97f4a7c15ULL, 0xbf58476d1ce4e5b9ULL};
+static uint64_t keydata_pool[2] = {0x9e3779b97f4a7c15ULL,
+                                   0xbf58476d1ce4e5b9ULL};
 static uint64_t keydata_ctr;
 
-/* Draw a fresh nonzero 64-bit per-thread secret.
- * Parameters:
+/* Draw a fresh nonzero 64-bit per-thread secret. Parameters:
  *   salt : caller-specific bits mixed into the sample
  * Return value: the secret.
  */
@@ -107,9 +116,9 @@ void keydata_stir(void)
                        __ATOMIC_RELAXED);
 }
 
-/* Compute the 32-bit wire key for a message under a thread's 64-bit secret.
- * The tag is SipHash-2-4 keyed by (secret, boot-wide pool half), truncated to
- * 32 bits and never 0. Parameters:
+/* Compute the 32-bit wire key for a message under a thread's 64-bit secret. The
+ * tag is SipHash-2-4 keyed by (secret, boot-wide pool half), truncated to 32
+ * bits and never 0. Parameters:
  *   buf, n : the message bytes (a kernel copy)
  *   secret : the thread's secret
  * Return value: the key.
@@ -199,6 +208,7 @@ void rdecl get_rcvinfo(thread_t *thp,
                 cop->un.lcl.seq = prp->seq;
                 rep->flags |= RTMUX_MI_NET_CRED_DIRTY;
             }
+
             /* The thread's msg_key_data secret must not reach even the net
              * manager; the remote key travels via vtp->keydata instead.
              */

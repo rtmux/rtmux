@@ -5,7 +5,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/* misc.c -- assorted small bits of roottask that don't deserve a file each:
+/*
+ * misc.c -- assorted small bits of roottask that don't deserve a file each:
  * storage definitions for the EXT-prefixed globals declared in "externs.h", the
  * build-time timestamp / version string, and the U-mode aliases for the
  * historical _s* heap functions.

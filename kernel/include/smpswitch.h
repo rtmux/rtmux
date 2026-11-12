@@ -5,7 +5,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/* Define various SMP specific macros that are shared between the kernel and
+/*
+ * Define various SMP specific macros that are shared between the kernel and
  * proc
  */
 

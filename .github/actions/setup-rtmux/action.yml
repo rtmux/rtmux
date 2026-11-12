@@ -1,32 +1,66 @@
 name: Set up RTMux build environment
 description: Install the RISC-V bare-metal toolchain, QEMU, lld and host tools.
 inputs:
+  qemu:
+    description: Install qemu-system-riscv64 and OpenSBI (jobs that boot RTMux).
+    default: 'true'
   lkl:
-    description: Also install the riscv64-linux-gnu cross toolchain and ext4 tools for LKL.
+    description: Install the riscv64-linux-gnu cross toolchain and kernel build deps for LKL.
     default: 'false'
+  formal:
+    description: Install the formal-verification tools (CBMC, Spin, Z3).
+    default: 'false'
+  packages:
+    description: Extra space-separated apt packages to install.
+    default: ''
 runs:
   using: composite
   steps:
     - name: Cache apt packages
-      uses: actions/cache@v5
+      uses: actions/cache@v6
       with:
         path: ~/apt-cache
-        key: apt-rtmux-${{ runner.os }}-lkl-${{ inputs.lkl }}-${{ hashFiles('.github/actions/setup-rtmux/action.yml') }}
+        key: apt-rtmux-${{ runner.os }}-q${{ inputs.qemu }}-l${{ inputs.lkl }}-f${{ inputs.formal }}-${{ inputs.packages }}-${{ hashFiles('.github/actions/setup-rtmux/action.yml') }}
 
     - name: Install packages
       shell: bash
       run: |
         mkdir -p ~/apt-cache
-        pkgs="build-essential lld qemu-system-misc opensbi python3 git e2fsprogs"
+        pkgs="build-essential lld python3 git e2fsprogs"
+        if [ "${{ inputs.qemu }}" = "true" ]; then
+          pkgs="$pkgs qemu-system-misc opensbi"
+        fi
         if [ "${{ inputs.lkl }}" = "true" ]; then
           pkgs="$pkgs gcc-riscv64-linux-gnu binutils-riscv64-linux-gnu flex bison bc libelf-dev"
         fi
-        sudo apt-get update
-        sudo apt-get install -y -o Dir::Cache::Archives=$HOME/apt-cache $pkgs
+        if [ "${{ inputs.formal }}" = "true" ]; then
+          pkgs="$pkgs cbmc spin z3"
+        fi
+        # A stalled mirror once hung `apt-get update` for the whole job timeout,
+        # so bound each attempt and retry.
+        apt() {
+          for attempt in 1 2 3; do
+            timeout 300 sudo apt-get -o Acquire::Retries=3 \
+              -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 "$@" && return 0
+            echo "apt-get $1 attempt $attempt failed" >&2
+            sleep 5
+          done
+          return 1
+        }
+        apt update
+        apt install -y -o "Dir::Cache::Archives=$HOME/apt-cache" $pkgs ${{ inputs.packages }}
+
+    # `make defconfig` clones Kconfiglib on first use; keep it out of the
+    # critical path (and off the network) on later runs.
+    - name: Cache Kconfiglib
+      uses: actions/cache@v6
+      with:
+        path: tools/kconfig
+        key: kconfiglib-${{ runner.os }}-v1
 
     - name: Cache xPack RISC-V toolchain
       id: tc-cache
-      uses: actions/cache@v5
+      uses: actions/cache@v6
       with:
         path: ~/toolchains/riscv-none-elf
         key: xpack-riscv-none-elf-gcc-15.2.0-1-linux-x64
@@ -49,4 +83,3 @@ runs:
       run: |
         echo "$HOME/toolchains/riscv-none-elf/bin" >> "$GITHUB_PATH"
         "$HOME/toolchains/riscv-none-elf/bin/riscv-none-elf-gcc" --version | head -1
-        qemu-system-riscv64 --version | head -1

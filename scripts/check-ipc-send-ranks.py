@@ -65,6 +65,9 @@ SEND_NAME = re.compile(
 LIST = r"[\w-]+(?:[ \t]*,[ \t]*[\w-]+)*"  # a comma list; blanks after a comma are allowed
 NOTE = re.compile(rf"ipc-send(-file)?:\s*({LIST})\s*->\s*({LIST})")
 NOTE_REACH = 4  # lines above a call that an ipc-send annotation may sit
+# A comment reflowed to the line limit continues on the next line after a `*`;
+# blank that out (same length, so offsets and line numbers hold) before matching.
+COMMENT_CONT = re.compile(r"[ \t]*\r?\n[ \t]*\*+(?!/)")
 SPLICE = re.compile(r"\\[ \t]*\r?\n")
 STRING_ARGS = re.compile(r'("[^"\\]*"\s*)+')
 ATTACH = re.compile(r"\bioserv_attach\s*\(")
@@ -315,7 +318,8 @@ def scan(nodes, root):
             errors.append(f"{rel}:{src.line(off)}: {why}; cannot scan this file")
         notes = {}  # line number -> (annotation was valid, its targets)
         for off, body in src.comments:  # annotations are read from comments only
-            for m in NOTE.finditer(body):
+            flat = COMMENT_CONT.sub(lambda c: " " * len(c.group()), body)
+            for m in NOTE.finditer(flat):
                 at = src.line(off + m.start())
                 if m.group(1):
                     errors.append(f"{rel}:{at}: ipc-send-file is retired; annotate "

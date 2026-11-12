@@ -5,7 +5,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/* This file contains the main interpretive interface to the resource database
+/*
+ * This file contains the main interpretive interface to the resource database
  * layer from outside to in.
  */
 

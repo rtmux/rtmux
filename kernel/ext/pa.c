@@ -5,7 +5,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/* Physical memory allocator, kernel-resident: physical memory belongs in the
+/*
+ * Physical memory allocator, kernel-resident: physical memory belongs in the
  * kernel by every microkernel convention (Linux buddy, FreeBSD vm_phys, seL4
  * untyped). kext_pa_* bodies call the helpers in this file directly; roottask
  * keeps thin syscall_priv wrappers in servers/roottask/mem/pa.c.

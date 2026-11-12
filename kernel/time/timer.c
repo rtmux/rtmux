@@ -304,8 +304,8 @@ int kdecl ksys_timer_info(thread_t *act, struct kcall_args_timer_info *kap)
          * would skip out_unlock, and this runs inside the RCU read section
          * opened above. The bounds failure two lines up already goes there.
          *
-         * Probe the whole struct, not just otime: the write below stores all
-         * of *inp, so probing one member left the rest of the extent unchecked.
+         * Probe the whole struct, not just otime: the write below stores all of
+         * *inp, so probing one member left the rest of the extent unchecked.
          * The store itself is fault-safe (see out_unlock) because it sits far
          * from this probe (the caller can unmap the page in between), so this
          * probe is the early reject for the deliberate case, not the guarantee.

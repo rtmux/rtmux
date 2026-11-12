@@ -19,7 +19,7 @@
 #endif
 
 /* General utility macros */
-#define VA_INVALID ((uintptr_t) -1)
+#define VA_INVALID ((uintptr_t) - 1)
 #define MM_MAP_PRIVATEANON 0x00000003U
 #define MM_MAP_NOX64K 0x00020000
 #define MM_MAP_BELOW16M 0x00040000

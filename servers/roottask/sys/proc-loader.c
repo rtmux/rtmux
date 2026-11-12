@@ -214,6 +214,7 @@ static int loader_fd(struct loader_context *lcp)
                 return EBADF;
             }
             info.flags = 0;
+
             /* A remote-node fd cannot be inherited: the roottask fd-info
              * service only answers one local fd per request from the child's
              * own loader, so a remote query never worked.
@@ -889,6 +890,7 @@ void *loader_load(void *parm)
 
     lcp->ctx.start.aux[0].a_type = AT_NULL;
     lcp->ctx.start.aux[0].a_un.a_val = 0;
+
     /* Secure mode compares the image owner with the spawner's real ids. The
      * thread's own real ids were replaced above by setreuid(geteuid(), 0), so
      * use the values captured before that call.
@@ -1019,14 +1021,16 @@ void *loader_load(void *parm)
             isatty(STDIN_FILENO) > 0) {
             if ((lcp->msg.spawn.i.parms.flags & SPAWN_SETSID) &&
                 tcsetsid(STDIN_FILENO, getpgrp()) == -1) {
-                root_log("loader: pid %d: cannot bind controlling terminal "
-                         "(errno %d)\n",
-                         lcp->ctx.pid, errno);
+                root_log(
+                    "loader: pid %d: cannot bind controlling terminal "
+                    "(errno %d)\n",
+                    lcp->ctx.pid, errno);
             }
             if (tcsetpgrp(STDIN_FILENO, getpgrp()) == -1) {
-                root_log("loader: pid %d: cannot set foreground group "
-                         "(errno %d)\n",
-                         lcp->ctx.pid, errno);
+                root_log(
+                    "loader: pid %d: cannot set foreground group "
+                    "(errno %d)\n",
+                    lcp->ctx.pid, errno);
             }
         }
     }

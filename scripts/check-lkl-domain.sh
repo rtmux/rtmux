@@ -613,13 +613,13 @@ awk '
 awk '
     /^check-lkl-iommu-live:/ { in_target = 1; next }
     in_target && /^[^[:space:]].*:/ { exit }
-    in_target && /lkl-iommu-domain --timeout 180 --require-supported/ {
+    in_target && /lkl-iommu-domain --timeout [^ ]+ --require-supported/ {
         domain = 1
     }
-    in_target && /lkl-iommu-dma-deny --timeout 180 --require-supported/ {
+    in_target && /lkl-iommu-dma-deny --timeout [^ ]+ --require-supported/ {
         deny = 1
     }
-    in_target && /lkl-iommu-revoke --timeout 180 --require-supported/ {
+    in_target && /lkl-iommu-revoke --timeout [^ ]+ --require-supported/ {
         revoke = 1
     }
     END { exit (domain && deny && revoke) ? 0 : 1 }

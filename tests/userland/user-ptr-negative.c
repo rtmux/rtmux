@@ -196,12 +196,33 @@ static void probe_opt_cases(void *gone)
      * without ever reaching it: only a real dead-but-unreaped thread gets
      * there. Joining one with an unmapped status pointer must fail closed and
      * leave the thread joinable, which the successful second join proves.
+     *
+     * The victim runs on a caller-supplied stack, which is a workaround, not
+     * the contract. A thread on a stack the kernel allocated parks at exit
+     * while roottask frees that stack (thread_destroy's stack handshake in
+     * kernel/thread/lifecycle.c), and the KILLSELF specret that resumes it
+     * (kernel/thread/special-return.c) forces DETACHED, so it is reaped as
+     * soon as that finishes. A pthread_join that arrives later then returns
+     * ESRCH, which POSIX does not allow for a terminated, unjoined thread. This
+     * test cannot depend on that timing, so it avoids the handshake; a joinable
+     * thread on a kernel-allocated stack is not covered here.
      */
     {
+        enum { VICTIM_STACK = 64 * 1024 };
+        pthread_attr_t attr;
         pthread_t victim;
+        int rc;
+        void *stack = mmap(NULL, VICTIM_STACK, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANON, NOFD, 0);
 
-        if (pthread_create(&victim, NULL, join_victim, NULL) != EOK) {
-            test_fail("thread_join unmapped status", strerror(errno));
+        if (stack == MAP_FAILED) {
+            test_fail("thread_join unmapped status", "victim stack mmap");
+        } else if ((rc = pthread_attr_init(&attr)) != EOK ||
+                   (rc = pthread_attr_setstack(&attr, stack, VICTIM_STACK)) !=
+                       EOK ||
+                   (rc = pthread_create(&victim, &attr, join_victim, NULL)) !=
+                       EOK) {
+            test_fail("thread_join unmapped status", strerror(rc));
         } else {
             void *status = NULL;
 
@@ -215,6 +236,8 @@ static void probe_opt_cases(void *gone)
                           strerror(errno));
             }
         }
+        if (stack != MAP_FAILED)
+            (void) munmap(stack, VICTIM_STACK);
     }
 }
 

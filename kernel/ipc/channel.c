@@ -64,6 +64,7 @@ int kdecl ksys_channel_create(thread_t *act,
         prp = NULL;
         souls = &global_channel_souls;
         chvec = &global_channel_vector;
+
         /* Range-check as well as probe, then take a kernel copy here rather
          * than reading the caller's memory again further down. The probe alone
          * only asks "is this accessible", which a mapped supervisor address
@@ -326,8 +327,8 @@ static void drain_wait_claim(thread_t *thp)
 }
 
 /* One drain step: force_ready() thp and, if the abort was deferred to a
- * claimer, wait (bounded) for the claim to drop. The caller must keep thp
- * valid with a tthread_rcu section and re-reads the queue head afterwards.
+ * claimer, wait (bounded) for the claim to drop. The caller must keep thp valid
+ * with a tthread_rcu section and re-reads the queue head afterwards.
  */
 static void drain_force(thread_t *thp, unsigned err)
 {
@@ -633,10 +634,10 @@ int kdecl ksys_channel_destroy(thread_t *act,
     }
 
     /* Drain the three channel queues under chp->lock. Lock dropped around
-     * force_ready / remote_ipc_send (both self-lock chp->lock).
-     * Unblock all threads send blocked on the channel We have to do this before
-     * we NULL the cop->channel pointers below so that force_ready can find the
-     * appropriate PRIL_HEAD structure.
+     * force_ready / remote_ipc_send (both self-lock chp->lock). Unblock all
+     * threads send blocked on the channel We have to do this before we NULL the
+     * cop->channel pointers below so that force_ready can find the appropriate
+     * PRIL_HEAD structure.
      */
     kspinlock_lock(&chp->lock);
     while ((thp = pril_first(&chp->send_queue))) {
@@ -660,8 +661,8 @@ int kdecl ksys_channel_destroy(thread_t *act,
             KCALL_RESTART(act);
             return ENOERROR;
         case TYPE_THREAD:
-            /* thp is still queued under chp->lock, so it is valid; open the
-             * RCU section before dropping the lock (see _channel_destroy).
+            /* thp is still queued under chp->lock, so it is valid; open the RCU
+             * section before dropping the lock (see _channel_destroy).
              */
             rcu_read_lock(&tthread_rcu);
             kspinlock_unlock(&chp->lock);

@@ -5,7 +5,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/* RISC-V pte_temp_map -- always use kernel 1:1 direct-map VA.
+/*
+ * RISC-V pte_temp_map -- always use kernel 1:1 direct-map VA.
  *
  * On RISC-V, the kernel's direct map (KERNEL_VIRT_BASE + PA) covers all
  * physical RAM and is accessible from S-mode regardless of which user-space

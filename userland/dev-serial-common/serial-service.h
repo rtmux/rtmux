@@ -87,9 +87,11 @@ static int ser_jobctl(unsigned subtype,
  * background process; a write is policed only under TOSTOP.
  *
  * A background read gets EIO when its group is orphaned or it blocks/ignores
- * SIGTTIN; otherwise the group is sent SIGTTIN and the read fails with EINTR.
- * A write gets the same with SIGTTOU, except that a blocked/ignored SIGTTOU lets
- * it through. Returns 0 to proceed, else the errno to reply.
+ * SIGTTIN; otherwise the group is sent SIGTTIN and the read fails with EINTR. A
+ * write gets the same with SIGTTOU, except that a blocked/ignored SIGTTOU lets
+ * it through.
+ *
+ * Returns 0 to proceed, else the errno to reply.
  */
 static int ser_jobctl_gate(pid_t pid, int is_write)
 {
@@ -114,7 +116,9 @@ static void serial_flush_input(void);
 
 /* A termios signal character typed on a terminal that has a session: echo it,
  * drop what was typed ahead (unless NOFLSH), and signal the session's
- * foreground group. Returns nonzero when c was consumed as a signal.
+ * foreground group.
+ *
+ * Returns nonzero when c was consumed as a signal.
  */
 static int ser_signal_char(int c)
 {
@@ -136,6 +140,7 @@ static int ser_signal_char(int c)
     }
     if (!(ser_termios.c_lflag & NOFLSH))
         serial_flush_input();
+
     /* A session that is gone leaves nobody to signal; stop claiming the
      * characters so they reach whoever reads next.
      */
@@ -521,6 +526,7 @@ static int ser_devctl(ioserv_context_t *ctp, io_devctl_t *msg, void *ocb)
         if (msg->i.nbytes < (int32_t) sizeof(pid_t) ||
             (size_t) ctp->size < sizeof(*msg) + sizeof(pid_t))
             return EINVAL;
+
         /* Roottask checks that this is the caller's controlling terminal and
          * that the group is in the caller's session, and records it.
          */
@@ -626,6 +632,7 @@ static int rx_notification_handler(message_context_t *ctp,
     pending_rcvid = -1;
     pending_scoid = -1;
     pending_coid = -1;
+
     /* The reader can still die between the liveness check and the reply: only
      * consume the byte once the reply succeeded, so a failed reply leaves it
      * for the next reader.
@@ -638,9 +645,7 @@ static int rx_notification_handler(message_context_t *ctp,
 /* A signalled or killed reader parked in ser_read(): reply EINTR if it is the
  * parked one. Any other rcvid is not ours, so leave it to the default action.
  */
-static int ser_unblock(ioserv_context_t *ctp,
-                       io_notification_t *msg,
-                       void *ocb)
+static int ser_unblock(ioserv_context_t *ctp, io_notification_t *msg, void *ocb)
 {
     (void) msg;
     (void) ocb;
@@ -651,13 +656,13 @@ static int ser_unblock(ioserv_context_t *ctp,
     return EINTR; /* the framework replies it to ctp->rcvid */
 }
 
-/* Close of a client open, including the close synthesized when a client
- * process dies. The parked reader is matched by client connection (scoid) and
- * by the open it read from (coid; the OCB is only the open flags), so closing
- * one open leaves a read parked on another open of the same client alone. A
- * match is replied EINTR when still blocked, not left hanging. When the whole
- * client is dying its rcvid is dead and the reply is dropped by the kernel; the
- * msg_info check keeps a reused rcvid from being answered by mistake.
+/* Close of a client open, including the close synthesized when a client process
+ * dies. The parked reader is matched by client connection (scoid) and by the
+ * open it read from (coid; the OCB is only the open flags), so closing one open
+ * leaves a read parked on another open of the same client alone. A match is
+ * replied EINTR when still blocked, not left hanging. When the whole client is
+ * dying its rcvid is dead and the reply is dropped by the kernel; the msg_info
+ * check keeps a reused rcvid from being answered by mistake.
  */
 static int ser_close_dup(ioserv_context_t *ctp, io_close_t *msg, void *ocb)
 {
@@ -667,8 +672,8 @@ static int ser_close_dup(ioserv_context_t *ctp, io_close_t *msg, void *ocb)
     if (pending_rcvid != -1 && ctp->info.scoid == pending_scoid &&
         ctp->info.coid == pending_coid) {
         struct _msg_info info;
-        int live = msg_info(pending_rcvid, &info) != -1 &&
-                   info.scoid == pending_scoid;
+        int live =
+            msg_info(pending_rcvid, &info) != -1 && info.scoid == pending_scoid;
 
         ser_cancel_pending(live ? EINTR : 0);
     }

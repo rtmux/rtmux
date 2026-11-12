@@ -5,7 +5,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/* Job control: stop/continue state and the terminal servers' view of sessions.
+/*
+ * Job control: stop/continue state and the terminal servers' view of sessions.
  *
  * A process stops and continues itself (its libc system thread holds and
  * releases the other threads) and reports each transition here, so roottask can
@@ -13,10 +14,10 @@
  * waitpid() reports.
  *
  * A terminal server (/dev/text inside roottask, dev-serial as a process) asks
- * the group, session, and orphan questions here. Nothing is cached: every answer
- * is computed from the current process, group, and session state. A server is
- * trusted only for sessions whose controlling terminal it serves, so a plain
- * process cannot use these calls to signal an arbitrary group.
+ * the group, session, and orphan questions here. Nothing is cached: every
+ * answer is computed from the current process, group, and session state. A
+ * server is trusted only for sessions whose controlling terminal it serves, so
+ * a plain process cannot use these calls to signal an arbitrary group.
  */
 
 #include "externs.h"
@@ -24,18 +25,19 @@
 #include "root-process.h"
 #include <sys/procmsg.h>
 
-#define JC_DEAD                                                            \
-    (RTMUX_FLG_PROC_TERMING | RTMUX_FLG_PROC_ZOMBIE | RTMUX_FLG_PROC_WAITINFO | \
-     RTMUX_FLG_PROC_WAITDONE | RTMUX_FLG_PROC_DESTROYALL)
+#define JC_DEAD                                          \
+    (RTMUX_FLG_PROC_TERMING | RTMUX_FLG_PROC_ZOMBIE |    \
+     RTMUX_FLG_PROC_WAITINFO | RTMUX_FLG_PROC_WAITDONE | \
+     RTMUX_FLG_PROC_DESTROYALL)
 
 /* A consistent copy of one process's group and session state. */
 struct jc_snap {
     pid_t pid;
     pid_t ppid;
     pid_t pgrp;
-    pid_t sid;     /* session leader pid, 0 when there is no session */
-    pid_t fg;      /* foreground group of the session's terminal */
-    int fd;        /* roottask's descriptor to the terminal, or -1 */
+    pid_t sid; /* session leader pid, 0 when there is no session */
+    pid_t fg;  /* foreground group of the session's terminal */
+    int fd;    /* roottask's descriptor to the terminal, or -1 */
     unsigned flags;
     channel_t *chp; /* the process's system channel */
 };
@@ -95,7 +97,9 @@ static int jc_orphaned(pid_t pgrp, pid_t sid)
 
 /* Post signo to every live member of group pgrp in session sid, except pid 1
  * and system servers: a terminal signal must not take them down along with the
- * jobs. Returns the number of members signalled.
+ * jobs.
+ *
+ * Returns the number of members signalled.
  */
 static int jc_signal_group(pid_t pgrp, pid_t sid, int signo, pid_t sender)
 {
@@ -118,7 +122,9 @@ static int jc_signal_group(pid_t pgrp, pid_t sid, int signo, pid_t sender)
             continue;
         if (m.pgrp != pgrp || m.sid != sid || (m.flags & JC_DEAD) || !m.chp)
             continue;
-        /* Post under the lock so the channel cannot go away with the process. */
+
+        /* Post under the lock so the channel cannot go away with the process.
+         */
         if (root_proc_lock(pid)) {
             root_proc_info_t qinfo;
 
@@ -137,8 +143,9 @@ static int jc_signal_group(pid_t pgrp, pid_t sid, int signo, pid_t sender)
  * server serves.
  *
  * _JOBCTL_CTTY is set only when pid's session has that server's terminal as its
- * controlling terminal; the others are meaningful only then. Returns ESRCH when
- * pid is gone.
+ * controlling terminal; the others are meaningful only then.
+ *
+ * Returns ESRCH when pid is gone.
  */
 int proc_jobctl_query(pid_t server, pid_t pid, struct _proc_jobctl_reply *out)
 {
@@ -164,7 +171,9 @@ int proc_jobctl_query(pid_t server, pid_t pid, struct _proc_jobctl_reply *out)
 
 /* proc_jobctl_signal_fg — signal the foreground group of the session led by
  * sid, for a terminal character (VINTR, VQUIT, VSUSP) typed on server's
- * terminal. Returns ESRCH when no such session is bound to that terminal.
+ * terminal.
+ *
+ * Returns ESRCH when no such session is bound to that terminal.
  */
 int proc_jobctl_signal_fg(pid_t server, pid_t sid, int signo)
 {
@@ -181,8 +190,9 @@ int proc_jobctl_signal_fg(pid_t server, pid_t sid, int signo)
         if (pid == 0 || jc_snapshot(pid, &l) != EOK || l.sid != sid ||
             (l.flags & JC_DEAD) || jc_tty_server(l.fd) != server)
             continue;
-        /* The foreground group lives in the session, which every member
-         * shares, so the first live member is enough.
+
+        /* The foreground group lives in the session, which every member shares,
+         * so the first live member is enough.
          */
         n = jc_signal_group(l.fg, sid, signo, 0);
         return n ? EOK : ESRCH;
@@ -315,6 +325,7 @@ static int jc_state(pid_t pid, int event, int arg)
 
     if (!root_proc_lock(pid))
         return ESRCH;
+
     /* A report racing with exit must not stamp a stop onto a process that is
      * dying: proc_terminate discards stale stop siginfo only once, so one
      * written after it would make waitpid() report a stop for a zombie.
@@ -327,6 +338,7 @@ static int jc_state(pid_t pid, int event, int arg)
     tmp->siginfo.si_code = stopped ? CLD_STOPPED : CLD_CONTINUED;
     tmp->siginfo.si_status = stopped ? arg : SIGCONT;
     tmp->siginfo.si_pid = pid;
+
     /* Continuing must clear the flag first: the kernel refuses to release the
      * threads of a stopped process. Set under the lock, with the liveness
      * check, so exit cannot interleave.
@@ -338,9 +350,8 @@ static int jc_state(pid_t pid, int event, int arg)
         (void) ProcessFlagsOp(pid, RTMUX_FLG_PROC_CONTINUED,
                               RTMUX_FLG_PROC_STOPPED);
     root_proc_unlock(pid);
-    (void) msg_send_notification(ROOTTASK_COID, -1,
-                                 stopped ? PROC_CODE_STOP : PROC_CODE_CONT,
-                                 pid);
+    (void) msg_send_notification(
+        ROOTTASK_COID, -1, stopped ? PROC_CODE_STOP : PROC_CODE_CONT, pid);
     jc_notify_parent(pid);
     return EOK;
 }

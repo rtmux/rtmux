@@ -5,7 +5,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/* lock_debug — lock-rank checker for the post-BKL fine-grained locks.
+/*
+ * lock_debug — lock-rank checker for the post-BKL fine-grained locks.
  *
  * Every kspinlock_lock and kspinlock_unlock call lands here when
  * CONFIG_LOCK_DEBUG is set. Each per-CPU "held stack" records the (class,

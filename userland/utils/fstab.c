@@ -120,7 +120,10 @@ int setfsent(void)
         fseek(_fs_fp, 0, SEEK_SET);
         return 1;
     }
-    /* ipc-send: utils -> roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring */
+
+    /* ipc-send: utils ->
+     * roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring
+     */
     if ((_fs_fp = fopen(_PATH_FSTAB, "r")))
         return 1;
     return 0;
