@@ -204,7 +204,11 @@ typedef struct _debug_timer {
 } debug_timer_t;
 
 typedef union _debug_gregs {
+#if defined(__aarch64__)
+    AARCH64_CPU_REGISTERS aarch64;
+#else
     RISCV_CPU_REGISTERS riscv;
+#endif
     uint64_t padding[1024];
 } debug_greg_t;
 
@@ -222,7 +226,11 @@ typedef union _debug_altregs {
 } debug_altreg_t;
 
 typedef union _debug_perfregs {
+#if defined(__aarch64__)
+    AARCH64_PERF_REGISTERS aarch64;
+#else
     RISCV_PERF_REGISTERS riscv;
+#endif
     uint64_t padding[1024];
 } debug_perfreg_t;
 

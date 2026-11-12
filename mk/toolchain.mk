@@ -21,7 +21,7 @@ ifneq ($(filter defconfig menuconfig guiconfig oldconfig savedefconfig,$(MAKECMD
   ARCH = none
   CROSS_COMPILE ?= none-
 else
-  export ARCH = riscv
+  export ARCH = $(if $(filter y,$(CONFIG_ARCH_AARCH64)),aarch64,riscv)
   CROSS_COMPILE ?= riscv-none-elf-
 endif
 export CROSS_COMPILE
@@ -74,6 +74,23 @@ GCC_INC := $(shell $(CROSS_COMPILE)gcc -print-file-name=include 2>/dev/null)
 LDSHARED ?= $(CC) -fuse-ld=lld -Wl,-melf64lriscv -shared
 export LDSHARED
 
+# AArch64 uses LLVM's freestanding cross target; no Linux sysroot is involved.
+ifeq ($(ARCH),aarch64)
+LLVM_PREFIX ?= $(if $(shell command -v clang-18 2>/dev/null),$(shell dirname $$(readlink -f $$(command -v clang-18)))/,)
+CC = $(LLVM_PREFIX)clang --target=aarch64-none-elf
+AS = $(CC)
+LD = $(LLVM_PREFIX)ld.lld --dynamic-linker=/lib/ld.so.1 -z max-page-size=4096
+AR = $(LLVM_PREFIX)llvm-ar
+OBJCOPY = $(LLVM_PREFIX)llvm-objcopy
+OBJDUMP = $(LLVM_PREFIX)llvm-objdump
+READELF = $(LLVM_PREFIX)llvm-readelf
+STRIP = $(LLVM_PREFIX)llvm-strip
+NM = $(LLVM_PREFIX)llvm-nm
+SIZE = $(LLVM_PREFIX)llvm-size
+GCC_INC := $(shell $(LLVM_PREFIX)clang -print-resource-dir)/include
+LDSHARED = $(CC) -fuse-ld=lld -Wl,-shared
+endif
+
 # Common flags.
 CPPFLAGS  = -Wall -nostdinc
 CPPFLAGS += $(if $(GCC_INC),-isystem $(GCC_INC))
@@ -124,10 +141,16 @@ CFLAGS   += -fno-pie -fno-builtin
 # -mno-strict-align lets gcc emit unaligned loads/stores. xPack gcc 15
 # defaults to -mstrict-align, which produces byte-by-byte access sequences
 # that RTMux's syscall and IPC fast paths cannot tolerate.
+ifeq ($(ARCH),aarch64)
+ARCH_FLAGS = -mcpu=cortex-a53 -mno-outline-atomics
+else
 ARCH_FLAGS = -march=rv64g -mabi=lp64d -mcmodel=medany -mno-relax -mno-strict-align
+endif
 CFLAGS  += $(ARCH_FLAGS)
 ASFLAGS += $(ARCH_FLAGS)
+ifneq ($(ARCH),aarch64)
 LD      += -m elf64lriscv
+endif
 
 # Extra flags for kernel/startup code only (not libc or userland).
 # Picked up by kernel/Makefile, kernel/startup/Makefile, and
@@ -137,6 +160,10 @@ LD      += -m elf64lriscv
 # tp holds the per-CPU pcpu pointer; the compiler must never spill to it.
 # User-space libc uses tp for its own thread TLS, so the flag stays out of
 # userland builds.
+ifeq ($(ARCH),aarch64)
+KERNEL_CFLAGS = -mgeneral-regs-only
+else
 KERNEL_CFLAGS = -ffixed-tp
+endif
 
 endif # _MK_TOOLCHAIN_INCLUDED

@@ -39,6 +39,12 @@ extern long SysCpupageGet_r(int index) __hidden;
  * from the syspage build_info record through the raw cpupage syscall; no libc,
  * filesystem or allocation is involved.
  */
+#if defined(__aarch64__)
+#define RTMUX_MACHINE_NAME "aarch64"
+#else
+#define RTMUX_MACHINE_NAME "riscv64"
+#endif
+
 static inline int uname(struct utsname *u)
 {
     const struct syspage_entry *sp =
@@ -56,7 +62,7 @@ static inline int uname(struct utsname *u)
         strlcpy(u->release, "unknown", sizeof(u->release));
         strlcpy(u->version, "unknown", sizeof(u->version));
     }
-    strlcpy(u->machine, "riscv64", sizeof(u->machine));
+    strlcpy(u->machine, RTMUX_MACHINE_NAME, sizeof(u->machine));
     return 0;
 }
 
@@ -5478,7 +5484,7 @@ static int parse_args(char *argv[],
                     "Default lib path %s\n"
                     "Env prefix %s\n"
                     "Optional static TLS size %zd bytes\n",
-                    "riscv64", ld_standard_library_path, ld_env_prefix,
+                    RTMUX_MACHINE_NAME, ld_standard_library_path, ld_env_prefix,
                     ld_static_tls_extra);
                 _exit(0);
             } else {

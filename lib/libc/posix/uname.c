@@ -69,7 +69,11 @@ int uname(struct utsname *u)
     memset(u, 0, sizeof(*u));
     uname_copy(u->sysname, "RTMux", sizeof(u->sysname));
     uname_copy(u->nodename, "rtmux", sizeof(u->nodename));
+#if defined(__aarch64__)
+    uname_copy(u->machine, "aarch64", sizeof(u->machine));
+#else
     uname_copy(u->machine, "riscv64", sizeof(u->machine));
+#endif
 
     bi = syspage_build_info_of(_syspage_ptr);
     if (bi) {

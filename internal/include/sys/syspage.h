@@ -57,7 +57,7 @@ enum {
 /* Architecture independent system page definitions */
 
 /* System page types */
-enum { SYSPAGE_RISCV };
+enum { SYSPAGE_RISCV, SYSPAGE_AARCH64 };
 
 #define QTIME_FLAG_TIMER_ON_CPU0 1u
 #define QTIME_FLAG_CHECK_STABLE 2u

@@ -57,7 +57,7 @@ POSIX1_SRCS = sleep.c write.c read.c close.c fstat.c fdatasync.c fsync.c sync.c 
               statvfs.c poll.c select.c resource.c fcntl.c signal.c iodir.c _exit.c exec.c raise.c unlink.c \
               gettimeofday.c localtime.c strftime.c setjmp.c uname.c
 
-ifeq ($(ARCH),riscv)
+ifneq ($(filter riscv aarch64,$(ARCH)),)
 POSIX1_ASM_SRCS = _setjmp.S
 else
 POSIX1_ASM_SRCS =
@@ -116,8 +116,8 @@ SERVICES_SRCS = rtmux-detach.c rtmux-phys-contain.c rtmux-hwres.c \
 	rtmux-delegate.c \
 	namespace-link.c namespace-symlink.c roottask-console-set.c ioserv.c
 
-ifeq ($(ARCH),riscv)
-ATOMIC_SRCS = atomic-rv64.S
+ifneq ($(filter riscv aarch64,$(ARCH)),)
+ATOMIC_SRCS = $(if $(filter aarch64,$(ARCH)),atomic-a64.S,atomic-rv64.S)
 USER_SRCS = syscalls.c syschan-init.c
 else
 ATOMIC_SRCS =
@@ -154,7 +154,7 @@ PTHREAD_SRCS = pthread-self.c pthread-equal.c \
                pthread-once.c pthread-setspecific.c pthread-key-data.c \
                pthread-spin.c pthread-barrier.c pthread-rwlock.c
 
-ifeq ($(ARCH),riscv)
+ifneq ($(filter riscv aarch64,$(ARCH)),)
 PTHREAD_ASM_SRCS = __my-thread-exit.S
 else
 PTHREAD_ASM_SRCS =
@@ -200,7 +200,7 @@ ALL_OBJS = $(STRING_OBJS) $(STDLIB_OBJS) $(RTMUX_OBJS) $(POSIX1_OBJS) \
            $(PTHREAD_OBJS) $(PTHREAD_ASM_OBJS) \
            $(STDIO_OBJS) $(USER_OBJS)
 
-ifeq ($(ARCH),riscv)
+ifneq ($(filter riscv aarch64,$(ARCH)),)
 all: $(LIBC_A) $(LIBC_SO) $(CRT0_O)
 else
 all: $(LIBC_A) $(LIBC_SO)

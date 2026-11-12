@@ -32,17 +32,21 @@ names=$(awk -F'|' '
 
 fail=0
 count=0
+case "${ARCH:-riscv}" in
+    aarch64) arch_cflags='-mcpu=cortex-a53'; arch_ldflags='' ;;
+    *) arch_cflags='-march=rv64g -mabi=lp64d'; arch_ldflags='-melf64lriscv' ;;
+esac
 for name in $names; do
     count=$((count + 1))
     printf 'extern int %s();\nint main(void) { return %s(); }\n' "$name" "$name" \
         > "$TMP/p.c"
-    $CC -march=rv64g -mabi=lp64d -ffreestanding -nostdinc -Wno-builtin-declaration-mismatch \
+    $CC $arch_cflags -ffreestanding -nostdinc \
         -Wno-implicit-function-declaration -c -o "$TMP/p.o" "$TMP/p.c"
-    if $LD -melf64lriscv -nostdlib -e main -o "$TMP/p.out" "$TMP/p.o" "$LIBC_A" \
+    if $LD $arch_ldflags -nostdlib -e main -o "$TMP/p.out" "$TMP/p.o" "$LIBC_A" \
         >"$TMP/link.log" 2>&1; then
         echo "check-porting-contract: $name links against libc.a" >&2
         fail=1
-    elif ! grep -q "undefined reference to \`$name'" "$TMP/link.log"; then
+    elif ! grep -Eq "undefined reference to .*${name}'|undefined symbol: ${name}([[:space:]]|$)" "$TMP/link.log"; then
         echo "check-porting-contract: $name failed to link for another reason:" >&2
         cat "$TMP/link.log" >&2
         fail=1

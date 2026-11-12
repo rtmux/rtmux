@@ -1,12 +1,13 @@
 mainmenu "RTMux Configuration"
 
+choice
+    prompt "CPU architecture"
+    default ARCH_RISCV
 config ARCH_RISCV
-    bool
-    default y
-    help
-      RTMux is currently RISC-V only.  This symbol still gates arch-specific
-      Kconfig entries and the include/arch symlink, so flattening it requires
-      a coordinated build-system cleanup.
+    bool "RISC-V RV64"
+config ARCH_AARCH64
+    bool "AArch64 Raspberry Pi 3B"
+endchoice
 
 config SMP
     bool "Symmetric Multi-Processing (SMP)"
@@ -88,5 +89,6 @@ config SERVER_POOL_CANARY
       production builds.
 
 source "arch/riscv/Kconfig"
+source "arch/aarch64/Kconfig"
 source "kernel/Kconfig"
 source "servers/roottask/Kconfig"

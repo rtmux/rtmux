@@ -1,0 +1,9 @@
+# QEMU validation image: adds instrumentation and allocation-failure injection.
+# Use pi3_defconfig for the ordinary image.
+CONFIG_ARCH_AARCH64=y
+CONFIG_POSIX_PROFILE_FULL=y
+# CONFIG_LKL_SERVERS is not set
+CONFIG_PROCESSORS_MAX=4
+CONFIG_PI3_RAM_SIZE_MB=256
+CONFIG_INSTRUMENTATION=y
+CONFIG_DEBUG_INJECT=y
