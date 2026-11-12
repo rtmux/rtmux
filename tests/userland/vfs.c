@@ -5618,6 +5618,23 @@ static ssize_t read_sys_log(int fd, char *buf, size_t cap)
     }
 }
 
+/* /sys/log keeps a sequence window, not a private snapshot. A full ring's
+ * very oldest byte can be overwritten by unrelated loader cleanup after
+ * open. Read the recent 64 KiB containing our markers, leaving room for that
+ * concurrent logging. The wrap test below checks the full-ring/EOVERFLOW
+ * contract separately. No failed read is retried. */
+static ssize_t read_recent_sys_log(int fd, char *buf, size_t cap)
+{
+    struct stat st;
+
+    if (fstat(fd, &st) != 0)
+        return -errno;
+    if (st.st_size >= 1024 * 1024 &&
+        lseek(fd, st.st_size - 65536, SEEK_SET) != st.st_size - 65536)
+        return -errno;
+    return read_sys_log(fd, buf, cap);
+}
+
 /* Child: as uid 1000, /sys/log (0400) refuses open and stat with EACCES (the gate is
  * the open path, which stat shares) while a world-readable /sys entry still opens, and
  * a log mark is refused with roottask's own EPERM.
@@ -5685,14 +5702,14 @@ static void test_sys_log_read(void)
     }
     check(fstat(fd, &st) == 0 && (st.st_mode & 07777) == 0400 && S_ISREG(st.st_mode),
           "sys_log_read mode 0400", "/sys/log must be a regular file with mode 0400");
-    n = read_sys_log(fd, buf, sizeof buf - 1);
+    n = read_recent_sys_log(fd, buf, sizeof buf - 1);
     check(n > 0, "sys_log_read reads data", "empty or failed read");
     if (n > 0) {
         buf[n] = '\0';
         /* Not wrapped (the ring is 1 MiB), so the oldest byte is the first
          * roottask line.
          */
-        if (n < 1024 * 1024)
+        if (st.st_size < 1024 * 1024)
             check(!strncmp(buf, "RT", 2), "sys_log_read oldest first",
                   "an unwrapped ring must start at its first line");
         /* Roottask may log between the mark and this read, so the mark need not be the last
@@ -5712,7 +5729,7 @@ static void test_sys_log_read(void)
     snprintf(mark, sizeof mark, "sys_log_read second %d", (int) getpid());
     (void) send_log_mark(mark, strlen(mark));
     check(lseek(fd, 0, SEEK_SET) == 0, "sys_log_read rewind", "lseek(0) failed");
-    n = read_sys_log(fd, buf, sizeof buf - 1);
+    n = read_recent_sys_log(fd, buf, sizeof buf - 1);
     if (n > 0)
         buf[n] = '\0';
     check(n > 0 && strstr(buf, mark) != NULL, "sys_log_read rewind resamples",
