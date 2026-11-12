@@ -434,4 +434,10 @@ static inline void cpu_irq_restore(unsigned long value)
         interrupt_enable();
 }
 
+static inline uintptr_t cpu_page_table_root(void) { return r_satp(); }
+static inline void cpu_tlb_flush(void)
+{
+    __asm__ volatile("sfence.vma" ::: "memory");
+}
+
 #endif

@@ -6,7 +6,7 @@
  */
 
 #include <core/globals.h>
-#include <cpu-inline.h> /* r_satp() — diagnostic */
+#include <cpu-inline.h> /* cpu_page_table_root() — diagnostic */
 
 
 /* Start the kernel threads and hand off to roottask.

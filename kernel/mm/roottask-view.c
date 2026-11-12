@@ -111,5 +111,5 @@ void mm_roottask_view_remove(process_t *target_prp)
      * are no live mappings to invalidate elsewhere — but the fence is cheap and
      * the flush avoids stale-TLB surprises if the dispatch model ever changes.
      */
-    __asm__ volatile("sfence.vma" ::: "memory");
+    cpu_tlb_flush();
 }

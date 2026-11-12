@@ -88,4 +88,6 @@ typedef uint64_t pde_t;
 typedef uint64_t pte_t;
 typedef uint64_t *pagetable_t; /* 512 PTEs */
 
+static inline int cpu_pte_leaf(pte_t p,int level) { (void)level; return (p & (PTE_R|PTE_W|PTE_X)) != 0; }
+static inline unsigned cpu_pte_prot(pte_t p) { return (unsigned)(p & (PTE_R|PTE_W|PTE_X)); }
 #endif

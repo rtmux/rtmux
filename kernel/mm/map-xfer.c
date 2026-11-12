@@ -69,7 +69,7 @@ static paddr_t sv39_va_to_pa(pagetable_t pgdir, uintptr_t va, size_t *contig)
         pte_t pte = pgdir[PX(level, va)];
         if (!(pte & PTE_V))
             return (paddr_t) -1;
-        if (pte & (PTE_R | PTE_W | PTE_X)) {
+        if (cpu_pte_leaf(pte, level)) {
             size_t pgsize = 1UL << PXSHIFT(level);
             paddr_t pa = PTE2PA(pte) | (va & (pgsize - 1));
             if (contig)
