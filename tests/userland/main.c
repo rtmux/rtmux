@@ -826,6 +826,12 @@ int main(int argc, char *argv[])
         return nvme_raw_child();
     if (argc == 2 && !strcmp(argv[1], "--sys-log-child"))
         return sys_log_child();
+    if (argc == 2 && !strcmp(argv[1], "--cputime-short-bursts")) {
+        test_cputime_short_bursts();
+        printf("\n=== Results: %d tests, %d passed, %d failed ===\n",
+               tests_run, tests_passed, tests_failed);
+        return tests_failed || !tests_passed ? EXIT_FAILURE : EXIT_SUCCESS;
+    }
     if (argc == 2 && !strcmp(argv[1], "--sys-log-wrap")) {
         printf("=== RTMux /sys/log Wrap Test ===\n\n[sys_log_wrap]\n");
         test_sys_log_wrap();

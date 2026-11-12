@@ -36,6 +36,7 @@ void test_printf(void);
 void test_setjmp(void);
 void test_signals(void);
 void test_vfs(void);
+void test_cputime_short_bursts(void);
 void test_namespace_combined_race(void);
 int spawn_echo_child(const char *tag);
 void test_posix_cap_boundary(void);
