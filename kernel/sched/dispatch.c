@@ -1208,6 +1208,11 @@ int rdecl force_ready(thread_t *thp, unsigned err)
         crash();
     }
 
+retry_wait:;
+    /* A late abort can span two waits on the same channel. Recheck
+     * WAIT_PENDING after taking the channel lock as well as before it;
+     * otherwise the second wait can be readied before block() relinquishes
+     * its CPU. Retrying releases the channel lock while the owner finishes. */
     /* The channel whose queue we unlink thp from below, for the per-channel
      * chp->lock. Carried across the STATE_REPLY -> STATE_RECEIVE fall-through:
      * the REPLY case sets it; a direct STATE_RECEIVE entry derives it from
@@ -1228,9 +1233,11 @@ int rdecl force_ready(thread_t *thp, unsigned err)
      */
     bool from_reply = false;
 
-    /* Make sure short message flag is cleared */
+    /* A SEND peer may be copying the buffered message under MSG_DELIVERY.
+     * Its flag is cleared only after the channel-lock ownership check below. */
     if (thp->state != STATE_READY && thp->state != STATE_RUNNING &&
-        thp->state != STATE_REPLY) {
+        thp->state != STATE_REPLY && thp->state != STATE_SEND &&
+        thp->state != STATE_NET_SEND) {
         atomic_clr(&thp->flags, RTMUX_FLG_THR_BUFF_MSG);
     }
 
@@ -1298,12 +1305,23 @@ int rdecl force_ready(thread_t *thp, unsigned err)
         from_reply = true;
 
 #if CONFIG_PROCESSORS_MAX > 1 && defined(CONFIG_SMP_MSGOPT)
-        if (thp->internal_flags & RTMUX_ITF_MSG_DELIVERY) {
-            force_ready_msgxfer(thp, err);
-#ifndef NDEBUG
-            /* kprintf("try to ready STATE_REPLY.\n"); */
-#endif
-            return 0;
+        if (chp) {
+            kspinlock_lock(&chp->lock);
+            if (thp->internal_flags & RTMUX_ITF_WAIT_PENDING) {
+                kspinlock_unlock(&chp->lock);
+                goto retry_wait;
+            }
+            if ((thp->state != STATE_REPLY && thp->state != STATE_NET_REPLY) ||
+                thp->blocked_on != cop) {
+                kspinlock_unlock(&chp->lock);
+                return 1;
+            }
+            if (thp->internal_flags & RTMUX_ITF_MSG_DELIVERY) {
+                force_ready_msgxfer(thp, err);
+                kspinlock_unlock(&chp->lock);
+                return 0;
+            }
+            kspinlock_unlock(&chp->lock);
         }
 #endif
 
@@ -1370,9 +1388,10 @@ int rdecl force_ready(thread_t *thp, unsigned err)
         /* Decide between "abort now" and "defer to the claimer" under the
          * channel lock, before any destructive step. A replier / msg_error /
          * msg_write claims thp (MSG_DELIVERY) under this same lock after
-         * checking state == STATE_REPLY, so the lock-free test at the top of
-         * this arm can lose the race: acting on it here would clear blocked_on
-         * and the reply link while the claimer still owns thp, leaving thp
+         * checking state == STATE_REPLY. The earlier check precedes the
+         * unblock handshake and must be repeated here before clearing blocked_on
+         * and the reply link; otherwise the claimer could still own thp,
+         * leaving thp
          * STATE_REPLY, still queued, with blocked_on == NULL and a stale
          * MSG_FORCE_RDY, which no path can then wake (the channel destroy drain
          * spins on it forever). Unlinking under the lock, with blocked_on
@@ -1385,10 +1404,9 @@ int rdecl force_ready(thread_t *thp, unsigned err)
                 __asm__ volatile("" ::: "memory");
             cpu_smp_mb();
             kspinlock_lock(&fr_chp->lock);
-            if (thp->internal_flags & RTMUX_ITF_MSG_DELIVERY) {
-                force_ready_msgxfer(thp, err);
+            if (thp->internal_flags & RTMUX_ITF_WAIT_PENDING) {
                 kspinlock_unlock(&fr_chp->lock);
-                return 0;
+                goto retry_wait;
             }
 
             /* Another force_ready or a replier may have completed the exchange
@@ -1399,6 +1417,11 @@ int rdecl force_ready(thread_t *thp, unsigned err)
                 thp->blocked_on != cop) {
                 kspinlock_unlock(&fr_chp->lock);
                 return 1;
+            }
+            if (thp->internal_flags & RTMUX_ITF_MSG_DELIVERY) {
+                force_ready_msgxfer(thp, err);
+                kspinlock_unlock(&fr_chp->lock);
+                return 0;
             }
             LINKPRIL_REM(thp);
             thp->blocked_on = NULL; /* == cop, checked above under the lock */
@@ -1450,19 +1473,6 @@ int rdecl force_ready(thread_t *thp, unsigned err)
         /* Fall Through */
 
     case STATE_RECEIVE:
-#if CONFIG_PROCESSORS_MAX > 1 && defined(CONFIG_SMP_MSGOPT)
-        /* A thread coming from the STATE_REPLY arm was already checked and
-         * unlinked under the channel lock there; a second, lock-free test here
-         * could only defer after that arm's destructive steps.
-         */
-        if (!unlinked && (thp->internal_flags & RTMUX_ITF_MSG_DELIVERY)) {
-            force_ready_msgxfer(thp, err);
-#ifndef NDEBUG
-            /* kprintf("try to ready STATE_RECEIVE.\n"); */
-#endif
-            return 0;
-        }
-#endif
 
         /* Spin-wait for any in-flight channel-waiter transition to complete
          * before observing chp->receive_queue. IPC kcalls set
@@ -1489,7 +1499,10 @@ int rdecl force_ready(thread_t *thp, unsigned err)
              */
             void *bo = __atomic_load_n(&thp->blocked_on, __ATOMIC_ACQUIRE);
 
-            if (thp->state != STATE_RECEIVE)
+            /* A delivery/abort clears the owning channel in its unlink
+             * window, before ready() can publish the receiver. A late timeout
+             * must not unlink it again or become a second waker. */
+            if (thp->state != STATE_RECEIVE || !bo)
                 return 1;
             if (bo && TYPE_MASK(((channel_t *) bo)->type) != TYPE_CHANNEL)
                 return 1;
@@ -1519,6 +1532,10 @@ int rdecl force_ready(thread_t *thp, unsigned err)
             /* The STATE_REPLY arm unlinked thp under fr_chp->lock already. */
         } else if (fr_chp) {
             kspinlock_lock(&fr_chp->lock);
+            if (thp->internal_flags & RTMUX_ITF_WAIT_PENDING) {
+                kspinlock_unlock(&fr_chp->lock);
+                goto retry_wait;
+            }
             if (!from_reply &&
                 (thp->state != STATE_RECEIVE || thp->blocked_on != fr_chp)) {
                 /* Moved on between the lock-free checks and the lock. */
@@ -1537,6 +1554,7 @@ int rdecl force_ready(thread_t *thp, unsigned err)
             }
 #endif
             LINKPRIL_REM(thp);
+            thp->blocked_on = NULL;
             kspinlock_unlock(&fr_chp->lock);
         } else {
             /* Skipped the unlink because the owning channel is freed. Null the
@@ -1559,6 +1577,7 @@ int rdecl force_ready(thread_t *thp, unsigned err)
     case STATE_NET_SEND:
     case STATE_SEND: {
         connect_t *cop;
+        channel_t *schp;
 
         /* WAIT_PENDING spin-wait + pril_rem on chp->send_queue under
          * channel_slock. Mirrors the STATE_RECEIVE branch above. The spin comes
@@ -1571,16 +1590,11 @@ int rdecl force_ready(thread_t *thp, unsigned err)
             __asm__ volatile("" ::: "memory");
         cpu_smp_mb();
         cop = thp->blocked_on;
-
-#if CONFIG_PROCESSORS_MAX > 1 && defined(CONFIG_SMP_MSGOPT)
-        if (thp->internal_flags & RTMUX_ITF_MSG_DELIVERY) {
-            force_ready_msgxfer(thp, err);
-#ifndef NDEBUG
-            /* kprintf("try to ready STATE_SEND.\n"); */
-#endif
-            return 0;
-        }
-#endif
+        /* The first waker owns the unlink-to-ready interval. A second abort
+         * must not ready a thread that may already be entering its next wait. */
+        if (!cop)
+            return 1;
+        schp = cop->channel;
 
         /* cop->channel == NULL only after channel_destroy / connect_detach have
          * already force-readied every queued sender (the drain runs before
@@ -1590,24 +1604,18 @@ int rdecl force_ready(thread_t *thp, unsigned err)
          * sender is still queued, that thread would dangle on the stale list;
          * keep the drain-before-null ordering to preserve this invariant.
          */
-        if (!cop || !cop->channel) {
+        if (!schp) {
             if (thp->blocked_on == cop)
                 thp->blocked_on = NULL;
-            if (cop && connect_links_drop(cop))
+            if (connect_links_drop(cop))
                 connect_detach(cop, thp->priority);
             break;
         }
-        kspinlock_lock(&cop->channel->lock);
-#if CONFIG_PROCESSORS_MAX > 1 && defined(CONFIG_SMP_MSGOPT)
-        /* A receiver claims this sender (MSG_DELIVERY) under the same lock; the
-         * lock-free test above can lose that race (see the STATE_RECEIVE arm).
-         */
-        if (thp->internal_flags & RTMUX_ITF_MSG_DELIVERY) {
-            force_ready_msgxfer(thp, err);
-            kspinlock_unlock(&cop->channel->lock);
-            return 0;
+        kspinlock_lock(&schp->lock);
+        if (thp->internal_flags & RTMUX_ITF_WAIT_PENDING) {
+            kspinlock_unlock(&schp->lock);
+            goto retry_wait;
         }
-#endif
 
         /* A receiver moves a sender from send_queue to reply_queue and flips
          * its state under this lock. A force_ready that read STATE_SEND before
@@ -1617,10 +1625,20 @@ int rdecl force_ready(thread_t *thp, unsigned err)
          */
         if ((thp->state != STATE_SEND && thp->state != STATE_NET_SEND) ||
             thp->blocked_on != cop) {
-            kspinlock_unlock(&cop->channel->lock);
+            kspinlock_unlock(&schp->lock);
             return 1;
         }
-        pril_rem(&cop->channel->send_queue, thp);
+#if CONFIG_PROCESSORS_MAX > 1 && defined(CONFIG_SMP_MSGOPT)
+        /* Both the claim check and abort publication use the channel lock;
+         * a completed transfer cannot receive a stale deferred abort. */
+        if (thp->internal_flags & RTMUX_ITF_MSG_DELIVERY) {
+            force_ready_msgxfer(thp, err);
+            kspinlock_unlock(&schp->lock);
+            return 0;
+        }
+#endif
+        atomic_clr(&thp->flags, RTMUX_FLG_THR_BUFF_MSG);
+        pril_rem(&schp->send_queue, thp);
 
         /* Unlinked and claimed in one lock window: a second force_ready now
          * sees blocked_on != cop and backs off instead of unlinking again. This
@@ -1628,7 +1646,7 @@ int rdecl force_ready(thread_t *thp, unsigned err)
          * free cop (see the STATE_REPLY case above).
          */
         thp->blocked_on = NULL; /* == cop, checked above under the lock */
-        kspinlock_unlock(&cop->channel->lock);
+        kspinlock_unlock(&schp->lock);
 
         if (connect_links_drop(cop)) {
             connect_detach(cop, thp->priority);

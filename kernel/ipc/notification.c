@@ -256,12 +256,6 @@ int rdecl notification_deliver(channel_t *chp,
                       RTMUX_FLG_THR_NOTIFICATION);
         }
 
-        SETKSTATUS(thp, 0);
-
-        if (status) {
-            kcall_err(thp, EFAULT);
-        }
-
         /* Unlink receive thread from the receive queue and ready it.
          * MSG_DELIVERY claim was set above; keep it set across LINKPRIL_REM so
          * that even if force_ready races us in the STATE_RECEIVE branch, it'll
@@ -270,11 +264,14 @@ int rdecl notification_deliver(channel_t *chp,
          */
         kspinlock_lock(&chp->lock);
         LINKPRIL_REM(thp);
+        thp->blocked_on = NULL;
+        SETKSTATUS(thp, 0);
 #if CONFIG_PROCESSORS_MAX > 1 && defined(CONFIG_SMP_MSGOPT)
-        atomic_clr((volatile unsigned *) &thp->internal_flags,
-                   RTMUX_ITF_MSG_DELIVERY);
+        ITF_CLR(thp, RTMUX_ITF_MSG_DELIVERY | RTMUX_ITF_MSG_FORCE_RDY);
 #endif
         kspinlock_unlock(&chp->lock);
+        if (status)
+            kcall_err(thp, EFAULT);
 
         /* By default the receiver runs with message driven priority. */
         if (thp->priority != prio &&
