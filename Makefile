@@ -45,7 +45,7 @@ LKL_EXT4_IMG = $(IMAGE_DIR)/lkl-ext4.img
 .PHONY: check-evidence-claims check-fault-recovery check-platform-boundary-contracts
 .PHONY: check-fu740-smoke-scripts check-make-target-names check-ci-coverage check-lkl-scripts
 .PHONY: check-header-deps check-gap-anchors check-rt-extra check-irq-modes check-hart-watchdog
-.PHONY: check-guest-misc check-trace-modes check-leak-gate check-version-skew
+.PHONY: check-guest-misc check-trace-modes check-leak-gate check-version-skew check-spawn-storm
 .PHONY: footprint-report check-lkl check-lkl-containment check-lkl-iommu-preflight check-lkl-iommu-live check-lkl-qemu check-lkl-differential check-lkl-trace check-trace-export check-trace-overhead
 .PHONY: check-qemu-deps check-lkl-differential-deps check-map-phys-inventory check-rcu-sched driver-gate indent check-indent check-style-deps
 .PHONY: posix-matrix check-posix-matrix check-posix-matrix-strict-ignore check-posix-matrix-options check-pse51 check-opts-pse51 check-posix-profile-header check-posix-profile-config check-posix-profile-surface posix-profile-boot-probe check-lkl-floor check-lkl-profile lkl-profile-smoke check-syscall-abi check-libc-abi
@@ -775,6 +775,19 @@ check-guest-misc: check-qemu-deps $(AUTOCONF_H) $(VER_FILE) startup initramfs
 check-trace-modes: check-qemu-deps $(AUTOCONF_H) $(VER_FILE) startup initramfs
 	$(msg) CHECK "tracelogger modes (instrumented kernel)"
 	$(call run-qemu-modes,$(TRACE_MODES),$(QEMU_TRACE_TIMEOUT))
+
+# 8 threads x 100 concurrent posix_spawn, on 4 harts and on 2. This storm exposed two
+# SMP defects (ready-queue corruption and an exit-path hang). Each
+# boot takes about 100 s on 4 harts and over 200 s on 2 on a loaded host.
+SPAWN_STORM_REPEAT ?= 5
+check-spawn-storm: check-qemu-deps $(AUTOCONF_H) $(VER_FILE) startup initramfs
+	$(msg) CHECK "concurrent spawn storm ($(SPAWN_STORM_REPEAT) boots on 4 harts, 2 on 2)"
+	$(Q)rc=0; \
+	CPUS=4 ./scripts/qemu-regress.sh --mode spawn-storm --repeat $(SPAWN_STORM_REPEAT) \
+	    --timeout 600 || { echo "  FAILED   spawn-storm (4 harts)"; rc=1; }; \
+	CPUS=2 ./scripts/qemu-regress.sh --mode spawn-storm --repeat 2 --timeout 600 \
+	    || { echo "  FAILED   spawn-storm (2 harts)"; rc=1; }; \
+	exit $$rc
 
 # Runs the whole suite three times in one boot after a kill-and-spawn storm: far
 # longer than the other modes.

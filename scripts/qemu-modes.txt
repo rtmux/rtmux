@@ -74,7 +74,7 @@ shutdown-sync-ignore
 shutdown-sync-negative
 shutdown-sync-wedge
 smp-invariants
-spawn-storm    # waived: open SMP defect; wire it as check-spawn-storm when it passes
+spawn-storm
 sporadic-budget
 syscall-testing
 syscall-testing-disk

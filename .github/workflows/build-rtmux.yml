@@ -184,6 +184,9 @@ jobs:
           - name: trace-modes
             run: make check-trace-modes QEMU_TRACE_TIMEOUT=300
             experimental: true
+          - name: spawn-storm
+            run: make check-spawn-storm
+            experimental: true
           - name: leak-gate
             run: make check-leak-gate
             experimental: true

@@ -8281,7 +8281,7 @@ static int spawn_count_dup_pids(const struct spawn_worker *w)
     return dup;
 }
 
-void test_spawn_concurrent(int force)
+void test_spawn_concurrent(void)
 {
     static struct spawn_worker w[SPAWN_WORKERS];
     pthread_barrier_t bar;
@@ -8290,16 +8290,6 @@ void test_spawn_concurrent(int force)
     int dup_pid;
     char detail[160];
 
-    if (!force && sysconf(_SC_NPROCESSORS_ONLN) > 1) {
-        /* Open defect (TODO Q32): with 2+ harts the 8x100 storm hangs (CPUS=2)
-         * or faults in the kernel IPC path (CPUS=4). Passes at one hart. The
-         * suite skips it; `qemu-regress.sh --mode spawn-storm` forces it.
-         * Remove this gate when the SMP spawn/exit defect is fixed.
-         */
-        test_skip("spawn_concurrent",
-                  "SMP: known defect; --mode spawn-storm forces it");
-        return;
-    }
     fds_before = spawn_count_open_fds();
     if (pthread_barrier_init(&bar, NULL, SPAWN_WORKERS) != 0) {
         test_fail("spawn_concurrent fixture", strerror(errno));
@@ -8370,7 +8360,7 @@ void test_vfs(void)
     test_nvme_raw_perm();
     test_sys_kstats();
     test_sys_log_read();
-    test_spawn_concurrent(0);
+    test_spawn_concurrent();
     test_malloc_growth();
     test_posix_errno_corners();
     test_posix_access_and_path_corners();

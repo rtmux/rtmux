@@ -13,6 +13,9 @@
 
 #include <core/globals.h>
 
+#define THR_IN_IPC_WAIT(t) \
+    ((t)->state == STATE_REPLY || (t)->state == STATE_SEND)
+
 /* kernel-internal: destroy with explicit process pointer */
 extern int _channel_destroy(process_t *prp, int chid);
 extern int _timer_destroy(process_t *prp, int id);
@@ -71,9 +74,11 @@ void kext_exit_destroy_threads(void *arg)
      */
     for (tid = 0; tid < prp->threads.nentries; ++tid) {
         if ((thp = vector_lookup2(&prp->threads, (unsigned) tid))) {
-            int reply_send =
-                (thp->state == STATE_REPLY || thp->state == STATE_SEND);
+            int reply_send;
             int stamped_dead = 0;
+
+        retry_claimed:
+            reply_send = THR_IN_IPC_WAIT(thp);
 
             if (reply_send) {
                 connect_t *cop;
@@ -155,6 +160,27 @@ void kext_exit_destroy_threads(void *arg)
                          * _connect_detach and channel destroy.
                          */
                         (void) atomic_sub_value(&cop->links, 1);
+                    } else if (THR_IN_IPC_WAIT(thp) && thp->blocked_on == cop &&
+                               thp->prev.pril && cop->channel == chp) {
+                        /* Transiently claimed: only MSG_DELIVERY made the
+                         * unlink test above fail. The claimer may be a plain
+                         * reader that unlinks nothing.
+                         *
+                         * Do not fall through to thread_destroy: force_ready's
+                         * unblock notification may already be consumed by the
+                         * claiming server, so nobody would reap the thread and
+                         * the process would never finish exiting.
+                         *
+                         * Drop chp->lock (the claimer's release needs it), wait
+                         * out the claim (it spans one transfer), and look
+                         * again: the claimer woke the thread, or it is still
+                         * ours to unlink.
+                         */
+                        kspinlock_unlock(&chp->lock);
+                        while (thp->internal_flags & RTMUX_ITF_MSG_DELIVERY)
+                            __asm__ volatile("" ::: "memory");
+                        cpu_smp_mb();
+                        goto retry_claimed;
                     } else {
                         kspinlock_unlock(&chp->lock);
                         reply_send = 0;

@@ -2425,7 +2425,14 @@ static void rdecl block_and_ready_default(thread_t *thp)
     thp->link3_link.prev = NULL;
 
     SNAP_TIME_INLINE(act->timestamp_last_block, 0);
-    dpp = thp->dpp;
+
+    /* Queue on this hart's instance, the one SCHED_LOCK_LOCAL() holds, as
+     * ready_default does. thp->dpp may be another hart's (a thread created for
+     * another process gets that process's default); linking into it under our
+     * lock tears its LINK3 list.
+     */
+    dpp = LOCAL_DPP;
+    thp->dpp = dpp;
     prio = thp->priority;
 
     /* We are blocking the active thread (externally) so stop the running Mark

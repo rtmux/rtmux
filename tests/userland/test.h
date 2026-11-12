@@ -72,7 +72,7 @@ void leak_suite_delta(int lap, const char *suite);
 void *test_unmapped_user_addr(void);
 
 void test_trace_negative(void);
-void test_spawn_concurrent(int force);
+void test_spawn_concurrent(void);
 void test_user_ptr_negative(void);
 int capgate_child_connect(const char *chid_arg);
 int capgate_child_dup_attack(int argc, char **argv);

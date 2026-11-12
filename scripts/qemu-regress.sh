@@ -491,7 +491,7 @@ usage: scripts/qemu-regress.sh [options] [-- extra emu args...]
 Options:
   --mode NAME       Guest rtmux.run mode: syscall-testing,
                     posix-cap-boundary, loader-negative, syscall-testing-disk,
-                    spawn-storm (8x100 concurrent posix_spawn; open SMP defect),
+                    spawn-storm (8x100 concurrent posix_spawn),
                     pci-nvme-smoke, rt-check, leak-gate (opt-in killspawn + laps),
                     version-skew (kernel and initramfs from two trees; expects one
                     "version skew:" line),

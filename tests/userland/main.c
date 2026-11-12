@@ -867,7 +867,7 @@ int main(int argc, char *argv[])
     }
     if (argc == 2 && !strcmp(argv[1], "--spawn-storm")) {
         printf("=== RTMux Concurrent Spawn Storm ===\n\n[spawn-storm]\n");
-        test_spawn_concurrent(1);
+        test_spawn_concurrent();
         tc_summary(&counts);
         return tc_status(&counts, 1) ? EXIT_FAILURE : EXIT_SUCCESS;
     }
