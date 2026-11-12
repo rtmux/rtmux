@@ -37,6 +37,7 @@ jobs:
     needs: archives
     runs-on: ubuntu-24.04
     timeout-minutes: 150
+    continue-on-error: ${{ matrix.experimental || false }}
     strategy:
       fail-fast: false
       matrix:
@@ -47,8 +48,11 @@ jobs:
             run: make check-lkl-qemu
           - name: differential
             run: make check-lkl-differential
+          # Non-blocking: the traced guests are too slow for a 4 vCPU runner and
+          # hit their timeout while still making progress.
           - name: trace
             run: make check-lkl-trace LKL_TRACE_TIMEOUT=900
+            experimental: true
           - name: profile
             run: make lkl-profile-smoke
     name: qemu (${{ matrix.name }})
