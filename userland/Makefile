@@ -176,8 +176,12 @@ endif
 		cp $(USR_BUILD)/toolbox $(INITRAMFS_DIR)/sbin/$$applet || exit 1; \
 		$(STRIP) --strip-unneeded $(INITRAMFS_DIR)/sbin/$$applet || exit 1; \
 	done
-	$(Q)cp init $(INITRAMFS_DIR)/sbin/init
+	$(Q)cp $(if $(filter aarch64,$(ARCH)),init-pi3,init) $(INITRAMFS_DIR)/sbin/init
 	$(Q)chmod +x $(INITRAMFS_DIR)/sbin/init
+ifeq ($(ARCH),aarch64)
+	$(Q)cp -R pi3-root/. $(INITRAMFS_DIR)/
+	$(Q)chmod 600 $(INITRAMFS_DIR)/usr/conf/shadow
+endif
 
 clean: $(addprefix clean-,$(SUBDIRS))
 	$(Q)rm -f $(TOOLBOX) $(TOOLBOX_OBJS) $(TOOLBOX_OBJS:.o=.d) \
