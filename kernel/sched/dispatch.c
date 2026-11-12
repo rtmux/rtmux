@@ -2052,6 +2052,15 @@ unready_release_and_exit(thread_t *thp, int newstate, kspinlock_t *to_release)
  */
 static void rdecl ready_default(thread_t *thp)
 {
+#if defined(CONFIG_DEBUG_PRIL)
+    if (thp->state == STATE_RUNNING) {
+        kprintf("WAKE_RUNNING ready_default thp=%p cpu=%u owner=%u caller=%lx\n",
+                thp, get_cpunum(), thp->runcpu,
+                (unsigned long) __builtin_return_address(0));
+        crash();
+    }
+#endif
+
     thread_t *act;
     kdispatch_t *dpp;
     uint8_t prio = thp->priority;
@@ -2408,6 +2417,15 @@ static void rdecl ready_default(thread_t *thp)
  */
 static void rdecl block_and_ready_default(thread_t *thp)
 {
+#if defined(CONFIG_DEBUG_PRIL)
+    if (thp->state == STATE_RUNNING) {
+        kprintf("WAKE_RUNNING block_and_ready_default thp=%p cpu=%u owner=%u caller=%lx\n",
+                thp, get_cpunum(), thp->runcpu,
+                (unsigned long) __builtin_return_address(0));
+        crash();
+    }
+#endif
+
     thread_t *act = get_active_thread(get_cpunum());
     kdispatch_t *dpp;
     uint8_t prio;
