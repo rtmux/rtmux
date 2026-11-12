@@ -412,4 +412,18 @@ static inline void debug_kdbreak(void)
     );
 }
 
+/* Preserve the caller's IRQ mask across common kernel critical sections. */
+static inline unsigned long cpu_irq_save(void)
+{
+    unsigned long value = r_sstatus();
+    w_sstatus(value & ~SSTATUS_SIE);
+    return value;
+}
+
+static inline void cpu_irq_restore(unsigned long value)
+{
+    if (value & SSTATUS_SIE)
+        interrupt_enable();
+}
+
 #endif

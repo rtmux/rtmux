@@ -1209,6 +1209,11 @@ int add_trace_event(uint32_t header, uint32_t d_0, uint32_t d_1, uint32_t d_2)
     if (__atomic_load_n(&trace_masks.main_flags, __ATOMIC_RELAXED) == 0)
         return EOK;
 
+    /* Tracepoints also run under scheduler/channel locks and from hard IRQs.
+     * Preserve the caller's IRQ mask; unconditionally enabling IRQs here can
+     * re-enter a scheduler lock held by the interrupted tracepoint. */
+    unsigned long irq_flags = cpu_irq_save();
+
     /* This needs to be out here, before we lock anything down, since it may
      * actually call add_trace_event itself!
      */
@@ -1228,14 +1233,14 @@ begin:
     if (trace_masks.main_flags == 0) {
         /* We're not actually tracing, bail out */
         SPINUNLOCK(&trace_masks.state_spin);
-        interrupt_enable();
+        cpu_irq_restore(irq_flags);
         return EOK;
     }
     t_b_p = privateptr->tracebuf;
     if (!t_b_p) {
         /* No Trace Buffer allocated */
         SPINUNLOCK(&trace_masks.state_spin);
-        interrupt_enable();
+        cpu_irq_restore(irq_flags);
         return ECANCELED;
     }
     SPINLOCK(&t_b_p->h.spin);
@@ -1251,7 +1256,7 @@ begin:
             privateptr->tracebuf = t_b_p->h.next;
             SPINUNLOCK(&t_b_p->h.spin);
             SPINUNLOCK(&trace_masks.state_spin);
-            interrupt_enable();
+            cpu_irq_restore(irq_flags);
             retry--;
             goto begin;
         } else {
@@ -1259,7 +1264,7 @@ begin:
                 SPINUNLOCK(&trace_masks.state_spin);
                 SPINUNLOCK(&t_b_p->h.spin);
                 dropped_events++;
-                interrupt_enable();
+                cpu_irq_restore(irq_flags);
                 return EOK;
             }
             /* Drop that buffer! */
@@ -1312,7 +1317,7 @@ begin:
         dropped_events++;
     }
     SPINUNLOCK(&t_b_p->h.spin);
-    interrupt_enable();
+    cpu_irq_restore(irq_flags);
 
     /* At this point we're done logging the event, but we still need to check to
      * see if we need to emit this buffer, or simply move to the next buffer in
@@ -1343,7 +1348,7 @@ begin:
             /* Someone else moved it? WTF? Assume that they flushed it too! */
             SPINUNLOCK(&trace_masks.state_spin);
         }
-        interrupt_enable();
+        cpu_irq_restore(irq_flags);
     }
     return EOK;
 }

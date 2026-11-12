@@ -160,6 +160,7 @@ host-tests: $(BUILD_BASE)/path-normalize-test $(BUILD_BASE)/cap-table-test \
 	$(Q)HOST_CC="$(HOST_CC)" $(PYTHON) $(TEST_DIR)/test-ipc-deferred-error.py
 	$(Q)HOST_CC="$(HOST_CC)" $(PYTHON) $(TEST_DIR)/test-ipc-receive-owner.py
 	$(Q)HOST_CC="$(HOST_CC)" $(PYTHON) $(TEST_DIR)/test-ipc-dispatch-owner.py
+	$(Q)HOST_CC="$(HOST_CC)" $(PYTHON) $(TEST_DIR)/test-trace-irq-mask.py
 	$(Q)$(PYTHON) $(TEST_DIR)/test-capability-namespace-doc.py
 	$(Q)$(PYTHON) $(TEST_DIR)/test-management-ipc-lock.py
 	$(Q)HOST_CC="$(HOST_CC)" $(PYTHON) -I $(TEST_DIR)/test-lkl-iommu-contract.py
