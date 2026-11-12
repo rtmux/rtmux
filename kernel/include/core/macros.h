@@ -550,6 +550,9 @@ static __inline__ void __attribute__((__unused__)) atomic_boundary()
  */
 #define RTMUX_ITF_NATIVE_REPLY 0x100U
 
+/* Resume a normal joinable exit after roottask releases its dynamic stack. */
+#define RTMUX_ITF_EXIT_STACK 0x200U
+
 /* internal_flags is a single 32-bit word whose bits are written from MULTIPLE
  * CPUs concurrently. A thread sets/clears its OWN WAIT_PENDING /
  * RCVNOTIFICATION / SPECRET_PENDING bits (e.g. ksys_msg_receivev clearing

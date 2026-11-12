@@ -1551,6 +1551,8 @@ void rdecl thread_destroy(thread_t *thp)
                      * time
                      */
                     thp->state = STATE_STACK;
+                    if (!(thp->flags & RTMUX_FLG_THR_DETACHED))
+                        ITF_SET(thp, RTMUX_ITF_EXIT_STACK);
 
                     _TRACE_TH_EMIT_STATE(thp, STACK);
                     atomic_or(&thp->flags,
