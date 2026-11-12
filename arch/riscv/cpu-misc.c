@@ -1219,3 +1219,10 @@ void cpu_console_write(const char *s, unsigned long n)
 {
     sbi_dbcn_write(s, n);
 }
+
+void cpu_board_interrupt_init(void)
+{
+    extern void plic_init(void), plic_inithart(void);
+    plic_init();
+    plic_inithart();
+}

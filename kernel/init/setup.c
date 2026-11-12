@@ -158,15 +158,8 @@ void kernel_init(int argc, char *argv[], char *env[])
     LOGF_D("kernel_init: init_cpu\n");
     init_cpu();
 
-    /* Initialize PLIC: set all priorities and per-hart thresholds. Must be
-     * after init_cpu() which sets up the interrupt tables.
-     */
-    {
-        extern void plic_init(void);
-        extern void plic_inithart(void);
-        plic_init();
-        plic_inithart();
-    }
+    extern void cpu_board_interrupt_init(void);
+    cpu_board_interrupt_init();
 
     /* Remaining arguments are for roottask, save them in malloc'd storage */
     argc -= (optind - 1);
