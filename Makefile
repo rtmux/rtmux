@@ -270,6 +270,8 @@ LKL_HOST_AUTHORED_MODES = \
 LKL_TRACE_TIMEOUT ?= 360
 QEMU_SYSCALL_TIMEOUT ?= 300
 QEMU_SMP_TIMEOUT ?= 180
+# Seconds a guest boot or mode may run; slower hosts (CI runners) raise it.
+QEMU_BOOT_TIMEOUT ?= 180
 LKL_TRACE_MODES = \
     tracelogger-lkl-fsd:$(LKL_TRACE_TIMEOUT) \
     tracelogger-lkl-netd:$(LKL_TRACE_TIMEOUT)
@@ -304,15 +306,15 @@ endif
 	@echo "  CHECK    boot syscall conformance suite from /usr block filesystem"
 	$(Q)./scripts/qemu-regress.sh --mode syscall-testing-disk --timeout $(QEMU_SYSCALL_TIMEOUT)
 	@echo "  CHECK    PCI/NVMe bring-up smoke"
-	$(Q)./scripts/qemu-regress.sh --mode pci-nvme-smoke --timeout 180
+	$(Q)./scripts/qemu-regress.sh --mode pci-nvme-smoke --timeout $(QEMU_BOOT_TIMEOUT)
 	@echo "  CHECK    boot RTMux + toolbox applet suite"
-	$(Q)./scripts/qemu-regress.sh --mode toolbox --timeout 180
+	$(Q)./scripts/qemu-regress.sh --mode toolbox --timeout $(QEMU_BOOT_TIMEOUT)
 .PHONY: check
 
 # Boot RTMux and run the /bin toolbox applet functional suite in isolation.
 check-toolbox: check-qemu-deps $(AUTOCONF_H) $(VER_FILE) startup initramfs
 	@echo "  CHECK    boot RTMux + toolbox applet suite"
-	$(Q)./scripts/qemu-regress.sh --mode toolbox --timeout 180
+	$(Q)./scripts/qemu-regress.sh --mode toolbox --timeout $(QEMU_BOOT_TIMEOUT)
 .PHONY: check-toolbox
 
 check-emu-headless:
@@ -327,7 +329,7 @@ check-emu-headless:
 #                      only gate that boots interactive-smoke
 qemu-regress: check-qemu-deps $(AUTOCONF_H) $(VER_FILE) startup initramfs
 	@echo "  CHECK    repeated QEMU boot/syscall regression gate"
-	$(Q)./scripts/qemu-regress.sh --mode interactive-smoke --timeout 180
+	$(Q)./scripts/qemu-regress.sh --mode interactive-smoke --timeout $(QEMU_BOOT_TIMEOUT)
 	$(Q)./scripts/qemu-regress.sh --mode syscall-testing --timeout $(QEMU_SYSCALL_TIMEOUT) --repeat 3
 
 # Interactive TTY smoke: expect-style serial I/O driving login, the shell, and
@@ -370,12 +372,12 @@ check-boot-manifest: check-qemu-deps $(AUTOCONF_H) $(VER_FILE) startup initramfs
 	$(Q)$(PYTHON) scripts/check-boot-manifest.py
 	$(Q)$(MAKE) -C tools/host host-tests
 	$(Q)$(MAKE) check-cap-namespace
-	$(Q)scripts/qemu-regress.sh --mode least-privilege-manifest --timeout 180
-	$(Q)scripts/qemu-regress.sh --mode boot-manifest --timeout 180
+	$(Q)scripts/qemu-regress.sh --mode least-privilege-manifest --timeout $(QEMU_BOOT_TIMEOUT)
+	$(Q)scripts/qemu-regress.sh --mode boot-manifest --timeout $(QEMU_BOOT_TIMEOUT)
 
 check-loader-negative: check-qemu-deps $(AUTOCONF_H) $(VER_FILE) startup initramfs
 	$(msg) CHECK "loader image policy negatives"
-	$(Q)scripts/qemu-regress.sh --mode loader-negative --timeout 180
+	$(Q)scripts/qemu-regress.sh --mode loader-negative --timeout $(QEMU_BOOT_TIMEOUT)
 
 check-smp-invariants: check-qemu-deps $(AUTOCONF_H) $(VER_FILE) startup initramfs
 	$(msg) CHECK "SMP invariant ledger"
@@ -408,7 +410,7 @@ check-fault-recovery: check-qemu-deps $(AUTOCONF_H) $(VER_FILE) startup initramf
 	$(Q)scripts/check-fault-recovery.sh
 	$(Q)scripts/check-fault-recovery.sh --expect-fail \
 	    docs/fault-recovery-negative.md
-	$(Q)scripts/qemu-regress.sh --mode fault-recovery --timeout 180
+	$(Q)scripts/qemu-regress.sh --mode fault-recovery --timeout $(QEMU_BOOT_TIMEOUT)
 
 check-fu740-smoke-scripts:
 	$(msg) CHECK "FU740 smoke script parsers"
@@ -599,9 +601,9 @@ check-lkl-iommu-preflight: check-qemu-deps $(AUTOCONF_H) $(VER_FILE) startup ini
 
 check-lkl-iommu-live: check-qemu-deps $(AUTOCONF_H) $(VER_FILE) startup initramfs
 	@echo "  CHECK    LKL IOMMU live enforcement"
-	$(Q)scripts/qemu-regress.sh --mode lkl-iommu-domain --timeout 180 --require-supported
-	$(Q)scripts/qemu-regress.sh --mode lkl-iommu-dma-deny --timeout 180 --require-supported
-	$(Q)scripts/qemu-regress.sh --mode lkl-iommu-revoke --timeout 180 --require-supported
+	$(Q)scripts/qemu-regress.sh --mode lkl-iommu-domain --timeout $(QEMU_BOOT_TIMEOUT) --require-supported
+	$(Q)scripts/qemu-regress.sh --mode lkl-iommu-dma-deny --timeout $(QEMU_BOOT_TIMEOUT) --require-supported
+	$(Q)scripts/qemu-regress.sh --mode lkl-iommu-revoke --timeout $(QEMU_BOOT_TIMEOUT) --require-supported
 
 check-lkl-containment: check-lkl check-lkl-profile check-map-phys-inventory check-lkl-iommu-preflight check-qemu-deps $(AUTOCONF_H) $(VER_FILE) startup initramfs
 	@echo "  CHECK    LKL containment regression"
@@ -698,7 +700,7 @@ done
 
 check-rt: check-rcu-sched check-rt-budgets check-qemu-deps $(AUTOCONF_H) $(VER_FILE) startup initramfs
 	@echo "  CHECK    boot RTMux + realtime probes"
-	$(Q)scripts/qemu-regress.sh --mode rt-check --timeout 180
+	$(Q)scripts/qemu-regress.sh --mode rt-check --timeout $(QEMU_BOOT_TIMEOUT)
 	$(Q)scripts/qemu-regress.sh --mode pi-inversion-xfail --timeout 140
 
 POSIX_MATRIX_SCRIPT = scripts/gen-posix-matrix.py
