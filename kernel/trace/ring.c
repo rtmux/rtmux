@@ -72,11 +72,7 @@ void trace_ring_dump(unsigned cpu)
     }
 
     /* Disable interrupts on this CPU for the entire dump. */
-    unsigned long sstatus_saved;
-    __asm__ volatile("csrrci %0, sstatus, %1"
-                     : "=r"(sstatus_saved)
-                     : "i"(2) /* SSTATUS_SIE bit */);
-    (void) sstatus_saved; /* not restored — we're crashing */
+    interrupt_disable(); /* Crash path never restores interrupts. */
 
     /* Force-release the kprintf lock; we're the only path now. */
     extern atomic_uint kprintf_slock;

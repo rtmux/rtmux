@@ -19,7 +19,7 @@
 #include <stdatomic.h>
 #include <core/globals.h>
 #include <cpu-inline.h>
-#include <sbi.h> /* sbi_dbcn_write — atomic console output */
+extern void cpu_console_write(const char *, unsigned long);
 
 /* Output character function pointer. Set by set_print_char() during board init
  * (before any kprintf call).
@@ -101,8 +101,7 @@ static atomic_uint crash_printer_picked;
 
 static inline void kprintf_lock(void)
 {
-    unsigned long s = r_sstatus();
-    w_sstatus(s & ~SSTATUS_SIE); /* disable interrupts (idempotent if nested) */
+    unsigned long s = cpu_irq_save();
 
     unsigned cpu = get_cpunum();
     if (in_kprintf[cpu]++ == 0) {
@@ -126,8 +125,7 @@ static inline void kprintf_unlock(void)
         /* Outermost call ending — release the lock and restore interrupts. */
         unsigned long s = kprintf_saved_sstatus[cpu];
         atomic_store_explicit(&kprintf_slock, 0, memory_order_release);
-        if (s & SSTATUS_SIE)
-            w_sstatus(r_sstatus() | SSTATUS_SIE);
+        cpu_irq_restore(s);
     }
     /* Nested unlock — outer still owns the lock; do nothing. */
 }
@@ -210,7 +208,7 @@ void set_print_char(void (*prt)(int))
 void con_write(const char *text, size_t len)
 {
     if (len != 0)
-        sbi_dbcn_write(text, (unsigned long) len);
+        cpu_console_write(text, (unsigned long) len);
 }
 
 /* Write a NUL-terminated string to the console. Parameters:
@@ -585,10 +583,9 @@ int kprintf(const char *fmt, ...)
  */
 static bool kprintf_trylock_bounded(unsigned spins)
 {
-    unsigned long s = r_sstatus();
+    unsigned long s = cpu_irq_save();
     unsigned cpu;
 
-    w_sstatus(s & ~SSTATUS_SIE);
     cpu = get_cpunum();
     if (in_kprintf[cpu]++ == 0) {
         while (
@@ -596,8 +593,7 @@ static bool kprintf_trylock_bounded(unsigned spins)
             atomic_exchange_explicit(&kprintf_slock, 1, memory_order_acquire)) {
             if (spins-- == 0) {
                 in_kprintf[cpu]--;
-                if (s & SSTATUS_SIE)
-                    w_sstatus(r_sstatus() | SSTATUS_SIE);
+                cpu_irq_restore(s);
                 return false;
             }
             __asm__ volatile("" ::: "memory");
@@ -879,7 +875,7 @@ void crash_quiesce_self(void)
      * on this CPU.
      */
     {
-        unsigned long pc = (unsigned long) r_sepc();
+        unsigned long pc = (unsigned long) cpu_exception_pc();
         kprintf("\n*** cpu %u quiesced by sibling crash IPI ***\n", cpu);
         kprintf("  sepc at IPI = 0x%lx\n", pc);
 

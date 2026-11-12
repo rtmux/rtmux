@@ -104,7 +104,11 @@ static inline uint64_t read_time(void)
 {
     uint64_t t;
 
+#if defined(__aarch64__)
+    __asm__ volatile("isb; mrs %0, cntvct_el0" : "=r"(t));
+#else
     __asm__ volatile("rdtime %0" : "=r"(t));
+#endif
     return t;
 }
 
@@ -625,13 +629,7 @@ static int run_timer_source(const char *label)
  */
 
 /* goldfish-rtc register offsets (google,goldfish-rtc), all 32-bit. */
-#define RTC_TIME_LOW 0x00
-#define RTC_TIME_HIGH 0x04
-#define RTC_ALARM_LOW 0x08
-#define RTC_ALARM_HIGH 0x0c
-#define RTC_IRQ_ENABLED 0x10
-#define RTC_CLEAR_ALARM 0x14
-#define RTC_CLEAR_INTERRUPT 0x1c
+#include "alarm-device.h"
 #define ALARM_DELTA_NS 1000000ULL /* 1 ms ahead */
 #define IRQ_ITERS 60
 
@@ -644,29 +642,13 @@ static atomic_int irq_stalled;
 static atomic_uint_least64_t irq_max_lat; /* ns */
 static int irq_vector;
 
-static uint32_t rtc_rd(unsigned off)
-{
-    return *(volatile uint32_t *) (irq_rtc + off);
-}
-
-static void rtc_wr(unsigned off, uint32_t v)
-{
-    *(volatile uint32_t *) (irq_rtc + off) = v;
-}
-
-/* Reading TIME_LOW latches the high half, so the pair is one snapshot. */
 static uint64_t rtc_now(void)
 {
-    uint32_t lo = rtc_rd(RTC_TIME_LOW);
-    uint32_t hi = rtc_rd(RTC_TIME_HIGH);
-    return ((uint64_t) hi << 32) | lo;
+    return alarm_now(irq_rtc);
 }
-
 static void rtc_arm(uint64_t when)
 {
-    rtc_wr(RTC_IRQ_ENABLED, 1);
-    rtc_wr(RTC_ALARM_HIGH, (uint32_t) (when >> 32));
-    rtc_wr(RTC_ALARM_LOW, (uint32_t) when);
+    alarm_arm(irq_rtc, when, 1);
 }
 
 /* Waiter on WAIT_CPU: attach the alarm IRQ as an IST, then loop arming the
@@ -704,7 +686,7 @@ static void *irq_waiter_worker(void *arg)
         if (lat > atomic_load_explicit(&irq_max_lat, memory_order_relaxed))
             atomic_store_explicit(&irq_max_lat, lat, memory_order_relaxed);
         atomic_store_explicit(&irq_progress, i + 1, memory_order_release);
-        rtc_wr(RTC_CLEAR_INTERRUPT, 1);
+        alarm_clear(irq_rtc);
         (void) __interrupt_unmask(irq_vector, iid);
         if (atomic_load_explicit(&irq_stop, memory_order_acquire))
             break;
@@ -736,9 +718,9 @@ static int run_irq_source(void)
     unsigned progress;
     uint64_t maxns;
 
-    if (rtmux_delegate_device(RTMUX_DEVICE_GOLDFISH_RTC, 0x1000,
+    if (rtmux_delegate_device(TEST_ALARM_DEVICE, 0x1000,
                               RTMUX_DELEGATE_ANY_BASE, &h) != EOK) {
-        printf("preempt-latency: irq SKIP no delegated goldfish-rtc\n");
+        printf("preempt-latency: irq SKIP no delegated %s\n", TEST_ALARM_NAME);
         return 2;
     }
     irq_vector = PLIC_VECTOR_BASE + h.irq_vector;
@@ -752,9 +734,7 @@ static int run_irq_source(void)
         return -1;
     }
     /* Disarm any stale alarm from a prior run before attaching. */
-    rtc_wr(RTC_IRQ_ENABLED, 0);
-    rtc_wr(RTC_CLEAR_ALARM, 1);
-    rtc_wr(RTC_CLEAR_INTERRUPT, 1);
+    alarm_reset(irq_rtc);
 
     if (pthread_create(&wd, NULL, wd_worker, &irq_wd_arg) != EOK)
         return -1;

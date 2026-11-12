@@ -27,7 +27,7 @@ import sys
 
 ELF_MAGIC = b"\x7fELF"
 RELA_ENTRY_SIZE = 24
-VALID_PLT_TYPES = {"R_RISCV_JUMP_SLOT", "R_RISCV_IRELATIVE"}
+VALID_PLT_TYPES = {"R_RISCV_JUMP_SLOT", "R_RISCV_IRELATIVE", "R_AARCH64_JUMP_SLOT", "R_AARCH64_IRELATIVE"}
 
 # Force C locale so readelf emits the English headings the parser keys on,
 # and decode tolerantly in case object paths or comments aren't UTF-8.

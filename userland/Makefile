@@ -13,7 +13,7 @@ CPPFLAGS += -DCONFIG_LKL_SERVERS=1
 endif
 
 CORE_DIRS = pipe waitfor
-DRIVER_DIRS = dev-serial-8250 dev-serial-sifive dev-nvme romfs
+DRIVER_DIRS = dev-serial-pl011 dev-serial-8250 dev-serial-sifive dev-nvme romfs ramblk
 # The syscall-conformance suite lives in tests/userland (built and installed by
 # the top-level Makefile), not here.
 
@@ -38,10 +38,12 @@ TOOLBOX_OBJS = $(TOOLBOX_SRCS:%.c=$(OBJDIR)/%.o)
 # in $(INITRAMFS_DIR)/bin/ is just the basename, so no src:dst pairs needed.
 INSTALL_BIN  = \
     toolbox \
+    dev-serial-pl011/dev-serial-pl011 \
     dev-serial-8250/dev-serial-8250 \
     dev-serial-sifive/dev-serial-sifive \
     dev-nvme/dev-nvme \
     romfs/romfs \
+    ramblk/ramblk \
     pipe/pipe \
     waitfor/waitfor
 TOOLBOX_BIN_APPLETS = \
@@ -174,8 +176,12 @@ endif
 		cp $(USR_BUILD)/toolbox $(INITRAMFS_DIR)/sbin/$$applet || exit 1; \
 		$(STRIP) --strip-unneeded $(INITRAMFS_DIR)/sbin/$$applet || exit 1; \
 	done
-	$(Q)cp init $(INITRAMFS_DIR)/sbin/init
+	$(Q)cp $(if $(filter aarch64,$(ARCH)),init-pi3,init) $(INITRAMFS_DIR)/sbin/init
 	$(Q)chmod +x $(INITRAMFS_DIR)/sbin/init
+ifeq ($(ARCH),aarch64)
+	$(Q)cp -R pi3-root/. $(INITRAMFS_DIR)/
+	$(Q)chmod 600 $(INITRAMFS_DIR)/usr/conf/shadow
+endif
 
 clean: $(addprefix clean-,$(SUBDIRS))
 	$(Q)rm -f $(TOOLBOX) $(TOOLBOX_OBJS) $(TOOLBOX_OBJS:.o=.d) \

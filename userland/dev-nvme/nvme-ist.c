@@ -118,7 +118,12 @@ static unsigned drain_cq(nvme_ctrl_t *c,
     /* Full hardware fence between the phase-bit check and the CQE-tail /
      * payload reads.
      */
+
+#ifdef __aarch64__
+    __asm__ volatile("dmb osh" ::: "memory");
+#else
     __asm__ __volatile__("fence rw,rw" ::: "memory");
+#endif
 
     uint16_t done_cid = cqe->cid;
     uint16_t sf = (uint16_t) (status >> 1);

@@ -8,6 +8,14 @@
 #ifndef _RISCV_CPUINLINE_H
 #define _RISCV_CPUINLINE_H
 
+static inline void *cpu_get_tls(void)
+{
+    void *tls;
+    __asm__("mv %0, tp" : "=r"(tls));
+    return tls;
+}
+
+
 #include <inttypes.h>
 #include <sys/spinlock.h>
 
@@ -410,6 +418,21 @@ static inline void debug_kdbreak(void)
         "ebreak\n"            /* Break to debugger */
         "srai x0, x0, 7\n"    /* NOP encoding the semihosting call number 7 */
     );
+}
+
+
+static inline unsigned long cpu_irq_save(void) { unsigned long v=r_sstatus(); w_sstatus(v & ~SSTATUS_SIE); return v; }
+static inline void cpu_irq_restore(unsigned long v) { if (v & SSTATUS_SIE) interrupt_enable(); }
+static inline uintptr_t cpu_page_table_root(void) { return r_satp(); }
+
+static inline uintptr_t cpu_exception_pc(void) { return r_sepc(); }
+
+/* Architecture-neutral hooks used by common kernel code. */
+#define __cpu_store_barrier() __asm__ volatile("fence rw, w" ::: "memory")
+#define cpu_relax() __asm__ volatile(".word 0x0100000f" ::: "memory")
+static inline void cpu_tlb_flush(void)
+{
+    __asm__ volatile("sfence.vma" ::: "memory");
 }
 
 #endif

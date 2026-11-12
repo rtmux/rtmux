@@ -1,0 +1,19 @@
+if ARCH_AARCH64
+config PI3_RAM_SIZE_MB
+    int "Pi3 RAM available to RTMux (MiB)"
+    range 160 960
+    default 960
+    help
+      The upper 64 MiB is reserved for the firmware/GPU. A smaller limit
+      permits bounded low-memory validation; 256 matches the RISC-V QEMU
+      regression environment. The initramfs at 128 MiB must still fit.
+config PAGE_OFFSET
+    hex
+    default 0xffffffc000000000
+config PA_BITS
+    int
+    default 32
+config VA_BITS
+    int
+    default 39
+endif

@@ -109,6 +109,12 @@ static const bootstrap_cap_grant_t bootstrap_cap_manifest[] = {
         .flags = BOOTSTRAP_GRANT_STEADY_STATE,
     },
     {
+        .server = "dev-serial-pl011",
+        .exec_path = "/bin/dev-serial-pl011",
+        .priv_caps = RTMUX_PRIV_CAP_IRQ,
+        .flags = BOOTSTRAP_GRANT_STEADY_STATE,
+    },
+    {
         .server = "dev-serial-8250",
         .exec_path = "/bin/dev-serial-8250",
         .priv_caps = RTMUX_PRIV_CAP_IRQ,

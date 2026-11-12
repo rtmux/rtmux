@@ -868,7 +868,7 @@ static int sendv_body(thread_t *act,
                 kspinlock_lock(&chp->lock);
                 ITF_CLR(thp, RTMUX_ITF_MSG_DELIVERY | RTMUX_ITF_MSG_FORCE_RDY);
                 kspinlock_unlock(&chp->lock);
-                force_ready(thp, (unsigned) KSTATUS(thp));
+                force_ready(thp, MSG_FORCE_ERROR(thp));
                 KCALL_RESTART(act);
                 act->restart = 0;
                 return ENOERROR;
@@ -980,8 +980,6 @@ static int sendv_body(thread_t *act,
             }
         }
 
-        SETKSTATUS(thp, (sender->tid << 16) | cop->scoid);
-
         /* Unlink receive thread from the receive queue. Queue mutation under
          * chp->lock; thp's MSG_DELIVERY was held since the peek up top to keep
          * force_ready / other peekers off it. Clear the claim only AFTER
@@ -990,8 +988,10 @@ static int sendv_body(thread_t *act,
          */
         kspinlock_lock(&chp->lock);
         LINKPRIL_REM(thp);
+        thp->blocked_on = NULL;
+        SETKSTATUS(thp, (sender->tid << 16) | cop->scoid);
 #if CONFIG_PROCESSORS_MAX > 1 && defined(CONFIG_SMP_MSGOPT)
-        ITF_CLR(thp, RTMUX_ITF_MSG_DELIVERY);
+        ITF_CLR(thp, RTMUX_ITF_MSG_DELIVERY | RTMUX_ITF_MSG_FORCE_RDY);
 #endif
         kspinlock_unlock(&chp->lock);
 
@@ -1319,18 +1319,18 @@ send_fault:
 
 rcv_fault:
     atomic_clr(&sender->flags, RTMUX_FLG_THR_BUFF_MSG);
-    kcall_err(thp, EFAULT);
-
     /* LINKPRIL_REM under chp->lock; clear MSG_DELIVERY claim INSIDE the lock
      * (after LINKPRIL_REM) so the same race window that bites the success path
      * can't bite here either.
      */
     kspinlock_lock(&chp->lock);
     LINKPRIL_REM(thp);
+    thp->blocked_on = NULL;
 #if CONFIG_PROCESSORS_MAX > 1 && defined(CONFIG_SMP_MSGOPT)
-    ITF_CLR(thp, RTMUX_ITF_MSG_DELIVERY);
+    ITF_CLR(thp, RTMUX_ITF_MSG_DELIVERY | RTMUX_ITF_MSG_FORCE_RDY);
 #endif
     kspinlock_unlock(&chp->lock);
+    kcall_err(thp, EFAULT);
     ready(thp);
 
     /* Restart the kernel call - same behavior as receive path */
@@ -1492,22 +1492,19 @@ int kdecl ksys_msg_sendnotification(thread_t *act,
             }
 
 
-            SETKSTATUS(thp, 0);
-
-            if (status) {
-                kcall_err(thp, EFAULT);
-            }
-
             /* Unlink receive thread from the receive queue and ready it. Queue
              * mutation under chp->lock
              */
             kspinlock_lock(&chp->lock);
             LINKPRIL_REM(thp);
+            thp->blocked_on = NULL;
+            SETKSTATUS(thp, 0);
 #if CONFIG_PROCESSORS_MAX > 1 && defined(CONFIG_SMP_MSGOPT)
-            atomic_clr((volatile unsigned *) &thp->internal_flags,
-                       RTMUX_ITF_MSG_DELIVERY);
+            ITF_CLR(thp, RTMUX_ITF_MSG_DELIVERY | RTMUX_ITF_MSG_FORCE_RDY);
 #endif
             kspinlock_unlock(&chp->lock);
+            if (status)
+                kcall_err(thp, EFAULT);
 
             /* By default the receiver runs with message driven priority. */
             if (thp->priority != prio &&
@@ -1876,7 +1873,7 @@ restart_recv:
                 END_SMP_XFER(act, thp);
                 ITF_CLR(thp, RTMUX_ITF_MSG_FORCE_RDY);
                 kspinlock_unlock(&chp->lock);
-                force_ready(thp, (unsigned) KSTATUS(thp));
+                force_ready(thp, MSG_FORCE_ERROR(thp));
                 KCALL_RESTART(act);
                 act->restart = 0;
                 return ENOERROR;
@@ -2446,7 +2443,7 @@ int kdecl ksys_msg_replyv(thread_t *act, struct kcall_args_msg_replyv *kap)
                 kspinlock_lock(&chp->lock);
                 ITF_CLR(thp, RTMUX_ITF_MSG_DELIVERY | RTMUX_ITF_MSG_FORCE_RDY);
                 kspinlock_unlock(&chp->lock);
-                force_ready(thp, (unsigned) KSTATUS(thp));
+                force_ready(thp, MSG_FORCE_ERROR(thp));
                 KCALL_RESTART(act);
                 act->restart = 0;
                 return ENOERROR;

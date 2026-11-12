@@ -48,7 +48,7 @@ static void ws_init(void)
      * stack for ourselves, which is located directly after _end (see head.S for
      * details).
      */
-    ws_early_next = ROUND(_end, __PAGESIZE);
+    ws_early_next = ROUND(STARTUP_V2P(_end), __PAGESIZE);
 
     avoid_list = MAKE_1TO1_PTR(ws_early_next);
     avoid_list[0].start = ws_early_next;

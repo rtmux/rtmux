@@ -2335,6 +2335,7 @@ _Static_assert(__KSYS_SCHED_YIELD == 90, "fp_loop hard-codes the yield syscall")
 uint64_t fp_loop(uint64_t pattern, uint64_t iters);
 uint64_t fp_read_all(void);
 
+#if defined(__riscv)
 __asm__(
     ".option push\n"
     ".option arch, +d\n"
@@ -2387,6 +2388,7 @@ __asm__(
     "    mv a0, t0\n"
     "    ret\n"
     ".option pop\n");
+#endif
 
 #define FP_ITERS 20000
 
@@ -2459,7 +2461,7 @@ static void *fp_zero_reader(void *arg)
 {
     uint64_t *out = arg;
 
-    (void) fp_pin(0);
+    /* Read before libc calls: AArch64 libc may legitimately use SIMD. */
     *out = fp_read_all();
     return NULL;
 }

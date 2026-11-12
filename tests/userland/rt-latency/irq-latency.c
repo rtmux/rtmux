@@ -56,7 +56,7 @@ static struct rtc_probe probe; /* shared RTC state (rtc-probe.h) */
 static int rtc_delegate(unsigned long *phys, int *irq)
 {
     struct rtmux_resource_handle h;
-    int rc = rtmux_delegate_device(RTMUX_DEVICE_GOLDFISH_RTC, 0x1000,
+    int rc = rtmux_delegate_device(TEST_ALARM_DEVICE, 0x1000,
                                    RTMUX_DELEGATE_ANY_BASE, &h);
 
     if (rc != EOK)
@@ -214,7 +214,8 @@ int main(int argc, char **argv)
     {
         unsigned addint[2] = {RTMUX_TRACE_ADDCLASS, RTMUX_TRACE_INT};
 
-        if (trace_event(addint) == -1 || trace_cmd(RTMUX_TRACE_START) == -1) {
+        if (trace_cmd(RTMUX_TRACE_DELALLCLASSES) == -1 ||
+            trace_event(addint) == -1 || trace_cmd(RTMUX_TRACE_START) == -1) {
             printf("irq-latency: FAIL start tracing: %s\n", strerror(errno));
             return 1;
         }

@@ -37,7 +37,7 @@ Current drivers satisfy the contract without a vendor seam:
 | Driver | Contract evidence |
 | --- | --- |
 | `userland/dev-nvme` | PCI resources come from `pci-server`; BAR0 is mapped only from the typed PCI BAR handle returned by attach, BAR/IRQ details are logged and smoked by `pci-nvme-smoke`; polling mode is explicit until interrupt completions land. |
-| `userland/dev-serial-8250` / `dev-serial-sifive` | MMIO records are delegated through `/dev/virtio-mmio`; IRQ setup and IST order are recorded in `docs/irq-contract.md` / `docs/driver-review-checklist.md`. |
+| `userland/dev-serial-8250` / `dev-serial-sifive` / `dev-serial-pl011` | MMIO records are delegated through `/dev/virtio-mmio`; IRQ setup and IST order are recorded in `docs/irq-contract.md` / `docs/driver-review-checklist.md`. |
 | `servers/pci` | Maps ECAM/DBI only from typed boot MMIO records and delegates narrowed BAR/IRQ data to device drivers. |
 
 ## Deferred Gates

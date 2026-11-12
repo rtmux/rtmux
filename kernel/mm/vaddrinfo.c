@@ -74,11 +74,11 @@ unsigned mm_vaddrinfo(pid_t pid,
     /* Translate PTE bits → POSIX prot bits. PTE_U doesn't matter for the caller
      * (kernel S-mode access uses SUM); we report read/write/exec presence.
      */
-    if (*pte & PTE_R)
+    if (cpu_pte_prot(*pte) & PTE_R)
         prot |= PROT_READ;
-    if (*pte & PTE_W)
+    if (cpu_pte_prot(*pte) & PTE_W)
         prot |= PROT_WRITE;
-    if (*pte & PTE_X)
+    if (cpu_pte_prot(*pte) & PTE_X)
         prot |= PROT_EXEC;
 
     /* Compute PA: extract PPN from PTE, OR with VA's intra-page offset.

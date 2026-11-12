@@ -425,9 +425,16 @@ static void test_statvfs_wrappers(void)
 /* Child half of nvme_raw_perm: drop to an unprivileged uid and require that
  * every raw NVMe node refuses both read and write opens with EACCES.
  */
+static const char *block_node(unsigned index)
+{
+    const char *path = getenv(index ? "RTMUX_TEST_BLOCK_PART" :
+                                    "RTMUX_TEST_BLOCK_WHOLE");
+    return path && *path ? path : (index ? "/dev/nvme0n1p8" : "/dev/nvme0n1");
+}
+
 int nvme_raw_child(void)
 {
-    static const char *const nodes[] = {"/dev/nvme0n1", "/dev/nvme0n1p8"};
+    const char *nodes[] = {block_node(0), block_node(1)};
 
     if (setgid(1000) != 0 || setuid(1000) != 0)
         return 2;
@@ -714,33 +721,37 @@ static void test_malloc_growth(void)
 
 static void test_nvme_raw_perm(void)
 {
-    static const char *const nodes[] = {"/dev/nvme0n1", "/dev/nvme0n1p8"};
+    const char *nodes[] = {block_node(0), block_node(1)};
     char *argv[] = {"syscall_testing", "--nvme-raw-child", NULL};
     struct stat st;
     pid_t pid;
     int status = -1;
 
-    if (geteuid() != 0 || stat(nodes[0], &st) != 0)
-        return; /* needs root, and NVMe present */
+    if (geteuid() != 0 || stat(nodes[0], &st) != 0) {
+        test_fail("block permission fixture", "needs root and configured block device");
+        return;
+    }
+    printf("  block fixture: whole=%s part=%s\n", nodes[0], nodes[1]);
 
     for (size_t i = 0; i < sizeof(nodes) / sizeof(nodes[0]); i++) {
         int fd = open(nodes[i], O_RDONLY);
 
-        check(fd >= 0, "nvme_raw_perm root open", nodes[i]);
+        check(fd >= 0, "block_raw_perm root open", nodes[i]);
         if (fd >= 0)
             (void) close(fd);
-        check(stat(nodes[i], &st) == 0 && (st.st_mode & 07777) == 0600,
-              "nvme_raw_perm mode 0600", nodes[i]);
+        check(stat(nodes[i], &st) == 0 && S_ISBLK(st.st_mode) &&
+                  (st.st_mode & 07777) == 0600,
+              "block_raw_perm mode 0600", nodes[i]);
     }
 
     if (posix_spawn(&pid, "/bin/syscall_testing", NULL, NULL, argv, NULL) != 0) {
-        test_fail("nvme_raw_perm spawn", strerror(errno));
+        test_fail("block_raw_perm spawn", strerror(errno));
         return;
     }
     check(wait_child_exit(pid, &status, 500) && WIFEXITED(status) &&
               WEXITSTATUS(status) == 0,
-          "nvme_raw_perm unprivileged open is EACCES",
-          "uid 1000 must not open raw NVMe nodes for read or write");
+          "block_raw_perm unprivileged open is EACCES",
+          "uid 1000 must not open raw block nodes for read or write");
 }
 
 static void test_nvme_negative_lseek(void)
@@ -749,30 +760,30 @@ static void test_nvme_negative_lseek(void)
     off_t pos;
     int fd;
 
-    fd = open("/dev/nvme0n1p8", O_RDONLY);
+    fd = open(block_node(1), O_RDONLY);
     if (fd == -1) {
-        test_fail("nvme lseek setup", strerror(errno));
+        test_fail("block lseek setup", strerror(errno));
         return;
     }
     if (fstat(fd, &st) == -1) {
-        test_fail("nvme lseek stat", strerror(errno));
+        test_fail("block lseek stat", strerror(errno));
         (void) close(fd);
         return;
     }
     if (st.st_size < 1024) {
-        test_fail("nvme lseek stat", "device is shorter than test offset");
+        test_fail("block lseek stat", "device is shorter than test offset");
         (void) close(fd);
         return;
     }
 
     errno = 0;
     pos = lseek(fd, -512, SEEK_END);
-    check(pos == st.st_size - 512, "nvme negative SEEK_END",
+    check(pos == st.st_size - 512, "block negative SEEK_END",
           "block devices must accept signed end-relative seeks");
 
     errno = 0;
     pos = lseek(fd, -512, SEEK_CUR);
-    check(pos == st.st_size - 1024, "nvme negative SEEK_CUR",
+    check(pos == st.st_size - 1024, "block negative SEEK_CUR",
           "block devices must accept signed current-relative seeks");
 
     (void) close(fd);
@@ -849,9 +860,9 @@ static void test_posix_errno_corners(void)
     /* Seek validation on a real seekable object: a resulting negative offset
      * and an unknown whence are both EINVAL.
      */
-    fd = open("/dev/nvme0n1p8", O_RDONLY);
+    fd = open(block_node(1), O_RDONLY);
     if (fd == -1) {
-        test_fail("errno-corner nvme setup", strerror(errno));
+        test_fail("errno-corner block setup", strerror(errno));
         return;
     }
 
@@ -3036,8 +3047,13 @@ static void test_uname_matches_syspage(void)
           "every utsname field must be a terminated string");
     check(strcmp(u.sysname, "RTMux") == 0, "uname sysname",
           "sysname must be RTMux");
+#if defined(__aarch64__)
+    check(strcmp(u.machine, "aarch64") == 0, "uname machine",
+          "machine must be aarch64");
+#else
     check(strcmp(u.machine, "riscv64") == 0, "uname machine",
           "machine must be riscv64");
+#endif
     check(u.nodename[0] != '\0', "uname nodename",
           "nodename must be non-empty (/etc/hostname or rtmux)");
     check(strncmp(u.release, bi->release, sizeof bi->release) == 0,
@@ -3649,10 +3665,16 @@ static void test_namespace_open_entry_generation_race(void)
         int fd;
         int saw_access;
 
-        saw_access = access(path, F_OK) == 0;
         gen_before = gen_after = 0;
-        if (saw_access)
-            (void) read_namespace_counter("namespace_version", &gen_before);
+        /* Bracket BOTH lookups. Reading the initial generation after access()
+         * misses a legitimate unlink between access() and that snapshot and
+         * falsely reports a stale-cache failure on a faster second CPU. */
+        if (read_namespace_counter("namespace_version", &gen_before) == -1) {
+            bad++;
+            last_bad_errno = errno;
+            continue;
+        }
+        saw_access = access(path, F_OK) == 0;
         errno = 0;
         fd = name_open(name, 0);
         if (fd != -1) {
@@ -4406,6 +4428,19 @@ static void test_at_syscalls_at_fdcwd(void)
               errno == EINVAL,
           "faccessat bad flag",
           "faccessat must reject an undefined AT_ flag with EINVAL");
+}
+
+/* Exercise deferred namespace replay repeatedly, then verify a combined stat
+ * and side-channel open still work in the same client. A premature open reply
+ * leaves an OCB bound to a recycled coid and poisons later stat/access calls. */
+void test_namespace_combined_race(void)
+{
+    for (int round = 0; round < 32; round++) {
+        printf("namespace-combined-race: round=%d\n", round);
+        test_namespace_open_race();
+        test_namespace_open_entry_generation_race();
+        test_at_syscalls_at_fdcwd();
+    }
 }
 
 static void test_namespace_sandbox_conformance(void)
@@ -5599,6 +5634,23 @@ static ssize_t read_sys_log(int fd, char *buf, size_t cap)
     }
 }
 
+/* /sys/log keeps a sequence window, not a private snapshot. A full ring's
+ * very oldest byte can be overwritten by unrelated loader cleanup after
+ * open. Read the recent 64 KiB containing our markers, leaving room for that
+ * concurrent logging. The wrap test below checks the full-ring/EOVERFLOW
+ * contract separately. No failed read is retried. */
+static ssize_t read_recent_sys_log(int fd, char *buf, size_t cap)
+{
+    struct stat st;
+
+    if (fstat(fd, &st) != 0)
+        return -errno;
+    if (st.st_size >= 1024 * 1024 &&
+        lseek(fd, st.st_size - 65536, SEEK_SET) != st.st_size - 65536)
+        return -errno;
+    return read_sys_log(fd, buf, cap);
+}
+
 /* Child: as uid 1000, /sys/log (0400) refuses open and stat with EACCES (the gate is
  * the open path, which stat shares) while a world-readable /sys entry still opens, and
  * a log mark is refused with roottask's own EPERM.
@@ -5666,14 +5718,14 @@ static void test_sys_log_read(void)
     }
     check(fstat(fd, &st) == 0 && (st.st_mode & 07777) == 0400 && S_ISREG(st.st_mode),
           "sys_log_read mode 0400", "/sys/log must be a regular file with mode 0400");
-    n = read_sys_log(fd, buf, sizeof buf - 1);
+    n = read_recent_sys_log(fd, buf, sizeof buf - 1);
     check(n > 0, "sys_log_read reads data", "empty or failed read");
     if (n > 0) {
         buf[n] = '\0';
         /* Not wrapped (the ring is 1 MiB), so the oldest byte is the first
          * roottask line.
          */
-        if (n < 1024 * 1024)
+        if (st.st_size < 1024 * 1024)
             check(!strncmp(buf, "RT", 2), "sys_log_read oldest first",
                   "an unwrapped ring must start at its first line");
         /* Roottask may log between the mark and this read, so the mark need not be the last
@@ -5693,7 +5745,7 @@ static void test_sys_log_read(void)
     snprintf(mark, sizeof mark, "sys_log_read second %d", (int) getpid());
     (void) send_log_mark(mark, strlen(mark));
     check(lseek(fd, 0, SEEK_SET) == 0, "sys_log_read rewind", "lseek(0) failed");
-    n = read_sys_log(fd, buf, sizeof buf - 1);
+    n = read_recent_sys_log(fd, buf, sizeof buf - 1);
     if (n > 0)
         buf[n] = '\0';
     check(n > 0 && strstr(buf, mark) != NULL, "sys_log_read rewind resamples",

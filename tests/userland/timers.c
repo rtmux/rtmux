@@ -677,14 +677,30 @@ static void cputime_round_run(struct cputime_round *r, int pairs, int per_block)
     r->med_dbusy = median_i64(dbusy_v, pairs);
 }
 
-static void test_cputime_short_bursts(void)
+void test_cputime_short_bursts(void)
 {
     enum { PAIRS = 50, PER_BLOCK = 100, ROUNDS = 3 }; /* 10^4 spin bursts */
     struct timespec res;
     struct cputime_round r;
     uint64_t res_ns = 0, tol = 0, c0, c1;
     int round, ok_pair = 0, ok_totals = 0, ok_dcpu = 0, ok_ctl = 0;
+    unsigned saved_mask = 0, pinned_mask;
     char detail[300], hist[100] = "";
+
+    /* The paired calibration assumes the same fixed kernel/wakeup cost in
+     * both blocks. Keep it on one CPU; migration can alternate an idle wake
+     * with a thread-to-thread switch and invalidate that assumption. The
+     * following two-thread and yield/steal tests cover cross-CPU billing. */
+    if (thread_ctl(RTMUX_TCTL_RUNMASK_GET_AND_SET, &saved_mask) != 0 ||
+        saved_mask == 0) {
+        test_fail("cputime_short_bursts affinity", "cannot read run mask");
+        return;
+    }
+    pinned_mask = saved_mask & (0U - saved_mask);
+    if (thread_ctl(RTMUX_TCTL_RUNMASK_GET_AND_SET, &pinned_mask) != 0) {
+        test_fail("cputime_short_bursts affinity", "cannot pin calibration");
+        return;
+    }
 
     if (clock_getres(CLOCK_MONOTONIC, &res) == 0)
         res_ns = ts_ns(&res);
@@ -737,6 +753,9 @@ static void test_cputime_short_bursts(void)
          * timer and wake work is charged) and never more than the wall time.
          */
         ok_ctl = r.ctl_cpu != 0 && r.ctl_cpu <= r.ctl_wall + 2 * res_ns;
+        printf("cputime calibration: round=%d median_error_ns=%lld "
+               "tolerance_ns=%llu pairs=%d\n", round, (long long) r.med_err,
+               (unsigned long long) tol, PAIRS);
         if (ok_pair && ok_totals && ok_dcpu && ok_ctl)
             break;
     }
@@ -766,6 +785,8 @@ static void test_cputime_short_bursts(void)
              "sleeps not)", round, (unsigned long long) r.ctl_cpu,
              (unsigned long long) r.ctl_wall);
     check(ok_ctl, "cputime_short_bursts fixed cost billed", detail);
+    if (thread_ctl(RTMUX_TCTL_RUNMASK_GET_AND_SET, &saved_mask) != 0)
+        test_fail("cputime_short_bursts affinity", "cannot restore run mask");
 }
 
 /* Two CPU-bound threads share the hart(s): each thread's own CPU clock summed

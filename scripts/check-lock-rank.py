@@ -50,6 +50,8 @@ ANNOTATIONS = {
     # remote_ipc is a file-scope anonymous struct in kernel/ipc/channel.c whose
     # .chp field is a channel_t*, so remote_ipc.chp->lock is a CHANNEL lock.
     "remote_ipc.chp->lock": "LOCK_CLASS_CHANNEL",
+    # LOCAL_DPP expands to get_pcpu()->pc_dispatch (kdispatch_t *).
+    "LOCAL_DPP->lock": "LOCK_CLASS_SCHED",
 }
 
 # Lock primitive / runtime checker itself — not lock consumers.  Excluded from
@@ -309,6 +311,10 @@ def main():
         field = re.sub(r'\[[^\]]*\]', '', field).strip()
         base = expr[:expr.rfind(field)].rstrip('.->')
         t = res.type_of(base, scope)
+        # dispatch_init initializes through an indexed pcpu_array expression
+        # outside the init-site resolver. Use the type, not a variable name.
+        if t == res.canon("kdispatch_t") and field == "lock":
+            return "LOCK_CLASS_SCHED"
         if t and (t, field) in type_field_class:
             return type_field_class[(t, field)]
         # vec_slock only exists on process_t today; fall back when the base type

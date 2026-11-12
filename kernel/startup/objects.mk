@@ -11,3 +11,7 @@ STARTUP_LIB_SRC = lib/mem lib/strtoul lib/getopt \
                   lib/typed-strings lib/util lib/cpio
 
 STARTUP_ALL_SRC = $(STARTUP_COMMON_SRC) $(STARTUP_LIB_SRC)
+
+ifeq ($(ARCH),aarch64)
+STARTUP_COMMON_SRC := $(filter-out cpu-syspage-memory init-intrinfo init-raminfo,$(STARTUP_COMMON_SRC))
+endif

@@ -191,3 +191,29 @@ void test_serial_unblock(void)
     }
     close(fd);
 }
+
+/* Own a foreground UART driver for an interactive coverage run. The parent
+ * shell can resume using its polling console after the driver is reaped. */
+void test_serial_unblock_driver(const char *driver)
+{
+    char *argv[] = {(char *) driver, NULL};
+    pid_t pid = -1;
+    int status = 0, ready = 0;
+    int rc = posix_spawn(&pid, driver, NULL, NULL, argv, NULL);
+    check(rc == 0 && pid > 0, "serial_unblock spawn driver", strerror(rc));
+    if (rc != 0 || pid <= 0)
+        return;
+    for (int i = 0; i < 500; i++) {
+        if (access(SERIAL_DEV, F_OK) == 0) {
+            ready = 1;
+            break;
+        }
+        sleep_ms(10);
+    }
+    check(ready, "serial_unblock driver published", "UART service missing");
+    if (ready)
+        test_serial_unblock();
+    rc = kill(pid, SIGKILL);
+    check(rc == 0 && waitpid(pid, &status, 0) == pid,
+          "serial_unblock driver reaped", "UART driver must release input ownership");
+}

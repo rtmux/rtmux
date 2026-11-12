@@ -59,6 +59,19 @@ static long test_kcall6(long n,
                         long arg4,
                         long arg5)
 {
+#if defined(__aarch64__)
+    register long x8 __asm__("x8") = n;
+    register long x0 __asm__("x0") = arg0;
+    register long x1 __asm__("x1") = arg1;
+    register long x2 __asm__("x2") = arg2;
+    register long x3 __asm__("x3") = arg3;
+    register long x4 __asm__("x4") = arg4;
+    register long x5 __asm__("x5") = arg5;
+    __asm__ volatile("svc #0" : "+r"(x0)
+                     : "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5), "r"(x8)
+                     : "memory", "cc");
+    return x0;
+#else
     register long a7 __asm__("a7") = n;
     register long a0 __asm__("a0") = arg0;
     register long a1 __asm__("a1") = arg1;
@@ -72,6 +85,7 @@ static long test_kcall6(long n,
                      : "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a5), "r"(a7)
                      : "memory");
     return a0;
+#endif
 }
 
 static void expect_refused(int rc, const char *name)

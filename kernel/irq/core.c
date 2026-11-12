@@ -449,7 +449,8 @@ int rdecl interrupt_mask(unsigned level, interrupt_t *itp)
     int new;
 
     ilp = &interrupt_level[level];
-    CPU_SLOCK_INTR_LOCK(&intr_slock);
+    unsigned long irq_flags = cpu_irq_save();
+    CPU_SLOCK_LOCK(&intr_slock);
     if (itp) {
         ++itp->mask_count;
     }
@@ -470,7 +471,8 @@ int rdecl interrupt_mask(unsigned level, interrupt_t *itp)
 #endif
     }
     new = ilp->mask_count; /* snarf before intrs enabled, avoid races */
-    CPU_SLOCK_INTR_UNLOCK(&intr_slock);
+    CPU_SLOCK_UNLOCK(&intr_slock);
+    cpu_irq_restore(irq_flags);
     return new;
 }
 

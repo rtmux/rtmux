@@ -303,7 +303,7 @@ static void ksys_start_roottask_umode(void)
      * initramfs_elf_load_sv39, so argc=0, argv[0]=NULL, envp[0]=NULL — exactly
      * what the in-kernel-launched roottask needs.
      */
-    thp->reg.gpr[RISCV_REG_A0] = (uintptr_t) server_m->user_sp;
+    CPU_REG_ARG(&thp->reg, 0) = (uintptr_t) server_m->user_sp;
 
     /* Open the SMP dispatch gate. Today this is done by roottask via
      * __KSYS_PRIV_SMP_BRINGUP, but for the U-mode launch path roottask can't

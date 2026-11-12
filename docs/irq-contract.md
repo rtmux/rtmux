@@ -48,6 +48,7 @@ Audited drivers:
 | --- | --- | --- | --- |
 | `userland/dev-nvme/nvme-ist.c` | Admin/I/O CQ rings, per-queue gates, controller vector, and IST attach sentinel are initialized in `nvme_ist_start()` before client service switches to interrupt mode. | No initial unmask; the IST waits, drains both CQs until quiet, then unmasks. | One outstanding command per queue; submitter and IST synchronize with each gate mutex/condvar. |
 | `userland/dev-serial-8250/main.c` | UART MMIO, RX buffer, I/O-service dispatch, side-channel connection, and notification handler are ready before the IST starts. | IST drains RX once after attach and before first unmask. | IST-only RX producer, dispatch-thread consumer through `serial-rxbuf`; notification wakes the consumer. |
+| `userland/dev-serial-pl011/main.c` | Delegated MMIO, RX ring, dispatch, side-channel and notification handler exist before the CPU0 IST attaches. | Drain RX and acknowledge RX/timeout, enable IMSC, then unmask; READY follows successful attachment. | IST-only RX producer and dispatch consumer; boot console polling yields while the UART IRQ has an owner and resumes after detachment. |
 | `userland/dev-serial-sifive/main.c` | UART MMIO, RX buffer, I/O-service dispatch, side-channel connection, and notification handler are ready before the IST starts. | IST drains RX once after attach and before first unmask. | IST-only RX producer, dispatch-thread consumer through `serial-rxbuf`; notification wakes the consumer. |
 | `servers/pci/dwmsi.c` | DBI mapping, target PA, MSI address registers, status clear, mask, and enable registers are programmed before the demux IST starts. | No initial unmask; the demux IST waits, drains/acks all pending MSI bits, then unmasks. | Single demux IST owns MSI status drain; vector allocation bitmap is protected by `dwmsi_mtx`. |
 | `servers/lkl/virtio.c` | Virtio MMIO mapping, IRQ vector, netdev lock/condvar, and LKL netdev state exist before the IST reports `irq_ready`. | `interrupt_wait(...UNMASK...)` arms the source; after wake the IST ACKs virtio interrupt status before broadcasting waiters. | Netdev state is protected by `rtnd->lock`; LKL consumers wake through the condition variable. |
@@ -61,6 +62,18 @@ Canonical examples:
 - `userland/dev-serial-8250/main.c` and `userland/dev-serial-sifive/main.c`: serial
   ISTs drain UART status and unmask.
 - `servers/pci/dwmsi.c`: MSI demultiplexing in user space.
+
+## IRQ state across shared trace and masking helpers
+
+`interrupt_mask()` and `add_trace_event()` preserve the caller's IRQ mask.
+They can run from a hard IRQ or while a scheduler/channel lock is held; enabling
+IRQs on return would permit a handler to reacquire the interrupted lock.
+AArch64 asserts that peripheral masking and IRQ-claim tracing return masked.
+`tests/host/test-trace-irq-mask.py` exercises the real trace append function
+across 16 enabled/masked buffer paths and rejects an unconditional-enable
+mutation. The Pi3 coverage gate also runs all-class, syscall-only and IRQ-only
+tracers sequentially in the same boot, requiring the expected event classes and
+50 actual peripheral IRQ wakeups.
 
 ## Notification/Event Tradeoff
 

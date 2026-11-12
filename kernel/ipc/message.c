@@ -325,7 +325,7 @@ int kdecl ksys_msg_readv(thread_t *act, struct kcall_args_msg_readv *kap)
     ITF_CLR(thp, RTMUX_ITF_MSG_DELIVERY);
     if (thp->internal_flags & RTMUX_ITF_MSG_FORCE_RDY) {
         ITF_CLR(thp, RTMUX_ITF_MSG_FORCE_RDY);
-        thp_status = (unsigned) KSTATUS(thp);
+        thp_status = MSG_FORCE_ERROR(thp);
         do_force_ready = 1;
     }
     kspinlock_unlock(&cop->channel->lock);
@@ -490,7 +490,7 @@ int kdecl ksys_msg_writev(thread_t *act, struct kcall_args_msg_writev *kap)
     ITF_CLR(thp, RTMUX_ITF_MSG_DELIVERY);
     if (thp->internal_flags & RTMUX_ITF_MSG_FORCE_RDY) {
         ITF_CLR(thp, RTMUX_ITF_MSG_FORCE_RDY);
-        thp_status = (unsigned) KSTATUS(thp);
+        thp_status = MSG_FORCE_ERROR(thp);
         do_force_ready = 1;
     }
     kspinlock_unlock(&cop->channel->lock);
@@ -610,7 +610,7 @@ int kdecl ksys_msg_readiov(thread_t *act, struct kcall_args_msg_readiov *kap)
     ITF_CLR(thp, RTMUX_ITF_MSG_DELIVERY);
     if (thp->internal_flags & RTMUX_ITF_MSG_FORCE_RDY) {
         ITF_CLR(thp, RTMUX_ITF_MSG_FORCE_RDY);
-        thp_status = (unsigned) KSTATUS(thp);
+        thp_status = MSG_FORCE_ERROR(thp);
         do_force_ready = 1;
     }
     kspinlock_unlock(&cop->channel->lock);

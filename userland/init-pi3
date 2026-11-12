@@ -1,0 +1,21 @@
+#!/bin/sh
+# Standalone Pi 3 boot: CPIO root, native RTMux services and PL011 /dev/text.
+PATH=/bin:/sbin
+export PATH
+/sbin/logger
+/sbin/virtio-mmio || exit 1
+/sbin/virtio-mmio --register-boot || exit 1
+/bin/pipe &
+waitfor /dev/pipe 5
+/bin/ramblk /boot/pi3-root.romfs /dev/ram0 /dev/ram1 || exit 1
+/bin/romfs /dev/ram1 /usr || exit 1
+# Select real RAM block devices for the architecture-independent block tests.
+# The default RISC-V fixture remains its NVMe whole disk and partition.
+RTMUX_TEST_BLOCK_WHOLE=/dev/ram0
+RTMUX_TEST_BLOCK_PART=/dev/ram1
+export RTMUX_TEST_BLOCK_WHOLE RTMUX_TEST_BLOCK_PART
+echo "RTMux Pi 3: native services ready"
+# Keep init as the parent so a logged-out shell can be restarted.
+while true; do
+    /bin/sh -i
+done

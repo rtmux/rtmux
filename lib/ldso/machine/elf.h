@@ -83,13 +83,17 @@ typedef Elf64_Half Elf_Versym;
 /* Size and sign macros */
 #define ELF_TARG_CLASS ELFCLASS64
 #define ELF_TARG_DATA ELFDATA2LSB
-#define ELF_TARG_MACH EM_RISCV
+#define ELF_TARG_MACH ELF_ARCH
 #define ELF_TARG_VER 1
 
 #define __ELF_WORD_SIZE 64
 
 /* Machine type checks */
+#ifdef __aarch64__
+#define ELF_ARCH EM_AARCH64
+#else
 #define ELF_ARCH EM_RISCV
+#endif
 #define ELF_MACHINE_OK(x) ((x) == ELF_ARCH)
 
 /* Dynamic load address */
@@ -226,3 +230,14 @@ typedef struct {
 #define HWCAP_ISA_C HWCAP_ISA_BIT('c')
 
 #endif /* _MACHINE_ELF_H */
+
+#define R_AARCH64_NONE 0
+#define R_AARCH64_ABS64 257
+#define R_AARCH64_COPY 1024
+#define R_AARCH64_GLOB_DAT 1025
+#define R_AARCH64_JUMP_SLOT 1026
+#define R_AARCH64_RELATIVE 1027
+#define R_AARCH64_TLS_DTPMOD64 1028
+#define R_AARCH64_TLS_DTPREL64 1029
+#define R_AARCH64_TLS_TPREL64 1030
+#define R_AARCH64_IRELATIVE 1032

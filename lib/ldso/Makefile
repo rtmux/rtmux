@@ -104,7 +104,7 @@ LIBC_CPPFLAGS = -Wall -nostdinc \
     -include $(LIBCDIR)/rtmux-libc-local.h \
     -DLDSO_MINIMAL_CONNECT
 LIBC_CFLAGS = -std=gnu17 -g -fpic -DPIC -ffreestanding \
-    -march=rv64g -mabi=lp64d -mcmodel=medany -mno-relax -mno-strict-align \
+    $(ARCH_FLAGS) \
     -ffunction-sections -fdata-sections
 
 $(OBJDIR)/lc_%.o: $(LIBCDIR)/string/%.c | $(OBJDIR)

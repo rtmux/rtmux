@@ -60,6 +60,15 @@ endif
 
 all: $(AUTOCONF_H) $(VER_FILE) startup initramfs
 
+# Experimental AArch64 platform bootstrap; intentionally not part of `all`.
+# Its private include path does not switch the RISC-V include/arch symlink.
+.PHONY: pi3-bringup check-pi3-bringup
+pi3-bringup:
+	$(Q)$(MAKE) -f mk/pi3-bringup.mk all
+
+check-pi3-bringup:
+	$(Q)$(MAKE) -f mk/pi3-bringup.mk check
+
 # Verify QEMU is available. OpenSBI ships with QEMU 11+ (and macOS
 # Homebrew packages it that way), so we only check for the QEMU binary
 # itself; scripts/emu.sh auto-detects opensbi (default = bundled, Debian path
@@ -155,7 +164,26 @@ endif
 # roottask embeds the bootstrap capability manifest for boot-image payloads.
 # Build those payloads first so the linked manifest matches the archive created
 # by the same `make initramfs` run.
-servers/roottask: userland userland-tests servers/logger servers/pci servers/virtio-mmio $(INITRAMFS_LKL_DEP)
+ifeq ($(ARCH),aarch64)
+$(call RTMUX_RECURSE_ALIAS,pi3-runtime-tests,tests/arch/aarch64/runtime,libc)
+BOOT_TESTS = userland-tests pi3-runtime-tests
+startup: initramfs
+PI3_ROMFS = $(OUT)/pi3-root.romfs
+$(PI3_ROMFS): $(OUT)/tools/host/mkromfs userland-tests $(wildcard userland/pi3-root/usr/conf/* userland/pi3-root/usr/bin/*)
+	$(msg) ROMFS $@
+	$(Q)rm -rf $(OUT)/pi3-romfs-root
+	$(Q)mkdir -p $(OUT)/pi3-romfs-root/bin
+	$(Q)cp -R userland/pi3-root/usr/. $(OUT)/pi3-romfs-root/
+	$(Q)chmod 600 $(OUT)/pi3-romfs-root/conf/shadow
+	$(Q)cp $(OUT)/tests/userland/syscall_testing $(OUT)/pi3-romfs-root/bin/
+	$(Q)$(STRIP) --strip-unneeded $(OUT)/pi3-romfs-root/bin/syscall_testing
+	$(Q)$(MKROMFS) -s 2 $@ $(OUT)/pi3-romfs-root
+$(INITRAMFS_CPIO): $(PI3_ROMFS)
+else
+BOOT_TESTS = userland-tests
+endif
+
+servers/roottask: userland $(BOOT_TESTS) servers/logger servers/pci servers/virtio-mmio $(INITRAMFS_LKL_DEP)
 
 servers: $(SERVER_DIRS)
 lkl-servers: $(LKL_SERVER_DIRS)
@@ -193,7 +221,7 @@ initramfs: $(INITRAMFS_CPIO)
 # binaries don't haunt the next archive, and writes the CPIO via a
 # tempfile so an interrupted run never leaves a half-written archive
 # at the canonical path.
-$(INITRAMFS_CPIO): servers/roottask libc ldso userland userland-tests servers $(INITRAMFS_LKL_DEP) scripts/validate-plt-relocs.py
+$(INITRAMFS_CPIO): servers/roottask libc ldso userland $(BOOT_TESTS) servers $(INITRAMFS_LKL_DEP) scripts/validate-plt-relocs.py
 	$(msg) MKDIR $(INITRAMFS_DIR)/
 	$(Q)rm -rf $(INITRAMFS_DIR)
 	$(Q)mkdir -p $(INITRAMFS_DIR)/boot $(INITRAMFS_DIR)/lib $(INITRAMFS_DIR)/sbin
@@ -216,6 +244,10 @@ ifeq ($(CONFIG_LKL_SERVERS),y)
 endif
 	$(Q)$(MAKE) -C userland install
 	$(Q)$(MAKE) -C tests/userland install
+ifeq ($(ARCH),aarch64)
+	$(Q)$(MAKE) -C tests/arch/aarch64/runtime install
+	$(Q)cp $(PI3_ROMFS) $(INITRAMFS_DIR)/boot/pi3-root.romfs
+endif
 	$(msg) PLTREL $(INITRAMFS_DIR)
 	$(Q)$(PYTHON) scripts/validate-plt-relocs.py --readelf "$(READELF)" \
 	    $(INITRAMFS_DIR)
@@ -465,7 +497,7 @@ check-porting-contract: libc
 
 check-kernel-nofp:
 	$(msg) CHECK "kernel executes no FP instructions"
-	$(Q)OBJDUMP="$(OBJDUMP)" scripts/check-kernel-nofp.sh
+	$(Q)OBJDUMP="$(OBJDUMP)" KERNEL="$(OUT)/arch/$(ARCH)/rtmux-kernel" scripts/check-kernel-nofp.sh
 
 check-lkl-scripts:
 	$(msg) CHECK LKL source fetch and patch scripts
@@ -921,3 +953,22 @@ check-indent: check-style-deps
 	    else \
 	        echo "  PASS    all style checks clean"; \
 	    fi
+
+# Native RTMux kernel + roottask + dynamically linked userland on QEMU Pi 3B.
+.PHONY: pi3 qemu-pi3 check-pi3 check-pi3-coverage check-pi3-profiles
+pi3:
+ifeq ($(ARCH),aarch64)
+	$(Q)$(MAKE) all
+	$(Q)cp .config $(OUT)/build.config
+else
+	$(error Run make defconfig DEFCONFIG=configs/pi3_defconfig first)
+endif
+qemu-pi3: pi3
+	$(Q)python3 scripts/run-pi3.py --out "$(OUT)"
+check-pi3: pi3
+	$(Q)python3 scripts/run-pi3.py --check --out "$(OUT)"
+check-pi3-coverage: pi3
+	$(Q)python3 tests/arch/aarch64/test-coverage-runner.py
+	$(Q)python3 scripts/check-pi3-coverage.py --out "$(OUT)" $(ARGS)
+check-pi3-profiles:
+	$(Q)python3 scripts/check-pi3-profiles.py --out "$(OUT)/pi3-profiles" $(ARGS)

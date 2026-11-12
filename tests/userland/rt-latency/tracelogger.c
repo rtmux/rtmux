@@ -190,7 +190,8 @@ int main(int argc, char **argv)
     }
 
     /* 3. Enable the trace classes and start recording. */
-    if ((kcall_only ? trace_add_class(RTMUX_TRACE_KCALLEXIT)
+    if (trace_cmd(RTMUX_TRACE_DELALLCLASSES) == -1 ||
+        (kcall_only ? trace_add_class(RTMUX_TRACE_KCALLEXIT)
                     : trace_cmd(RTMUX_TRACE_ADDALLCLASSES)) == -1 ||
         trace_cmd(RTMUX_TRACE_START) == -1) {
         printf("tracelogger: FAIL start tracing: %s\n", strerror(errno));

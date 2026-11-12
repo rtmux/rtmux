@@ -18,7 +18,7 @@ LIBC_TLS(void)
 {
     void *__tls;
 
-    __asm__("mv %0, tp" : "=r"(__tls));
+    __tls = cpu_get_tls();
     return (struct _thread_local_storage *) __tls;
 }
 

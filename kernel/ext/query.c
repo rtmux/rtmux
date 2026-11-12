@@ -279,7 +279,7 @@ void kext_soul_stats(void *data)
             num_processors < kap->timer_n ? num_processors : kap->timer_n;
 
         for (unsigned i = 0; i < n; i++)
-            intr[i] = __atomic_load_n(&stimer_intr_count[i], __ATOMIC_RELAXED);
+            intr[i] = atomic_load_explicit(&stimer_intr_count[i], memory_order_relaxed);
         if (xfer_memcpy(kap->timer_intr, intr, n * sizeof intr[0]) != 0)
             ret = EFAULT;
     }

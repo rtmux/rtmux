@@ -408,6 +408,7 @@ void rdecl smp_flush_tlb(void)
  */
 void cpu_idle(unsigned cpu)
 {
+    interrupt_disable();
     /* tp is invariant per hart (set once at bootstrap, never reassigned in
      * S-mode), so thread migration cannot leave it stale. ksys_exit's
      * idle-fallback path stamps tp = &pcpu_array[cpu] before tail-calling here.
@@ -1213,3 +1214,15 @@ void rdecl cpu_free_perfregs(thread_t *thp)
 void rdecl cpu_debug_init_perfregs(void) {}
 
 extern unsigned hart_ids[];
+
+void cpu_console_write(const char *s, unsigned long n)
+{
+    sbi_dbcn_write(s, n);
+}
+
+void cpu_board_interrupt_init(void)
+{
+    extern void plic_init(void), plic_inithart(void);
+    plic_init();
+    plic_inithart();
+}

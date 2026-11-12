@@ -10,7 +10,7 @@
 
 static inline void thread_join_relax(void)
 {
-    __asm__ volatile(".word 0x0100000f" ::: "memory");
+    cpu_relax();
 }
 
 static void thread_join_wait_ready(thread_t *thp)

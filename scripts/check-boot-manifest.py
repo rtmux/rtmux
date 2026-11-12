@@ -10,6 +10,7 @@ the shipped binaries into boot-manifest.hashes and loaded by roottask at boot
     every manifest exec_path present in the image;
   * the load/verify path and the build step are wired.
 """
+import argparse
 import re
 from pathlib import Path
 
@@ -63,6 +64,11 @@ def require(errors, path, text, token):
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--image-root', type=Path, action='append', default=[],
+                        help='Verify an explicit built image instead of the default output trees')
+    args = parser.parse_args()
+    images = {str(p): p for p in args.image_root} if args.image_root else IMAGES
     manifest_text = MANIFEST.read_text()
     errors = []
 
@@ -76,9 +82,11 @@ def main() -> int:
             errors.append(f"bootstrap-manifest.c: stale hash artifact {stale}")
 
     # Verify each built image's generated hash file against the real binaries.
-    for label, root in IMAGES.items():
+    for label, root in images.items():
         hashfile = root / "boot-manifest.hashes"
         if not root.exists():
+            if args.image_root:
+                errors.append(f"{label}: image root does not exist")
             continue
         if not hashfile.exists():
             errors.append(f"{label}: missing boot-manifest.hashes")

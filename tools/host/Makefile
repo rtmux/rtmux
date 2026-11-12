@@ -36,15 +36,23 @@ PROGS = $(BUILD_BASE)/mkasmoff $(BUILD_BASE)/mkromfs $(BUILD_BASE)/treeromfs \
         $(BUILD_BASE)/ldso-hash-test $(BUILD_BASE)/ldso-page-test \
         $(BUILD_BASE)/ldso-parse-test $(BUILD_BASE)/ldso-path-test \
         $(BUILD_BASE)/cpio-parser-test $(BUILD_BASE)/spawn-fd-policy-test \
-        $(BUILD_BASE)/serial-reply-test
+        $(BUILD_BASE)/serial-reply-test $(BUILD_BASE)/ioserv-combine-test
 
 all: $(PROGS)
+
+$(BUILD_BASE)/ioserv-combine-test: $(TEST_DIR)/test-ioserv-combine.c \
+                                  ../../lib/libc/ioserv/connect-handler.c
+	@mkdir -p $(@D)
+	$(msg) HOSTCC $(notdir $@)
+	$(Q)$(HOST_CC) -DRTMUX_HOST_TEST -I../../include -I../../internal/include \
+	    -I../../lib/libc/internal -I../../lib/common $(HOST_CFLAGS) \
+	    -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -o $@ $<
 
 $(BUILD_BASE)/spawn-fd-policy-test: $(TEST_DIR)/test-spawn-fd-policy.c \
                                     ../../servers/roottask/include/spawn-fd-policy.h
 	@mkdir -p $(@D)
 	$(msg) HOSTCC $(notdir $@)
-	$(Q)$(HOST_CC) $(HOST_CPPFLAGS) -I../../internal/include -I../../include $(HOST_CFLAGS) -o $@ \
+	$(Q)$(HOST_CC) -DRTMUX_HOST_TEST $(HOST_CPPFLAGS) -I../../internal/include -I../../include $(HOST_CFLAGS) -o $@ \
 	    $(TEST_DIR)/test-spawn-fd-policy.c
 
 # The shared serial service is compiled against the tree's own headers with the
@@ -53,7 +61,7 @@ SERIAL_DIR = ../../userland/dev-serial-common
 $(BUILD_BASE)/serial-reply-test: $(TEST_DIR)/test-serial-reply.c $(SERIAL_DIR)/serial-service.h
 	@mkdir -p $(@D)
 	$(msg) HOSTCC $(notdir $@)
-	$(Q)$(HOST_CC) -I$(SERIAL_DIR) -I../../include -I../../internal/include $(HOST_CFLAGS) \
+	$(Q)$(HOST_CC) -DRTMUX_HOST_TEST -I$(SERIAL_DIR) -I../../include -I../../internal/include $(HOST_CFLAGS) \
 	    -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -o $@ $(TEST_DIR)/test-serial-reply.c
 
 cap-table-test: $(BUILD_BASE)/cap-table-test
@@ -145,7 +153,7 @@ host-tests: $(BUILD_BASE)/path-normalize-test $(BUILD_BASE)/cap-table-test \
             $(BUILD_BASE)/ldso-hash-test $(BUILD_BASE)/ldso-page-test \
             $(BUILD_BASE)/ldso-parse-test $(BUILD_BASE)/ldso-path-test \
             $(BUILD_BASE)/cpio-parser-test $(BUILD_BASE)/spawn-fd-policy-test \
-            $(BUILD_BASE)/serial-reply-test
+            $(BUILD_BASE)/serial-reply-test $(BUILD_BASE)/ioserv-combine-test
 	$(Q)$<
 	$(Q)$(BUILD_BASE)/cap-table-test
 	$(Q)$(BUILD_BASE)/bootstrap-manifest-test
@@ -157,6 +165,11 @@ host-tests: $(BUILD_BASE)/path-normalize-test $(BUILD_BASE)/cap-table-test \
 	$(Q)$(BUILD_BASE)/cpio-parser-test
 	$(Q)$(BUILD_BASE)/spawn-fd-policy-test
 	$(Q)$(BUILD_BASE)/serial-reply-test
+	$(Q)$(BUILD_BASE)/ioserv-combine-test
+	$(Q)HOST_CC="$(HOST_CC)" $(PYTHON) $(TEST_DIR)/test-trace-irq-mask.py
+	$(Q)HOST_CC="$(HOST_CC)" $(PYTHON) $(TEST_DIR)/test-ipc-deferred-error.py
+	$(Q)HOST_CC="$(HOST_CC)" $(PYTHON) $(TEST_DIR)/test-ipc-receive-owner.py
+	$(Q)HOST_CC="$(HOST_CC)" $(PYTHON) $(TEST_DIR)/test-ipc-dispatch-owner.py
 	$(Q)$(PYTHON) $(TEST_DIR)/test-capability-namespace-doc.py
 	$(Q)$(PYTHON) $(TEST_DIR)/test-management-ipc-lock.py
 	$(Q)HOST_CC="$(HOST_CC)" $(PYTHON) -I $(TEST_DIR)/test-lkl-iommu-contract.py

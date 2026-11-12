@@ -237,8 +237,7 @@ static inline void kspinlock_unlock(kspinlock_t *l)
      * ready() would then take the same outer lock and self-deadlock.
      */
     if (--pcpu_array[get_cpunum()].pc_kspin_depth > 0) {
-        __asm__ __volatile__("amoswap.w.rl x0, x0, (%0)" ::"r"(&l->spin.value)
-                             : "memory");
+        __atomic_store_n(&l->spin.value, 0, __ATOMIC_RELEASE);
         return;
     }
 #if defined(CONFIG_INSTRUMENTATION)
@@ -284,8 +283,7 @@ static inline void kspinlock_unlock_irqrestore(kspinlock_t *l,
      * disabled.
      */
     if (--pcpu_array[get_cpunum()].pc_kspin_depth > 0) {
-        __asm__ __volatile__("amoswap.w.rl x0, x0, (%0)" ::"r"(&l->spin.value)
-                             : "memory");
+        __atomic_store_n(&l->spin.value, 0, __ATOMIC_RELEASE);
         return;
     }
 #if defined(CONFIG_INSTRUMENTATION)
@@ -301,8 +299,7 @@ static inline void kspinlock_unlock_irqrestore(kspinlock_t *l,
      * SIE (unlike kspinlock_unlock, which calls interrupt_unlock →
      * interrupt_enable), then restore only the caller's prior SIE state.
      */
-    __asm__ __volatile__("amoswap.w.rl x0, x0, (%0)" ::"r"(&l->spin.value)
-                         : "memory");
+    __atomic_store_n(&l->spin.value, 0, __ATOMIC_RELEASE);
     if (sie)
         interrupt_enable();
 #else

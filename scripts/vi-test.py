@@ -26,10 +26,17 @@ vi editing + failure handling:
 
 Build first (kernel + initramfs), then run:
     make -j && python3 scripts/vi-test.py     # or: make tty-smoke
+For a native Pi3 image built with configs/pi3_defconfig:
+    RTMUX_TTY_PI3_OUT=build/pi3 python3 scripts/vi-test.py
+The same backend also runs scripts/tty-jobctl-test.py. RTMUX_TTY_LOG saves the
+serial transcript on both success and failure. Leave instrumentation off for
+these screen-rendering assertions so diagnostic output does not overwrite vi.
 
 Exit status is nonzero if any check fails.
 """
 import os
+import importlib.util
+from pathlib import Path
 import re
 import subprocess
 import sys
@@ -54,8 +61,15 @@ STATUS_MSG = b"toolbox vi"    # vi's startup status line — marks the first fra
 
 class Qemu:
     def __init__(self):
+        cmd = ["bash", EMU]
+        if os.environ.get("RTMUX_TTY_PI3_OUT"):
+            spec = importlib.util.spec_from_file_location("pi3_runner", Path(TOP) / "scripts/run-pi3.py")
+            runner = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(runner)
+            cmd = runner.command(Path(os.environ["RTMUX_TTY_PI3_OUT"]).resolve(),
+                                 os.environ.get("QEMU_AARCH64", "qemu-system-aarch64"))
         self.proc = subprocess.Popen(
-            ["bash", EMU],
+            cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -63,7 +77,8 @@ class Qemu:
         self.buf = bytearray()
         self.pos = 0
         self.lock = threading.Lock()
-        threading.Thread(target=self._reader, daemon=True).start()
+        self.reader = threading.Thread(target=self._reader, daemon=True)
+        self.reader.start()
 
     def _reader(self):
         while True:
@@ -107,6 +122,12 @@ class Qemu:
             self.proc.wait(timeout=5)
         except Exception:
             self.proc.kill()
+            self.proc.wait(timeout=5)
+        self.reader.join(timeout=2)
+        if os.environ.get("RTMUX_TTY_LOG"):
+            log = Path(os.environ["RTMUX_TTY_LOG"])
+            log.parent.mkdir(parents=True, exist_ok=True)
+            log.write_bytes(self.slice(0))
 
 
 class Checks:
@@ -139,6 +160,14 @@ def malformed_cups(data):
 
 def login(q, c):
     print("== boot + login ==")
+    if os.environ.get("RTMUX_TTY_PI3_OUT"):
+        if not c.ok(q.expect("RTMux Pi 3: native services ready", 90) and
+                    q.expect(b"# ", 20), "native Pi3 shell ready"):
+            return False
+        # The standalone image boots a shell. Enter the same getty/name-reader
+        # used by RISC-V, including its empty-name retry, before shared login
+        # and terminal scenarios. Direct login treats an empty name differently.
+        q.send("/sbin/getty\n")
     if not c.ok(q.expect("login:", 90), "reached login prompt"):
         return False
     q.send("\n")
@@ -413,7 +442,8 @@ def scenario_insert(q, c):
 
 
 def main():
-    if not os.path.exists(os.path.join(TOP, "build", "initramfs.cpio")):
+    out = os.environ.get("RTMUX_TTY_PI3_OUT", os.path.join(TOP, "build"))
+    if not os.path.exists(os.path.join(out, "initramfs.cpio")):
         print("initramfs.cpio missing — run `make -j` first", file=sys.stderr)
         return 2
     q = Qemu()

@@ -18,8 +18,8 @@ rcu_t connobj_rcu = RCU_INITIALIZER("connobj_rcu");
 
 static inline void rcu_cpu_relax(void)
 {
-    /* RISC-V Zihintpause PAUSE encoding, kept raw for older assemblers. */
-    __asm__ volatile(".word 0x0100000f" ::: "memory");
+    /* Architecture-specific spin-wait hint. */
+    cpu_relax();
 }
 
 static inline int rcu_cpu_alive(unsigned cpu)

@@ -118,6 +118,16 @@ def main():
     if missing:
         fail("libc stubs do not cover active slots: " + ", ".join(missing))
 
+    arm_covers = set(re.findall(r"__KSYS_[A-Z0-9_]+", read("lib/libc/aarch64/syscalls.c")))
+    if libc_covers != arm_covers:
+        fail("AArch64/RISC-V libc syscall coverage differs: " +
+             ", ".join(sorted(libc_covers ^ arm_covers)))
+    arm = read("arch/aarch64/trap-handler.c")
+    if not re.search(r"i < 6; i\+\+\).*?kap\[i\] = act->kcall_c_args\[i\] = r->gpr\[i\]", arm, re.S):
+        fail("AArch64 must snapshot all six x0-x5 argument words")
+    if "unsigned num = (unsigned) r->gpr[8]" not in arm:
+        fail("AArch64 syscall number must be x8")
+
     counts, pointers = parse_kcall_arg_slots()
     oversized = [f"{name}={count}" for name, count in counts.items() if count > 6]
     if oversized:

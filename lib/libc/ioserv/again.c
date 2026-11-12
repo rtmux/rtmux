@@ -6,6 +6,7 @@
  */
 
 #include <unistd.h>
+#include <pthread.h>
 #include <sys/dispatch.h>
 #include "api.h"
 #include "internal.h"
@@ -25,7 +26,11 @@ int ioserv_backend_msg_again(ioserv_context_t *ctp, int rcvid)
 
     (void) msg_current(rcvid);
 
+    /* A connect callback may replay another client's deferred request. Keep
+     * its link reference in TLS until the original callback returns. */
+    void *outer_link = pthread_getspecific(_ioserv_thread_key);
     _ioserv_handler(ctp);
+    (void) pthread_setspecific(_ioserv_thread_key, outer_link);
 
     return 0;
 }

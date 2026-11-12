@@ -251,8 +251,13 @@ void specialret_attr specialret(thread_t *thp)
         case RTMUX_FLG_THR_KILLSELF:
             atomic_clr((volatile unsigned *) &thp->flags,
                        RTMUX_FLG_THR_KILLSELF);
-            atomic_or((volatile unsigned *) &thp->flags,
-                      RTMUX_FLG_THR_DETACHED);
+            /* Stack reclamation resumes an ordinary pthread_exit through
+             * KILLSELF too. Preserve joinability until pthread_join consumes
+             * its status; forced termination already carries DETACHED. */
+            if (!(thp->internal_flags & RTMUX_ITF_EXIT_STACK))
+                atomic_or((volatile unsigned *) &thp->flags,
+                          RTMUX_FLG_THR_DETACHED);
+            ITF_CLR(thp, RTMUX_ITF_EXIT_STACK);
             thread_destroy(thp);
             break;
 

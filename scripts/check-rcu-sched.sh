@@ -33,6 +33,21 @@ need_order arch/riscv/exit.c \
     'set_active_thread(cpu, NULL);' \
     'dead-thread exit loop must publish a quiescent state before clearing active thread'
 
+need_order arch/aarch64/cpu-misc.c \
+    'rcu_sched_quiescent();' \
+    '__asm__ volatile("wfi"' \
+    'AArch64 idle must publish a quiescent state before WFI'
+
+need_order arch/aarch64/exit.c \
+    'if ((thp->reg.pstate & 15) == 0)' \
+    'rcu_sched_quiescent();' \
+    'AArch64 EL0 return must publish a quiescent state'
+
+need_order arch/aarch64/exit.c \
+    'rcu_sched_quiescent();' \
+    'set_active_thread(cpu, NULL);' \
+    'AArch64 dead-thread exit must publish QS before clearing active thread'
+
 need_order kernel/sched/dispatch.c \
     'if (old != new)' \
     'rcu_sched_quiescent();' \
@@ -238,11 +253,13 @@ if ! awk '
     exit 1
 fi
 
-if grep -Eq 'kernel/(sync/)?smr\.c|Use SMR|SMR \(RCU-equivalent\)' \
-    README.md AGENTS.md; then
-    echo "RCU-sched: current-facing docs must not point to retired SMR" >&2
-    exit 1
-fi
+for doc in README.md AGENTS.md; do
+    test -f "$doc" || continue
+    if grep -Eq 'kernel/(sync/)?smr\.c|Use SMR|SMR \(RCU-equivalent\)' "$doc"; then
+        echo "RCU-sched: current-facing docs must not point to retired SMR" >&2
+        exit 1
+    fi
+done
 
 if grep -q 'endpoint_cap_to_context' kernel/ipc/connect.c; then
     echo "RCU-sched: endpoint cap users must keep generated caps pinned through validation" >&2
@@ -2437,21 +2454,24 @@ if ! awk '
     exit 1
 fi
 
-if ! awk '
-    /static inline void rcu_cpu_relax\(void\)/ { in_relax = 1 }
-    in_relax && /\.word 0x0100000f/ { saw_pause = NR }
-    in_relax && /\.insn r 0x0F, 0, 0, x0, x0, x0/ { saw_bad = 1 }
-    in_relax && /^}/ { in_relax = 0 }
-    END { exit !(saw_pause && !saw_bad) }
-' kernel/sync/rcu.c; then
-    echo "RCU-sched: rcu_cpu_relax must use the correct raw RISC-V pause encoding" >&2
+# Shared code delegates ordering and spin hints to the architecture layer.
+if ! grep -Fq 'cpu_relax();' kernel/sync/rcu.c ||
+   ! grep -Fq '#define cpu_relax() __asm__ volatile(".word 0x0100000f" ::: "memory")' arch/riscv/include/cpu-inline.h ||
+   ! grep -Fq '#define cpu_relax() __asm__ volatile("yield" ::: "memory")' arch/aarch64/include/cpu-inline.h; then
+    echo "RCU-sched: shared wait must use the RISC-V pause / AArch64 yield helper" >&2
+    exit 1
+fi
+
+if ! grep -Fq '#define __cpu_store_barrier() __asm__ volatile("fence rw, w" ::: "memory")' arch/riscv/include/cpu-inline.h ||
+   ! grep -Fq '#define __cpu_store_barrier() __asm__ volatile("dmb ish" ::: "memory")' arch/aarch64/include/cpu-inline.h; then
+    echo "RCU-sched: architecture publication barriers must order prior loads/stores before publication" >&2
     exit 1
 fi
 
 if ! awk '
     /#define rcu_assign_pointer\(ptr, val\)/ { in_assign = 1 }
-    in_assign && /fence rw, w/ { saw_release = NR }
-    in_assign && /(cpu_smp_mb\(\)|__cpu_membarrier|fence rw, rw)/ { saw_full = 1 }
+    in_assign && /__cpu_store_barrier\(\);/ { saw_release = NR }
+    in_assign && /(cpu_smp_mb\(\)|__cpu_membarrier)/ { saw_full = 1 }
     in_assign && /\(ptr\) = \(val\);/ { saw_store = NR }
     in_assign && /} while \(0\)/ { in_assign = 0 }
     END { exit !(saw_release && saw_store && saw_release < saw_store && !saw_full) }

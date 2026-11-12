@@ -25,8 +25,8 @@ extern void kernel_thread_exit_fallback(void *arg);
 
 static inline void thread_cpu_relax(void)
 {
-    /* RISC-V Zihintpause PAUSE encoding, kept raw for older assemblers. */
-    __asm__ volatile(".word 0x0100000f" ::: "memory");
+    /* Architecture-specific spin-wait hint. */
+    cpu_relax();
 }
 
 static void thread_recycle_reset(thread_t *thp)
@@ -38,7 +38,7 @@ static void thread_recycle_reset(thread_t *thp)
     thp->internal_flags = 0;
     thp->timestamp_last_block = 0;
     thp->as_prp = NULL;
-    __atomic_store_n(&thp->async_flags, 0, __ATOMIC_RELAXED);
+    atomic_store_explicit(&thp->async_flags, 0, memory_order_relaxed);
     thp->dpp = NULL;
     thp->timeout_flags = 0;
     thp->flags = 0;
@@ -1352,6 +1352,16 @@ void rdecl thread_destroy(thread_t *thp)
      */
     int self_reap = (thp == get_active_thread(get_cpunum()));
 
+    /* A terminating process cannot wait for a live server's UNBLOCK reply.
+     * In particular, roottask deliberately never replies to _PROC_EXIT. An
+     * IPC claim can make exit's second teardown pass defer, leaving the last
+     * thread REPLY-blocked with KILLSELF and UNBLOCK_QUEUED forever. Bypass
+     * the handshake, but retain force_ready's channel lock / transfer-claim
+     * coordination before unlinking and dispatching the self-reaper. */
+    unsigned force_flags = _FORCE_KILL_SELF;
+    if (prp->flags & (RTMUX_FLG_PROC_TERMING | RTMUX_FLG_PROC_DESTROYALL))
+        force_flags |= _FORCE_NO_UNBLOCK;
+
     /* Destroy-claim — see banner on thread_t::destroy_claim in objects.h.
      * Atomically claim destruction of this thread.
      *
@@ -1453,7 +1463,7 @@ void rdecl thread_destroy(thread_t *thp)
                  * that is fine: the pager / xfer completion readies it, and the
                  * KILLSELF flag makes it self-reap then.
                  */
-                force_ready(thp, _FORCE_KILL_SELF);
+                force_ready(thp, force_flags);
             }
             __atomic_store_n(&thp->destroy_claim, 0, __ATOMIC_RELEASE);
             return;
@@ -1463,7 +1473,7 @@ void rdecl thread_destroy(thread_t *thp)
     _TRACE_TH_EMIT_DESTROY(thp);
     if (thread_state_load_acquire(thp) != STATE_DEAD) {
         /* Remove thread from any queues. */
-        if (!force_ready(thp, _FORCE_KILL_SELF)) {
+        if (!force_ready(thp, force_flags)) {
             /* Couldn't kill this thread right now, do it later */
             __atomic_store_n(&thp->destroy_claim, 0, __ATOMIC_RELEASE);
             return;
@@ -1551,6 +1561,8 @@ void rdecl thread_destroy(thread_t *thp)
                      * time
                      */
                     thp->state = STATE_STACK;
+                    if (!(thp->flags & RTMUX_FLG_THR_DETACHED))
+                        ITF_SET(thp, RTMUX_ITF_EXIT_STACK);
 
                     _TRACE_TH_EMIT_STATE(thp, STACK);
                     atomic_or(&thp->flags,

@@ -114,7 +114,7 @@ void test_fail(const char *name, const char *detail)
 {
     tests_run++;
     tests_failed++;
-    printf("  FAIL  %s: %s\n", name, detail);
+    printf("  FAIL  %s: %s (last errno=%d)\n", name, detail, errno);
 }
 
 void check(int cond, const char *name, const char *detail)
@@ -826,6 +826,12 @@ int main(int argc, char *argv[])
         return nvme_raw_child();
     if (argc == 2 && !strcmp(argv[1], "--sys-log-child"))
         return sys_log_child();
+    if (argc == 2 && !strcmp(argv[1], "--cputime-short-bursts")) {
+        test_cputime_short_bursts();
+        printf("\n=== Results: %d tests, %d passed, %d failed ===\n",
+               tests_run, tests_passed, tests_failed);
+        return tests_failed || !tests_passed ? EXIT_FAILURE : EXIT_SUCCESS;
+    }
     if (argc == 2 && !strcmp(argv[1], "--sys-log-wrap")) {
         printf("=== RTMux /sys/log Wrap Test ===\n\n[sys_log_wrap]\n");
         test_sys_log_wrap();
@@ -860,6 +866,12 @@ int main(int argc, char *argv[])
     }
     if (argc == 3 && !strcmp(argv[1], "--serial-unblock-child"))
         return serial_unblock_child(!strcmp(argv[2], "announce"));
+    if (argc == 3 && !strcmp(argv[1], "--serial-unblock-driver")) {
+        test_serial_unblock_driver(argv[2]);
+        printf("\n=== Results: %d tests, %d passed, %d failed ===\n",
+               tests_run, tests_passed, tests_failed);
+        return tests_failed || !tests_passed ? EXIT_FAILURE : EXIT_SUCCESS;
+    }
     if (argc == 2 && !strcmp(argv[1], "--serial-unblock")) {
         printf("=== RTMux Serial Unblock Test ===\n\n");
         test_serial_unblock();
@@ -1204,6 +1216,27 @@ int main(int argc, char *argv[])
         return run_laps(atoi(argv[2]));
     }
     printf("=== RTMux Syscall Conformance Test Suite ===\n\n");
+
+    if (argc == 2 && !strcmp(argv[1], "--namespace-combined-race")) {
+        test_namespace_combined_race();
+        printf("\n=== Results: %d tests, %d passed, %d failed ===\n",
+               tests_run, tests_passed, tests_failed);
+        return tests_failed || !tests_passed ? EXIT_FAILURE : EXIT_SUCCESS;
+    }
+
+    if (argc == 3 && !strcmp(argv[1], "--suite")) {
+        for (i = 0; i < sizeof test_suites / sizeof test_suites[0]; i++) {
+            if (strcmp(argv[2], test_suites[i].name))
+                continue;
+            printf("[%s]\n", test_suites[i].name);
+            test_suites[i].run();
+            printf("\n=== Results: %d tests, %d passed, %d failed ===\n",
+                   tests_run, tests_passed, tests_failed);
+            return tests_failed || !tests_passed ? EXIT_FAILURE : EXIT_SUCCESS;
+        }
+        fprintf(stderr, "Unknown test suite: %s\n", argv[2]);
+        return EXIT_FAILURE;
+    }
 
     for (i = 0; i < sizeof test_suites / sizeof test_suites[0]; i++) {
         printf("%s[%s]\n", i == 0 ? "" : "\n", test_suites[i].name);
