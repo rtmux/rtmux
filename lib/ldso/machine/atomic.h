@@ -72,11 +72,8 @@
 #define CACHE_LINE_SIZE 64
 #endif
 
-#define atomic_thread_fence_acq() __asm volatile("fence r, rw" ::: "memory")
-#define atomic_thread_fence_rel() __asm volatile("fence rw, w" ::: "memory")
-#define atomic_thread_fence_acq_rel() \
-    __asm volatile("fence rw, rw" ::: "memory")
-#define atomic_thread_fence_seq_cst() \
-    __asm volatile("fence rw, rw" ::: "memory")
-
+#define atomic_thread_fence_acq() __atomic_thread_fence(__ATOMIC_ACQUIRE)
+#define atomic_thread_fence_rel() __atomic_thread_fence(__ATOMIC_RELEASE)
+#define atomic_thread_fence_acq_rel() __atomic_thread_fence(__ATOMIC_ACQ_REL)
+#define atomic_thread_fence_seq_cst() __atomic_thread_fence(__ATOMIC_SEQ_CST)
 #endif
