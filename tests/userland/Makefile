@@ -12,6 +12,9 @@ SRCS = main.c timers.c sync.c printf-test.c setjmp-test.c signals-test.c \
        notifications.c vfs.c posix-options.c capgate.c trace-negative.c \
        user-ptr-negative.c serial-unblock.c leak.c
 OBJS = $(SRCS:%.c=$(OBJDIR)/%.o)
+ifeq ($(ARCH),aarch64)
+OBJS += $(OBJDIR)/fp-aarch64.o
+endif
 PROG = $(BUILD_BASE)/syscall_testing
 CRYPTTEST = $(BUILD_BASE)/crypttest
 
@@ -51,6 +54,11 @@ $(OBJDIR)/%.o: %.c test.h
 	@mkdir -p $(@D)
 	$(msg) CC $@
 	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
+
+$(OBJDIR)/%.o: %.S
+	@mkdir -p $(@D)
+	$(msg) AS $@
+	$(Q)$(CC) $(ASFLAGS) -c -o $@ $<
 
 $(PROG): $(OBJS) $(CRT0_O) $(LIBC_SO)
 	@mkdir -p $(@D)

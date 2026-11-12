@@ -3036,8 +3036,13 @@ static void test_uname_matches_syspage(void)
           "every utsname field must be a terminated string");
     check(strcmp(u.sysname, "RTMux") == 0, "uname sysname",
           "sysname must be RTMux");
+#if defined(__aarch64__)
+    check(strcmp(u.machine, "aarch64") == 0, "uname machine",
+          "machine must be aarch64");
+#else
     check(strcmp(u.machine, "riscv64") == 0, "uname machine",
           "machine must be riscv64");
+#endif
     check(u.nodename[0] != '\0', "uname nodename",
           "nodename must be non-empty (/etc/hostname or rtmux)");
     check(strncmp(u.release, bi->release, sizeof bi->release) == 0,

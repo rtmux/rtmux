@@ -104,7 +104,11 @@ static inline uint64_t read_time(void)
 {
     uint64_t t;
 
+#if defined(__aarch64__)
+    __asm__ volatile("isb; mrs %0, cntvct_el0" : "=r"(t));
+#else
     __asm__ volatile("rdtime %0" : "=r"(t));
+#endif
     return t;
 }
 
