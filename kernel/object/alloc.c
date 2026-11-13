@@ -394,6 +394,44 @@ void *_scalloc_pgalign(size_t size)
     return (void *) (((uintptr_t) raw + __PAGESIZE - 1) & ~(__PAGESIZE - 1));
 }
 
+/* Free pages handed back by _sfree_page, linked through their first word and
+ * guarded by alloc_slock.
+ */
+static void *page_free_list;
+
+/* Allocate one zeroed, page-aligned page that _sfree_page can take back. A
+ * _scalloc_pgalign block cannot be freed exactly (its alignment slack is lost),
+ * so pages that come and go, such as page tables, are recycled here instead:
+ * the slack is paid once per page ever allocated, not once per allocation.
+ * Return value: the page, or NULL.
+ */
+void *_scalloc_page(void)
+{
+    void *p;
+
+    kspinlock_lock(&alloc_slock);
+    if ((p = page_free_list))
+        page_free_list = *(void **) p;
+    kspinlock_unlock(&alloc_slock);
+    if (!p)
+        return _scalloc_pgalign(__PAGESIZE);
+    memset(p, 0, __PAGESIZE);
+    return p;
+}
+
+/* Return a page from _scalloc_page for reuse. Parameters:
+ *   p : the page (NULL is a no-op)
+ */
+void _sfree_page(void *p)
+{
+    if (!p)
+        return;
+    kspinlock_lock(&alloc_slock);
+    *(void **) p = page_free_list;
+    page_free_list = p;
+    kspinlock_unlock(&alloc_slock);
+}
+
 /* Free a block allocated by malloc/calloc/realloc.
  *
  * The block's size is recovered from the size_t header stored just below the

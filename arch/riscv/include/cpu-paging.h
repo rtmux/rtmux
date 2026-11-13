@@ -25,6 +25,11 @@
 #define PTE_G (1UL << 5) /* global */
 #define PTE_A (1UL << 6) /* accessed */
 #define PTE_D (1UL << 7) /* dirty */
+/* Software bit (RSW, ignored by hardware) on a non-leaf PTE: the table it points
+ * to came from pa_alloc (sv39_walk), not the kernel heap, so cpu_pgdir_free
+ * returns it with pa_free_paddr.
+ */
+#define PTE_SW_PA (1UL << 8)
 
 /* shift a physical address to the right place for a PTE. */
 #define PA2PTE(pa) ((((uint64_t) pa) >> 12) << 10)

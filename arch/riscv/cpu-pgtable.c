@@ -37,7 +37,7 @@
  */
 pagetable_t cpu_pgdir_create(void)
 {
-    pagetable_t pgdir = (pagetable_t) _scalloc_pgalign(PGSIZE);
+    pagetable_t pgdir = (pagetable_t) _scalloc_page();
     if (!pgdir)
         return NULL;
 
@@ -109,7 +109,7 @@ static pte_t *walk(pagetable_t pgdir, uintptr_t va, int alloc)
         } else {
             if (!alloc)
                 return NULL;
-            pgdir = (pagetable_t) _scalloc_pgalign(PGSIZE);
+            pgdir = (pagetable_t) _scalloc_page();
             if (!pgdir)
                 return NULL;
             *pte = PA2PTE(PTR_TO_PHYS(pgdir)) | PTE_V;
@@ -155,6 +155,23 @@ int cpu_map_pages(pagetable_t pgdir,
     return 0;
 }
 
+extern void pa_free_paddr(paddr_t p, paddr_t s, paddr_t resv_size);
+extern void cpu_tlb_flush_complete(void);
+
+/* Free the table a non-leaf PTE points to, with the allocator that made it:
+ * sv39_walk (cpu-pte.c) takes intermediate tables from pa_alloc and marks the
+ * PTE with PTE_SW_PA; walk() above takes them from _scalloc_page. Freeing a pa page
+ * into the kernel heap kept it from pa for good, a few pages per exited process
+ * (and quietly refilled the heap that the pgdir's alignment slack drained).
+ */
+static void pgtable_page_free(pte_t entry)
+{
+    if (entry & PTE_SW_PA)
+        pa_free_paddr((paddr_t) PTE2PA(entry), PGSIZE, 0);
+    else
+        _sfree_page(PHYS_TO_PTR(PTE2PA(entry)));
+}
+
 /* cpu_pgdir_free — free a page table tree (walk and free all levels).
  *
  * Frees the page table pages themselves, NOT the physical pages that were
@@ -174,15 +191,22 @@ void cpu_pgdir_free(pagetable_t pgdir)
     pte_t l2_entry = pgdir[0];
     if ((l2_entry & PTE_V) && !(l2_entry & (PTE_R | PTE_W | PTE_X))) {
         pagetable_t l1 = (pagetable_t) PHYS_TO_PTR(PTE2PA(l2_entry));
+
+        /* A hart may still cache translations walked through these tables.
+         * Flush every hart before they are freed: pa hands a page straight on
+         * to its next user, and a stale walk through it then reads that user's
+         * data as page-table entries.
+         */
+        cpu_tlb_flush_complete();
         for (int j = 0; j < 512; j++) {
             pte_t l1_entry = l1[j];
             if ((l1_entry & PTE_V) && !(l1_entry & (PTE_R | PTE_W | PTE_X))) {
-                _sfree(PHYS_TO_PTR(PTE2PA(l1_entry)), PGSIZE);
+                pgtable_page_free(l1_entry);
             }
         }
-        _sfree(l1, PGSIZE);
+        pgtable_page_free(l2_entry);
     }
-    _sfree(pgdir, PGSIZE);
+    _sfree_page(pgdir);
 }
 
 /* cpu_va2pa — look up a VA in a page table, return PA (or 0 if unmapped). */

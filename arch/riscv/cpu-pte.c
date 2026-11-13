@@ -148,8 +148,10 @@ static pte_t *sv39_walk(pagetable_t pgdir, uintptr_t va, int alloc)
             /* Zero the new page table */
             CPU_ZERO_PAGE(pgdir, __PAGESIZE, 0);
 
-            /* Install the PDE pointing to the new page */
-            *pte = PA2PTE(paddr) | PTE_V;
+            /* Install the PDE pointing to the new page, marked as pa_alloc'd so
+             * cpu_pgdir_free gives it back to pa rather than the kernel heap.
+             */
+            *pte = PA2PTE(paddr) | PTE_V | PTE_SW_PA;
         }
     }
     return &pgdir[PX(0, va)];

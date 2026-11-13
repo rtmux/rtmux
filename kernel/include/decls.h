@@ -206,6 +206,8 @@ void free(void *data);
 void *_smalloc(size_t size);
 void *_scalloc(size_t size);
 void *_scalloc_pgalign(size_t size);
+void *_scalloc_page(void);
+void _sfree_page(void *p);
 void *_srealloc(void *data, size_t old_size, size_t new_size);
 void *_sreallocfunc(void *data,
                     size_t old_size,
