@@ -2268,7 +2268,9 @@ run_one()
     if [ -n "$LAPS" ]; then
         local lap
         for lap in $(seq 1 "$LAPS"); do
-            if ! grep -Eq "^lap=${lap} PASS\r?$" "$log"; then
+            # The serial log ends lines with CR LF, and grep -E does not read
+            # "\r" in a pattern as a carriage return: drop the CRs first.
+            if ! tr -d '\r' <"$log" | grep -Eq "^lap=${lap} PASS\$"; then
                 echo "  FAIL     ${MODE} missing lap line: lap=${lap} PASS"
                 tail -n 160 "$log"
                 return 1

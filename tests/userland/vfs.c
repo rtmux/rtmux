@@ -8182,6 +8182,9 @@ struct spawn_worker {
     pthread_barrier_t *bar;
     int idx;
     int bad_spawn, bad_report, bad_exit;
+    int spawn_err; /* first posix_spawn error, for the failure detail */
+    /* Progress, read by the joining thread to name a stalled worker. */
+    _Atomic int round, phase, done;
     pid_t pids[SPAWN_ROUNDS];
 };
 
@@ -8232,28 +8235,81 @@ static void *spawn_worker_body(void *arg)
         pid_t pid = -1;
         int status = -1;
 
+        w->round = r;
+        w->phase = 1; /* spawning */
         snprintf(tag, sizeof tag, "%d:%d", w->idx, r);
         snprintf(env, sizeof env, "SPAWN_TAG=%s", tag);
         w->pids[r] = -1;
-        if (posix_spawn_file_actions_init(&fa) != 0 ||
-            posix_spawn_file_actions_adddup2(&fa, w->pipefd[1],
-                                             SPAWN_REPORT_FD) != 0 ||
-            posix_spawn(&pid, "/bin/syscall_testing", &fa, NULL, argv, envp)) {
-            w->bad_spawn++;
+        int rc = posix_spawn_file_actions_init(&fa);
+
+        if (!rc) {
+            rc = posix_spawn_file_actions_adddup2(&fa, w->pipefd[1], SPAWN_REPORT_FD);
+            if (!rc)
+                rc = posix_spawn(&pid, "/bin/syscall_testing", &fa, NULL, argv, envp);
             (void) posix_spawn_file_actions_destroy(&fa);
+        }
+        if (rc) {
+            w->bad_spawn++;
+            if (!w->spawn_err)
+                w->spawn_err = rc;
             continue;
         }
-        (void) posix_spawn_file_actions_destroy(&fa);
         w->pids[r] = pid;
+        w->phase = 2; /* reaping */
+        /* Reap first: the child writes its line before it exits, so the line is
+         * in the pipe by then however slowly the child ran. Reading first gave
+         * up after the poll timeout on a loaded hart and then took the late line
+         * as the next round's report.
+         */
+        if (waitpid(pid, &status, 0) != pid || !WIFEXITED(status) ||
+            WEXITSTATUS(status) != 0)
+            w->bad_exit++;
+        w->phase = 3; /* reading the report */
         if (!spawn_read_report(w->pipefd[0], line, sizeof line) ||
             strncmp(line, tag, strlen(tag)) || line[strlen(tag)] != ' ' ||
             strtol(line + strlen(tag) + 1, NULL, 10) != (long) pid)
             w->bad_report++;
-        if (waitpid(pid, &status, 0) != pid || !WIFEXITED(status) ||
-            WEXITSTATUS(status) != 0)
-            w->bad_exit++;
     }
+    w->done = 1;
     return NULL;
+}
+
+/* Join the team, naming every worker's round and phase when none has moved for
+ * SPAWN_STALL_S seconds, so a hang says whether it is a spawn, a reap or a read.
+ */
+enum { SPAWN_STALL_S = 30 };
+
+static void spawn_join(struct spawn_worker *w)
+{
+    static const char *const phase[] = {"start", "spawn", "reap", "read"};
+    long last = -1;
+    int still = 0;
+
+    for (;;) {
+        long sum = 0;
+        int done = 0;
+
+        for (int i = 0; i < SPAWN_WORKERS; i++) {
+            sum += w[i].round * 4 + w[i].phase;
+            done += w[i].done;
+        }
+        if (done == SPAWN_WORKERS)
+            break;
+        still = sum == last ? still + 1 : 0;
+        last = sum;
+        if (still == SPAWN_STALL_S) {
+            still = 0;
+            printf("spawn_concurrent: no progress for %d s:", SPAWN_STALL_S);
+            for (int i = 0; i < SPAWN_WORKERS; i++)
+                printf(" w%d=%d:%s%s pid=%d", i, w[i].round, phase[w[i].phase & 3],
+                       w[i].done ? "(done)" : "",
+                       (int) (w[i].phase >= 2 ? w[i].pids[w[i].round] : -1));
+            printf("\n");
+        }
+        sleep(1);
+    }
+    for (int i = 0; i < SPAWN_WORKERS; i++)
+        (void) pthread_join(w[i].th, NULL);
 }
 
 static unsigned spawn_count_open_fds(void)
@@ -8288,9 +8344,11 @@ void test_spawn_concurrent(void)
     pthread_barrier_t bar;
     unsigned fds_before, fds_after;
     int piped = 0, created = 0, bad_spawn = 0, bad_report = 0, bad_exit = 0;
-    int dup_pid;
+    int dup_pid, spawn_err = 0;
     char detail[160];
 
+    /* Static for its size, so clear it: --laps runs the test again. */
+    memset(w, 0, sizeof w);
     fds_before = spawn_count_open_fds();
     if (pthread_barrier_init(&bar, NULL, SPAWN_WORKERS) != 0) {
         test_fail("spawn_concurrent fixture", strerror(errno));
@@ -8313,12 +8371,13 @@ void test_spawn_concurrent(void)
         test_fail("spawn_concurrent fixture", strerror(errno));
     /* An incomplete team never releases the barrier: do not join it. */
     if (created == SPAWN_WORKERS)
-        for (int i = 0; i < created; i++)
-            (void) pthread_join(w[i].th, NULL);
+        spawn_join(w);
     for (int i = 0; i < piped && created == SPAWN_WORKERS; i++) {
         bad_spawn += w[i].bad_spawn;
         bad_report += w[i].bad_report;
         bad_exit += w[i].bad_exit;
+        if (!spawn_err)
+            spawn_err = w[i].spawn_err;
     }
     dup_pid = created == SPAWN_WORKERS ? spawn_count_dup_pids(w) : 0;
     if (created == SPAWN_WORKERS) {
@@ -8329,8 +8388,9 @@ void test_spawn_concurrent(void)
         (void) pthread_barrier_destroy(&bar);
         fds_after = spawn_count_open_fds();
         snprintf(detail, sizeof detail,
-                 "spawn=%d report=%d exit=%d dup_pid=%d fds %u->%u", bad_spawn,
-                 bad_report, bad_exit, dup_pid, fds_before, fds_after);
+                 "spawn=%d (%s) report=%d exit=%d dup_pid=%d fds %u->%u", bad_spawn,
+                 spawn_err ? strerror(spawn_err) : "-", bad_report, bad_exit, dup_pid,
+                 fds_before, fds_after);
         check(!bad_spawn && !bad_report && !bad_exit && !dup_pid &&
                   fds_before == fds_after,
               "spawn_concurrent 8x100 exact argv/envp, unique pids, no fd leak",
