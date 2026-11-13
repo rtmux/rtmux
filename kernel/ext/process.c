@@ -294,9 +294,10 @@ void kext_process_create(void *data)
 
 /* kext_process_destroyall — destroy all threads of a process.
  *
- * Looks up the process and tears down every thread via thread_destroyall; if
- * its lead thread was stopped, readies it so the teardown can complete.
- * Parameters:
+ * Looks up the process and tears down every thread via thread_destroyall, then
+ * readies every stopped thread so each runs its KILLSELF and self-reaps. Only
+ * the lead thread used to be readied: a second thread stopped by SIGSTOP stayed
+ * stopped, never reaped itself, and kept a SIGKILLed process alive. Parameters:
  *   data : the target pid (cast from void *)
  */
 void kext_process_destroyall(void *data)
@@ -333,12 +334,29 @@ void kext_process_destroyall(void *data)
             return;
         }
         thread_destroyall(thp);
-        if (thp->state == STATE_STOPPED) {
+        if (thp->state == STATE_STOPPED && thread_active_hart(thp) < 0 &&
+            !(atomic_or_value(&thp->internal_flags, RTMUX_ITF_EXIT_READIED) &
+              RTMUX_ITF_EXIT_READIED)) {
             kspinlock_unlock(&prp->vec_slock);
             ready(thp);
             kspinlock_lock(&prp->vec_slock);
         }
         tthread_unpin(thp);
+
+        /* The other stopped threads too (exit_ready_stopped). ready() takes
+         * sched_slock, so drop vec_slock around it and look each slot up again
+         * after. One not parked yet is left to the exit pass, which retries.
+         */
+        for (unsigned tid = 0; tid < prp->threads.nentries; ++tid) {
+            thread_t *t = vector_lookup2(&prp->threads, tid);
+
+            if (!t || t == thp || t->state != STATE_STOPPED || tthread_pin(t) != EOK)
+                continue;
+            kspinlock_unlock(&prp->vec_slock);
+            (void) exit_ready_stopped(t);
+            kspinlock_lock(&prp->vec_slock);
+            tthread_unpin(t);
+        }
     }
     kspinlock_unlock(&prp->vec_slock);
 

@@ -550,6 +550,11 @@ static __inline__ void __attribute__((__unused__)) atomic_boundary()
  */
 #define RTMUX_ITF_NATIVE_REPLY 0x100U
 
+/* Claimed (atomic_or_value) by the one teardown path that readies a parked
+ * stopped thread so it self-reaps; see exit_ready_stopped in ext/exit.c.
+ */
+#define RTMUX_ITF_EXIT_READIED 0x200U
+
 /* internal_flags is a single 32-bit word whose bits are written from MULTIPLE
  * CPUs concurrently. A thread sets/clears its OWN WAIT_PENDING /
  * RCVNOTIFICATION / SPECRET_PENDING bits (e.g. ksys_msg_receivev clearing

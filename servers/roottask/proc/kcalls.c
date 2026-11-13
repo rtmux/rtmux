@@ -62,7 +62,21 @@ struct kext_destroy_args {
  */
 void process_threads_destroy(process_t *prp)
 {
-    syscall_priv(__KSYS_PRIV_EXIT_DESTROY_THREADS, prp);
+    /* The kernel returns EAGAIN while a thread of prp is held by a
+     * message-delivery claim it could not wait out; the claimer may need this
+     * hart, so sleep rather than yield (a yield only lets equal priorities run)
+     * and call again.
+     */
+    static const struct timespec ts = {.tv_sec = 0, .tv_nsec = 1000000};
+    unsigned tries = 0;
+
+    while ((int) syscall_priv(__KSYS_PRIV_EXIT_DESTROY_THREADS, prp) == -EAGAIN) {
+        /* A claim normally clears within a transfer; say so if one does not. */
+        if (++tries % 1000 == 0)
+            root_warn("process_threads_destroy: teardown still waiting after %u retries\n",
+                       tries);
+        (void) nanosleep(&ts, NULL);
+    }
 }
 
 /* process_timer_destroy — destroy one timer of a process. Parameters:

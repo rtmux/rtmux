@@ -156,6 +156,8 @@ void rdecl thread_cancel(thread_t *thp);
 int rdecl process_pin(process_t *prp);
 void rdecl process_unpin(process_t *prp);
 int rdecl tthread_pin(thread_t *thp);
+int thread_active_hart(thread_t *thp);
+int exit_ready_stopped(thread_t *thp);
 void rdecl tthread_unpin(thread_t *thp);
 int rdecl thread_set_as_prp(thread_t *thp, process_t *prp);
 void rdecl thread_clear_as_prp_if(thread_t *thp, process_t *prp);
