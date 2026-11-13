@@ -1,15 +1,13 @@
 # Build the RV64 LKL archives (fsd / netd personalities) from lkl/linux.
 #
-# Runs nightly and on demand, and publishes the archives as workflow artifacts
-# (3-day retention).  Also a reusable workflow: lkl-qemu.yml, which runs on
-# every push and pull request, calls it and boots RTMux against the archives it
-# makes.  The upstream commit is resolved once, so both personalities build the
-# same tree, and the finished archives are cached by commit and build inputs.
+# Runs on demand and as a reusable workflow, and publishes the archives as
+# workflow artifacts (3-day retention).  lkl-qemu.yml, which runs on every push
+# and pull request, and publish-lkl.yml, which releases the nightly prerelease,
+# call it.  The upstream commit is resolved once, so both personalities build
+# the same tree, and the finished archives are cached by commit and build inputs.
 name: Build LKL (rv64)
 
 on:
-  schedule:
-    - cron: '30 0 * * *'
   workflow_dispatch:
     inputs:
       lkl_ref:
@@ -54,17 +52,17 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # The cross compiler and binutils come from apt, so the runner image
-      # version (which moves with those packages) is part of the cache key.
-      - id: image
-        run: echo "version=${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
+      # The build inputs and the runner image (whose apt packages carry the
+      # cross compiler and binutils); publish-lkl.yml uses the same hash.
+      - id: inputs
+        run: echo "hash=$(scripts/lkl/inputs-hash.sh)" >> "$GITHUB_OUTPUT"
 
       - name: Cache built archive
         id: arch-cache
         uses: actions/cache@v6
         with:
           path: prebuilt/lkl-rv64/out-${{ matrix.personality }}
-          key: lkl-rv64-${{ matrix.personality }}-${{ steps.image.outputs.version }}-${{ needs.resolve.outputs.commit }}-${{ hashFiles('scripts/build-lkl-rv64.sh', 'configs/lkl-*.config', 'scripts/lkl/**', '.github/actions/setup-rtmux/action.yml') }}
+          key: lkl-rv64-${{ matrix.personality }}-${{ needs.resolve.outputs.commit }}-${{ steps.inputs.outputs.hash }}
 
       - uses: ./.github/actions/setup-rtmux
         if: steps.arch-cache.outputs.cache-hit != 'true'
