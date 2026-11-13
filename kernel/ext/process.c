@@ -369,24 +369,39 @@ void kext_process_destroy(void *data)
     pid_t pid = (pid_t) (uintptr_t) data;
     thread_t *act = get_active_thread(get_cpunum());
 
-    kspinlock_lock(&process_vector_slock);
-    if (!(prp = vector_lookup(&process_vector, PINDEX(pid)))) {
-        kspinlock_unlock(&process_vector_slock);
-        kcall_err(act, ESRCH);
-        return;
-    }
-    kspinlock_unlock(&process_vector_slock);
+    /* Match the whole pid, generation included, and claim the teardown in the
+     * same lock window. Roottask can send a second destroy for a pid
+     * (proc_terminate and the WAITDONE reap in proc_exit may both fire): once
+     * the index is reused, an index-only lookup finds the new live process and
+     * tears it down with its address space still attached, and two destroys
+     * that both pass the lookup would free the process twice.
+     *
+     * A process with a query_object() in flight cannot be freed under the
+     * reader. Say so (EAGAIN) and let the caller retry: success here used to be
+     * returned without destroying anything, and roottask then released its half
+     * of the process, leaving a live kernel process nobody could look up or
+     * exit.
+     */
+    {
+        int err = 0;
 
-    if (prp->querying) {
-        /* Some proc thread is looking at the process fields (a query_object()
-         * has been done on it). We cannot destroy the process and free the
-         * memory under it. Say so: success here used to be returned without
-         * destroying anything, and roottask then released its half of the
-         * process, leaving a live kernel process nobody could look up or exit.
-         * The caller retries until the query ends.
+        kspinlock_lock(&process_vector_slock);
+
+        /* Open-coded: the RCU-sched gate allows no plain pid-lookup helper
+         * call, and this lookup holds process_vector_slock instead.
          */
-        kcall_err(act, EAGAIN);
-        return;
+        if (!(prp = vector_lookup(&process_vector, PINDEX(pid))) || prp->pid != pid ||
+            prp->destroying)
+            err = ESRCH;
+        else if (prp->querying)
+            err = EAGAIN;
+        else
+            prp->destroying = true;
+        kspinlock_unlock(&process_vector_slock);
+        if (err) {
+            kcall_err(act, err);
+            return;
+        }
     }
 
     _TRACE_PR_EMIT_DESTROY(prp, pid);
@@ -527,6 +542,11 @@ void kext_process_destroy(void *data)
             &prp->timers); /* force free to avoid leak, but investigate */
     }
     if (prp->memory) {
+        /* Name the process: the crash line alone does not say which teardown
+         * path skipped the address-space shutdown.
+         */
+        kprintf("process destroy: pid %d flags %#x still has an address space\n", pid,
+                (unsigned) prp->flags);
         crash();
     }
     if (prp->join_queue)

@@ -295,6 +295,11 @@ typedef struct process_entry {
     uint8_t process_priority;
     siginfo_t fault_siginfo;
     bool querying;
+
+    /* Set under process_vector_slock by the one kext_process_destroy that owns
+     * the teardown; a concurrent destroy of the same pid sees it and backs off.
+     */
+    bool destroying;
     unsigned pending_interrupts;
 
     /* Per-process vector spinlock (LOCK_CLASS_PROCVEC). Initialized by
