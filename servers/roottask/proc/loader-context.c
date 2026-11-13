@@ -8,19 +8,24 @@
 #include "externs.h"
 #include "private.h"
 #include "root-process.h"
-#include <sys/mman.h> /* libc mmap(), see loader_context_alloc */
+#include <sys/mman.h> /* PROT_* for roottask_mmap_anon_user */
 
-/* Number of loader contexts to keep around, including the spare */
-#define MAX_LOADER_CONTEXT 3
-
+/* Every loader context ever allocated, once free. They come from the
+ * roottask_mmap_anon_user window, which only grows (kernel/ext/query.c,
+ * root_phys_map_va), so a context can never be returned; keeping each one for
+ * reuse bounds the window by the peak number of spawns in flight per size class
+ * (see loader_context_alloc).
+ */
 static pthread_mutex_t loader_context_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* Largest loader context: a spawn needing more is refused rather than kept. */
+#define LOADER_CLASS_MAX (512u * 1024u)
 static struct loader_context *lcp_list;
-static int lcp_num;
 
 
 /* loader_context_alloc — obtain a loader context for a spawn.
  *
- * Reuses one from the free list when the requested size fits the standard slab;
+ * Reuses the smallest free context of the request's size class or larger;
  * otherwise allocates one via roottask_mmap_anon_user so it lands inside the
  * child-visible L2[3] view (where the loader thread, running in the child's
  * pgdir, can dereference it).
@@ -32,23 +37,44 @@ static int lcp_num;
  */
 struct loader_context *loader_context_alloc(unsigned msgsize, int state)
 {
-    struct loader_context *lcp;
-    size_t size;
+    struct loader_context *lcp, **fit = NULL;
+    size_t size, class;
 
     if (msgsize < sizeof(union proc_msg_union)) {
         msgsize = sizeof(union proc_msg_union);
     }
     size = offsetof(struct loader_context, msg) + msgsize;
 
-    lcp = NULL;
+    /* Size classes. The client sets the message size, so exact sizes would let
+     * a stream of ever-larger spawns allocate a new context each time from the
+     * window that never shrinks. The standard context (most spawns) is the
+     * smallest class and each larger one doubles it, up to LOADER_CLASS_MAX
+     * (ARG_MAX of arguments plus a full descriptor map fit well below it).
+     * Reuse takes an exact class first, so a big context is not used up by a
+     * small spawn.
+     */
+    class = sizeof(struct loader_context);
+    while (class < size)
+        class <<= 1;
+    if (class > LOADER_CLASS_MAX)
+        return NULL;
+    size = class;
+
     pthread_mutex_lock(&loader_context_mutex);
-    if (size <= sizeof(*lcp)) {
-        lcp = lcp_list;
-        if (lcp) {
-            lcp_list = lcp->ctx.next;
-            lcp_num--;
-            size = lcp->ctx.size;
+    for (struct loader_context **pp = &lcp_list; *pp; pp = &(*pp)->ctx.next) {
+        size_t have = (*pp)->ctx.size;
+
+        if (have == size) {
+            fit = pp;
+            break;
         }
+        if (have > size && (!fit || have < (*fit)->ctx.size))
+            fit = pp;
+    }
+    lcp = fit ? *fit : NULL;
+    if (lcp) {
+        *fit = lcp->ctx.next;
+        size = lcp->ctx.size;
     }
     if (!lcp) {
         uintptr_t va;
@@ -89,8 +115,10 @@ struct loader_context *loader_context_alloc(unsigned msgsize, int state)
 
 /* loader_context_free — return a loader context to the free list.
  *
- * Caches the context for reuse when there is room and it is a standard slab;
- * otherwise unmaps it.
+ * Always kept for reuse: its memory came from the grow-only
+ * roottask_mmap_anon_user window, which libc munmap cannot give back. Unmapping
+ * it here used to leak that window by one context per spawn beyond a
+ * three-entry cache, until roottask's own allocations from the window failed.
  *
  * Parameters:
  *   lcp : the loader context being released
@@ -98,17 +126,8 @@ struct loader_context *loader_context_alloc(unsigned msgsize, int state)
 void loader_context_free(struct loader_context *lcp)
 {
     pthread_mutex_lock(&loader_context_mutex);
-    if ((lcp_num < MAX_LOADER_CONTEXT) &&
-        (lcp->ctx.msgsize <= sizeof(lcp->msg))) {
-        lcp->ctx.next = lcp_list;
-        lcp_list = lcp;
-        lcp_num++;
-    } else {
-        pthread_mutex_unlock(&loader_context_mutex);
-        /* Matched libc mmap above — release via libc munmap. */
-        (void) munmap((void *) lcp, lcp->ctx.size);
-        pthread_mutex_lock(&loader_context_mutex);
-    }
+    lcp->ctx.next = lcp_list;
+    lcp_list = lcp;
     pthread_mutex_unlock(&loader_context_mutex);
 }
 
