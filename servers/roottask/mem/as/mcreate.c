@@ -82,3 +82,39 @@ fail2:
     tmp->anon = NULL;
     return r;
 }
+
+
+/* as_mdestroy_pid — undo as_mcreate_pid once the process is unmapped.
+ *
+ * Drops the anonymous-memory object, which frees any pages it still holds that
+ * no mapping covered at exit, and returns the map entries to the map pool.
+ * Process exit used to leave both behind, keeping a few pages of physical
+ * memory and a map block per exited process. Call with the process's
+ * address-space write lock held, after the whole range was unmapped; an entry
+ * that still references an object keeps the map (the unmap did not finish).
+ * Parameters:
+ *   pid : process whose roottask-side address-space state to release
+ */
+void as_mdestroy_pid(pid_t pid)
+{
+    root_process_t *tmp = root_proc(pid);
+    path_object_t *anon = tmp->anon;
+    struct mm_map *mm;
+
+    for (mm = tmp->map.head; mm; mm = mm->next)
+        if (mm->obj_ref)
+            break;
+    if (mm) {
+        /* The unmap did not finish: keep the map and its object rather than
+         * free memory something still references, and say so.
+         */
+        root_warn("as_mdestroy_pid: pid %d still maps an object after exit unmap\n",
+                  (int) pid);
+        return;
+    }
+    (void) map_fini(&tmp->map);
+    if (anon) {
+        tmp->anon = NULL;
+        path_object_done(anon);
+    }
+}

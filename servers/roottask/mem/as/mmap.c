@@ -760,6 +760,13 @@ int as_mmap(pid_t pid,
     mask = 0;
 
     anmem_obp = tmp->anon;
+    if (!anmem_obp) {
+        /* No anonymous-memory object: the address space is being torn down
+         * (as_mdestroy_pid). Every path below uses it, so refuse here.
+         */
+        r = ENOMEM;
+        goto fail1;
+    }
 
     /* RUSH2: Need to deal with alignment RUSH2: Need to deal with
      * /proc/<pid>/as objects...
