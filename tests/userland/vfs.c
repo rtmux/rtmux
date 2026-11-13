@@ -558,12 +558,13 @@ static void test_sys_kstats(void)
     if (harts < 1 || kstats_get(snap, key) != -1)
         bad++;
     check(bad == 0 && kstats_get(snap, "pa.free_bytes") > 0 &&
+              kstats_get(snap, "roottask.heap_used") > 0 &&
               kstats_get(snap, "ioserv.disconnects") >= 0 &&
               kstats_get(snap, "thread.live") > 0 &&
               kstats_get(snap, "thread.live") <= kstats_get(snap, "soul.thread.used") + 2 &&
               kstats_get(snap, "timeout.live") >= 0 &&
               kstats_get(snap, "timeout.live") <= kstats_get(snap, "thread.live") &&
-              lines == (int) (3 * (sizeof pools / sizeof pools[0]) + 4 + (size_t) harts),
+              lines == (int) (3 * (sizeof pools / sizeof pools[0]) + 5 + (size_t) harts),
           "sys_kstats_format documented keys appear exactly once",
           "a documented key is missing, duplicated, or extra");
 

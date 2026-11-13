@@ -138,8 +138,8 @@ static size_t synth_kstats(char *buf, size_t cap)
             len += (size_t) n;
     }
     if (len < cap) {
-        n = snprintf(buf + len, cap - len, "pa.free_bytes=%llu\n",
-                     (unsigned long long) pa_free_size());
+        n = snprintf(buf + len, cap - len, "pa.free_bytes=%llu\nroottask.heap_used=%zu\n",
+                     (unsigned long long) pa_free_size(), roottask_heap_in_use());
         if (n > 0 && (size_t) n < cap - len)
             len += (size_t) n;
     }

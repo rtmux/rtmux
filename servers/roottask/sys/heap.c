@@ -43,6 +43,14 @@ static atomic_uint ext_lock;
 
 void *__crt_morecore(size_t n);
 void __crt_lesscore(void *p, size_t n);
+size_t roottask_heap_in_use(void);
+
+/* Arena bytes ever handed out (the arena only grows), for /sys/kstats. */
+size_t roottask_heap_in_use(void)
+{
+    /* Written under ext_lock by __crt_morecore; read without it, atomically. */
+    return __atomic_load_n(&roottask_heap_used, __ATOMIC_RELAXED);
+}
 
 static void ext_acquire(void)
 {
@@ -71,7 +79,7 @@ void *__crt_morecore(size_t n)
     }
     if (!p && n <= sizeof roottask_heap - roottask_heap_used) {
         p = roottask_heap + roottask_heap_used;
-        roottask_heap_used += n;
+        __atomic_store_n(&roottask_heap_used, roottask_heap_used + n, __ATOMIC_RELAXED);
     }
     ext_release();
     return p;
