@@ -104,6 +104,445 @@ static void test_pipe_read_write_transport(void)
     (void) close(fd[1]);
 }
 
+static void test_native_combined_io(void)
+{
+    const char path[] = "/dev/shmem/rtmux-combined-io";
+    struct {
+        struct _io_write write;
+        unsigned char data[4];
+        struct _io_stat stat;
+    } packet = {0};
+    struct stat st;
+    int fd;
+
+    (void) unlink(path);
+    fd = open(path, O_CREAT | O_EXCL | O_RDWR, 0600);
+    if (fd == -1) {
+        test_fail("native combined fixture", strerror(errno));
+        return;
+    }
+    packet.write.type = _IO_WRITE;
+    packet.write.combine_len =
+        (uint16_t) offsetof(__typeof__(packet), stat) | _IO_COMBINE_FLAG;
+    packet.write.nbytes = 12;
+    packet.stat.type = _IO_STAT;
+    packet.stat.combine_len = sizeof packet.stat;
+    errno = 0;
+    check(msg_send(fd, &packet, sizeof packet, &st, sizeof st) == -1 &&
+              errno == EBADMSG,
+          "native write cannot consume next frame",
+          "a write must not use the following stat header as payload");
+    check(fstat(fd, &st) == 0 && st.st_size == 0,
+          "native rejects oversized frame before resize",
+          "invalid payload bounds must not change file size");
+
+    packet.write.nbytes = 0;
+    packet.write.combine_len = _IO_COMBINE_FLAG;
+    errno = 0;
+    check(msg_send(fd, &packet, sizeof packet, &st, sizeof st) == -1 &&
+              errno == EBADMSG,
+          "native rejects zero frame length", "frame traversal must progress");
+    packet.write.combine_len = 0x7fff | _IO_COMBINE_FLAG;
+    errno = 0;
+    check(msg_send(fd, &packet, sizeof packet, &st, sizeof st) == -1 &&
+              errno == EBADMSG,
+          "native rejects frame beyond message", "do not silently clip a frame");
+    packet.write.combine_len = sizeof packet.write | _IO_COMBINE_FLAG;
+    packet.write.xtype = _IO_XTYPE_OFFSET;
+    errno = 0;
+    check(msg_send(fd, &packet, sizeof packet, &st, sizeof st) == -1 &&
+              errno == EBADMSG,
+          "native offset cannot consume next frame",
+          "the positioned offset must fit the current frame");
+    errno = 0;
+    check(msg_send(fd, &packet, sizeof(uint16_t), NULL, 0) == -1 &&
+              errno == EBADMSG,
+          "native rejects truncated common header", "need type and length");
+
+    struct {
+        struct _io_write first;
+        unsigned char a[4];
+        struct _io_write second;
+        unsigned char b[4];
+        struct _io_read read;
+        struct _xtype_offset offset;
+    } chain = {0};
+    unsigned char received[8] = {0};
+    const unsigned char expected[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+
+    struct {
+        struct _io_write write;
+        unsigned char data[4];
+        unsigned char padding[4];
+        struct _io_stat stat;
+    } padded = {0};
+    padded.write.type = _IO_WRITE;
+    padded.write.combine_len =
+        (uint16_t) offsetof(__typeof__(padded), stat) | _IO_COMBINE_FLAG;
+    padded.write.nbytes = sizeof padded.data;
+    memcpy(padded.data, expected, sizeof padded.data);
+    memset(padded.padding, 0xcc, sizeof padded.padding);
+    padded.stat.type = _IO_STAT;
+    padded.stat.combine_len = sizeof padded.stat;
+    check(msg_send(fd, &padded, sizeof padded, &st, sizeof st) == 0 &&
+              st.st_size == 4 && pread(fd, received, 4, 0) == 4 &&
+              memcmp(received, expected, 4) == 0,
+          "native combined padding is not payload",
+          "write only nbytes while skipping the full padded frame");
+    check(lseek(fd, 0, SEEK_SET) == 0, "native combined rewind", "reset position");
+
+    chain.first.type = chain.second.type = _IO_WRITE;
+    chain.first.combine_len =
+        (uint16_t) offsetof(__typeof__(chain), second) | _IO_COMBINE_FLAG;
+    chain.second.combine_len =
+        (uint16_t) (offsetof(__typeof__(chain), read) -
+                     offsetof(__typeof__(chain), second)) | _IO_COMBINE_FLAG;
+    chain.first.nbytes = chain.second.nbytes = 4;
+    memcpy(chain.a, expected, 4);
+    memcpy(chain.b, expected + 4, 4);
+    chain.read.type = _IO_READ;
+    chain.read.combine_len = sizeof chain.read + sizeof chain.offset;
+    chain.read.nbytes = sizeof received;
+    chain.read.xtype = _IO_XTYPE_OFFSET;
+    check(msg_send(fd, &chain, sizeof chain, received, sizeof received) == 8 &&
+              memcmp(received, expected, sizeof received) == 0,
+          "native two writes and terminal read",
+          "valid combined writes must use their own buffered payloads");
+    check(lseek(fd, 0, SEEK_CUR) == 8 && fstat(fd, &st) == 0 && st.st_size == 8,
+          "native combined positions and size", "positioned read must not seek");
+
+    chain.second.nbytes = 12;
+    errno = 0;
+    check(msg_send(fd, &chain, sizeof chain, received, sizeof received) == -1 &&
+              errno == EBADMSG,
+          "native stops at invalid second frame", "reject before executing it");
+    check(fstat(fd, &st) == 0 && st.st_size == 12 &&
+              pread(fd, received, 4, 8) == 4 && memcmp(received, expected, 4) == 0,
+          "native retains only earlier completed writes",
+          "stop on error without rolling back the first frame");
+
+    _Alignas(8) unsigned char unaligned[18 + sizeof(struct _io_read)] = {0};
+    struct _io_write first = {0};
+    struct _io_read last = {0};
+    first.type = _IO_WRITE;
+    first.combine_len = 18 | _IO_COMBINE_FLAG;
+    last.type = _IO_READ;
+    last.combine_len = sizeof last;
+    memcpy(unaligned, &first, sizeof first);
+    memcpy(unaligned + 18, &last, sizeof last);
+    errno = 0;
+    check(msg_send(fd, unaligned, sizeof unaligned, NULL, 0) == -1 &&
+              errno == EBADMSG,
+          "native rejects misaligned read header", "read fields need LP64 alignment");
+    (void) close(fd);
+    check(unlink(path) == 0, "native combined cleanup", "unlink fixture");
+
+}
+
+static void test_native_large_write(void)
+{
+    const char path[] = "/dev/shmem/rtmux-large-write";
+    const size_t length = 65536;
+    unsigned char *data = malloc(length), *received = malloc(length);
+    int fd = -1;
+
+    if (!data || !received) {
+        test_fail("native large write buffers", "allocation failed");
+        goto done;
+    }
+    (void) unlink(path);
+    fd = open(path, O_CREAT | O_EXCL | O_RDWR, 0600);
+    if (fd == -1) {
+        test_fail("native large write fixture", strerror(errno));
+        goto done;
+    }
+    for (size_t i = 0; i < length; ++i)
+        data[i] = (unsigned char) (i * 37U + i / 4096U);
+    check(write(fd, data, length) == (ssize_t) length,
+          "native standalone write exceeds receive buffer",
+          "validate against full IPC length, not the initial receive prefix");
+    check(pread(fd, received, length, 0) == (ssize_t) length &&
+              memcmp(data, received, length) == 0,
+          "native large write payload intact", "all 64 KiB must match");
+done:
+    if (fd != -1) {
+        (void) close(fd);
+        (void) unlink(path);
+    }
+    free(data);
+    free(received);
+}
+
+static void test_native_short_reads(void)
+{
+    const char path[] = "/dev/shmem/rtmux-short-read";
+    const unsigned char data[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    struct {
+        unsigned char bytes[3];
+        unsigned char guard;
+    } received = {{0}, 0xcc};
+    struct _io_read read_msg = {0};
+    struct {
+        struct _io_read read;
+        struct _xtype_offset offset;
+    } positioned = {0};
+    struct stat st;
+    int fd;
+
+    (void) unlink(path);
+    fd = open(path, O_CREAT | O_EXCL | O_RDWR, 0600);
+    if (fd == -1) {
+        test_fail("native short read fixture", strerror(errno));
+        return;
+    }
+    check(write(fd, data, sizeof data) == sizeof data &&
+              lseek(fd, 1, SEEK_SET) == 1,
+          "native short read setup", "create data and set position");
+    read_msg.type = _IO_READ;
+    read_msg.combine_len = sizeof read_msg;
+    read_msg.nbytes = 6;
+    check(msg_send(fd, &read_msg, sizeof read_msg, received.bytes,
+                    sizeof received.bytes) == sizeof received.bytes,
+          "native short read returns transferred count",
+          "a reply buffer shorter than nbytes is a valid short transfer");
+    check(memcmp(received.bytes, data + 1, sizeof received.bytes) == 0 &&
+              received.guard == 0xcc,
+          "native short read copies only reply prefix", "preserve reply bounds");
+    check(lseek(fd, 0, SEEK_CUR) == 4,
+          "native short read advances by transferred count",
+          "advance by three bytes, not the requested six");
+    check(msg_send(fd, &read_msg, sizeof read_msg, NULL, 0) == 0 &&
+              lseek(fd, 0, SEEK_CUR) == 4,
+          "native empty reply leaves position unchanged",
+          "a zero-byte transfer must return zero without moving the OCB");
+
+    positioned.read = read_msg;
+    positioned.read.combine_len = sizeof positioned;
+    positioned.read.xtype = _IO_XTYPE_OFFSET;
+    positioned.offset.offset = 2;
+    check(msg_send(fd, &positioned, sizeof positioned, received.bytes, 2) == 2 &&
+              memcmp(received.bytes, data + 2, 2) == 0 &&
+              lseek(fd, 0, SEEK_CUR) == 4,
+          "native positioned short read preserves position",
+          "return the copied prefix without updating the current position");
+    check(read(fd, received.bytes, 2) == 2 &&
+              memcmp(received.bytes, data + 4, 2) == 0,
+          "native read resumes after short transfer", "do not repeat bytes");
+    check(fstat(fd, &st) == 0 && st.st_size == sizeof data,
+          "native short reads preserve file size", "reads must not resize");
+    (void) close(fd);
+    check(unlink(path) == 0, "native short read cleanup", "unlink fixture");
+}
+
+static void test_native_rw_validation(void)
+{
+    const char path[] = "/dev/shmem/rtmux-rw-validation";
+    struct {
+        struct _io_write write;
+        struct _xtype_offset offset;
+        unsigned char data[4];
+    } positioned = {0};
+    struct {
+        struct _io_read read;
+        struct _xtype_offset offset;
+    } read_at = {0};
+    struct stat st;
+    char data[4] = {1, 2, 3, 4};
+    int fd;
+
+    (void) unlink(path);
+    fd = open(path, O_CREAT | O_EXCL | O_RDWR | O_APPEND, 0600);
+    if (fd == -1) {
+        test_fail("native validation fixture", strerror(errno));
+        return;
+    }
+    check(write(fd, data, sizeof data) == sizeof data &&
+              lseek(fd, 1, SEEK_SET) == 1,
+          "native append validation setup", "create data and set position");
+    positioned.write.type = _IO_WRITE;
+    positioned.write.combine_len = sizeof positioned;
+    positioned.write.nbytes = sizeof data;
+    positioned.write.xtype = _IO_XTYPE_OFFSET;
+    positioned.offset.offset = -1;
+    errno = 0;
+    check(msg_send(fd, &positioned, sizeof positioned, NULL, 0) == -1 &&
+              errno == EINVAL,
+          "native rejects negative wire write offset", "validate before append");
+    check(lseek(fd, 0, SEEK_CUR) == 1 && fstat(fd, &st) == 0 && st.st_size == 4,
+          "native invalid append preserves position and size",
+          "invalid requests must not move the OCB to EOF");
+    positioned.write.xtype = 3;
+    errno = 0;
+    check(msg_send(fd, &positioned, sizeof positioned, NULL, 0) == -1 &&
+              errno == ENOSYS,
+          "native rejects unknown write xtype", "unsupported protocol variant");
+    read_at.read.type = _IO_READ;
+    read_at.read.combine_len = sizeof read_at;
+    read_at.read.nbytes = 1;
+    read_at.read.xtype = _IO_XTYPE_OFFSET;
+    read_at.offset.offset = -1;
+    errno = 0;
+    check(msg_send(fd, &read_at, sizeof read_at, data, 1) == -1 &&
+              errno == EINVAL,
+          "native rejects negative wire read offset", "bypass client-side guard");
+    errno = 0;
+    check(msg_send(fd, &read_at, 4, data, 1) == -1 && errno == EBADMSG,
+          "native rejects truncated read header", "full LP64 header required");
+    check(pwrite(fd, data, 1, 0) == 1 && lseek(fd, 0, SEEK_CUR) == 1 &&
+              fstat(fd, &st) == 0 && st.st_size == 4,
+          "native positioned append preserves position",
+          "explicit offsets must not append or change the current position");
+    (void) close(fd);
+    fd = open(path, O_WRONLY);
+    if (fd == -1) {
+        test_fail("native write-only fixture", strerror(errno));
+        goto done;
+    }
+    errno = 0;
+    check(read(fd, data, 1) == -1 && errno == EBADF,
+          "native write-only handle denies read", "enforce read access");
+    io_lseek_t seek = {0};
+    uint64_t position = 0;
+    seek.i.type = _IO_LSEEK;
+    seek.i.combine_len = sizeof seek.i;
+    seek.i.whence = SEEK_SET;
+    seek.i.offset = UINT64_MAX - 1;
+    check(msg_send(fd, &seek.i, sizeof seek.i, &position, sizeof position) == 0 &&
+              position == UINT64_MAX - 1,
+          "native overflow fixture", "set a raw position outside signed off_t");
+    errno = 0;
+    check(write(fd, data, sizeof data) == -1 && errno == EOVERFLOW,
+          "native rejects position plus count overflow", "do not wrap file size");
+    check(fstat(fd, &st) == 0 && st.st_size == 4,
+          "native overflow leaves size unchanged", "reject before resizing");
+done:
+    if (fd != -1)
+        (void) close(fd);
+    check(unlink(path) == 0, "native validation cleanup", "unlink fixture");
+}
+
+/* Native memory files use different LP64 read/write wire headers. Exercise
+ * actual payloads and offsets, not just open/close or client-side rejection.
+ */
+void test_native_file_io(void)
+{
+    const char path[] = "/dev/shmem/rtmux-native-file-io";
+    unsigned char data[4096], received[4096];
+    const unsigned char marker[] = {0xd3, 0x7a, 0x91};
+    struct stat st;
+    int fd;
+    ssize_t n;
+
+    for (size_t i = 0; i < sizeof data; ++i)
+        data[i] = (unsigned char) (i * 37U + 1U);
+    (void) unlink(path);
+    fd = open(path, O_CREAT | O_EXCL | O_RDWR, 0600);
+    if (fd == -1) {
+        test_fail("native file create", strerror(errno));
+        return;
+    }
+    check(fstat(fd, &st) == 0 && st.st_size == 0,
+          "native file initially empty", "new file must have size zero");
+    n = write(fd, data, sizeof data);
+    check(n == (ssize_t) sizeof data, "native file write payload",
+          "LP64 write header must be decoded as write, not read");
+    if (n != (ssize_t) sizeof data)
+        goto done;
+    check(fstat(fd, &st) == 0 && st.st_size == (off_t) sizeof data,
+          "native file write grows size", "write must extend the file");
+    check(lseek(fd, 0, SEEK_SET) == 0, "native file rewind", "seek to start");
+    n = read(fd, received, sizeof received);
+    check(n == (ssize_t) sizeof received &&
+              memcmp(data, received, sizeof data) == 0,
+          "native file read payload", "copy must start after the actual header");
+    check(lseek(fd, 9, SEEK_SET) == 9, "native file seek before positioned I/O",
+          "set an independent current position");
+    check(pwrite(fd, marker, sizeof marker, 2049) == (ssize_t) sizeof marker,
+          "native file pwrite unaligned", "decode write offset after 16-byte header");
+    check(lseek(fd, 0, SEEK_CUR) == 9, "native file pwrite preserves position",
+          "positioned writes must not move the OCB position");
+    memset(received, 0, sizeof received);
+    check(pread(fd, received, sizeof marker, 2049) == (ssize_t) sizeof marker &&
+              memcmp(received, marker, sizeof marker) == 0,
+          "native file pread unaligned", "read the exact positioned-write bytes");
+    check(lseek(fd, 0, SEEK_CUR) == 9, "native file pread preserves position",
+          "positioned reads must not move the OCB position");
+    check(pwrite(fd, marker, sizeof marker, 8193) == (ssize_t) sizeof marker,
+          "native file pwrite extends", "positioned write beyond EOF must grow");
+    check(fstat(fd, &st) == 0 && st.st_size == 8196,
+          "native file sparse size", "new size is offset plus payload length");
+    memset(received, 0xff, sizeof received);
+    n = pread(fd, received, sizeof received, 4096);
+    int zero_hole = n == (ssize_t) sizeof received;
+    for (size_t i = 0; zero_hole && i < sizeof received; ++i)
+        zero_hole = received[i] == 0;
+    check(zero_hole, "native file sparse hole zeroed",
+          "the gap before a positioned write must read as zeros");
+    check(lseek(fd, 16384, SEEK_SET) == 16384 && write(fd, data, 0) == 0 &&
+              fstat(fd, &st) == 0 && st.st_size == 8196,
+          "native file zero write does not grow",
+          "zero-byte writes beyond EOF must leave the size unchanged");
+    check(read(fd, received, 1) == 0, "native file read past EOF", "must return zero");
+
+    /* Reject malformed wire requests before allocating or copying data. */
+    struct _io_write wr = {0};
+    wr.type = _IO_WRITE;
+    wr.combine_len = sizeof wr;
+    wr.nbytes = -1;
+    errno = 0;
+    check(msg_send(fd, &wr, sizeof wr, NULL, 0) == -1 && errno == EINVAL,
+          "native file negative wire count", "reject negative signed write count");
+    wr.nbytes = 1;
+    errno = 0;
+    check(msg_send(fd, &wr, sizeof wr, NULL, 0) == -1 && errno == EBADMSG,
+          "native file missing wire payload", "advertised payload must exist");
+    wr.nbytes = 0;
+    wr.xtype = _IO_XTYPE_OFFSET;
+    errno = 0;
+    check(msg_send(fd, &wr, sizeof wr, NULL, 0) == -1 && errno == EBADMSG,
+          "native file truncated write offset", "offset must fit received header");
+    wr.xtype = _IO_XTYPE_NONE;
+    errno = 0;
+    check(msg_send(fd, &wr, 4, NULL, 0) == -1 && errno == EBADMSG,
+          "native file truncated write header", "fixed header must fit");
+    struct _io_read rd = {0};
+    rd.type = _IO_READ;
+    rd.combine_len = sizeof rd;
+    rd.nbytes = 1;
+    rd.xtype = _IO_XTYPE_OFFSET;
+    errno = 0;
+    check(msg_send(fd, &rd, sizeof rd, received, 1) == -1 && errno == EBADMSG,
+          "native file truncated read offset", "read offset must fit received header");
+    rd.xtype = _IO_XTYPE_NONE;
+    rd.nbytes = SIZE_MAX;
+    errno = 0;
+    check(msg_send(fd, &rd, sizeof rd, NULL, 0) == -1 && errno == EINVAL,
+          "native file oversized wire read", "reply count must be representable");
+    check(fstat(fd, &st) == 0 && st.st_size == 8196,
+          "native file rejected requests leave size unchanged", "no allocation side effects");
+    check(close(fd) == 0, "native file close writer", "close must succeed");
+    fd = open(path, O_RDONLY);
+    if (fd == -1) {
+        test_fail("native file reopen", strerror(errno));
+        goto done;
+    }
+    check(pread(fd, received, sizeof marker, 8193) == (ssize_t) sizeof marker &&
+              memcmp(received, marker, sizeof marker) == 0,
+          "native file reopen retains bytes", "read the committed object data");
+    errno = 0;
+    check(write(fd, data, 1) == -1 && errno == EBADF,
+          "native file read-only handle denies write", "access mode must remain enforced");
+done:
+    if (fd != -1)
+        (void) close(fd);
+    check(unlink(path) == 0, "native file unlink", "fixture cleanup");
+    test_native_combined_io();
+    test_native_large_write();
+    test_native_short_reads();
+    test_native_rw_validation();
+    test_native_io_boundaries();
+}
+
 static void test_posix_io_size_overflow_guards(void)
 {
     char byte = 0;
@@ -8359,6 +8798,7 @@ void test_vfs(void)
     test_mqueue_transfer();
     test_mqueue_blocking();
     test_pipe_read_write_transport();
+    test_native_file_io();
     test_posix_io_size_overflow_guards();
     test_posix_memalign_contract();
     test_posix_umask_contract();

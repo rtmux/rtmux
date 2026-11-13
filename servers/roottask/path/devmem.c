@@ -99,9 +99,10 @@ static int mem_read_write(ioserv_context_t *ctp,
     uint64_t *pos;
     uint64_t offset;
     size_t skip;
+    unsigned xtype;
+    int writing = msg->type == _IO_WRITE;
+    int combined;
     int client_locked = 0;
-
-    /* IO_READ and IO_WRITE messages exactly overlay, as does XTYPE_OFFSET! */
 
     if (!ocb) {
         nbytes = 0;
@@ -111,26 +112,72 @@ static int mem_read_write(ioserv_context_t *ctp,
           ((msg->type == _IO_READ) ? _IO_FLAG_RD : _IO_FLAG_WR))) {
         return EBADF;
     }
-    nbytes = msg->read.i.nbytes;
+    skip = writing ? sizeof(msg->write.i) : sizeof(msg->read.i);
+    if (ctp->size < 0 || (size_t) ctp->size < skip ||
+        (uintptr_t) msg % (writing ? _Alignof(struct _io_write)
+                                   : _Alignof(struct _io_read)) != 0)
+        return EBADMSG;
+    combined = (msg->combine.combine_len & _IO_COMBINE_FLAG) != 0;
+    if (writing) {
+        if (msg->write.i.nbytes < 0)
+            return EINVAL;
+        nbytes = (size_t) msg->write.i.nbytes;
+        xtype = msg->write.i.xtype;
+    } else {
+        nbytes = msg->read.i.nbytes;
+        xtype = msg->read.i.xtype;
+    }
+    if (nbytes > INT32_MAX)
+        return EINVAL;
 
     obp = ocb->object;
-    if ((msg->type == _IO_WRITE) && (ocb->ioflag & O_APPEND) && obp) {
-        ocb->pos = (uint64_t) OBJECT_SIZE(obp);
-    }
-
-    switch (msg->read.i.xtype & _IO_XTYPE_MASK) {
+    switch (xtype & _IO_XTYPE_MASK) {
     case _IO_XTYPE_NONE:
-        pos = &ocb->pos;
-        skip = sizeof(msg->read.i);
-        break;
-    case _IO_XTYPE_OFFSET:
-        offset = (uint64_t) ((io_pread_t *) msg)->offset.offset;
+        offset = writing && (ocb->ioflag & O_APPEND) && obp
+                     ? (uint64_t) OBJECT_SIZE(obp)
+                     : ocb->pos;
         pos = &offset;
-        skip = sizeof(io_pread_t);
         break;
+    case _IO_XTYPE_OFFSET: {
+        off64_t requested_offset;
+
+        skip = writing ? sizeof(io_pwrite_t) : sizeof(io_pread_t);
+        if ((size_t) ctp->size < skip ||
+            (uintptr_t) msg % (writing ? _Alignof(io_pwrite_t)
+                                       : _Alignof(io_pread_t)) != 0)
+            return EBADMSG;
+        requested_offset = writing ? ((io_pwrite_t *) msg)->offset.offset
+                                   : ((io_pread_t *) msg)->offset.offset;
+        if (requested_offset < 0)
+            return EINVAL;
+        offset = (uint64_t) requested_offset;
+        pos = &offset;
+        break;
+    }
     default: /* this really shouldn't happen, but just in case */
         return ENOSYS;
     }
+
+    /* The receive buffer may contain only a prefix of a large write. Check
+     * the sender's full message length; msgreadv fetches the remaining data.
+     */
+    if (writing && (ctp->offset < 0 ||
+                    (size_t) ctp->offset > ctp->info.srcmsglen ||
+                    skip > ctp->info.srcmsglen - (size_t) ctp->offset ||
+                    nbytes > ctp->info.srcmsglen - (size_t) ctp->offset - skip))
+        return EBADMSG;
+    if (combined) {
+        size_t frame_size = (unsigned) msg->combine.combine_len &
+                            ~(unsigned) _IO_COMBINE_FLAG;
+
+        if (frame_size > (size_t) ctp->size || skip > frame_size ||
+            (writing && nbytes > frame_size - skip))
+            return EBADMSG;
+    }
+    if (nbytes == 0)
+        goto ok;
+    if (writing && *pos > SIZE_MAX - nbytes)
+        return EOVERFLOW;
 
     proc = roottask_prp;
     size = obp ? (size_t) OBJECT_SIZE(obp) : UINT_MAX;
@@ -144,7 +191,7 @@ static int mem_read_write(ioserv_context_t *ctp,
             return EPERM;
         }
     }
-    if (*pos > size - nbytes || *pos + nbytes > size) {
+    if (*pos > size || nbytes > size - *pos) {
         if (obp && msg->type == _IO_WRITE) {
             int status;
 
@@ -199,6 +246,9 @@ static int mem_read_write(ioserv_context_t *ctp,
 
         if (msg->type == _IO_READ) {
             status = ioserv_msgwritev(ctp, ctp->iov + 0, 1, 0);
+        } else if (combined) {
+            memcpy(addr, (const char *) msg + skip, nbytes);
+            status = (int) nbytes;
         } else {
             status = ioserv_msgreadv(ctp, ctp->iov + 0, 1, (int) skip);
         }
@@ -209,15 +259,19 @@ static int mem_read_write(ioserv_context_t *ctp,
                                   0);
         proc_unlock_adp(ROOTTASK_PID);
 
-        if (status == -1) {
+        if (status == -1 || (writing && (size_t) status != nbytes)) {
             process_bind(0);
             proc_thread_pool_reserve_done();
             if (client_locked)
                 proc_unlock_adp(ctp->info.pid);
-            return err;
+            return status == -1 ? err : EIO;
         }
 
+        if (!writing)
+            nbytes = (size_t) status;
         *pos += nbytes;
+        if ((xtype & _IO_XTYPE_MASK) == _IO_XTYPE_NONE)
+            ocb->pos = *pos;
         if (obp && msg->type == _IO_WRITE) {
             obp->mem.pm.mtime = time(0);
         }

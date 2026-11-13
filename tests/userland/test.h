@@ -36,6 +36,8 @@ void test_printf(void);
 void test_setjmp(void);
 void test_signals(void);
 void test_vfs(void);
+void test_native_file_io(void);
+void test_native_io_boundaries(void);
 int spawn_echo_child(const char *tag);
 void test_posix_cap_boundary(void);
 int posix_cap_boundary_child(void);
