@@ -64,6 +64,7 @@ cleanup()
         else
             rm -f .config
         fi
+
         # Always drop autoconf.h rather than restoring a saved copy. Restoring
         # it preserved any .config/autoconf.h mismatch forever, and since the
         # copy lands newer than the restored .config, make considered it
@@ -143,17 +144,17 @@ resolve_tool()
     return 1
 }
 
-# Differential FS oracle: extract the ext4 the guest wrote (it lives at sector 34
-# of NVME_IMG, sized like LKL_EXT4_IMG -- see scripts/emu.sh
+# Differential FS oracle: extract the ext4 the guest wrote (it lives at sector
+# 34 of NVME_IMG, sized like LKL_EXT4_IMG -- see scripts/emu.sh
 # refresh_lkl_ext4_partition) and check it with host e2fsprogs.
 #
 # The guest never cleanly unmounts, so the ext4 journal holds committed but
-# uncheckpointed transactions.  Replay the journal first on the temp copy
-# (-E journal_only, which ONLY replays -- it runs no repair passes, so unlike
+# uncheckpointed transactions. Replay the journal first on the temp copy (-E
+# journal_only, which ONLY replays -- it runs no repair passes, so unlike
 # -fy/-fp it cannot silently launder genuine lkl-fsd corruption), so the check
 # sees the filesystem a normal mount would observe, then gate on a read-only
 # `e2fsck -fn`: exit non-zero on any real structural damage (bad inode, bitmap,
-# directory).  Verified both directions with e2fsprogs 1.47: the guest image
+# directory). Verified both directions with e2fsprogs 1.47: the guest image
 # passes, and corrupting its inode table makes the -fn pass exit non-zero.
 # (journal_only needs a Linux e2fsck; on a host where it errors the replay is a
 # no-op and the -fn pass still catches structural damage in the on-disk image.)
@@ -239,10 +240,10 @@ PY
     return 0
 }
 
-# Host oracle for the shutdown-sync pair: the guest wrote an un-fsynced
-# sentinel and shut down within a second, so only the roottask sync sweep can
-# have put it on the disk.  shutdown-sync must find it intact; the negative
-# variant (shutdown -n) must not, or the oracle proves nothing.
+# Host oracle for the shutdown-sync pair: the guest wrote an un-fsynced sentinel
+# and shut down within a second, so only the roottask sync sweep can have put it
+# on the disk. shutdown-sync must find it intact; the negative variant (shutdown
+# -n) must not, or the oracle proves nothing.
 differential_sync_check()
 {
     local fsck debugfs size sectors work dump rc
@@ -272,8 +273,9 @@ differential_sync_check()
         rm -rf "$dump" "$work"
         return 1
     fi
-    # The guest copied /hello.txt to /sync-sentinel.txt, so a surviving
-    # sentinel must match the seed byte for byte.
+
+    # The guest copied /hello.txt to /sync-sentinel.txt, so a surviving sentinel
+    # must match the seed byte for byte.
     "$debugfs" -R "cat /hello.txt" "$work" >"$dump/hello.txt" \
         2>/tmp/rtmux-diff-debugfs.log || true
     "$debugfs" -R "cat /sync-sentinel.txt" "$work" >"$dump/sentinel.txt" \
@@ -427,8 +429,8 @@ require_lkl_mode_oracle()
     esac
 }
 
-# The roottask sync sweep logs "sync: start" and "sync: done t=<ms>"; the
-# modes below pin what it did.  The toolbox suite runs the sync applet and then
+# The roottask sync sweep logs "sync: start" and "sync: done t=<ms>"; the modes
+# below pin what it did. The toolbox suite runs the sync applet and then
 # shutdown, so it sweeps twice.
 require_sync_log_oracle()
 {
@@ -458,6 +460,7 @@ require_sync_log_oracle()
         shutdown-sync-wedge)
             n="$(grep -c 'sync timeout: ' "$log")"
             t="$(sed -n 's/.*sync: done t=\([0-9][0-9]*\).*/\1/p' "$log" | tail -n 1)"
+
             # The only mount is wedged past the kernel unblock request: the
             # sweep abandons its worker at the 2 s budget plus a 250 ms grace.
             if [ "$n" -ne 1 ] || [ -z "$t" ] || [ "$t" -lt 2000 ] ||
@@ -470,6 +473,7 @@ require_sync_log_oracle()
         shutdown-sync-ignore)
             n="$(grep -c 'sync timeout: ' "$log")"
             t="$(sed -n 's/.*sync: done t=\([0-9][0-9]*\).*/\1/p' "$log" | tail -n 1)"
+
             # One wedged mount costs its 2 s budget; the healthy ext4 flush
             # after it adds its commit time, well inside the 8 s sweep cap.
             if [ "$n" -ne 1 ] || [ -z "$t" ] || [ "$t" -lt 2000 ] ||
@@ -491,7 +495,7 @@ usage: scripts/qemu-regress.sh [options] [-- extra emu args...]
 Options:
   --mode NAME       Guest rtmux.run mode: syscall-testing,
                     posix-cap-boundary, loader-negative, syscall-testing-disk,
-                    spawn-storm (8x100 concurrent posix_spawn; open SMP defect),
+                    spawn-storm (8x100 concurrent posix_spawn),
                     pci-nvme-smoke, rt-check, leak-gate (opt-in killspawn + laps),
                     version-skew (kernel and initramfs from two trees; expects one
                     "version skew:" line),
@@ -958,11 +962,11 @@ setup_system_iommu_metadata_or_skip()
     export EMU_QEMU_OPTS="${EMU_QEMU_OPTS:+$EMU_QEMU_OPTS }-dtb $patched_dtb"
 }
 
-# patch_fdt_cpu_status_dts IN OUT HART PLACEMENT: set cpu@HART status = "disabled"
-# in a decoded QEMU DTS. PLACEMENT is "first" (status ahead of mmu-type, QEMU's
-# own order) or "last" (after mmu-type, ahead of the cpu's child nodes). dtc
-# needs a node's properties before its subnodes, so the status line is dropped
-# from where QEMU put it and re-emitted at the requested spot.
+# patch_fdt_cpu_status_dts IN OUT HART PLACEMENT: set cpu@HART status =
+# "disabled" in a decoded QEMU DTS. PLACEMENT is "first" (status ahead of
+# mmu-type, QEMU's own order) or "last" (after mmu-type, ahead of the cpu's
+# child nodes). dtc needs a node's properties before its subnodes, so the status
+# line is dropped from where QEMU put it and re-emitted at the requested spot.
 patch_fdt_cpu_status_dts()
 {
     local in_dts="$1" out_dts="$2" hart="$3" where="$4"
@@ -1194,6 +1198,7 @@ while [ $# -gt 0 ]; do
             shift
             ;;
         --gdb-on-timeout)
+
             # Keep QEMU alive past the timeout with a live gdb stub, dump every
             # hart, then kill it. The log is kept so the dump sits beside it.
             GDB_ON_TIMEOUT=1
@@ -1270,6 +1275,7 @@ case "$MODE" in
         MODE_ARG="rtmux.run=${MODE}"
         ;;
     debug-inject)
+
         # Forces CONFIG_DEBUG_INJECT=y, boots four harts, stalls hart 1 for
         # three seconds with interrupts off, and requires the guest to carry on
         # (scripts/qemu-regress.sh --mode debug-inject --gdb-on-timeout also
@@ -1281,6 +1287,7 @@ case "$MODE" in
         NEEDS_DEBUG_INJECT=1
         ;;
     hart-watchdog|hart-watchdog-console|hart-watchdog-idle)
+
         # Neighbour watchdog (Q18). hart-watchdog stalls hart 2 for three
         # seconds with interrupts off; hart-watchdog-idle only idles for a
         # minute; hart-watchdog-console also has the stalled hart hold the
@@ -1294,6 +1301,7 @@ case "$MODE" in
         [ "$MODE" != "hart-watchdog-idle" ] && NEEDS_DEBUG_INJECT=1
         ;;
     syslog-wrap)
+
         # Q21: forces CONFIG_ROOTTASK_SYSLOG_SIZE=4096 so 200 numbered markers
         # wrap roottask's log ring; /sys/log must read back contiguously and
         # report EOVERFLOW for a window the ring has overwritten.
@@ -1304,6 +1312,7 @@ case "$MODE" in
         NEEDS_SYSLOG_SMALL=1
         ;;
     roottask-wait-watch)
+
         # Roottask wait scan (Q20). slow-server holds two sync requests for 8 s
         # each; check_roottask_wait_reports() requires one "liveness:" line per
         # held sync, 5..7 s after it began, and none for RECEIVE.
@@ -1314,6 +1323,7 @@ case "$MODE" in
         NEEDS_STALL_DETECTOR=1
         ;;
     hang-inject)
+
         # Hangs every hart but one with interrupts off, so the run never
         # finishes. Only meaningful with --gdb-on-timeout: the pass condition is
         # a complete dump with a register and backtrace block for every hart.
@@ -1335,6 +1345,7 @@ case "$MODE" in
         NEEDS_INSTRUMENTATION=1
         ;;
     trace-negative)
+
         # The trace payload cases (full-width user pointers, payload caps) only
         # run on an instrumented kernel; syscall-testing skips them on a stub.
         BEGIN_MARKER="RTMux trace-negative: BEGIN"
@@ -1344,6 +1355,7 @@ case "$MODE" in
         NEEDS_INSTRUMENTATION=1
         ;;
     tickless-idle)
+
         # Needs the instrumented build so the kernel emits the per-hart
         # [tickless] STIMER-count lines the oracle checks for a quiet hart.
         BEGIN_MARKER="RTMux tickless-idle: BEGIN"
@@ -1353,9 +1365,10 @@ case "$MODE" in
         NEEDS_INSTRUMENTATION=1
         ;;
     sh-posix)
+
         # The init wrapper's "RTMux sh-posix: PASS" is derived from the suite's
         # exit status, which a bug that exits the script early can leave at 0 --
-        # a silent false pass.  Require the suite's OWN completion marker, which
+        # a silent false pass. Require the suite's OWN completion marker, which
         # test.sh prints (unprefixed, at line start) only after every check ran
         # with no failures; the wrapper line keeps its "RTMux " prefix, so the
         # anchored regex ignores it.
@@ -1366,6 +1379,7 @@ case "$MODE" in
         MODE_ARG="rtmux.run=${MODE}"
         ;;
     toolbox)
+
         # Same false-pass guard as sh-posix: require the suite's own unprefixed
         # completion marker, printed only after every applet check passed.
         BEGIN_MARKER="RTMux ${MODE}: BEGIN"
@@ -1395,6 +1409,7 @@ case "$MODE" in
         NEEDS_LKL_SERVERS=1
         ;;
     lkl-contain)
+
         # Exercises the roottask MAP_PHYS containment gate directly (the
         # mechanism lkl-netd self-restricts with); needs no LKL server, no ext4,
         # no network — just a plain boot running the guest probe.
@@ -1413,6 +1428,7 @@ case "$MODE" in
         [ "$TIMEOUT_SET" -eq 0 ] && TIMEOUT=60
         ;;
     fdt-cpu-status)
+
         # Boots the irq-notify guest on a DTB with cpu@1 disabled; the host
         # drives both property orders (see the main loop) and checks the log.
         BEGIN_MARKER="RTMux irq-notify: BEGIN"
@@ -1469,6 +1485,7 @@ case "$MODE" in
         exit 0
         ;;
     tracelogger|tracelogger-kcall|tracelogger-irq|tracelogger-pi|tracelogger-lkl-fsd|tracelogger-lkl-netd|tracelogger-lkl-netd-default)
+
         # Drains the kernel instrumentation ring to userland (CTF-exporter first
         # increment); requires a CONFIG_INSTRUMENTATION=y build. Drop the "-T"
         # auto-trace flag so the boot dumper does not pre-own the singleton ring
@@ -1489,6 +1506,7 @@ case "$MODE" in
         fi
         ;;
     shutdown-sync|shutdown-sync-negative|shutdown-sync-ignore)
+
         # The guest leaves an un-fsynced sentinel on the LKL ext4 mount and
         # shuts down; the verdict is the host-side oracle (--differential).
         BEGIN_MARKER="RTMux ${MODE}: BEGIN"
@@ -1505,7 +1523,8 @@ case "$MODE" in
         MODE_ARG="rtmux.run=${MODE}"
         NEEDS_LKL_SERVERS=1
         case "$MODE" in
-            # Single-server one-boot LKL modes are quick (60s).  The two-server
+
+            # Single-server one-boot LKL modes are quick (60s). The two-server
             # lkl-multi* modes and the *-restart modes (which boot two server
             # generations) keep the 180s default; the stress loop gets longer.
             lkl-multi|lkl-multi-crash|lkl-netd-restart|lkl-fsd-restart) : ;;
@@ -1514,9 +1533,10 @@ case "$MODE" in
         esac
         ;;
     version-skew)
+
         # Builds two trees with distinct build ids, boots one's kernel with the
         # other's initramfs, and requires exactly one "version skew:" line (and
-        # none for a matching pair).  Self-contained: see check-version-skew.sh.
+        # none for a matching pair). Self-contained: see check-version-skew.sh.
         if [ "$TIMEOUT_SET" -eq 1 ]; then
             exec "$SCRIPT_DIR/check-version-skew.sh" --timeout "$TIMEOUT"
         fi
@@ -1557,6 +1577,21 @@ if { [ "$MODE" = "rr-fairness" ] || [ "$MODE" = "sporadic-budget" ]; } && [ -z "
     CPUS=2
     export CPUS
 fi
+
+# The *-isolated LKL modes pin the LKL server to CPU1 and the *-split modes pin
+# the load and the probe to CPU1 and CPU0, so they need two harts. The one-vCPU
+# default has no CPU1: an isolated pin fails with EINVAL and the server never
+# starts, and a split run silently falls back to one CPU.
+case "$MODE" in
+lkl-fsd-tree-isolated|lkl-netd-http-isolated|lkl-fsd-tree-split|lkl-netd-http-split)
+    [ -n "${CPUS:-}" ] || CPUS=2
+    export CPUS
+    if [ "$CPUS" -lt 2 ]; then
+        echo "qemu-regress: $MODE needs CPUS >= 2" >&2
+        exit 2
+    fi
+    ;;
+esac
 
 # preempt-latency pins a waiter and hog to CPU0, a watchdog to CPU1, and the
 # controller to CPU2, and the timer-wake gap it probes only appears with more
@@ -1728,10 +1763,12 @@ if [ "$NEEDS_LKL_SERVERS" -eq 1 ] || [ "$NEEDS_INSTRUMENTATION" -eq 1 ] ||
         fi
         rm -f .config.bak
     fi
-    # Force regeneration: the sed edits above can leave .config no newer
-    # than a stale autoconf.h, and make would then skip the rule.
+
+    # Force regeneration: the sed edits above can leave .config no newer than a
+    # stale autoconf.h, and make would then skip the rule.
     rm -f "$AUTOCONF_H"
     "${MAKE:-make}" "$AUTOCONF_H"
+
     # The default build/lkl-regress tree is shared by every forced-Kconfig mode
     # and the object rules there do not track headers or the config, so a tree
     # built for another option set or an older checkout silently yields a kernel
@@ -1740,8 +1777,8 @@ if [ "$NEEDS_LKL_SERVERS" -eq 1 ] || [ "$NEEDS_INSTRUMENTATION" -eq 1 ] ||
     # commit, the tracked-file diff, and the contents of untracked (not ignored)
     # files, and start from nothing when the stamp differs: switching modes with
     # different options costs a full rebuild, repeating one costs none. A tree
-    # named by LKL_REGRESS_BUILD_DIR is the caller's: it is never wiped here (the
-    # Makefile's LKL smoke targets rebuild theirs from scratch themselves).
+    # named by LKL_REGRESS_BUILD_DIR is the caller's: it is never wiped here
+    # (the Makefile's LKL smoke targets rebuild theirs from scratch themselves).
     if [ -z "${LKL_REGRESS_BUILD_DIR:-}" ] &&
        [ "${LKL_REGRESS_SKIP_BUILD:-0}" != 1 ]; then
         build_stamp="$({
@@ -1775,6 +1812,7 @@ if [ "$NEEDS_LKL_SERVERS" -eq 1 ] || [ "$NEEDS_INSTRUMENTATION" -eq 1 ] ||
         "$MKFS_EXT4_BIN" -q -F -d "$EMU_BUILD_DIR/lkl-ext4-root" "$LKL_EXT4_IMG"
         rm -f "$NVME_IMG" "$NVME_PRE_IMG" "$NVME_P8_IMG"
     fi
+
     # lkl-fsd-tricky reverses the FS oracle: host e2fsprogs authors the ext4
     # (hardlink/sparse/big dir/perms) and lkl-fsd must read it back.
     if [ "$MODE" = "lkl-fsd-tricky" ]; then
@@ -1852,6 +1890,7 @@ postprocess_trace_log()
     if [ "$MODE" = "tracelogger-lkl-fsd" ] ||
        [ "$MODE" = "tracelogger-lkl-netd" ] ||
        [ "$MODE" = "tracelogger-lkl-netd-default" ]; then
+
         # Generate the host-op wait CSV first so the budget step can turn its
         # rows into rt-budget blocks alongside the lkl-measure rows.
         echo "  TRACE    ${log}.lkl-host.csv"
@@ -1859,24 +1898,27 @@ postprocess_trace_log()
             return 1
         budget_args+=(--lkl-host "${log}.lkl-host.csv")
     elif [ "$MODE" = "tracelogger-kcall" ]; then
+
         # This mode exists to produce the per-kernel-call rows, so an empty
         # result is a failure, not an absence: without this the run stays green
         # when the kcall hook stops emitting.
         :
     else
+
         # tracelogger-irq and the plain CTF-exporter self-test legitimately have
         # nothing for the budget step to measure. tracelogger-pi lands here too
         # and does produce pi_boost rows, so it is allowed rather than required
         # to: its own gate is the boost-span block in docs/rt-budgets.md.
         budget_args+=(--allow-empty)
     fi
+
     # Every tracelogger mode gets a budget file: the LKL modes for their
-    # lkl-measure rows, the rest for the per-kernel-call cost rows.
-    # Platform contracts are chosen per row class by rt-trace-budget.py, not per
-    # mode: one run can mix guest fs/net rows and kcall rows.  kcall
-    # and pi_boost spans are timer-only and fixed in the script; the classes
-    # below are named here, each with its own citation and no fallback, and a
-    # row whose class is unknown makes the script fail.
+    # lkl-measure rows, the rest for the per-kernel-call cost rows. Platform
+    # contracts are chosen per row class by rt-trace-budget.py, not per mode:
+    # one run can mix guest fs/net rows and kcall rows. kcall and pi_boost spans
+    # are timer-only and fixed in the script; the classes below are named here,
+    # each with its own citation and no fallback, and a row whose class is
+    # unknown makes the script fail.
     budget_args+=(--platform-fs "qemu-only PB-TIMER-RDTIME, PB-DMA-COHERENT"
                   --platform-net "qemu-only PB-TIMER-RDTIME, PB-DMA-COHERENT, PB-IOMMU-UNDESCRIBED"
                   --platform-host "qemu-only PB-TIMER-RDTIME")
@@ -1955,6 +1997,7 @@ dump_hang_state()
         -x "$TOP_DIR/scripts/gdb/dump-state.gdb" "$kernel" >>"$dump" 2>&1 &&
        grep -q "DUMP COMPLETE" "$dump"; then
         echo "# result: complete" >>"$dump"
+
         # User-mode return addresses (roottask is a fixed-VA image at
         # 0xc0000000) do not resolve in the kernel ELF; symbolize them here.
         local roottask="${EMU_BUILD_DIR:-${BUILD_DIR:-$TOP_DIR/build}}/servers/roottask/roottask"
@@ -1975,8 +2018,8 @@ dump_hang_state()
 }
 
 # check_hartwatch_reports LOG: neighbour-watchdog verdict. hart-watchdog needs
-# exactly one report, naming the injected hart, at 2000..2500 ms of silence (the stall
-# lasts 3 s, and the report must land within 2.5 s of the last progress);
+# exactly one report, naming the injected hart, at 2000..2500 ms of silence (the
+# stall lasts 3 s, and the report must land within 2.5 s of the last progress);
 # hart-watchdog-idle needs none. Reports may carry a "[n] " console prefix, so
 # the match is not anchored.
 check_hartwatch_reports()
@@ -2005,6 +2048,7 @@ check_hartwatch_reports()
         return 1
     fi
     if [ "$MODE" = "hart-watchdog-console" ]; then
+
         # The report must land while the stalled hart still owns the console
         # lock: after the "held" line and before the "released" one.
         local held rep rel clean
@@ -2021,13 +2065,13 @@ check_hartwatch_reports()
     return 0
 }
 
-# check_roottask_wait_reports LOG: roottask wait-scan verdict. Each held
-# sync (the fixture prints "slow-server: WITHHOLD n" as it starts one) must
-# produce exactly one "liveness: pid 1 tid <n> REPLY <ms>ms chid=<c>" line with
-# the wait between 5000 and 7000 ms, and no liveness line may name a thread in
-# RECV. Other states (an idle roottask worker parked on a condvar, say) are
-# listed but do not decide the verdict. Lines may carry a "[n] " console
-# prefix, so the match is not anchored.
+# check_roottask_wait_reports LOG: roottask wait-scan verdict. Each held sync
+# (the fixture prints "slow-server: WITHHOLD n" as it starts one) must produce
+# exactly one "liveness: pid 1 tid <n> REPLY <ms>ms chid=<c>" line with the wait
+# between 5000 and 7000 ms, and no liveness line may name a thread in RECV.
+# Other states (an idle roottask worker parked on a condvar, say) are listed but
+# do not decide the verdict. Lines may carry a "[n] " console prefix, so the
+# match is not anchored.
 check_roottask_wait_reports()
 {
     local log="$1" held recv ms bad=0 n w l next
@@ -2037,6 +2081,7 @@ check_roottask_wait_reports()
         echo "  FAIL     ${MODE}: fixture held $held syncs, want 2"
         return 1
     fi
+
     # Each liveness line must fall between its own WITHHOLD line and the next
     # one (or the end of the log), exactly once.
     for n in 1 2; do
@@ -2089,8 +2134,8 @@ run_one()
     local pass_grace=20
 
     # Kept logs go to a stable, findable path so follow-on post-processing
-    # (differential checks, artifact collection) can name them deterministically;
-    # ephemeral runs stay in a throwaway mktemp file.
+    # (differential checks, artifact collection) can name them
+    # deterministically; ephemeral runs stay in a throwaway mktemp file.
     if [ "$KEEP_LOGS" -eq 1 ]; then
         log="${QEMU_REGRESS_LOG_DIR:-$TOP_DIR/build/lkl-logs}/${MODE}-${idx}.log"
         mkdir -p "${log%/*}" || return 1
@@ -2129,11 +2174,14 @@ run_one()
     local gdb_port=
     local ticks=0 hung=0 hang_ok=0
     if [ "$GDB_ON_TIMEOUT" -eq 1 ]; then
-        # Unique per process and run, so concurrent harness loops do not collide.
+
+        # Unique per process and run, so concurrent harness loops do not
+        # collide.
         gdb_port=$((20000 + ($$ % 20000) + idx))
         cmd+=("-gdb-live=${gdb_port}")
         wrap_timeout=$((TIMEOUT + ${HANG_DUMP_TIMEOUT:-120} + 20)) # headroom for the dump
     fi
+
     # serial-unblock feeds one byte to the guest UART (QEMU's stdio) once the
     # guest prints "serial-unblock: WAITING"; every other mode reads nothing.
     local stdin_src=/dev/null serial_fifo= serial_fd= serial_sent=0
@@ -2147,7 +2195,8 @@ run_one()
     local runner=$!
     local terminal=0
     while kill -0 "$runner" 2>/dev/null; do
-        if grep -Fq "$FAIL_MARKER" "$log" || grep -Eq "$BAD_RE" "$log"; then
+        if grep -Fq -e "$FAIL_MARKER" -e "RTMux ${MODE}: SKIP" "$log" ||
+           grep -Eq "$BAD_RE" "$log"; then
             terminal=1
             kill "$runner" 2>/dev/null || true
             break
@@ -2204,8 +2253,8 @@ run_one()
     fi
 
     # boot and pci-nvme-smoke never exit the guest (they idle at login:), so a
-    # timeout (rc=124) is expected once the pass marker is in the log; tolerate it
-    # for both and fall through to the login-in-log check below.
+    # timeout (rc=124) is expected once the pass marker is in the log; tolerate
+    # it for both and fall through to the login-in-log check below.
     if [ "$rc" -ne 0 ] &&
        { { [ "$MODE" != "boot" ] && [ "$NVME_SMOKE" -ne 1 ]; } ||
          [ "$rc" -ne 124 ]; }; then
@@ -2231,6 +2280,12 @@ run_one()
         return 1
     fi
 
+    if grep -Fq "RTMux ${MODE}: SKIP" "$log"; then
+        echo "  FAIL     ${MODE} did not run (the guest skipped it); a mode that must run cannot pass by skipping:"
+        grep -E "^${MODE}: SKIP|RTMux ${MODE}: SKIP" "$log" | head -n 3
+        return 1
+    fi
+
     if grep -Fq "$FAIL_MARKER" "$log"; then
         echo "  FAIL     ${MODE} reported guest failure"
         tail -n 160 "$log"
@@ -2246,7 +2301,10 @@ run_one()
     if [ -n "$LAPS" ]; then
         local lap
         for lap in $(seq 1 "$LAPS"); do
-            if ! grep -Eq "^lap=${lap} PASS\r?$" "$log"; then
+
+            # The serial log ends lines with CR LF, and grep -E does not read
+            # "\r" in a pattern as a carriage return: drop the CRs first.
+            if ! tr -d '\r' <"$log" | grep -Eq "^lap=${lap} PASS\$"; then
                 echo "  FAIL     ${MODE} missing lap line: lap=${lap} PASS"
                 tail -n 160 "$log"
                 return 1
@@ -2256,10 +2314,11 @@ run_one()
 
     # lkl-multi-crash proves lkl-fsd survives an lkl-netd crash. The absence of
     # /net alone would also hold if lkl-netd merely exited cleanly, so require
-    # the crash path's own marker before trusting the isolation result.
+    # the crash path's own marker (the one --serve-net-crash-on-ping prints)
+    # before trusting the isolation result.
     if [ "$MODE" = "lkl-multi-crash" ] &&
-       ! grep -Fq 'lkl-netd: intentional crash after start' "$log"; then
-        echo "  FAIL     ${MODE} lkl-netd did not log its intentional crash"
+       ! grep -Fq 'lkl: virtio-net crash after bounced tx' "$log"; then
+        echo "  FAIL     ${MODE} lkl-netd did not crash after its first bounced TX"
         tail -n 160 "$log"
         return 1
     fi
@@ -2272,8 +2331,8 @@ run_one()
     fi
 
     # The *-restart modes pass only if the supervisor brought up a *restarted*
-    # generation -- "gen 1 up" proves the full crash -> cap-reclaim -> respawn ->
-    # republish cycle ran, not just that generation 0 came up.
+    # generation -- "gen 1 up" proves the full crash -> cap-reclaim -> respawn
+    # -> republish cycle ran, not just that generation 0 came up.
     case "$MODE" in
         lkl-netd-restart | lkl-fsd-restart)
             if ! grep -Fq 'lkl-supervisor: gen 1 up' "$log"; then
@@ -2301,15 +2360,15 @@ run_one()
         fi
     fi
 
-    # PCI/NVMe bring-up smoke: the boot reaches login with /usr mounted before it
-    # (checked above), and every stage of PCI enumeration + NVMe driver attach
-    # left its diagnostic in the log. Covers ECAM discovery, device attach + BAR0
-    # mapping (sizing), device identity, block I/O (GPT parse), IRQ/MSI vector
-    # allocation, and that mainfs= actually selected the NVMe p8 device. Each
-    # pattern is a short substring that survives console interleaving — the SBI
-    # console splits long writes, so a single line like "controller at <bdf> BAR0
-    # 0x<addr>" can arrive as two, hence the separate "controller at" and "BAR0
-    # 0x" checks rather than one combined regex.
+    # PCI/NVMe bring-up smoke: the boot reaches login with /usr mounted before
+    # it (checked above), and every stage of PCI enumeration + NVMe driver
+    # attach left its diagnostic in the log. Covers ECAM discovery, device
+    # attach + BAR0 mapping (sizing), device identity, block I/O (GPT parse),
+    # IRQ/MSI vector allocation, and that mainfs= actually selected the NVMe p8
+    # device. Each pattern is a short substring that survives console
+    # interleaving — the SBI console splits long writes, so a single line like
+    # "controller at <bdf> BAR0 0x<addr>" can arrive as two, hence the separate
+    # "controller at" and "BAR0 0x" checks rather than one combined regex.
     if [ "$NVME_SMOKE" -eq 1 ]; then
         for re in \
             'pci-host-ecam-generic' \
@@ -2469,6 +2528,7 @@ run_one()
     fi
 
     if [ "$MODE" = "tickless-idle" ]; then
+
         # Two conditions over the [tickless] lines emitted DURING the probe's
         # quiet phase (bounded by the window markers so a not-yet-active AP at
         # boot or an incidental low count at shutdown is ignored):
@@ -2511,6 +2571,7 @@ run_one()
     fi
 
     if [ "$MODE" = "irq-notify-suppress" ]; then
+
         # Exactly one timeout, and it is the suppressed attempt; the guest has
         # already checked the 1.0-1.1 s window and prints the elapsed time.
         require_log_patterns "$log" "suppressed IRQ attempt" \

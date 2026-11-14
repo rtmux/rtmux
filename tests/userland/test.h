@@ -11,6 +11,7 @@
 #define _RTMUX_TEST_H
 
 #include <pthread.h>
+#include "outcome.h"
 
 struct pshared_region {
     pthread_mutex_t mtx;
@@ -25,6 +26,14 @@ struct pshared_region {
 void test_ok(const char *name);
 void test_fail(const char *name, const char *detail);
 void check(int cond, const char *name, const char *detail);
+
+/* A known failure: `expected` is its stable id, `observed` the id seen now
+ * (NULL when the case passed). Matching is a GAP; a pass or another failure is
+ * a FAIL.
+ */
+void test_gap(const char *name, const char *anchor, const char *expected, const char *observed);
+/* A case that did not run; the reason is mandatory. */
+void test_skip(const char *name, const char *reason);
 
 void test_timers(void);
 int rlimit_cpu_child(void);
@@ -42,7 +51,6 @@ int posix_cap_boundary_child(void);
 void test_notifications(void);
 void test_serial_unblock(void);
 int serial_unblock_child(int announce);
-#define DISCONNECT_SKIP 77
 int disconnect_under_alloc_failure(void);
 int disconnect_child(const char *pid_arg, const char *chid_arg);
 void test_posix_options(void);
@@ -54,6 +62,7 @@ void test_orphan_send_kill(void);
 int gauge_child(int argc, char **argv);
 int leak_lap_check(int lap);
 void leak_suite_delta(int lap, const char *suite);
+
 /* Malformed-user-pointer test helpers, shared by the negative suites.
  *
  * TEST_KERNEL_ADDR is canonical Sv39 supervisor space, above every user
@@ -67,7 +76,7 @@ void leak_suite_delta(int lap, const char *suite);
 void *test_unmapped_user_addr(void);
 
 void test_trace_negative(void);
-void test_spawn_concurrent(int force);
+void test_spawn_concurrent(void);
 void test_user_ptr_negative(void);
 int capgate_child_connect(const char *chid_arg);
 int capgate_child_dup_attack(int argc, char **argv);

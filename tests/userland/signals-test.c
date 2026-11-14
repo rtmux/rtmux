@@ -308,7 +308,7 @@ static void test_signal_set_helpers(void)
 }
 
 
-/* ---- cross-process kill() ---- */
+/* cross-process kill() */
 
 #define KILL_UID 1000
 #define KILL_LOOPS 1500 /* x 10 ms: hard cap so a lost stop cannot hang */
@@ -372,8 +372,8 @@ static void nap(void)
 static pid_t kill_spawn(int idx, int uid, int pgid);
 
 /* Victim: --kill-child idx uid pgid. pgid < 0 keeps the inherited group, 0
- * starts a new one, > 0 joins it. Group leader (pgid -2) calls setsid() and sends
- * kill(0, SIGUSR2) when "go" is posted.
+ * starts a new one, > 0 joins it. Group leader (pgid -2) calls setsid() and
+ * sends kill(0, SIGUSR2) when "go" is posted.
  */
 static int kill_victim(int idx, uid_t uid, pid_t pgid)
 {
@@ -389,7 +389,8 @@ static int kill_victim(int idx, uid_t uid, pid_t pgid)
 
     if (pgid == -2) {
         /* Group leader: own session and group, then two members that inherit
-         * both from it. */
+         * both from it.
+         */
         if (setsid() < 0)
             return 104;
         for (int m = 0; m < 2; m++)
@@ -549,7 +550,7 @@ static void kill_cleanup(int first, int last)
             kill_sem_drop(tags[t], i);
 }
 
-/* ---- job control: stop/continue, controlling terminal, background access ---- */
+/* job control: stop/continue, controlling terminal, background access */
 
 /* A process stops and continues itself (its system thread holds the other
  * threads) and reports each change to roottask, which sets
@@ -581,7 +582,9 @@ static void jc_catch_tstp(int sig)
 }
 
 /* Wait for pid to report a state change, polling so a lost one cannot hang the
- * suite. Returns the waitpid() result, 0 on timeout.
+ * suite.
+ *
+ * Returns the waitpid() result, 0 on timeout.
  */
 static pid_t jc_wait(pid_t pid, int *st, int opts, int ms)
 {
@@ -662,7 +665,8 @@ static int jc_await_cont(void)
 }
 
 /* Hold the child until the parent has seen its continue reported: waitpid()
- * reports an exit before a continue, so a child that left at once would hide it.
+ * reports an exit before a continue, so a child that left at once would hide
+ * it.
  */
 static void jc_linger(void)
 {
@@ -697,9 +701,8 @@ static int jc_tty_child(const char *mode)
 
     if (!strcmp(mode, "read")) {
         /* Background read: SIGTTIN and EINTR, and once the group is foreground
-         * and we are continued the read goes through (no input: EAGAIN).
-         */
-        /* The stop takes hold asynchronously, possibly before the next line, so
+         * and we are continued the read goes through (no input: EAGAIN). The
+         * stop takes hold asynchronously, possibly before the next line, so
          * announce first and look at the result once continued.
          */
         (void) sem_post(intr);
@@ -796,8 +799,8 @@ static pid_t jc_spawn(const char *mode, int newgrp)
     return rc == 0 ? pid : -1;
 }
 
-/* Middle process of the orphan fixture: start the group leader in a group of its
- * own, then exit, leaving that group orphaned.
+/* Middle process of the orphan fixture: start the group leader in a group of
+ * its own, then exit, leaving that group orphaned.
  */
 static int jc_orphan_parent(void)
 {
@@ -895,7 +898,8 @@ static void test_jobctl_stop(const char *mode, const char *name, int signo)
 
     check(kill(pid, signo) == 0, "jobctl stop signal", "kill must succeed");
     if (!strcmp(mode, "spinhard")) {
-        /* Blocked and ignored SIGTSTP does nothing; SIGSTOP below still stops. */
+        /* Blocked and ignored SIGTSTP does nothing; SIGSTOP below still stops.
+         */
         check(jc_wait(pid, &st, WUNTRACED, 300) == 0,
               "jobctl ignored SIGTSTP does not stop",
               "an ignored stop signal must not stop the process");
@@ -1019,10 +1023,13 @@ static void test_jobctl_tty(void)
     int termios_saved;
 
     if (fd < 0 || !isatty(fd) || tcgetpgrp(fd) != getpgrp()) {
-        printf("  SKIP: jobctl tty fixtures (fd %d, isatty %d, tcgetpgrp %d, "
-               "getpgrp %d, errno %d)\n",
-               fd, fd >= 0 ? isatty(fd) : -1, fd >= 0 ? tcgetpgrp(fd) : -1,
-               (int) getpgrp(), errno);
+        char why[192];
+
+        snprintf(why, sizeof why,
+                 "tty fixtures unavailable: fd %d, isatty %d, tcgetpgrp %d, getpgrp %d, errno %d",
+                 fd, fd >= 0 ? isatty(fd) : -1, fd >= 0 ? tcgetpgrp(fd) : -1,
+                 (int) getpgrp(), errno);
+        test_skip("jobctl tty fixtures", why);
         if (fd >= 0)
             close(fd);
         return;
@@ -1313,7 +1320,7 @@ static void test_kill_pgrp(void)
 }
 
 
-/* ---- siginfo sender and handler priority ---- */
+/* siginfo sender and handler priority */
 
 static volatile pid_t si_got_pid;
 static volatile int si_got_code;
@@ -1462,7 +1469,7 @@ static void test_sigthread_prio_stable(void)
     kill_sem_drop("sigack", 0);
 }
 
-/* ---- caught signal interrupts a blocked call with EINTR (Q35) ---- */
+/* caught signal interrupts a blocked call with EINTR (Q35) */
 
 enum eintr_kind {
     EK_READ,
@@ -1684,7 +1691,8 @@ static void test_eintr_cond_wait(void)
     eintr_uninstall();
 }
 
-/* SA_RESTART: the handler runs but the read keeps blocking and later gets data. */
+/* SA_RESTART: the handler runs but the read keeps blocking and later gets data.
+ */
 static void test_restart_read(void)
 {
     pthread_t t;
@@ -1838,6 +1846,7 @@ static int eintr_remote_child(void)
     for (int i = 0; i < 100000; i++)
         sched_yield(); /* let the reader reach read() */
     (void) sem_post(ready);
+
     /* Spin, not nap(): a sleeping main thread would itself be a registered
      * waiter with a lower tid than the reader, and take the interrupt.
      */

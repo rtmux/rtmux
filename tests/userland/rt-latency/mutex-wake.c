@@ -43,6 +43,8 @@
 #include <sys/rtmux-core.h>
 #include <sys/syspage.h>
 
+#include "../outcome.h"
+
 extern struct syspage_entry *_syspage_ptr;
 
 #define HOLDER_CPU 0
@@ -52,6 +54,7 @@ extern struct syspage_entry *_syspage_ptr;
 #define WAITER_PRIO 40
 #define WARMUP 32
 #define ITERS 200
+
 /* Guard the holder spins, holding the mutex, after publishing the generation
  * and before the timed unlock. It only has to exceed the time for the waiter on
  * the other hart to enter pthread_mutex_lock and block; 100 us is generous and,
@@ -167,6 +170,7 @@ static void *holder_worker(void *arg)
             atomic_store_explicit(&setup_failed, 1, memory_order_release);
             return NULL;
         }
+
         /* Publish the round only after the mutex is held, so the waiter that
          * proceeds on this generation blocks instead of acquiring free.
          */
@@ -258,9 +262,9 @@ int main(void)
 
     if (rate == 0) {
         printf("mutex-wake: SKIP counter rate unavailable\n");
-        printf("mutex-wake: PASS (skipped)\n");
-        return EXIT_SUCCESS;
+        return TC_EXIT_SKIP;
     }
+
     /* Sit the controller on its own hart, distinct from the holder (cpu0) and
      * waiter (cpu1) harts, so it does not compete with the steady-state
      * high-priority waiter after setup. A newly created worker briefly inherits
@@ -271,8 +275,7 @@ int main(void)
      */
     if (pin_to_cpu(CTRL_CPU) == -1) {
         printf("mutex-wake: SKIP needs at least 3 harts\n");
-        printf("mutex-wake: PASS (skipped)\n");
-        return EXIT_SUCCESS;
+        return TC_EXIT_SKIP;
     }
 
     rc = pthread_mutexattr_init(&attr);

@@ -34,6 +34,8 @@
 #include <sys/rtmux-core.h>
 #include <sys/syspage.h>
 
+#include "../outcome.h"
+
 extern struct syspage_entry *_syspage_ptr;
 
 #define PIN_CPU 0
@@ -42,6 +44,7 @@ extern struct syspage_entry *_syspage_ptr;
 #define WARMUP 64
 #define ITERS 1000
 #define HIST_BUCKETS 32
+
 /* The default userland fast path is faster than the rdtime counter resolves, so
  * time this many lock/unlock pairs per sample and divide back to a per-pair
  * cost. The kernel ceiling path is above the counter resolution, so it uses 1.
@@ -231,9 +234,9 @@ int main(void)
 
     if (rate == 0) {
         printf("mutex-uncontended: SKIP counter rate unavailable\n");
-        printf("mutex-uncontended: PASS (skipped)\n");
-        return EXIT_SUCCESS;
+        return TC_EXIT_SKIP;
     }
+
     /* Raise to a real-time priority and pin so the tight timing loop is not
      * migrated or preempted by ordinary threads mid-measurement.
      */

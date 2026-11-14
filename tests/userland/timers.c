@@ -570,11 +570,11 @@ static void test_timer_id_reuse(void)
  * arm, block, wake, return), which no user-space MONOTONIC bracket can see, so
  * that fixed per-burst cost is calibrated away: each block is paired with a
  * control block of 100 zero-spin bursts (same clock reads and sleeps) run right
- * before it. Per pair, (CPU delta of the spin block - control block) is compared
- * with (sum of the spin bursts' bracketing CLOCK_MONOTONIC intervals - the
- * control's). The median pair error scaled to all 50 pairs is checked against
- * max(1% of the bracketed spin time, 2 x clock resolution); the median keeps a
- * host stall that inflates one block (QEMU descheduled under load) from
+ * before it. Per pair, (CPU delta of the spin block - control block) is
+ * compared with (sum of the spin bursts' bracketing CLOCK_MONOTONIC intervals -
+ * the control's). The median pair error scaled to all 50 pairs is checked
+ * against max(1% of the bracketed spin time, 2 x clock resolution); the median
+ * keeps a host stall that inflates one block (QEMU descheduled under load) from
  * deciding the result. With tick billing the sleeping bursts were never charged
  * and the spin blocks would show no CPU growth over the controls.
  */
@@ -592,8 +592,9 @@ static uint64_t clock_ns(clockid_t id)
     return ts_ns(&ts);
 }
 
-/* Run n bursts of spin_ns busy time, each followed by a 100 us sleep. Returns
- * the CPU-clock delta and adds the bracketing intervals to *busy.
+/* Run n bursts of spin_ns busy time, each followed by a 100 us sleep.
+ *
+ * Returns the CPU-clock delta and adds the bracketing intervals to *busy.
  */
 static uint64_t cputime_block(int n,
                               uint64_t spin_ns,
@@ -704,11 +705,11 @@ static void test_cputime_short_bursts(void)
               detail);
     }
 
-    /* Up to ROUNDS attempts: the tolerance is the 1% bound (2 x resolution or
-     * 1 ms floor), and it must hold for a whole round. Only a round that
-     * fails is repeated, so a persistent billing error still fails all three;
-     * a transient host stall (QEMU descheduled under load) does not decide
-     * the result. The detail line reports the attempt number.
+    /* Up to ROUNDS attempts: the tolerance is the 1% bound (2 x resolution or 1
+     * ms floor), and it must hold for a whole round. Only a round that fails is
+     * repeated, so a persistent billing error still fails all three; a
+     * transient host stall (QEMU descheduled under load) does not decide the
+     * result. The detail line reports the attempt number.
      */
     for (round = 1; round <= ROUNDS; round++) {
         int64_t med;
@@ -722,16 +723,19 @@ static void test_cputime_short_bursts(void)
                  (long long) med);
         ok_pair = c0 != 0 && r.dbusy_total != 0 &&
                   (med < 0 ? -med : med) * PAIRS <= (int64_t) tol;
-        /* Totals: the spin blocks' CPU covers what the brackets prove ran
-         * and cannot exceed their wall time (a sleeper is never charged).
+
+        /* Totals: the spin blocks' CPU covers what the brackets prove ran and
+         * cannot exceed their wall time (a sleeper is never charged).
          */
         ok_totals = r.spin_cpu + 2 * res_ns >= r.spin_busy - r.spin_busy / 100 &&
                     r.spin_cpu <= r.spin_wall + 2 * res_ns;
+
         /* Median per-pair CPU delta within 50%..200% of the median bracketed
          * delta (outlier-robust, unlike a sum of positive deltas).
          */
         ok_dcpu = r.med_dbusy > 0 && r.med_dcpu >= r.med_dbusy / 2 &&
                   r.med_dcpu <= r.med_dbusy * 2;
+
         /* The control blocks are the fixed per-burst kernel cost the pair
          * method cancels, so check it directly: billed (nonzero: the trap,
          * timer and wake work is charged) and never more than the wall time.
@@ -816,6 +820,7 @@ static void test_cputime_two_threads(void)
              (unsigned long long) ca, (unsigned long long) cb,
              (unsigned long long) (m1 - m0), (unsigned long long) pd,
              (unsigned long long) (w1 - w0), ncpu, (unsigned long long) tol);
+
     /* Thread teardown after the final read is billed to the process only, so
      * the process may exceed the sum, never fall below it by more than tol.
      */
@@ -894,9 +899,10 @@ static void test_cputime_yield_steal_stress(void)
 
     for (int i = 0; i < created; i++) {
         sum += ys[i].cpu;
+
         /* A thread runs on one hart at a time, so its clock cannot exceed its
-         * own lifetime; a stolen stretch billed from both harts would show
-         * here even when the all-thread sum stays under wall x harts.
+         * own lifetime; a stolen stretch billed from both harts would show here
+         * even when the all-thread sum stays under wall x harts.
          */
         if (ys[i].cpu > ys[i].life && ys[i].cpu - ys[i].life > over)
             over = ys[i].cpu - ys[i].life;
@@ -926,10 +932,10 @@ static void test_cputime_yield_steal_stress(void)
 /* Q63(b): RLIMIT_CPU must stop a process with nothing else to reschedule. The
  * child lowers its soft and hard limit to 1 s of CPU and spins; the parent is
  * asleep, so no other thread is ready on the child's hart and the tick's
- * reschedule branch never fires for it. The child's billed CPU (RUSAGE_CHILDREN,
- * which includes its startup) must land within max(1%, 2 x resolution) of the
- * limit, and the parent kills the child at a deadline if the limit is not
- * enforced.
+ * reschedule branch never fires for it. The child's billed CPU
+ * (RUSAGE_CHILDREN, which includes its startup) must land within max(1%, 2 x
+ * resolution) of the limit, and the parent kills the child at a deadline if the
+ * limit is not enforced.
  */
 #define RLIMIT_TEST_SECS 1
 
@@ -998,6 +1004,7 @@ int rlimit_inherit_grandchild(void)
     if (getrlimit(RLIMIT_CPU, &got) != 0 || got.rlim_cur != RLIMIT_TEST_SECS ||
         got.rlim_max != RLIMIT_TEST_SECS)
         return 6;
+
     /* Bounded, so a broken inheritance fails the test instead of leaving an
      * orphaned spinner on a hart for the rest of the run.
      */
@@ -1019,7 +1026,9 @@ int rlimit_inherit_child(void)
         return 5;
     if (waitpid(pid, &status, 0) != pid)
         return 7;
-    /* Stopped by SIGXCPU (not a normal exit, so not the 6 of a bad readback). */
+
+    /* Stopped by SIGXCPU (not a normal exit, so not the 6 of a bad readback).
+     */
     return WIFEXITED(status) ? 8 : 0;
 }
 
@@ -1109,10 +1118,10 @@ static void test_rlimit_inherit(void)
           detail);
 }
 
-/* Q34: 1 ns nanosleep storm on a tickless hart. The sleeper is pinned to hart
- * 1 and a watchdog counter to hart 2; the sleeper checks the watchdog advances
- * in every 100 ms window, i.e. that a storm of sub-tick timer deadlines does
- * not wedge or starve another hart. Needs three online harts.
+/* Q34: 1 ns nanosleep storm on a tickless hart. The sleeper is pinned to hart 1
+ * and a watchdog counter to hart 2; the sleeper checks the watchdog advances in
+ * every 100 ms window, i.e. that a storm of sub-tick timer deadlines does not
+ * wedge or starve another hart. Needs three online harts.
  */
 enum { STORM_CALLS = 100000, STORM_WINDOW_NS = 100000000 };
 #define STORM_DEADLINE_NS 100000000000ULL /* 100 s */
@@ -1236,7 +1245,7 @@ static void test_nanosleep_1ns_storm(void)
     char detail[200];
 
     if (sysconf(_SC_NPROCESSORS_ONLN) < 3) {
-        printf("  SKIP  nanosleep_1ns_storm (needs 3 online harts)\n");
+        test_skip("nanosleep_1ns_storm", "needs 3 online harts");
         return;
     }
     c.sleeper_cpu = 1;
@@ -1274,15 +1283,15 @@ static void test_nanosleep_1ns_storm(void)
 
     /* Upper bound on the sleeper hart's STIMER interrupts. Each 1 ns sleep arms
      * one deadline, and one deadline costs at most one interrupt (a sleep that
-     * finds its deadline already past takes none), so the calls contribute
-     * <= STORM_CALLS. On top of that the hart takes at most the periodic
-     * heartbeat (one per tick of clock_getres) and at most one round-robin
-     * slice expiry per tick, so 2 * (elapsed / tick + 1); STORM_INTR_SLACK
-     * covers the two /sys/kstats reads (roottask IPC on this hart) and wakeups
-     * that predate the first sample. An unbounded count means the interrupt
-     * path re-fires without advancing (a livelock), which is what the bound is
-     * there to catch; it deliberately has no lower bound, since a sleep may
-     * legitimately finish without an interrupt.
+     * finds its deadline already past takes none), so the calls contribute <=
+     * STORM_CALLS. On top of that the hart takes at most the periodic heartbeat
+     * (one per tick of clock_getres) and at most one round-robin slice expiry
+     * per tick, so 2 * (elapsed / tick + 1); STORM_INTR_SLACK covers the two
+     * /sys/kstats reads (roottask IPC on this hart) and wakeups that predate
+     * the first sample. An unbounded count means the interrupt path re-fires
+     * without advancing (a livelock), which is what the bound is there to
+     * catch; it deliberately has no lower bound, since a sleep may legitimately
+     * finish without an interrupt.
      */
     {
         struct timespec res;

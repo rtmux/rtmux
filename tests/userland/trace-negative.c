@@ -66,10 +66,10 @@ static void expect_any_refusal(unsigned *data, const char *name)
     expect_fail(data, name, 0);
 }
 
-/* Payload walks of the three pointer-carrying insert opcodes. The kernel
- * copies the caller buffer before taking any lock, so every malformed payload
- * must come back EFAULT or EINVAL without a kernel fault, and a well-formed one
- * must succeed whether or not the event mask is armed. The stub kernel answers
+/* Payload walks of the three pointer-carrying insert opcodes. The kernel copies
+ * the caller buffer before taking any lock, so every malformed payload must
+ * come back EFAULT or EINVAL without a kernel fault, and a well-formed one must
+ * succeed whether or not the event mask is armed. The stub kernel answers
  * ENOTSUP to all of it, so the strict checks run only when QUERYSUPPORT reports
  * instrumentation.
  */
@@ -105,8 +105,12 @@ static void trace_payload_cases(void)
 
     errno = 0;
     instr = trace_event(q) != RTMUX_TRACE_NOINSTRSUPP;
-    if (!instr || !edge) {
-        test_ok("trace payload cases skipped (stub kernel)");
+    if (!instr) {
+        test_skip("trace payload cases", "kernel built without instrumentation (stub)");
+        return;
+    }
+    if (!edge) {
+        test_skip("trace payload cases", "no unmapped user page for the fixture");
         return;
     }
 
@@ -256,8 +260,8 @@ void test_trace_negative(void)
     cmd[1] = 1;
     expect_any_refusal(cmd, "trace allocbuffer null paddr-out");
 
-    /* 5b. user_slice range rules on the paddr-out destination: a wrapping and
-     * a boundary-straddling eight-byte slot. Same authority caveat as case 4.
+    /* 5b. user_slice range rules on the paddr-out destination: a wrapping and a
+     * boundary-straddling eight-byte slot. Same authority caveat as case 4.
      */
     memset(cmd, 0, sizeof cmd);
     cmd[0] = RTMUX_TRACE_ALLOCBUFFER;
@@ -310,13 +314,13 @@ void test_trace_negative(void)
 
     /* ALLOCBUFFER's buffer-count bound (zero, and counts near 0x40001 that
      * wrapped the 32-bit size while the header-init loop walked past the
-     * allocation) deliberately has no case here. Its RTMUX_PRIV_CAP_TRACE
-     * check fires several lines ahead of the count check, and this binary is
-     * an unprivileged process, so any case written against it would be
-     * satisfied by the EPERM and would still pass with the count check deleted
-     * entirely. A test that cannot fail is worse than an acknowledged gap.
-     * Covering it needs a trace-capable process, which this suite does not
-     * have; case 6 above is the honest version, asserting only the authority
-     * refusal that is actually reachable from here.
+     * allocation) deliberately has no case here. Its RTMUX_PRIV_CAP_TRACE check
+     * fires several lines ahead of the count check, and this binary is an
+     * unprivileged process, so any case written against it would be satisfied
+     * by the EPERM and would still pass with the count check deleted entirely.
+     * A test that cannot fail is worse than an acknowledged gap. Covering it
+     * needs a trace-capable process, which this suite does not have; case 6
+     * above is the honest version, asserting only the authority refusal that is
+     * actually reachable from here.
      */
 }

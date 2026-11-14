@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <sys/dispatch.h>
 #include <sys/rtmux-core.h>
@@ -21,6 +22,8 @@
 #define DEFAULT_SAMPLES 5
 #define PROBE_ITERS 128
 #define WAIT_LOOPS 20000
+/* How long every client may take to land its first send before detach. */
+#define FIRST_SEND_WAIT_MS 2000
 
 struct revoke_args {
     const char *name;
@@ -29,6 +32,7 @@ struct revoke_args {
     atomic_int stop;
     atomic_int ready;
     atomic_int sends;
+    atomic_int started; /* clients whose first send succeeded */
     atomic_int failures;
     atomic_int clients_done;
     atomic_int server_done;
@@ -111,6 +115,9 @@ static void *revoke_client(void *arg)
         if (msg_send(fd, &msg, sizeof(msg), &reply, sizeof(reply)) == 0 &&
             reply == msg) {
             atomic_fetch_add_explicit(&args->sends, 1, memory_order_relaxed);
+            if (i == 0)
+                atomic_fetch_add_explicit(&args->started, 1,
+                                          memory_order_relaxed);
         } else {
             atomic_fetch_add_explicit(&args->failures, 1,
                                       memory_order_relaxed);
@@ -291,13 +298,30 @@ static int run_once(int nclients, int iters, uint64_t *detach_ns,
         launched++;
     }
 
-    for (int i = 0; i < WAIT_LOOPS &&
-                    atomic_load_explicit(&rargs.sends,
-                                         memory_order_relaxed) < nclients;
-         i++)
-        (void) __sched_yield();
-    if (atomic_load_explicit(&rargs.sends, memory_order_relaxed) < nclients) {
-        errno = ETIMEDOUT;
+    /* Wait on time, sleeping, not on a count of yields. Each first send is a
+     * name_open through roottask's path manager, and four of them contend
+     * there; 20000 yields lasted only 30 to 60 ms and sometimes ran out while
+     * they were still queued. A spinning wait also holds a hart the clients and
+     * roottask could use.
+     */
+    for (int ms = 0; ms < FIRST_SEND_WAIT_MS &&
+                     atomic_load_explicit(&rargs.started,
+                                          memory_order_relaxed) < nclients &&
+                     !atomic_load_explicit(&rargs.failures,
+                                           memory_order_relaxed);
+         ms++) {
+        struct timespec ts = {0, 1000000};
+
+        (void) nanosleep(&ts, NULL);
+    }
+
+    /* A client whose first send failed has left and will never start: report
+     * the failure, not a timeout.
+     */
+    if (atomic_load_explicit(&rargs.started, memory_order_relaxed) < nclients) {
+        errno = atomic_load_explicit(&rargs.failures, memory_order_relaxed)
+                    ? EIO
+                    : ETIMEDOUT;
         goto done;
     }
 

@@ -79,8 +79,9 @@ static void *notification_wait_sender(void *arg)
     return NULL;
 }
 
-/* An ordinary queued sender must not make a notification-only receive spin;
- * the receive must time out and leave that sender for a normal receive. */
+/* An ordinary queued sender must not make a notification-only receive spin; the
+ * receive must time out and leave that sender for a normal receive.
+ */
 static void test_notification_with_queued_sender(void)
 {
     struct notification_wait_sender sender = {.coid = -1, .result = -1};
@@ -110,8 +111,10 @@ static void test_notification_with_queued_sender(void)
     }
     while (!atomic_load(&sender.started))
         sched_yield();
+
     /* There is no queue-state query here; allow the sender time to enter the
-     * kernel. The pre-fix run must hang to confirm this setup hit the race. */
+     * kernel. The pre-fix run must hang to confirm this setup hit the race.
+     */
     (void) nanosleep(&settle, NULL);
     (void) __timer_timeout(CLOCK_MONOTONIC, RTMUX_TIMEOUT_RECEIVE, NULL, &timeout_ns, NULL);
     errno = 0;
@@ -234,7 +237,9 @@ static void disc_nap(void)
 }
 
 /* Poll until "key" reaches "want" (want >= 0), or holds one value over two
- * consecutive samples (want < 0). Returns the last value read.
+ * consecutive samples (want < 0).
+ *
+ * Returns the last value read.
  */
 static long disc_wait(const char *key, long want)
 {
@@ -351,8 +356,8 @@ static const char *disc_round(int chid, const char *pidarg, char *detail,
     return NULL;
 }
 
-/* Returns 0 when it ran (the verdict goes through check), or DISCONNECT_SKIP
- * when fault injection is not available.
+/* Returns 0 when it ran (the verdict goes through check), or TC_EXIT_SKIP when
+ * fault injection is not available.
  */
 int disconnect_under_alloc_failure(void)
 {
@@ -361,7 +366,7 @@ int disconnect_under_alloc_failure(void)
     int chid, round;
 
     if (disc_inject("alloc-status", NULL, NULL) != 0)
-        return DISCONNECT_SKIP;
+        return TC_EXIT_SKIP;
     disc_fd = open("/sys/kstats", O_RDONLY);
     chid = channel_create(RTMUX_FLG_CHF_DISCONNECT);
     if (disc_fd < 0 || chid == -1) {
@@ -454,7 +459,6 @@ void test_notifications(void)
 
     test_connection_send_revoke();
     test_notification_with_queued_sender();
-    if (disconnect_under_alloc_failure() == DISCONNECT_SKIP)
-        printf("  SKIP  disconnect_under_alloc_failure (fault injection "
-               "unavailable)\n");
+    if (disconnect_under_alloc_failure() == TC_EXIT_SKIP)
+        test_skip("disconnect_under_alloc_failure", "fault injection unavailable");
 }

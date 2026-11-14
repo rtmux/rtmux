@@ -36,6 +36,7 @@
 #include <sys/mman.h>
 #include <sys/path-registry.h>
 #include <sys/poll.h>
+#include <sys/procfs.h>
 #include <sys/procmsg.h>
 #include <sys/select.h>
 #include <sys/resource.h>
@@ -558,12 +559,13 @@ static void test_sys_kstats(void)
     if (harts < 1 || kstats_get(snap, key) != -1)
         bad++;
     check(bad == 0 && kstats_get(snap, "pa.free_bytes") > 0 &&
+              kstats_get(snap, "roottask.heap_used") > 0 &&
               kstats_get(snap, "ioserv.disconnects") >= 0 &&
               kstats_get(snap, "thread.live") > 0 &&
               kstats_get(snap, "thread.live") <= kstats_get(snap, "soul.thread.used") + 2 &&
               kstats_get(snap, "timeout.live") >= 0 &&
               kstats_get(snap, "timeout.live") <= kstats_get(snap, "thread.live") &&
-              lines == (int) (3 * (sizeof pools / sizeof pools[0]) + 4 + (size_t) harts),
+              lines == (int) (3 * (sizeof pools / sizeof pools[0]) + 5 + (size_t) harts),
           "sys_kstats_format documented keys appear exactly once",
           "a documented key is missing, duplicated, or extra");
 
@@ -602,6 +604,7 @@ static void test_sys_kstats(void)
     check(base >= 0 && during == base + 1 && after == base,
           "sys_kstats_thread_delta soul.thread.used +1 then baseline",
           "thread pool gauge did not track a live thread");
+
     /* thread.live follows the process thread vectors, so a created thread shows
      * in both gauges and the leak gate's difference (souls no process owns)
      * stays put.
@@ -609,8 +612,9 @@ static void test_sys_kstats(void)
     check(live_base > 0 && live_during == live_base + 1 && during - live_during == base - live_base,
           "sys_kstats_thread_live +1 with the live thread",
           "thread.live did not track a live thread");
-    /* The new thread slept once, so it owns a timeout timer: both gauges rise by
-     * one and the leak gate's difference (timers nobody owns) stays put.
+
+    /* The new thread slept once, so it owns a timeout timer: both gauges rise
+     * by one and the leak gate's difference (timers nobody owns) stays put.
      */
     check(tmo_base >= 0 && tmo_during == tmo_base + 1 &&
               timer_during - tmo_during == timer_base - tmo_base,
@@ -5550,8 +5554,9 @@ static void test_spawn_file_actions_close_dup2(void)
 
 #define ROOT_LOG_MARK_TEST_MAX 128 /* _SYS_CMD_LOG_MARK text limit */
 
-/* msg_sendnc_r returns the reply status or -errno directly and never sets errno, so a
- * -1 is EPERM, not the libc failure marker; reading errno there returned a stale value.
+/* msg_sendnc_r returns the reply status or -errno directly and never sets
+ * errno, so a -1 is EPERM, not the libc failure marker; reading errno there
+ * returned a stale value.
  */
 static int roottask_errno_status(int status)
 {
@@ -5577,8 +5582,10 @@ static int send_log_mark(const char *text, size_t len)
         msg_sendnc_r(ROOTTASK_COID, &msg, sizeof msg.hdr + len, NULL, 0));
 }
 
-/* Read /sys/log from fd to EOF into buf (cap bytes); every read must be at
- * most 4096 bytes. Returns the byte count, or -errno from the failing read.
+/* Read /sys/log from fd to EOF into buf (cap bytes); every read must be at most
+ * 4096 bytes.
+ *
+ * Returns the byte count, or -errno from the failing read.
  */
 static ssize_t read_sys_log(int fd, char *buf, size_t cap)
 {
@@ -5599,9 +5606,9 @@ static ssize_t read_sys_log(int fd, char *buf, size_t cap)
     }
 }
 
-/* Child: as uid 1000, /sys/log (0400) refuses open and stat with EACCES (the gate is
- * the open path, which stat shares) while a world-readable /sys entry still opens, and
- * a log mark is refused with roottask's own EPERM.
+/* Child: as uid 1000, /sys/log (0400) refuses open and stat with EACCES (the
+ * gate is the open path, which stat shares) while a world-readable /sys entry
+ * still opens, and a log mark is refused with roottask's own EPERM.
  */
 int sys_log_child(void)
 {
@@ -5670,14 +5677,17 @@ static void test_sys_log_read(void)
     check(n > 0, "sys_log_read reads data", "empty or failed read");
     if (n > 0) {
         buf[n] = '\0';
+
         /* Not wrapped (the ring is 1 MiB), so the oldest byte is the first
          * roottask line.
          */
         if (n < 1024 * 1024)
             check(!strncmp(buf, "RT", 2), "sys_log_read oldest first",
                   "an unwrapped ring must start at its first line");
-        /* Roottask may log between the mark and this read, so the mark need not be the last
-         * line; it must be one whole line that follows the literal-format one.
+
+        /* Roottask may log between the mark and this read, so the mark need not
+         * be the last line; it must be one whole line that follows the
+         * literal-format one.
          */
         snprintf(line, sizeof line, "\nRT   %s\n", mark);
         last = strstr(buf, line);
@@ -5689,7 +5699,8 @@ static void test_sys_log_read(void)
               "a newline in a mark must be logged as '?', not start a new line");
     }
 
-    /* Rewind to a fresh window: a later mark shows up on the same descriptor. */
+    /* Rewind to a fresh window: a later mark shows up on the same descriptor.
+     */
     snprintf(mark, sizeof mark, "sys_log_read second %d", (int) getpid());
     (void) send_log_mark(mark, strlen(mark));
     check(lseek(fd, 0, SEEK_SET) == 0, "sys_log_read rewind", "lseek(0) failed");
@@ -5709,9 +5720,10 @@ static void test_sys_log_read(void)
           "uid 1000 must get EACCES on /sys/log and a refused log mark");
 }
 
-/* Run only under qemu-regress.sh --mode syslog-wrap (ROOTTASK_SYSLOG_SIZE=4096):
- * 200 numbered markers overrun the ring, the survivors read back contiguously
- * and newest last, and a window that was overwritten after open reads EOVERFLOW.
+/* Run only under qemu-regress.sh --mode syslog-wrap
+ * (ROOTTASK_SYSLOG_SIZE=4096): 200 numbered markers overrun the ring, the
+ * survivors read back contiguously and newest last, and a window that was
+ * overwritten after open reads EOVERFLOW.
  */
 #define WRAP_RING 4096
 #define WRAP_MARKS 200
@@ -6301,8 +6313,9 @@ static void endpoint_probe_record_max(atomic_ulong *target, unsigned long value)
 static void *endpoint_revoke_server(void *arg)
 {
     struct endpoint_revoke_args *args = arg;
-    /* The channel delivers a disconnect notice per closed client, and a
-     * receive buffer smaller than struct _notification would fail on it.
+
+    /* The channel delivers a disconnect notice per closed client, and a receive
+     * buffer smaller than struct _notification would fail on it.
      */
     union {
         int msg;
@@ -6733,8 +6746,8 @@ static void *name_unlink_race_opener(void *arg)
  * path manager parks the unlink and the opens that arrive behind it, and the
  * first open to finish must restart only those parked operations. Before the
  * fix it also stole the entries of the opens still running on other roottask
- * threads, which corrupted the pending list and left the parked unlink (and
- * its caller) in MsgSend forever. A regression shows up as a hang here, so the
+ * threads, which corrupted the pending list and left the parked unlink (and its
+ * caller) in MsgSend forever. A regression shows up as a hang here, so the
  * suite timeout is the failure signal.
  */
 static void test_name_unlink_open_race(void)
@@ -8181,6 +8194,9 @@ struct spawn_worker {
     pthread_barrier_t *bar;
     int idx;
     int bad_spawn, bad_report, bad_exit;
+    int spawn_err; /* first posix_spawn error, for the failure detail */
+    /* Progress, read by the joining thread to name a stalled worker. */
+    _Atomic int round, phase, done;
     pid_t pids[SPAWN_ROUNDS];
 };
 
@@ -8231,28 +8247,163 @@ static void *spawn_worker_body(void *arg)
         pid_t pid = -1;
         int status = -1;
 
+        /* Clear this round's pid before publishing the round, so a reader that
+         * sees the new round never takes a stale pid for it.
+         */
+        __atomic_store_n(&w->pids[r], -1, __ATOMIC_RELAXED);
+        w->round = r;
+        w->phase = 1; /* spawning */
         snprintf(tag, sizeof tag, "%d:%d", w->idx, r);
         snprintf(env, sizeof env, "SPAWN_TAG=%s", tag);
-        w->pids[r] = -1;
-        if (posix_spawn_file_actions_init(&fa) != 0 ||
-            posix_spawn_file_actions_adddup2(&fa, w->pipefd[1],
-                                             SPAWN_REPORT_FD) != 0 ||
-            posix_spawn(&pid, "/bin/syscall_testing", &fa, NULL, argv, envp)) {
-            w->bad_spawn++;
+        int rc = posix_spawn_file_actions_init(&fa);
+
+        if (!rc) {
+            rc = posix_spawn_file_actions_adddup2(&fa, w->pipefd[1], SPAWN_REPORT_FD);
+            if (!rc)
+                rc = posix_spawn(&pid, "/bin/syscall_testing", &fa, NULL, argv, envp);
             (void) posix_spawn_file_actions_destroy(&fa);
+        }
+        if (rc) {
+            w->bad_spawn++;
+            if (!w->spawn_err)
+                w->spawn_err = rc;
             continue;
         }
-        (void) posix_spawn_file_actions_destroy(&fa);
-        w->pids[r] = pid;
+        __atomic_store_n(&w->pids[r], pid, __ATOMIC_RELAXED);
+        w->phase = 2; /* reaping */
+        /* Reap first: the child writes its line before it exits, so the line is
+         * in the pipe by then however slowly the child ran. Reading first gave
+         * up after the poll timeout on a loaded hart and then took the late
+         * line as the next round's report.
+         */
+        if (waitpid(pid, &status, 0) != pid || !WIFEXITED(status) ||
+            WEXITSTATUS(status) != 0)
+            w->bad_exit++;
+        w->phase = 3; /* reading the report */
         if (!spawn_read_report(w->pipefd[0], line, sizeof line) ||
             strncmp(line, tag, strlen(tag)) || line[strlen(tag)] != ' ' ||
             strtol(line + strlen(tag) + 1, NULL, 10) != (long) pid)
             w->bad_report++;
-        if (waitpid(pid, &status, 0) != pid || !WIFEXITED(status) ||
-            WEXITSTATUS(status) != 0)
-            w->bad_exit++;
     }
+    w->done = 1;
     return NULL;
+}
+
+enum { SPAWN_STALL_S = 30 }; /* seconds without progress that count as a stall */
+
+/* Print every thread of pid with its kernel state, the sync object it waits on,
+ * its last hart and how long it has been blocked. Run on a stall only.
+ */
+static void spawn_dump_threads(pid_t pid)
+{
+    char path[32];
+    procfs_info info;
+    int fd;
+
+    snprintf(path, sizeof path, "/proc/%d", (int) pid);
+    if ((fd = open(path, O_RDONLY)) < 0) {
+        printf("  pid %d: %s\n", (int) pid, strerror(errno));
+        return;
+    }
+    memset(&info, 0, sizeof info);
+    if (devctl(fd, DEVCTL_PROC_INFO, &info, sizeof info, NULL) == EOK)
+        printf("  pid %d: flags %#x threads %u parent %d\n", (int) pid,
+               info.flags, info.num_threads, (int) info.parent);
+    for (int tid = 1, n = 0; n < 64; tid++, n++) {
+        procfs_status st;
+
+        memset(&st, 0, sizeof st);
+        st.tid = tid;
+        if (devctl(fd, DEVCTL_PROC_TIDSTATUS, &st, sizeof st, NULL) != EOK ||
+            (int) st.tid < tid)
+            break;
+        tid = (int) st.tid;
+        printf("  pid %d tid %d state %u sync %#lx cpu %u blocked %llu ms\n",
+               (int) pid, tid, st.state, (unsigned long) st.blocked.sync.sync,
+               st.last_cpu, (unsigned long long) (st.nsec_since_block / 1000000));
+    }
+    (void) close(fd);
+}
+
+/* The child a worker is reaping or reading from, or -1. The worker may be
+ * moving on as this runs, so every field is loaded atomically.
+ */
+static pid_t spawn_cur_pid(const struct spawn_worker *w)
+{
+    /* Phase before round: a phase of 2 then belongs to this round or an earlier
+     * one, whose pid is already stored, and a newer round reads the -1 its
+     * worker stored before publishing it.
+     */
+    int phase = w->phase;
+    int round = w->round;
+
+    return phase >= 2 ? __atomic_load_n(&w->pids[round], __ATOMIC_RELAXED) : -1;
+}
+
+static void spawn_dump_stall(const struct spawn_worker *w)
+{
+    const pthread_barrier_t *b = w[0].bar;
+
+    /* A stalled worker may still wake and write these: load them atomically. */
+    printf("  barrier %p: lock owner %#lx count %#lx, cond owner %#lx, "
+           "waiting %u gen %lu\n",
+           (const void *) b,
+           (unsigned long) __atomic_load_n(&b->lock.owner, __ATOMIC_RELAXED),
+           (unsigned long) __atomic_load_n(&b->lock.count, __ATOMIC_RELAXED),
+           (unsigned long) __atomic_load_n(&b->cond.owner, __ATOMIC_RELAXED),
+           __atomic_load_n(&b->waiting, __ATOMIC_RELAXED),
+           __atomic_load_n(&b->generation, __ATOMIC_RELAXED));
+    spawn_dump_threads(getpid());
+    for (int i = 0; i < SPAWN_WORKERS; i++) {
+        pid_t pid = spawn_cur_pid(&w[i]); /* read once: the worker moves on */
+
+        if (!w[i].done && pid > 0)
+            spawn_dump_threads(pid);
+    }
+    spawn_dump_threads(ROOTTASK_PID);
+}
+
+/* Join the team, naming every worker's round and phase when none has moved for
+ * SPAWN_STALL_S seconds, so a hang says whether it is a spawn, a reap or a
+ * read.
+ */
+static void spawn_join(struct spawn_worker *w)
+{
+    static const char *const phase[] = {"start", "spawn", "reap", "read"};
+    long last = -1;
+    int still = 0;
+    bool dumped = false; /* thread dump printed for the current stall */
+
+    for (;;) {
+        long sum = 0;
+        int done = 0;
+
+        for (int i = 0; i < SPAWN_WORKERS; i++) {
+            sum += w[i].round * 4 + w[i].phase;
+            done += w[i].done;
+        }
+        if (done == SPAWN_WORKERS)
+            break;
+        still = sum == last ? still + 1 : 0;
+        if (!still)
+            dumped = false;
+        last = sum;
+        if (still == SPAWN_STALL_S) {
+            still = 0;
+            printf("spawn_concurrent: no progress for %d s:", SPAWN_STALL_S);
+            for (int i = 0; i < SPAWN_WORKERS; i++)
+                printf(" w%d=%d:%s%s pid=%d", i, w[i].round, phase[w[i].phase & 3],
+                       w[i].done ? "(done)" : "",
+                       (int) spawn_cur_pid(&w[i]));
+            printf("\n");
+            if (!dumped)
+                spawn_dump_stall(w);
+            dumped = true;
+        }
+        sleep(1);
+    }
+    for (int i = 0; i < SPAWN_WORKERS; i++)
+        (void) pthread_join(w[i].th, NULL);
 }
 
 static unsigned spawn_count_open_fds(void)
@@ -8281,25 +8432,17 @@ static int spawn_count_dup_pids(const struct spawn_worker *w)
     return dup;
 }
 
-void test_spawn_concurrent(int force)
+void test_spawn_concurrent(void)
 {
     static struct spawn_worker w[SPAWN_WORKERS];
     pthread_barrier_t bar;
     unsigned fds_before, fds_after;
     int piped = 0, created = 0, bad_spawn = 0, bad_report = 0, bad_exit = 0;
-    int dup_pid;
+    int dup_pid, spawn_err = 0;
     char detail[160];
 
-    if (!force && sysconf(_SC_NPROCESSORS_ONLN) > 1) {
-        /* Open defect (TODO Q32): with 2+ harts the 8x100 storm hangs (CPUS=2)
-         * or faults in the kernel IPC path (CPUS=4). Passes at one hart. The
-         * suite skips it; `qemu-regress.sh --mode spawn-storm` forces it.
-         * Remove this gate when the SMP spawn/exit defect is fixed.
-         */
-        printf("  SKIP  spawn_concurrent (SMP: open defect, see Q32; "
-               "--mode spawn-storm forces it)\n");
-        return;
-    }
+    /* Static for its size, so clear it: --laps runs the test again. */
+    memset(w, 0, sizeof w);
     fds_before = spawn_count_open_fds();
     if (pthread_barrier_init(&bar, NULL, SPAWN_WORKERS) != 0) {
         test_fail("spawn_concurrent fixture", strerror(errno));
@@ -8322,12 +8465,13 @@ void test_spawn_concurrent(int force)
         test_fail("spawn_concurrent fixture", strerror(errno));
     /* An incomplete team never releases the barrier: do not join it. */
     if (created == SPAWN_WORKERS)
-        for (int i = 0; i < created; i++)
-            (void) pthread_join(w[i].th, NULL);
+        spawn_join(w);
     for (int i = 0; i < piped && created == SPAWN_WORKERS; i++) {
         bad_spawn += w[i].bad_spawn;
         bad_report += w[i].bad_report;
         bad_exit += w[i].bad_exit;
+        if (!spawn_err)
+            spawn_err = w[i].spawn_err;
     }
     dup_pid = created == SPAWN_WORKERS ? spawn_count_dup_pids(w) : 0;
     if (created == SPAWN_WORKERS) {
@@ -8338,8 +8482,9 @@ void test_spawn_concurrent(int force)
         (void) pthread_barrier_destroy(&bar);
         fds_after = spawn_count_open_fds();
         snprintf(detail, sizeof detail,
-                 "spawn=%d report=%d exit=%d dup_pid=%d fds %u->%u", bad_spawn,
-                 bad_report, bad_exit, dup_pid, fds_before, fds_after);
+                 "spawn=%d (%s) report=%d exit=%d dup_pid=%d fds %u->%u", bad_spawn,
+                 spawn_err ? strerror(spawn_err) : "-", bad_report, bad_exit, dup_pid,
+                 fds_before, fds_after);
         check(!bad_spawn && !bad_report && !bad_exit && !dup_pid &&
                   fds_before == fds_after,
               "spawn_concurrent 8x100 exact argv/envp, unique pids, no fd leak",
@@ -8370,7 +8515,7 @@ void test_vfs(void)
     test_nvme_raw_perm();
     test_sys_kstats();
     test_sys_log_read();
-    test_spawn_concurrent(0);
+    test_spawn_concurrent();
     test_malloc_growth();
     test_posix_errno_corners();
     test_posix_access_and_path_corners();
