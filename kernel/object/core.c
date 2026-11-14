@@ -39,8 +39,10 @@ static inline void object_alloc_context_check(void)
             ((ik >> 24) == get_cpunum())) {
             crash();
         }
+
+        /* Unnested: the fire path allocates from inside the trap dispatch. */
         if (pcpu_array[0].pc_alive) {
-            interrupt_enable();
+            interrupt_enable_unnested();
         }
 #else
         ik = get_inkernel();

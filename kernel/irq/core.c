@@ -449,7 +449,7 @@ int rdecl interrupt_mask(unsigned level, interrupt_t *itp)
     int new;
 
     ilp = &interrupt_level[level];
-    CPU_SLOCK_INTR_LOCK(&intr_slock);
+    interrupt_lock(&intr_slock);
     if (itp) {
         ++itp->mask_count;
     }
@@ -470,7 +470,11 @@ int rdecl interrupt_mask(unsigned level, interrupt_t *itp)
 #endif
     }
     new = ilp->mask_count; /* snarf before intrs enabled, avoid races */
-    CPU_SLOCK_INTR_UNLOCK(&intr_slock);
+
+    /* Unnested: the PLIC dispatch masks the level from inside the trap handler.
+     */
+    intrspin_release(&intr_slock);
+    interrupt_enable_unnested();
     return new;
 }
 
@@ -490,7 +494,7 @@ int rdecl interrupt_unmask(unsigned level, interrupt_t *itp)
     ilp = &interrupt_level[level];
     /* don't enable/disable interrupts during kernel initialization */
     if (pcpu_array[0].pc_alive) {
-        CPU_SLOCK_INTR_LOCK(&intr_slock);
+        interrupt_lock(&intr_slock);
     }
 
     if (itp && itp->mask_count != 0) {
@@ -523,7 +527,8 @@ int rdecl interrupt_unmask(unsigned level, interrupt_t *itp)
     new = ilp->mask_count; /* snarf before intrs enabled, avoid races */
     /* don't enable/disable interrupts during kernel initialization */
     if (pcpu_array[0].pc_alive) {
-        CPU_SLOCK_INTR_UNLOCK(&intr_slock);
+        intrspin_release(&intr_slock);
+        interrupt_enable_unnested();
     }
     return new;
 }

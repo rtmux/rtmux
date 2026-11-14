@@ -439,14 +439,20 @@ common:
                             CONNECT_ATTACH_RETURN(EMFILE);
                         }
 
-                        /* cop is an existing connection — refcount bump is
-                         * atomic. We've just vector_add'd a new client-side
-                         * reference to cop above, which makes cop reachable
-                         * through the new slot; the atomic increment makes the
-                         * bump visible across CPUs. No cop->lock needed for the
-                         * refcount itself.
+                        /* Take the new slot's reference only while cop is still
+                         * live. A client detach drops its reference after it
+                         * leaves vec_slock, so the links seen in the scan above
+                         * can reach 0 before this point: that last drop has
+                         * already queued the disconnect notice, and the server
+                         * detaches cop when it reads it. Sharing cop then would
+                         * hand the caller a connection whose sends fail with
+                         * ESRCH. Undo the slot and keep looking instead; with
+                         * no live match a fresh connection is made below.
                          */
-                        (void) atomic_add_value(&cop->links, 1);
+                        if (!connect_link_get(cop)) {
+                            vector_rem(newvec, (unsigned) coid);
+                            continue;
+                        }
 
                         if ((uint32_t) kap->flags & RTMUX_FLG_COF_CLOEXEC) {
                             vector_flag(newvec, (unsigned) coid, 1);

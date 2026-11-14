@@ -1425,13 +1425,10 @@ int kdecl ksys_msg_sendnotification(thread_t *act,
         int short_circuit;
         kspinlock_lock(&chp->lock);
 
-        /* Same ->destroying guard as the send paths: a concurrent
-         * channel_destroy drains send_queue after setting ->destroying under
-         * chp->lock. Without this recheck notification_deliver() below could
-         * notification_add() a fresh soul onto a just-drained channel, leaking
-         * it onto the chp that is about to be object_free'd. The standalone
-         * ChannelDestroy case sets no process-exit flag, so this bit is the
-         * only thing that catches it.
+        /* Same ->destroying guard as the send paths, so a channel being
+         * destroyed or a stale connection fails with ESRCH before the
+         * short-circuit picks anything. notification_deliver() re-checks
+         * ->destroying in its own queueing window.
          */
         if (chp->destroying || cop->channel != chp) {
             kspinlock_unlock(&chp->lock);

@@ -284,7 +284,8 @@ static void ipi_handler(void)
     if (cmds & IPI_DEBUG_SPIN) {
         /* Busy-wait with interrupts off (a trap entered with SIE clear), so
          * this hart looks stalled to the rest of the system. UINT32_MAX hangs
-         * for ever. */
+         * for ever.
+         */
         uint32_t ms = pcpu_array[cpu].pc_inject_spin_ms;
         uint64_t per_ms = qtimeptr->cycles_per_sec / 1000;
         uint64_t end = r_time() + (uint64_t) ms * per_ms;
@@ -396,11 +397,11 @@ int priv_call_phase(unsigned id)
  *   regs : the saved CPU register frame for this trap
  */
 /* User FP state is saved at every trap from U-mode in which the thread dirtied
- * it, not at switch-out: the scheduler links a preempted thread onto a run queue
- * before it marks the next one running, so another hart could dispatch it before
- * a switch-out hook ran. By the time the thread can be seen anywhere else, its
- * registers are already in its save area. The kernel never executes FP
- * instructions, so the registers still hold the thread's values here. The
+ * it, not at switch-out: the scheduler links a preempted thread onto a run
+ * queue before it marks the next one running, so another hart could dispatch it
+ * before a switch-out hook ran. By the time the thread can be seen anywhere
+ * else, its registers are already in its save area. The kernel never executes
+ * FP instructions, so the registers still hold the thread's values here. The
  * registers stay live (FS=Clean), so resuming on this hart costs nothing.
  */
 static inline void fpu_trap_save(CPU_REGISTERS *regs)
@@ -446,10 +447,12 @@ static int insn_is_fp(uint32_t insn)
 }
 
 /* First FP instruction since this thread last lost the FP registers: allocate
- * its save area if it has none (zeroed, so a thread reads zeros before its first
- * write), load its context, take ownership of this hart's registers, and let the
- * instruction retry. Returns 0 if the trap is not an FP use or no memory is
- * left, in which case the caller treats it as an illegal instruction.
+ * its save area if it has none (zeroed, so a thread reads zeros before its
+ * first write), load its context, take ownership of this hart's registers, and
+ * let the instruction retry.
+ *
+ * Returns 0 if the trap is not an FP use or no memory is left, in which case
+ * the caller treats it as an illegal instruction.
  */
 static int fpu_first_use(thread_t *thp, CPU_REGISTERS *regs)
 {
@@ -553,6 +556,24 @@ void strap_handler_c(CPU_REGISTERS *regs)
          * init/shutdown.c to detect interrupt context.
          */
         atomic_add(&inkernel, 1);
+
+        /* Hold the kspinlock nesting depth for the whole dispatch. The trap
+         * arrived with SIE off, but handlers wake threads through ready(),
+         * whose plain kspinlock pair re-enables SIE on its outermost unlock. A
+         * clock interrupt could then nest into timer_expiry's deferred-fire
+         * drain, stack its fires on the ones not yet delivered and overflow the
+         * per-hart buffer, losing timeouts for good (ipc-contention hung with
+         * every hart idle and its sleepers' timers spent). With the depth held,
+         * those unlocks are inner ones and leave SIE off until the trap
+         * returns.
+         */
+        pcpu_array[_mon_cpu].pc_kspin_depth++;
+#if defined(CONFIG_INSTRUMENTATION)
+        /* Handler locks no longer open their own windows (they are inner now),
+         * so measure the dispatch as the one IRQ-off window it is.
+         */
+        irqoff_open(LOCK_CLASS_INTREVENT);
+#endif
 
         register unsigned long sp_at_entry __asm__("sp");
         unsigned long saved_sp = sp_at_entry;
@@ -745,9 +766,25 @@ void strap_handler_c(CPU_REGISTERS *regs)
             }
         }
 
+#ifndef NDEBUG
+        /* Nothing in the dispatch may turn interrupts back on: a nested timer
+         * interrupt would stack fires past the deferred-fire buffer and lose
+         * them. Code a handler reaches uses interrupt_enable_unnested.
+         */
+        if (intr_get()) {
+            kprintf("INTR BUG: interrupts enabled in dispatch cause=%lu\n",
+                    cause);
+            crash();
+        }
+#endif
+
         /* Decrement interrupt nesting depth (matches increment above). Matches
          * MIPS ADJUST_INKERNEL(k0,k1,k1,-1,0) at interrupt exit.
          */
+#if defined(CONFIG_INSTRUMENTATION)
+        irqoff_close();
+#endif
+        pcpu_array[_mon_cpu].pc_kspin_depth--;
         atomic_sub(&inkernel, 1);
 
         /* On return to U-mode (SPP=0), route through kernel_exit when dispatch

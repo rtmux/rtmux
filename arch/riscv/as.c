@@ -44,6 +44,10 @@ void as_switch(process_t *actprp, process_t **pactprp)
         w_satp(satp);
         sfence_vma();
         *pactprp = actprp;
-        interrupt_enable();
+
+        /* The message-passing and kernel_exit callers rely on the enable; trace
+         * emitters switch address space from inside the trap dispatch.
+         */
+        interrupt_enable_unnested();
     }
 }

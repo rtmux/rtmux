@@ -175,6 +175,32 @@ static int dispatch_unlink_ready(kdispatch_t *dpp, thread_t *thp)
     return 1;
 }
 
+/* Wake one idle hart that thp may run on, so its idle_pick_thread steals thp
+ * from the busy hart it was queued on. No-op when every legal hart is busy.
+ *
+ * A sleeping hart's active slot names its idle thread (cpu_idle points it there
+ * so pc_curthread never lags), not NULL; NULL is a hart not yet started.
+ * Testing for NULL alone never matched a sleeping hart, so the kick never fired
+ * and a thread queued behind a busy one waited for an idle hart's next timer
+ * interrupt, which under tickless idle can be seconds away.
+ */
+static void kick_idle_hart(thread_t *thp)
+{
+    extern unsigned hart_ids[];
+    unsigned mycpu = get_cpunum();
+
+    for (unsigned hi = 0; hi < num_processors; hi++) {
+        unsigned h = hart_ids[hi];
+        thread_t *act = get_active_thread(h);
+
+        if (h != mycpu && (thp->runmask & (1u << h)) == 0 && act &&
+            act == pcpu_array[h].pc_idle_thp) {
+            SENDIPI(h, IPI_RESCHED);
+            return;
+        }
+    }
+}
+
 static int rdecl select_cpu(thread_t *thp)
 {
     thread_t *act;
@@ -845,6 +871,15 @@ void rdecl sched_ss_block(thread_t *thp, int preempted)
                      thp->schedinfo.ss_info->max_repl));
 }
 
+/* Start a new sporadic activation for thp, unless it runs boosted. */
+static void sched_ss_activate(thread_t *thp)
+{
+    if (thp->schedinfo.ss_info->org_priority != 0)
+        return;
+    snap_time(&thp->schedinfo.ss_info->activation_time, 0);
+    thp->schedinfo.ss_info->consumed = 0;
+}
+
 /**
  * This function is called when we put a thread at the tail of the READY queue
  * and we need to reset the activation time and clear the amount of execution
@@ -857,9 +892,6 @@ void rdecl sched_ss_block(thread_t *thp, int preempted)
 void rdecl sched_ss_queue(thread_t *thp)
 {
     CRASHCHECK(thp->policy != SCHED_SPORADIC);
-    if (thp->schedinfo.ss_info->org_priority != 0) {
-        return;
-    }
 
     switch (thp->state) {
     case STATE_RUNNING: /* Time already snapped for these guys */
@@ -867,8 +899,7 @@ void rdecl sched_ss_queue(thread_t *thp)
         break;
 
     default:
-        snap_time(&thp->schedinfo.ss_info->activation_time, 0);
-        thp->schedinfo.ss_info->consumed = 0;
+        sched_ss_activate(thp);
         break;
     }
 }
@@ -2088,8 +2119,8 @@ static void rdecl ready_default(thread_t *thp)
         /* No active thread on this CPU. Enqueue as READY on MY CPU's per-CPU
          * dispatch — I'm the idle path that'll pick it up next. If thp's
          * runmask excludes my CPU, idle_pick_thread still finds it via the
-         * steal scan over all per-CPU dpps. Other idle CPUs are kicked too so
-         * any of them can also try.
+         * steal scan over all per-CPU dpps. One idle hart thp may run on is
+         * kicked so it can steal thp too.
          */
         thp->state = STATE_READY;
         _TRACE_TH_EMIT_STATE(thp, READY);
@@ -2098,13 +2129,7 @@ static void rdecl ready_default(thread_t *thp)
         LINK3_END(DISPATCH_LST(dpp, prio), &thp->link3_link, thread_t);
         DISPATCH_SET(dpp, thp);
 #if CONFIG_PROCESSORS_MAX > 1
-        {
-            unsigned mycpu = get_cpunum();
-            for (unsigned i = 0; i < num_processors; i++) {
-                if (i != mycpu && !get_active_thread(i))
-                    SENDIPI(i, IPI_RESCHED);
-            }
-        }
+        kick_idle_hart(thp);
 #endif
         SCHED_UNLOCK_LOCAL();
         return;
@@ -2192,17 +2217,7 @@ static void rdecl ready_default(thread_t *thp)
              * hart so it steals the client. If none is idle, keep the client
              * local as intended (all harts busy ⇒ no migration win anyway).
              */
-            {
-                extern unsigned hart_ids[];
-                unsigned mycpu = get_cpunum();
-                for (unsigned hi = 0; hi < num_processors; hi++) {
-                    unsigned h = hart_ids[hi];
-                    if (h != mycpu && !get_active_thread(h)) {
-                        SENDIPI(h, IPI_RESCHED);
-                        break;
-                    }
-                }
-            }
+            kick_idle_hart(thp);
 #endif
             SCHED_UNLOCK_LOCAL();
             return;
@@ -2425,7 +2440,14 @@ static void rdecl block_and_ready_default(thread_t *thp)
     thp->link3_link.prev = NULL;
 
     SNAP_TIME_INLINE(act->timestamp_last_block, 0);
-    dpp = thp->dpp;
+
+    /* Queue on this hart's instance, the one SCHED_LOCK_LOCAL() holds, as
+     * ready_default does. thp->dpp may be another hart's (a thread created for
+     * another process gets that process's default); linking into it under our
+     * lock tears its LINK3 list.
+     */
+    dpp = LOCAL_DPP;
+    thp->dpp = dpp;
     prio = thp->priority;
 
     /* We are blocking the active thread (externally) so stop the running Mark
@@ -3239,13 +3261,27 @@ int rdecl set_runmask(thread_t *thp, unsigned runmask)
     /* If we are on a CPU which we have masked then force us off! */
     if (thp->runmask & (1u << thp->runcpu)) {
         if (thp == act) {
-            act->state = STATE_STOPPED;
-            _TRACE_TH_EMIT_STATE(thp, STOPPED);
-
-            /* No need to update thp->timestamp_last_block since block() below
-             * will do it.
+            /* Move off this hart: block() hands it to another thread and
+             * ready() queues act on a hart its runmask allows. act stays
+             * STATE_RUNNING throughout, so SIGCONT, a debugger resume or
+             * teardown only flag and kick it and never ready it a second time.
+             * block() updates timestamp_last_block and charges the sporadic
+             * budget when it hands the hart to another thread (not when the
+             * hart goes idle, as for any block). ready_default skips the new
+             * sporadic activation for a RUNNING thread, so start it here, as a
+             * block and ready through any other state would.
              */
             block();
+
+            /* Test the policy again under the lock: block() may have passed an
+             * RCU quiescent state, and a policy change frees ss_info after one.
+             */
+            if (IS_SCHED_SS(thp)) {
+                SCHED_LOCK_LOCAL();
+                if (IS_SCHED_SS(thp))
+                    sched_ss_activate(thp);
+                SCHED_UNLOCK_LOCAL();
+            }
             ready(thp);
         } else if (thp->state == STATE_RUNNING) {
             SENDIPI(thp->runcpu, IPI_RESCHED);
