@@ -918,9 +918,17 @@ if ! awk '
     }
     in_timer && /vector_lookup2\(&prp->timers, id\)/ { saw_timer_vec = NR }
     in_timer && /xfer_probe\(inp, sizeof\(\*inp\)/ { saw_probe = NR }
-    in_timer && /info.overruns = tip->overruns;/ { saw_snapshot = NR }
+    # The claim and its give-back must each sit under the reset test, and the
+    # give-back under the failed copy: unguarded, they clear or re-add the
+    # count on every read.
+    in_timer && /__atomic_exchange_n\(&tip->overruns, 0,/ &&
+        prev ~ /^ *if \(reset\)$/ && !saw_snapshot { saw_snapshot = NR }
     in_timer && /xfer_memcpy\(inp, &info, sizeof\(info\)\)/ { saw_copy = NR }
-    in_timer && /tip->overruns = 0;/ { saw_reset = NR }
+    in_timer && /timer_add_overruns\(tip, overruns\)/ &&
+        prev ~ /^ *if \(reset\)$/ &&
+        pprev ~ /xfer_memcpy\(inp, &info, sizeof\(info\)\) != 0/ {
+        saw_reset = NR
+    }
     in_timer && /rcu_read_unlock\(&process_rcu\);/ && !saw_unlock {
         saw_unlock = NR
     }
@@ -928,6 +936,7 @@ if ! awk '
     in_timer && /lookup_pid\(kap->pid\)/ { saw_plain = NR }
     in_timer && /reset_prp|reset_tip/ { saw_second_lookup = NR }
     in_timer && /^}/ { in_timer = 0 }
+    { pprev = prev; prev = $0 }
     END {
         exit !(saw_prp_rcu && saw_timer_if && saw_timer_search &&
                saw_timer_else && saw_timer_vec && saw_probe &&
@@ -944,7 +953,7 @@ if ! awk '
                !saw_plain && !saw_raw_store && !saw_second_lookup)
     }
 ' kernel/time/timer.c; then
-    echo "RCU-sched: timer_info must snapshot tip under process_rcu and copy out with fault-safe xfer_memcpy before clearing overruns" >&2
+    echo "RCU-sched: timer_info must snapshot tip under process_rcu, claim a reset with an exchange, copy out with fault-safe xfer_memcpy and give the claim back if the copy fails" >&2
     exit 1
 fi
 
@@ -2202,7 +2211,7 @@ if ! awk '
     in_destroy && /proc_threads_destroyed\(prp, &ev\);/ && saw_notify_t0 {
         saw_notify_fill = NR
     }
-    in_destroy && /sigevent_notification_roottask\(ev.sigev_code,/ &&
+    in_destroy && /nrc = sigevent_notification_roottask\(/ &&
         saw_notify_fill {
         saw_notify_send = NR
     }
@@ -2622,7 +2631,7 @@ if ! awk '
     in_destroyall && /\(thp = prp->valid_thp\)/ { saw_valid = NR }
     in_destroyall && /tthread_pin\(thp\)/ { saw_thp_pin = NR }
     in_destroyall && /thread_destroyall\(thp\)/ { saw_destroy = NR }
-    in_destroyall && /ready\(thp\);/ { saw_ready = NR }
+    in_destroyall && /exit_ready_stopped\(thp\);/ { saw_ready = NR }
     in_destroyall && /tthread_unpin\(thp\);/ { saw_thp_unpin = NR }
     in_destroyall && /process_unpin\(prp\);/ && saw_thp_unpin {
         saw_prp_unpin = NR

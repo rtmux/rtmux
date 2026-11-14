@@ -22,6 +22,7 @@ int rdecl get_interrupt_level(thread_t *act, unsigned vector)
     unsigned level;
     int cascade;
     unsigned i;
+    unsigned hops = 0;
     struct intrinfo_entry *iip;
 
     if (vector >= RTMUX_INTR_CLASS_SYNTHETIC && vector <= RTMUX_HOOK_LAST) {
@@ -59,8 +60,15 @@ int rdecl get_interrupt_level(thread_t *act, unsigned vector)
         }
 
         /* Guy wanted a cascaded interrupt level. Give him the first one of the
-         * secondary controller instead.
+         * secondary controller instead. A cascade chain cannot visit more
+         * controllers than exist, so more hops than that means the platform
+         * table has a cycle.
          */
+        if (++hops > intrinfo_num) {
+            if (act)
+                kcall_err(act, EINVAL);
+            return -1;
+        }
         vector = interrupt_level[cascade].info->vector_base;
     }
 }
