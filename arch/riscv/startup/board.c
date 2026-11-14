@@ -819,7 +819,7 @@ void parse_fdt(size_t *fdt_size)
         case FDT_END:
             TRACETAG("(END FDT)\n");
             if (fdt_size)
-                *fdt_size = ROUND(PTR_DIFF(&node->tag, fdt), __PAGESIZE);
+                *fdt_size = ROUND(_BE(fdt->totalsize), __PAGESIZE);
             finished = 1;
             break;
 
