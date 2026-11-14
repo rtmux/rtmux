@@ -92,6 +92,7 @@ void rdecl timer_period(void);
 void rdecl timer_remaining(ktimer_t *tip, struct _itimer *left);
 int rdecl timer_past(int clockid, int flags, uint64_t *firetime);
 void rdecl timer_activate(ktimer_t *tip);
+void timer_add_overruns(ktimer_t *tip, uint64_t n);
 int rdecl timer_deactivate(ktimer_t *tip);
 void rdecl timer_next(uint64_t *nexttime);
 void rdecl timer_next_deadline(uint64_t *nexttime);
@@ -156,6 +157,8 @@ void rdecl thread_cancel(thread_t *thp);
 int rdecl process_pin(process_t *prp);
 void rdecl process_unpin(process_t *prp);
 int rdecl tthread_pin(thread_t *thp);
+int thread_active_hart(thread_t *thp);
+int exit_ready_stopped(thread_t *thp);
 void rdecl tthread_unpin(thread_t *thp);
 int rdecl thread_set_as_prp(thread_t *thp, process_t *prp);
 void rdecl thread_clear_as_prp_if(thread_t *thp, process_t *prp);
@@ -206,6 +209,8 @@ void free(void *data);
 void *_smalloc(size_t size);
 void *_scalloc(size_t size);
 void *_scalloc_pgalign(size_t size);
+void *_scalloc_page(void);
+void _sfree_page(void *p);
 void *_srealloc(void *data, size_t old_size, size_t new_size);
 void *_sreallocfunc(void *data,
                     size_t old_size,
