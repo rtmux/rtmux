@@ -51,6 +51,7 @@ struct timer_queue {
     unsigned flags;
     unsigned fire_idx;
     unsigned last_tick_idx;
+    uint64_t last_tick; /* absolute tick (time >> downshift) of the last walk */
     struct timer_link slot[1]; /* variable sized */
 };
 
@@ -148,6 +149,24 @@ static uint64_t timer_deadline_mono(const ktimer_t *tip)
         deadline = deadline > adj ? deadline - adj : 0;
     }
     return deadline;
+}
+
+/* How far behind a late interval timer may fall and still fire every missed
+ * period. The shortest interval is one tick (1 ms), so this caps the burst at
+ * about a thousand fires.
+ */
+#define TIMER_CATCHUP_NS 1000000000ULL
+
+/* The wheel's current time in tip's timebase: what timer_expiry compares the
+ * deadline against (qtp->nsec, plus the TOD adjustment for TOD-based timers).
+ */
+static uint64_t timer_wheel_now(const ktimer_t *tip)
+{
+    uint64_t now = qtimeptr->nsec;
+
+    if (tip->flags & RTMUX_TI_TOD_BASED)
+        now += qtimeptr->nsec_tod_adjust;
+    return now;
 }
 
 static void timer_note_deadline(ktimer_t *tip)
@@ -382,6 +401,17 @@ static void timer_insert(ktimer_t *tip, enum fire_source src)
      * lifetime refs; keep correctness and accept longer slot walks.
      */
     idx = GET_QUEUE_IDX(queue, tip->itime.nsec);
+
+    /* A deadline at or before the wheel's current time hashes to a slot the
+     * expiry walk may already have passed (it visits fire_idx up to the current
+     * tick), and would then wait for the ring to come round again. Meanwhile
+     * the cached deadline stays overdue and an idle hart re-arms every
+     * TIMER_BACKLOG_DELTA_NS for it: a periodic 50 ms sleeper kept an idle hart
+     * at hundreds of interrupts a second. Put it in the slot the next walk
+     * starts from instead; the slot is sorted, so it fires first.
+     */
+    if (tip->itime.nsec <= timer_wheel_now(tip))
+        idx = queue->fire_idx;
     back = fore = (ktimer_t *) &queue->slot[idx];
     if (fore->link.next != back) {
         /* Not an empty list - search backwards and forwards */
@@ -480,8 +510,14 @@ static void timer_rearm(ktimer_t *tip, enum fire_source src)
     /* Recalculate the trigger time. */
     tip->itime.nsec += interval;
 
-    /* FIX PR-8735 if we're CLOCK_SOFTTIME, and after recalculating the trigger
-     * time we're still less then current tod, we need to resync ourselves
+    /* Still behind after one interval. CLOCK_SOFTTIME resyncs to now (PR-8735).
+     * Every other clock keeps its missed periods, which timer_insert fires back
+     * to back from the current slot: callers that count ticks (the LKL
+     * measurement timers) rely on each one, and stall if any are skipped, even
+     * under heavy load. Only a timer more than TIMER_CATCHUP_NS behind (a start
+     * time far in the past, a large forward TOD step) skips to the present,
+     * counting the skipped periods in overruns, so it cannot keep the boot hart
+     * firing it for seconds.
      */
     if (tip->clockid == CLOCK_SOFTTIME) {
         uint64_t tod;
@@ -489,6 +525,17 @@ static void timer_rearm(ktimer_t *tip, enum fire_source src)
         snap_time(&tod, tip->flags & RTMUX_TI_TOD_BASED);
         if (tip->itime.nsec < tod) {
             tip->itime.nsec = tod + interval;
+        }
+    } else {
+        uint64_t now = timer_wheel_now(tip);
+
+        if (tip->itime.nsec <= now && now - tip->itime.nsec > TIMER_CATCHUP_NS) {
+            uint64_t missed = (now - tip->itime.nsec) / interval + 1;
+
+            tip->itime.nsec += missed * interval;
+            tip->overruns = missed > UINT32_MAX - tip->overruns
+                                ? UINT32_MAX
+                                : tip->overruns + (uint32_t) missed;
         }
     }
     timer_insert(tip, src);
@@ -607,6 +654,7 @@ void rdecl timer_expiry(systime_t *qtp)
     ktimer_t *first;
     unsigned nfires;
     unsigned curr_tick_idx;
+    uint64_t now_tick;
     unsigned count;
     int adjusted = 0;
     int capped = 0;
@@ -635,10 +683,23 @@ void rdecl timer_expiry(systime_t *qtp)
             tod += qtp->nsec_tod_adjust;
         }
         curr_tick_idx = GET_QUEUE_IDX(queue, tod);
+        now_tick = tod >> queue->downshift;
         if (queue->num_active != 0) {
             owner = &queue->next;
+
+            /* Slots to visit: those the last walk left behind (a capped walk
+             * stops short of last_tick_idx) plus the ticks since it ran. Count
+             * the elapsed ticks from absolute tick numbers, not slot indices: a
+             * tickless hart can sleep a whole number of turns of the wheel
+             * (four 1 ms slots for the relative queue), and the index
+             * difference then reads as no time at all, so the walk skipped
+             * every slot but the current one and a due timer waited a turn.
+             */
             count = (queue->last_tick_idx - queue->fire_idx) & queue->mask;
-            count += (curr_tick_idx - queue->last_tick_idx) & queue->mask;
+            if (now_tick - queue->last_tick > queue->mask)
+                count = queue->mask + 1;
+            else
+                count += (unsigned) (now_tick - queue->last_tick);
             if (count > queue->mask) {
                 /* We've wrapped around, have to examine all the slots */
                 queue->fire_idx = (curr_tick_idx + 1) & queue->mask;
@@ -695,6 +756,7 @@ void rdecl timer_expiry(systime_t *qtp)
             queue->fire_idx = curr_tick_idx;
         }
         queue->last_tick_idx = curr_tick_idx;
+        queue->last_tick = now_tick;
     }
 capped_out:
     /* Recompute the cached earliest deadline while we still own the wheel: the

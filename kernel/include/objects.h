@@ -810,7 +810,7 @@ typedef struct timer_entry {
     ktimer_t *pending;
     struct timer_queue *queue;
     thread_t *thread;
-    uint32_t overruns;
+    uint32_t overruns; /* periods timer_rearm skipped for a timer far behind */
     int8_t unused;
 
     /* Non-zero when this timer holds one notification_souls reservation for its
