@@ -1,0 +1,129 @@
+# Publish the RV64 LKL archives as the lkl-rv64-nightly prerelease.
+#
+# Runs nightly and on demand.  It resolves the upstream lkl/linux commit, skips
+# the build when that commit and the build inputs match the last published
+# release, otherwise calls build-lkl.yml (which caches the archives by commit
+# and inputs) and replaces the release with the fresh tarballs.  Pushes and
+# pull requests never publish: they only use build-lkl.yml through lkl-qemu.yml.
+#
+# The release always holds exactly the latest build: liblkl-rv64-fsd.tar.gz,
+# liblkl-rv64-netd.tar.gz and sha256sums.txt.  Its notes record the upstream
+# commit and a hash of the build inputs, which is how the next run decides
+# whether anything changed.
+name: Publish LKL (rv64 nightly)
+
+on:
+  schedule:
+    - cron: '30 0 * * *'
+  workflow_dispatch:
+    inputs:
+      lkl_ref:
+        description: 'lkl/linux branch, tag or commit (default: HEAD)'
+        default: ''
+      force:
+        description: 'Publish even if upstream and the build inputs are unchanged'
+        type: boolean
+        default: false
+
+concurrency:
+  group: lkl-rv64-nightly
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  NIGHTLY_TAG: lkl-rv64-nightly
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    outputs:
+      commit: ${{ steps.head.outputs.commit }}
+      inputs_hash: ${{ steps.head.outputs.inputs_hash }}
+      needs_build: ${{ steps.compare.outputs.needs_build }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - id: head
+        env:
+          LKL_REF: ${{ inputs.lkl_ref }}
+        run: |
+          commit=$(scripts/lkl/resolve-ref.sh "$LKL_REF")
+          # The same hash build-lkl.yml keys its archive cache on.
+          inputs_hash=$(scripts/lkl/inputs-hash.sh)
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "inputs_hash=$inputs_hash" >> "$GITHUB_OUTPUT"
+
+      - id: compare
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ inputs.force }}
+          LKL_REF: ${{ inputs.lkl_ref }}
+          COMMIT: ${{ steps.head.outputs.commit }}
+          INPUTS_HASH: ${{ steps.head.outputs.inputs_hash }}
+        run: |
+          # A named ref is an explicit request, so it always builds.
+          if [ "$FORCE" = true ] || [ -n "$LKL_REF" ]; then
+              echo "needs_build=true" >> "$GITHUB_OUTPUT"
+              exit 0
+          fi
+          notes=$(gh release view "$NIGHTLY_TAG" --json body --jq .body 2>/dev/null) || notes=
+          last_commit=$(printf '%s\n' "$notes" | sed -n 's/^commit=//p' | head -1)
+          last_hash=$(printf '%s\n' "$notes" | sed -n 's/^inputs_hash=//p' | head -1)
+          if [ "$last_commit" = "$COMMIT" ] && [ "$last_hash" = "$INPUTS_HASH" ]; then
+              echo "needs_build=false" >> "$GITHUB_OUTPUT"
+              echo "Upstream $COMMIT and the build inputs are unchanged; nothing to publish."
+          else
+              echo "needs_build=true" >> "$GITHUB_OUTPUT"
+              echo "Changed: commit ${last_commit:-none} -> $COMMIT"
+          fi
+
+  build:
+    needs: check
+    if: needs.check.outputs.needs_build == 'true'
+    uses: ./.github/workflows/build-lkl.yml
+    with:
+      lkl_ref: ${{ needs.check.outputs.commit }}
+
+  publish:
+    needs: [check, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          pattern: lkl-rv64-*
+          merge-multiple: true
+
+      - name: Replace the prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          COMMIT: ${{ needs.check.outputs.commit }}
+          INPUTS_HASH: ${{ needs.check.outputs.inputs_hash }}
+        run: |
+          (cd dist && sha256sum liblkl-rv64-*.tar.gz > sha256sums.txt)
+          date=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          {
+              echo "Prebuilt RV64 LKL archives for RTMux (fsd and netd personalities)."
+              echo
+              echo "commit=$COMMIT"
+              echo "inputs_hash=$INPUTS_HASH"
+              echo "date=$date"
+              echo "upstream=https://github.com/lkl/linux/commit/$COMMIT"
+          } > notes.md
+          files="dist/liblkl-rv64-fsd.tar.gz dist/liblkl-rv64-netd.tar.gz dist/sha256sums.txt"
+          title="LKL rv64 nightly ($date)"
+          # Keep the existing release until its replacement assets are uploaded,
+          # so a failed or cancelled run never leaves the tag without archives.
+          # The notes (which the next run compares against) change last.
+          if gh release view "$NIGHTLY_TAG" >/dev/null 2>&1; then
+              gh release upload "$NIGHTLY_TAG" $files --clobber
+              gh release edit "$NIGHTLY_TAG" --title "$title" --notes-file notes.md --prerelease
+          else
+              gh release create "$NIGHTLY_TAG" --title "$title" \
+                  --notes-file notes.md --prerelease $files
+          fi
