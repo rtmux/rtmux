@@ -20,15 +20,11 @@ all: $(OBJECTS)
 $(OBJDIR)/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(msg) CC $@
-	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
-
-# These rules have no automatic header tracking.  hardware-init.o bakes
-# RTMUX_BUILD_ID into the syspage, so it must follow the generated header, or a
-# new commit would leave a stale kernel id and roottask would report a false
-# "version skew".
-$(OBJDIR)/hardware-init.o: $(abspath $(TOPDIR))/internal/include/rtmux-version.h
+	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) $(DEPFLAGS) -c -o $@ $<
 
 clean:
 	$(Q)rm -rf $(BUILD_BASE)
 
 .PHONY: all clean
+
+$(eval $(call dep-include,$(OBJECTS)))

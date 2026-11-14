@@ -643,7 +643,11 @@ static void thread_soul_free(process_t *prp, thread_t *thp)
     object_free(prp, &thread_souls, thp);
 }
 
-static int thread_active_hart(thread_t *thp)
+/* The hart that has thp as its current thread, or -1. Also used by the exit
+ * paths to tell a parked stopped thread from one that set STATE_STOPPED and is
+ * still running toward block().
+ */
+int thread_active_hart(thread_t *thp)
 {
     extern unsigned hart_ids[];
 

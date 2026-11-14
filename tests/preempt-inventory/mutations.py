@@ -6,12 +6,19 @@ scripts/preempt-inventory.sh to fail with a specific message, so a gate that
 silently accepts a bad classification is caught.
 """
 
+import re
 import shutil
 import subprocess
 import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def scanned_dirs():
+    """The directories the gate scans, read from the script so the two cannot drift."""
+    text = (ROOT / "scripts/preempt-inventory.sh").read_text()
+    return re.search(r'^DIRS="([^"]+)"', text, re.M).group(1).split()
 
 
 def run(root, *args):
@@ -28,8 +35,7 @@ def expect_failure(root, message, what):
 def main():
     with tempfile.TemporaryDirectory(prefix="rtmux-preempt-mutations-") as tmp:
         work = Path(tmp)
-        for directory in ("kernel/ipc", "kernel/sync", "kernel/xfer", "kernel/thread",
-                          "kernel/ext", "kernel/sched", "kernel/time", "scripts"):
+        for directory in (*scanned_dirs(), "scripts"):
             (work / directory).parent.mkdir(parents=True, exist_ok=True)
             shutil.copytree(ROOT / directory, work / directory, symlinks=True)
         baseline = run(work)
@@ -61,6 +67,60 @@ def main():
         source.write_text("void q83_mutation(void)\n{\n    for (;;) {\n    }\n}\n")
         expect_failure(work, "unclassified long loop", "new for (;;) loop")
         source.unlink()
+
+        # 1b. Every scanned directory rejects a new loop, including the ones added
+        # after the original IPC/sync/sched scope.
+        for rel in scanned_dirs():
+            source = work / rel / "q83-mutation.c"
+            source.write_text("void q83_mutation(void)\n{\n    for (;;) {\n    }\n}\n")
+            expect_failure(work, "unclassified long loop", f"new for (;;) loop in {rel}")
+            source.unlink()
+
+        # 1b2. Headers and assembly are scanned too: a loop in a header, or a backward
+        # branch in an assembly file, must be classified; a forward branch is not a loop.
+        header = work / "kernel/include/q83-mutation.h"
+        header.write_text("static inline void q83_h(void)\n{\n    for (;;) {\n    }\n}\n")
+        expect_failure(work, "unclassified long loop", "new loop in a header")
+        header.unlink()
+        asm = work / "arch/riscv/q83-mutation.S"
+        for body, what in (
+            ("q83_spin:\n\twfi\n\tj\tq83_spin\n", "new backward branch in assembly"),
+            ("q83_numeric:\n1:\twfi\n\tbnez\ta0, 1b\n", "new numeric backward branch"),
+            ("q83_cmt:\n1:\twfi\n\tbnez\ta0, 1b /* retry */\n",
+             "backward branch with a trailing block comment"),
+            ("q83_semi:\n1:\twfi; bnez a0, 1b\n", "backward branch after a semicolon"),
+        ):
+            asm.write_text(body)
+            expect_failure(work, "unclassified long loop", what)
+        asm.unlink()
+        header.write_text("static inline void q83_i(void)\n{\n    __asm__ volatile(\n"
+                          "        \"1: lw t1, (%0)\\n\"\n        \"   bnez t1, 1b\\n\" ::);\n}\n")
+        expect_failure(work, "unclassified long loop", "backward branch in an inline-asm string")
+        header.unlink()
+        asm.write_text("q83_fwd:\n\tbeqz\ta0, 1f\n\tnop\n1:\tret\n")
+        result = run(work)
+        if result.returncode != 0:
+            raise SystemExit("a forward branch in assembly was reported as a loop:\n" + result.stdout)
+        # A loop inside a multi-line block comment is not code.
+        asm.write_text("q83_c:\n/*\n1:\twfi\n\tbnez\ta0, 1b\n*/\n\tret\n")
+        result = run(work)
+        if result.returncode != 0:
+            raise SystemExit("a branch inside a block comment was reported as a loop:\n" + result.stdout)
+        asm.unlink()
+
+        # A member access in the condition is not a comparison: this is a spin on a
+        # flag, not a counting loop.
+        source = work / "kernel/ipc/q83-mutation.c"
+        source.write_text("void q83_arrow(struct s *p)\n{\n    int i;\n\n    for (i = 0; p->busy; i++) {\n    }\n}\n")
+        expect_failure(work, "unclassified long loop", "for loop whose condition only has ->")
+        source.unlink()
+
+        # 1c. A new kernel directory with source files must not escape the scan scope.
+        newdir = work / "kernel/q83newdir"
+        newdir.mkdir()
+        (newdir / "x.c").write_text("void q83_x(void)\n{\n}\n")
+        expect_failure(work, "holds source files but is not in DIRS", "new kernel directory")
+        shutil.rmtree(newdir)
 
         # 2. Function-name parsing of int(xfer_memchk)(...) style definitions.
         source = work / "kernel/xfer/q83-mutation.c"
@@ -113,6 +173,11 @@ def main():
         # 8. input_dependent must name the input and a tracked review.
         mutate_first("input_dependent", "", lambda l: set_reason(l, "input: iovec count"))
         expect_failure(work, "input_dependent needs input: and review: Q<n>", "no review")
+        restore()
+
+        # 8b. terminal must say it is terminal and name what it holds.
+        mutate_first("terminal", "", lambda l: set_reason(l, "parks the hart"))
+        expect_failure(work, "terminal needs terminal: and holds:", "terminal without fields")
         restore()
 
         # 9. bounded and checkpointed need a stated bound or checkpoint.

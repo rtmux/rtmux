@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <sys/dispatch.h>
 #include <sys/rtmux-core.h>
@@ -21,6 +22,8 @@
 #define DEFAULT_SAMPLES 5
 #define PROBE_ITERS 128
 #define WAIT_LOOPS 20000
+/* How long every client may take to land its first send before detach. */
+#define FIRST_SEND_WAIT_MS 2000
 
 struct revoke_args {
     const char *name;
@@ -291,11 +294,20 @@ static int run_once(int nclients, int iters, uint64_t *detach_ns,
         launched++;
     }
 
-    for (int i = 0; i < WAIT_LOOPS &&
-                    atomic_load_explicit(&rargs.sends,
-                                         memory_order_relaxed) < nclients;
-         i++)
-        (void) __sched_yield();
+    /* Wait on time, sleeping, not on a count of yields. Each first send is a
+     * name_open through roottask's path manager, and four of them contend
+     * there; 20000 yields lasted only 30 to 60 ms and sometimes ran out while
+     * they were still queued. A spinning wait also holds a hart the clients and
+     * roottask could use.
+     */
+    for (int ms = 0; ms < FIRST_SEND_WAIT_MS &&
+                     atomic_load_explicit(&rargs.sends,
+                                          memory_order_relaxed) < nclients;
+         ms++) {
+        struct timespec ts = {0, 1000000};
+
+        (void) nanosleep(&ts, NULL);
+    }
     if (atomic_load_explicit(&rargs.sends, memory_order_relaxed) < nclients) {
         errno = ETIMEDOUT;
         goto done;

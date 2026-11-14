@@ -30,7 +30,7 @@ all: $(TARGET)
 $(OBJDIR)/%.o: %.c server.h pcidrvr.h globals.h slogcodes.h
 	@mkdir -p $(@D)
 	$(msg) CC $@
-	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
+	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) $(DEPFLAGS) -c -o $@ $<
 
 $(TARGET): $(OBJS) $(CRT0_O) $(LIBC_SO)
 	@mkdir -p $(@D)
@@ -41,3 +41,5 @@ clean:
 	$(Q)rm -rf $(BUILD_BASE)
 
 .PHONY: all clean
+
+$(eval $(call dep-include,$(OBJS)))

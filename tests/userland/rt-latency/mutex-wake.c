@@ -43,6 +43,8 @@
 #include <sys/rtmux-core.h>
 #include <sys/syspage.h>
 
+#include "../outcome.h"
+
 extern struct syspage_entry *_syspage_ptr;
 
 #define HOLDER_CPU 0
@@ -258,8 +260,7 @@ int main(void)
 
     if (rate == 0) {
         printf("mutex-wake: SKIP counter rate unavailable\n");
-        printf("mutex-wake: PASS (skipped)\n");
-        return EXIT_SUCCESS;
+        return TC_EXIT_SKIP;
     }
     /* Sit the controller on its own hart, distinct from the holder (cpu0) and
      * waiter (cpu1) harts, so it does not compete with the steady-state
@@ -271,8 +272,7 @@ int main(void)
      */
     if (pin_to_cpu(CTRL_CPU) == -1) {
         printf("mutex-wake: SKIP needs at least 3 harts\n");
-        printf("mutex-wake: PASS (skipped)\n");
-        return EXIT_SUCCESS;
+        return TC_EXIT_SKIP;
     }
 
     rc = pthread_mutexattr_init(&attr);

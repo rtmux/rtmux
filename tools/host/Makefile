@@ -36,7 +36,21 @@ PROGS = $(BUILD_BASE)/mkasmoff $(BUILD_BASE)/mkromfs $(BUILD_BASE)/treeromfs \
         $(BUILD_BASE)/ldso-hash-test $(BUILD_BASE)/ldso-page-test \
         $(BUILD_BASE)/ldso-parse-test $(BUILD_BASE)/ldso-path-test \
         $(BUILD_BASE)/cpio-parser-test $(BUILD_BASE)/spawn-fd-policy-test \
-        $(BUILD_BASE)/serial-reply-test
+        $(BUILD_BASE)/serial-reply-test $(BUILD_BASE)/outcomes-test
+
+# Each tool compiles and links its sources in one command, so -MMD cannot give a
+# per-tool dependency file (with several sources it writes one named after each
+# source, into the source directory). These tools are cheap to build, so every
+# one depends on every header in the trees they include from: a header edit
+# rebuilds them, and no header can be forgotten from a hand-written list.
+HOST_HDRS = $(wildcard $(TOPDIR)/include/*.h $(TOPDIR)/include/*/*.h \
+                       $(TOPDIR)/internal/include/*.h $(TOPDIR)/internal/include/*/*.h \
+                       $(TOPDIR)/kernel/include/*.h $(TOPDIR)/kernel/include/*/*.h \
+                       $(TOPDIR)/servers/roottask/include/*.h \
+                       $(TOPDIR)/lib/common/*.h $(TOPDIR)/lib/ldso/*.h \
+                       $(TOPDIR)/lib/ldso/*/*.h $(TOPDIR)/userland/romfs/*.h \
+                       $(TOPDIR)/userland/dev-serial-common/*.h \
+                       $(TOPDIR)/tests/userland/outcome.h)
 
 all: $(PROGS)
 
@@ -46,6 +60,12 @@ $(BUILD_BASE)/spawn-fd-policy-test: $(TEST_DIR)/test-spawn-fd-policy.c \
 	$(msg) HOSTCC $(notdir $@)
 	$(Q)$(HOST_CC) $(HOST_CPPFLAGS) -I../../internal/include -I../../include $(HOST_CFLAGS) -o $@ \
 	    $(TEST_DIR)/test-spawn-fd-policy.c
+
+# Outcome accounting (pass/fail/gap/skip) shared with the guest suite.
+$(BUILD_BASE)/outcomes-test: $(TEST_DIR)/test-outcomes.c ../../tests/userland/outcome.h
+	@mkdir -p $(@D)
+	$(msg) HOSTCC $(notdir $@)
+	$(Q)$(HOST_CC) -I../../tests/userland $(HOST_CFLAGS) -o $@ $(TEST_DIR)/test-outcomes.c
 
 # The shared serial service is compiled against the tree's own headers with the
 # IPC calls stubbed (the host libc has no ssp/string.h, so fortify is off).
@@ -145,7 +165,7 @@ host-tests: $(BUILD_BASE)/path-normalize-test $(BUILD_BASE)/cap-table-test \
             $(BUILD_BASE)/ldso-hash-test $(BUILD_BASE)/ldso-page-test \
             $(BUILD_BASE)/ldso-parse-test $(BUILD_BASE)/ldso-path-test \
             $(BUILD_BASE)/cpio-parser-test $(BUILD_BASE)/spawn-fd-policy-test \
-            $(BUILD_BASE)/serial-reply-test
+            $(BUILD_BASE)/serial-reply-test $(BUILD_BASE)/outcomes-test
 	$(Q)$<
 	$(Q)$(BUILD_BASE)/cap-table-test
 	$(Q)$(BUILD_BASE)/bootstrap-manifest-test
@@ -157,6 +177,7 @@ host-tests: $(BUILD_BASE)/path-normalize-test $(BUILD_BASE)/cap-table-test \
 	$(Q)$(BUILD_BASE)/cpio-parser-test
 	$(Q)$(BUILD_BASE)/spawn-fd-policy-test
 	$(Q)$(BUILD_BASE)/serial-reply-test
+	$(Q)$(BUILD_BASE)/outcomes-test >/dev/null
 	$(Q)$(PYTHON) $(TEST_DIR)/test-capability-namespace-doc.py
 	$(Q)$(PYTHON) $(TEST_DIR)/test-management-ipc-lock.py
 	$(Q)HOST_CC="$(HOST_CC)" $(PYTHON) -I $(TEST_DIR)/test-lkl-iommu-contract.py
@@ -328,3 +349,7 @@ clean:
 	$(Q)rm -rf $(FUZZ_OUT)
 
 .PHONY: all clean host-tests cap-table-test host-sanitize host-fuzz
+
+# After every recipe rule, so these extra prerequisites follow the sources and $< in
+# the recipes above still names the first source file.
+$(PROGS): $(HOST_HDRS)

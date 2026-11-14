@@ -1236,7 +1236,7 @@ static void test_nanosleep_1ns_storm(void)
     char detail[200];
 
     if (sysconf(_SC_NPROCESSORS_ONLN) < 3) {
-        printf("  SKIP  nanosleep_1ns_storm (needs 3 online harts)\n");
+        test_skip("nanosleep_1ns_storm", "needs 3 online harts");
         return;
     }
     c.sleeper_cpu = 1;

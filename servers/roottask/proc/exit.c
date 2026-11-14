@@ -13,6 +13,7 @@
 #include <private/root-proc-info.h>
 #include "private.h"
 #include "root-process.h"
+#include "as.h"
 
 /* proc_exit — handle a _PROC_EXIT message from a dying process.
  *
@@ -223,6 +224,7 @@ int proc_terminate(message_context_t *ctp,
             if (proc_wlock_adp(pid) != -1) {
                 proc_lock_owner_mark(pid);
                 root_vm_ops.munmap(pid, prp, 0, ~(size_t) 0, 0);
+                as_mdestroy_pid(pid);
                 proc_unlock_adp(pid);
             }
             proc_wlock_adp(ROOTTASK_PID);

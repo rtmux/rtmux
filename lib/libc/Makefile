@@ -224,81 +224,81 @@ $(LIBC_SO): $(ALL_OBJS) libc.map
 # Pattern rules by source directory
 $(OBJDIR)/%.o: string/%.c | $(OBJDIR)
 	$(msg) CC $@
-	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
+	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) $(DEPFLAGS) -c -o $@ $<
 
 $(OBJDIR)/%.o: stdlib/%.c | $(OBJDIR)
 	$(msg) CC $@
-	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
+	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) $(DEPFLAGS) -c -o $@ $<
 
 $(OBJDIR)/%.o: rtmux/%.c | $(OBJDIR)
 	$(msg) CC $@
-	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
+	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) $(DEPFLAGS) -c -o $@ $<
 
 $(OBJDIR)/%.o: posix/%.c | $(OBJDIR)
 	$(msg) CC $@
-	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
+	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) $(DEPFLAGS) -c -o $@ $<
 
 $(OBJDIR)/%.o: posix/mman/%.c | $(OBJDIR)
 	$(msg) CC $@
-	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
+	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) $(DEPFLAGS) -c -o $@ $<
 
 $(OBJDIR)/%.o: xopen/%.c | $(OBJDIR)
 	$(msg) CC $@
-	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
+	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) $(DEPFLAGS) -c -o $@ $<
 
 $(OBJDIR)/%.o: alloc/%.c | $(OBJDIR)
 	$(msg) CC $@
-	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) -Ialloc -c -o $@ $<
+	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) -Ialloc $(DEPFLAGS) -c -o $@ $<
 
 $(OBJDIR)/%.o: support/%.c | $(OBJDIR)
 	$(msg) CC $@
-	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
+	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) $(DEPFLAGS) -c -o $@ $<
 
 $(OBJDIR)/%.o: services/%.c | $(OBJDIR)
 	$(msg) CC $@
-	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
+	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) $(DEPFLAGS) -c -o $@ $<
 
 $(OBJDIR)/%.o: dispatch/%.c | $(OBJDIR)
 	$(msg) CC $@
-	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
+	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) $(DEPFLAGS) -c -o $@ $<
 
 $(OBJDIR)/%.o: ioserv/%.c | $(OBJDIR)
 	$(msg) CC $@
-	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
+	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) $(DEPFLAGS) -c -o $@ $<
 
 $(OBJDIR)/%.o: pthread/%.c | $(OBJDIR)
 	$(msg) CC $@
-	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
+	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) $(DEPFLAGS) -c -o $@ $<
 
 $(OBJDIR)/%.o: spawn/%.c | $(OBJDIR)
 	$(msg) CC $@
-	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
+	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) $(DEPFLAGS) -c -o $@ $<
 
 $(OBJDIR)/%.o: stdio/%.c | $(OBJDIR)
 	$(msg) CC $@
-	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
+	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) $(DEPFLAGS) -c -o $@ $<
 
 $(OBJDIR)/%.o: posix/$(ARCH)/%.S | $(OBJDIR)
 	$(msg) AS $@
-	$(Q)$(CC) -I$(INCDIR) -I$(ARCHINCDIR) $(CFLAGS) -c -o $@ $<
+	$(Q)$(CC) -I$(INCDIR) -I$(ARCHINCDIR) $(CFLAGS) $(DEPFLAGS) -c -o $@ $<
 
 $(OBJDIR)/%.o: pthread/$(ARCH)/%.S | $(OBJDIR)
 	$(msg) AS $@
-	$(Q)$(CC) -I$(INCDIR) -I$(ARCHINCDIR) $(CFLAGS) -c -o $@ $<
+	$(Q)$(CC) -I$(INCDIR) -I$(ARCHINCDIR) $(CFLAGS) $(DEPFLAGS) -c -o $@ $<
 
 $(OBJDIR)/%.o: atomic/$(ARCH)/%.S | $(OBJDIR)
 	$(msg) AS $@
-	$(Q)$(CC) -I$(INCDIR) -I$(ARCHINCDIR) $(CFLAGS) -c -o $@ $<
+	$(Q)$(CC) -I$(INCDIR) -I$(ARCHINCDIR) $(CFLAGS) $(DEPFLAGS) -c -o $@ $<
 
 $(OBJDIR)/%.o: $(ARCH)/%.c | $(OBJDIR)
 	$(msg) CC $@
-	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) -fPIC -c -o $@ $<
+	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) -fPIC $(DEPFLAGS) -c -o $@ $<
 
 # CRT0 — standalone object (not in libc.a), linked into every user-space program
 $(CRT0_O): $(ARCH)/crt0.S
 	@mkdir -p $(@D)
 	$(msg) AS $@
-	$(Q)$(CC) -I$(INCDIR) -I$(ARCHINCDIR) $(CFLAGS) -c -o $@ $<
+	$(Q)$(CC) -I$(INCDIR) -I$(ARCHINCDIR) $(CFLAGS) $(DEPFLAGS) -c -o $@ $<
 
 $(OBJDIR):
 	$(Q)mkdir -p $@
@@ -307,3 +307,5 @@ clean:
 	$(Q)rm -rf $(BUILD_BASE)
 
 .PHONY: all clean
+
+$(eval $(call dep-include,$(ALL_OBJS) $(CRT0_O)))

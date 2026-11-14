@@ -9,9 +9,11 @@ LKL_OUT_NAME ?= out-rtmux
 LKL_OUT ?= ../../prebuilt/lkl-rv64/$(LKL_OUT_NAME)
 LKL_RTMUX_LIB ?= $(LKL_OUT)/liblkl-rtmux.a
 LKL_CPPFLAGS = -I../lkl/include -I../lkl -isystem $(LKL_OUT)/include
-LKL_HOST_SRC = ../lkl/host.c
-LKL_VIRTIO_SRC = ../lkl/virtio.c
-LKL_SERVER_SRC = ../lkl/server.c
+# The LKL headers come in through -isystem, which -MMD leaves out of the .d files,
+# so a header-only change in a regenerated LKL tree (the archive is the only
+# prerequisite that changes mtime otherwise) would not rebuild the servers. -MD
+# records system headers too.
+LKL_DEPFLAGS = -MD -MP
 LKL_CONNECTPATH_SRC = ../lkl/connectpath.c
 LKL_SERVER_VIRTIO ?= y
 LKL_SERVER_OBJS = $(OBJDIR)/host.o $(OBJDIR)/server.o $(OBJDIR)/connectpath.o
@@ -19,26 +21,24 @@ ifeq ($(LKL_SERVER_VIRTIO),y)
 LKL_SERVER_OBJS += $(OBJDIR)/virtio.o
 endif
 
-$(OBJDIR)/host.o: $(LKL_HOST_SRC) $(LKL_RTMUX_LIB)
+# Objects built from ../lkl against the LKL headers (virtio.o is linked only when
+# LKL_SERVER_VIRTIO=y; listing it here is harmless otherwise).
+LKL_HDR_OBJS = $(OBJDIR)/host.o $(OBJDIR)/server.o $(OBJDIR)/virtio.o
+# Recipe for an object that includes the LKL headers (one place for the flags).
+define lkl-cc
 	@mkdir -p $(@D)
 	$(msg) CC $@
-	$(Q)$(CC) $(CPPFLAGS) $(LKL_CPPFLAGS) $(CFLAGS) -MMD -MP -c -o $@ $<
+	$(Q)$(CC) $(CPPFLAGS) $(LKL_CPPFLAGS) $(CFLAGS) $(LKL_DEPFLAGS) -c -o $@ $<
+endef
 
-$(OBJDIR)/virtio.o: $(LKL_VIRTIO_SRC) $(LKL_RTMUX_LIB)
-	@mkdir -p $(@D)
-	$(msg) CC $@
-	$(Q)$(CC) $(CPPFLAGS) $(LKL_CPPFLAGS) $(CFLAGS) -MMD -MP -c -o $@ $<
-
-$(OBJDIR)/server.o: $(LKL_SERVER_SRC) $(LKL_RTMUX_LIB)
-	@mkdir -p $(@D)
-	$(msg) CC $@
-	$(Q)$(CC) $(CPPFLAGS) $(LKL_CPPFLAGS) $(CFLAGS) -MMD -MP -c -o $@ $<
+$(LKL_HDR_OBJS): $(OBJDIR)/%.o: ../lkl/%.c $(LKL_RTMUX_LIB)
+	$(lkl-cc)
 
 # connectpath.c is pure libc (no LKL headers), also host-fuzzed via tools/host.
 $(OBJDIR)/connectpath.o: $(LKL_CONNECTPATH_SRC)
 	@mkdir -p $(@D)
 	$(msg) CC $@
-	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c -o $@ $<
+	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) $(DEPFLAGS) -c -o $@ $<
 
 # Obtain the LKL archive: build it from source when LKL_SRC is set (must be an
 # absolute path to an LKL tree), else extract the prebuilt tarball.  Both land in

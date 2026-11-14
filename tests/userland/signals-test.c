@@ -1019,10 +1019,13 @@ static void test_jobctl_tty(void)
     int termios_saved;
 
     if (fd < 0 || !isatty(fd) || tcgetpgrp(fd) != getpgrp()) {
-        printf("  SKIP: jobctl tty fixtures (fd %d, isatty %d, tcgetpgrp %d, "
-               "getpgrp %d, errno %d)\n",
-               fd, fd >= 0 ? isatty(fd) : -1, fd >= 0 ? tcgetpgrp(fd) : -1,
-               (int) getpgrp(), errno);
+        char why[192];
+
+        snprintf(why, sizeof why,
+                 "tty fixtures unavailable: fd %d, isatty %d, tcgetpgrp %d, getpgrp %d, errno %d",
+                 fd, fd >= 0 ? isatty(fd) : -1, fd >= 0 ? tcgetpgrp(fd) : -1,
+                 (int) getpgrp(), errno);
+        test_skip("jobctl tty fixtures", why);
         if (fd >= 0)
             close(fd);
         return;

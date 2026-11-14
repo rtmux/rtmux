@@ -30,6 +30,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "outcome.h"
 #include "test.h"
 
 struct test_suite {
@@ -57,9 +58,7 @@ static const struct test_suite test_suites[] = {
 };
 
 /* Test infrastructure */
-static int tests_run;
-static int tests_passed;
-static int tests_failed;
+static struct test_counts counts;
 static volatile uintptr_t fault_addr_seed = 1U;
 
 #define FAULT_RECOVERY_CHECK(name, expr, detail) \
@@ -105,16 +104,22 @@ struct pthread_cancel_child_ctx {
 
 void test_ok(const char *name)
 {
-    tests_run++;
-    tests_passed++;
-    printf("  PASS  %s\n", name);
+    tc_ok(&counts, name);
 }
 
 void test_fail(const char *name, const char *detail)
 {
-    tests_run++;
-    tests_failed++;
-    printf("  FAIL  %s: %s\n", name, detail);
+    tc_fail(&counts, name, detail);
+}
+
+void test_gap(const char *name, const char *anchor, const char *expected, const char *observed)
+{
+    tc_gap(&counts, name, anchor, expected, observed);
+}
+
+void test_skip(const char *name, const char *reason)
+{
+    tc_skip(&counts, name, reason);
 }
 
 void check(int cond, const char *name, const char *detail)
@@ -779,20 +784,22 @@ static int run_laps(int laps)
     int total_failed = 0;
 
     for (int lap = 1; lap <= laps; lap++) {
-        int grown;
+        int lap_failed;
 
-        tests_run = tests_passed = tests_failed = 0;
+        counts = (struct test_counts) {0};
         printf("lap=%d BEGIN\n", lap);
         for (size_t i = 0; i < sizeof test_suites / sizeof test_suites[0]; i++) {
             printf("%s[%s]\n", i == 0 ? "" : "\n", test_suites[i].name);
             test_suites[i].run();
             leak_suite_delta(lap, test_suites[i].name);
         }
-        grown = leak_lap_check(lap);
-        printf("\n=== Results: %d tests, %d passed, %d failed ===\n", tests_run,
-               tests_passed, tests_failed);
-        total_failed += tests_failed + grown;
-        printf("lap=%d %s\n", lap, tests_failed || grown ? "FAIL" : "PASS");
+        lap_failed = counts.failed + leak_lap_check(lap);
+        tc_summary(&counts);
+        /* A lap that ran no case (every one skipped) is not a pass. */
+        if (!lap_failed && tc_status(&counts, 1))
+            lap_failed = 1;
+        total_failed += lap_failed;
+        printf("lap=%d %s\n", lap, lap_failed ? "FAIL" : "PASS");
     }
     printf("laps=%d cumulative_failures=%d\n", laps, total_failed);
     return total_failed ? EXIT_FAILURE : EXIT_SUCCESS;
@@ -829,9 +836,8 @@ int main(int argc, char *argv[])
     if (argc == 2 && !strcmp(argv[1], "--sys-log-wrap")) {
         printf("=== RTMux /sys/log Wrap Test ===\n\n[sys_log_wrap]\n");
         test_sys_log_wrap();
-        printf("\n=== Results: %d tests, %d passed, %d failed ===\n",
-               tests_run, tests_passed, tests_failed);
-        return tests_failed || !tests_passed ? EXIT_FAILURE : EXIT_SUCCESS;
+        tc_summary(&counts);
+        return tc_status(&counts, 1) ? EXIT_FAILURE : EXIT_SUCCESS;
     }
     if (argc == 2 && !strcmp(argv[1], "--posix-cap-boundary-child"))
         return posix_cap_boundary_child();
@@ -839,55 +845,44 @@ int main(int argc, char *argv[])
         printf("=== RTMux POSIX Capability Boundary Test ===\n\n");
         printf("[posix-cap-boundary]\n");
         test_posix_cap_boundary();
-        printf("\n=== Results: %d tests, %d passed, %d failed ===\n",
-               tests_run, tests_passed, tests_failed);
-        return tests_failed ? EXIT_FAILURE : EXIT_SUCCESS;
+        tc_summary(&counts);
+        return tc_status(&counts, 0) ? EXIT_FAILURE : EXIT_SUCCESS;
     }
     if (argc == 4 && !strcmp(argv[1], "--disconnect-child"))
         return disconnect_child(argv[2], argv[3]);
     if (argc == 2 && !strcmp(argv[1], "--disconnect-alloc-failure")) {
-        int skipped;
-
         printf("[disconnect_under_alloc_failure]\n");
-        skipped = disconnect_under_alloc_failure() == DISCONNECT_SKIP;
-        if (skipped)
-            printf("  FAIL  disconnect_under_alloc_failure: fault injection "
-                   "unavailable\n");
-        printf("\n=== Results: %d tests, %d passed, %d failed ===\n",
-               tests_run, tests_passed, tests_failed);
-        return tests_failed || skipped || !tests_passed ? EXIT_FAILURE
-                                                         : EXIT_SUCCESS;
+        if (disconnect_under_alloc_failure() == DISCONNECT_SKIP)
+            test_skip("disconnect_under_alloc_failure", "fault injection unavailable");
+        tc_summary(&counts);
+        return tc_status(&counts, 1) ? EXIT_FAILURE : EXIT_SUCCESS;
     }
     if (argc == 3 && !strcmp(argv[1], "--serial-unblock-child"))
         return serial_unblock_child(!strcmp(argv[2], "announce"));
     if (argc == 2 && !strcmp(argv[1], "--serial-unblock")) {
         printf("=== RTMux Serial Unblock Test ===\n\n");
         test_serial_unblock();
-        printf("\n=== Results: %d tests, %d passed, %d failed ===\n",
-               tests_run, tests_passed, tests_failed);
-        return tests_failed || !tests_passed ? EXIT_FAILURE : EXIT_SUCCESS;
+        tc_summary(&counts);
+        return tc_status(&counts, 1) ? EXIT_FAILURE : EXIT_SUCCESS;
     }
     if (argc == 2 && !strcmp(argv[1], "--spawn-storm")) {
         printf("=== RTMux Concurrent Spawn Storm ===\n\n[spawn-storm]\n");
-        test_spawn_concurrent(1);
-        printf("\n=== Results: %d tests, %d passed, %d failed ===\n",
-               tests_run, tests_passed, tests_failed);
-        return tests_failed || !tests_passed ? EXIT_FAILURE : EXIT_SUCCESS;
+        test_spawn_concurrent();
+        tc_summary(&counts);
+        return tc_status(&counts, 1) ? EXIT_FAILURE : EXIT_SUCCESS;
     }
     if (argc == 2 && !strcmp(argv[1], "--trace-negative")) {
         printf("=== RTMux Trace Negative Test ===\n\n[trace-negative]\n");
         test_trace_negative();
-        printf("\n=== Results: %d tests, %d passed, %d failed ===\n",
-               tests_run, tests_passed, tests_failed);
-        return tests_failed || !tests_passed ? EXIT_FAILURE : EXIT_SUCCESS;
+        tc_summary(&counts);
+        return tc_status(&counts, 1) ? EXIT_FAILURE : EXIT_SUCCESS;
     }
     if (argc == 2 && !strcmp(argv[1], "--fault-recovery")) {
         printf("=== RTMux Fault Recovery Test ===\n\n");
         printf("[fault-recovery]\n");
         test_fault_recovery_subset();
-        printf("\n=== Results: %d tests, %d passed, %d failed ===\n",
-               tests_run, tests_passed, tests_failed);
-        return tests_failed ? EXIT_FAILURE : EXIT_SUCCESS;
+        tc_summary(&counts);
+        return tc_status(&counts, 0) ? EXIT_FAILURE : EXIT_SUCCESS;
     }
     if (argc == 3 && !strcmp(argv[1], "--loader-execvp-child"))
         return loader_execvp_child(argv[2]);
@@ -899,9 +894,8 @@ int main(int argc, char *argv[])
         printf("=== RTMux Loader Negative Test ===\n\n");
         printf("[loader-negative]\n");
         test_loader_negative_subset();
-        printf("\n=== Results: %d tests, %d passed, %d failed ===\n",
-               tests_run, tests_passed, tests_failed);
-        return tests_failed ? EXIT_FAILURE : EXIT_SUCCESS;
+        tc_summary(&counts);
+        return tc_status(&counts, 0) ? EXIT_FAILURE : EXIT_SUCCESS;
     }
     if (argc == 3 && !strcmp(argv[1], "--connect-gated")) {
         /* Child fixture for test_capgate: a fresh process holding no gating cap
@@ -1181,23 +1175,20 @@ int main(int argc, char *argv[])
     if (argc == 2 && !strcmp(argv[1], "--gauges")) { /* opt-in: just the gauge regressions */
         printf("=== RTMux gauge regressions ===\n\n[gauges]\n");
         test_gauges();
-        printf("\n=== Results: %d tests, %d passed, %d failed ===\n", tests_run,
-               tests_passed, tests_failed);
-        return tests_failed || !tests_passed ? EXIT_FAILURE : EXIT_SUCCESS;
+        tc_summary(&counts);
+        return tc_status(&counts, 1) ? EXIT_FAILURE : EXIT_SUCCESS;
     }
     if (argc == 2 && !strcmp(argv[1], "--orphan-send")) { /* opt-in reproducer, see leak.c */
         printf("=== RTMux orphan-send reproducer ===\n\n[gauges]\n");
         test_orphan_send_kill();
-        printf("\n=== Results: %d tests, %d passed, %d failed ===\n", tests_run,
-               tests_passed, tests_failed);
-        return tests_failed || !tests_passed ? EXIT_FAILURE : EXIT_SUCCESS;
+        tc_summary(&counts);
+        return tc_status(&counts, 1) ? EXIT_FAILURE : EXIT_SUCCESS;
     }
     if (argc == 2 && !strcmp(argv[1], "--killspawn")) { /* opt-in: not in test_suites[] */
         printf("=== RTMux Leak Gate (killspawn) ===\n\n[leak]\n");
         test_leak();
-        printf("\n=== Results: %d tests, %d passed, %d failed ===\n", tests_run,
-               tests_passed, tests_failed);
-        return tests_failed || !tests_passed ? EXIT_FAILURE : EXIT_SUCCESS;
+        tc_summary(&counts);
+        return tc_status(&counts, 1) ? EXIT_FAILURE : EXIT_SUCCESS;
     }
     if (argc == 3 && !strcmp(argv[1], "--laps") && atoi(argv[2]) > 0) {
         printf("=== RTMux Syscall Conformance Test Suite ===\n\n");
@@ -1210,8 +1201,7 @@ int main(int argc, char *argv[])
         test_suites[i].run();
     }
 
-    printf("\n=== Results: %d tests, %d passed, %d failed ===\n", tests_run,
-           tests_passed, tests_failed);
+    tc_summary(&counts);
 
-    return tests_failed ? EXIT_FAILURE : EXIT_SUCCESS;
+    return tc_status(&counts, 1) ? EXIT_FAILURE : EXIT_SUCCESS;
 }

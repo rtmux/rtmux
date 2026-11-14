@@ -9,6 +9,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -430,10 +431,20 @@ static void test_spawn_gauge(int fd)
     long process0, timer0;
     int ok, failed;
 
+    char snap[KS_BUF];
+    long pa0 = -1, pa1 = -1;
+
     spawn_batch(&ok, &failed); /* warm up */
     process0 = gauge_stable(fd, "soul.process.used");
     timer0 = gauge_stable(fd, "soul.timer.used");
+    if (kstats_read(fd, snap, sizeof snap) > 0)
+        pa0 = kstats_get(snap, "pa.free_bytes");
     spawn_batch(&ok, &failed);
+    if (kstats_read(fd, snap, sizeof snap) > 0)
+        pa1 = kstats_get(snap, "pa.free_bytes");
+    /* Physical memory is not a soul pool: report what a batch kept. */
+    printf("spawn-gauge: pa.free_bytes %ld -> %ld (%ld bytes per child)\n", pa0, pa1,
+           (pa0 - pa1) / GAUGE_CHILDREN);
     check(ok == GAUGE_CHILDREN, "spawn-gauge nap children exit 0", "child failed or was not reaped");
     check(failed == GAUGE_FAILED_SPAWNS, "spawn-gauge missing binary fails",
           "spawn or exec of a missing binary must fail");
@@ -972,6 +983,38 @@ int leak_lap_check(int lap)
     return grown;
 }
 
+/* Name every live process ("pid:name"), so a suite that leaves one behind says
+ * which. Parameters:
+ *   lap, suite : for the line prefix
+ */
+static void print_procs(int lap, const char *suite)
+{
+    DIR *d = opendir("/proc");
+    struct dirent *de;
+
+    if (!d)
+        return;
+    printf("lap=%d suite=%s procs:", lap, suite);
+    while ((de = readdir(d))) {
+        char path[64], name[48];
+        int fd;
+        ssize_t len;
+
+        if (de->d_name[0] < '0' || de->d_name[0] > '9')
+            continue;
+        snprintf(path, sizeof path, "/proc/%s/name", de->d_name);
+        name[0] = '\0';
+        if ((fd = open(path, O_RDONLY)) >= 0) {
+            if ((len = read(fd, name, sizeof name - 1)) > 0)
+                name[len - (name[len - 1] == '\n')] = '\0';
+            (void) close(fd);
+        }
+        printf(" %s:%s", de->d_name, name);
+    }
+    printf("\n");
+    (void) closedir(d);
+}
+
 /* Per-suite attribution for --laps: after each suite, print every pool whose
  * settled live count differs from the count after the previous suite ("lap=<n>
  * suite=<name> gauge <pool> <before> -> <after>"). Settled means two samples
@@ -1001,14 +1044,22 @@ void leak_suite_delta(int lap, const char *suite)
             break;
     }
     (void) close(fd);
+    /* Physical memory is not a soul pool; report it so a lap that runs the
+     * allocator dry shows which suite took the memory.
+     */
+    printf("lap=%d suite=%s pa.free_bytes=%ld roottask.heap_used=%ld\n", lap, suite,
+           kstats_get(snap, "pa.free_bytes"), kstats_get(snap, "roottask.heap_used"));
     live = kstats_get(snap, "thread.live");
     if (lap > 1 && live != live_before)
         printf("lap=%d suite=%s gauge thread.live %ld -> %ld\n", lap, suite, live_before, live);
     live_before = live;
     for (int i = 0; lap > 1 && i < n && i < before_n; i++)
-        if (cur[i].base != before[i].base)
+        if (cur[i].base != before[i].base) {
             printf("lap=%d suite=%s gauge %s %ld -> %ld\n", lap, suite, cur[i].name,
                    before[i].base, cur[i].base);
+            if (!strcmp(cur[i].name, "soul.process.used") && cur[i].base > before[i].base)
+                print_procs(lap, suite);
+        }
     memcpy(before, cur, sizeof cur);
     before_n = n;
 }

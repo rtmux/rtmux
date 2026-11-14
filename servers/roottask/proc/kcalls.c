@@ -62,7 +62,21 @@ struct kext_destroy_args {
  */
 void process_threads_destroy(process_t *prp)
 {
-    syscall_priv(__KSYS_PRIV_EXIT_DESTROY_THREADS, prp);
+    /* The kernel returns EAGAIN while a thread of prp is held by a
+     * message-delivery claim it could not wait out; the claimer may need this
+     * hart, so sleep rather than yield (a yield only lets equal priorities run)
+     * and call again.
+     */
+    static const struct timespec ts = {.tv_sec = 0, .tv_nsec = 1000000};
+    unsigned tries = 0;
+
+    while ((int) syscall_priv(__KSYS_PRIV_EXIT_DESTROY_THREADS, prp) == -EAGAIN) {
+        /* A claim normally clears within a transfer; say so if one does not. */
+        if (++tries % 1000 == 0)
+            root_warn("process_threads_destroy: teardown still waiting after %u retries\n",
+                       tries);
+        (void) nanosleep(&ts, NULL);
+    }
 }
 
 /* process_timer_destroy — destroy one timer of a process. Parameters:
@@ -116,7 +130,7 @@ struct kcall_args_process_create {
  *   out_pid    : if non-NULL, receives the new process's pid (0 on error)
  * Return value: kernel-VA process_t pointer, or (process_t *)-1 on failure.
  */
-process_t *process_create(pid_t parent_pid, void *lcp, pid_t *out_pid)
+static process_t *process_create_locked(pid_t parent_pid, void *lcp, pid_t *out_pid)
 {
     struct kcall_args_process_create data;
     process_t *prp;
@@ -171,16 +185,35 @@ process_t *process_create(pid_t parent_pid, void *lcp, pid_t *out_pid)
      * succeed.
      */
     if (as_mcreate_pid(new_pid) != EOK) {
-        /* Roll back via the regular destroy path. */
+        /* Roll back via the regular destroy path. The kernel half already has
+         * an address space (mm_mcreate), and process destroy asserts it is
+         * gone, so shut it down first, under the ROOTTASK_PID write lock that
+         * process_create holds, the way proc_exit does. process_destroy_call
+         * releases the roottask slot once the kernel half is gone.
+         */
         (void) process_destroy_all(new_pid);
+        while (process_shutdown(prp, 0) == -1 && errno == EAGAIN)
+            ;
         (void) process_destroy_call(new_pid);
-        root_process_fini(new_pid);
         if (out_pid)
             *out_pid = 0;
         return (process_t *) -1;
     }
     if (out_pid)
         *out_pid = new_pid;
+    return prp;
+}
+
+process_t *process_create(pid_t parent_pid, void *lcp, pid_t *out_pid)
+{
+    process_t *prp;
+
+    /* Held across creation so a failed as_mcreate_pid can shut the new address
+     * space down; the lock is not recursive, so callers must not hold it.
+     */
+    proc_wlock_adp(ROOTTASK_PID);
+    prp = process_create_locked(parent_pid, lcp, out_pid);
+    proc_unlock_adp(ROOTTASK_PID);
     return prp;
 }
 
@@ -218,8 +251,11 @@ int process_destroy_call(pid_t pid)
         (void) __sched_yield();
     }
 
-    /* Retries exhausted: the kernel half is still alive, so keep the slot. */
-    if (rc == EAGAIN || rc == -EAGAIN)
+    /* Retries exhausted: the kernel half is still alive, so keep the slot.
+     * ESRCH means the pid is stale or another destroy owns the teardown, which
+     * may still be running; that destroy releases the slot when it succeeds.
+     */
+    if (rc == EAGAIN || rc == -EAGAIN || rc == ESRCH || rc == -ESRCH)
         return rc;
 
     /* Release the roottask-side per-process slot once the kernel half is gone.

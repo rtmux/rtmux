@@ -25,13 +25,11 @@ $(PROG): $(OBJDIR)/main.o $(CRT0_O) $(LIBC_SO)
 $(OBJDIR)/main.o: main.c
 	@mkdir -p $(@D)
 	$(msg) CC $@
-	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c -o $@ $<
+	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) $(DEPFLAGS) -c -o $@ $<
 
 clean:
 	$(Q)rm -rf $(BUILD_BASE)
 
 .PHONY: all clean
 
-# Auto-generated header deps (-MMD/-MP above) so a touched header — including
-# the generated autoconf.h — rebuilds objects instead of leaving them stale.
--include $(OBJDIR)/main.d
+$(eval $(call dep-include,$(OBJDIR)/main.o))

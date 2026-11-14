@@ -47,6 +47,8 @@
 
 #include <arch/plic-vector.h>
 
+#include "../outcome.h"
+
 extern struct syspage_entry *_syspage_ptr;
 
 #define WAIT_CPU 0       /* waiter/client and hog share the boot hart */
@@ -852,8 +854,7 @@ int main(void)
      */
     if (pin_to_cpu(CTRL_CPU) == -1) {
         printf("preempt-latency: SKIP needs at least 3 harts\n");
-        printf("preempt-latency: PASS (skipped)\n");
-        return EXIT_SUCCESS;
+        return TC_EXIT_SKIP;
     }
 
     /* Every latency here is derived from the rdtime counter rate. Without it
@@ -861,8 +862,7 @@ int main(void)
      */
     if (cycles_per_sec() == 0) {
         printf("preempt-latency: SKIP counter rate unavailable\n");
-        printf("preempt-latency: PASS (skipped)\n");
-        return EXIT_SUCCESS;
+        return TC_EXIT_SKIP;
     }
 
     printf(

@@ -6,6 +6,7 @@
  */
 
 #include <core/globals.h>
+#include <rtmux-version.h>
 #if defined(CONFIG_INSTRUMENTATION)
 #include <trace/events.h>
 #include <user-slice.h>

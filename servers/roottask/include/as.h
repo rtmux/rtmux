@@ -266,6 +266,7 @@ extern int memory_reference(struct mm_map **,
 AS_FUNCS(as)
 extern void as_init_mem(int phase);
 extern int as_mcreate_pid(pid_t);
+extern void as_mdestroy_pid(pid_t);
 extern int munmap_flags_default;
 
 /* map_spin (intrspin_t) was replaced with map_mutex (pthread_mutex_t) for

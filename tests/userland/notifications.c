@@ -455,6 +455,5 @@ void test_notifications(void)
     test_connection_send_revoke();
     test_notification_with_queued_sender();
     if (disconnect_under_alloc_failure() == DISCONNECT_SKIP)
-        printf("  SKIP  disconnect_under_alloc_failure (fault injection "
-               "unavailable)\n");
+        test_skip("disconnect_under_alloc_failure", "fault injection unavailable");
 }

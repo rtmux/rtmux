@@ -105,8 +105,12 @@ static void trace_payload_cases(void)
 
     errno = 0;
     instr = trace_event(q) != RTMUX_TRACE_NOINSTRSUPP;
-    if (!instr || !edge) {
-        test_ok("trace payload cases skipped (stub kernel)");
+    if (!instr) {
+        test_skip("trace payload cases", "kernel built without instrumentation (stub)");
+        return;
+    }
+    if (!edge) {
+        test_skip("trace payload cases", "no unmapped user page for the fixture");
         return;
     }
 

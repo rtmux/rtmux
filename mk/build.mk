@@ -59,6 +59,27 @@ endif
 BUILD_BASE = $(if $(MODDIR),$(OUT)/$(MODDIR),$(OUT))
 OBJDIR     = $(BUILD_BASE)
 
+# Header dependency tracking. Each Makefile calls, after its object rules:
+#     $(eval $(call dep-include,<its objects>))
+# which pulls in the .d files written by $(DEPFLAGS) and makes every object depend
+# on a per-directory stamp. The stamp is created once, so an object built before
+# dependency tracking existed (no .d file) is older than it and rebuilds exactly
+# once, gaining its .d. -MP (in DEPFLAGS) keeps a deleted header harmless. The
+# stamp is not re-keyed on later flag changes: delete it (or make -B) to force one.
+#
+# The stamp rule is defined inside the macro, not at file scope: this file is
+# included before each Makefile's own first target, and a rule here would become
+# the default goal.
+DEPSTAMP = $(BUILD_BASE)/.deps
+
+define dep-include
+$(1): $$(DEPSTAMP)
+$$(DEPSTAMP):
+	@mkdir -p $$(@D)
+	@touch $$@
+-include $(1:.o=.d)
+endef
+
 # ---------------------------------------------------------------------
 # Conventional build-output paths for common dependencies. Sub-Makefiles
 # link/include against these names instead of redefining the paths.

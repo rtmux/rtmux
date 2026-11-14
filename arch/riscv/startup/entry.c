@@ -49,7 +49,10 @@ char boot_command_line[CONFIG_MAX_BOOTLINE_SIZE];
  */
 char boot_command_line_orig[CONFIG_MAX_BOOTLINE_SIZE];
 
-static char *argv[64];
+/* Every token takes at least a character and a separator, so a full boot line holds
+ * at most (size + 1) / 2 tokens, plus the terminating NULL slot.
+ */
+static char *argv[(CONFIG_MAX_BOOTLINE_SIZE + 1) / 2 + 1];
 static char **envv = NULL;
 
 
@@ -65,7 +68,8 @@ static void setup_cmdline(void)
     /* Snapshot the pristine command line before destructive split. */
     memcpy(boot_command_line_orig, boot_command_line, (size_t) n + 1);
 
-    while (i < n && argc < (int) NUM_ELTS(argv)) {
+    /* Keep a slot for the terminating NULL. */
+    while (i < n && argc < (int) NUM_ELTS(argv) - 1) {
         /* Skip consecutive spaces */
         while (i < n && s[i] == ' ')
             i++;

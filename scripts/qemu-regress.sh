@@ -491,7 +491,7 @@ usage: scripts/qemu-regress.sh [options] [-- extra emu args...]
 Options:
   --mode NAME       Guest rtmux.run mode: syscall-testing,
                     posix-cap-boundary, loader-negative, syscall-testing-disk,
-                    spawn-storm (8x100 concurrent posix_spawn; open SMP defect),
+                    spawn-storm (8x100 concurrent posix_spawn),
                     pci-nvme-smoke, rt-check, leak-gate (opt-in killspawn + laps),
                     version-skew (kernel and initramfs from two trees; expects one
                     "version skew:" line),
@@ -1558,6 +1558,21 @@ if { [ "$MODE" = "rr-fairness" ] || [ "$MODE" = "sporadic-budget" ]; } && [ -z "
     export CPUS
 fi
 
+# The *-isolated LKL modes pin the LKL server to CPU1 and the *-split modes pin
+# the load and the probe to CPU1 and CPU0, so they need two harts. The one-vCPU
+# default has no CPU1: an isolated pin fails with EINVAL and the server never
+# starts, and a split run silently falls back to one CPU.
+case "$MODE" in
+lkl-fsd-tree-isolated|lkl-netd-http-isolated|lkl-fsd-tree-split|lkl-netd-http-split)
+    [ -n "${CPUS:-}" ] || CPUS=2
+    export CPUS
+    if [ "$CPUS" -lt 2 ]; then
+        echo "qemu-regress: $MODE needs CPUS >= 2" >&2
+        exit 2
+    fi
+    ;;
+esac
+
 # preempt-latency pins a waiter and hog to CPU0, a watchdog to CPU1, and the
 # controller to CPU2, and the timer-wake gap it probes only appears with more
 # than two harts. Default to four vCPUs when the caller did not set CPUS.
@@ -2147,7 +2162,8 @@ run_one()
     local runner=$!
     local terminal=0
     while kill -0 "$runner" 2>/dev/null; do
-        if grep -Fq "$FAIL_MARKER" "$log" || grep -Eq "$BAD_RE" "$log"; then
+        if grep -Fq "$FAIL_MARKER" "$log" || grep -Fq "RTMux ${MODE}: SKIP" "$log" ||
+           grep -Eq "$BAD_RE" "$log"; then
             terminal=1
             kill "$runner" 2>/dev/null || true
             break
@@ -2231,6 +2247,12 @@ run_one()
         return 1
     fi
 
+    if grep -Fq "RTMux ${MODE}: SKIP" "$log"; then
+        echo "  FAIL     ${MODE} did not run (the guest skipped it); a mode that must run cannot pass by skipping:"
+        grep -E "^${MODE}: SKIP|RTMux ${MODE}: SKIP" "$log" | head -n 3
+        return 1
+    fi
+
     if grep -Fq "$FAIL_MARKER" "$log"; then
         echo "  FAIL     ${MODE} reported guest failure"
         tail -n 160 "$log"
@@ -2246,7 +2268,9 @@ run_one()
     if [ -n "$LAPS" ]; then
         local lap
         for lap in $(seq 1 "$LAPS"); do
-            if ! grep -Eq "^lap=${lap} PASS\r?$" "$log"; then
+            # The serial log ends lines with CR LF, and grep -E does not read
+            # "\r" in a pattern as a carriage return: drop the CRs first.
+            if ! tr -d '\r' <"$log" | grep -Eq "^lap=${lap} PASS\$"; then
                 echo "  FAIL     ${MODE} missing lap line: lap=${lap} PASS"
                 tail -n 160 "$log"
                 return 1
@@ -2256,10 +2280,11 @@ run_one()
 
     # lkl-multi-crash proves lkl-fsd survives an lkl-netd crash. The absence of
     # /net alone would also hold if lkl-netd merely exited cleanly, so require
-    # the crash path's own marker before trusting the isolation result.
+    # the crash path's own marker (the one --serve-net-crash-on-ping prints) before
+    # trusting the isolation result.
     if [ "$MODE" = "lkl-multi-crash" ] &&
-       ! grep -Fq 'lkl-netd: intentional crash after start' "$log"; then
-        echo "  FAIL     ${MODE} lkl-netd did not log its intentional crash"
+       ! grep -Fq 'lkl: virtio-net crash after bounced tx' "$log"; then
+        echo "  FAIL     ${MODE} lkl-netd did not crash after its first bounced TX"
         tail -n 160 "$log"
         return 1
     fi

@@ -52,6 +52,7 @@ jobs:
         run: |
           make -j"$(nproc)" \
                check-ci-coverage check-lkl-scripts check-make-target-names \
+               check-gap-anchors \
                check-posix-matrix check-posix-matrix-strict-ignore \
                check-posix-matrix-options check-pse51 \
                check-posix-profile-header check-posix-profile-config \
@@ -64,6 +65,11 @@ jobs:
                check-evidence-claims check-memory-safety-inventory \
                check-map-phys-inventory check-rcu-sched check-cap-v1 \
                check-trace-export check-fu740-smoke-scripts driver-gate
+
+      # Alone, not in the parallel list above: it touches shared headers, and a
+      # target compiling at the same moment would see them rebuild.
+      - name: Header dependency tracking
+        run: make check-header-deps
 
   formal:
     runs-on: ubuntu-24.04
@@ -157,6 +163,35 @@ jobs:
             run: make qemu-regress
           - name: tty-smoke
             run: make tty-smoke
+            experimental: true
+          # Non-blocking until each has passed on shared runners: these modes are
+          # timing-sensitive or slow (the realtime and IRQ modes use sub-second
+          # windows, the watchdog modes stall harts on purpose, trace-modes
+          # rebuilds an instrumented kernel, leak-gate runs the suite three times,
+          # version-skew builds two trees). Promote each once it has been green.
+          - name: rt-extra
+            run: make check-rt-extra
+            experimental: true
+          - name: irq-modes
+            run: make check-irq-modes
+            experimental: true
+          - name: guest-misc
+            run: make check-guest-misc
+            experimental: true
+          - name: hart-watchdog
+            run: make check-hart-watchdog
+            experimental: true
+          - name: trace-modes
+            run: make check-trace-modes QEMU_TRACE_TIMEOUT=300
+            experimental: true
+          - name: spawn-storm
+            run: make check-spawn-storm
+            experimental: true
+          - name: leak-gate
+            run: make check-leak-gate
+            experimental: true
+          - name: version-skew
+            run: make check-version-skew
             experimental: true
     name: runtime (${{ matrix.name }})
     steps:
