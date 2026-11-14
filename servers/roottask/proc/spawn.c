@@ -293,9 +293,7 @@ int proc_spawn(ioserv_context_t *ctp, void *vmsg)
 
         {
             pid_t new_pid = 0;
-            proc_wlock_adp(ROOTTASK_PID);
             prp = lcp->ctx.process = process_create(ppid, lcp, &new_pid);
-            proc_unlock_adp(ROOTTASK_PID);
             if (prp == (void *) -1) {
                 int err = errno ? errno : EAGAIN;
 

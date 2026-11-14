@@ -643,7 +643,11 @@ static void thread_soul_free(process_t *prp, thread_t *thp)
     object_free(prp, &thread_souls, thp);
 }
 
-static int thread_active_hart(thread_t *thp)
+/* The hart that has thp as its current thread, or -1. Also used by the exit
+ * paths to tell a parked stopped thread from one that set STATE_STOPPED and is
+ * still running toward block().
+ */
+int thread_active_hart(thread_t *thp)
 {
     extern unsigned hart_ids[];
 
@@ -1906,10 +1910,22 @@ void rdecl thread_destroy(thread_t *thp)
     if (last_active) {
         struct sigevent ev;
         uint64_t t0 = stats_enabled && join_woke ? cpu_clock_ticks() : 0;
+        pid_t pid = prp->pid; /* prp may be freed once roottask is readied */
+        int nrc;
+
         proc_threads_destroyed(prp, &ev);
-        sigevent_notification_roottask(ev.sigev_code,
-                                       (unsigned) ev.sigev_priority,
-                                       (uintptr_t) ev.sigev_value.sival_int);
+        nrc = sigevent_notification_roottask(
+            ev.sigev_code, (unsigned) ev.sigev_priority,
+            (uintptr_t) ev.sigev_value.sival_int);
+
+        /* Losing this leaves the process with no threads and nobody to free it,
+         * and its parent's wait unanswered: say so.
+         */
+        if (nrc != EOK)
+            kprintf(
+                "thread_destroy: pid %d: last-thread notification failed "
+                "(%d)\n",
+                (int) pid, nrc);
         if (stats_enabled && join_woke)
             post_notify_cycles = cpu_clock_ticks() - t0;
     }
