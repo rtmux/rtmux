@@ -29,7 +29,12 @@
 /* shift a physical address to the right place for a PTE. */
 #define PA2PTE(pa) ((((uint64_t) pa) >> 12) << 10)
 
-#define PTE2PA(pte) (((pte) >> 10) << 12)
+/* Sv39 PPN field, bits [53:10]. Bits [63:54] are not part of the physical
+ * address: Svpbmt, Svnapot and vendor extensions (T-Head C9xx memory
+ * attributes) put flags there, so mask them before shifting.
+ */
+#define PTE_PPN_MASK 0x003FFFFFFFFFFC00UL
+#define PTE2PA(pte) ((((pte) & PTE_PPN_MASK) >> 10) << 12)
 
 #define PTE_FLAGS(pte) ((pte) & 0x3FF)
 
