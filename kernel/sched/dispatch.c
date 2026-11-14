@@ -175,6 +175,32 @@ static int dispatch_unlink_ready(kdispatch_t *dpp, thread_t *thp)
     return 1;
 }
 
+/* Wake one idle hart that thp may run on, so its idle_pick_thread steals thp
+ * from the busy hart it was queued on. No-op when every legal hart is busy.
+ *
+ * A sleeping hart's active slot names its idle thread (cpu_idle points it there
+ * so pc_curthread never lags), not NULL; NULL is a hart not yet started.
+ * Testing for NULL alone never matched a sleeping hart, so the kick never fired
+ * and a thread queued behind a busy one waited for an idle hart's next timer
+ * interrupt, which under tickless idle can be seconds away.
+ */
+static void kick_idle_hart(thread_t *thp)
+{
+    extern unsigned hart_ids[];
+    unsigned mycpu = get_cpunum();
+
+    for (unsigned hi = 0; hi < num_processors; hi++) {
+        unsigned h = hart_ids[hi];
+        thread_t *act = get_active_thread(h);
+
+        if (h != mycpu && (thp->runmask & (1u << h)) == 0 && act &&
+            act == pcpu_array[h].pc_idle_thp) {
+            SENDIPI(h, IPI_RESCHED);
+            return;
+        }
+    }
+}
+
 static int rdecl select_cpu(thread_t *thp)
 {
     thread_t *act;
@@ -2192,17 +2218,7 @@ static void rdecl ready_default(thread_t *thp)
              * hart so it steals the client. If none is idle, keep the client
              * local as intended (all harts busy ⇒ no migration win anyway).
              */
-            {
-                extern unsigned hart_ids[];
-                unsigned mycpu = get_cpunum();
-                for (unsigned hi = 0; hi < num_processors; hi++) {
-                    unsigned h = hart_ids[hi];
-                    if (h != mycpu && !get_active_thread(h)) {
-                        SENDIPI(h, IPI_RESCHED);
-                        break;
-                    }
-                }
-            }
+            kick_idle_hart(thp);
 #endif
             SCHED_UNLOCK_LOCAL();
             return;
