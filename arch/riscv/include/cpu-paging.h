@@ -29,7 +29,26 @@
 /* shift a physical address to the right place for a PTE. */
 #define PA2PTE(pa) ((((uint64_t) pa) >> 12) << 10)
 
-#define PTE2PA(pte) (((pte) >> 10) << 12)
+/* Sv39 PPN field, bits [53:10]. Bits [63:54] are not part of the physical
+ * address: Svpbmt, Svnapot and vendor extensions (T-Head C9xx memory
+ * attributes) put flags there, so mask them before shifting.
+ */
+#define PTE_PPN_MASK 0x003FFFFFFFFFFC00UL
+#define PTE2PA(pte) ((((pte) & PTE_PPN_MASK) >> 10) << 12)
+
+/* T-Head C9xx (e.g. C906 in the Sophgo SG2002) memory attributes in PTE bits
+ * [63:59]. They exist only while the M-mode MXSTATUS.MAEE bit is set; then an
+ * all-zero field means non-cacheable, and atomics to such pages fault. Values
+ * follow Linux arch/riscv/include/asm/pgtable-64.h (_PAGE_PMA_THEAD,
+ * _PAGE_IO_THEAD); the openc906 user manual (section 5.2) documents SO/C/B/Sec
+ * and leaves bit 60 (SH) undefined, Linux sets it anyway.
+ */
+#define PTE_THEAD_SO (1UL << 63) /* strong order (device) */
+#define PTE_THEAD_C (1UL << 62)  /* cacheable */
+#define PTE_THEAD_B (1UL << 61)  /* bufferable */
+#define PTE_THEAD_SH (1UL << 60) /* shareable */
+#define PTE_THEAD_PMA (PTE_THEAD_C | PTE_THEAD_B | PTE_THEAD_SH)
+#define PTE_THEAD_IO (PTE_THEAD_SO | PTE_THEAD_SH)
 
 #define PTE_FLAGS(pte) ((pte) & 0x3FF)
 
@@ -87,5 +106,13 @@
 typedef uint64_t pde_t;
 typedef uint64_t pte_t;
 typedef uint64_t *pagetable_t; /* 512 PTEs */
+
+/* Extra bits OR-ed into every leaf PTE: memory type for normal RAM and for
+ * device MMIO. Zero on standard cores; set to PTE_THEAD_PMA / PTE_THEAD_IO by
+ * startup init_mmu() when it detects a T-Head core with MAEE enabled. Non-leaf
+ * PTEs never carry them. Defined in arch/riscv/cpu-pgtable.c.
+ */
+extern uint64_t riscv_pte_attr_mem;
+extern uint64_t riscv_pte_attr_io;
 
 #endif

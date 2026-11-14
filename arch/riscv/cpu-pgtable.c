@@ -24,6 +24,13 @@
 #include <core/globals.h>
 #include <paging.h>
 
+/* Leaf-PTE memory-type bits (see cpu-paging.h). Written once by startup
+ * init_mmu() before any leaf PTE is built; zero unless the core is T-Head with
+ * MAEE enabled.
+ */
+uint64_t riscv_pte_attr_mem;
+uint64_t riscv_pte_attr_io;
+
 /* cpu_pgdir_create — allocate a user root page table with kernel mappings.
  *
  * Allocates a zeroed 4KB page, then copies L2 entries 1..511 from the boot
@@ -146,7 +153,8 @@ int cpu_map_pages(pagetable_t pgdir,
             kprintf("cpu_map_pages: remap at va=%lx\n", (unsigned long) a);
             return -1;
         }
-        *pte = PA2PTE(pa) | pte_flags;
+        /* Callers (the initramfs ELF loader) only map RAM */
+        *pte = PA2PTE(pa) | pte_flags | riscv_pte_attr_mem;
         if (a == last)
             break;
         a += PGSIZE;

@@ -39,6 +39,12 @@ static uint64_t prot_to_pte_bits(unsigned prot)
     /* User-space mappings need PTE_U */
     bits |= PTE_U;
 
+    /* Memory type (non-zero only on T-Head with MAEE, see cpu-paging.h).
+     * Drivers map MMIO with PROT_NOCACHE; mm-reference.c also maps no-cache
+     * RAM that way after a cached pass. Both get the strongly-ordered I/O type.
+     */
+    bits |= (prot & PROT_NOCACHE) ? riscv_pte_attr_io : riscv_pte_attr_mem;
+
     return bits;
 }
 
