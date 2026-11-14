@@ -41,13 +41,11 @@ $(BUILD_BASE)/gpt-test: gpt-test.c gpt.c gpt.h crc32.h
 $(OBJDIR)/%.o: %.c
 	@mkdir -p $(@D)
 	$(msg) CC $@
-	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c -o $@ $<
+	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) $(DEPFLAGS) -c -o $@ $<
 
 clean:
 	$(Q)rm -rf $(BUILD_BASE)
 
 .PHONY: all clean gpt-test
 
-# Auto-generated header deps (-MMD/-MP above) so a touched header — including
-# the generated autoconf.h — rebuilds objects instead of leaving them stale.
--include $(OBJS:.o=.d)
+$(eval $(call dep-include,$(OBJS)))

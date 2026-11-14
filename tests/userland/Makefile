@@ -12,6 +12,9 @@ SRCS = main.c timers.c sync.c printf-test.c setjmp-test.c signals-test.c \
        notifications.c vfs.c posix-options.c capgate.c trace-negative.c \
        user-ptr-negative.c serial-unblock.c leak.c
 OBJS = $(SRCS:%.c=$(OBJDIR)/%.o)
+# Single-file helper programs built by the rules below, outside the main binary.
+PROBE_OBJS = $(addprefix $(OBJDIR)/, crypttest.o setuid-probe.o preload-probe.o \
+                                     sync-ignore.o slow-server.o)
 PROG = $(BUILD_BASE)/syscall_testing
 CRYPTTEST = $(BUILD_BASE)/crypttest
 
@@ -50,7 +53,7 @@ all: $(PROG) $(CRYPTTEST) $(PROBE) $(PROBE_PLAIN) $(PROBE_SETGID) $(PRELOAD_PROB
 $(OBJDIR)/%.o: %.c test.h
 	@mkdir -p $(@D)
 	$(msg) CC $@
-	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
+	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) $(DEPFLAGS) -c -o $@ $<
 
 $(PROG): $(OBJS) $(CRT0_O) $(LIBC_SO)
 	@mkdir -p $(@D)
@@ -74,7 +77,7 @@ $(PROBE) $(PROBE_PLAIN) $(PROBE_SETGID): \
 $(OBJDIR)/preload-probe.o: preload-probe.c
 	@mkdir -p $(@D)
 	$(msg) CC $@
-	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) -fPIC -c -o $@ $<
+	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) -fPIC $(DEPFLAGS) -c -o $@ $<
 
 $(PRELOAD_PROBE): $(OBJDIR)/preload-probe.o
 	@mkdir -p $(@D)
@@ -154,3 +157,5 @@ clean: $(RT_LATENCY_CLEAN) $(LOCK_RANK_STRESS_CLEAN) $(NAMESPACE_ROUNDTRIP_CLEAN
 	$(Q)rm -rf $(BUILD_BASE)
 
 .PHONY: all install clean
+
+$(eval $(call dep-include,$(OBJS) $(PROBE_OBJS)))

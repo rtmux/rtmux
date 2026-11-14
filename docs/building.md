@@ -17,7 +17,7 @@
 ```bash
 make defconfig           # First time only: apply configs/defconfig
 make                     # kernel + roottask + libc + userland + initramfs.cpio
-make -Bj                 # Forced parallel rebuild (after header changes)
+make -Bj                 # Forced rebuild (only after a toolchain or flag change)
 make startup             # Kernel binary only
 make initramfs           # Repack initramfs.cpio after userland/lib/servers edits
 make menuconfig          # Kconfig front end

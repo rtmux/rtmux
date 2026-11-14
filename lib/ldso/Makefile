@@ -85,15 +85,15 @@ $(LDSO_SO): $(ALL_OBJS) Symbol.map
 
 $(OBJDIR)/%.o: %.c | $(OBJDIR)
 	$(msg) CC $@
-	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
+	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) $(DEPFLAGS) -c -o $@ $<
 
 $(OBJDIR)/%.o: $(ARCH)/%.c | $(OBJDIR)
 	$(msg) CC $@
-	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
+	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) $(DEPFLAGS) -c -o $@ $<
 
 $(OBJDIR)/%.o: $(ARCH)/%.S | $(OBJDIR)
 	$(msg) AS $@
-	$(Q)$(CC) $(ASFLAGS) -c -o $@ $<
+	$(Q)$(CC) $(ASFLAGS) $(DEPFLAGS) -c -o $@ $<
 
 # libc sources compiled with PIC and an lc_ prefix.
 # Use libc's own CPPFLAGS (no local.h)
@@ -109,31 +109,31 @@ LIBC_CFLAGS = -std=gnu17 -g -fpic -DPIC -ffreestanding \
 
 $(OBJDIR)/lc_%.o: $(LIBCDIR)/string/%.c | $(OBJDIR)
 	$(msg) CC $@
-	$(Q)$(CC) $(LIBC_CPPFLAGS) $(LIBC_CFLAGS) -c -o $@ $<
+	$(Q)$(CC) $(LIBC_CPPFLAGS) $(LIBC_CFLAGS) $(DEPFLAGS) -c -o $@ $<
 
 $(OBJDIR)/lc_%.o: $(LIBCDIR)/stdlib/%.c | $(OBJDIR)
 	$(msg) CC $@
-	$(Q)$(CC) $(LIBC_CPPFLAGS) $(LIBC_CFLAGS) -c -o $@ $<
+	$(Q)$(CC) $(LIBC_CPPFLAGS) $(LIBC_CFLAGS) $(DEPFLAGS) -c -o $@ $<
 
 $(OBJDIR)/lc_%.o: $(LIBCDIR)/rtmux/%.c | $(OBJDIR)
 	$(msg) CC $@
-	$(Q)$(CC) $(LIBC_CPPFLAGS) $(LIBC_CFLAGS) -c -o $@ $<
+	$(Q)$(CC) $(LIBC_CPPFLAGS) $(LIBC_CFLAGS) $(DEPFLAGS) -c -o $@ $<
 
 $(OBJDIR)/lc_%.o: $(LIBCDIR)/posix/mman/%.c | $(OBJDIR)
 	$(msg) CC $@
-	$(Q)$(CC) $(LIBC_CPPFLAGS) $(LIBC_CFLAGS) -c -o $@ $<
+	$(Q)$(CC) $(LIBC_CPPFLAGS) $(LIBC_CFLAGS) $(DEPFLAGS) -c -o $@ $<
 
 $(OBJDIR)/lc_%.o: $(LIBCDIR)/posix/%.c | $(OBJDIR)
 	$(msg) CC $@
-	$(Q)$(CC) $(LIBC_CPPFLAGS) $(LIBC_CFLAGS) -c -o $@ $<
+	$(Q)$(CC) $(LIBC_CPPFLAGS) $(LIBC_CFLAGS) $(DEPFLAGS) -c -o $@ $<
 
 $(OBJDIR)/lc_%.o: $(LIBCDIR)/support/%.c | $(OBJDIR)
 	$(msg) CC $@
-	$(Q)$(CC) $(LIBC_CPPFLAGS) $(LIBC_CFLAGS) -c -o $@ $<
+	$(Q)$(CC) $(LIBC_CPPFLAGS) $(LIBC_CFLAGS) $(DEPFLAGS) -c -o $@ $<
 
 $(OBJDIR)/lc_%.o: $(LIBCDIR)/$(ARCH)/%.c | $(OBJDIR)
 	$(msg) CC $@
-	$(Q)$(CC) $(LIBC_CPPFLAGS) $(LIBC_CFLAGS) -c -o $@ $<
+	$(Q)$(CC) $(LIBC_CPPFLAGS) $(LIBC_CFLAGS) $(DEPFLAGS) -c -o $@ $<
 
 $(OBJDIR):
 	$(Q)mkdir -p $@
@@ -142,3 +142,5 @@ clean:
 	$(Q)rm -rf $(BUILD_BASE)
 
 .PHONY: all clean
+
+$(eval $(call dep-include,$(ALL_OBJS)))

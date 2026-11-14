@@ -74,7 +74,7 @@ void roottask_conf_init(void)
     _sysconf_list = (long *) &roottask_internal_table;
 
     /* "os_version_string" defined in automatically created timestamp.c file,
-     * value determined by the RTMUX_VERSION macro in <sys/rtmux-core.h>
+     * value determined by the RTMUX_VERSION macro in <rtmux-version.h>
      */
     roottask_confstr_seed(0, _CS_RELEASE, os_version_string);
 
