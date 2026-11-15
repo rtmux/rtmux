@@ -45,6 +45,8 @@ static const struct test_suite test_suites[] = {
     TEST_SUITE(sync),
     TEST_SUITE(printf),
     TEST_SUITE(setjmp),
+    TEST_SUITE(time),
+    TEST_SUITE(strftime),
     TEST_SUITE(signals),
     TEST_SUITE(notifications),
     TEST_SUITE(capgate),
