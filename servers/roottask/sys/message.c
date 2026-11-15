@@ -195,6 +195,8 @@ int message_start(void)
      */
     {
         syscall_priv(__KSYS_PRIV_SMP_BRINGUP, NULL);
+        legal_cpu_bitmask =
+            (uint64_t) syscall_priv(__KSYS_PRIV_LEGAL_CPU_MASK, NULL);
     }
 
     /* Wait until at least one pool thread is blocked in msg_receive on the

@@ -32,6 +32,11 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+/* __KSYS_BAD, for the out-of-range system call probe. Same relative-include
+ * convention user-ptr-negative.c uses.
+ */
+#include "../../internal/include/sys/calls.h"
+
 #include "outcome.h"
 #include "test.h"
 
@@ -734,6 +739,80 @@ static void test_loader_negative_subset(void)
     test_setid_loader();
 }
 
+/* Out-of-range system calls, and faulting children, in a loop. Each must come
+ * back with the documented result every time, and the kernel's report of each
+ * is rate-limited per call site: scripts/qemu-regress.sh counts the
+ * "ecall: invalid syscall" and "user fault:" lines this mode prints against
+ * KPRINTF_RL_BURST + ceil(N / KPRINTF_RL_INTERVAL) + 1.
+ */
+#define BAD_SYSCALL_CALLS 100000
+#define CRASH_LOOP_CHILDREN 40
+
+/* Raw zero-argument trap. Decodes the result the way libc's __sc_err does: a
+ * negative a0 is a negated errno.
+ */
+static long raw_kcall0_err(long n)
+{
+    register long a7 __asm__("a7") = n;
+    register long a0 __asm__("a0");
+
+    __asm__ volatile("ecall" : "=r"(a0) : "r"(a7) : "memory");
+    if (a0 < 0) {
+        errno = (int) -a0;
+        return -1;
+    }
+    return a0;
+}
+
+static void test_bad_syscall_enosys(void)
+{
+    /* Just past the table, far past it, all ones, and a number whose low 32
+     * bits name a live call (NOP), which must not alias it.
+     */
+    static const long nums[] = {
+        __KSYS_BAD, __KSYS_BAD + 1, 0x7fffffffL, -1L,
+        (long) ((1UL << 32) | __KSYS_NOP),
+    };
+    const size_t nnums = sizeof nums / sizeof nums[0];
+    long wrong = 0;
+    int first_errno = 0;
+    char detail[80];
+
+    for (long i = 0; i < BAD_SYSCALL_CALLS; i++) {
+        errno = 0;
+        if (raw_kcall0_err(nums[(size_t) i % nnums]) != -1 || errno != ENOSYS) {
+            if (!wrong++)
+                first_errno = errno;
+        }
+    }
+    snprintf(detail, sizeof detail, "%ld of %d calls wrong, first errno=%d",
+             wrong, BAD_SYSCALL_CALLS, first_errno);
+    FAULT_RECOVERY_CHECK(bad_syscall_enosys, wrong == 0, detail);
+    if (!wrong)
+        FAULT_RECOVERY_EVENT("illegal-syscall", "deny", "out-of-range-call",
+                             "return-ENOSYS");
+}
+
+static void test_crash_loop(void)
+{
+    int reaped = 0;
+
+    for (int i = 0; i < CRASH_LOOP_CHILDREN; i++) {
+        char *argv[] = {"syscall_testing", "--fault-sigsegv", NULL};
+        pid_t pid;
+        int status;
+
+        if (posix_spawn(&pid, "/bin/syscall_testing", NULL, NULL, argv,
+                        NULL) != EOK)
+            break;
+        if (waitpid(pid, &status, 0) == pid && WIFSIGNALED(status) &&
+            WTERMSIG(status) == SIGSEGV)
+            reaped++;
+    }
+    FAULT_RECOVERY_CHECK(crash_loop, reaped == CRASH_LOOP_CHILDREN,
+                         "every faulting child must be reaped with SIGSEGV");
+}
+
 static void test_fault_recovery_subset(void)
 {
     int msg = 0;
@@ -761,6 +840,107 @@ static void test_fault_recovery_subset(void)
                              "--fault-sigsegv", SIGSEGV);
     FAULT_RECOVERY_SPAWN_SIG(readonly_write_fault, "user-page-fault",
                              "--fault-mprotect-ro", SIGSEGV);
+
+    test_bad_syscall_enosys();
+    test_crash_loop();
+}
+
+/* fdt-reserved-memory: fill RAM and check that no frame handed out lies in a
+ * range the device tree reserved. The ranges are the fixture
+ * scripts/qemu-regress.sh builds for that mode (setup_fdt_resv_or_skip): two
+ * no-map reg pairs in one /reserved-memory child, a plain child, and a
+ * /memreserve/ entry. Keep the two in step.
+ */
+#define RESV_FILL_CHUNK (1UL << 20)
+#define RESV_FILL_MAX_MAPS 8192
+
+static const struct {
+    uint64_t start, end;
+} resv_fixture[] = {
+    {0x8c000000UL, 0x8c010000UL}, /* mmode_resv0, first reg pair, no-map */
+    {0x8c100000UL, 0x8c110000UL}, /* mmode_resv0, second reg pair */
+    {0x8c200000UL, 0x8c220000UL}, /* rtmux-resv-test, plain */
+    {0x8c300000UL, 0x8c310000UL}, /* rtmux-resv-reusable, reusable */
+    {0x8c400000UL, 0x8c410000UL}, /* /memreserve/ */
+};
+
+/* Count the physically contiguous runs of [p, p + len) that touch a fixture
+ * range (once per range touched); a page whose physical address is unknown
+ * counts in *unknown. One query covers each run.
+ */
+static void resv_check(unsigned char *p,
+                       size_t len,
+                       unsigned long *inside,
+                       unsigned long *unknown)
+{
+    for (size_t off = 0; off < len; off += __PAGESIZE)
+        p[off] = 0x5a;
+    for (size_t off = 0; off < len;) {
+        off_t pa;
+        size_t run;
+
+        /* mem_offset, not posix_mem_offset: POSIX answers only for a memory
+         * object, and this is anonymous memory.
+         */
+        if (mem_offset(p + off, NOFD, len - off, &pa, &run) || run == 0) {
+            (*unknown)++;
+            off += __PAGESIZE;
+            continue;
+        }
+        if (run > len - off)
+            run = len - off;
+        for (size_t r = 0; r < sizeof resv_fixture / sizeof resv_fixture[0];
+             r++) {
+            if ((uint64_t) pa < resv_fixture[r].end &&
+                (uint64_t) pa + run > resv_fixture[r].start) {
+                (*inside)++;
+                if (*inside == 1)
+                    printf("resv-fill: run at pa %#llx+%#zx is reserved\n",
+                           (unsigned long long) pa, run);
+            }
+        }
+        off += (run + __PAGESIZE - 1) & ~(size_t) (__PAGESIZE - 1);
+    }
+}
+
+/* Map 1 MiB chunks until that fails, then halve the size on each failure down
+ * to a single page, so the fill reaches the frames a fragmented free pool still
+ * holds.
+ */
+static int resv_fill(void)
+{
+    static void *maps[RESV_FILL_MAX_MAPS];
+    static size_t lens[RESV_FILL_MAX_MAPS];
+    unsigned nmaps = 0;
+    unsigned long pages = 0, inside = 0, unknown = 0;
+    size_t len = RESV_FILL_CHUNK;
+
+    while (nmaps < RESV_FILL_MAX_MAPS) {
+        unsigned char *p = mmap(NULL, len, PROT_READ | PROT_WRITE,
+                                MAP_PRIVATE | MAP_ANON, NOFD, 0);
+
+        if (p == MAP_FAILED) {
+            if (len == __PAGESIZE)
+                break;
+            len /= 2;
+            continue;
+        }
+        maps[nmaps] = p;
+        lens[nmaps++] = len;
+        pages += len / __PAGESIZE;
+        resv_check(p, len, &inside, &unknown);
+    }
+    for (unsigned i = 0; i < nmaps; i++)
+        munmap(maps[i], lens[i]);
+    printf("resv-fill: maps=%u pages=%lu inside=%lu unknown=%lu%s\n", nmaps,
+           pages, inside, unknown,
+           nmaps == RESV_FILL_MAX_MAPS ? " (map cap reached)" : "");
+    check(pages > 0 && unknown == 0 && nmaps < RESV_FILL_MAX_MAPS,
+          "fdt-reserved-memory fill",
+          "the fill must run RAM dry and learn every page's address");
+    check(inside == 0, "fdt-reserved-memory outside",
+          "no frame may come from a reserved range");
+    return finish(1);
 }
 
 /* --laps N: rerun every suite N times in one boot. Each lap resets the per-lap
@@ -881,6 +1061,10 @@ int main(int argc, char *argv[])
         printf("=== RTMux Trace Negative Test ===\n\n[trace-negative]\n");
         test_trace_negative();
         return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--resv-fill")) {
+        printf("=== RTMux Reserved Memory Fill ===\n\n[fdt-reserved-memory]\n");
+        return resv_fill();
     }
     if (argc == 2 && !strcmp(argv[1], "--fault-recovery")) {
         printf("=== RTMux Fault Recovery Test ===\n\n");

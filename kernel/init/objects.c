@@ -193,28 +193,20 @@ void init_objects()
     dpp = init_scheduler();
     prp->default_dpp = dpp;
 
-    /* Build LEGAL_CPU_BITMASK from hart_ids[] */
-    {
-        extern unsigned hart_ids[];
-        unsigned mask = 0;
-        for (unsigned k = 0; k < num_processors; k++)
-            mask |= (1U << hart_ids[k]);
-        legal_cpu_bitmask = mask;
-    }
+    /* Every logical CPU starts legal; kext_smp_bringup() drops one whose hart
+     * does not start.
+     */
+    legal_cpu_bitmask =
+        num_processors >= 64 ? ~(uint64_t) 0 : (1ULL << num_processors) - 1;
 
-    /* Create idle threads — one per CPU, indexed by hart ID.
-     *
-     * hart_ids[] is populated by the FDT parser in startup and contains the
-     * actual RISC-V hart IDs. The kernel uses these directly as indices into
-     * actives[], ksys_stack[], cpupageptr[], etc. No logical-to-physical CPU
-     * mapping — hart IDs are the only CPU identifiers in the system.
+    /* Create idle threads — one per logical CPU. Every per-CPU array
+     * (actives[], ksys_stack[], cpupageptr[], ...) is indexed by logical CPU;
+     * hart_ids[cpu] gives the hart ID SBI needs.
      */
     {
-        extern unsigned hart_ids[];
-
         i = 0;
         do {
-            unsigned cpu = hart_ids[i];
+            unsigned cpu = (unsigned) i;
             uintptr_t stack_top;
             void *dummy __attribute__((unused));
 

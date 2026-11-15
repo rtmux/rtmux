@@ -9,7 +9,7 @@
  */
 
 #include <trap-asm.h>
-#include <arch/pcpu.h>          /* PC_HART, PC_CURTHREAD — asm-visible */
+#include <arch/pcpu.h>          /* PC_CPU, PC_CURTHREAD — asm-visible */
 
     .text
     .option norvc           /* no compressed instructions in kernel asm */
@@ -31,13 +31,13 @@
 ksys_start:
     /*
      * Switch to this CPU's kernel stack: ksys_stack[get_cpunum()].
-     * tp = &pcpu_array[hart], so the hart ID is one lw at PC_HART(tp)
+     * tp = &pcpu_array[cpu], so the logical CPU is one lw at PC_CPU(tp)
      * — no chain.
      */
-    lwu  t1, PC_HART(tp)        /* t1 = pc_hart */
-    slli t1, t1, 3              /* t1 = hart * 8 */
+    lwu  t1, PC_CPU(tp)         /* t1 = pc_cpu */
+    slli t1, t1, 3              /* t1 = cpu * 8 */
     la   t0, ksys_stack
-    add  t0, t0, t1             /* t0 = &ksys_stack[hart] */
+    add  t0, t0, t1             /* t0 = &ksys_stack[cpu] */
     ld   sp, 0(t0)
 
     /* Ensure sscratch = 0 (S-mode convention) */

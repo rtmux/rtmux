@@ -439,6 +439,21 @@ void add_ram(paddr_t start, uint64_t size)
     }
 }
 
+/* boot_in_use_end — first byte past the memory startup is already using above
+ * _start: the kernel image, the startup stack (16 KiB above _end, see head.S)
+ * and the boot workspace handed out so far, which starts at the page after
+ * _end. Meaningful only before the first add_ram().
+ */
+paddr_t boot_in_use_end(void)
+{
+    paddr_t stack_top =
+        ROUND((paddr_t) (uintptr_t) _end, __PAGESIZE) + KILO(16);
+
+    if (!avoid_list)
+        ws_init();
+    return ws_early_next > stack_top ? ws_early_next : stack_top;
+}
+
 /**
  * \brief Add a given region to the avoid list.
  */
@@ -451,6 +466,9 @@ void avoid_ram(paddr_t start, size_t size)
     if (!avoid_list) {
         ws_init();
     }
+    if (avoid_list_size + sizeof(*avoid) > MAX_AVOID_LIST_SIZE)
+        crash("%s: more than %u reserved ranges\n", __func__,
+              (unsigned) (MAX_AVOID_LIST_SIZE / sizeof(*avoid) - 1));
     avoid = (void *) ((uint8_t *) avoid_list + avoid_list_size);
 
     avoid[-1].start = start;
@@ -502,9 +520,21 @@ void *ws_alloc(size_t size)
 
     size = ROUND(size, sizeof(uint64_t));
     if (ram_list_size <= sizeof(struct ram_entry)) {
-        /* No add_ram()'s have been done yet */
+        /* No add_ram()'s have been done yet, so the workspace grows up from
+         * _end without find_ram()'s avoid-list check. Refuse to grow into a
+         * range already reserved (an FDT reservation just above the image).
+         */
         paddr = ws_early_next;
         ws_early_next += size;
+        for (struct avoid_entry *a = avoid_list; a->end != 0; ++a) {
+            if (a->start < ws_early_next && a->end > paddr)
+                crash(
+                    "%s: boot workspace [%lx..%lx) runs into reserved "
+                    "[%lx..%lx)\n",
+                    __func__, (unsigned long) paddr,
+                    (unsigned long) ws_early_next, (unsigned long) a->start,
+                    (unsigned long) a->end);
+        }
     } else {
         /* We've been told where memory is */
         paddr = find_ram(size, sizeof(uint64_t), 0, 0);

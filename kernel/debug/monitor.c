@@ -44,7 +44,6 @@ extern kspinlock_t alloc_slock, sync_slock, global_channel_slock, as_slock,
  * ipi_handler_count, ipicmds, as_prp) lives in pcpu_array[], visible via
  * core/globals.h's <arch/pcpu.h>.
  */
-extern unsigned hart_ids[];
 extern unsigned num_processors;
 extern unsigned in_kcall[CONFIG_PROCESSORS_MAX];
 extern process_t *kernel_threads_prp;
@@ -498,7 +497,7 @@ static void mon_dump_ghost_running(void)
              */
             bool is_idle = false;
             for (unsigned i = 0; i < num_processors; i++) {
-                if (pcpu_array[hart_ids[i]].pc_idle_thp == thp) {
+                if (pcpu_array[i].pc_idle_thp == thp) {
                     is_idle = true;
                     break;
                 }
@@ -511,7 +510,7 @@ static void mon_dump_ghost_running(void)
              */
             int owner = -1;
             for (unsigned i = 0; i < num_processors; i++) {
-                unsigned hart = hart_ids[i];
+                unsigned hart = i;
                 if (pcpu_array[hart].pc_curthread == thp) {
                     owner = (int) hart;
                     break;
@@ -781,7 +780,7 @@ void __attribute__((noreturn)) monitor_loop(void)
          */
         mon_puts("sched=");
         for (unsigned i = 0; i < num_processors; i++) {
-            unsigned hart = hart_ids[i];
+            unsigned hart = i;
             struct dispatch_entry *dpp = pcpu_array[hart].pc_dispatch;
             if (!dpp) {
                 mon_putc('?');
@@ -799,7 +798,7 @@ void __attribute__((noreturn)) monitor_loop(void)
          * stuck kernel extension.
          */
         for (unsigned i = 0; i < num_processors; i++) {
-            unsigned hart = hart_ids[i];
+            unsigned hart = i;
             thread_t *thp = get_active_thread(hart);
             mon_puts(" h");
             mon_put_dec(hart);

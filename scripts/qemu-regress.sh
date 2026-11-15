@@ -50,6 +50,8 @@ IOMMU_METADATA_DTS=
 IOMMU_METADATA_ERR=
 FDT_CPU_DTB=
 FDT_CPU_DTS=
+FDT_RESV_DTB=
+FDT_RESV_DTS=
 FDT_CPU_SEEN=
 FDT_CPU_BASE_OPTS=
 
@@ -58,7 +60,8 @@ cleanup()
     kill "${http_pid:-}" "${udp_pid:-}" "${dns_pid:-}" "${payload_pid:-}" \
         2>/dev/null || true
     rm -f "${IOMMU_METADATA_DTB:-}" "${IOMMU_METADATA_DTS:-}" \
-        "${IOMMU_METADATA_ERR:-}" "${FDT_CPU_DTB:-}" "${FDT_CPU_DTS:-}"
+        "${IOMMU_METADATA_ERR:-}" "${FDT_CPU_DTB:-}" "${FDT_CPU_DTS:-}" \
+        "${FDT_RESV_DTB:-}" "${FDT_RESV_DTS:-}"
     if [ "$RESTORE_CONFIG" -eq 1 ]; then
         if [ "$HAD_CONFIG" -eq 1 ]; then
             cp "$CONFIG_SAVE" .config
@@ -1004,37 +1007,184 @@ patch_fdt_cpu_status_dts()
     ' "$in_dts" >"$out_dts"
 }
 
+# patch_fdt_sparse_harts_dts IN OUT: mark cpu@1..cpu@8 disabled, leaving harts 0
+# and 9 of a 10-hart virt machine: a hart ID past PROCESSORS_MAX (8) that must
+# still get a logical CPU.
+patch_fdt_sparse_harts_dts()
+{
+    awk '
+        /^\t\tcpu@[1-8] \{$/ { print; print "\t\t\tstatus = \"disabled\";"; n++; skip = 1; next }
+        skip && /^\t\t\tstatus = / { skip = 0; next }
+        /^\t\t};/ { skip = 0 }
+        { print }
+        END { exit(n == 8 ? 0 : 1) }
+    ' "$1" >"$2"
+}
+
+# setup_fdt_sparse_harts_or_skip: boot 10 harts on the patched DTB above.
+setup_fdt_sparse_harts_or_skip()
+{
+    FDT_CPU_DTB="$(mktemp /tmp/rtmux-fdt-cpu-dtb.XXXXXX)"
+    FDT_CPU_DTS="$(mktemp /tmp/rtmux-fdt-cpu-dts.XXXXXX)"
+    build_patched_dtb "$FDT_CPU_DTB" "$FDT_CPU_DTS" patch_fdt_sparse_harts_dts ||
+        fixture_unsupported "cannot build sparse-hart DTB fixture"
+    export EMU_QEMU_OPTS="${EMU_QEMU_OPTS:+$EMU_QEMU_OPTS }-dtb $FDT_CPU_DTB"
+}
+
+# check_smp_bringup LOG: the bring-up verdicts for the smp-* modes. OpenSBI
+# picks the boot hart by lottery, so the checks name logical CPUs (the boot hart
+# is always CPU 0; the injected fault hits the last, CPU 3 of 4) rather than
+# hart IDs.
+check_smp_bringup()
+{
+    local log="$1"
+
+    case "$MODE" in
+    smp-hart-start-fail)
+        require_log_patterns "$log" "injected start failure" \
+            'cpu_start_others: hart [0-9]+ \(cpu 3\) failed' \
+            'smp: hart [0-9]+ \(cpu 3\) did not start, dropped' \
+            'smp: 3 harts online[[:space:]]*$' || return 1
+        ;;
+    smp-hart-start-late)
+        require_log_patterns "$log" "late hart" \
+            'smp: hart [0-9]+ \(cpu 3\) did not start, dropped' \
+            'smp: hart [0-9]+ \(cpu 3\) arrived late, parked' \
+            'smp: 3 harts online[[:space:]]*$' || return 1
+        ;;
+    smp-sparse-harts)
+        # The boot hart is never withheld, so a disabled hart that wins the
+        # lottery comes up too: 2 or 3 harts, hart 9 always among them.
+        if ! grep -aEq 'Boot HART ID[[:space:]]*: 9[[:space:]]*$' "$log" &&
+           ! grep -aEq 'cpu_start_others: hart 9 \(cpu [12]\) started' "$log"; then
+            echo "  FAIL     ${MODE}: hart 9 neither booted nor started"
+            grep -a 'Boot HART ID\|cpu_start_others' "$log"
+            return 1
+        fi
+        if ! grep -aEq 'smp: [23] harts online[[:space:]]*$' "$log"; then
+            echo "  FAIL     ${MODE}: expected 2 or 3 harts online"
+            grep -a 'smp: ' "$log"
+            return 1
+        fi
+        ;;
+    smp-too-many-harts)
+        require_log_patterns "$log" "harts past PROCESSORS_MAX" \
+            'smp: 8 harts online[[:space:]]*$' || return 1
+        if [ "$(grep -ac 'fdt: hart [0-9]* parked: no logical CPU slot' "$log")" -ne 2 ]; then
+            echo "  FAIL     ${MODE}: expected two harts parked for want of a slot"
+            grep -a 'parked' "$log"
+            return 1
+        fi
+        ;;
+    esac
+}
+
+# fixture_unsupported WHAT: report that the WHAT DTB fixture cannot be built and
+# leave, failing only under --require-supported.
+fixture_unsupported()
+{
+    echo "  UNSUPPORTED ${MODE}: $1"
+    [ "$REQUIRE_SUPPORTED" -eq 1 ] && exit 2
+    exit 0
+}
+
+# build_patched_dtb DTB DTS PATCH_FN [ARGS...]: dump QEMU's DTB for CPUS harts,
+# decompile it, run PATCH_FN IN_DTS OUT_DTS ARGS..., and compile OUT_DTS into
+# DTB. Leaves the mode as unsupported without dtc; fails if any step does.
+build_patched_dtb()
+{
+    local dtb="$1" dts="$2" patch="$3" rc=0
+    shift 3
+
+    command -v dtc >/dev/null 2>&1 ||
+        fixture_unsupported "dtc is required to build the DTB fixture"
+
+    "${QEMU_HEADLESS_ENV[@]}" "${QEMU:-qemu-system-riscv64}" \
+        -machine "virt,graphics=off,dumpdtb=$dtb.raw" -m 256M -smp "${CPUS:-1}" \
+        -nographic -serial none -monitor none -S >/dev/null 2>&1 &&
+        dtc -I dtb -O dts "$dtb.raw" >"$dts.raw" 2>/dev/null &&
+        "$patch" "$dts.raw" "$dts" "$@" &&
+        dtc -I dts -O dtb "$dts" -o "$dtb" 2>/dev/null || rc=1
+    rm -f "$dtb.raw" "$dts.raw"
+    return "$rc"
+}
+
 # setup_fdt_cpu_status_or_skip PLACEMENT BASE_OPTS: dump QEMU's DTB for CPUS
 # harts, patch cpu@1 to disabled, and point the guest at it.
 setup_fdt_cpu_status_or_skip()
 {
-    local where="$1" base="$2" ok=1 raw raw_dts
+    local where="$1" base="$2"
 
-    if ! command -v dtc >/dev/null 2>&1; then
-        echo "  UNSUPPORTED ${MODE}: dtc is required to build the cpu status DTB fixture"
-        [ "$REQUIRE_SUPPORTED" -eq 1 ] && exit 2
-        exit 0
-    fi
     rm -f "$FDT_CPU_DTB" "$FDT_CPU_DTS"
     FDT_CPU_DTB="$(mktemp /tmp/rtmux-fdt-cpu-dtb.XXXXXX)"
     FDT_CPU_DTS="$(mktemp /tmp/rtmux-fdt-cpu-dts.XXXXXX)"
-    raw="$FDT_CPU_DTB.raw"
-    raw_dts="$FDT_CPU_DTS.raw"
-    if ! "${QEMU_HEADLESS_ENV[@]}" "${QEMU:-qemu-system-riscv64}" \
-            -machine "virt,graphics=off,dumpdtb=$raw" -m 256M -smp "${CPUS:-1}" \
-            -nographic -serial none -monitor none -S >/dev/null 2>&1 ||
-       ! dtc -I dtb -O dts "$raw" >"$raw_dts" 2>/dev/null ||
-       ! patch_fdt_cpu_status_dts "$raw_dts" "$FDT_CPU_DTS" 1 "$where" ||
-       ! dtc -I dts -O dtb "$FDT_CPU_DTS" -o "$FDT_CPU_DTB" 2>/dev/null; then
-        ok=0
-    fi
-    rm -f "$raw" "$raw_dts"
-    if [ "$ok" -eq 0 ]; then
-        echo "  UNSUPPORTED ${MODE}: cannot build cpu status DTB fixture"
-        [ "$REQUIRE_SUPPORTED" -eq 1 ] && exit 2
-        exit 0
-    fi
+    build_patched_dtb "$FDT_CPU_DTB" "$FDT_CPU_DTS" patch_fdt_cpu_status_dts \
+        1 "$where" || fixture_unsupported "cannot build cpu status DTB fixture"
     export EMU_QEMU_OPTS="${base:+$base }-dtb $FDT_CPU_DTB"
+}
+
+# patch_fdt_resv_dts IN OUT: add a /memreserve/ entry and a /reserved-memory
+# node holding a no-map child with two reg pairs, a plain child and a reusable
+# child. Properties must precede subnodes, so the node goes in before the
+# root's first child.
+patch_fdt_resv_dts()
+{
+    awk '
+        /^\/dts-v1\/;/ && !hdr {
+            print; print "/memreserve/ 0x8c400000 0x10000;"; hdr = 1; next
+        }
+        /^\t[^\t].*\{$/ && !root {
+            print "\treserved-memory {"
+            print "\t\t#address-cells = <0x02>;"
+            print "\t\t#size-cells = <0x02>;"
+            print "\t\tranges;"
+            print "\t\tmmode_resv0@8c000000 {"
+            print "\t\t\treg = <0x00 0x8c000000 0x00 0x10000>, <0x00 0x8c100000 0x00 0x10000>;"
+            print "\t\t\tno-map;"
+            print "\t\t};"
+            print "\t\trtmux-resv-test@8c200000 {"
+            print "\t\t\treg = <0x00 0x8c200000 0x00 0x20000>;"
+            print "\t\t};"
+            print "\t\trtmux-resv-reusable@8c300000 {"
+            print "\t\t\treg = <0x00 0x8c300000 0x00 0x10000>;"
+            print "\t\t\treusable;"
+            print "\t\t};"
+            print "\t};"
+            print; root = 1; next
+        }
+        { print }
+        END { exit(hdr && root ? 0 : 1) }
+    ' "$1" >"$2"
+}
+
+# setup_fdt_resv_or_skip: boot the guest on QEMU's DTB patched by
+# patch_fdt_resv_dts. The ranges sit in the middle of the 256 MiB of RAM, clear
+# of the kernel, the initramfs and the FDT, and must match resv_fixture[] in
+# tests/userland/main.c. OpenSBI adds its own mmode_resv nodes beside these.
+setup_fdt_resv_or_skip()
+{
+    FDT_RESV_DTB="$(mktemp /tmp/rtmux-fdt-resv-dtb.XXXXXX)"
+    FDT_RESV_DTS="$(mktemp /tmp/rtmux-fdt-resv-dts.XXXXXX)"
+    build_patched_dtb "$FDT_RESV_DTB" "$FDT_RESV_DTS" patch_fdt_resv_dts ||
+        fixture_unsupported "cannot build reserved-memory DTB fixture"
+    export EMU_QEMU_OPTS="${EMU_QEMU_OPTS:+$EMU_QEMU_OPTS }-dtb $FDT_RESV_DTB"
+}
+
+# check_fdt_resv LOG: both reg pairs of the no-map child, the plain and the
+# reusable child, and the /memreserve/ entry are each reserved, and the no-map
+# pairs are left out of the kernel's mappings (init_mmu checks the final PTEs
+# before it prints "unmapped").
+check_fdt_resv()
+{
+    require_log_patterns "$1" "reserved-memory fixture" \
+        'fdt: reserved mmode_resv0@8c000000 \[8c000000\.\.8c010000\) no-map' \
+        'fdt: reserved mmode_resv0@8c000000 \[8c100000\.\.8c110000\) no-map' \
+        'fdt: reserved rtmux-resv-test@8c200000 \[8c200000\.\.8c220000\)[[:space:]]*$' \
+        'fdt: reserved rtmux-resv-reusable@8c300000 \[8c300000\.\.8c310000\) reusable' \
+        'fdt: reserved /memreserve/ \[8c400000\.\.8c410000\)[[:space:]]*$' \
+        'unmapped no-map \[8c000000\.\.8c010000\)' \
+        'unmapped no-map \[8c100000\.\.8c110000\)' \
+        '^  PASS  fdt-reserved-memory outside[[:space:]]*$'
 }
 
 # check_fdt_cpu_status LOG PLACEMENT: OpenSBI picks the boot hart by lottery, so
@@ -1459,6 +1609,44 @@ case "$MODE" in
         MODE_ARG="rtmux.run=${MODE}"
         setup_pci_iommu_or_skip
         [ "$TIMEOUT_SET" -eq 0 ] && TIMEOUT=60
+        ;;
+    smp-hart-start-fail|smp-hart-start-late)
+
+        # K3: a debug-inject kernel fails (or delays past its wait) the SBI start
+        # of the last of 4 harts; the system must reach login on the other 3.
+        BEGIN_MARKER='Mounting '
+        PASS_MARKER='^login:'
+        PASS_GREP=-E
+        FAIL_MARKER='*** /usr unavailable'
+        MODE_ARG="rtmux.inject=${MODE#smp-}"
+        NEEDS_DEBUG_INJECT=1
+        CPUS=4
+        export CPUS
+        ;;
+    smp-sparse-harts|smp-too-many-harts)
+
+        # K3: 10 harts against PROCESSORS_MAX=8. sparse-harts disables cpu@1..8
+        # in the DTB so hart 9 must get a logical CPU; too-many-harts boots all
+        # 10 so two must be parked.
+        BEGIN_MARKER='Mounting '
+        PASS_MARKER='^login:'
+        PASS_GREP=-E
+        FAIL_MARKER='*** /usr unavailable'
+        MODE_ARG=''
+        CPUS=10
+        export CPUS
+        [ "$MODE" = "smp-sparse-harts" ] && setup_fdt_sparse_harts_or_skip
+        ;;
+    fdt-reserved-memory)
+
+        # K8: boots a DTB with extra /reserved-memory children and a
+        # /memreserve/ entry; the guest fills RAM and checks that no frame comes
+        # from those ranges, and check_fdt_resv() checks the boot log.
+        BEGIN_MARKER="RTMux ${MODE}: BEGIN"
+        PASS_MARKER="RTMux ${MODE}: PASS"
+        FAIL_MARKER="RTMux ${MODE}: FAIL"
+        MODE_ARG="rtmux.run=${MODE}"
+        setup_fdt_resv_or_skip
         ;;
     fdt-cpu-status)
 
@@ -2135,6 +2323,34 @@ check_hartwatch_reports()
     return 0
 }
 
+# check_fault_report_bound LOG PATTERN N: a kernel report rate-limited by
+# KPRINTF_RATELIMITED (kernel/include/log.h) that fired N times may print at
+# most BURST + ceil(N / INTERVAL) + 1 lines, and once N passes the burst at
+# least one line must carry the suppressed count, proving the events reached it.
+check_fault_report_bound()
+{
+    local log="$1" pattern="$2" events="$3" burst interval limit lines
+
+    burst=$(sed -nE 's/^#define[[:space:]]+KPRINTF_RL_BURST[[:space:]]+([0-9]+).*/\1/p' kernel/include/log.h)
+    interval=$(sed -nE 's/^#define[[:space:]]+KPRINTF_RL_INTERVAL[[:space:]]+([0-9]+).*/\1/p' kernel/include/log.h)
+    if [ -z "$burst" ] || [ -z "$interval" ]; then
+        echo "  FAIL     ${MODE}: cannot read KPRINTF_RL_BURST/INTERVAL from kernel/include/log.h"
+        return 1
+    fi
+    limit=$((burst + (events + interval - 1) / interval + 1))
+    lines=$(grep -aF -c -- "$pattern" "$log" || true)
+    if [ "$lines" -gt "$limit" ]; then
+        echo "  FAIL     ${MODE}: ${lines} '${pattern}' lines for ${events} events, limit ${limit}"
+        return 1
+    fi
+    if [ "$events" -gt $((burst + interval - 1)) ] &&
+       ! grep -aF -- "$pattern" "$log" | grep -Eq 'suppressed, [0-9]+ total\)'; then
+        echo "  FAIL     ${MODE}: no rate-limited '${pattern}' line carries a suppressed count"
+        return 1
+    fi
+    echo "  OK       ${MODE}: ${lines} '${pattern}' lines for ${events} events (limit ${limit})"
+}
+
 # check_roottask_wait_reports LOG: roottask wait-scan verdict. Each held sync
 # (the fixture prints "slow-server: WITHHOLD n" as it starts one) must produce
 # exactly one "liveness: pid 1 tid <n> REPLY <ms>ms chid=<c>" line with the wait
@@ -2506,6 +2722,16 @@ run_one()
         fi
     fi
 
+    if [ "$MODE" = "fdt-reserved-memory" ]; then
+        check_fdt_resv "$log" || return 1
+    fi
+
+    case "$MODE" in
+    smp-hart-start-fail|smp-hart-start-late|smp-sparse-harts|smp-too-many-harts)
+        check_smp_bringup "$log" || return 1
+        ;;
+    esac
+
     if [ "$MODE" = "fault-recovery" ]; then
         require_log_patterns_in_order "$log" "fault recovery probes" \
             '^  PASS  fault-recovery illegal_syscall[[:space:]]*$' \
@@ -2517,6 +2743,13 @@ run_one()
             '^  PASS  fault-recovery readonly_write_fault[[:space:]]*$' || return 1
         require_log_patterns "$log" "fault recovery readonly event" \
             '^fault-event event_id=user-page-fault severity=thread-fatal subject=self cause=--fault-mprotect-ro action=reported-signal authority_delta=none[[:space:]]*$' || return 1
+        require_log_patterns_in_order "$log" "fault recovery report floods" \
+            '^  PASS  fault-recovery bad_syscall_enosys[[:space:]]*$' \
+            '^fault-event event_id=illegal-syscall severity=deny subject=self cause=out-of-range-call action=return-ENOSYS authority_delta=none[[:space:]]*$' \
+            '^  PASS  fault-recovery crash_loop[[:space:]]*$' || return 1
+        check_fault_report_bound "$log" 'ecall: invalid syscall' 100000 || return 1
+        # Two single faults above, then the crash loop's forty children.
+        check_fault_report_bound "$log" 'user fault: ' 42 || return 1
     fi
 
     if [ "$MODE" = "rcu-lookup-measure" ]; then

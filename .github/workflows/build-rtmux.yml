@@ -181,6 +181,9 @@ jobs:
           - name: hart-watchdog
             run: make check-hart-watchdog
             experimental: true
+          - name: smp-bringup
+            run: make check-smp-bringup
+            experimental: true
           - name: trace-modes
             run: make check-trace-modes QEMU_TRACE_TIMEOUT=300
             experimental: true

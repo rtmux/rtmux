@@ -222,7 +222,7 @@ void __attribute__((noreturn)) kernel_exit(void)
              * the stack to the per-CPU kernel stack top to prevent stack growth
              * from repeated kernel_exit → cpu_idle transitions. Set tp =
              * &pcpu_array[cpu] before tail-calling cpu_idle so get_cpunum()
-             * reads pc_hart at offset PC_HART(tp).
+             * reads pc_cpu at offset PC_CPU(tp).
              */
             __asm__ volatile("mv tp, %0" ::"r"(&pcpu_array[cpu]));
             in_kcall_dec();

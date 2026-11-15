@@ -221,28 +221,72 @@ void cpu_shutdown(void)
     SBI_ECALL_0(SBI_EXT_0_1_SHUTDOWN);
 }
 
-/* cpu_start_others — start secondary CPUs via SBI HSM. start = address of
- * _smpstart; ~0UL means shutdown (no-op).
- */
-void cpu_start_others(uintptr_t start)
+uint32_t smp_slot[PROCESSORS_MAX];
+uint64_t smp_start_tick[PROCESSORS_MAX]; /* rdtime when the start was asked */
+
+/* smp_slot_open — open cpu's start slot and start its bring-up deadline. */
+static void smp_slot_open(unsigned cpu)
 {
+    smp_start_tick[cpu] = cpu_clock_ticks();
+    __atomic_store_n(&smp_slot[cpu], SMP_SLOT_OPEN, __ATOMIC_RELEASE);
+}
+
+/* cpu_start_one — open logical CPU cpu's start slot and start its hart at
+ * start (a physical address) via SBI HSM, passing cpu as the opaque word
+ * _smpstart reads in a1. A hart that fails to start has its slot abandoned at
+ * once.
+ */
+static void cpu_start_one(unsigned cpu, uintptr_t start)
+{
+    extern unsigned hart_ids[];
+    unsigned hart = hart_ids[cpu];
+    long ret;
+
+    smp_slot_open(cpu);
+#ifdef CONFIG_DEBUG_INJECT
+    if (smp_inject(cpu, "rtmux.inject=hart-start-fail"))
+        ret = SBI_ERR_FAILED;
+    else
+#endif
+        ret = sbi_hart_start(hart, start, cpu);
+    if (ret == SBI_SUCCESS) {
+        kprintf("cpu_start_others: hart %u (cpu %u) started\n", hart, cpu);
+    } else if (ret != SBI_ERR_ALREADY_AVAILABLE) {
+        kprintf("cpu_start_others: hart %u (cpu %u) failed: %ld\n", hart, cpu,
+                ret);
+        __atomic_store_n(&smp_slot[cpu], SMP_SLOT_ABANDONED, __ATOMIC_RELEASE);
+    }
+}
+
+/* cpu_start_others — start secondary CPUs via SBI HSM. start = address of
+ * _smpstart; ~0UL means shutdown (no-op). Return value: the number of harts
+ * started outside the scheduler (the monitor hart), which kext_smp_bringup
+ * counts as online.
+ */
+unsigned cpu_start_others(uintptr_t start)
+{
+    unsigned extra = 0;
+
     if (start == ~0UL)
-        return;
+        return 0;
 
     /* SBI needs a physical address; convert if we're running at high VA */
     if (CPU_VADDR_IN_RANGE(start))
         start = CPU_V2P(start);
 
-    extern unsigned hart_ids[];
     for (unsigned i = 0; i < num_processors; i++) {
-        unsigned hart = hart_ids[i];
-        if (hart != get_cpunum()) {
-            long ret = sbi_hart_start(hart, start, hart);
-            if (ret == SBI_SUCCESS)
-                kprintf("cpu_start_others: hart %u started\n", hart);
-            else if (ret != SBI_ERR_ALREADY_AVAILABLE)
-                kprintf("cpu_start_others: hart %u failed: %ld\n", hart, ret);
+        if (i == get_cpunum())
+            continue;
+#ifdef CONFIG_DEBUG_INJECT
+        if (smp_inject(i, "rtmux.inject=hart-start-late")) {
+            /* Leave the slot open but the hart stopped; kext_smp_bringup()
+             * starts it after giving up on it.
+             */
+            smp_slot_open(i);
+            continue;
         }
+#endif
+        cpu_start_one(i, start);
     }
 
 #ifdef CONFIG_MONITORING_KTHREAD
@@ -252,6 +296,8 @@ void cpu_start_others(uintptr_t start)
         if (CPU_VADDR_IN_RANGE(mstart))
             mstart = CPU_V2P(mstart);
         long ret = sbi_hart_start(monitor_hart_id, mstart, monitor_hart_id);
+        if (ret == SBI_SUCCESS || ret == SBI_ERR_ALREADY_AVAILABLE)
+            extra++;
         if (ret == SBI_SUCCESS)
             kprintf("cpu_start_others: monitor hart %u started\n",
                     monitor_hart_id);
@@ -260,6 +306,7 @@ void cpu_start_others(uintptr_t start)
                     monitor_hart_id, ret);
     }
 #endif
+    return extra;
 }
 
 /* CPU specific code to force FPU save: write this hart's live FP registers
@@ -344,12 +391,14 @@ void halt(void)
  * that lost-wakeup.
  *
  * Parameters:
- *   cpu : hart ID of the target CPU (ipicmds[] is hart-indexed and
- *         sbi_send_ipi takes a hart mask)
+ *   cpu : logical CPU of the target (ipicmds[] is indexed by it; the SBI call
+ *         names its hart as the mask base, so any hart ID works)
  *   cmd : IPI command bits to OR into the target's pending word
  */
 void rdecl send_ipi(unsigned cpu, int cmd)
 {
+    extern unsigned hart_ids[];
+
     if (num_processors <= 1)
         return;
 
@@ -357,7 +406,7 @@ void rdecl send_ipi(unsigned cpu, int cmd)
         atomic_fetch_or_explicit(&pcpu_array[cpu].pc_ipicmds, (unsigned) cmd,
                                  memory_order_release);
     }
-    sbi_send_ipi(1UL << cpu, 0);
+    sbi_send_ipi(1UL, hart_ids[cpu]);
 }
 
 /* cpu_icache_sync_all — make freshly-written instructions visible to
@@ -381,17 +430,19 @@ void cpu_icache_sync_all(void)
     extern unsigned hart_ids[];
     unsigned self = get_cpunum();
     unsigned long mask = 0;
-    int i;
+    unsigned i;
 
     cpu_icache_sync(); /* local fence.i */
 
     if (num_processors <= 1)
         return;
 
+    /* Every admitted hart ID is below 64 (admit_hart() parks larger ones for
+     * want of a PLIC context), so one mask from base 0 names them all.
+     */
     for (i = 0; i < num_processors; ++i) {
-        unsigned h = hart_ids[i];
-        if (h != self && pcpu_array[h].pc_alive)
-            mask |= (1UL << h);
+        if (i != self && pcpu_array[i].pc_alive)
+            mask |= 1UL << hart_ids[i];
     }
     if (mask != 0)
         sbi_remote_fence_i(mask, 0);
@@ -413,6 +464,23 @@ void cpu_idle(unsigned cpu)
      * idle-fallback path stamps tp = &pcpu_array[cpu] before tail-calling here.
      */
 
+    /* A secondary CPU's first entry commits it to joining (see SMP_SLOT_* in
+     * decls.h) by moving its slot from ARRIVED to JOINED. Anything else means
+     * kext_smp_bringup() abandoned the slot after _smpstart claimed it: park,
+     * with interrupts still off, before publishing pc_alive, so nothing ever
+     * sees this CPU. The boot CPU (slot CLOSED) and later entries (pc_alive
+     * already set) skip the commit.
+     */
+    if (cpu != boot_cpunum &&
+        !__atomic_load_n(&pcpu_array[cpu].pc_alive, __ATOMIC_RELAXED)) {
+        uint32_t st = SMP_SLOT_ARRIVED;
+
+        if (!__atomic_compare_exchange_n(&smp_slot[cpu], &st, SMP_SLOT_JOINED,
+                                         false, __ATOMIC_ACQ_REL,
+                                         __ATOMIC_ACQUIRE))
+            halt();
+    }
+
     /* Discard every translation cached during _smpstart bring-up before we
      * publish pc_alive. cpu_tlb_flush_complete() skips not-yet-alive harts in
      * its cross-hart shootdown; this sfence is the other half of that contract
@@ -422,7 +490,7 @@ void cpu_idle(unsigned cpu)
      * anything walked between that point and here.
      */
     sfence_vma();
-    pcpu_array[cpu].pc_alive = true;
+    __atomic_store_n(&pcpu_array[cpu].pc_alive, true, __ATOMIC_RELEASE);
 
     /* Set PLIC threshold to 0 so this hart can receive external interrupts.
      * Must be done per-hart.
@@ -636,7 +704,13 @@ void cpu_idle(unsigned cpu)
 const uint64_t kern_va_offset __attribute__((used)) = KERNEL_VIRT_BASE;
 
 /* _smpstart — assembly entry point for all CPUs except the boot CPU. Called by
- * SBI HSM with a0=hartid, a1=opaque (also hartid).
+ * SBI HSM with a0=hartid, a1=opaque (the logical CPU, see cpu_start_one).
+ *
+ * Before touching any per-CPU state it checks that a1 is a logical CPU below
+ * PROCESSORS_MAX whose hart_ids[] entry is this hart, and claims the CPU's
+ * start slot by swapping in ARRIVED. A hart failing either check, or finding
+ * its slot no longer OPEN (kext_smp_bringup gave up on it), parks in wfi and
+ * never joins the kernel.
  *
  * Sets up MMU, switches to high VA (same as the boot CPU), then calls
  * cpu_idle() at the high VA. All CPUs are equal — there is no AP/BP
@@ -645,8 +719,23 @@ const uint64_t kern_va_offset __attribute__((used)) = KERNEL_VIRT_BASE;
 void __attribute__((naked)) _smpstart(void)
 {
     __asm__ volatile(
-        /* a0 = hartid from SBI. sscratch = 0 (no U-mode context yet). tp will
-         * be set to &pcpu_array[hartid] after MMU is enabled (see below).
+        /* a0 = hartid, a1 = logical CPU. The checks run at PA, MMU off. */
+        "li   t0, %[ncpu]\n"
+        "bgeu a1, t0, 9f\n" /* no logical slot */
+        "slli t4, a1, 2\n" /* t4 = cpu * 4, for both u32 arrays */
+        "la   t0, hart_ids\n"
+        "add  t0, t0, t4\n"
+        "lwu  t1, 0(t0)\n"
+        "bne  t1, a0, 9f\n" /* the slot names another hart */
+        "la   t0, smp_slot\n"
+        "add  t0, t0, t4\n"
+        "li   t1, %[arrived]\n"
+        "amoswap.w.aqrl t1, t1, (t0)\n"
+        "li   t2, %[open]\n"
+        "bne  t1, t2, 9f\n" /* too late: the boot CPU gave up on us */
+
+        /* sscratch = 0 (no U-mode context yet). tp will be set to
+         * &pcpu_array[cpu] after MMU is enabled (see below).
          */
         "csrw sscratch, zero\n"
 
@@ -681,31 +770,34 @@ void __attribute__((naked)) _smpstart(void)
         /* Set up per-CPU kernel stack (already at high VA) */
         "la   t0, ksys_stack\n"
         "add  t0, t0, t3\n" /* ksys_stack VA */
-        "slli t1, a0, 3\n"  /* t1 = hartid * 8 */
+        "slli t1, a1, 3\n"  /* t1 = cpu * 8 */
         "add  t0, t0, t1\n"
-        "ld   sp, 0(t0)\n" /* sp = ksys_stack[hartid] */
+        "ld   sp, 0(t0)\n" /* sp = ksys_stack[cpu] */
 
-        /* tp = &pcpu_array[hartid]. pcpu_array[hartid].pc_hart was populated by
+        /* tp = &pcpu_array[cpu]. pcpu_array[cpu].pc_cpu was populated by
          * kernel_entry on the boot CPU before this AP was released, so
-         * get_cpunum() = "lw PC_HART(tp)" returns the correct hart ID
-         * immediately.
+         * get_cpunum() = "lw PC_CPU(tp)" returns the logical CPU immediately.
          */
         "la   t0, pcpu_array\n"
         "add  t0, t0, t3\n"            /* pcpu_array VA */
-        "slli t1, a0, %[pcpu_shift]\n" /* t1 = hartid * sizeof(struct pcpu) */
-        "add  tp, t0, t1\n"            /* tp = &pcpu_array[hartid] */
+        "slli t1, a1, %[pcpu_shift]\n" /* t1 = cpu * sizeof(struct pcpu) */
+        "add  tp, t0, t1\n"            /* tp = &pcpu_array[cpu] */
 
         /* Jump to cpu_idle at its HIGH VA. This is the PA→VA switch point —
          * after this jump, the CPU executes at high VAs just like the boot CPU.
-         * a0 still holds hartid.
          */
         "la   t0, cpu_idle\n"
         "add  t0, t0, t3\n" /* VA of cpu_idle */
-        "jr   t0\n"         /* jump; a0 = hartid */
+        "mv   a0, a1\n"
+        "jr   t0\n" /* jump; a0 = cpu */
 
-        /* Should never reach here */
-        "1: wfi\n"
-        "   j 1b\n" ::[pcpu_shift] "i"(__builtin_ctz(sizeof(struct pcpu))));
+        /* Parked: no slot, or arrived too late. Interrupts are off, so wfi
+         * only ever returns to the next wfi.
+         */
+        "9: wfi\n"
+        "   j 9b\n" ::[pcpu_shift] "i"(__builtin_ctz(sizeof(struct pcpu))),
+        [ncpu] "i"(PROCESSORS_MAX), [arrived] "i"(SMP_SLOT_ARRIVED),
+        [open] "i"(SMP_SLOT_OPEN));
 }
 
 /* RISC-V atomic operations (AMO instructions). */

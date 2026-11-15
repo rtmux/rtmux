@@ -602,9 +602,9 @@ static __inline__ void __attribute__((__unused__)) atomic_boundary()
  * clobbered by a concurrent xfer on another hart, and the faulting hart would
  * longjmp into a foreign/stale stack frame -> XFER kernel crash.
  *
- * Kept as a hart-indexed array (xfer_env[], in core.c) rather than a pcpu
- * field: struct pcpu is held at a power-of-2 size for the AP boot asm and has
- * no spare slot. Same pattern as the per-CPU trace rings.
+ * Kept as a CPU-indexed array (xfer_env[], in core.c) rather than a pcpu field:
+ * struct pcpu is held at a power-of-2 size for the AP boot asm and has no spare
+ * slot. Same pattern as the per-CPU trace rings.
  */
 #define SET_XFER_ENV(env) (xfer_env[get_cpunum()] = (env))
 #define GET_XFER_ENV() (xfer_env[get_cpunum()])

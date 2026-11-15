@@ -175,12 +175,11 @@ static void rcu_sched_busy_add_peer(struct rcu_sched_busy *detail, unsigned cpu)
 
 static unsigned rcu_sched_busy_peers(struct rcu_sched_busy *detail)
 {
-    extern unsigned hart_ids[];
     unsigned self = get_cpunum();
     unsigned peers = 0;
 
     for (int i = 0; i < (int) num_processors; i++) {
-        unsigned cpu = hart_ids[i];
+        unsigned cpu = (unsigned) i;
         unsigned depth;
 
         if (cpu == self)
@@ -203,11 +202,10 @@ static unsigned rcu_sched_busy_peers(struct rcu_sched_busy *detail)
 
 void rcu_sched_wait(rcu_epoch_t goal)
 {
-    extern unsigned hart_ids[];
     unsigned self = get_cpunum();
 
     for (int i = 0; i < (int) num_processors; i++) {
-        unsigned cpu = hart_ids[i];
+        unsigned cpu = (unsigned) i;
         unsigned depth;
 
         if (cpu == self)

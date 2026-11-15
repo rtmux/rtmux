@@ -30,13 +30,6 @@
 #include <private/inject.h> /* inject_spin_begin/end */
 #endif
 
-/* Recovered-xfer-fault reports to print per boot before going quiet. Assumption
- * class: tuning. Diagnostics only; the recovery itself is unaffected. Revisit
- * trigger: a debugging session that needs the full stream, which should raise
- * this rather than remove the throttle.
- */
-#define XFER_FAULT_REPORT_MAX 16
-
 /* Cause names for the most common S-mode exceptions. */
 static const char *scause_name(uint64_t cause)
 {
@@ -75,8 +68,9 @@ static const char *scause_name(uint64_t cause)
 /* ===================================================================== *
  * Verbose U-mode fault report — gated on CONFIG_UMODE_VERBOSE_FAULT_REPORT.
  *
- * deliver_fault() always prints a one-line "user fault:" summary; that tells us
- * a process died but not where the corruption came from. When this option is
+ * deliver_fault() prints a one-line "user fault:" summary (rate-limited per
+ * call site, see KPRINTF_RATELIMITED); that tells us a process died but not
+ * where the corruption came from. When this option is
  * enabled, dump_umode_fault() additionally reports the exact scause, the
  * page-table state of both the fault IP and the fault address, the full
  * register file, and a fault-safe scan of the user stack for candidate return
@@ -473,8 +467,8 @@ static int fpu_first_use(thread_t *thp, CPU_REGISTERS *regs)
     fp = FPUDATA_PTR(thp->fpudata);
     if (!fp) {
         if (!(fp = object_alloc(thp->process, &fpu_souls))) {
-            kprintf("fpu_souls exhausted pid=%d tid=%u\n", thp->process->pid,
-                    thp->tid);
+            KPRINTF_RATELIMITED("fpu_souls exhausted pid=%d tid=%u\n",
+                                thp->process->pid, thp->tid);
             return 0;
         }
         memset(fp, 0, sizeof *fp);
@@ -822,7 +816,11 @@ void strap_handler_c(CPU_REGISTERS *regs)
      * kcallptr (ecall instruction in syspage).
      */
     if (RISCV_EXC_IS_ECALL(scause)) {
-        unsigned num = (unsigned) regs->gpr[RISCV_REG_A7];
+        /* Clamp before narrowing, so a number with high bits set is refused
+         * as out of range instead of aliasing a live call.
+         */
+        uint64_t a7 = regs->gpr[RISCV_REG_A7];
+        unsigned num = a7 < __KSYS_BAD ? (unsigned) a7 : __KSYS_BAD;
         int from_smode = (scause == RISCV_EXC_ECALL_S);
 
         /* Pack arguments from the trap frame (read-only: copies register values
@@ -839,7 +837,8 @@ void strap_handler_c(CPU_REGISTERS *regs)
         kap[5] = regs->gpr[RISCV_REG_A5];
 
 #ifdef CONFIG_TRACE_SYSCALLS
-        if (num != __KSYS_DBGPRINT) {
+        /* An out-of-range number is reported, rate-limited, below. */
+        if (num != __KSYS_DBGPRINT && num != __KSYS_BAD) {
             static const char *const _knames[] = {
                 [0] = "nop",
                 [1] = "trace_event",
@@ -1000,9 +999,10 @@ void strap_handler_c(CPU_REGISTERS *regs)
          * infinite loop.
          */
         if (num >= __KSYS_BAD) {
-            kprintf("ecall: invalid syscall %u from sepc=%lx\n", num,
-                    (unsigned long) (act->reg.pc - 4));
-            act->reg.gpr[RISCV_REG_A0] = (uint64_t) (-1L);
+            KPRINTF_RATELIMITED("ecall: invalid syscall %lx from sepc=%lx\n",
+                                (unsigned long) a7,
+                                (unsigned long) (act->reg.pc - 4));
+            SETKSTATUS(act, -ENOSYS); /* kcall_err()'s encoding */
             lookup_rcvid_release();
             in_kcall_dec();
             return;
@@ -1121,29 +1121,18 @@ void strap_handler_c(CPU_REGISTERS *regs)
                  * Rate-limited because this is now reachable on demand: any
                  * process can hand a kcall a null or unmapped pointer and land
                  * here, and an unthrottled kprintf is both a console flood and
-                 * a realtime hazard, since a kernel-side console write costs
-                 * hundreds of microseconds (see the kcall-dbgprint row in
-                 * docs/rt-budgets.md). Keep the first few per boot for
-                 * diagnosis, then count silently. Racy across harts by design;
-                 * it is a log throttle, not an accounting record.
+                 * a realtime hazard (see KPRINTF_RATELIMITED).
                  */
-                static unsigned xfer_fault_reports;
                 thread_t *act = get_active_thread(cpu);
                 unsigned flags = RISCV_EXC_IS_STORE(scause) ? SIGCODE_STORE : 0;
 
-                if (xfer_fault_reports < XFER_FAULT_REPORT_MAX) {
-                    xfer_fault_reports++;
-                    kprintf(
-                        "XFER fault: cpu=%u sepc=%lx stval=%lx scause=%lu "
-                        "(%s) flags=%x pid=%d tid=%u%s\n",
-                        cpu, (unsigned long) r_sepc(),
-                        (unsigned long) fault_addr, scause, scause_name(scause),
-                        flags, (act && act->process) ? act->process->pid : -1,
-                        act ? act->tid : 0U,
-                        xfer_fault_reports == XFER_FAULT_REPORT_MAX
-                            ? " (further reports suppressed)"
-                            : "");
-                }
+                KPRINTF_RATELIMITED(
+                    "XFER fault: cpu=%u sepc=%lx stval=%lx scause=%lu "
+                    "(%s) flags=%x pid=%d tid=%u\n",
+                    cpu, (unsigned long) r_sepc(), (unsigned long) fault_addr,
+                    scause, scause_name(scause), flags,
+                    (act && act->process) ? act->process->pid : -1,
+                    act ? act->tid : 0U);
                 fh->fault(act, &act->reg, flags);
                 /* fault handler does longjmp — should not return */
             }
@@ -1210,7 +1199,16 @@ void strap_handler_c(CPU_REGISTERS *regs)
              * deliver_fault() prints the one-line summary either way. Compiled
              * out when the option is off (default).
              */
-            dump_umode_fault(act, scause);
+            {
+                /* Rate-limited like the one-line summary in deliver_fault(),
+                 * with its own counter: a crash loop must not buy a
+                 * multi-line dump per fault.
+                 */
+                static struct kprintf_ratelimit dump_rl;
+
+                if (kprintf_rl_admit(&dump_rl, NULL, NULL))
+                    dump_umode_fault(act, scause);
+            }
 #endif
 
             in_kcall_inc();

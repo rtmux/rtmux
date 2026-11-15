@@ -466,11 +466,10 @@ int rdecl interrupt_mask(unsigned level, interrupt_t *itp)
 #if CONFIG_PROCESSORS_MAX > 1
         if (pcpu_array[boot_cpunum].pc_alive &&
             ilp->info->flags & INTR_FLAG_SMP_BROADCAST_MASK) {
-            extern unsigned hart_ids[];
             unsigned mycpu = get_cpunum();
 
             for (unsigned _hi = 0; _hi < num_processors; ++_hi) {
-                unsigned h = hart_ids[_hi];
+                unsigned h = _hi;
                 if (h != mycpu)
                     SENDIPI(h, IPI_INTR_MASK);
             }
@@ -517,11 +516,10 @@ int rdecl interrupt_unmask(unsigned level, interrupt_t *itp)
 #if CONFIG_PROCESSORS_MAX > 1
         if (pcpu_array[boot_cpunum].pc_alive &&
             ilp->info->flags & INTR_FLAG_SMP_BROADCAST_UNMASK) {
-            extern unsigned hart_ids[];
             unsigned mycpu = get_cpunum();
 
             for (unsigned _hi = 0; _hi < num_processors; ++_hi) {
-                unsigned h = hart_ids[_hi];
+                unsigned h = _hi;
                 if (h != mycpu)
                     SENDIPI(h, IPI_INTR_UNMASK);
             }

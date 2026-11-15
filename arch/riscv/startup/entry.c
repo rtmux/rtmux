@@ -97,29 +97,25 @@ static void setup_cmdline(void)
  * Initializes the board, parses the command line, builds the syspage, switches
  * to high VA, then hands control to the kernel via kernel_entry().
  */
-/* tp points at pcpu_array[hart]. This is set up here for the boot hart; other
- * harts get their tp set in _smpstart.
+/* tp points at pcpu_array[cpu]. The boot hart is logical CPU 0 and is set up
+ * here; other harts get their tp set in _smpstart.
  *
- * pcpu_array[boot_hart].pc_hart is populated below so get_cpunum() (which reads
- * "lw PC_HART(tp)") returns the correct hart ID for the very first kprintf
- * onward.
+ * pcpu_array[0].pc_cpu is populated below so get_cpunum() (which reads
+ * "lw PC_CPU(tp)") returns 0 for the very first kprintf onward.
  */
 
 void startup_entry(void)
 {
     {
-        extern uint64_t _boot_a0;
-        unsigned boot_hart = (unsigned) _boot_a0;
-
         /* Set up the S-mode register convention immediately:
          *   sscratch = 0 (no U-mode context)
-         *   tp = &pcpu_array[boot_hart]
+         *   tp = &pcpu_array[0]
          *
-         * get_cpunum() reads "lw PC_HART(tp)" — one load.
+         * get_cpunum() reads "lw PC_CPU(tp)" — one load.
          */
-        pcpu_array[boot_hart].pc_hart = boot_hart;
+        pcpu_array[0].pc_cpu = 0;
         __asm__ volatile("csrw sscratch, zero");
-        __asm__ volatile("mv tp, %0" ::"r"(&pcpu_array[boot_hart]));
+        __asm__ volatile("mv tp, %0" ::"r"(&pcpu_array[0]));
     }
 
     paddr_bits = arch_max_paddr_bits();

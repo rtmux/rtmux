@@ -583,7 +583,6 @@ static uint64_t thread_destroy_cycles_to_ns(uint64_t cycles_delta)
 
 static void thread_destroy_wait_inactive(thread_t *thp, process_t *prp)
 {
-    extern unsigned hart_ids[];
     unsigned self = get_cpunum();
     unsigned spins = 0;
 
@@ -593,7 +592,7 @@ static void thread_destroy_wait_inactive(thread_t *thp, process_t *prp)
         unsigned depth = 0;
 
         for (hi = 0; hi < num_processors; hi++) {
-            unsigned hart = hart_ids[hi];
+            unsigned hart = hi;
             thread_t *cur;
 
             if (hart == self)
@@ -651,10 +650,8 @@ static void thread_soul_free(process_t *prp, thread_t *thp)
  */
 int thread_active_hart(thread_t *thp)
 {
-    extern unsigned hart_ids[];
-
     for (unsigned hi = 0; hi < num_processors; hi++) {
-        unsigned hart = hart_ids[hi];
+        unsigned hart = hi;
         thread_t *cur;
 
         cur = __atomic_load_n(&pcpu_array[hart].pc_curthread, __ATOMIC_ACQUIRE);

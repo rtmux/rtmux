@@ -16,8 +16,8 @@ static char *local_envv[16];
  *
  * Clamps the CPU count, captures CPU flags and the system-private pointer,
  * converts the kernel cpupage to high VA and wires per-CPU cpupage/pcpu state,
- * determines the boot hart and reorders hart_ids[] so the boot hart is first,
- * optionally reserves the last hart for the monitoring kthread, and records the
+ * logs the harts a -P limit leaves without a logical CPU, optionally reserves
+ * the last hart for the monitoring kthread, and records the
  * kcall/qtime/intrinfo pointers.
  */
 static void syspage_init()
@@ -48,31 +48,15 @@ static void syspage_init()
     {
         extern unsigned hart_ids[];
         extern unsigned board_smp_num_cpu(void);
-        extern uint64_t _boot_a0;
 
-        /* Set boot_cpunum HERE, not in kernel_init (which runs later).
-         * syspage_init must know the boot hart to build cpupageptr correctly.
+        /* board.c put the boot hart at hart_ids[0], so it is logical CPU 0
+         * (startup_entry already pointed its tp at pcpu_array[0]). With -P N,
+         * the harts past N-1 get no logical CPU and are never started.
          */
-        boot_cpunum = (unsigned) _boot_a0;
-
-        /* Rebuild hart_ids[0..num_processors-1] with boot hart at [0]. The
-         * FDT-populated list may have any ordering, and with -P N the boot hart
-         * may be beyond index N-1.
-         */
-        {
-            unsigned fdt_count = board_smp_num_cpu();
-            unsigned fdt_harts[PROCESSORS_MAX];
-            unsigned idx = 1;
-
-            for (unsigned k = 0; k < fdt_count && k < PROCESSORS_MAX; k++)
-                fdt_harts[k] = hart_ids[k];
-
-            hart_ids[0] = boot_cpunum;
-            for (unsigned k = 0; k < fdt_count && idx < num_processors; k++) {
-                if (fdt_harts[k] != boot_cpunum)
-                    hart_ids[idx++] = fdt_harts[k];
-            }
-        }
+        boot_cpunum = 0;
+        for (unsigned k = num_processors; k < board_smp_num_cpu(); k++)
+            kprintf("smp: hart %u parked: no logical CPU slot (-P %u)\n",
+                    hart_ids[k], num_processors);
 
 #ifdef CONFIG_MONITORING_KTHREAD
 
@@ -88,27 +72,19 @@ static void syspage_init()
 #endif
 
         for (i = 0; i < num_processors; ++i) {
-            unsigned cpu = hart_ids[i];
-            cpupageptr[cpu] = cpupage;
+            cpupageptr[i] = cpupage;
             cpupage->syspage = privateptr->user_syspageptr;
-            cpupage->cpu = cpu;
+            cpupage->cpu = i;
             cpupage =
                 (void *) ((uint8_t *) cpupage + privateptr->cpupage_spacing);
 
-            /* Populate each hart's pc_hart so that get_cpunum() = "lw
-             * PC_HART(tp)" returns the correct architectural hart ID once an AP
-             * sets its tp = &pcpu_array[hart] in _smpstart. For the boot hart
-             * this was already populated in startup_entry, but re-writing it
-             * with the same value is harmless and keeps the loop uniform across
-             * all harts.
+            /* Stamp each slot before its AP starts: _smpstart points tp at
+             * pcpu_array[cpu], so get_cpunum() = "lw PC_CPU(tp)" returns the
+             * logical CPU at once. Slot 0 was stamped in startup_entry; the
+             * rewrite is harmless.
              */
-            pcpu_array[cpu].pc_hart = cpu;
+            pcpu_array[i].pc_cpu = i;
         }
-
-        /* The boot hart's tp already points at &pcpu_array[boot_cpunum] (set in
-         * startup_entry). No re-stamp needed — pcpu_array[boot_cpunum].pc_hart
-         * was populated above; get_cpunum() works correctly.
-         */
     }
 
     /* kcallptr must be a user-accessible address: cpu_force_thread_destroyall
