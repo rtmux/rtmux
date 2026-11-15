@@ -62,6 +62,13 @@ int setvbuf(FILE *__restrict fp, char *__restrict buf, int mode, size_t size)
         if (flags & __SLBF)
             fp->_lbfsize = -fp->_bf._size;
         fp->_r = 0;
+
+        /* A stream already set up for writing skips __swsetup, so give it the
+         * new buffer's write room here; left at 0, __sfvwrite would drive _w
+         * negative and copy past the end of the buffer.
+         */
+        if (flags & __SWR)
+            fp->_w = flags & (__SLBF | __SNBF) ? 0 : fp->_bf._size;
     }
     return ret;
 }

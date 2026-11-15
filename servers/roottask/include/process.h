@@ -24,6 +24,7 @@ int roottask_sysconf_set(pid_t pid,
                          long value,
                          const char *str);
 void roottask_sysconf_destroy(pid_t pid);
+long roottask_sc_pagesize(int name);
 
 /* ids.c */
 int proc_getsetid(ioserv_context_t *ctp, proc_getsetid_t *msg);

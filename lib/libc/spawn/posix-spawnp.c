@@ -16,9 +16,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-extern char **environ;
+#include "env-lock.h"
 
-static char *find_envvar(char *const envp[], const char *envvar);
 static int parse_envvar_str(char *str, const char *token, char ***value);
 
 /* posix_spawnp — like posix_spawn(), except that <file> may be a bare name; in
@@ -59,12 +58,20 @@ int posix_spawnp(pid_t *restrict pid,
     int r = -1;
     int i;
     char *envvar_str;
+    const char *path_env;
     char **env_path;
     char path[PATH_MAX + 1];
 
-    if (!(envvar_str = find_envvar(environ, "PATH")))
+    /* Copy PATH under the environment lock, so setenv cannot change it or free
+     * the vector while it is read.
+     */
+    __env_lock();
+    path_env = getenv("PATH");
+    envvar_str = path_env ? strdup(path_env) : NULL;
+    __env_unlock();
+    if (!path_env)
         return ENOENT;
-    if (!(envvar_str = strdup(envvar_str)))
+    if (!envvar_str)
         return ENOMEM;
 
     if ((num_paths = parse_envvar_str(envvar_str, ":", &env_path)) <= 0) {
@@ -119,22 +126,6 @@ int posix_spawnp(pid_t *restrict pid,
     free(env_path);
     free(envvar_str);
     return r != -1 ? r : ENOENT;
-}
-
-/* find_envvar — return a pointer to the value side of an env entry.
- *   find_envvar(environ, "PATH") on env={"PATH=./:/foo", ...} → "./:/foo"
- */
-static char *find_envvar(char *const envp[], const char *envvar)
-{
-    while (*envp) {
-        char *s1 = *envp;
-        size_t len = strlen(envvar);
-
-        if (strncmp(s1, envvar, len) == 0 && s1[len] == '=')
-            return s1 + len + 1;
-        ++envp;
-    }
-    return NULL;
 }
 
 /* parse_envvar_str — split <str> at <token> in place, returning the count of

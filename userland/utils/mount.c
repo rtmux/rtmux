@@ -180,7 +180,11 @@ int toolbox_mount_main(int argc, char **argv)
 
     rval = 0;
     options = NULL;
-    while (argc) {
+
+    /* Each round parses options up to a device and mount point, then mounts;
+     * the next round carries on from optind over the same argv.
+     */
+    for (;;) {
         vfslist = NULL;
         mntfromname = mntonname = vfstype = extoptions = NULL;
         all = verbose = 0;
@@ -224,21 +228,12 @@ int toolbox_mount_main(int argc, char **argv)
                 return usage();
             }
         }
-        argc -= optind;
-        argv += optind;
-
         /* First non-option is the device name */
-        if (argc > 0) {
-            mntfromname = argv[0];
-            argv++;
-            argc--;
-        }
+        if (optind < argc)
+            mntfromname = argv[optind++];
         /* Next non-option is the mount point */
-        if (argc > 0 && *argv[0] != '-') {
-            mntonname = argv[0];
-            argv++;
-            argc--;
-        }
+        if (optind < argc && *argv[optind] != '-')
+            mntonname = argv[optind++];
 
         if (verbose) {
             fprintf(stderr, "mount: from [%s] on [%s] type [%s]\n",
@@ -322,10 +317,8 @@ int toolbox_mount_main(int argc, char **argv)
 
         rval = mountfs(vfstype, mntfromname, mntonname, init_flags, options,
                        extoptions, 0);
-        if (rval != 0)
+        if (rval != 0 || optind >= argc)
             break;
-
-        optind = 0;
     }
 
     free(options);

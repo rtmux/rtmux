@@ -48,7 +48,7 @@ RTMUX_SRCS = sigemptyset.c sigfillset.c sigaddset.c sigdelset.c sigismember.c \
 POSIX1_SRCS = sleep.c write.c read.c close.c fstat.c fdatasync.c fsync.c sync.c \
               sigprocmask.c sigaction.c pthread-sigmask.c pthread-kill.c fpathconf.c \
               setpgid.c setids.c tcsetpgrp.c tcsetsid.c \
-              open.c stat.c access.c chdir.c chroot.c issetugid.c \
+              open.c stat.c access.c chdir.c chroot.c issetugid.c getpagesize.c \
               getgroups.c sysconf.c umask.c time-posix.c times.c \
               lseek.c dup.c kill.c pause.c \
               pipe.c waitpid.c getcwd.c isatty.c creat.c \

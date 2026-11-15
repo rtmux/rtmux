@@ -493,6 +493,7 @@ int main(int argc, char **argv)
                           "Incorrect value for max_msi %d", max_msi);
                 return -1;
             }
+            break;
 
         case 'p':
             program_display_device = 1;
@@ -512,8 +513,13 @@ int main(int argc, char **argv)
             break;
 
         default:
-            pci_slogf(_SLOGC_PCI, _SLOG_WARNING, "%s unknown option", progname);
-            break;
+            /* Stop here: carrying on would read the rest of a bad argument such
+             * as "--verbose" as a group of option letters.
+             */
+            pci_slogf(_SLOGC_PCI, _SLOG_ERROR,
+                      "%s unknown option or missing argument -%c", progname,
+                      optopt);
+            exit(EXIT_FAILURE);
         }
     }
 

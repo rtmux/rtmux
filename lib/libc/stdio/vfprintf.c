@@ -72,19 +72,18 @@ static char zeroes[PADSIZE] = {'0', '0', '0', '0', '0', '0', '0', '0',
         uio.uio_iovcnt = 0;                        \
         uio.uio_resid = 0;                         \
         iovp = iov;                                \
+        bufq = 0;                                  \
     } while (0)
 
 /* Accumulate into the int character count, failing per POSIX with EOVERFLOW if
  * the running total would exceed what an int can hold rather than overflowing
  * it. Every addition to ret goes through here; amount is always non-negative.
  */
-#define ADD_RET(amount)                 \
-    do {                                \
-        if ((amount) > INT_MAX - ret) { \
-            errno = EOVERFLOW;          \
-            goto error;                 \
-        }                               \
-        ret += (amount);                \
+#define ADD_RET(amount)               \
+    do {                              \
+        if ((amount) > INT_MAX - ret) \
+            goto overflow;            \
+        ret += (amount);              \
     } while (0)
 
 /* Accumulate a decimal digit into acc, clamping at INT_MAX instead of
@@ -109,6 +108,42 @@ static char zeroes[PADSIZE] = {'0', '0', '0', '0', '0', '0', '0', '0',
 #define PTRINT 0x200
 #define SIZINT 0x400
 #define CHARINT 0x800
+#define LONGDBL 0x1000
+
+/* PRINT() queues pointers, not bytes: nothing is copied until the next
+ * __sfvwrite. The sign and the 0x prefix are therefore queued from string
+ * literals, and buf, the one stack buffer that is ever queued, is claimed
+ * through TAKE_BUF(), which drains the iov first if buf may still be in it.
+ * FLUSH() clears bufq; the drain inside PRINT() leaves it set, since TAKE_BUF()
+ * raises it before the sign, prefix, and padding that precede buf are queued.
+ *
+ * Debug builds (STDIO_DEBUG, which the host fuzz and sanitizer builds define)
+ * also check that buf is really out of the iov before it is rewritten, which
+ * catches a path that queues buf without TAKE_BUF() or a drain that clears bufq
+ * too early. The check walks up to NIOV entries per conversion, so it is kept
+ * off the realtime path of the default build.
+ */
+#ifdef STDIO_DEBUG
+#include <assert.h>
+#define ASSERT_BUF_UNQUEUED()                                    \
+    do {                                                         \
+        uintptr_t lo_ = (uintptr_t) buf, hi_ = lo_ + sizeof buf; \
+        for (int i_ = 0; i_ < uio.uio_iovcnt; i_++) {            \
+            uintptr_t b_ = (uintptr_t) iov[i_].iov_base;         \
+            assert(b_ + iov[i_].iov_len <= lo_ || b_ >= hi_);    \
+        }                                                        \
+    } while (0)
+#else
+#define ASSERT_BUF_UNQUEUED() ((void) 0)
+#endif
+
+#define TAKE_BUF()             \
+    do {                       \
+        if (bufq)              \
+            FLUSH();           \
+        ASSERT_BUF_UNQUEUED(); \
+        bufq = 1;              \
+    } while (0)
 
 #define NIOV 8
 
@@ -173,14 +208,15 @@ int __vfprintf(FILE *fp, const char *fmt0, va_list ap)
     int ret;
     int width;
     int prec;
-    char sign;
+    const char *sign;   /* "-", "+", " ", or NULL */
+    const char *prefix; /* "0x", "0X", or NULL */
+    int bufq = 0;       /* buf is queued in the iov */
     unsigned long ulval;
     int base;
     int dprec;
     int fieldsz;
     int realsz;
     int size;
-    char ox[2];
 
     char buf[BUF];
     struct __siov iov[NIOV];
@@ -201,6 +237,7 @@ int __vfprintf(FILE *fp, const char *fmt0, va_list ap)
     fmt = fmt0;
     for (;;) {
         const char *startp;
+        const char *spec;
         for (startp = fmt; (ch = *fmt) != '\0' && ch != '%'; fmt++)
             ;
         if ((n = (int) (fmt - startp)) != 0) {
@@ -209,13 +246,13 @@ int __vfprintf(FILE *fp, const char *fmt0, va_list ap)
         }
         if (ch == '\0')
             goto done;
-        fmt++; /* skip '%' */
+        spec = fmt++; /* skip '%' */
 
         flags = 0;
         width = 0;
         prec = -1;
-        sign = '\0';
-        ox[1] = '\0';
+        sign = NULL;
+        prefix = NULL;
 
     rflag:
         ch = *fmt++;
@@ -223,7 +260,7 @@ int __vfprintf(FILE *fp, const char *fmt0, va_list ap)
         switch (ch) {
         case ' ':
             if (!sign)
-                sign = ' ';
+                sign = " ";
             goto rflag;
         case '#':
             flags |= ALT;
@@ -240,7 +277,7 @@ int __vfprintf(FILE *fp, const char *fmt0, va_list ap)
             flags |= LADJUST;
             goto rflag;
         case '+':
-            sign = '+';
+            sign = "+";
             goto rflag;
         case '.':
             if ((ch = *fmt++) == '*') {
@@ -282,7 +319,7 @@ int __vfprintf(FILE *fp, const char *fmt0, va_list ap)
                 flags |= SHORTINT;
             goto rflag;
         case 'j':
-            flags |= LLONGINT;
+            flags |= LONGINT; /* intmax_t is long on LP64 */
             goto rflag;
         case 'l':
             if (*fmt == 'l') {
@@ -300,12 +337,18 @@ int __vfprintf(FILE *fp, const char *fmt0, va_list ap)
         case 'z':
             flags |= SIZINT;
             goto rflag;
+        case 'L':
+            /* long double for the float conversions; glibc also accepts it as a
+             * synonym for ll on the integer ones.
+             */
+            flags |= LONGDBL | LLONGINT;
+            goto rflag;
 
         case 'c':
+            TAKE_BUF();
             *(cp = buf) = (char) va_arg(ap, int);
             size = 1;
-            sign = '\0';
-            goto pforw;
+            goto pstr;
 
         case 'd':
         case 'i': {
@@ -326,12 +369,12 @@ int __vfprintf(FILE *fp, const char *fmt0, va_list ap)
                 sval = va_arg(ap, int);
             if (sval < 0) {
                 ulval = -(unsigned long) sval;
-                sign = '-';
+                sign = "-";
             } else {
                 ulval = (unsigned long) sval;
             }
             base = 10;
-            goto nosign;
+            goto number;
         }
 
         case 'e':
@@ -342,18 +385,30 @@ int __vfprintf(FILE *fp, const char *fmt0, va_list ap)
         case 'G':
         case 'a':
         case 'A':
-            /* Float: consume argument, print placeholder */
-            (void) va_arg(ap, double);
+            /* Float: consume the argument at its real width so the conversions
+             * after it stay aligned, then print a placeholder.
+             */
+            if (flags & LONGDBL)
+                (void) va_arg(ap, long double);
+            else
+                (void) va_arg(ap, double);
             cp = "[float]";
             size = 7;
-            sign = '\0';
-            goto pforw;
+            goto pstr;
 
         case 'n':
+            /* The store may alias a queued %s argument, so write out what is
+             * queued first.
+             */
+            FLUSH();
             if (flags & LLONGINT)
                 *va_arg(ap, long long *) = ret;
             else if (flags & LONGINT)
                 *va_arg(ap, long *) = ret;
+            else if (flags & PTRINT)
+                *va_arg(ap, ptrdiff_t *) = ret;
+            else if (flags & SIZINT)
+                *va_arg(ap, ssize_t *) = ret;
             else if (flags & SHORTINT)
                 *va_arg(ap, short *) = (short) ret;
             else if (flags & CHARINT)
@@ -363,26 +418,23 @@ int __vfprintf(FILE *fp, const char *fmt0, va_list ap)
             continue;
 
         case 'o':
-            if (flags & (LLONGINT | LONGINT | PTRINT | SIZINT))
-                ulval = va_arg(ap, unsigned long);
-            else
-                ulval = va_arg(ap, unsigned int);
-            if (flags & SHORTINT)
-                ulval = (unsigned short) ulval;
-            else if (flags & CHARINT)
-                ulval = (unsigned char) ulval;
             base = 8;
-            goto nosign;
+            goto unsig;
 
         case 'p':
+            /* As glibc: %#lx for a non-null pointer, "(nil)" for null, with the
+             * sign flags honoured.
+             */
             ulval = (unsigned long) (uintptr_t) va_arg(ap, void *);
+            if (ulval == 0) {
+                cp = "(nil)";
+                size = 5;
+                goto pstr;
+            }
             base = 16;
             xdigs = xdigs_lower;
-            ox[1] = 'x';
-            flags |= ALT;
-            if (prec < 0)
-                prec = (int) (sizeof(void *) * 2);
-            goto nosign;
+            prefix = "0x";
+            goto number;
 
         case 's':
             cp = va_arg(ap, char *);
@@ -393,39 +445,17 @@ int __vfprintf(FILE *fp, const char *fmt0, va_list ap)
                 size = p ? (int) (p - cp) : prec;
             } else
                 size = (int) strlen(cp);
-            sign = '\0';
-            goto pforw;
+            goto pstr;
 
         case 'u':
-            if (flags & (LLONGINT | LONGINT | PTRINT | SIZINT))
-                ulval = va_arg(ap, unsigned long);
-            else
-                ulval = va_arg(ap, unsigned int);
-            if (flags & SHORTINT)
-                ulval = (unsigned short) ulval;
-            else if (flags & CHARINT)
-                ulval = (unsigned char) ulval;
             base = 10;
-            goto nosign;
+            goto unsig;
 
         case 'X':
-            xdigs = xdigs_upper;
-            /* FALLTHROUGH */
         case 'x':
-            if (ch == 'x')
-                xdigs = xdigs_lower;
-            if (flags & (LLONGINT | LONGINT | PTRINT | SIZINT))
-                ulval = va_arg(ap, unsigned long);
-            else
-                ulval = va_arg(ap, unsigned int);
-            if (flags & SHORTINT)
-                ulval = (unsigned short) ulval;
-            else if (flags & CHARINT)
-                ulval = (unsigned char) ulval;
+            xdigs = ch == 'X' ? xdigs_upper : xdigs_lower;
             base = 16;
-            if (flags & ALT && ulval != 0)
-                ox[1] = (char) ch;
-            goto nosign;
+            goto unsig;
 
         case '%':
             PRINT("%", 1);
@@ -433,20 +463,61 @@ int __vfprintf(FILE *fp, const char *fmt0, va_list ap)
             continue;
 
         default:
-            /* Unknown conversion, print it literally */
+            /* Undefined conversion: print the whole specification literally, as
+             * glibc does. It is queued straight from the format string, so no
+             * stack buffer is involved.
+             */
             if (ch == '\0')
                 goto done;
-            buf[0] = '%';
-            buf[1] = (char) ch;
-            PRINT(buf, 2);
-            ADD_RET(2);
+            n = (int) (fmt - spec);
+            PRINT(spec, n);
+            ADD_RET(n);
             continue;
         }
 
-    nosign:
-        FLUSH();
-        cp = __ultoa(ulval, buf + BUF, base, xdigs == xdigs_upper);
+    unsig:
+        /* The unsigned conversions %o %u %x %X: fetch at the modifier's type.
+         */
+        if (flags & LLONGINT)
+            ulval = va_arg(ap, unsigned long long);
+        else if (flags & (LONGINT | PTRINT | SIZINT))
+            ulval = va_arg(ap, unsigned long);
+        else
+            ulval = va_arg(ap, unsigned int);
+        if (flags & SHORTINT)
+            ulval = (unsigned short) ulval;
+        else if (flags & CHARINT)
+            ulval = (unsigned char) ulval;
+        if (base == 16 && (flags & ALT) && ulval != 0)
+            prefix = ch == 'X' ? "0X" : "0x";
+        /* The + and space flags apply to signed conversions only. */
+        sign = NULL;
+    number:
+        /* A precision overrides the 0 flag, and a zero value with a zero
+         * precision produces no digits (but %#o still prints its 0).
+         */
+        if (prec >= 0)
+            flags &= ~ZEROPAD;
+        TAKE_BUF();
+        cp = buf + BUF;
+        if (ulval != 0 || prec != 0)
+            cp = __ultoa(ulval, cp, base, xdigs == xdigs_upper);
+
+        /* %#o needs a leading 0 unless the digits already start with one, which
+         * happens only for a zero value printed with any precision.
+         */
+        if ((flags & ALT) && base == 8 && (ulval != 0 || prec == 0))
+            *--cp = '0';
         size = (int) (buf + BUF - cp);
+        goto pforw;
+
+    pstr:
+        /* Strings and characters: no sign, the precision only truncates (done
+         * above for %s), and the 0 flag does not apply.
+         */
+        sign = NULL;
+        prec = -1;
+        flags &= ~ZEROPAD;
 
     pforw:
         /* Right-justify by default, unless LADJUST */
@@ -458,32 +529,29 @@ int __vfprintf(FILE *fp, const char *fmt0, va_list ap)
          */
         if (sign) {
             if (fieldsz == INT_MAX) {
-                errno = EOVERFLOW;
-                goto error;
+                goto overflow;
             }
             fieldsz++;
         }
-        if (ox[1]) {
+        if (prefix) {
             if (fieldsz > INT_MAX - 2) {
-                errno = EOVERFLOW;
-                goto error;
+                goto overflow;
             }
             fieldsz += 2;
         }
         realsz = width > fieldsz ? width : fieldsz;
+        if (flags & LADJUST)
+            flags &= ~ZEROPAD; /* - overrides 0 */
 
         /* Leading padding (spaces or zeroes) */
         if (!(flags & (LADJUST | ZEROPAD)))
             PAD(realsz - fieldsz, blanks);
         /* Sign */
-        if (sign) {
-            PRINT(&sign, 1);
-        }
+        if (sign)
+            PRINT(sign, 1);
         /* 0x/0X prefix */
-        if (ox[1]) {
-            ox[0] = '0';
-            PRINT(ox, 2);
-        }
+        if (prefix)
+            PRINT(prefix, 2);
         /* Zero padding for precision and ZEROPAD */
         if (flags & ZEROPAD)
             PAD(realsz - fieldsz, zeroes);
@@ -495,20 +563,16 @@ int __vfprintf(FILE *fp, const char *fmt0, va_list ap)
             PAD(realsz - fieldsz, blanks);
 
         ADD_RET(realsz);
-
-        /* Drain the iov vector before the next iteration starts. PRINT() above
-         * stashes pointers to two stack-locals -- &sign and ox[] -- but the
-         * next iteration's "flags=0; sign='\0'; ox[1]='\0';" reset clobbers
-         * those bytes before __sfvwrite has read them, emitting stray NUL bytes
-         * mid-string.
-         */
-        FLUSH();
     }
 
 done:
     FLUSH();
     return ret;
 
+overflow:
+    /* Write out what is already queued rather than drop it, then fail. */
+    FLUSH();
+    errno = EOVERFLOW;
 error:
     return EOF;
 }

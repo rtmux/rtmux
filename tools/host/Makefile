@@ -38,7 +38,8 @@ PROGS = $(BUILD_BASE)/mkasmoff $(BUILD_BASE)/mkromfs $(BUILD_BASE)/treeromfs \
         $(BUILD_BASE)/cpio-parser-test $(BUILD_BASE)/spawn-fd-policy-test \
         $(BUILD_BASE)/serial-reply-test $(BUILD_BASE)/outcomes-test \
         $(BUILD_BASE)/sv39-lookup-test \
-        $(BUILD_BASE)/strftime-test
+        $(BUILD_BASE)/strftime-test \
+        $(BUILD_BASE)/libc-algorithms-test
 
 # Each tool compiles and links its sources in one command, so -MMD cannot give a
 # per-tool dependency file (with several sources it writes one named after each
@@ -68,6 +69,29 @@ $(BUILD_BASE)/outcomes-test: $(TEST_DIR)/test-outcomes.c
 	@mkdir -p $(@D)
 	$(msg) HOSTCC $(notdir $@)
 	$(Q)$(HOST_CC) -I../../tests/userland $(HOST_CFLAGS) -o $@ $(TEST_DIR)/test-outcomes.c
+
+# The guest libc suites with no system dependency, linked against the RTMux
+# sources, whose definitions take precedence over the host libc's. _GNU_SOURCE
+# makes the host <stdlib.h> declare qsort_r, which glibc gives the POSIX.1-2024
+# signature. libc-host-shim.h routes their allocations through a counting
+# allocator; the host headers mark the getenv family nonnull, which the RTMux
+# NULL checks would otherwise warn about. Environment strings and vectors are
+# never freed by design, so the sanitizer run suppresses leaks from getenv.c
+# alone (libc-algorithms.lsan).
+LIBC_ALGO_SRCS = ../../tests/userland/report.c ../../tests/userland/qsort-test.c \
+                 ../../lib/libc/stdlib/qsort.c ../../tests/userland/getopt-test.c \
+                 ../../lib/libc/stdlib/getopt.c ../../tests/userland/env-test.c \
+                 ../../lib/libc/stdlib/getenv.c
+LIBC_ALGO_FLAGS = -I../../tests/userland -I$(TEST_DIR) -idirafter ../../internal/include \
+                  -idirafter ../../lib/libc/internal -D_GNU_SOURCE -DLIBC_HOST_TEST \
+                  -include $(TEST_DIR)/libc-host-shim.h -pthread -Wno-nonnull-compare
+$(BUILD_BASE)/libc-algorithms-test: $(TEST_DIR)/test-libc-algorithms.c $(LIBC_ALGO_SRCS) \
+                                     ../../tests/userland/test.h $(TEST_DIR)/libc-host-shim.h \
+                                     ../../lib/libc/internal/env-lock.h
+	@mkdir -p $(@D)
+	$(msg) HOSTCC $(notdir $@)
+	$(Q)$(HOST_CC) $(LIBC_ALGO_FLAGS) $(HOST_CFLAGS) -o $@ \
+	    $(TEST_DIR)/test-libc-algorithms.c $(LIBC_ALGO_SRCS)
 
 # The shared serial service is compiled against the tree's own headers with the
 # IPC calls stubbed (the host libc has no ssp/string.h, so fortify is off).
@@ -205,7 +229,8 @@ host-tests: $(BUILD_BASE)/path-normalize-test $(BUILD_BASE)/cap-table-test \
             $(BUILD_BASE)/cpio-parser-test $(BUILD_BASE)/spawn-fd-policy-test \
             $(BUILD_BASE)/serial-reply-test $(BUILD_BASE)/outcomes-test \
             $(BUILD_BASE)/sv39-lookup-test \
-            $(BUILD_BASE)/strftime-test $(BUILD_BASE)/strftime-asan-test
+            $(BUILD_BASE)/strftime-test $(BUILD_BASE)/strftime-asan-test \
+            $(BUILD_BASE)/libc-algorithms-test
 	$(Q)$<
 	$(Q)$(BUILD_BASE)/cap-table-test
 	$(Q)$(BUILD_BASE)/bootstrap-manifest-test
@@ -221,6 +246,7 @@ host-tests: $(BUILD_BASE)/path-normalize-test $(BUILD_BASE)/cap-table-test \
 	$(Q)$(BUILD_BASE)/sv39-lookup-test
 	$(Q)$(BUILD_BASE)/strftime-test
 	$(Q)$(BUILD_BASE)/strftime-asan-test
+	$(Q)out=$$($(BUILD_BASE)/libc-algorithms-test) || { printf '%s\n' "$$out"; exit 1; }
 	$(Q)$(PYTHON) $(TEST_DIR)/test-capability-namespace-doc.py
 	$(Q)$(PYTHON) $(TEST_DIR)/test-management-ipc-lock.py
 	$(Q)HOST_CC="$(HOST_CC)" $(PYTHON) -I $(TEST_DIR)/test-lkl-iommu-contract.py
@@ -307,11 +333,11 @@ GETSUBOPT_SRC = ../../lib/libc/stdlib/getsubopt.c
 # RTMux header world (-nostdinc plus the RTMux include dirs and the libc build
 # prelude) and link against the host-world harness by plain vsnprintf prototype.
 # The vfprintf target is therefore built on its own below, not through the shared
-# tuple loop.
+# tuple loop. STDIO_DEBUG turns on vfprintf's queued-buffer assertion.
 VFP_STDIO   = ../../lib/libc/stdio/vfprintf.c ../../lib/libc/stdio/vsnprintf.c \
               ../../lib/libc/stdio/fvwrite.c
 VFP_BUILTIN := $(shell $(CLANG) -print-file-name=include)
-VFP_NS      = -nostdinc -isystem $(VFP_BUILTIN) \
+VFP_NS      = -nostdinc -isystem $(VFP_BUILTIN) -DSTDIO_DEBUG \
               -include ../../lib/libc/rtmux-libc-local.h \
               -I../../include -I../../internal/include -I../../lib/libc/stdio
 
@@ -350,6 +376,11 @@ host-sanitize:
 	    $(FUZZ_DIR)/fuzz-vfprintf.c $(FUZZ_DIR)/standalone-main.c \
 	    $(FUZZ_OUT)/vfp-san-*.o; \
 	$(FUZZ_OUT)/san-vfprintf $(FUZZ_CORPUS)/vfprintf/*; \
+	printf '  %-8s %s\n' SANITIZE libc-algorithms; \
+	$(CLANG) $(SAN_FLAGS) $(LIBC_ALGO_FLAGS) -o $(FUZZ_OUT)/san-libc-algorithms \
+	    $(TEST_DIR)/test-libc-algorithms.c $(LIBC_ALGO_SRCS); \
+	LSAN_OPTIONS=suppressions=$(TEST_DIR)/libc-algorithms.lsan \
+	    $(FUZZ_OUT)/san-libc-algorithms >/dev/null; \
 	printf '  %-8s %s\n' SANITIZE oob-selftest; \
 	$(CLANG) $(SAN_FLAGS) -o $(FUZZ_OUT)/san-oob \
 	    $(FUZZ_DIR)/fuzz-oob-selftest.c $(FUZZ_DIR)/standalone-main.c; \

@@ -18,6 +18,7 @@
 #include <string.h>
 #include <sys/rtmux-core.h>
 #include <sys/syspage.h>
+#include <sys/auxv.h>
 #include <sys/procmsg.h>
 #include <sys/_pthreadtypes.h>
 #include <pthread.h>
@@ -27,11 +28,22 @@
 
 static int __rtmux_syschan_chid = -1;
 
-/* Start of the auxiliary vector, for issetugid(). Any start file that sets
- * environ to the initial envp before calling __rtmux_syschan_init() gets it
- * recorded here: the vector follows envp's NULL terminator.
+/* Start of the auxiliary vector, for __libc_auxv_get(). Any start file that
+ * sets environ to the initial envp before calling __rtmux_syschan_init() gets
+ * it recorded here: the vector follows envp's NULL terminator.
  */
-const uint64_t *__libc_auxv __hidden;
+static const uint64_t *__libc_auxv;
+
+unsigned long __libc_auxv_get(unsigned long type)
+{
+    const uint64_t *av;
+
+    for (av = __libc_auxv; av && av[0] != AT_NULL; av += 2) {
+        if (av[0] == type)
+            return (unsigned long) av[1];
+    }
+    return 0;
+}
 extern char **environ __attribute__((weak));
 
 #define SYSTHRD_STACK_SIZE 4096

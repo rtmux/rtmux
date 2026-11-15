@@ -75,6 +75,11 @@ extern void qsort(void *__base,
                   size_t __nmemb,
                   size_t __size,
                   int (*__compar)(const void *, const void *));
+extern void qsort_r(void *__base,
+                    size_t __nmemb,
+                    size_t __size,
+                    int (*__compar)(const void *, const void *, void *),
+                    void *__arg);
 extern long int strtol(const char *__nptr, char **__endptr, int __base);
 extern unsigned long int strtoul(const char *__nptr,
                                  char **__endptr,
