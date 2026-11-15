@@ -180,7 +180,7 @@ static const struct toolbox_applet applets[] = {
     {"true", applet_true, "true"},
     {"uniq", applet_uniq, "uniq [-cdu] [FILE]"},
     {"vi", toolbox_vi_main, "vi [FILE]"},
-    {"wc", applet_wc, "wc [FILE ...]"},
+    {"wc", applet_wc, "wc [-lwc] [FILE ...]"},
     {"which", applet_which, "which COMMAND ..."},
     {"whoami", applet_whoami, "whoami"},
     {"xargs", applet_xargs, "xargs [-n MAX] [COMMAND [ARG ...]]"},
@@ -3390,7 +3390,8 @@ static int applet_true(int argc, char **argv)
     return 0;
 }
 
-static int wc_one(FILE *fp, const char *name, int print_name)
+/* show: which counts to print, bit 0 lines, bit 1 words, bit 2 bytes. */
+static int wc_one(FILE *fp, const char *name, int print_name, int show)
 {
     unsigned long lines = 0;
     unsigned long words = 0;
@@ -3409,7 +3410,18 @@ static int wc_one(FILE *fp, const char *name, int print_name)
             in_word = 1;
         }
     }
-    printf("%8lu %8lu %8lu", lines, words, bytes);
+    {
+        unsigned long v[3] = {lines, words, bytes};
+        const char *sep = "";
+
+        for (int k = 0; k < 3; k++) {
+            if (show & (1 << k)) {
+                /* A lone count is unpadded, so "$(wc -l <f)" = 3 holds. */
+                printf("%s%*lu", sep, (show & (show - 1)) ? 8 : 0, v[k]);
+                sep = " ";
+            }
+        }
+    }
     if (print_name)
         printf(" %s", name);
     putchar('\n');
@@ -3419,10 +3431,26 @@ static int wc_one(FILE *fp, const char *name, int print_name)
 static int applet_wc(int argc, char **argv)
 {
     int rc = 0;
+    static const char opts[] = "lwc";
+    int show = 0;
+    int i = 1;
 
-    if (argc == 1)
-        return wc_one(stdin, "-", 0);
-    for (int i = 1; i < argc; i++) {
+    for (; i < argc && argv[i][0] == '-' && argv[i][1] != '\0'; i++) {
+        for (const char *f = argv[i] + 1; *f != '\0'; f++) {
+            const char *opt = strchr(opts, *f);
+
+            if (!opt) {
+                fprintf(stderr, "usage: wc [-lwc] [FILE ...]\n");
+                return 1;
+            }
+            show |= 1 << (opt - opts);
+        }
+    }
+    if (!show)
+        show = 7;
+    if (i == argc)
+        return wc_one(stdin, "-", 0, show);
+    for (; i < argc; i++) {
         /* ipc-send: utils ->
          * roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring
          */
@@ -3432,7 +3460,7 @@ static int applet_wc(int argc, char **argv)
             rc = 1;
             continue;
         }
-        wc_one(fp, argv[i], 1);
+        wc_one(fp, argv[i], 1, show);
         fclose(fp);
     }
     return rc;
