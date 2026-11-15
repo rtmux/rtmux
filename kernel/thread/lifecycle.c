@@ -57,6 +57,9 @@ static void thread_recycle_reset(thread_t *thp)
     thp->blocked_on = NULL;
     thp->blocked_on_turnstile = NULL;
     thp->owned_turnstiles = NULL;
+    thp->robust_held = NULL;
+    thp->robust_spare = NULL;
+    thp->robust_nheld = 0;
     thp->restart = NULL;
     memset(&thp->args.wa, 0, sizeof(thp->args.wa));
     thp->runmask = 0;
@@ -85,6 +88,7 @@ static void thread_recycle_reset(thread_t *thp)
     thp->held_ceiling_n = 0;
     thp->held_ceiling_floor = 0;
     thp->held_ceiling_saturated = false;
+    thread_init_prio(thp, 0);
     thp->stall_reported_ts = 0;
 }
 
@@ -694,6 +698,14 @@ static int roottask_stack_alloc(thread_t *thp)
         return EOK;
     }
     kspinlock_unlock(&roottask_stack_slock);
+
+    /* The caller turns this into EAGAIN for whatever needed the thread: say so,
+     * or a spawn or mmap fails far from its cause.
+     */
+    KPRINTF_RATELIMITED(
+        "roottask: no pool stack for a new thread (%u active "
+        "threads)\n",
+        (unsigned) thp->process->num_active_threads);
     return EAGAIN;
 }
 
@@ -1014,7 +1026,7 @@ int rdecl kernel_thread_create(void (*entry)(void *),
     thp->type = TYPE_THREAD;
     thp->state = STATE_DEAD;
     thp->policy = SCHED_RR;
-    thp->priority = thp->real_priority = (uint8_t) priority;
+    thread_init_prio(thp, priority);
     thp->dpp = thp->orig_dpp = kernel_threads_prp->default_dpp;
     thp->runmask = thp->default_runmask = runmask;
     thp->last_chid = -1;
@@ -1109,6 +1121,9 @@ int rdecl thread_create(thread_t *act,
     thp->client = 0;
     thp->blocked_on_turnstile = NULL;
     thp->owned_turnstiles = NULL;
+    thp->robust_held = NULL;
+    thp->robust_spare = NULL;
+    thp->robust_nheld = 0;
     thp->held_ceiling_n = 0;
     thp->held_ceiling_floor = 0;
     thp->held_ceiling_saturated = false;
@@ -1170,7 +1185,7 @@ int rdecl thread_create(thread_t *act,
      * block active, we don't want priority inversion if the new thread is a
      * lower priority.
      */
-    thp->priority = thp->real_priority = act->real_priority;
+    thread_init_prio(thp, thread_inherit_prio(act));
     thp->policy = act->policy;
 
     /* Inherit scheduler partition.

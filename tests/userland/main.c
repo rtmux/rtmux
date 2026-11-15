@@ -50,6 +50,7 @@ static const struct test_suite test_suites[] = {
 #define TEST_SUITE_NAMED(label, token) {.name = (label), .run = test_##token}
     TEST_SUITE(timers),
     TEST_SUITE(sync),
+    TEST_SUITE_NAMED("prio-loan", prio_loan),
     TEST_SUITE(printf),
     TEST_SUITE(setjmp),
     TEST_SUITE(time),
@@ -1026,6 +1027,12 @@ int main(int argc, char *argv[])
             test_skip("disconnect_under_alloc_failure", "fault injection unavailable");
         return finish(1);
     }
+    if (argc == 2 && !strcmp(argv[1], "--sched-set-error")) {
+        printf("[sched_set_error_after_lowering]\n");
+        if (sched_set_error_after_lowering() == TC_EXIT_SKIP)
+            test_skip("sched_set_error_after_lowering", "fault injection unavailable");
+        return finish(1);
+    }
     if (argc == 3 && !strcmp(argv[1], "--serial-unblock-child"))
         return serial_unblock_child(!strcmp(argv[2], "announce"));
     if (argc == 2 && !strcmp(argv[1], "--console-poll")) {
@@ -1376,6 +1383,38 @@ int main(int argc, char *argv[])
         }
         (void) munmap(r, sizeof *r);
         return EXIT_SUCCESS;
+    }
+    if (argc == 3 && (!strcmp(argv[1], "--robust-hold") ||
+                      !strcmp(argv[1], "--robust-exit") ||
+                      !strcmp(argv[1], "--robust-wait"))) {
+        /* Lock the robust mutex in shm argv[2] and die holding it:
+         * --robust-exit sets state to 1 and exits at once, --robust-hold waits
+         * for the parent's SIGKILL (or gives up after 3 s), and --robust-wait
+         * takes the lock whether or not the previous owner died (the parent
+         * holds it, so this blocks) and exits.
+         */
+        int fd = shm_open(argv[2], O_RDWR, 0600);
+        struct pshared_region *r;
+        struct timespec ts = {.tv_sec = 0, .tv_nsec = 10000000};
+        int lrc;
+
+        if (fd == -1)
+            _exit(2);
+        r = mmap(NULL, sizeof *r, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        (void) close(fd);
+        if (r == MAP_FAILED)
+            _exit(3);
+        lrc = pthread_mutex_lock(&r->mtx);
+        if (lrc != EOK && lrc != EOWNERDEAD)
+            _exit(3);
+        if (!strcmp(argv[1], "--robust-wait"))
+            _exit(0);
+        r->state = 1;
+        if (!strcmp(argv[1], "--robust-hold")) {
+            for (int i = 0; i < 300; i++)
+                (void) nanosleep(&ts, NULL);
+        }
+        _exit(0);
     }
     if (argc == 3 && !strcmp(argv[1], "--pshared-cond-wait")) {
         int fd = shm_open(argv[2], O_RDWR, 0600);

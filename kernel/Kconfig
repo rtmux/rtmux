@@ -30,6 +30,20 @@ config SMP_MSGOPT
       kcall_no_bkl[] table and kernel/ipc/fastmsg.c::kcall_msg_receivev
       for the consumers.
 
+config PRIO_REPLY_DEPTH
+    int "Priority propagation depth through REPLY-blocked clients"
+    default 8
+    range 1 64
+    help
+      When a thread's effective priority changes while it is REPLY-blocked,
+      the kernel lends the new priority to the server serving it, and on
+      along any further REPLY or PI-mutex wait. This bounds how many REPLY
+      hops one propagation walk takes, so the work done for one priority
+      change is bounded. A walk that reaches the bound stops there: the
+      threads past it keep the priority they had, and the walk is counted
+      in /sys/kstats as prio.reply_depth_overflow. See
+      docs/pi-pc-design.md "REPLY propagation".
+
 config INSTRUMENTATION
     bool "Kernel instrumentation (trace events)"
     default n

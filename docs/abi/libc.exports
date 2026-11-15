@@ -446,6 +446,7 @@ pthread_join	FUNC	GLOBAL	DEFAULT	-
 pthread_key_create	FUNC	GLOBAL	DEFAULT	-
 pthread_key_delete	FUNC	GLOBAL	DEFAULT	-
 pthread_kill	FUNC	GLOBAL	DEFAULT	-
+pthread_mutex_consistent	FUNC	GLOBAL	DEFAULT	-
 pthread_mutex_destroy	FUNC	GLOBAL	DEFAULT	-
 pthread_mutex_getprioceiling	FUNC	GLOBAL	DEFAULT	-
 pthread_mutex_init	FUNC	GLOBAL	DEFAULT	-
@@ -458,11 +459,13 @@ pthread_mutexattr_destroy	FUNC	GLOBAL	DEFAULT	-
 pthread_mutexattr_getprioceiling	FUNC	GLOBAL	DEFAULT	-
 pthread_mutexattr_getprotocol	FUNC	GLOBAL	DEFAULT	-
 pthread_mutexattr_getpshared	FUNC	GLOBAL	DEFAULT	-
+pthread_mutexattr_getrobust	FUNC	GLOBAL	DEFAULT	-
 pthread_mutexattr_gettype	FUNC	GLOBAL	DEFAULT	-
 pthread_mutexattr_init	FUNC	GLOBAL	DEFAULT	-
 pthread_mutexattr_setprioceiling	FUNC	GLOBAL	DEFAULT	-
 pthread_mutexattr_setprotocol	FUNC	GLOBAL	DEFAULT	-
 pthread_mutexattr_setpshared	FUNC	GLOBAL	DEFAULT	-
+pthread_mutexattr_setrobust	FUNC	GLOBAL	DEFAULT	-
 pthread_mutexattr_settype	FUNC	GLOBAL	DEFAULT	-
 pthread_once	FUNC	GLOBAL	DEFAULT	-
 pthread_rwlock_destroy	FUNC	GLOBAL	DEFAULT	-

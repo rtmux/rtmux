@@ -53,8 +53,12 @@ savedefconfig: $(KCONFIG_DIR)/menuconfig.py
 		--kconfig $(KCONFIG_SCHEMA) --out $(DEFCONFIG)
 	$(msg) SAVE $(DEFCONFIG)
 
-# Regenerate autoconf.h whenever .config or Kconfig changes.
-$(AUTOCONF_H): .config $(KCONFIG_SCHEMA) $(KCONFIG_DIR)/menuconfig.py
+# Every file the schema sources, so that a new symbol in a sub-Kconfig
+# regenerates autoconf.h (genconfig.py fills in its default).
+KCONFIG_SOURCES := $(KCONFIG_SCHEMA) $(wildcard */Kconfig */*/Kconfig */*/*/Kconfig)
+
+# Regenerate autoconf.h whenever .config or any Kconfig file changes.
+$(AUTOCONF_H): .config $(KCONFIG_SOURCES) $(KCONFIG_DIR)/menuconfig.py
 	$(Q)mkdir -p $(dir $@)
 	$(msg) KCFG $@
 	$(Q)$(KCONFIG_ENV) python3 $(KCONFIG_DIR)/genconfig.py \

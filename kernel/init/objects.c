@@ -233,7 +233,7 @@ void init_objects()
              * User __thread_create enforces priority > 0 (lifecycle.c), so no
              * user thread can compete with idle at this priority.
              */
-            thp->real_priority = thp->priority = 0;
+            thread_init_prio(thp, 0);
             thp->start_time = prp->start_time;
             thp->un.lcl.stackaddr = (void *) _smalloc(sizeof(startup_stack));
             thp->un.lcl.stacksize = sizeof(startup_stack);

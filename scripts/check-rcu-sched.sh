@@ -3178,7 +3178,7 @@ if ! awk '
     /int kdecl ksys_msg_sendv\(thread_t \*act,/ { in_wrapper = 1 }
     in_wrapper && /sendv_body\(act, kap, &held\)/ { saw_call = NR }
     in_wrapper && /if \(held\)/ { saw_held = NR }
-    in_wrapper && /connect_client_drop\(held, act->real_priority\)/ { saw_drop = NR }
+    in_wrapper && /connect_client_drop\(held, thread_base_prio\(act\)\)/ { saw_drop = NR }
     in_wrapper && /^}/ { in_wrapper = 0 }
     END {
         if (!saw_open) print "RCU detail: send lock" > "/dev/stderr"

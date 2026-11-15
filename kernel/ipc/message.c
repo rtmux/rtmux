@@ -28,9 +28,8 @@ int kdecl ksys_msg_current(thread_t *act, struct kcall_args_msg_current *kap)
     connect_t *cop;
     thread_t *thp;
     int do_pi = 0;
-    uint8_t new_prio = 0;
     kdispatch_t *new_dpp = NULL;
-
+    thread_t *prior_client = act->client;
 
     /* Disown act's prior client, if any. Single-pointer atomic writes; the
      * prior client briefly observes server=0 with act->client cleared —
@@ -38,12 +37,20 @@ int kdecl ksys_msg_current(thread_t *act, struct kcall_args_msg_current *kap)
      * per-thread_t lock would close this window; not yet instantiated
      * (LOCK_CLASS_THREAD placeholder).
      */
-    if (act->client != 0) {
-        act->client->args.ms.server = 0;
+    if (prior_client) {
+        prior_client->args.ms.server = 0;
         act->client = 0;
     }
 
     if (kap->rcvid == 0) {
+        /* No client left to lend priority. A notification loan stays until the
+         * next receive.
+         */
+        if (prior_client && thread_msg_loan_is_request(act)) {
+            CRITICAL_CLEAR(act);
+            thread_lend_msg(act, 0, false);
+            thread_prio_update(act);
+        }
         return EOK;
     }
 
@@ -117,7 +124,6 @@ int kdecl ksys_msg_current(thread_t *act, struct kcall_args_msg_current *kap)
      */
     if ((cop->channel->flags & RTMUX_FLG_CHF_FIXED_PRIORITY) == 0) {
         do_pi = 1;
-        new_prio = thp->priority;
         new_dpp = thp->dpp;
     }
 
@@ -125,10 +131,23 @@ int kdecl ksys_msg_current(thread_t *act, struct kcall_args_msg_current *kap)
 
     /* PI propagation — outside cop->lock to honor SCHED-vs-CONNECT rank. */
     if (do_pi) {
-        act->real_priority = new_prio;
-        /* TODO: confirm adjust_priority() is needed here as well as below. */
+        /* act now serves thp, which lends its priority until act replies. Read
+         * thp's priority after act->client = thp is published, not snapshotted
+         * under cop->lock: a REPLY propagation that raced the snapshot fails
+         * its swap against the generation this lend starts, so a stale value
+         * here would stay.
+         */
         CRITICAL_INHERIT(act, thp);
-        adjust_priority(act, new_prio, new_dpp, 1);
+        thread_lend_msg(act, __atomic_load_n(&thp->priority, __ATOMIC_ACQUIRE),
+                        true);
+        thread_drop_gone_client_loan(act, thp);
+        (void) thread_prio_update_dpp(act, new_dpp, 1);
+    } else {
+        /* A fixed-priority channel lends nothing. Drop the loan an earlier
+         * client left, or a REPLY propagation from thp would relend it.
+         */
+        thread_lend_msg(act, 0, false);
+        thread_prio_update(act);
     }
 
     return EOK;

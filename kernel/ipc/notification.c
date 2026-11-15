@@ -279,9 +279,12 @@ int rdecl notification_deliver(channel_t *chp,
         kspinlock_unlock(&chp->lock);
 
         /* By default the receiver runs with message driven priority. */
-        if (thp->priority != prio &&
-            (chp->flags & RTMUX_FLG_CHF_FIXED_PRIORITY) == 0) {
-            thp->real_priority = thp->priority = (uint8_t) prio;
+        if ((chp->flags & RTMUX_FLG_CHF_FIXED_PRIORITY) == 0) {
+            /* The notification lends prio until thp next receives. thp is on no
+             * queue until ready() below.
+             */
+            thread_lend_msg(thp, prio, false);
+            thread_prio_settle(thp);
         }
 
         if ((unsigned) priority & _NOTIFICATION_PRIO_VTID) {
@@ -337,18 +340,13 @@ int rdecl notification_deliver(channel_t *chp,
                                value, id);
     if (added) {
         kspinlock_unlock(&chp->lock);
-        /* To prevent priority inversion, boost all threads in the server */
-        if ((chp->flags & RTMUX_FLG_CHF_FIXED_PRIORITY) == 0) {
-            int i;
-            /* Adjust priorities, but do not inherit critical-event state. */
-            for (i = 0; i < chp->process->threads.nentries; ++i) {
-                if (VECP(thp, &chp->process->threads, i) &&
-                    thp->priority < prio && thp->last_chid == chp->chid) {
-                    adjust_priority(thp, prio, thp->dpp, 1);
-                    thp->real_priority = thp->priority;
-                }
-            }
-        }
+
+        /* To prevent priority inversion, lend the pending notification to the
+         * threads serving the channel until they next receive or reply;
+         * critical-event state is not inherited.
+         */
+        if ((chp->flags & RTMUX_FLG_CHF_FIXED_PRIORITY) == 0)
+            channel_lend_pending(chp, prio, true);
 
         rcu_read_unlock(&tthread_rcu);
         return EOK;

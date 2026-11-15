@@ -791,10 +791,15 @@ int rdecl remote_ipc_msg(thread_t *act, connect_t *cop, unsigned prio)
         LINKPRIL_REM(thp);
         kspinlock_unlock(&chp->lock);
 
-        /* By default the receiver runs with message driven priority. */
-        if ((chp->flags & RTMUX_FLG_CHF_FIXED_PRIORITY) == 0) {
-            thp->real_priority = thp->priority = (uint8_t) prio;
-        }
+        /* By default the receiver runs with message driven priority: the remote
+         * sender lends prio (a NET_REPLY client, so not a request loan that a
+         * reply ends; the next receive replaces it). thp is on no queue until
+         * block_and_ready() below.
+         */
+        thread_lend_msg(
+            thp, (chp->flags & RTMUX_FLG_CHF_FIXED_PRIORITY) == 0 ? prio : 0,
+            false);
+        thread_prio_settle(thp);
 
         /* this is not a client blocked for server, no onbehalf */
         act->args.ms.server = 0;
@@ -874,18 +879,11 @@ int rdecl remote_ipc_msg(thread_t *act, connect_t *cop, unsigned prio)
     kspinlock_unlock(&chp->lock);
     (void) atomic_add_value(&cop->links, 1);
 
-    /* To prevent priority inversion, boost all threads in the server */
-    if ((chp->flags & RTMUX_FLG_CHF_FIXED_PRIORITY) == 0) {
-        unsigned i;
-
-        for (i = 0; i < chp->process->threads.nentries; ++i) {
-            if (VECP(thp, &chp->process->threads, i) && thp->priority < prio &&
-                thp->last_chid == chp->chid) {
-                adjust_priority(thp, prio, thp->dpp, 1);
-                thp->real_priority = thp->priority;
-            }
-        }
-    }
+    /* To prevent priority inversion, lend the pending send to the threads
+     * serving the channel until they next receive or reply.
+     */
+    if ((chp->flags & RTMUX_FLG_CHF_FIXED_PRIORITY) == 0)
+        channel_lend_pending(chp, prio, true);
 
     return ENOERROR;
 }

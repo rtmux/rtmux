@@ -132,7 +132,14 @@ if test "$rtmux_run" = "debug-inject"; then
             ok=2
         fi
     fi
+    # A failing kcall must keep its error status when its caller was switched
+    # out inside the call.
     if test "$ok" = 2; then
+        if /bin/syscall_testing --sched-set-error; then
+            ok=3
+        fi
+    fi
+    if test "$ok" = 3; then
         echo "RTMux debug-inject: PASS"
     else
         echo "RTMux debug-inject: FAIL"

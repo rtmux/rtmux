@@ -147,7 +147,8 @@ static const struct toolbox_applet applets[] = {
     {"id", applet_id, "id [USER]"},
     {"inject", applet_inject,
      "inject spin-irqoff HART MS | spin-console HART MS | hang-hart HART | "
-     "fail-alloc POOL PID | alloc-status"},
+     "fail-alloc POOL PID | alloc-status | fail-sched-set PID COUNT | "
+     "sched-set-status | sched-set-displaced MIN"},
     {"kill", applet_kill, "kill [-SIG] PID ..."},
     {"login", applet_login, "login [USER]"},
     {"less", applet_less, "less [FILE ...]"},
@@ -3126,6 +3127,21 @@ static int applet_inject(int argc, char **argv)
         }
         rc = inject_call(INJECT_OP_FAIL_NEXT_ALLOC, id,
                          strtoul(argv[3], NULL, 0));
+    } else if (argc == 4 && !strcmp(argv[1], "fail-sched-set")) {
+        rc = inject_call(INJECT_OP_FAIL_NEXT_SCHED_SET,
+                         strtoul(argv[2], NULL, 0), strtoul(argv[3], NULL, 0));
+    } else if (argc == 2 && !strcmp(argv[1], "sched-set-status")) {
+        rc = inject_call(INJECT_OP_SCHED_SET_STATUS, 0, 0);
+        if (rc >= 0)
+            printf("sched-set-consumed=%d\n", rc);
+        return rc < 0 ? 1 : 0;
+    } else if (argc == 3 && !strcmp(argv[1], "sched-set-displaced")) {
+        /* Exit 0 when at least MIN error returns met a switched-out caller. */
+        rc = inject_call(INJECT_OP_SCHED_SET_DISPLACED, 0, 0);
+        if (rc >= 0)
+            printf("sched-set-displaced=%d\n", rc);
+        return rc >= 0 && (unsigned long) rc >= strtoul(argv[2], NULL, 0) ? 0
+                                                                          : 3;
     } else if (argc == 2 && !strcmp(argv[1], "alloc-status")) {
         rc = inject_call(INJECT_OP_ALLOC_STATUS, 0, 0);
         if (rc >= 0)
@@ -3134,7 +3150,9 @@ static int applet_inject(int argc, char **argv)
     } else {
         fprintf(stderr,
                 "usage: inject spin-irqoff HART MS | spin-console HART MS | "
-                "hang-hart HART | fail-alloc POOL PID | alloc-status\n");
+                "hang-hart HART | fail-alloc POOL PID | alloc-status | "
+                "fail-sched-set PID COUNT | sched-set-status | "
+                "sched-set-displaced MIN\n");
         return 2;
     }
     return rc == 0 ? 0 : 1;

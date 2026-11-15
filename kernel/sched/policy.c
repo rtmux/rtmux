@@ -187,6 +187,7 @@ int kdecl ksys_sched_set(thread_t *act, struct kcall_args_sched_set *kap)
     int status;
     int prp_pinned = 0;
     int thp_pinned = 0;
+    unsigned old_prio = act->priority;
 
     if (kap->pid == 0 || kap->pid == act->process->pid) {
         prp = act->process;
@@ -280,8 +281,8 @@ int kdecl ksys_sched_set(thread_t *act, struct kcall_args_sched_set *kap)
         /* @@@ Run the entire thread list adjusting by the delta amount?
          * PROBLEM: sched_thread does more range checking than adjust_priority
          * does. for(tid = 0 ; tid < prp->threads.nentries ; ++tid) { if(thp =
-         * VECP(thp, &prp->threads, tid)) { adjust_priority(thp, thp->priority +
-         * delta, thp->dpp); thp->real_priority += delta; } }
+         * VECP(thp, &prp->threads, tid)) { thread_set_base_prio(thp,
+         * thread_base_prio(thp) + delta); thread_prio_update(thp); } }
          */
     } else if (sched_set_noop_status(thp, kap->policy, &param, &status)) {
         if (status != EOK) {
@@ -292,6 +293,12 @@ int kdecl ksys_sched_set(thread_t *act, struct kcall_args_sched_set *kap)
     }
 
     status = EOK;
+
+    /* After the change is applied, so the caller may already be switched out.
+     */
+    if (inject_should_fail_sched_set(act,
+                                     thp == act && act->priority < old_prio))
+        status = EINVAL;
 out:
     if (thp_pinned)
         tthread_unpin(thp);

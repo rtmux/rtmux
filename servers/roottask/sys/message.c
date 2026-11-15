@@ -11,6 +11,7 @@
 #include <sched.h>
 #include <sys/mman.h> /* mmap, MAP_*, PROT_*, NOFD */
 #include <errno.h>
+#include <stdatomic.h>
 
 static pthread_attr_t thread_attr;
 
@@ -270,7 +271,14 @@ int proc_thread_pool_reserve()
      * messages (sopen, spawn) through the same dispatch channel deadlock
      * non-deterministically when no other worker is in msg_receive yet.
      */
-    return thread_pool_reserve(tpp, 1);
+    static _Atomic unsigned fails;
+    int rc = thread_pool_reserve(tpp, 1);
+
+    /* The first failure and every 64th after it are logged. */
+    if (rc != 0 && (atomic_fetch_add(&fails, 1) & 63) == 0)
+        root_log("roottask: cannot reserve a dispatch worker (errno %d)\n",
+                 errno);
+    return rc;
 }
 
 /* Release the spare dispatch worker reserved by proc_thread_pool_reserve.

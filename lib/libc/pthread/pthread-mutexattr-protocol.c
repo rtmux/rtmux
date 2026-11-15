@@ -91,6 +91,33 @@ int pthread_mutexattr_setpshared(pthread_mutexattr_t *attr, int pshared)
     }
 }
 
+int pthread_mutexattr_getrobust(const pthread_mutexattr_t *attr, int *robust)
+{
+    if (!attr || !robust)
+        return EINVAL;
+
+    *robust = (attr->flags & PTHREAD_ROBUST_MASK) ? PTHREAD_MUTEX_ROBUST
+                                                  : PTHREAD_MUTEX_STALLED;
+    return EOK;
+}
+
+int pthread_mutexattr_setrobust(pthread_mutexattr_t *attr, int robust)
+{
+    if (!attr)
+        return EINVAL;
+
+    switch (robust) {
+    case PTHREAD_MUTEX_STALLED:
+        attr->flags &= ~(unsigned) PTHREAD_ROBUST_MASK;
+        return EOK;
+    case PTHREAD_MUTEX_ROBUST:
+        attr->flags |= PTHREAD_ROBUST_MASK;
+        return EOK;
+    default:
+        return EINVAL;
+    }
+}
+
 int pthread_mutexattr_gettype(const pthread_mutexattr_t *attr, int *type)
 {
     if (!attr || !type)

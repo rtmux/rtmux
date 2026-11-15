@@ -19,33 +19,37 @@ int(pthread_mutex_lock)(pthread_mutex_t *mutex)
     unsigned long id = LIBC_TLS()->__owner;
     int ret;
 
-    /* PRIO_PROTECT needs kernel participation even when uncontended: the kernel
-     * validates the caller priority against the ceiling and applies the
-     * temporary ceiling boost. Keep the lockless fast path for PRIO_NONE and
-     * PRIO_INHERIT only.
+    /* PRIO_PROTECT and robust mutexes need kernel participation even when
+     * uncontended: for PRIO_PROTECT the kernel validates the caller priority
+     * against the ceiling and applies the temporary ceiling boost; for a robust
+     * mutex it records the holder, so that it can hand the mutex on with
+     * EOWNERDEAD if the holder dies. Keep the lockless fast path for the
+     * others.
      */
-    if ((mutex->count & RTMUX_SYNC_PRIOCEILING) != 0) {
-        /* A re-lock by the current owner of a RECURSIVE ceiling mutex recurses
-         * in user space (the kernel already checked the ceiling and applied the
-         * boost on the first acquire); the depth lives in the low 16 bits,
-         * clear of the ceiling. Every other case (first/contended acquire, or a
-         * non-recursive re-lock that must fail EDEADLK) goes through the
-         * kernel.
+    if ((mutex->count & (RTMUX_SYNC_PRIOCEILING | RTMUX_SYNC_ROBUST)) != 0) {
+        unsigned long depth_mask = rtmux_sync_depth_mask(mutex->count);
+
+        /* A re-lock by the current owner of a RECURSIVE mutex recurses in user
+         * space (the kernel already did its part on the first acquire); a
+         * PRIO_PROTECT depth lives in the low 16 bits, clear of the ceiling.
+         * Every other case (first/contended acquire, or a non-recursive re-lock
+         * that must fail EDEADLK) goes through the kernel.
          */
         if ((mutex->owner & ~RTMUX_SYNC_WAITING) == id &&
             (mutex->count & RTMUX_SYNC_NONRECURSIVE) == 0) {
-            if ((mutex->count & RTMUX_SYNC_PPDEPTHMASK) ==
-                RTMUX_SYNC_PPDEPTHMASK)
+            if (((unsigned long) mutex->count & depth_mask) == depth_mask)
                 return EAGAIN; /* Unix 98 recursive-count saturation */
             ++mutex->count;
             __ulock_debug_acquire(mutex, __pc);
             return EOK;
         }
-        if ((ret = sync_mutex_lock_r((sync_t *) mutex)) != EOK)
-            return __rtmux_pthread_ret(ret);
+        /* EOWNERDEAD comes with the mutex held, at depth 0. */
+        ret = __rtmux_pthread_ret(sync_mutex_lock_r((sync_t *) mutex));
+        if (ret != EOK && ret != EOWNERDEAD)
+            return ret;
         ++mutex->count;
         __ulock_debug_acquire(mutex, __pc);
-        return EOK;
+        return ret;
     }
 
     /* Fast path: CAS the owner field from unlocked to caller. */

@@ -853,7 +853,9 @@ int ProcessSetRlimit(pid_t pid, int resource, uint64_t cur, uint64_t max)
 
 /* soul_stats — fetch one record per kernel object pool (see kstats.h), plus the
  * per-hart STIMER interrupt counts into timer_intr (clipped to timer_n entries;
- * *timer_count is the number of online harts).
+ * *timer_count is the number of online harts), the count of priority walks
+ * stopped at the REPLY depth bound (*prio_reply_overflow), and that bound
+ * (*prio_reply_depth).
  * Returns EOK, ERANGE if n is too small (*count_out is still set), or EFAULT.
  */
 int soul_stats(struct kstat_soul_rec *out,
@@ -863,7 +865,9 @@ int soul_stats(struct kstat_soul_rec *out,
                unsigned *live_timeouts,
                uint64_t *timer_intr,
                unsigned timer_n,
-               unsigned *timer_count)
+               unsigned *timer_count,
+               uint64_t *prio_reply_overflow,
+               unsigned *prio_reply_depth)
 {
     struct kcall_args_soul_stats data;
 
@@ -875,6 +879,8 @@ int soul_stats(struct kstat_soul_rec *out,
     data.timer_intr = timer_intr;
     data.timer_n = timer_n;
     data.timer_count = 0;
+    data.prio_reply_overflow = 0;
+    data.prio_reply_depth = 0;
     data.ret = -1;
     (void) syscall_priv(__KSYS_PRIV_SOUL_STATS, &data);
     if (live_threads)
@@ -883,6 +889,10 @@ int soul_stats(struct kstat_soul_rec *out,
         *live_timeouts = data.live_timeouts;
     if (timer_count)
         *timer_count = data.timer_count;
+    if (prio_reply_overflow)
+        *prio_reply_overflow = data.prio_reply_overflow;
+    if (prio_reply_depth)
+        *prio_reply_depth = data.prio_reply_depth;
     return data.ret;
 }
 

@@ -280,6 +280,14 @@ server's receive as two separate stores, so a `force_ready` of the client may se
 the pair half-cleared; it clears the server's link with a compare-exchange against
 the client and does not treat the half-cleared state as corruption.
 
+It then ends the server's request loan of that client (`thread_end_msg_loan`).
+A receive installs the loan after it publishes the client, so the two sides
+meet through a store-buffering handshake: the receiver stores the loan, fences
+and re-reads the client (`thread_drop_gone_client_loan`), and `force_ready`
+stores the cleared client, fences and re-reads the loan word.  With both fences
+at least one of them sees the other's store, so a loan installed after its
+client left is always ended by one of them.
+
 ### Unblock notification of a reply-blocked client
 
 When `force_ready` aborts a `STATE_REPLY` client whose channel has `CHF_UNBLOCK`

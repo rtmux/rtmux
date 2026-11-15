@@ -8,8 +8,8 @@ include ../../mk/def.mk
 include ../../mk/recurse.mk
 include ../../userland/lib/common.mk
 
-SRCS = main.c timers.c sync.c printf-test.c setjmp-test.c signals-test.c \
-       time-test.c strftime-test.c \
+SRCS = main.c timers.c sync.c prio-loan.c printf-test.c setjmp-test.c signals-test.c time-test.c \
+       strftime-test.c \
        notifications.c vfs.c posix-options.c capgate.c trace-negative.c \
        user-ptr-negative.c serial-unblock.c leak.c native-io-boundaries.c \
        qsort-test.c report.c getopt-test.c env-test.c sysconf-test.c

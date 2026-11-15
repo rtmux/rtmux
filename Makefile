@@ -309,7 +309,7 @@ check: check-posix-matrix-options check-pse51 check-posix-profile-header
 check: check-posix-profile-config check-posix-profile-surface check-lkl-profile
 check: check-syscall-abi check-libc-abi check-make-target-names check-trace-export check-rt-budgets check-irq-contract
 check: check-platform-boundary-contracts
-check: check-lock-rank check-preempt-inventory check-loader-negative check-fu740-smoke-scripts
+check: check-lock-rank check-prio-writes check-preempt-inventory check-loader-negative check-fu740-smoke-scripts
 check: driver-gate $(LKL_CHECK_DEP) check-emu-headless check-rt check-qemu-deps
 check: $(AUTOCONF_H) $(VER_FILE) startup initramfs
 ifeq ($(CONFIG_LKL_SERVERS),y)
@@ -936,6 +936,13 @@ check-lock-rank:
 	$(msg) CHECK static lock-rank acquisition order
 	$(Q)$(PYTHON) scripts/check-lock-rank.py
 .PHONY: check-lock-rank
+
+# Base vs lent priority: only kernel/include/thread-prio.h writes a thread's
+# base (real_priority) or its loans. Static text check, no build needed.
+check-prio-writes:
+	$(msg) CHECK base and loan priority writes go through the accessors
+	$(Q)scripts/check-prio-writes.sh
+.PHONY: check-prio-writes
 
 # Preemption-checkpoint inventory: every long or unbounded loop in the
 # scheduling-critical kernel subsystems must be classified in

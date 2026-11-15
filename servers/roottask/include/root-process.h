@@ -226,6 +226,8 @@ int soul_stats(struct kstat_soul_rec *out,
                unsigned *live_timeouts,
                uint64_t *timer_intr,
                unsigned timer_n,
-               unsigned *timer_count);
+               unsigned *timer_count,
+               uint64_t *prio_reply_overflow,
+               unsigned *prio_reply_depth);
 
 #endif /* _ROOTTASK_ROOT_PROCESS_H */

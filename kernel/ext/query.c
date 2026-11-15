@@ -281,6 +281,9 @@ void kext_soul_stats(void *data)
      * timer_count is always set; the copy is clipped to the caller's capacity.
      */
     kap->timer_count = num_processors;
+    kap->prio_reply_overflow =
+        atomic_load_explicit(&prio_reply_depth_overflow, memory_order_relaxed);
+    kap->prio_reply_depth = CONFIG_PRIO_REPLY_DEPTH;
     if (ret == EOK && kap->timer_intr && kap->timer_n) {
         uint64_t intr[CONFIG_PROCESSORS_MAX];
         unsigned n =

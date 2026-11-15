@@ -670,17 +670,24 @@ void rdecl sched_ss_update(thread_t *thp,
     CRASHCHECK(ssrepl->amount == 0);
 
     if (drop) {
-        ssinfo->org_priority =
-            thp->real_priority; /* Guarantee no more ss operations */
-        if (thp->priority <= thp->real_priority) {
-            if (ssinfo->sched_locked)
-                /* thp is already blocked: see SS_STOP_RUNNING_LOCKED */
-                thp->priority = ssinfo->low_priority;
-            else
-                adjust_priority(thp, ssinfo->low_priority, thp->dpp,
-                                0); /* CHECKME */
+        unsigned target;
+
+        /* The drop lowers the base only: a loan (PI waiter, ceiling, message)
+         * above the low priority keeps holding the thread up.
+         */
+        ssinfo->org_priority = (uint8_t) thread_base_prio(
+            thp); /* Guarantee no more ss operations */
+        thread_set_base_prio(thp, ssinfo->low_priority);
+        if (ssinfo->sched_locked) {
+            /* thp is already blocked, and the caller holds the dispatch lock
+             * (see SS_STOP_RUNNING_LOCKED): store it; the next loan or base
+             * change on thp reapplies it under sync_pi_slock.
+             */
+            target = thread_effective_prio(thp);
+            thp->priority = (uint8_t) target;
+        } else {
+            (void) thread_prio_update_dpp(thp, thp->dpp, 0); /* CHECKME */
         }
-        thp->real_priority = ssinfo->low_priority;
     }
 }
 
@@ -731,11 +738,9 @@ int rdecl sched_ss_adjust()
                     ssinfo->activation_time = bound;
                     ssinfo->consumed = 0;
 
-                    if (thp->priority <= ssinfo->org_priority) {
-                        adjust_priority(thp, ssinfo->org_priority, thp->dpp,
-                                        0); /* CHECKME */
-                    }
-                    thp->real_priority = ssinfo->org_priority;
+                    thread_set_base_prio(thp, ssinfo->org_priority);
+                    (void) thread_prio_update_dpp(thp, thp->dpp,
+                                                  0); /* CHECKME */
 
                     ssinfo->org_priority = 0;
 
@@ -917,6 +922,7 @@ void rdecl sched_ss_queue(thread_t *thp)
 int rdecl sched_thread(thread_t *thp, int policy, struct sched_param *param)
 {
     unsigned new_prio;
+    unsigned old_prio;
     kdispatch_t *dpp;
     int verify;
     struct _ss_schedinfo *ss_info;
@@ -955,25 +961,25 @@ int rdecl sched_thread(thread_t *thp, int policy, struct sched_param *param)
             new_prio >= kopt.priv_prio) {
             return EPERM;
         }
-        if (new_prio != thp->priority) {
-            int lowered = (new_prio < thp->priority);
-
-            adjust_priority(thp, new_prio, thp->dpp, 0);
-
-            /* If we lowered priority, ensure we will be head of priority list
-             */
-            if (lowered && thp->state == STATE_READY) {
-                LINK3_REM(DISPATCH_LST(thp->dpp, thp->priority),
-                          &thp->link3_link, thread_t);
-                LINK3_BEG(DISPATCH_LST(thp->dpp, thp->priority),
-                          &thp->link3_link, thread_t);
-            }
-        }
         if (thp->policy == SCHED_SPORADIC &&
             thp->schedinfo.ss_info->org_priority != 0) {
             thp->schedinfo.ss_info->org_priority = (uint8_t) new_prio;
         }
-        thp->real_priority = (uint8_t) new_prio;
+
+        /* SchedSet sets the base. A loan above it (a PI waiter, a ceiling, a
+         * message being served) keeps the thread at the loan until it ends.
+         */
+        old_prio = thp->priority;
+        thread_set_base_prio(thp, new_prio);
+        (void) thread_prio_update_dpp(thp, thp->dpp, 0);
+
+        /* If we lowered priority, ensure we will be head of priority list */
+        if (thp->priority < old_prio && thp->state == STATE_READY) {
+            LINK3_REM(DISPATCH_LST(thp->dpp, thp->priority), &thp->link3_link,
+                      thread_t);
+            LINK3_BEG(DISPATCH_LST(thp->dpp, thp->priority), &thp->link3_link,
+                      thread_t);
+        }
         return EOK;
     default:
         break;
@@ -1080,8 +1086,14 @@ int rdecl sched_thread(thread_t *thp, int policy, struct sched_param *param)
     /* Change policy and priority after fiddling with attributes */
     thp->policy = (uint8_t) policy;
 
-    adjust_priority(thp, new_prio, thp->dpp, 0);
-    thp->real_priority = (uint8_t) new_prio;
+    /* The base only; a loan above it holds until it ends. An unchanged priority
+     * still sends the caller to the tail of its level, as adjust_priority() did
+     * for an equal priority.
+     */
+    thread_set_base_prio(thp, new_prio);
+    if (!thread_prio_update_dpp(thp, thp->dpp, 0) &&
+        thp == get_active_thread(get_cpunum()))
+        yield();
 
     return EOK;
 }
@@ -1141,7 +1153,7 @@ static void rdecl priority_chain_drop(thread_t *thp, int why)
         /* Synchronizaion object switch */
         switch (why) {
         case STATE_MUTEX: {
-            restore_priority = thp->real_priority;
+            restore_priority = thread_effective_prio(thp);
             if ((syp = thp->mutex_holdlist) &&
                 (next_owner = pril_first(&syp->waiting))) {
                 if (restore_priority < next_owner->priority) {
@@ -1453,8 +1465,42 @@ int rdecl force_ready(thread_t *thp, unsigned err)
             thread_t *srv = thp->args.ms.server;
             thread_t *expect = thp;
 
-            __atomic_compare_exchange_n(&srv->client, &expect, NULL, 0,
-                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
+            bool is_thr = TYPE_MASK(srv->type) == TYPE_THREAD;
+
+            /* Read the loan before the client link, as the REPLY walk does: a
+             * receive sets the new client before it bumps the generation.
+             */
+            uint64_t seen = is_thr ? thread_msg_loan_word(srv) : 0;
+
+            if (__atomic_compare_exchange_n(&srv->client, &expect, NULL, 0,
+                                            __ATOMIC_ACQ_REL,
+                                            __ATOMIC_RELAXED)) {
+                bool ended = thread_end_msg_loan(srv, seen);
+
+                /* The receive that made thp the client may install its loan
+                 * after `seen` was read, even when the old loan just ended
+                 * here. A request loan with no client is that one, so end it
+                 * too. The fence pairs with the one in
+                 * thread_drop_gone_client_loan.
+                 */
+                if (is_thr) {
+                    uint64_t now;
+
+                    cpu_smp_mb();
+                    now = thread_msg_loan_word(srv);
+                    if (__atomic_load_n(&srv->client, __ATOMIC_ACQUIRE) == NULL)
+                        ended |= thread_end_msg_loan(srv, now);
+                }
+
+                /* Return the server to the priority it is owed now. The chain
+                 * is not followed: force_ready runs from timer and event
+                 * delivery under caller locks, so a second server this one
+                 * waits on keeps the lent priority until it replies (an
+                 * over-boost, never a deficit).
+                 */
+                if (ended)
+                    thread_prio_settle(srv);
+            }
             thp->args.ms.server = NULL;
         }
         if (thp->restart) {
@@ -2955,7 +3001,33 @@ static void rdecl adjust_priority_default(thread_t *thp,
             SENDIPI(thp->runcpu, IPI_RESCHED);
             break;
         }
+#else
+        CRASHCHECK(thp != act);
+#endif
 
+        /* A priority loan changing under the running thread: never switch away
+         * from it here. The caller is inside one of act's own kernel calls (a
+         * condition wait giving up a PI mutex, an unlock, an IPC reply), which
+         * has to finish, and may block act with unready_release(), which
+         * requires act to be the active thread. Displacing act would also put a
+         * thread still running on this stack on a ready queue, where another
+         * hart can pick it up. Lower the priority and post a reschedule:
+         * kernel_exit, or the return from the interrupt, runs resched(), which
+         * moves to a thread that is due and puts act at the head of its new
+         * queue, as a preempted thread.
+         */
+        if (priority_inherit) {
+            if (prio < act->priority) {
+                atomic_fetch_or_explicit(&act->async_flags,
+                                         RTMUX_ATF_SMP_RESCHED,
+                                         memory_order_release);
+            }
+            act->priority = (uint8_t) prio;
+            _TRACE_TH_EMIT_ANY_STATE(act, act->state);
+            chk_dispatch(1);
+            break;
+        }
+#if CONFIG_PROCESSORS_MAX > 1
         /* Thread is running on this processor. */
         if (prio < act->priority) {
             /* If act is mid-sync-transition (WAIT_PENDING set), DO NOT demote
@@ -3006,7 +3078,6 @@ static void rdecl adjust_priority_default(thread_t *thp,
             _TRACE_TH_EMIT_ANY_STATE(act, act->state);
         }
 #else
-        CRASHCHECK(thp != act);
         if (prio < act->priority && prio <= DISPATCH_HIGHEST_PRI(dpp)) {
             thread_t *oldact = act;
 

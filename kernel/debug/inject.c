@@ -19,7 +19,64 @@ static atomic_uint armed_soul = KSTAT_SOUL_COUNT; /* KSTAT_SOUL_COUNT: none */
 static atomic_int armed_pid;
 static atomic_int consumed;
 
+/* The armed SchedSet failures: the pid they are armed for, how many are left,
+ * and how many were delivered. A failure goes to exactly one caller by a
+ * compare-and-swap of `sched_left`.
+ */
+static atomic_int sched_armed_pid = -1;
+static atomic_int sched_left;
+static atomic_int sched_consumed;
+static atomic_int sched_displaced;
+static _Atomic(thread_t *) sched_failed_thr; /* the caller just failed */
+
+static inline bool inject_op_is_status(unsigned op)
+{
+    return op == INJECT_OP_ALLOC_STATUS || op == INJECT_OP_SCHED_SET_STATUS ||
+           op == INJECT_OP_SCHED_SET_DISPLACED;
+}
+
 atomic_ullong inject_spin_state;
+
+/* Called from ksys_sched_set once the change is applied; `lowered` says the
+ * caller's priority went down. Only a lowering call fails, so the caller can
+ * raise itself again with the failure still armed.
+ */
+bool inject_should_fail_sched_set(thread_t *act, bool lowered)
+{
+    int left;
+
+    if (!lowered || !act || !act->process ||
+        act->process->pid !=
+            atomic_load_explicit(&sched_armed_pid, memory_order_acquire))
+        return false;
+    left = atomic_load_explicit(&sched_left, memory_order_relaxed);
+    do {
+        if (left <= 0)
+            return false;
+    } while (!atomic_compare_exchange_weak_explicit(
+        &sched_left, &left, left - 1, memory_order_acq_rel,
+        memory_order_relaxed));
+    atomic_store_explicit(&sched_failed_thr, act, memory_order_release);
+    atomic_fetch_add_explicit(&sched_consumed, 1, memory_order_release);
+    return true;
+}
+
+/* Called from the trap handler on every error return. If that error is the
+ * SchedSet failure just injected for act, consume the mark, and count it when
+ * the caller was already switched out, so a test can tell a status that
+ * survived a switch from one that never met one. Consuming the mark on an
+ * undisplaced return keeps it from matching a later, unrelated error.
+ */
+void inject_note_sched_return(thread_t *act, bool displaced)
+{
+    thread_t *expect = act;
+
+    if (atomic_compare_exchange_strong_explicit(&sched_failed_thr, &expect,
+                                                NULL, memory_order_acq_rel,
+                                                memory_order_relaxed) &&
+        displaced)
+        atomic_fetch_add_explicit(&sched_displaced, 1, memory_order_release);
+}
 
 /* Called from object_alloc before it touches the free list. Ordinary allocation
  * only: the reserved path (object_alloc_reserved) must never fail this way.
@@ -101,14 +158,32 @@ void kext_debug_inject(void *data)
     case INJECT_OP_ALLOC_STATUS:
         ret = atomic_load_explicit(&consumed, memory_order_acquire);
         break;
+    case INJECT_OP_FAIL_NEXT_SCHED_SET:
+        if (kap->arg0 > INT32_MAX || kap->arg1 > INT32_MAX) {
+            ret = EINVAL;
+            break;
+        }
+        atomic_store_explicit(&sched_consumed, 0, memory_order_relaxed);
+        atomic_store_explicit(&sched_displaced, 0, memory_order_relaxed);
+        atomic_store_explicit(&sched_left, (int) kap->arg1,
+                              memory_order_relaxed);
+        atomic_store_explicit(&sched_armed_pid, (int) kap->arg0,
+                              memory_order_release);
+        break;
+    case INJECT_OP_SCHED_SET_STATUS:
+        ret = atomic_load_explicit(&sched_consumed, memory_order_acquire);
+        break;
+    case INJECT_OP_SCHED_SET_DISPLACED:
+        ret = atomic_load_explicit(&sched_displaced, memory_order_acquire);
+        break;
     default:
         ret = EINVAL;
         break;
     }
     kap->ret = ret;
 
-    /* ALLOC_STATUS answers through kap->ret; a nonzero status would read as a
-     * refused call to syscall_priv callers.
+    /* The *_STATUS and *_DISPLACED ops answer through kap->ret; a nonzero
+     * status would read as a refused call to syscall_priv callers.
      */
-    SETKSTATUS(act, kap->op == INJECT_OP_ALLOC_STATUS ? EOK : ret);
+    SETKSTATUS(act, inject_op_is_status(kap->op) ? EOK : ret);
 }

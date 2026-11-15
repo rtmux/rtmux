@@ -344,6 +344,20 @@ void cpu_force_fpu_save(thread_t *thp);
 #ifdef CONFIG_DEBUG_INJECT
 int inject_should_fail_alloc(process_t *prp,
                              soul_t *soulp); /* debug/inject.c */
+bool inject_should_fail_sched_set(thread_t *act, bool lowered);
+void inject_note_sched_return(thread_t *act, bool displaced);
+#else
+static inline bool inject_should_fail_sched_set(thread_t *act, bool lowered)
+{
+    (void) act;
+    (void) lowered;
+    return false;
+}
+static inline void inject_note_sched_return(thread_t *act, bool displaced)
+{
+    (void) act;
+    (void) displaced;
+}
 #endif
 void fpu_drop_claims(thread_t *thp);
 /* User FP context: save/restore f0-f31 and fcsr (arch/riscv/fpcontext.S). */
