@@ -828,26 +828,27 @@ int ProcessFlagsOp(pid_t pid, uint32_t set, uint32_t clear)
     return (int) syscall_priv(__KSYS_PRIV_PROC_FLAGS_OP, &data);
 }
 
-/* ProcessSetRlimitCpu — install RLIMIT_CPU (soft/hard, seconds) for a process
- * kernel-side; the kernel derives the nanosecond max_cpu_time the tick
- * enforces. Wraps __KSYS_PRIV_PROC_SET_RLIMIT.
+/* ProcessSetRlimit — install a settable rlimit (RLIMIT_CPU in seconds,
+ * RLIMIT_DATA or RLIMIT_AS in bytes) for a process kernel-side; for RLIMIT_CPU
+ * the kernel derives the nanosecond max_cpu_time the tick enforces. Wraps
+ * __KSYS_PRIV_PROC_SET_RLIMIT.
  *
- * Return value: EOK, or ESRCH if pid is gone.
+ * Return value: EOK, EINVAL for another resource or cur > max, EPERM if max
+ * raises the hard limit, or ESRCH if pid is gone.
  */
-struct kcall_args_proc_set_rlimit {
-    pid_t pid;
-    uint64_t cur;
-    uint64_t max;
-};
-
-int ProcessSetRlimitCpu(pid_t pid, uint64_t cur, uint64_t max)
+int ProcessSetRlimit(pid_t pid, int resource, uint64_t cur, uint64_t max)
 {
     struct kcall_args_proc_set_rlimit data;
+    long r;
 
     data.pid = pid;
+    data.resource = resource;
     data.cur = cur;
     data.max = max;
-    return (int) syscall_priv(__KSYS_PRIV_PROC_SET_RLIMIT, &data);
+
+    /* kcall_err comes back as a negative errno; callers want it positive. */
+    r = syscall_priv(__KSYS_PRIV_PROC_SET_RLIMIT, &data);
+    return r < 0 ? (int) -r : (int) r;
 }
 
 /* soul_stats — fetch one record per kernel object pool (see kstats.h), plus the

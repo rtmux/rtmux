@@ -1176,18 +1176,12 @@ static int vm_shared_to_private(pid_t pid,
         memcpy(tmap, (void *) ((uintptr_t) info.vaddr), map_size);
     }
 
-    /* now, unmap the shared page that will be privatized and create a new
-     * private mapping at the same address as the previous shared mapping and
-     * copy the original contents to it (from the temp mapping)
+    /* now, replace the shared page with a new private mapping at the same
+     * address (MAP_FIXED unmaps it) and copy the original contents to it from
+     * the temp mapping. No separate munmap first: as_mmap checks RLIMIT_AS and
+     * RLIMIT_DATA before it removes the replaced range, so a refusal leaves the
+     * shared page in place instead of a hole in the process.
      */
-    status = root_vm_ops.munmap(pid, prp, info.vaddr, size, 0);
-    if (status != EOK) {
-        /* release temporary mapping and return a failure */
-        (void) root_vm_ops.munmap(pid, prp, (uintptr_t) tmap, map_size, 0);
-        process_bind(0);
-        return -1;
-    }
-
     status =
         root_vm_ops.mmap(pid, prp, info.vaddr, /* address */
                          size, (int) (info.flags & PROT_MASK) | PROT_WRITE,

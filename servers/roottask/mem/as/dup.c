@@ -255,7 +255,7 @@ int as_dup(pid_t pprp_pid, process_t *pprp, pid_t prp_pid, process_t *prp)
                 goto fail3;
             por = pmm->obj_ref;
             if (por) {
-                if (pmm->mmap_flags & EXTRA_FLAG_RLIMIT_DATA) {
+                if (pmm->extra_flags & EXTRA_FLAG_RLIMIT_DATA) {
                     child_tmp->rlimit.data += len;
                 } else if (pmm->extra_flags & EXTRA_FLAG_PRIMARY_STK) {
                     child_tmp->rlimit.stack += len;

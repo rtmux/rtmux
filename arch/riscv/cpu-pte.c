@@ -18,6 +18,7 @@
 #include "as.h"
 #include "mm-xboundary.h"
 #include <cpu-inline.h>
+#include <sv39-lookup.h>
 #include <stdatomic.h>
 
 /* Cross-boundary remapping for roottask-resident dependencies. */
@@ -327,26 +328,13 @@ unsigned cpu_as_vaddrinfo(process_t *prp,
     return PROT_READ | PROT_WRITE | PROT_EXEC;
 }
 
-/* cpu_pte_lookup — read-only walk of pgdir for vaddr.
- *
- * Returns a pointer to the leaf PTE if the page is mapped, NULL otherwise.
- * Walks both 2 MiB megapages (leaf at L1) and 4 KiB pages (leaf at L0). For
- * megapage leaves, returned pointer points at the L1 entry; caller can detect
- * that case via PX(0, vaddr) versus the slot offset.
- */
-pte_t *cpu_pte_lookup(pagetable_t pgdir, uintptr_t vaddr)
+/* cpu_pte_lookup — read-only walk of pgdir for vaddr; see sv39_lookup_leaf. */
+pte_t *cpu_pte_lookup(pagetable_t pgdir,
+                      uintptr_t vaddr,
+                      int *levelp,
+                      pte_t *ep)
 {
-    for (int level = 2; level > 0; level--) {
-        pte_t *pte = &pgdir[PX(level, vaddr)];
-        if (!(*pte & PTE_V))
-            return NULL;
-        /* Megapage leaf at L1 (or rare L2) — has any of R/W/X. */
-        if (*pte & (PTE_R | PTE_W | PTE_X))
-            return pte;
-        pgdir = (pagetable_t) PA_TO_VA(PTE2PA(*pte));
-    }
-    pte_t *pte = &pgdir[PX(0, vaddr)];
-    return (*pte & PTE_V) ? pte : NULL;
+    return sv39_lookup_leaf(pgdir, vaddr, levelp, ep);
 }
 
 /* cpu_uvaddr_to_paddr — physical address of a user virtual address in the

@@ -24,6 +24,7 @@
 
 #include <core/globals.h>
 #include <paging.h>
+#include <sv39-lookup.h>
 
 /* cpu_pgdir_create — allocate a user root page table with kernel mappings.
  *
@@ -217,10 +218,12 @@ paddr_t cpu_va2pa(pagetable_t pgdir, uintptr_t va)
     if (va >= MAXVA)
         return 0;
 
-    pte_t *pte = walk(pgdir, va, 0);
-    if (!pte || !(*pte & PTE_V))
+    /* walk() would descend through a superpage leaf as if it were a table; the
+     * leaf lookup stops there and reports its level.
+     */
+    int level;
+    pte_t e;
+    if (!cpu_pte_lookup(pgdir, va, &level, &e))
         return 0;
-
-    paddr_t pa = PTE2PA(*pte);
-    return pa | (va & (PGSIZE - 1));
+    return (paddr_t) sv39_leaf_paddr(e, level, va, NULL);
 }

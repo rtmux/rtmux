@@ -13,8 +13,8 @@
 /* proc_msg_resource — handle a _PROC_RESOURCE message.
  *
  * Implements getrusage (RUSAGE_SELF / RUSAGE_CHILDREN, sourced from the debug
- * process-info), getrlimit (single resource), and setrlimit (RLIMIT_CPU on the
- * caller only; other resources return ENOSYS).
+ * process-info), getrlimit (single resource), and setrlimit (RLIMIT_CPU,
+ * RLIMIT_DATA and RLIMIT_AS on the caller only; other resources return ENOSYS).
  *
  * Parameters:
  *   ctp  : I/O service context (ctp->info.pid = calling process)
@@ -75,10 +75,14 @@ int proc_msg_resource(ioserv_context_t *ctp, void *vmsg)
         }
 
     case _PROC_RESOURCE_SETLIMIT:
-        /* Only RLIMIT_CPU is settable, and only on the caller itself: the
-         * rlimit arrays live kernel-side (heap is PTE_U=0), so the validated
-         * pair goes through ProcessSetRlimitCpu. A process may lower either
-         * limit but not raise the hard limit (no privilege override yet).
+        /* Only RLIMIT_CPU, RLIMIT_DATA and RLIMIT_AS are settable, and only on
+         * the caller itself: the rlimit arrays live kernel-side (heap is
+         * PTE_U=0), so the pair goes through ProcessSetRlimit, which checks it
+         * against the hard limit under the lock that guards it (EINVAL for cur
+         * > max, EPERM for a raised hard limit: no privilege override yet).
+         * RLIMIT_DATA and RLIMIT_AS take effect at the next mapping
+         * (rlimit_blown); lowering one below the current usage leaves existing
+         * mappings alone.
          */
         if (msg->hdr.pid) {
             return proc_error(EPERM, locked_pid);
@@ -87,24 +91,15 @@ int proc_msg_resource(ioserv_context_t *ctp, void *vmsg)
             msg->setlimit.i.entry[0].resource >= RLIM_NLIMITS) {
             return proc_error(EINVAL, locked_pid);
         }
-        if (msg->setlimit.i.entry[0].resource != RLIMIT_CPU) {
-            return proc_error(ENOSYS, locked_pid);
-        }
         {
-            root_proc_info_t qinfo_rl;
+            int res = (int) msg->setlimit.i.entry[0].resource;
             struct rlimit nl = msg->setlimit.i.entry[0].limit;
 
-            if (process_query_info(locked_pid, &qinfo_rl) != EOK) {
-                return proc_error(ESRCH, locked_pid);
-            }
-            if (nl.rlim_cur > nl.rlim_max) {
-                return proc_error(EINVAL, locked_pid);
-            }
-            if (nl.rlim_max > qinfo_rl.rlimit_vals_hard[RLIMIT_CPU]) {
-                return proc_error(EPERM, locked_pid);
+            if (!rlimit_settable(res)) {
+                return proc_error(ENOSYS, locked_pid);
             }
             return proc_error(
-                ProcessSetRlimitCpu(locked_pid, nl.rlim_cur, nl.rlim_max),
+                ProcessSetRlimit(locked_pid, res, nl.rlim_cur, nl.rlim_max),
                 locked_pid);
         }
 

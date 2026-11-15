@@ -51,8 +51,11 @@ int getrlimit(int resource, struct rlimit *rlim)
                       sizeof(*rlim));
 }
 
-/* Only RLIMIT_CPU is settable (seconds of billed CPU time, enforced against the
- * process's summed thread time); other resources fail with ENOSYS.
+/* Settable resources: RLIMIT_CPU (seconds of billed CPU time, enforced against
+ * the process's summed thread time), and RLIMIT_DATA and RLIMIT_AS (bytes of
+ * private anonymous memory and of address space, enforced when a mapping is
+ * created, so mmap and malloc fail with ENOMEM past the soft limit). Other
+ * resources fail with ENOSYS.
  */
 int setrlimit(int resource, const struct rlimit *rlim)
 {

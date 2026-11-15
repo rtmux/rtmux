@@ -36,7 +36,8 @@ PROGS = $(BUILD_BASE)/mkasmoff $(BUILD_BASE)/mkromfs $(BUILD_BASE)/treeromfs \
         $(BUILD_BASE)/ldso-hash-test $(BUILD_BASE)/ldso-page-test \
         $(BUILD_BASE)/ldso-parse-test $(BUILD_BASE)/ldso-path-test \
         $(BUILD_BASE)/cpio-parser-test $(BUILD_BASE)/spawn-fd-policy-test \
-        $(BUILD_BASE)/serial-reply-test $(BUILD_BASE)/outcomes-test
+        $(BUILD_BASE)/serial-reply-test $(BUILD_BASE)/outcomes-test \
+        $(BUILD_BASE)/sv39-lookup-test
 
 # Each tool compiles and links its sources in one command, so -MMD cannot give a
 # per-tool dependency file (with several sources it writes one named after each
@@ -124,6 +125,15 @@ $(BUILD_BASE)/elf-range-test: $(TEST_DIR)/test-elf-range.c ../../kernel/include/
 	$(Q)$(HOST_CC) $(HOST_CPPFLAGS) $(HOST_CFLAGS) -o $@ \
 	    $(TEST_DIR)/test-elf-range.c
 
+# Sv39 leaf walk and superpage address arithmetic, from the kernel's header.
+$(BUILD_BASE)/sv39-lookup-test: $(TEST_DIR)/test-sv39-lookup.c \
+                              ../../arch/riscv/include/sv39-lookup.h \
+                              ../../arch/riscv/include/cpu-paging.h
+	@mkdir -p $(@D)
+	$(msg) HOSTCC $(notdir $@)
+	$(Q)$(HOST_CC) -I../../arch/riscv/include $(HOST_CFLAGS) -o $@ \
+	    $(TEST_DIR)/test-sv39-lookup.c
+
 $(BUILD_BASE)/ldso-hash-test: $(TEST_DIR)/test-ldso-hash.c ../../lib/ldso/hash.c \
                               ../../lib/ldso/hash.h
 	@mkdir -p $(@D)
@@ -165,7 +175,8 @@ host-tests: $(BUILD_BASE)/path-normalize-test $(BUILD_BASE)/cap-table-test \
             $(BUILD_BASE)/ldso-hash-test $(BUILD_BASE)/ldso-page-test \
             $(BUILD_BASE)/ldso-parse-test $(BUILD_BASE)/ldso-path-test \
             $(BUILD_BASE)/cpio-parser-test $(BUILD_BASE)/spawn-fd-policy-test \
-            $(BUILD_BASE)/serial-reply-test $(BUILD_BASE)/outcomes-test
+            $(BUILD_BASE)/serial-reply-test $(BUILD_BASE)/outcomes-test \
+            $(BUILD_BASE)/sv39-lookup-test
 	$(Q)$<
 	$(Q)$(BUILD_BASE)/cap-table-test
 	$(Q)$(BUILD_BASE)/bootstrap-manifest-test
@@ -178,6 +189,7 @@ host-tests: $(BUILD_BASE)/path-normalize-test $(BUILD_BASE)/cap-table-test \
 	$(Q)$(BUILD_BASE)/spawn-fd-policy-test
 	$(Q)$(BUILD_BASE)/serial-reply-test
 	$(Q)$(BUILD_BASE)/outcomes-test >/dev/null
+	$(Q)$(BUILD_BASE)/sv39-lookup-test
 	$(Q)$(PYTHON) $(TEST_DIR)/test-capability-namespace-doc.py
 	$(Q)$(PYTHON) $(TEST_DIR)/test-management-ipc-lock.py
 	$(Q)HOST_CC="$(HOST_CC)" $(PYTHON) -I $(TEST_DIR)/test-lkl-iommu-contract.py
