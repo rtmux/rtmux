@@ -1100,8 +1100,8 @@ int arch_timer_load(struct qtime_entry *qtp)
          * reprogram, and the STIE enable — the same-CPU ISR must not observe a
          * half-updated base or fire against an un-reprogrammed compare.
          */
-        int en = intr_get();
-        interrupt_disable();
+        unsigned long sie = interrupt_save();
+
         /* Seqlock write: bump to odd, update the pair, bump to even, so a
          * cross-hart arch_timer_now_ns reader never sees a half-updated base.
          */
@@ -1113,8 +1113,7 @@ int arch_timer_load(struct qtime_entry *qtp)
         atomic_fetch_add_explicit(&timer_base_seq, 1u, memory_order_release);
         arch_timer_program_next(qtp, 0);
         w_sie(r_sie() | SIE_STIE);
-        if (en)
-            interrupt_enable();
+        interrupt_restore(sie);
     }
     return 1;
 }

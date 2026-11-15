@@ -29,6 +29,7 @@
  * time. os_version_string is the canonical release string from
  * RTMUX_VERSION_STRING.
  */
+#include <rtmux-version.h>
 #include <sys/rtmux-core.h>
 
 const char timestamp[] = __DATE__ " " __TIME__;

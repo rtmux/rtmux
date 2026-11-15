@@ -722,5 +722,7 @@ int map_fini(struct mm_map_head *mh)
         map_free((struct mm_map_internal *) first,
                  (struct mm_map_internal *) last);
     }
+    mh->head = NULL;
+    mh->rover = NULL;
     return EOK;
 }

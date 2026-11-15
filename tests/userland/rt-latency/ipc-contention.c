@@ -42,6 +42,8 @@
 #include <sys/rtmux-core.h>
 #include <sys/syspage.h>
 
+#include "../outcome.h"
+
 extern struct syspage_entry *_syspage_ptr;
 
 #define CTRL_CPU 0
@@ -56,6 +58,7 @@ extern struct syspage_entry *_syspage_ptr;
 #define ITERS 200
 #define MSG_BYTES 64
 #define SETUP_BUDGET_MS 3000
+
 /* A phase measures ITERS round trips, each possibly slow under contention and
  * TCG cross-hart descheduling, so the controller waits generously for a phase.
  */
@@ -358,22 +361,20 @@ int main(void)
 
     if (pin_to_cpu(CTRL_CPU) == -1) {
         printf("ipc-contention: SKIP needs at least 4 harts\n");
-        printf("ipc-contention: PASS (skipped)\n");
-        return EXIT_SUCCESS;
+        return TC_EXIT_SKIP;
     }
     if (rate == 0) {
         printf("ipc-contention: SKIP counter rate unavailable\n");
-        printf("ipc-contention: PASS (skipped)\n");
-        return EXIT_SUCCESS;
+        return TC_EXIT_SKIP;
     }
+
     /* Probe for the fourth hart the high client needs (cpu3): harts are
      * contiguous, so if pinning to cpu3 works, cpu0 through cpu3 all exist. Pin
      * back to the controller hart afterward.
      */
     if (pin_to_cpu(HIGH_CPU) == -1 || pin_to_cpu(CTRL_CPU) == -1) {
         printf("ipc-contention: SKIP needs at least 4 harts\n");
-        printf("ipc-contention: PASS (skipped)\n");
-        return EXIT_SUCCESS;
+        return TC_EXIT_SKIP;
     }
 
     chid = channel_create(0);

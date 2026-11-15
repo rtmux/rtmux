@@ -255,10 +255,12 @@ struct _notification {
 #define RTMUX_TCTL_RUNMASK_GET_AND_SET_INHERIT 10
 #define RTMUX_TCTL_NAME 11
 #define RTMUX_TCTL_THREAD_DESTROY_STATS 12
+
 /* data = (void *) 1 / (void *) 0: allow / forbid a native capability header in
  * the replies to this thread's own requests (calling thread only).
  */
 #define RTMUX_TCTL_NATIVE_REPLY 13
+
 /* data = the 1-based tid of a thread of the calling process (the pthread_t
  * value). Break that thread's interruptible blocked call with EINTR (message
  * send/reply/receive, condvar, semaphore, sleep, join; never a mutex wait).
@@ -375,6 +377,7 @@ struct _thread_runmask {
 #define RTMUX_FLG_CHF_REPLY_LEN 0x0080U
 #define RTMUX_FLG_CHF_STICKY 0x0100U
 #define RTMUX_FLG_CHF_ASYNC_NONBLOCK 0x0200U
+
 /* Capability-gate a global channel: connect by chid alone is refused unless the
  * caller holds a live capability over the channel. Only meaningful together
  * with RTMUX_FLG_CHF_GLOBAL. See channel_create_cap().
@@ -391,6 +394,7 @@ struct _thread_runmask {
 #define RTMUX_FLG_COF_NONBLOCK 0x0100U
 #define RTMUX_FLG_COF_ASYNC 0x0200U
 #define RTMUX_FLG_COF_GLOBAL 0x0400U
+
 /* Connect-flags operation, not a stored flag: when this bit is in the
  * connect_flags mask, the kernel clears RTMUX_CAP_ENDPOINT_SEND from the
  * connection's rights, so the holder can no longer send or arm notifications on
@@ -499,6 +503,7 @@ struct _clockperiod {
 /* Operation to tell msg_key_data to verify instead of calculate */
 #define RTMUX_KEYDATA_VERIFY 0
 #define RTMUX_KEYDATA_CALCULATE 1
+
 /* Wrong VERIFY keys a minted msg_key_data secret survives before it is retired;
  * shared by the kernel (ipc/message.c) and the capgate retire test.
  */
@@ -510,11 +515,6 @@ struct _clockperiod {
 #define RTMUX_SCTL_SETEVENT 3       /* mutex    struct sigevent *event */
 
 struct iovec;
-
-/* RTMUX_VERSION is defined in <rtmux-version.h> as (major<<16 | minor<<8 |
- * patch)
- */
-#include <rtmux-version.h>
 
 #define ROOTTASK_PID 1
 #define ROOTTASK_CHID 1
@@ -542,6 +542,7 @@ extern void rtmux_hwres_release_range_for_pid(uint64_t __base,
                                              unsigned __type,
                                              pid_t __pid);
 struct rtmux_resource_handle;
+
 /* Pass as rtmux_delegate_device's expected_base to accept any granted base (a
  * real MMIO base can be 0, so this cannot be a value the server may grant: the
  * server rejects any base above INT64_MAX).
@@ -585,6 +586,7 @@ extern void dbgprintf(const char *__fmt, ...)
 
 extern int channel_create(unsigned __flags);
 extern int channel_create_r(unsigned __flags);
+
 /* Create a capability-gated global channel (RTMUX_FLG_CHF_CAP_GATED implied).
  * On success the minted gating capability id is written to *__cap_out; the
  * server delegates it to authorized clients via the IPC cap transfer.
@@ -812,6 +814,7 @@ extern int msg_error(int __rcvid, int __err);
 extern int msg_error_r(int __rcvid, int __err);
 extern int msg_current(int __rcvid);
 extern int msg_current_r(int __rcvid);
+
 /* Signal* kernel calls removed — signal subsystem eliminated. Stubs returning
  * -ENOSYS exist in calls.c for declared-but-unimplemented entry points.
  */

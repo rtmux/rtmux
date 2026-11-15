@@ -9,6 +9,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -70,7 +71,7 @@ static long kstats_get(const char *snap, const char *key)
     return -1;
 }
 
-/* ---- killspawn ---------------------------------------------------------- */
+/* killspawn */
 
 static const char *const gauges[] = {"thread", "connect", "channel", "process"};
 #define NGAUGE (sizeof gauges / sizeof gauges[0])
@@ -117,8 +118,8 @@ int killspawn_child(const char *fd_arg)
 static long pool_adjust(const char *snap, const char *name, long used)
 {
     /* A thread's timeout timer is allocated on its first timed wait, so the
-     * timers of live threads depend on which pool thread timed out yet: subtract
-     * them (timeout.live) and keep the timers nobody owns.
+     * timers of live threads depend on which pool thread timed out yet:
+     * subtract them (timeout.live) and keep the timers nobody owns.
      */
     long live = kstats_get(snap, !strcmp(name, "soul.timer.used") ? "timeout.live"
                                                                   : "thread.live");
@@ -149,7 +150,8 @@ static int gauge_sample(int fd, long *out)
  */
 enum { ACK_TIMEOUT_MS = 10000 };
 
-/* Spawn the child, wait for its ack, SIGKILL it and reap it. NULL on success. */
+/* Spawn the child, wait for its ack, SIGKILL it and reap it. NULL on success.
+ */
 static const char *killspawn_round(const int *pfd)
 {
     char fdarg[16], byte;
@@ -314,7 +316,7 @@ void test_leak(void)
     test_killspawn();
 }
 
-/* ---- per-operation gauge regressions ------------------------------------- */
+/* per-operation gauge regressions */
 
 enum { GAUGE_PAIRS = 100, GAUGE_CHILDREN = 10, GAUGE_FAILED_SPAWNS = 8 };
 
@@ -396,11 +398,10 @@ static void test_pipe_gauge(int fd)
  * to load: none may leave a process or a per-thread timeout timer behind. A
  * failed spawn used to stay a zombie, a waitpid that won the race against the
  * last thread's exit left the reaped child pinned, and a thread that exited
- * after sleeping never freed its timeout timer.
- */
-/* One batch: spawn, wait and reap GAUGE_CHILDREN children, then try a spawn and
- * an exec of a missing binary GAUGE_FAILED_SPAWNS times. *ok counts children
- * that exited 0, *failed the attempts that failed as they must.
+ * after sleeping never freed its timeout timer. One batch: spawn, wait and reap
+ * GAUGE_CHILDREN children, then try a spawn and an exec of a missing binary
+ * GAUGE_FAILED_SPAWNS times. *ok counts children that exited 0, *failed the
+ * attempts that failed as they must.
  */
 static void spawn_batch(int *ok, int *failed)
 {
@@ -430,10 +431,20 @@ static void test_spawn_gauge(int fd)
     long process0, timer0;
     int ok, failed;
 
+    char snap[KS_BUF];
+    long pa0 = -1, pa1 = -1;
+
     spawn_batch(&ok, &failed); /* warm up */
     process0 = gauge_stable(fd, "soul.process.used");
     timer0 = gauge_stable(fd, "soul.timer.used");
+    if (kstats_read(fd, snap, sizeof snap) > 0)
+        pa0 = kstats_get(snap, "pa.free_bytes");
     spawn_batch(&ok, &failed);
+    if (kstats_read(fd, snap, sizeof snap) > 0)
+        pa1 = kstats_get(snap, "pa.free_bytes");
+    /* Physical memory is not a soul pool: report what a batch kept. */
+    printf("spawn-gauge: pa.free_bytes %ld -> %ld (%ld bytes per child)\n", pa0, pa1,
+           (pa0 - pa1) / GAUGE_CHILDREN);
     check(ok == GAUGE_CHILDREN, "spawn-gauge nap children exit 0", "child failed or was not reaped");
     check(failed == GAUGE_FAILED_SPAWNS, "spawn-gauge missing binary fails",
           "spawn or exec of a missing binary must fail");
@@ -441,7 +452,7 @@ static void test_spawn_gauge(int fd)
     gauge_check(fd, "spawn, nap, exit, reap", "soul.timer.used", timer0);
 }
 
-/* ---- fixtures for the gauge regressions ---------------------------------- */
+/* fixtures for the gauge regressions */
 
 struct dr_state {
     atomic_int coid;
@@ -467,7 +478,8 @@ static void *dr_sender(void *arg)
 enum { DR_SENDERS = 3, DR_ITERS = 100, LINGER_THREADS = 6 };
 
 /* Sibling threads MsgSend on a coid while the main thread detaches it (the last
- * reference, so the server gets its disconnect notice) and attaches a fresh one.
+ * reference, so the server gets its disconnect notice) and attaches a fresh
+ * one.
  */
 static int detach_race_child(pid_t server, int chid)
 {
@@ -490,6 +502,7 @@ static int detach_race_child(pid_t server, int chid)
         if (i % 5 == 0)
         for (int y = 0; y < 20; y++)
             sched_yield();
+
         /* Drop the only reference from under senders that already loaded the
          * number: the race the last-drop notice has to survive.
          */
@@ -765,10 +778,10 @@ static void test_timed_send_kill(int fd)
  * reference. The soul must go back (the disconnect notice reaches the server,
  * which detaches its scoid) while the channel is still alive.
  *
- * Opt-in (`syscall_testing --orphan-send`), not in test_gauges(): on the dev tree
- * at CPUS=2 it hangs about 1 run in 3 after the gauge checks, with one hart in
- * rcu_sched_synchronize() under ksys_connect_detach() and the other inside
- * ksys_msg_receivev() (Q67). It passes with or without a change to
+ * Opt-in (`syscall_testing --orphan-send`), not in test_gauges(): on the dev
+ * tree at CPUS=2 it hangs about 1 run in 3 after the gauge checks, with one
+ * hart in rcu_sched_synchronize() under ksys_connect_detach() and the other
+ * inside ksys_msg_receivev() (Q67). It passes with or without a change to
  * exit.c, so it does not pin the Q65 b drop; it is kept as a reproducer.
  */
 void test_orphan_send_kill(void)
@@ -871,7 +884,7 @@ void test_gauges(void)
     (void) close(fd);
 }
 
-/* ---- lap gauge comparison ------------------------------------------------ */
+/* lap gauge comparison */
 
 struct pool_gauge {
     char name[48];
@@ -907,7 +920,9 @@ static int pools_parse(const char *snap, struct pool_gauge *out)
  * per-thread timers and pool threads reach their steady state there and in lap
  * 2), so nothing is sampled; the end of lap LAP_BASELINE records the baseline;
  * later laps report every pool above it, after up to KS_SETTLE_MS for
- * asynchronous teardown. Returns the number that grew.
+ * asynchronous teardown.
+ *
+ * Returns the number that grew.
  */
 static int lap_check_fd(int lap, int fd)
 {
@@ -972,10 +987,42 @@ int leak_lap_check(int lap)
     return grown;
 }
 
+/* Name every live process ("pid:name"), so a suite that leaves one behind says
+ * which. Parameters:
+ *   lap, suite : for the line prefix
+ */
+static void print_procs(int lap, const char *suite)
+{
+    DIR *d = opendir("/proc");
+    struct dirent *de;
+
+    if (!d)
+        return;
+    printf("lap=%d suite=%s procs:", lap, suite);
+    while ((de = readdir(d))) {
+        char path[64], name[48];
+        int fd;
+        ssize_t len;
+
+        if (de->d_name[0] < '0' || de->d_name[0] > '9')
+            continue;
+        snprintf(path, sizeof path, "/proc/%s/name", de->d_name);
+        name[0] = '\0';
+        if ((fd = open(path, O_RDONLY)) >= 0) {
+            if ((len = read(fd, name, sizeof name - 1)) > 0)
+                name[len - (name[len - 1] == '\n')] = '\0';
+            (void) close(fd);
+        }
+        printf(" %s:%s", de->d_name, name);
+    }
+    printf("\n");
+    (void) closedir(d);
+}
+
 /* Per-suite attribution for --laps: after each suite, print every pool whose
  * settled live count differs from the count after the previous suite ("lap=<n>
- * suite=<name> gauge <pool> <before> -> <after>"). Settled means two samples
- * 50 ms apart agree. Lap 1 only records, so a pool that changes only in lap 1
+ * suite=<name> gauge <pool> <before> -> <after>"). Settled means two samples 50
+ * ms apart agree. Lap 1 only records, so a pool that changes only in lap 1
  * (lazy pool growth) stays silent.
  */
 void leak_suite_delta(int lap, const char *suite)
@@ -1001,14 +1048,23 @@ void leak_suite_delta(int lap, const char *suite)
             break;
     }
     (void) close(fd);
+
+    /* Physical memory is not a soul pool; report it so a lap that runs the
+     * allocator dry shows which suite took the memory.
+     */
+    printf("lap=%d suite=%s pa.free_bytes=%ld roottask.heap_used=%ld\n", lap, suite,
+           kstats_get(snap, "pa.free_bytes"), kstats_get(snap, "roottask.heap_used"));
     live = kstats_get(snap, "thread.live");
     if (lap > 1 && live != live_before)
         printf("lap=%d suite=%s gauge thread.live %ld -> %ld\n", lap, suite, live_before, live);
     live_before = live;
     for (int i = 0; lap > 1 && i < n && i < before_n; i++)
-        if (cur[i].base != before[i].base)
+        if (cur[i].base != before[i].base) {
             printf("lap=%d suite=%s gauge %s %ld -> %ld\n", lap, suite, cur[i].name,
                    before[i].base, cur[i].base);
+            if (!strcmp(cur[i].name, "soul.process.used") && cur[i].base > before[i].base)
+                print_procs(lap, suite);
+        }
     memcpy(before, cur, sizeof cur);
     before_n = n;
 }

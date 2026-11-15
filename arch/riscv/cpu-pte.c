@@ -78,6 +78,7 @@ void cpu_tlb_flush_complete(void)
             wait[hi] = false;
             continue;
         }
+
         /* Claim a ticket the target must reach with an sfence that causally
          * follows this hart's page-table store. A bare completion counter is
          * not enough: an unrelated flusher's sfence could bump it without
@@ -148,8 +149,10 @@ static pte_t *sv39_walk(pagetable_t pgdir, uintptr_t va, int alloc)
             /* Zero the new page table */
             CPU_ZERO_PAGE(pgdir, __PAGESIZE, 0);
 
-            /* Install the PDE pointing to the new page */
-            *pte = PA2PTE(paddr) | PTE_V;
+            /* Install the PDE pointing to the new page, marked as pa_alloc'd so
+             * cpu_pgdir_free gives it back to pa rather than the kernel heap.
+             */
+            *pte = PA2PTE(paddr) | PTE_V | PTE_SW_PA;
         }
     }
     return &pgdir[PX(0, va)];
@@ -192,6 +195,7 @@ int cpu_pte_manipulate(struct mm_pte_manipulate *data)
 
             if (curr < KERNEL_VIRT_BASE && (bits & PTE_U)) {
                 extern char _text_start[], _end[];
+
                 /* Guard against mapping the kernel image into a user VA. Bound
                  * the window with the actual linker image extent [_text_start,
                  * _end): a fixed 16 MiB window above the image crashed on a
@@ -380,6 +384,7 @@ int cpu_uvaddr_to_paddr(uintptr_t vaddr, paddr_t *pa)
 
         if (!(*pte & PTE_V))
             return -1;
+
         /* A leaf carries R/W/X; an interior node does not. The leaf's page
          * spans 4 KiB << (9 * level), so mask the offset with PXSHIFT(level).
          */

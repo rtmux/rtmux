@@ -181,8 +181,9 @@ notification_t *rdecl notification_add_reserved(process_t *prp,
  * _NOTIFICATION_PRIO_* bits code : notification code value : notification value
  * id : notification id (source side-channel scoid)
  *   notification_flags : NOTIFICATION_DELIVER_*_FLAG bits
- * Return value: EOK/EFAULT on delivery to a waiter, EOK when queued,
- *               or an errno (EINVAL/ENXIO/EAGAIN).
+ * Return value: EOK/EFAULT on delivery to a waiter, EOK when queued, or an
+ *               errno: EINVAL (bad priority), ESRCH (channel being destroyed),
+ *               ENXIO (process dying), EAGAIN (no notification soul).
  */
 int rdecl notification_deliver(channel_t *chp,
                                unsigned priority,
@@ -225,9 +226,10 @@ int rdecl notification_deliver(channel_t *chp,
         ITF_SET(thp, RTMUX_ITF_MSG_DELIVERY);
     }
 #endif
-    kspinlock_unlock(&chp->lock);
 
     if (thp) {
+        kspinlock_unlock(&chp->lock);
+
         /* Spin-wait if thp is mid-transition into STATE_RECEIVE. Pairs with the
          * receiver's WAIT_PENDING set+clear in ksys_msg_recv, bridging the
          * LINKPRIL_BEG -> unready window. The trailing fence pairs with the
@@ -304,19 +306,29 @@ int rdecl notification_deliver(channel_t *chp,
         rcu_read_unlock(&tthread_rcu);
         return status ? EFAULT : EOK;
     }
-    /* Fail any notification delivery attempt to a dying process. */
-    if (chp->process->flags & (RTMUX_FLG_PROC_TERMING | RTMUX_FLG_PROC_ZOMBIE |
-                               RTMUX_FLG_PROC_COREDUMP)) {
+
+    /* No receiver. chp->lock is still held from the probe and stays held until
+     * the notification is queued: ksys_msg_receivev re-probes send_queue under
+     * it before it sleeps, so dropping it here would let a receiver sleep past
+     * the notification.
+     *
+     * Refuse a dying process, and a channel being destroyed: channel_destroy
+     * sets ->destroying under this lock before it drains send_queue.
+     */
+    if (chp->destroying ||
+        (chp->process->flags & (RTMUX_FLG_PROC_TERMING | RTMUX_FLG_PROC_ZOMBIE |
+                                RTMUX_FLG_PROC_COREDUMP))) {
+        /* ESRCH for a destroyed channel, as the send paths report it. */
+        int err = chp->destroying ? ESRCH : ENXIO;
+
+        kspinlock_unlock(&chp->lock);
         rcu_read_unlock(&tthread_rcu);
-        return ENXIO;
+        return err;
     }
 
-    /* No-one waiting for a msg, so the critical-delivery state is lost here.
-     * notification_add mutates chp->send_queue — wrap in channel_slock.
-     * notification_add itself does not take the lock (caller's responsibility,
-     * parallel to pril_add).
+    /* The critical-delivery state is lost here. notification_add does not take
+     * the lock itself (parallel to pril_add).
      */
-    kspinlock_lock(&chp->lock);
     notification_t *added =
         (notification_flags & NOTIFICATION_DELIVER_RESERVED_FLAG)
             ? notification_add_reserved(chp->process, &chp->send_queue,

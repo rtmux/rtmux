@@ -13,7 +13,7 @@ all: $(PROG)
 $(OBJDIR)/%.o: %.c
 	@mkdir -p $(@D)
 	$(msg) CC $@
-	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
+	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) $(DEPFLAGS) -c -o $@ $<
 
 $(PROG): $(OBJS) $(CRT0_O) $(LIBC_SO)
 	@mkdir -p $(@D)
@@ -24,3 +24,5 @@ clean:
 	$(Q)rm -rf $(BUILD_BASE)
 
 .PHONY: all clean
+
+$(eval $(call dep-include,$(OBJS)))

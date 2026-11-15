@@ -643,7 +643,11 @@ static void thread_soul_free(process_t *prp, thread_t *thp)
     object_free(prp, &thread_souls, thp);
 }
 
-static int thread_active_hart(thread_t *thp)
+/* The hart that has thp as its current thread, or -1. Also used by the exit
+ * paths to tell a parked stopped thread from one that set STATE_STOPPED and is
+ * still running toward block().
+ */
+int thread_active_hart(thread_t *thp)
 {
     extern unsigned hart_ids[];
 
@@ -1906,10 +1910,22 @@ void rdecl thread_destroy(thread_t *thp)
     if (last_active) {
         struct sigevent ev;
         uint64_t t0 = stats_enabled && join_woke ? cpu_clock_ticks() : 0;
+        pid_t pid = prp->pid; /* prp may be freed once roottask is readied */
+        int nrc;
+
         proc_threads_destroyed(prp, &ev);
-        sigevent_notification_roottask(ev.sigev_code,
-                                       (unsigned) ev.sigev_priority,
-                                       (uintptr_t) ev.sigev_value.sival_int);
+        nrc = sigevent_notification_roottask(
+            ev.sigev_code, (unsigned) ev.sigev_priority,
+            (uintptr_t) ev.sigev_value.sival_int);
+
+        /* Losing this leaves the process with no threads and nobody to free it,
+         * and its parent's wait unanswered: say so.
+         */
+        if (nrc != EOK)
+            kprintf(
+                "thread_destroy: pid %d: last-thread notification failed "
+                "(%d)\n",
+                (int) pid, nrc);
         if (stats_enabled && join_woke)
             post_notify_cycles = cpu_clock_ticks() - t0;
     }
@@ -2194,10 +2210,16 @@ void rdecl thread_specret(thread_t *thp)
 
     cpu_thread_waaa(thp);
 
-    /* Let the parent continue. The tid was stuffed during thread_create(). */
+    /* Let the parent continue. The tid was stuffed during thread_create().
+     * Clear thp->join before the ready: the parent can run on another hart at
+     * once, and a pthread_join it makes while the field still names it fails
+     * with EBUSY.
+     */
     if (thp->join && thp->join->state == STATE_WAITTHREAD) {
-        ready(thp->join);
+        thread_t *parent = thp->join;
+
         thp->join = NULL;
+        ready(parent);
     }
 
     /* Don't change priority until parent thread freed to run again
@@ -2229,7 +2251,10 @@ void rdecl thread_specret(thread_t *thp)
 /* Mark every thread of a process for self-destruction.
  *
  * Flags each thread DETACHED | KILLSELF (clearing stop/stack flags) and sets
- * RTMUX_FLG_PROC_DESTROYALL on the process. Parameters:
+ * RTMUX_FLG_PROC_DESTROYALL on the process. The caller holds prp->vec_slock:
+ * vector_add can swap and free the slot buffer under an unlocked walk, and a
+ * joiner tests DETACHED and reserves a zombie under the same lock, so one that
+ * comes after this walk is refused. Parameters:
  *   thp : any thread of the process to destroy
  */
 void rdecl thread_destroyall(thread_t *thp)
@@ -2238,8 +2263,11 @@ void rdecl thread_destroyall(thread_t *thp)
     thread_t *thp2;
     int tid;
 
+    /* VECP2, not VECP: an unjoined zombie's slot is flagged invalid for
+     * lookups, and it must still be detached or the process never empties.
+     */
     for (tid = 0; tid < prp->threads.nentries; ++tid) {
-        if (VECP(thp2, &prp->threads, tid)) {
+        if ((thp2 = VECP2(thp2, &prp->threads, tid))) {
             atomic_or(&thp2->flags,
                       RTMUX_FLG_THR_DETACHED | RTMUX_FLG_THR_KILLSELF);
             /* Knock down the stack flag, faster to do it when we unmap all */

@@ -13,10 +13,56 @@
 
 #include <core/globals.h>
 
+#define THR_IN_IPC_WAIT(t) \
+    ((t)->state == STATE_REPLY || (t)->state == STATE_SEND)
+
+/* How long to wait in the kcall for a message-delivery claim to clear before
+ * handing the wait back to roottask (EAGAIN). A claim normally clears within
+ * one transfer; one that does not may belong to a claimer that needs this hart.
+ */
+#define EXIT_CLAIM_SPIN 4096U
+
 /* kernel-internal: destroy with explicit process pointer */
 extern int _channel_destroy(process_t *prp, int chid);
 extern int _timer_destroy(process_t *prp, int id);
 extern int _connect_detach(process_t *prp, int coid);
+
+/* exit_ready_stopped — ready a parked stopped thread so it self-reaps.
+ *
+ * KILLSELF is the lowest special-return bit, so a readied thread self-destructs
+ * before any pending stop takes it again. STATE_STOPPED is also seen briefly on
+ * a thread still running toward block() (specialret's stop), which is reported
+ * for a retry instead. The RTMUX_ITF_EXIT_READIED claim makes sure only one
+ * teardown path readies a thread: ready_default drops a duplicate only while it
+ * is still READY, not once another hart has run it. Parameters:
+ *   thp : a thread of a dying process, pinned by the caller
+ * Return value: 1 if thp is stopped but not parked yet (call again), else 0.
+ */
+int exit_ready_stopped(thread_t *thp)
+{
+    unsigned spins = 0;
+
+    if (thp->state != STATE_STOPPED)
+        return 0;
+
+    /* A thread on its way into block() parks within microseconds: wait for it
+     * briefly before handing the retry to roottask, which costs a 1 ms sleep
+     * and a repeat of the whole pass.
+     */
+    while (thread_active_hart(thp) >= 0 && ++spins < EXIT_CLAIM_SPIN)
+        __asm__ volatile("" ::: "memory");
+
+    cpu_smp_mb();
+    if (thp->state != STATE_STOPPED)
+        return 0;
+    if (thread_active_hart(thp) >= 0)
+        return 1;
+    if (atomic_or_value(&thp->internal_flags, RTMUX_ITF_EXIT_READIED) &
+        RTMUX_ITF_EXIT_READIED)
+        return 0;
+    ready(thp);
+    return 0;
+}
 
 /* kext_exit_destroy_threads — tear down every thread in a dying process.
  *
@@ -26,9 +72,11 @@ extern int _connect_detach(process_t *prp, int coid);
 void kext_exit_destroy_threads(void *arg)
 {
     process_t *prp = arg;
+    thread_t *act = get_active_thread(get_cpunum());
     int tid;
     thread_t *thp;
     int destroyed = 0;
+    int unparked = 0;
 
     /* Defensive guard: refuse to destroy the ROOTTASK_PID (roottask) process.
      * In the U-mode pool model the loader thread (a roottask pool thread) calls
@@ -47,6 +95,26 @@ void kext_exit_destroy_threads(void *arg)
             thread_destroy(thp);
             destroyed++;
         }
+    }
+
+    /* A stopped thread (held by a job-control stop) runs nothing, so the
+     * KILLSELF the first pass set never takes effect: force_ready reports
+     * STATE_STOPPED as runnable without readying it. Ready each one so it
+     * self-reaps. One still on its way into the stop is not parked yet: ask
+     * roottask to call again (EAGAIN) rather than leave it stopped for good. A
+     * SIGKILLed stopped process used to keep its held threads, and so itself,
+     * alive.
+     */
+    for (tid = 0; tid < prp->threads.nentries; ++tid) {
+        if ((thp = vector_lookup2(&prp->threads, (unsigned) tid)) &&
+            thp->state == STATE_STOPPED && tthread_pin(thp) == EOK) {
+            unparked |= exit_ready_stopped(thp);
+            tthread_unpin(thp);
+        }
+    }
+    if (unparked) {
+        kcall_err(act, EAGAIN);
+        return;
     }
 
     /* Second pass: thread_destroy can't handle STATE_REPLY/SEND threads
@@ -71,9 +139,11 @@ void kext_exit_destroy_threads(void *arg)
      */
     for (tid = 0; tid < prp->threads.nentries; ++tid) {
         if ((thp = vector_lookup2(&prp->threads, (unsigned) tid))) {
-            int reply_send =
-                (thp->state == STATE_REPLY || thp->state == STATE_SEND);
+            int reply_send;
             int stamped_dead = 0;
+
+        retry_claimed:
+            reply_send = THR_IN_IPC_WAIT(thp);
 
             if (reply_send) {
                 connect_t *cop;
@@ -111,10 +181,8 @@ void kext_exit_destroy_threads(void *arg)
                         __asm__ volatile("" ::: "memory");
                     cpu_smp_mb();
                     kspinlock_lock(&chp->lock);
-                    if ((thp->state == STATE_REPLY ||
-                         thp->state == STATE_SEND) &&
-                        thp->blocked_on == cop && thp->prev.pril &&
-                        cop->channel == chp &&
+                    if (THR_IN_IPC_WAIT(thp) && thp->blocked_on == cop &&
+                        thp->prev.pril && cop->channel == chp &&
                         !(thp->internal_flags & RTMUX_ITF_MSG_DELIVERY)) {
                         thread_t *srv = thp->args.ms.server;
 
@@ -155,6 +223,43 @@ void kext_exit_destroy_threads(void *arg)
                          * _connect_detach and channel destroy.
                          */
                         (void) atomic_sub_value(&cop->links, 1);
+                    } else if (THR_IN_IPC_WAIT(thp) && thp->blocked_on == cop &&
+                               thp->prev.pril && cop->channel == chp) {
+                        /* Transiently claimed: only MSG_DELIVERY made the
+                         * unlink test above fail. The claimer may be a plain
+                         * reader that unlinks nothing.
+                         *
+                         * Do not fall through to thread_destroy: force_ready's
+                         * unblock notification may already be consumed by the
+                         * claiming server, so nobody would reap the thread and
+                         * the process would never finish exiting.
+                         *
+                         * Drop chp->lock (the claimer's release needs it), wait
+                         * out the claim (it spans one transfer), and look
+                         * again: the claimer woke the thread, or it is still
+                         * ours to unlink. A claim that outlasts a short wait
+                         * may be held by a claimer queued on this hart, which
+                         * cannot run while this kcall spins: return EAGAIN so
+                         * roottask sleeps and calls again. Every pass is safe
+                         * to repeat, and no thread is destroyed under a claim.
+                         */
+                        unsigned spins = 0;
+
+                        /* thp stays valid across the unlocked wait even if the
+                         * claimer wakes it and it self-reaps: the reaper frees
+                         * a thread only after rcu_sched_synchronize, and this
+                         * kcall is no quiescent state until it returns.
+                         */
+                        kspinlock_unlock(&chp->lock);
+                        while ((thp->internal_flags & RTMUX_ITF_MSG_DELIVERY) &&
+                               ++spins < EXIT_CLAIM_SPIN)
+                            __asm__ volatile("" ::: "memory");
+                        cpu_smp_mb();
+                        if (thp->internal_flags & RTMUX_ITF_MSG_DELIVERY) {
+                            kcall_err(act, EAGAIN);
+                            return;
+                        }
+                        goto retry_claimed;
                     } else {
                         kspinlock_unlock(&chp->lock);
                         reply_send = 0;
@@ -194,6 +299,7 @@ void kext_exit_destroy_threads(void *arg)
     }
 
     LOGF_T("proc_exit: pid=%d destroyed %d threads\n", prp->pid, destroyed);
+    SETKSTATUS(act, EOK);
 }
 
 /* Per-process resource teardown bodies.
@@ -377,5 +483,5 @@ void process_destroy(process_t *prp, pid_t killer_pid)
         return;
 
     prp->flags |= RTMUX_FLG_PROC_DESTROYALL;
-    atomic_or(&thp->flags, RTMUX_FLG_THR_KILLSELF);
+    atomic_or(&thp->flags, RTMUX_FLG_THR_DETACHED | RTMUX_FLG_THR_KILLSELF);
 }

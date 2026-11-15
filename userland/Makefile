@@ -142,7 +142,7 @@ toolbox: $(TOOLBOX)
 $(OBJDIR)/%.o: %.c
 	@mkdir -p $(@D)
 	$(msg) CC $@
-	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c -o $@ $<
+	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) $(DEPFLAGS) -c -o $@ $<
 
 $(TOOLBOX): $(TOOLBOX_OBJS) $(CRT0_O) $(LIBC_SO)
 	@mkdir -p $(@D)
@@ -183,7 +183,4 @@ clean: $(addprefix clean-,$(SUBDIRS))
 
 .PHONY: all build toolbox install clean
 
-# Auto-generated header dependencies (-MMD/-MP above). Pulls in the per-object
-# .d files so a touched header — including the generated autoconf.h /
-# rtmux-version.h — rebuilds the toolbox objects instead of leaving them stale.
--include $(TOOLBOX_OBJS:.o=.d)
+$(eval $(call dep-include,$(TOOLBOX_OBJS)))

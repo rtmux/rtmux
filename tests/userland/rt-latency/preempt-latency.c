@@ -47,6 +47,8 @@
 
 #include <arch/plic-vector.h>
 
+#include "../outcome.h"
+
 extern struct syspage_entry *_syspage_ptr;
 
 #define WAIT_CPU 0       /* waiter/client and hog share the boot hart */
@@ -60,6 +62,7 @@ extern struct syspage_entry *_syspage_ptr;
 #define TIMER_ITERS 60
 #define IPC_ITERS 200
 #define IPC_WARMUP 32
+
 /* Generous wake-to-dispatch ceiling. Absolute values under TCG are emulation
  * noise (docs/rt-budgets.md), so this is not a latency budget; it only catches
  * a grossly late wake. The real signal is completed-and-preempted versus
@@ -68,6 +71,7 @@ extern struct syspage_entry *_syspage_ptr;
 #define WAKE_BOUND_NS 50000000
 /* Watchdog declares a stall after this long with no waiter progress. */
 #define STALL_BUDGET_NS 2000000000ULL
+
 /* Cross-hart pass gets a more generous budget: a real regression is a permanent
  * stall that trips any budget, so the extra headroom only absorbs the rare
  * multi-hart TCG scheduling spike without turning the strict gate flaky.
@@ -75,6 +79,7 @@ extern struct syspage_entry *_syspage_ptr;
 #define XHART_STALL_BUDGET_NS 4000000000ULL
 /* Bound on how long the controller waits for a worker to finish setup. */
 #define SETUP_BUDGET_MS 3000
+
 /* Second non-boot hart for the cross-hart timer pass: the boot-hart timer
  * readies the waiter onto this different busy hart, exercising the cross-hart
  * reschedule IPI preemption path. Distinct from OFF_CPU and CTRL_CPU, so it
@@ -331,6 +336,7 @@ static void *ipc_client(void *arg)
         wake = read_time();
         reply = atomic_load_explicit(&ipc_reply_ts, memory_order_acquire);
         lat = wake > reply ? wake - reply : 0;
+
         /* The controller reads ipc_samples only after joining this thread, so
          * the join is the ordering barrier and no atomic is needed here.
          */
@@ -391,6 +397,7 @@ static int run_ipc_source(void)
     }
 
     (void) thread_join(client, NULL);
+
     /* If the client failed before sending its own stop, it left the server
      * blocked in msg_receive; release it so the join below cannot hang.
      */
@@ -402,6 +409,7 @@ static int run_ipc_source(void)
         printf("preempt-latency: ipc FAIL client did not complete\n");
         return -1;
     }
+
     /* Sort so max is the last element and p99 a fixed index; the client has
      * been joined, so ipc_samples is stable.
      */
@@ -459,6 +467,7 @@ static void *waiter_worker(void *arg)
         if (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &deadline, NULL) !=
             0)
             break;
+
         /* Lateness past the programmed deadline is the wake-to-dispatch time.
          */
         clock_gettime(CLOCK_MONOTONIC, &now);
@@ -852,8 +861,7 @@ int main(void)
      */
     if (pin_to_cpu(CTRL_CPU) == -1) {
         printf("preempt-latency: SKIP needs at least 3 harts\n");
-        printf("preempt-latency: PASS (skipped)\n");
-        return EXIT_SUCCESS;
+        return TC_EXIT_SKIP;
     }
 
     /* Every latency here is derived from the rdtime counter rate. Without it
@@ -861,8 +869,7 @@ int main(void)
      */
     if (cycles_per_sec() == 0) {
         printf("preempt-latency: SKIP counter rate unavailable\n");
-        printf("preempt-latency: PASS (skipped)\n");
-        return EXIT_SUCCESS;
+        return TC_EXIT_SKIP;
     }
 
     printf(

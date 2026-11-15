@@ -14,28 +14,22 @@ LKL_PERSONALITY = fsd
 
 all: $(PROG)
 
-# Auto-generated header deps (-MMD -MP below) so edits to domain.h,
-# host.h, etc. rebuild the objects; the explicit rules below otherwise
-# list only the .c, so header changes would silently ship stale binaries.
--include $(OBJS:.o=.d)
-
 include ../../mk/lkl-server.mk
 
+# After lkl-server.mk: it defines LKL_SERVER_OBJS, which OBJS expands.
+$(eval $(call dep-include,$(OBJS)))
+
 $(OBJDIR)/main.o: main.c $(LKL_RTMUX_LIB)
-	@mkdir -p $(@D)
-	$(msg) CC $@
-	$(Q)$(CC) $(CPPFLAGS) $(LKL_CPPFLAGS) $(CFLAGS) -MMD -MP -c -o $@ $<
+	$(lkl-cc)
 
 $(OBJDIR)/host-selftest.o: ../../tests/lkl/test-host-selftest.c $(LKL_RTMUX_LIB)
-	@mkdir -p $(@D)
-	$(msg) CC $@
-	$(Q)$(CC) $(CPPFLAGS) $(LKL_CPPFLAGS) $(CFLAGS) -MMD -MP -c -o $@ $<
+	$(lkl-cc)
 
 # pathbuild.c is pure libc (no LKL headers), also host-fuzzed via tools/host.
 $(OBJDIR)/pathbuild.o: pathbuild.c pathbuild.h
 	@mkdir -p $(@D)
 	$(msg) CC $@
-	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c -o $@ $<
+	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) $(DEPFLAGS) -c -o $@ $<
 
 $(PROG): $(OBJS) $(CRT0_O) $(LIBC_SO) $(LKL_RTMUX_LIB)
 	@mkdir -p $(@D)

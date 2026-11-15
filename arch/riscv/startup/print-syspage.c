@@ -87,6 +87,11 @@ static char *get_string(unsigned off)
 static void asinfo_string_name(struct asinfo_entry *curr)
 {
     struct asinfo_entry *base = _SYSPAGE_ENTRY(PSP_SYSPAGE, asinfo);
+
+    /* An owner chain is shorter than the table; a longer walk is a cycle, and
+     * each hop costs an alloca, so stop rather than overflow the stack.
+     */
+    unsigned hops = (unsigned) (_SYSPAGE_ENTRY_SIZE(PSP_SYSPAGE, asinfo) / sizeof(*base));
     struct list {
         struct list *next;
         struct asinfo_entry *as;
@@ -98,7 +103,7 @@ static void asinfo_string_name(struct asinfo_entry *curr)
         new->next = chain;
         new->as = curr;
         chain = new;
-        if (curr->owner == PSP_NATIVE_ENDIAN16(AS_NULL_OFF))
+        if (curr->owner == PSP_NATIVE_ENDIAN16(AS_NULL_OFF) || hops-- == 0)
             break;
         curr = (struct asinfo_entry *) ((uint8_t *) base +
                                         PSP_NATIVE_ENDIAN16(curr->owner));
@@ -327,6 +332,7 @@ static struct debug_syspage_section sp_section[] = {
     PRT_SYSPAGE_RTN(typed_strings),  PRT_SYSPAGE_RTN(strings),
     PRT_SYSPAGE_RTN(intrinfo),       PRT_SYSPAGE_RTN(smp),
     PRT_SYSPAGE_RTN(pminfo),         PRT_SYSPAGE_RTN(build_info),
+
 /* This second include of print_sysp.h will cause the CPU_PRT_SYSPAGE_RTN
  * definitions for the various routines to be added.
  */

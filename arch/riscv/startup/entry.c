@@ -42,6 +42,7 @@ bool secure_system = 0;
 extern int hardware_init(int argc, char **argv, char **envv);
 extern void kernel_entry(struct syspage_entry *sysp);
 char boot_command_line[CONFIG_MAX_BOOTLINE_SIZE];
+
 /* Pristine copy of the boot command line. setup_cmdline() splits
  * boot_command_line[] in place by replacing inter-token spaces with NULs, so by
  * the time the syspage is built we'd have lost the space-separated form. Save a
@@ -49,7 +50,10 @@ char boot_command_line[CONFIG_MAX_BOOTLINE_SIZE];
  */
 char boot_command_line_orig[CONFIG_MAX_BOOTLINE_SIZE];
 
-static char *argv[64];
+/* Every token takes at least a character and a separator, so a full boot line
+ * holds at most (size + 1) / 2 tokens, plus the terminating NULL slot.
+ */
+static char *argv[(CONFIG_MAX_BOOTLINE_SIZE + 1) / 2 + 1];
 static char **envv = NULL;
 
 
@@ -65,7 +69,8 @@ static void setup_cmdline(void)
     /* Snapshot the pristine command line before destructive split. */
     memcpy(boot_command_line_orig, boot_command_line, (size_t) n + 1);
 
-    while (i < n && argc < (int) NUM_ELTS(argv)) {
+    /* Keep a slot for the terminating NULL. */
+    while (i < n && argc < (int) NUM_ELTS(argv) - 1) {
         /* Skip consecutive spaces */
         while (i < n && s[i] == ' ')
             i++;
@@ -105,6 +110,7 @@ void startup_entry(void)
     {
         extern uint64_t _boot_a0;
         unsigned boot_hart = (unsigned) _boot_a0;
+
         /* Set up the S-mode register convention immediately:
          *   sscratch = 0 (no U-mode context)
          *   tp = &pcpu_array[boot_hart]
@@ -197,10 +203,12 @@ int errno;
 int *__get_errno_ptr(void)
 {
     struct _thread_local_storage *tls;
+
     /* tp (x4) always holds the current thread's TLS pointer when the thread is
      * running; see kernel_exit / idle_tls setup.
      */
     __asm__ volatile("mv %0, tp" : "=r"(tls));
+
     /* Reject obviously-invalid TLS (NULL or not in kernel VA range) and any TLS
      * that has not been initialized with __errptr.
      */

@@ -6,6 +6,7 @@
  */
 
 #include <errno.h>
+#include <limits.h>
 #include <stdbool.h>
 #include <time.h>
 #include <sys/rtmux-core.h>
@@ -61,7 +62,11 @@ int timer_getoverrun(timer_t timerid)
     if (__timer_info(0, timerid, 0, &info) == -1)
         return -1;
 
-    return (int) info.overruns;
+    /* POSIX caps the count at DELAYTIMER_MAX; past INT_MAX the cast would read
+     * as an error.
+     */
+    return info.overruns < DELAYTIMER_MAX ? (int) info.overruns
+                                          : DELAYTIMER_MAX;
 }
 
 int timer_gettime(timer_t timerid, struct itimerspec *value)

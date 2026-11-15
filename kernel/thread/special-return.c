@@ -215,25 +215,31 @@ void specialret_attr specialret(thread_t *thp)
 
             CRASHCHECK(!mutex);
 
-            if ((mutex->owner & RTMUX_SYNC_OWNER_MASK) == want) {
-                mutex->count += thp->args.mu.incr;
-                atomic_clr((volatile unsigned *) &thp->flags,
-                           RTMUX_FLG_THR_ACQUIRE_MUTEX);
-            } else {
+            if ((mutex->owner & RTMUX_SYNC_OWNER_MASK) != want) {
                 sync_mutex_lock(thp, mutex, 0);
 
-                if (thp->state == STATE_RUNNING) {
-                    /* We got the mutex, update the count. Normally incr is
-                     * zero, but it'll be one if this mutex is being used with a
-                     * condvar wait.
-                     */
-                    mutex->count += thp->args.mu.incr;
-                    atomic_clr((volatile unsigned *) &thp->flags,
-                               RTMUX_FLG_THR_ACQUIRE_MUTEX);
-                }
+                /* Blocked: thp may already own the mutex and be running on
+                 * another hart, whose specialret pass restores the depth and
+                 * the status. Touch nothing more.
+                 */
+                if (thp != get_active_thread(get_cpunum()))
+                    break;
             }
-            /* Timeout always overrides success on getting the mutex. */
-            if (status == ETIMEDOUT) {
+
+            /* Restore the depth (incr, normally zero, is the condvar wait's
+             * saved depth) only when we own the mutex: a failed lock (KSTATUS
+             * set) must not leave a depth on a mutex held by someone else.
+             * Clear the flag either way, or a lasting error would retry here
+             * for ever.
+             */
+            if ((mutex->owner & RTMUX_SYNC_OWNER_MASK) == want)
+                mutex->count += thp->args.mu.incr;
+            atomic_clr((volatile unsigned *) &thp->flags,
+                       RTMUX_FLG_THR_ACQUIRE_MUTEX);
+
+            /* Timeout always overrides the lock result. KSTATUS holds -errno.
+             */
+            if (status == -ETIMEDOUT) {
                 SETKSTATUS(thp, status);
             }
 
@@ -248,11 +254,15 @@ void specialret_attr specialret(thread_t *thp)
                        RTMUX_FLG_THR_CANCELSELF);
             break;
 
+        /* Do not detach here. thread_destroy also parks an exiting thread on
+         * KILLSELF (STATE_STACK while roottask frees its stack, or until a
+         * remote hart or FPU context lets go), and detaching it then reaped a
+         * joinable thread before its joiner arrived, failing the join with
+         * ESRCH. A kill that must not leave a zombie sets DETACHED itself.
+         */
         case RTMUX_FLG_THR_KILLSELF:
             atomic_clr((volatile unsigned *) &thp->flags,
                        RTMUX_FLG_THR_KILLSELF);
-            atomic_or((volatile unsigned *) &thp->flags,
-                      RTMUX_FLG_THR_DETACHED);
             thread_destroy(thp);
             break;
 
@@ -269,5 +279,7 @@ void specialret_attr specialret(thread_t *thp)
     }
 
     unspecret_kernel();
-    thp->restart = 0;
+    /* A thread that blocked above may be running on another hart by now. */
+    if (thp == get_active_thread(get_cpunum()))
+        thp->restart = 0;
 }

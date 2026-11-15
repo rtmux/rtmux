@@ -295,6 +295,11 @@ typedef struct process_entry {
     uint8_t process_priority;
     siginfo_t fault_siginfo;
     bool querying;
+
+    /* Set under process_vector_slock by the one kext_process_destroy that owns
+     * the teardown; a concurrent destroy of the same pid sees it and backs off.
+     */
+    bool destroying;
     unsigned pending_interrupts;
 
     /* Per-process vector spinlock (LOCK_CLASS_PROCVEC). Initialized by
@@ -805,7 +810,12 @@ typedef struct timer_entry {
     ktimer_t *pending;
     struct timer_queue *queue;
     thread_t *thread;
-    uint32_t overruns;
+
+    /* Periods timer_rearm skipped for a timer far behind. 64 bits so an add
+     * never needs a retry loop to saturate; timer_info clamps it to the 32 bits
+     * it reports.
+     */
+    uint64_t overruns;
     int8_t unused;
 
     /* Non-zero when this timer holds one notification_souls reservation for its
@@ -820,7 +830,8 @@ typedef struct timer_entry {
 
     /* Per-object spinlock (LOCK_CLASS_TIMER). Initialized by timer_alloc() in
      * time/timer-core.c; covers the per-tip state fields
-     * (flags/itime/event/thread/overruns/clockid). Acquired before
+     * (flags/itime/event/thread/clockid; overruns is updated atomically, as
+     * timer_rearm adds to it under the wheel lock alone). Acquired before
      * timer_wheel_slock when both are needed (see
      * doc/tex/KerFuncRef/ch06-timers-clocks.tex).
      */

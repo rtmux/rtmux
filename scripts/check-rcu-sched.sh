@@ -492,15 +492,13 @@ if ! grep -q 'RTMUX_TCTL_THREAD_DESTROY_STATS' internal/include/sys/rtmux-core.h
     tests/userland/rt-latency/rcu-lookup-measure.c ||
    ! grep -q 'thread_destroy_expect_active_claim(label)' \
     tests/userland/rt-latency/rcu-lookup-measure.c ||
-   ! grep -q 'stats.destroy_claim_active != calls' \
+   ! grep -q 'stats.destroy_join_wake == 0' \
     tests/userland/rt-latency/rcu-lookup-measure.c ||
-   ! grep -q 'stats.destroy_claim_reserved != 0' \
-    tests/userland/rt-latency/rcu-lookup-measure.c ||
-   ! grep -q 'stats.destroy_join_wake != calls' \
+   ! grep -q 'stats.destroy_join_wake > stats.destroy_claim_active' \
     tests/userland/rt-latency/rcu-lookup-measure.c ||
    ! grep -q 'stats.destroy_join_wake_ns == 0' \
     tests/userland/rt-latency/rcu-lookup-measure.c ||
-   ! grep -q 'stats.destroy_join_post_ready != calls' \
+   ! grep -q 'stats.destroy_join_post_ready != stats.destroy_join_wake' \
     tests/userland/rt-latency/rcu-lookup-measure.c ||
    ! grep -q 'stats.destroy_join_post_ready_ns == 0' \
     tests/userland/rt-latency/rcu-lookup-measure.c ||
@@ -920,9 +918,17 @@ if ! awk '
     }
     in_timer && /vector_lookup2\(&prp->timers, id\)/ { saw_timer_vec = NR }
     in_timer && /xfer_probe\(inp, sizeof\(\*inp\)/ { saw_probe = NR }
-    in_timer && /info.overruns = tip->overruns;/ { saw_snapshot = NR }
+    # The claim and its give-back must each sit under the reset test, and the
+    # give-back under the failed copy: unguarded, they clear or re-add the
+    # count on every read.
+    in_timer && /__atomic_exchange_n\(&tip->overruns, 0,/ &&
+        prev ~ /^ *if \(reset\)$/ && !saw_snapshot { saw_snapshot = NR }
     in_timer && /xfer_memcpy\(inp, &info, sizeof\(info\)\)/ { saw_copy = NR }
-    in_timer && /tip->overruns = 0;/ { saw_reset = NR }
+    in_timer && /timer_add_overruns\(tip, overruns\)/ &&
+        prev ~ /^ *if \(reset\)$/ &&
+        pprev ~ /xfer_memcpy\(inp, &info, sizeof\(info\)\) != 0/ {
+        saw_reset = NR
+    }
     in_timer && /rcu_read_unlock\(&process_rcu\);/ && !saw_unlock {
         saw_unlock = NR
     }
@@ -930,6 +936,7 @@ if ! awk '
     in_timer && /lookup_pid\(kap->pid\)/ { saw_plain = NR }
     in_timer && /reset_prp|reset_tip/ { saw_second_lookup = NR }
     in_timer && /^}/ { in_timer = 0 }
+    { pprev = prev; prev = $0 }
     END {
         exit !(saw_prp_rcu && saw_timer_if && saw_timer_search &&
                saw_timer_else && saw_timer_vec && saw_probe &&
@@ -946,7 +953,7 @@ if ! awk '
                !saw_plain && !saw_raw_store && !saw_second_lookup)
     }
 ' kernel/time/timer.c; then
-    echo "RCU-sched: timer_info must snapshot tip under process_rcu and copy out with fault-safe xfer_memcpy before clearing overruns" >&2
+    echo "RCU-sched: timer_info must snapshot tip under process_rcu, claim a reset with an exchange, copy out with fault-safe xfer_memcpy and give the claim back if the copy fails" >&2
     exit 1
 fi
 
@@ -2022,16 +2029,20 @@ fi
 
 if ! awk '
     /void rdecl thread_specret\(thread_t \*thp\)/ { in_specret = 1 }
+    # Both steps must sit inside the WAITTHREAD guard, the clear before the
+    # ready: a parent woken first can join on another hart while the field
+    # still names it, and get EBUSY.
+    in_wait && /^    }$/ { in_wait = 0 }
     in_specret &&
         /if \(thp->join && thp->join->state == STATE_WAITTHREAD\) {/ {
-        saw_wait = NR
+        in_wait = 1
     }
-    in_specret && /ready\(thp->join\);/ { saw_ready = NR }
-    in_specret && /thp->join = NULL;/ { saw_clear = NR }
+    in_wait && /thread_t \*parent = thp->join;/ { saw_parent = NR }
+    in_wait && /thp->join = NULL;/ { saw_clear = NR }
+    in_wait && /ready\(parent\);/ { saw_ready = NR }
     in_specret && /^}/ { in_specret = 0 }
     END {
-        exit !(saw_wait && saw_ready && saw_clear &&
-               saw_wait < saw_ready && saw_ready < saw_clear)
+        exit !(saw_parent && saw_parent < saw_clear && saw_clear < saw_ready)
     }
 ' kernel/thread/lifecycle.c; then
     echo "RCU-sched: thread birth must clear the temporary join handshake" >&2
@@ -2200,7 +2211,7 @@ if ! awk '
     in_destroy && /proc_threads_destroyed\(prp, &ev\);/ && saw_notify_t0 {
         saw_notify_fill = NR
     }
-    in_destroy && /sigevent_notification_roottask\(ev.sigev_code,/ &&
+    in_destroy && /nrc = sigevent_notification_roottask\(/ &&
         saw_notify_fill {
         saw_notify_send = NR
     }
@@ -2620,7 +2631,7 @@ if ! awk '
     in_destroyall && /\(thp = prp->valid_thp\)/ { saw_valid = NR }
     in_destroyall && /tthread_pin\(thp\)/ { saw_thp_pin = NR }
     in_destroyall && /thread_destroyall\(thp\)/ { saw_destroy = NR }
-    in_destroyall && /ready\(thp\);/ { saw_ready = NR }
+    in_destroyall && /exit_ready_stopped\(thp\);/ { saw_ready = NR }
     in_destroyall && /tthread_unpin\(thp\);/ { saw_thp_unpin = NR }
     in_destroyall && /process_unpin\(prp\);/ && saw_thp_unpin {
         saw_prp_unpin = NR

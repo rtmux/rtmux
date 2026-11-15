@@ -22,6 +22,7 @@ int rdecl get_interrupt_level(thread_t *act, unsigned vector)
     unsigned level;
     int cascade;
     unsigned i;
+    unsigned hops = 0;
     struct intrinfo_entry *iip;
 
     if (vector >= RTMUX_INTR_CLASS_SYNTHETIC && vector <= RTMUX_HOOK_LAST) {
@@ -59,8 +60,15 @@ int rdecl get_interrupt_level(thread_t *act, unsigned vector)
         }
 
         /* Guy wanted a cascaded interrupt level. Give him the first one of the
-         * secondary controller instead.
+         * secondary controller instead. A cascade chain cannot visit more
+         * controllers than exist, so more hops than that means the platform
+         * table has a cycle.
          */
+        if (++hops > intrinfo_num) {
+            if (act)
+                kcall_err(act, EINVAL);
+            return -1;
+        }
         vector = interrupt_level[cascade].info->vector_base;
     }
 }
@@ -449,7 +457,7 @@ int rdecl interrupt_mask(unsigned level, interrupt_t *itp)
     int new;
 
     ilp = &interrupt_level[level];
-    CPU_SLOCK_INTR_LOCK(&intr_slock);
+    interrupt_lock(&intr_slock);
     if (itp) {
         ++itp->mask_count;
     }
@@ -470,7 +478,11 @@ int rdecl interrupt_mask(unsigned level, interrupt_t *itp)
 #endif
     }
     new = ilp->mask_count; /* snarf before intrs enabled, avoid races */
-    CPU_SLOCK_INTR_UNLOCK(&intr_slock);
+
+    /* Unnested: the PLIC dispatch masks the level from inside the trap handler.
+     */
+    intrspin_release(&intr_slock);
+    interrupt_enable_unnested();
     return new;
 }
 
@@ -490,7 +502,7 @@ int rdecl interrupt_unmask(unsigned level, interrupt_t *itp)
     ilp = &interrupt_level[level];
     /* don't enable/disable interrupts during kernel initialization */
     if (pcpu_array[0].pc_alive) {
-        CPU_SLOCK_INTR_LOCK(&intr_slock);
+        interrupt_lock(&intr_slock);
     }
 
     if (itp && itp->mask_count != 0) {
@@ -523,7 +535,8 @@ int rdecl interrupt_unmask(unsigned level, interrupt_t *itp)
     new = ilp->mask_count; /* snarf before intrs enabled, avoid races */
     /* don't enable/disable interrupts during kernel initialization */
     if (pcpu_array[0].pc_alive) {
-        CPU_SLOCK_INTR_UNLOCK(&intr_slock);
+        intrspin_release(&intr_slock);
+        interrupt_enable_unnested();
     }
     return new;
 }

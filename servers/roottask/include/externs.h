@@ -190,4 +190,7 @@ void signal_kill(channel_t *chp, int signo, pid_t sender_pid);
  */
 #include "root-log.h"
 
+/* Bytes of roottask's fixed malloc arena handed out so far (sys/heap.c). */
+size_t roottask_heap_in_use(void);
+
 #endif

@@ -25,9 +25,11 @@ all: $(OBJECTS)
 $(OBJDIR)/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(msg) CC $@
-	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
+	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) $(DEPFLAGS) -c -o $@ $<
 
 clean:
 	$(Q)rm -rf $(BUILD_BASE)
 
 .PHONY: all clean
+
+$(eval $(call dep-include,$(OBJECTS)))

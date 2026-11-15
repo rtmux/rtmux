@@ -129,6 +129,34 @@ int em_event(tracebuf_t *t_b_p)
     return ENOTSUP;
 }
 
+/* Mark this hart's cpupage as running an event handler and point its TLS at
+ * intr_tls, saving what eh_cpupage_leave puts back. Interrupts stay off across
+ * the update, and stay off after it under a held kspinlock or the trap
+ * dispatch, where handlers can run too.
+ */
+static void eh_cpupage_enter(struct cpupage_entry *cpu_p,
+                             unsigned long *state,
+                             void **save_tls)
+{
+    interrupt_disable();
+    *state = cpu_p->state;
+    cpu_p->state = *state | 0x2;
+    *save_tls = cpu_p->tls;
+    cpu_p->tls = &intr_tls;
+    interrupt_enable_unnested();
+}
+
+/* Undo eh_cpupage_enter. */
+static void eh_cpupage_leave(struct cpupage_entry *cpu_p,
+                             unsigned long state,
+                             void *save_tls)
+{
+    interrupt_disable();
+    cpu_p->state = state;
+    cpu_p->tls = save_tls;
+    interrupt_enable_unnested();
+}
+
 /* Executes an event handler with two data arguments and pid/tid */
 uint32_t exe_pt_event_h(ehandler_data_t *stor_ptr,
                         uint32_t header,
@@ -146,12 +174,7 @@ uint32_t exe_pt_event_h(ehandler_data_t *stor_ptr,
     void *save_tls;
     struct cpupage_entry *cpu_p = cpupageptr[cpu];
 
-    interrupt_disable();
-    state = cpu_p->state;
-    cpu_p->state = state | 0x2;
-    save_tls = cpu_p->tls;
-    cpu_p->tls = &intr_tls;
-    interrupt_enable();
+    eh_cpupage_enter(cpu_p, &state, &save_tls);
     if (thp->as_prp && thp->as_prp != pp) {
         vm_ops->as(thp->as_prp, &pcpu_array[cpu].pc_as_prp);
     }
@@ -168,10 +191,7 @@ uint32_t exe_pt_event_h(ehandler_data_t *stor_ptr,
     if (pp && pp != pcpu_array[cpu].pc_as_prp) {
         vm_ops->as(pp, &pcpu_array[cpu].pc_as_prp);
     }
-    interrupt_disable();
-    cpu_p->state = state;
-    cpu_p->tls = save_tls;
-    interrupt_enable();
+    eh_cpupage_leave(cpu_p, state, save_tls);
     return r_vlocal;
 }
 
@@ -190,12 +210,7 @@ uint32_t exe_event_h(ehandler_data_t *stor_ptr,
     void *save_tls;
     struct cpupage_entry *cpu_p = cpupageptr[cpu];
 
-    interrupt_disable();
-    state = cpu_p->state;
-    cpu_p->state = state | 0x2;
-    save_tls = cpu_p->tls;
-    cpu_p->tls = &intr_tls;
-    interrupt_enable();
+    eh_cpupage_enter(cpu_p, &state, &save_tls);
     if (thp->as_prp && thp->as_prp != pp) {
         vm_ops->as(thp->as_prp, &pcpu_array[cpu].pc_as_prp);
     }
@@ -210,10 +225,7 @@ uint32_t exe_event_h(ehandler_data_t *stor_ptr,
     if (pp && pp != pcpu_array[cpu].pc_as_prp) {
         vm_ops->as(pp, &pcpu_array[cpu].pc_as_prp);
     }
-    interrupt_disable();
-    cpu_p->state = state;
-    cpu_p->tls = save_tls;
-    interrupt_enable();
+    eh_cpupage_leave(cpu_p, state, save_tls);
     return r_vlocal;
 }
 
@@ -234,12 +246,7 @@ uint32_t exe_pt_event_h_buff(ehandler_data_t *stor_ptr,
     void *save_tls;
     struct cpupage_entry *cpu_p = cpupageptr[cpu];
 
-    interrupt_disable();
-    state = cpu_p->state;
-    cpu_p->state = state | 0x2;
-    save_tls = cpu_p->tls;
-    cpu_p->tls = &intr_tls;
-    interrupt_enable();
+    eh_cpupage_enter(cpu_p, &state, &save_tls);
     if (thp->as_prp && thp->as_prp != pp) {
         vm_ops->as(thp->as_prp, &pcpu_array[cpu].pc_as_prp);
     }
@@ -255,10 +262,7 @@ uint32_t exe_pt_event_h_buff(ehandler_data_t *stor_ptr,
     if (pp && pp != pcpu_array[cpu].pc_as_prp) {
         vm_ops->as(pp, &pcpu_array[cpu].pc_as_prp);
     }
-    interrupt_disable();
-    cpu_p->state = state;
-    cpu_p->tls = save_tls;
-    interrupt_enable();
+    eh_cpupage_leave(cpu_p, state, save_tls);
     return r_vlocal;
 }
 
@@ -279,12 +283,7 @@ uint32_t exe_event_h_buff(int locked,
     struct cpupage_entry *cpu_p = cpupageptr[cpu];
 
     (void) locked; /* unused */
-    interrupt_disable();
-    state = cpu_p->state;
-    cpu_p->state = state | 0x2;
-    save_tls = cpu_p->tls;
-    cpu_p->tls = &intr_tls;
-    interrupt_enable();
+    eh_cpupage_enter(cpu_p, &state, &save_tls);
     if (thp->as_prp && thp->as_prp != pp) {
         vm_ops->as(thp->as_prp, &pcpu_array[cpu].pc_as_prp);
     }
@@ -298,10 +297,7 @@ uint32_t exe_event_h_buff(int locked,
     if (pp && pp != pcpu_array[cpu].pc_as_prp) {
         vm_ops->as(pp, &pcpu_array[cpu].pc_as_prp);
     }
-    interrupt_disable();
-    cpu_p->state = state;
-    cpu_p->tls = save_tls;
-    interrupt_enable();
+    eh_cpupage_leave(cpu_p, state, save_tls);
     return r_vlocal;
 }
 
@@ -320,12 +316,7 @@ static uint32_t exe_event_h_no_lock(ehandler_data_t *stor_ptr,
     void *save_tls;
     struct cpupage_entry *cpu_p = cpupageptr[cpu];
 
-    interrupt_disable();
-    state = cpu_p->state;
-    cpu_p->state = state | 0x2;
-    save_tls = cpu_p->tls;
-    cpu_p->tls = &intr_tls;
-    interrupt_enable();
+    eh_cpupage_enter(cpu_p, &state, &save_tls);
     if (thp->as_prp && thp->as_prp != pp) {
         vm_ops->as(thp->as_prp, &pcpu_array[cpu].pc_as_prp);
     }
@@ -340,10 +331,7 @@ static uint32_t exe_event_h_no_lock(ehandler_data_t *stor_ptr,
     if (pp && pp != pcpu_array[cpu].pc_as_prp) {
         vm_ops->as(pp, &pcpu_array[cpu].pc_as_prp);
     }
-    interrupt_disable();
-    cpu_p->state = state;
-    cpu_p->tls = save_tls;
-    interrupt_enable();
+    eh_cpupage_leave(cpu_p, state, save_tls);
 
     return r_vlocal;
 }
@@ -464,7 +452,7 @@ int trace_flushbuffer(void)
                 SPINUNLOCK(&tracebuf->h.spin);
                 SPINUNLOCK(&trace_masks.state_spin);
             }
-            interrupt_enable();
+            interrupt_enable_unnested();
         }
 
         return EOK;
@@ -1215,7 +1203,6 @@ int add_trace_event(uint32_t header, uint32_t d_0, uint32_t d_1, uint32_t d_2)
     if (!_TRACE_GET_STRUCT(header)) {
         d_0 = get_time_off(0);
     }
-    /* interrupt_disable(); */
 begin:
     interrupt_disable();
 
@@ -1228,14 +1215,14 @@ begin:
     if (trace_masks.main_flags == 0) {
         /* We're not actually tracing, bail out */
         SPINUNLOCK(&trace_masks.state_spin);
-        interrupt_enable();
+        interrupt_enable_unnested();
         return EOK;
     }
     t_b_p = privateptr->tracebuf;
     if (!t_b_p) {
         /* No Trace Buffer allocated */
         SPINUNLOCK(&trace_masks.state_spin);
-        interrupt_enable();
+        interrupt_enable_unnested();
         return ECANCELED;
     }
     SPINLOCK(&t_b_p->h.spin);
@@ -1251,7 +1238,7 @@ begin:
             privateptr->tracebuf = t_b_p->h.next;
             SPINUNLOCK(&t_b_p->h.spin);
             SPINUNLOCK(&trace_masks.state_spin);
-            interrupt_enable();
+            interrupt_enable_unnested();
             retry--;
             goto begin;
         } else {
@@ -1259,7 +1246,7 @@ begin:
                 SPINUNLOCK(&trace_masks.state_spin);
                 SPINUNLOCK(&t_b_p->h.spin);
                 dropped_events++;
-                interrupt_enable();
+                interrupt_enable_unnested();
                 return EOK;
             }
             /* Drop that buffer! */
@@ -1312,7 +1299,7 @@ begin:
         dropped_events++;
     }
     SPINUNLOCK(&t_b_p->h.spin);
-    interrupt_enable();
+    interrupt_enable_unnested();
 
     /* At this point we're done logging the event, but we still need to check to
      * see if we need to emit this buffer, or simply move to the next buffer in
@@ -1343,7 +1330,7 @@ begin:
             /* Someone else moved it? WTF? Assume that they flushed it too! */
             SPINUNLOCK(&trace_masks.state_spin);
         }
-        interrupt_enable();
+        interrupt_enable_unnested();
     }
     return EOK;
 }

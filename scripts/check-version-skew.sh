@@ -5,12 +5,13 @@
 #   scripts/check-version-skew.sh [--timeout SECONDS]
 #   scripts/qemu-regress.sh --mode version-skew
 #
-# Two trees are built (OUT=build/skew-a and build/skew-b) with distinct
-# RTMUX_BUILD_ID values.  The first boot takes the kernel from tree A and the
-# initramfs from tree B (scripts/emu.sh EMU_KERNEL=) and must log exactly one
+# Two trees are built ($OUT/skew-a and $OUT/skew-b, OUT defaulting to build)
+# with distinct RTMUX_BUILD_ID values. The first boot takes the kernel from tree
+# A and the initramfs from tree B (scripts/emu.sh EMU_KERNEL=) and must log
+# exactly one
 #   version skew: kernel=<id-a> roottask=<id-b>
-# line.  The control boot uses tree B's own kernel and must log none.  Both
-# boots must reach the login prompt.
+# line. The control boot uses tree B's own kernel and must log none. Both boots
+# must reach the login prompt.
 
 set -u
 
@@ -28,8 +29,11 @@ done
 
 ID_A=skewaaaaaaaa
 ID_B=skewbbbbbbbb
-DIR_A="$TOP_DIR/build/skew-a"
-DIR_B="$TOP_DIR/build/skew-b"
+
+# Under the caller's build tree (make exports OUT as an absolute path), so a
+# custom OUT build never removes the default tree's skew directories.
+DIR_A="${OUT:-$TOP_DIR/build}/skew-a"
+DIR_B="${OUT:-$TOP_DIR/build}/skew-b"
 MAKE="${MAKE:-make}"
 LOG_DIR="$(mktemp -d "${TMPDIR:-/tmp}/rtmux-version-skew.XXXXXX")" || exit 2
 RUNNER=
@@ -38,6 +42,7 @@ cleanup()
 {
     [ -n "$RUNNER" ] && kill "$RUNNER" 2>/dev/null
     rm -rf "$LOG_DIR"
+
     # The header is shared by every tree; put the normal build id back so the
     # next ordinary make does not see a stale one.
     "$MAKE" internal/include/rtmux-version.h >/dev/null 2>&1

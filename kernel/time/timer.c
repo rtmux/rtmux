@@ -267,7 +267,8 @@ int kdecl ksys_timer_info(thread_t *act, struct kcall_args_timer_info *kap)
     unsigned id;
     struct _timer_info *inp = kap->info;
     struct _timer_info info;
-    int have_info = 0;
+    uint64_t overruns;
+    int reset = (kap->flags & RTMUX_TIMER_RESET_OVERRUNS) != 0;
     int status = EOK;
 
     if (kap->pid == 0 || kap->pid == act->process->pid) {
@@ -320,7 +321,17 @@ int kdecl ksys_timer_info(thread_t *act, struct kcall_args_timer_info *kap)
             0xffff; /* Turn off timer id in top 16 bits */
         info.notify = info.event.sigev_notify;
         info.flags = tip->flags;
-        info.overruns = tip->overruns;
+
+        /* A reset claims the count with an exchange, so concurrent resets each
+         * take a distinct count and periods timer_rearm adds meanwhile stay for
+         * the next reader; a failed copy below gives the claim back.
+         */
+        if (reset)
+            overruns = __atomic_exchange_n(&tip->overruns, 0, __ATOMIC_RELAXED);
+        else
+            overruns = __atomic_load_n(&tip->overruns, __ATOMIC_RELAXED);
+        info.overruns =
+            overruns < UINT32_MAX ? (uint32_t) overruns : UINT32_MAX;
         if (tip->flags & RTMUX_TI_TARGET_PROCESS) {
             info.tid = 0;
         } else {
@@ -329,32 +340,25 @@ int kdecl ksys_timer_info(thread_t *act, struct kcall_args_timer_info *kap)
         info.clockid = tip->clockid;
         info.itime = tip->itime;
         timer_remaining(tip, &info.otime);
-        have_info = 1;
-    }
 
-    /* Copy out before the reset, and inside the RCU section, so the clear is
-     * conditional on the caller actually receiving the count.
-     *
-     * Fault-safe, not `*inp = info`: the probe above cannot promise the page
-     * survives to the store, and this kcall arms no fault handler, so a raw
-     * store was an unrecoverable S-mode fault. xfer_memcpy does not block, so
-     * it is safe inside the read section; it recovers into its own setjmp and
-     * returns, which is why it can sit here rather than after the unlock.
-     *
-     * Ordering matters for RTMUX_TIMER_RESET_OVERRUNS specifically. With the
-     * clear ahead of the copy, a copy that faulted destroyed the count in the
-     * kernel and never delivered it, so a retrying caller read 0 and silently
-     * under-reported missed expirations forever. tip is only valid inside this
-     * section, so restoring it after the unlock is not an option; doing the
-     * copy first is.
-     */
-    if (have_info && xfer_memcpy(inp, &info, sizeof(info)) != 0) {
-        status = EFAULT;
-        goto out_unlock;
-    }
-
-    if (kap->flags & RTMUX_TIMER_RESET_OVERRUNS) {
-        tip->overruns = 0;
+        /* Copy out inside the RCU section: tip is only valid there, so a reset
+         * whose copy faults gives its claim back here, not after the unlock.
+         *
+         * Fault-safe, not `*inp = info`: the probe above cannot promise the
+         * page survives to the store, and this kcall arms no fault handler, so
+         * a raw store was an unrecoverable S-mode fault. xfer_memcpy does not
+         * block, so it is safe inside the read section; it recovers into its
+         * own setjmp and returns, which is why it can sit here rather than
+         * after the unlock.
+         */
+        if (xfer_memcpy(inp, &info, sizeof(info)) != 0) {
+            if (reset)
+                timer_add_overruns(tip, overruns);
+            status = EFAULT;
+        }
+    } else if (reset) {
+        /* No info buffer: the reset just discards the count. */
+        __atomic_store_n(&tip->overruns, 0, __ATOMIC_RELAXED);
     }
 
 out_unlock:

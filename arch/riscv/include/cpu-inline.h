@@ -95,7 +95,7 @@ static inline uint64_t r_sstatus()
 
 static inline void w_sstatus(uint64_t x)
 {
-    __asm__ volatile("csrw sstatus, %0" ::"r"(x));
+    __asm__ volatile("csrw sstatus, %0" ::"r"(x) : "memory");
 }
 
 /* Supervisor Interrupt Pending */
@@ -307,16 +307,19 @@ static inline void chk_kernel_sp(uintptr_t sp, const char *site)
     }
 }
 
-/* enable device interrupts */
+/* enable device interrupts. A single csrsi/csrci, and a compiler barrier
+ * through the "memory" clobber: without it gcc may move a store out of the
+ * interrupts-off section it was written inside.
+ */
 static inline void interrupt_enable()
 {
-    w_sstatus(r_sstatus() | SSTATUS_SIE);
+    __asm__ volatile("csrsi sstatus, %0" ::"i"(SSTATUS_SIE) : "memory");
 }
 
 /* disable device interrupts */
 static inline void interrupt_disable()
 {
-    w_sstatus(r_sstatus() & ~SSTATUS_SIE);
+    __asm__ volatile("csrci sstatus, %0" ::"i"(SSTATUS_SIE) : "memory");
 }
 
 /* are device interrupts enabled? */
@@ -352,34 +355,43 @@ static inline void cpu_icache_sync(void)
     __asm__ volatile("fence.i" ::: "memory");
 }
 
+/* Spin until the lock is ours. The caller has disabled interrupts. */
+static inline void intrspin_acquire(struct intrspin *__spin)
+{
+#if CONFIG_PROCESSORS_MAX > 1
+    __asm__ __volatile__(
+        "       li           t0, 1;"        /* Initialize swap value */
+        "1:     lw           t1, (%0);"     /* Check if lock is held */
+        "       bnez         t1, 1b;"       /* Retry if held */
+        "       amoswap.w.aq t1, t0, (%0);" /* Attempt to acquire lock */
+        "       bnez         t1, 1b"        /* Retry if held */
+        :
+        : "r"(&__spin->value)
+
+        /* "memory": the .aq bit orders the hardware, but without a compiler
+         * barrier gcc may hoist critical-section accesses above the acquire.
+         * The matching release in intrspin_release() already carries it.
+         */
+        : "t0", "t1", "memory");
+#else
+    __spin->value = 1;
+#endif
+}
+
+/* Release the lock without touching the interrupt state. */
+static inline void intrspin_release(struct intrspin *__spin)
+{
+    __asm__ __volatile__("amoswap.w.rl x0, x0, (%0)" ::"r"(&__spin->value)
+                         : "memory");
+}
+
 /**
  * \brief Disable interrupts and wait on a spinlock
  */
 static inline void interrupt_lock(struct intrspin *__spin)
 {
     interrupt_disable();
-#if CONFIG_PROCESSORS_MAX > 1
-    {
-        __asm__ __volatile__(
-            "       li           t0, 1;"        /* Initialize swap value */
-            "1:     lw           t1, (%0);"     /* Check if lock is held */
-            "       bnez         t1, 1b;"       /* Retry if held */
-            "       amoswap.w.aq t1, t0, (%0);" /* Attempt to acquire lock */
-            "       bnez         t1, 1b"        /* Retry if held */
-            :
-            : "r"(&__spin->value)
-
-            /* "memory": the .aq bit orders the hardware, but without a compiler
-             * barrier gcc may hoist critical-section accesses above the
-             * acquire. The matching release in interrupt_unlock() already
-             * carries it.
-             */
-            : "t0", "t1", "memory");
-    }
-#else
-    /* acquire the spin lock */
-    __spin->value = 1;
-#endif
+    intrspin_acquire(__spin);
 }
 
 /**
@@ -387,9 +399,39 @@ static inline void interrupt_lock(struct intrspin *__spin)
  */
 static inline void interrupt_unlock(struct intrspin *__spin)
 {
-    __asm__ __volatile__("amoswap.w.rl x0, x0, (%0)" ::"r"(&__spin->value)
-                         : "memory");
+    intrspin_release(__spin);
     interrupt_enable();
+}
+
+/* Disable interrupts and return whether they were enabled, in one csrrci, for a
+ * section that must leave the interrupt state as it found it.
+ */
+static inline unsigned long interrupt_save(void)
+{
+    unsigned long sstatus;
+
+    __asm__ __volatile__("csrrci %0, sstatus, %1"
+                         : "=r"(sstatus)
+                         : "i"(SSTATUS_SIE)
+                         : "memory");
+    return sstatus & SSTATUS_SIE;
+}
+
+/* Re-enable interrupts only if interrupt_save() found them enabled. */
+static inline void interrupt_restore(unsigned long sie)
+{
+    if (sie)
+        interrupt_enable();
+}
+
+/* Release the spinlock and restore the interrupt state interrupt_save()
+ * returned.
+ */
+static inline void interrupt_unlock_restore(struct intrspin *__spin,
+                                            unsigned long sie)
+{
+    intrspin_release(__spin);
+    interrupt_restore(sie);
 }
 
 /**

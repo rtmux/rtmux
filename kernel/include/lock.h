@@ -237,8 +237,7 @@ static inline void kspinlock_unlock(kspinlock_t *l)
      * ready() would then take the same outer lock and self-deadlock.
      */
     if (--pcpu_array[get_cpunum()].pc_kspin_depth > 0) {
-        __asm__ __volatile__("amoswap.w.rl x0, x0, (%0)" ::"r"(&l->spin.value)
-                             : "memory");
+        intrspin_release(&l->spin);
         return;
     }
 #if defined(CONFIG_INSTRUMENTATION)
@@ -284,8 +283,7 @@ static inline void kspinlock_unlock_irqrestore(kspinlock_t *l,
      * disabled.
      */
     if (--pcpu_array[get_cpunum()].pc_kspin_depth > 0) {
-        __asm__ __volatile__("amoswap.w.rl x0, x0, (%0)" ::"r"(&l->spin.value)
-                             : "memory");
+        intrspin_release(&l->spin);
         return;
     }
 #if defined(CONFIG_INSTRUMENTATION)
@@ -301,16 +299,27 @@ static inline void kspinlock_unlock_irqrestore(kspinlock_t *l,
      * SIE (unlike kspinlock_unlock, which calls interrupt_unlock →
      * interrupt_enable), then restore only the caller's prior SIE state.
      */
-    __asm__ __volatile__("amoswap.w.rl x0, x0, (%0)" ::"r"(&l->spin.value)
-                         : "memory");
-    if (sie)
-        interrupt_enable();
+    interrupt_unlock_restore(&l->spin, sie);
 #else
     (void) l;
     (void) sie;
 #endif
 }
 
+
+/* Re-enable interrupts unless this hart holds a kspinlock. The trap dispatch
+ * holds the nesting depth too, so this never enables mid-handler, where a
+ * nested timer interrupt would overflow the deferred-fire buffer. For code that
+ * ends a short interrupts-off section and must stay usable from both contexts.
+ */
+static inline void interrupt_enable_unnested(void)
+{
+#ifdef KERNEL_INTERNAL
+    if (pcpu_array[get_cpunum()].pc_kspin_depth != 0)
+        return;
+#endif
+    interrupt_enable();
+}
 
 /* Per-CPU object-allocator override.
  *
