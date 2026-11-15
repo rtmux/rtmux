@@ -99,7 +99,6 @@ static int riscv_plic_unmask(struct syspage_entry *sp, int irq)
 {
     extern void plic_complete_deferred(int irq);
     extern uint8_t plic_owner_hart[]; /* PLIC_NUM_SOURCES entries */
-    extern unsigned hart_ids[];
     unsigned ncpu = sp->num_cpu;
 
     /* Per-hart pinning: if a kcall_exit recorded an owner via
@@ -116,7 +115,7 @@ static int riscv_plic_unmask(struct syspage_entry *sp, int irq)
     uint8_t owner = (irq > 0 && irq < 128) ? plic_owner_hart[irq] : 0xff;
     if (owner != 0xff) {
         for (unsigned i = 0; i < ncpu; i++) {
-            unsigned hart = hart_ids[i];
+            unsigned hart = i;
             volatile uint32_t *en =
                 PLIC_REG(PLIC_OFF_SENABLE(hart) + ((unsigned) irq / 32) * 4);
             if (hart == owner)
@@ -129,7 +128,7 @@ static int riscv_plic_unmask(struct syspage_entry *sp, int irq)
          * pinning was recorded.
          */
         for (unsigned i = 0; i < ncpu; i++) {
-            unsigned hart = hart_ids[i];
+            unsigned hart = i;
             volatile uint32_t *en =
                 PLIC_REG(PLIC_OFF_SENABLE(hart) + ((unsigned) irq / 32) * 4);
             *en |= 1U << ((unsigned) irq % 32);

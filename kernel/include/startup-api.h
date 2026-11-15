@@ -75,6 +75,7 @@ struct tm *_gmtime(const time_t *timer, struct tm *tmbuf);
 
 /* Memory management */
 void *ws_alloc(size_t);
+paddr_t boot_in_use_end(void);
 void add_sysram(void);
 void avoid_ram(paddr_t, size_t size);
 void add_ram(paddr_t start, uint64_t size);
@@ -190,6 +191,21 @@ extern const uint8_t _start[], _end[];
 
 extern void *fdt_addr;
 extern size_t fdt_size;
+
+/* FDT /reserved-memory ranges marked no-map (set by board.c). They are kept out
+ * of the allocator like every reservation, and init_mmu() also leaves them out
+ * of the kernel's RAM mappings. More than FDT_NOMAP_MAX is a boot crash, not a
+ * silent mapping.
+ */
+#define FDT_NOMAP_MAX 16
+
+struct fdt_nomap_range {
+    paddr_t start;
+    paddr_t end;
+};
+
+extern struct fdt_nomap_range fdt_nomap[FDT_NOMAP_MAX];
+extern unsigned fdt_nomap_count;
 
 /* Callbacks to be called when we parse FDT */
 extern void (*fdt_handle_node_cb)(const char *);

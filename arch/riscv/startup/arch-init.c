@@ -58,6 +58,7 @@ void init_cpuinfo(void)
 
     struct cpuinfo_entry *cpu = lsp.cpuinfo.p;
     for (unsigned i = 0; i < ncpu; i++) {
+        /* Entry i is logical CPU i; .cpu is its architectural hart ID. */
         cpu[i].cpu = hart_ids[i];
         /* cpuinfo.speed is nominally MHz. RTMux has no CPU clock-rate
          * source (the FDT gives only the timebase), so this reports the

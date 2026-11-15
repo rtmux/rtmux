@@ -1118,11 +1118,10 @@ void kext_process_shutdown(void *data)
          */
 #if CONFIG_PROCESSORS_MAX > 1
         {
-            extern unsigned hart_ids[];
             for (;;) {
                 bool matched = false;
                 for (int _hi = 0; _hi < num_processors; ++_hi) {
-                    unsigned i = hart_ids[_hi];
+                    unsigned i = (unsigned) _hi;
                     process_t *prp0;
 
                     /* On RISC-V 64-bit, pointer loads are atomic. */

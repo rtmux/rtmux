@@ -25,13 +25,23 @@ void rdecl deliver_fault(thread_t *thp, siginfo_t *info)
 {
     process_t *prp = thp->process;
 
-    kprintf(
+    /* Any process can fault on purpose, as often as it can respawn. */
+    KPRINTF_RATELIMITED(
         "user fault: pid=%d tid=%d signo=%d code=%d fltno=%d addr=%p ip=%p\n",
         prp ? prp->pid : -1, thp->tid, info->si_signo, info->si_code,
         info->si_fltno, info->si_addr, info->si_fltip);
 
-    if (prp)
-        prp->fault_siginfo = *info;
+    /* thp->process is cleared only when a dead thread's soul is recycled
+     * (thread_recycle_reset), so a thread with no process is already destroyed:
+     * there is nothing left to kill, and marking it KILLSELF would only move
+     * the NULL dereference into thread_destroy. Every caller today reads
+     * thp->process first, so this is defensive, but the code below locks
+     * prp->vec_slock and walks prp->threads and must never see prp == NULL.
+     */
+    if (!prp)
+        return;
+
+    prp->fault_siginfo = *info;
 
     /* Kill all threads in the process. thread_destroyall marks every thread
      * with DETACHED | KILLSELF. We must also force-unblock non-active threads
@@ -152,7 +162,7 @@ void rdecl usr_fault(int code_signo, thread_t *thp, uintptr_t addr)
     }
 
     /* Check if being debugged */
-    if (prp->debugger) {
+    if (prp && prp->debugger) {
         /* If debugger stops the process, don't deliver the fault */
         if (debug_thread_fault(thp, &info)) {
             return;

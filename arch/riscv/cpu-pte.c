@@ -51,14 +51,13 @@ void cpu_tlb_flush_complete(void)
     if (num_processors <= 1)
         return;
 
-    extern unsigned hart_ids[];
     unsigned self = get_cpunum();
     unsigned ticket[PROCESSORS_MAX];
     bool wait[PROCESSORS_MAX];
 
     atomic_thread_fence(memory_order_seq_cst);
     for (int hi = 0; hi < num_processors; hi++) {
-        unsigned hart = hart_ids[hi];
+        unsigned hart = (unsigned) hi;
 
         /* Skip ourselves and any hart not yet online (pc_alive == false). A
          * not-yet-online hart cannot service an IPI to ack, so waiting on it
@@ -98,7 +97,7 @@ void cpu_tlb_flush_complete(void)
     }
 
     for (int hi = 0; hi < num_processors; hi++) {
-        unsigned hart = hart_ids[hi];
+        unsigned hart = (unsigned) hi;
         unsigned spins = 0;
 
         if (!wait[hi]) /* self, or a hart that was offline — not waited */

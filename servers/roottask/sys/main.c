@@ -192,11 +192,12 @@ int roottask_main(int argc, char **argv)
      */
     kext_register_mm_helpers(&va_rover, pte_map, &restrict_proc, &pgtbl_list);
 
-    /* One-shot fetch of LEGAL_CPU_BITMASK — kernel-built from hart_ids[] at SMP
-     * bring-up; cached here for spawn-time runmask validation in proc_loader.
+    /* Fetch LEGAL_CPU_BITMASK, cached for spawn-time runmask validation in
+     * proc_loader. message_start fetches it again after SMP bring-up, which
+     * drops any CPU whose hart did not start.
      */
     legal_cpu_bitmask =
-        (unsigned) syscall_priv(__KSYS_PRIV_LEGAL_CPU_MASK, NULL);
+        (uint64_t) syscall_priv(__KSYS_PRIV_LEGAL_CPU_MASK, NULL);
 
     /* This is not debug printout: it's the greeting printed for the user */
     dbgprintf("\nRTMux User-Mode Roottask starting\n\n");

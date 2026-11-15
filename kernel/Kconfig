@@ -140,7 +140,8 @@ config UMODE_VERBOSE_FAULT_REPORT
       both the fault IP and the fault address, the full register file,
       and a fault-safe scan of the user stack for candidate return
       addresses.  When disabled (the default) only the one-line
-      "user fault: pid=... ip=..." summary is printed.
+      "user fault: pid=... ip=..." summary is printed.  Both the
+      summary and the dump are rate-limited (KPRINTF_RATELIMITED).
 
       Useful for hunting memory corruption / control-flow faults (e.g.
       the FU740 I-cache investigation).  Costs nothing at runtime when

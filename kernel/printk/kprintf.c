@@ -541,11 +541,28 @@ static void kprintf_emit_locked(const char *buffer, size_t len)
     kprintf_unlock();
 }
 
+/* kprintf_emit — send one formatted line to the console.
+ *
+ * In crash mode (per-CPU) the line goes to this CPU's staging buffer instead:
+ * no global lock, no console, and the rendezvous printer dumps every CPU's
+ * buffer in order, so output cannot interleave. Otherwise it is written under
+ * the kprintf lock with a [cpu] line prefix.
+ */
+static void kprintf_emit(const char *buffer, size_t len)
+{
+    unsigned cpu = get_cpunum();
+
+    if (crash_mode_active[cpu]) {
+        crash_buf_append(cpu, buffer, len);
+        return;
+    }
+    kprintf_lock();
+    kprintf_emit_locked(buffer, len);
+}
+
 /* Formatted kernel output to the console.
  *
- * Formats into a fixed buffer, then either appends to this CPU's per-CPU crash
- * buffer (in crash mode) or writes to the console under the kprintf lock with a
- * [cpu] line prefix. Parameters:
+ * Formats into a fixed buffer and hands it to kprintf_emit. Parameters:
  *   fmt : printf-style format string, followed by its arguments.
  * Return value: number of characters formatted.
  */
@@ -559,19 +576,100 @@ int kprintf(const char *fmt, ...)
     len = kvsnprintf(buffer, sizeof buffer, fmt, ap);
     va_end(ap);
 
-    /* Crash mode (per-CPU): divert to the per-CPU staging buffer. No global
-     * lock, no console; the rendezvous printer dumps every CPU's buffer in
-     * order, so output cannot interleave.
-     */
-    unsigned cpu = get_cpunum();
-    if (crash_mode_active[cpu]) {
-        crash_buf_append(cpu, buffer, len);
-        return (int) len;
+    kprintf_emit(buffer, len);
+    return (int) len;
+}
+
+/* kprintf_rl_admit — decide whether a rate-limited report prints; see
+ * KPRINTF_RATELIMITED in log.h.
+ *
+ * The first KPRINTF_RL_BURST events print. After that an event prints only when
+ * it is a multiple of KPRINTF_RL_INTERVAL past the burst and no line from this
+ * site printed in the last second. A site that fires N times in a boot thus
+ * prints at most KPRINTF_RL_BURST + N / KPRINTF_RL_INTERVAL lines, and once
+ * past the burst no more than one a second however hard it is driven.
+ *
+ * No lock: the count is one relaxed fetch-add, and the once-a-second slot is
+ * claimed with a compare-exchange, so of two harts racing for it one prints and
+ * the other drops. The second is between admissions, not console writes: a
+ * writer delayed for longer than that can land next to the following one, and
+ * its suppressed count then reads 0. Before the timebase is known (early
+ * startup) only the count applies. Parameters:
+ *   rl   : the call site's state, zero-initialized.
+ *   seen : out, this event's number at the site, counted from 1; may be NULL.
+ *   last : out, the number of the previous printed event (0 if none); may be
+ *          NULL.
+ * Return value: true when the caller should print.
+ */
+bool kprintf_rl_admit(struct kprintf_ratelimit *rl,
+                      unsigned long *seen,
+                      unsigned long *last)
+{
+    unsigned long n = __atomic_add_fetch(&rl->events, 1, __ATOMIC_RELAXED);
+    unsigned long now, next, prev;
+
+    if (n > KPRINTF_RL_BURST) {
+        if ((n - KPRINTF_RL_BURST) % KPRINTF_RL_INTERVAL != 0)
+            return false;
+        now = r_time();
+        next = __atomic_load_n(&rl->next_tick, __ATOMIC_RELAXED);
+        if ((long) (now - next) < 0 ||
+            !__atomic_compare_exchange_n(&rl->next_tick, &next,
+                                         now + kopt.timebase_freq, false,
+                                         __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+            return false;
     }
 
-    kprintf_lock();
-    kprintf_emit_locked(buffer, len);
-    return (int) len;
+    /* Advance printed_at monotonically: an admitted event delayed behind a
+     * later one must not move it back.
+     */
+    prev = __atomic_load_n(&rl->printed_at, __ATOMIC_RELAXED);
+    while (prev < n &&
+           !__atomic_compare_exchange_n(&rl->printed_at, &prev, n, false,
+                                        __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+        ;
+    if (seen)
+        *seen = n;
+    if (last)
+        *last = prev;
+    return true;
+}
+
+/* kprintf_rl_print — print an event kprintf_rl_admit admitted.
+ *
+ * The last burst line says further reports are rate-limited; each later line
+ * carries the number dropped since the previous one and the running total.
+ * Parameters:
+ *   seen, last : as kprintf_rl_admit returned them.
+ *   fmt        : printf-style format string, followed by its arguments.
+ */
+void kprintf_rl_print(unsigned long seen,
+                      unsigned long last,
+                      const char *fmt,
+                      ...)
+{
+    /* Room kept for the appended note: 64 characters fit it even with both
+     * counts at 20 digits.
+     */
+    enum { NOTE_ROOM = 64 };
+    char buffer[256]; /* kprintf's size: no deeper trap-stack use */
+    va_list ap;
+    size_t len;
+
+    va_start(ap, fmt);
+    len = kvsnprintf(buffer, sizeof buffer - NOTE_ROOM, fmt, ap);
+    va_end(ap);
+
+    if (seen >= KPRINTF_RL_BURST && len && buffer[len - 1] == '\n')
+        len--;
+    if (seen == KPRINTF_RL_BURST)
+        len += (size_t) ksnprintf(buffer + len, NOTE_ROOM,
+                                  " (further reports rate-limited)\n");
+    else if (seen > KPRINTF_RL_BURST)
+        len += (size_t) ksnprintf(buffer + len, NOTE_ROOM,
+                                  " (%lu suppressed, %lu total)\n",
+                                  seen > last ? seen - last - 1 : 0, seen);
+    kprintf_emit(buffer, len);
 }
 
 #ifdef CONFIG_STALL_DETECTOR

@@ -42,9 +42,10 @@ unsigned hart_ids[CONFIG_PROCESSORS_MAX];
  * without a cpu@ node at all) stay (unsigned)~0u.
  *
  * Sized PLIC_MAX_HARTS so we can index by raw FDT hart ID, not by position in
- * hart_ids[].
+ * hart_ids[]. admit_hart() parks a hart whose ID does not fit, so every
+ * hart_ids[] entry indexes it in bounds (PLIC_S_CTX in plic-regs.h).
  */
-#define PLIC_MAX_HARTS 16
+#define PLIC_MAX_HARTS 64
 unsigned plic_s_ctx[PLIC_MAX_HARTS];
 static int hart_has_cpu_node[PLIC_MAX_HARTS];
 static int hart_has_mmu[PLIC_MAX_HARTS];
@@ -65,6 +66,32 @@ static int pending_mmu_ok;
 static int pending_status_ok;
 static char pending_status[16];
 static unsigned fdt_depth;
+
+/* /reserved-memory parsing. Properties precede subnodes in a flattened tree,
+ * so a node's #address-cells and #size-cells are known before its children
+ * open. A child's reg, no-map and reusable may come in any order, so it is
+ * committed when the child closes. The DT spec defaults are 2 address cells
+ * and 1 size cell.
+ */
+static unsigned root_addr_cells = 2, root_size_cells = 1;
+static unsigned resv_addr_cells, resv_size_cells;
+static bool in_resv;  /* inside /reserved-memory (always at fdt_depth 2) */
+#define RESV_DEPTH 2u
+static const char *pending_resv_name;
+static const uint32_t *pending_resv_reg;
+static unsigned pending_resv_reg_len;
+static bool pending_resv_nomap;
+static bool pending_resv_disabled; /* status is present and not okay */
+static const char *pending_resv_tag; /* log suffix: no-map, reusable, or "" */
+
+struct fdt_nomap_range fdt_nomap[FDT_NOMAP_MAX];
+unsigned fdt_nomap_count;
+
+/* True while the parser is at a direct child of /reserved-memory. */
+static inline bool in_resv_child(void)
+{
+    return in_resv && fdt_depth == RESV_DEPTH + 1;
+}
 
 /* CPU model info captured from FDT cpu@N nodes */
 char cpu_isa_string[64]; /* riscv,isa (e.g., "rv64imafdch_zicsr_...") */
@@ -237,6 +264,24 @@ static void handle_node_early(const char *name)
 {
 #define NODE_MATCH(_n) if (strncmp(name, _n, strlen(_n)) == 0)
     fdt_depth++;
+    if (fdt_depth == RESV_DEPTH && !strcmp(name, "reserved-memory")) {
+        in_resv = true;
+        resv_addr_cells = root_addr_cells;
+        resv_size_cells = root_size_cells;
+    } else if (in_resv_child()) {
+        /* The parent's properties are all known by its first child. */
+        if (resv_addr_cells < 1 || resv_addr_cells > 2 ||
+            resv_size_cells < 1 || resv_size_cells > 2)
+            crash("fdt: reserved-memory #address-cells=%u #size-cells=%u "
+                  "unsupported\n",
+                  resv_addr_cells, resv_size_cells);
+        pending_resv_name = name;
+        pending_resv_reg = NULL;
+        pending_resv_reg_len = 0;
+        pending_resv_nomap = false;
+        pending_resv_disabled = false;
+        pending_resv_tag = "";
+    }
     NODE_MATCH("cpu@")
     {
         /* Extract hart ID from "cpu@X" node name. Don't add to hart_ids[] yet —
@@ -311,6 +356,136 @@ static void handle_node_early(const char *name)
     pending_pci_ecam_size = 0;
 }
 
+/* Read a 1- or 2-cell big-endian number. */
+static uint64_t fdt_read_cells(const uint32_t *cells, unsigned n)
+{
+    uint64_t v = 0;
+
+    while (n--)
+        v = (v << 32) | ENDIAN_RET32(*cells++);
+    return v;
+}
+
+/* Keep [base, base + size) out of the allocator, and record a no-map range so
+ * init_mmu() leaves it out of the kernel's RAM mappings as well. Firmware owns
+ * a no-map range outright (OpenSBI's are PMP-protected), so a mapping is a
+ * standing invitation to touch it, speculation included.
+ */
+static void reserve_fdt_range(const char *what,
+                              uint64_t base,
+                              uint64_t size,
+                              bool nomap,
+                              const char *tag)
+{
+    uint64_t end = base + size;
+
+    if (size == 0)
+        return;
+    if (end < base) /* wraps: reserve to the top of the address space */
+        end = ~(uint64_t) 0 & ~(uint64_t) (__PAGESIZE - 1);
+    /* init_mmu() unmaps a no-map range in whole pages, so keep the rest of a
+     * page it shares out of the allocator too: anything placed there would
+     * sit behind a missing mapping.
+     */
+    if (nomap) {
+        base &= ~(uint64_t) (__PAGESIZE - 1);
+        if (end & (__PAGESIZE - 1))
+            end = (end | (__PAGESIZE - 1)) + 1;
+        if (end == 0)
+            end = ~(uint64_t) 0 & ~(uint64_t) (__PAGESIZE - 1);
+    }
+    /* The kernel image, the startup stack and the boot workspace after it are
+     * already in use, so a reservation over them cannot be honoured.
+     */
+    if (base < boot_in_use_end() && end > (uint64_t) (uintptr_t) _start)
+        crash("fdt: reserved %s [%lx..%lx) overlaps the kernel image, stack or "
+              "boot workspace\n",
+              what, (unsigned long) base, (unsigned long) end);
+    kprintf("fdt: reserved %s [%lx..%lx)%s\n", what, (unsigned long) base,
+            (unsigned long) end, tag);
+    avoid_ram((paddr_t) base, (size_t) (end - base));
+    if (!nomap)
+        return;
+    if (fdt_nomap_count == FDT_NOMAP_MAX)
+        crash("fdt: more than %u no-map reserved ranges\n", FDT_NOMAP_MAX);
+    fdt_nomap[fdt_nomap_count].start = (paddr_t) base;
+    fdt_nomap[fdt_nomap_count].end = (paddr_t) end;
+    fdt_nomap_count++;
+}
+
+/* Commit the /reserved-memory child that just closed: every reg tuple, in the
+ * parent's cell sizes. A child with no reg is a dynamic allocation request
+ * (size / alloc-ranges), which this kernel does not serve.
+ */
+static void reserve_fdt_child(void)
+{
+    unsigned ac = resv_addr_cells, sc = resv_size_cells;
+    unsigned tuple = (ac + sc) * (unsigned) sizeof(uint32_t);
+    const uint32_t *cell = pending_resv_reg;
+
+    if (pending_resv_disabled) {
+        kprintf("fdt: reserved-memory/%s is disabled, nothing reserved\n",
+                pending_resv_name);
+        return;
+    }
+    if (!pending_resv_reg) {
+        kprintf("fdt: reserved-memory/%s has no reg, nothing reserved\n",
+                pending_resv_name);
+        return;
+    }
+    if (pending_resv_reg_len % tuple)
+        kprintf("fdt: reserved-memory/%s reg is %u bytes, not a multiple of "
+                "%u\n",
+                pending_resv_name, pending_resv_reg_len, tuple);
+    for (unsigned i = 0; i < pending_resv_reg_len / tuple; i++) {
+        reserve_fdt_range(pending_resv_name, fdt_read_cells(cell, ac),
+                          fdt_read_cells(cell + ac, sc), pending_resv_nomap,
+                          pending_resv_tag);
+        cell += ac + sc;
+    }
+}
+
+/* Reserve every /memreserve/ entry, up to the all-zero terminator. The block is
+ * bounded by totalsize so a missing terminator cannot walk off the blob.
+ */
+static void reserve_fdt_memreserve(const struct fdt_header *fdt)
+{
+    const uint32_t esz = (uint32_t) sizeof(struct fdt_reserve_entry);
+    uint32_t off = _BE(fdt->off_mem_rsvmap);
+    uint32_t total = _BE(fdt->totalsize);
+
+    for (; off <= total && total - off >= esz; off += esz) {
+        const struct fdt_reserve_entry *e = TOPTR((uintptr_t) fdt + off);
+        uint64_t base = ENDIAN_RET64(e->address);
+        uint64_t size = ENDIAN_RET64(e->size);
+
+        if (!base && !size)
+            break;
+        reserve_fdt_range("/memreserve/", base, size, false, "");
+    }
+}
+
+/* admit_hart — give a secondary FDT hart a logical CPU slot in hart_ids[].
+ *
+ * board_init() seeds slot 0 with the boot hart before the walk, since it is
+ * already running this kernel as CPU 0, so it is counted exactly once whatever
+ * its cpu@ node says. Other harts take the next free slot; once all
+ * CONFIG_PROCESSORS_MAX are used, or if the ID does not fit the PLIC context
+ * table, a hart is parked (never started) and logged.
+ */
+static void admit_hart(unsigned hart)
+{
+    if (hart >= PLIC_MAX_HARTS)
+        kprintf("fdt: hart %u parked: past the PLIC context table (%u)\n",
+                hart, PLIC_MAX_HARTS);
+    else if (num_cpus_detected < CONFIG_PROCESSORS_MAX)
+        hart_ids[num_cpus_detected++] = hart;
+    else
+        kprintf("fdt: hart %u parked: no logical CPU slot "
+                "(PROCESSORS_MAX=%u)\n",
+                hart, CONFIG_PROCESSORS_MAX);
+}
+
 /**
  * \brief Close a node: admit the pending cpu@N hart if every gate holds.
  *
@@ -330,12 +505,14 @@ static void handle_end_node_early(void)
                 kprintf("fdt: hart %u withheld (status=%s)\n",
                         pending_hart_id, pending_status);
         }
-        if (pending_mmu_seen && pending_mmu_ok &&
-            (pending_status_ok || boot) &&
-            num_cpus_detected < CONFIG_PROCESSORS_MAX)
-            hart_ids[num_cpus_detected++] = pending_hart_id;
+        if (pending_mmu_seen && pending_mmu_ok && pending_status_ok && !boot)
+            admit_hart(pending_hart_id);
         pending_hart_valid = 0;
     }
+    if (in_resv_child())
+        reserve_fdt_child();
+    else if (in_resv && fdt_depth == RESV_DEPTH)
+        in_resv = false;
     if (fdt_depth)
         fdt_depth--;
 }
@@ -352,6 +529,39 @@ static void handle_property_early(const char *node,
                                   const unsigned datalen)
 {
 #define NODE_PROP_MATCH(_n, _p) if (!strcmp(node, _n) && !strcmp(prop, _p))
+
+    /* Cell sizes of the root and of /reserved-memory, and the properties of a
+     * /reserved-memory child. A child is consumed here so a name such as
+     * "memory@..." never reaches the matches below.
+     */
+    if (data && datalen == sizeof(uint32_t) &&
+        (fdt_depth == 1 || (in_resv && fdt_depth == RESV_DEPTH))) {
+        unsigned *ac = fdt_depth == 1 ? &root_addr_cells : &resv_addr_cells;
+        unsigned *sc = fdt_depth == 1 ? &root_size_cells : &resv_size_cells;
+
+        if (!strcmp(prop, "#address-cells"))
+            *ac = WORD_AT(data);
+        else if (!strcmp(prop, "#size-cells"))
+            *sc = WORD_AT(data);
+    }
+    if (in_resv_child()) {
+        if (!strcmp(prop, "reg") && data) {
+            pending_resv_reg = data;
+            pending_resv_reg_len = datalen;
+        } else if (!strcmp(prop, "no-map")) {
+            pending_resv_nomap = true;
+            pending_resv_tag = " no-map";
+        } else if (!strcmp(prop, "reusable") && !pending_resv_nomap) {
+            pending_resv_tag = " reusable";
+        } else if (!strcmp(prop, "status") && data) {
+            /* The DT spec: a node whose status is not "okay" (or the legacy
+             * "ok") does not describe a live region.
+             */
+            pending_resv_disabled =
+                strcmp(data, "okay") != 0 && strcmp(data, "ok") != 0;
+        }
+        return;
+    }
 
     /* Root node properties — board identity */
     if (node[0] == '\0' && data && datalen > 0) {
@@ -539,7 +749,7 @@ static void handle_property_early(const char *node,
     else
 
         /* Physical RAM start — from "memory@..." node */
-        if (!strncmp(node, "memory@", 7) && !ram_phys_start)
+        if (fdt_depth == 2 && !strncmp(node, "memory@", 7) && !ram_phys_start)
     {
         if (!strcmp(prop, "reg") && datalen >= 16) {
             uint64_t *ptr = data;
@@ -723,20 +933,6 @@ static void handle_property_early(const char *node,
                 pci_fdt.irq_base = pending_pci_interrupts[(unsigned) inta_idx];
         }
     }
-    else
-
-        if (!strncmp(node, "mmode_resv0@", 12) && !strcmp(prop, "reg"))
-    {
-        /* Proceed through all base/len pairs */
-        for (unsigned i = 0; i < datalen / (2 * sizeof(uint64_t)); i++) {
-            uint64_t *ptr = data;
-            uint64_t regbase = ENDIAN_RET64(ptr[0]);
-            uint64_t regsize = ENDIAN_RET64(ptr[1]);
-
-            avoid_ram(regbase, regsize);
-            LOGF_D("Reserved memory at %#p, size %#p\n", regbase, regsize);
-        }
-    }
 }
 
 
@@ -861,8 +1057,15 @@ void board_init(void)
     fdt_handle_end_node_cb = handle_end_node_early;
     fdt_handle_property_cb = handle_property_early;
     fdt_depth = 0;
+    /* The boot hart is logical CPU 0 whatever its cpu@ node says. */
+    if ((unsigned) _boot_a0 >= PLIC_MAX_HARTS)
+        crash("boot hart %u is past the PLIC context table (%u)\n",
+              (unsigned) _boot_a0, PLIC_MAX_HARTS);
+    hart_ids[0] = (unsigned) _boot_a0;
+    num_cpus_detected = 1;
     parse_fdt(&fdt_size);
     fdt_handle_end_node_cb = NULL;
+    reserve_fdt_memreserve(fdt);
 
     /* Compute per-hart PLIC S-mode context indices from the physical hart
      * layout we just discovered. Assumes the standard Linux/SBI convention:
@@ -893,8 +1096,8 @@ void board_init(void)
     }
 
     /* Avoid everything below _start — this is where OpenSBI firmware lives. The
-     * FDT only declares a small scratch region (mmode_resv0), not the firmware
-     * code itself, so we must protect it explicitly. ram_phys_start was just
+     * FDT may declare only part of it in /reserved-memory (OpenSBI's
+     * mmode_resv nodes), so we must protect it explicitly. ram_phys_start was just
      * set by parse_fdt from the "memory@" node.
      */
     volatile paddr_t start_pa = (paddr_t) _start;

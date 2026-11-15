@@ -186,13 +186,17 @@ static int dispatch_unlink_ready(kdispatch_t *dpp, thread_t *thp)
  */
 static void kick_idle_hart(thread_t *thp)
 {
-    extern unsigned hart_ids[];
     unsigned mycpu = get_cpunum();
+    uint64_t legal = __atomic_load_n(&LEGAL_CPU_BITMASK, __ATOMIC_RELAXED);
 
-    for (unsigned hi = 0; hi < num_processors; hi++) {
-        unsigned h = hart_ids[hi];
+    for (unsigned h = 0; h < num_processors; h++) {
         thread_t *act = get_active_thread(h);
 
+        /* A dropped CPU keeps the idle thread init_objects() gave it, so it
+         * would look asleep and absorb the kick; skip it as select_cpu does.
+         */
+        if (!(legal & (1ULL << h)))
+            continue;
         if (h != mycpu && (thp->runmask & (1u << h)) == 0 && act &&
             act == pcpu_array[h].pc_idle_thp) {
             SENDIPI(h, IPI_RESCHED);
@@ -208,11 +212,11 @@ static int rdecl select_cpu(thread_t *thp)
     int cpu = -1;
     unsigned minprio;
     unsigned alternates[PROCESSORS_MAX];
+    uint64_t legal = __atomic_load_n(&LEGAL_CPU_BITMASK, __ATOMIC_RELAXED);
 
     {
-        extern unsigned hart_ids[];
         for (int _hi = (int) num_processors - 1, _init = 1; _hi >= 0; --_hi) {
-            i = hart_ids[_hi];
+            i = (unsigned) _hi;
             if (_init) {
                 j = 0;
                 cpu = -1;
@@ -221,6 +225,8 @@ static int rdecl select_cpu(thread_t *thp)
             }
             if (!smp_dispatch_enabled && i != get_cpunum())
                 continue;
+            if (!(legal & (1ULL << i)))
+                continue; /* offline: its hart never started */
             if ((thp->runmask & (1u << i)) == 0) {
                 act = get_active_thread(i);
                 if (!act)
@@ -298,11 +304,10 @@ static thread_t *rdecl select_thread_default(int cpu, int prio)
      * cycle if there is one).
      */
     {
-        extern unsigned hart_ids[];
         SCHED_UNLOCK(pcpu_array[cpu].pc_dispatch);
 
         for (int idx = 0; idx < (int) num_processors; idx++) {
-            unsigned hart = hart_ids[idx];
+            unsigned hart = (unsigned) idx;
             if (hart == (unsigned) cpu)
                 continue;
             kdispatch_t *odpp = pcpu_array[hart].pc_dispatch;
@@ -1094,9 +1099,8 @@ static void force_ready_msgxfer(thread_t *thp, unsigned err)
      * the msgxfer, and send ipi to preempt that one
      */
     {
-        extern unsigned hart_ids[];
         for (int _hi = 0; _hi < num_processors; _hi++) {
-            unsigned h = hart_ids[_hi];
+            unsigned h = (unsigned) _hi;
 
             /* Load the hart's active thread once: it clears to NULL whenever
              * that hart blocks into idle, so a second get_active_thread(h)
@@ -2164,7 +2168,8 @@ static void rdecl ready_default(thread_t *thp)
          * hart.
          */
         if ((thp->runmask & (1u << get_cpunum())) != 0) {
-            unsigned legal_mask = (~thp->runmask) & LEGAL_CPU_BITMASK;
+            unsigned legal_mask =
+                (unsigned) (~thp->runmask & LEGAL_CPU_BITMASK);
             if (legal_mask != 0) {
                 int target_cpu = 0;
                 while (((1U << target_cpu) & legal_mask) == 0)
@@ -3323,8 +3328,6 @@ static void rdecl debug_moduleinfo_default(process_t *prp,
 
 kdispatch_t *init_scheduler_default(void)
 {
-    extern unsigned hart_ids[];
-
     /* Init function pointers */
     ready = ready_default;
     block_and_ready = block_and_ready_default;
@@ -3344,7 +3347,7 @@ kdispatch_t *init_scheduler_default(void)
      * (= ascending hart_id) order to avoid deadlock.
      */
     for (int idx = 0; idx < (int) num_processors; idx++) {
-        unsigned hart = hart_ids[idx];
+        unsigned hart = (unsigned) idx;
         pcpu_array[hart].pc_dispatch = _scalloc(sizeof(kdispatch_t));
         kspinlock_init(&pcpu_array[hart].pc_dispatch->lock, LOCK_CLASS_SCHED,
                        "sched_dpp");

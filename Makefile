@@ -44,7 +44,7 @@ LKL_EXT4_IMG = $(IMAGE_DIR)/lkl-ext4.img
 .PHONY: check-boot-manifest check-loader-negative verify
 .PHONY: check-evidence-claims check-fault-recovery check-platform-boundary-contracts
 .PHONY: check-fu740-smoke-scripts check-make-target-names check-ci-coverage check-lkl-scripts
-.PHONY: check-header-deps check-gap-anchors check-rt-extra check-irq-modes check-hart-watchdog
+.PHONY: check-header-deps check-gap-anchors check-rt-extra check-irq-modes check-hart-watchdog check-smp-bringup
 .PHONY: check-guest-misc check-trace-modes check-leak-gate check-version-skew check-spawn-storm
 .PHONY: footprint-report check-lkl check-lkl-containment check-lkl-iommu-preflight check-lkl-iommu-live check-lkl-qemu check-lkl-differential check-lkl-trace check-trace-export check-trace-overhead
 .PHONY: check-qemu-deps check-lkl-differential-deps check-map-phys-inventory check-rcu-sched driver-gate indent check-indent check-style-deps
@@ -739,9 +739,13 @@ check-rt: check-rcu-sched check-rt-budgets check-qemu-deps $(AUTOCONF_H) $(VER_F
 RT_EXTRA_MODES = ipc-priority-donation ipc-roundtrip logger-restart monotonic-time \
                  mutex-uncontended mutex-wake rr-fairness sporadic-budget tickless-idle \
                  preempt-latency ipc-contention rcu-lookup-measure revoke-stress
-IRQ_MODES = irq-notify irq-notify-suppress fdt-cpu-status
+IRQ_MODES = irq-notify irq-notify-suppress fdt-cpu-status fdt-reserved-memory
 HART_WATCHDOG_MODES = debug-inject hart-watchdog hart-watchdog-console \
                       hart-watchdog-idle roottask-wait-watch
+# Secondary-hart bring-up: a failed or late start, sparse hart IDs, and more
+# harts than PROCESSORS_MAX.
+SMP_BRINGUP_MODES = smp-hart-start-fail smp-hart-start-late smp-sparse-harts \
+                    smp-too-many-harts
 GUEST_MISC_MODES = posix-cap-boundary sh-posix serial-unblock trace-negative syslog-wrap \
                    shutdown-sync-wedge
 # Each rebuilds the kernel with instrumentation, so they are slower than the others.
@@ -767,6 +771,10 @@ check-irq-modes: check-qemu-deps $(AUTOCONF_H) $(VER_FILE) startup initramfs
 check-hart-watchdog: check-qemu-deps $(AUTOCONF_H) $(VER_FILE) startup initramfs
 	$(msg) CHECK "stall detector and hart watchdog modes"
 	$(call run-qemu-modes,$(HART_WATCHDOG_MODES),$(QEMU_BOOT_TIMEOUT))
+
+check-smp-bringup: check-qemu-deps $(AUTOCONF_H) $(VER_FILE) startup initramfs
+	$(msg) CHECK "secondary-hart bring-up modes"
+	$(call run-qemu-modes,$(SMP_BRINGUP_MODES),$(QEMU_BOOT_TIMEOUT))
 
 check-guest-misc: check-qemu-deps $(AUTOCONF_H) $(VER_FILE) startup initramfs
 	$(msg) CHECK "capability, shell, serial and trace guest modes"

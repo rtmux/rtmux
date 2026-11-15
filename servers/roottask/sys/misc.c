@@ -160,8 +160,8 @@ void object_free(soul_t *soulp, void *ptr)
  */
 int proc_service_scoid;
 unsigned user_boundary_addr;
-unsigned legal_cpu_bitmask; /* populated once by roottask_main
-                             * via __KSYS_PRIV_LEGAL_CPU_MASK
+uint64_t legal_cpu_bitmask; /* fetched by roottask_main, and again after SMP
+                             * bring-up, via __KSYS_PRIV_LEGAL_CPU_MASK
                              */
 
 

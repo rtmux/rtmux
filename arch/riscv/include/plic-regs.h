@@ -28,9 +28,12 @@
  * layout.
  */
 extern unsigned plic_s_ctx[];
+extern unsigned hart_ids[];
 
-#define PLIC_OFF_SENABLE(hart) (0x002000 + plic_s_ctx[hart] * 0x80)
-#define PLIC_OFF_SPRIORITY(hart) (0x200000 + plic_s_ctx[hart] * 0x1000)
-#define PLIC_OFF_SCLAIM(hart) (0x200004 + plic_s_ctx[hart] * 0x1000)
+/* The context table is indexed by hart ID; callers pass a logical CPU. */
+#define PLIC_S_CTX(cpu) plic_s_ctx[hart_ids[cpu]]
+#define PLIC_OFF_SENABLE(cpu) (0x002000 + PLIC_S_CTX(cpu) * 0x80)
+#define PLIC_OFF_SPRIORITY(cpu) (0x200000 + PLIC_S_CTX(cpu) * 0x1000)
+#define PLIC_OFF_SCLAIM(cpu) (0x200004 + PLIC_S_CTX(cpu) * 0x1000)
 
 #endif /* _RISCV_PLIC_REGS_H */

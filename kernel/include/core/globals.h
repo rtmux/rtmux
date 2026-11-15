@@ -233,7 +233,7 @@ extern paddr_t uart_base;
 extern paddr_t plic_base;
 extern size_t plic_size;
 extern paddr_t clint_base;
-EXT unsigned legal_cpu_bitmask;
+EXT uint64_t legal_cpu_bitmask;
 EXT uintptr_t run_ker_stack_bot;
 EXT uintptr_t run_ker_stack_top;
 EXT struct cpupage_entry *_cpupage_ptr;
@@ -285,8 +285,8 @@ EXT int inspecret;
 EXT struct cpupage_entry *cpupageptr[PROCESSORS_MAX];
 EXT struct _thread_local_storage *idle_tls[PROCESSORS_MAX];
 
-/* idle_thp[] now lives at pcpu_array[hart].pc_idle_thp Per-CPU dispatch (ready)
- * queues, now at pcpu_array[hart].pc_dispatch. Indexed by hart ID. Slot is
+/* idle_thp[] now lives at pcpu_array[cpu].pc_idle_thp Per-CPU dispatch (ready)
+ * queues, now at pcpu_array[cpu].pc_dispatch. Indexed by logical CPU. Slot is
  * non-NULL for every active hart; undefined slots stay NULL. Allocated by
  * init_scheduler_default(). Thread placement: a thread is enqueued on the
  * dispatch instance for the hart it should run on next; thp->dpp points at the

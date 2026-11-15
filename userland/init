@@ -513,6 +513,18 @@ if test "$rtmux_run" = "logger-restart"; then
     exec /bin/sh -i
 fi
 
+if test "$rtmux_run" = "fdt-reserved-memory"; then
+    echo "RTMux fdt-reserved-memory: BEGIN"
+    if /bin/syscall_testing --resv-fill; then
+        echo "RTMux fdt-reserved-memory: PASS"
+    else
+        echo "RTMux fdt-reserved-memory: FAIL"
+    fi
+    shutdown -h
+    sleep 1
+    exec /bin/sh -i
+fi
+
 if test "$rtmux_run" = "fault-recovery"; then
     echo "RTMux fault-recovery: BEGIN"
     if /bin/syscall_testing --fault-recovery; then

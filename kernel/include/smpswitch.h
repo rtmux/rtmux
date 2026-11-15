@@ -58,11 +58,14 @@ extern unsigned num_processors;
 #define MEM_BARRIER_RW()
 #endif
 
-/* LEGAL_CPU_BITMASK — bitmask of all active hart IDs. Built at boot from
- * hart_ids[]. Cannot be a simple 0..N-1 formula because hart IDs may be
- * non-contiguous.
+/* LEGAL_CPU_BITMASK — bitmask of the logical CPUs that are online. Set to
+ * 0..num_processors-1 at boot; kext_smp_bringup() clears the bit of a CPU whose
+ * hart does not start. 64 bits wide, so PROCESSORS_MAX may not exceed 64 (the
+ * runmask ABI caps it at 32 today, see kernel/sched/thread.c).
  */
-extern unsigned legal_cpu_bitmask;
+extern uint64_t legal_cpu_bitmask;
+_Static_assert(CONFIG_PROCESSORS_MAX <= 64,
+               "LEGAL_CPU_BITMASK holds at most 64 logical CPUs");
 #define LEGAL_CPU_BITMASK legal_cpu_bitmask
 
 /* IPI commands for the SMP kernel. */

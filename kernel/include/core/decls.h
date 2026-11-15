@@ -318,7 +318,26 @@ void cpu_intr_attach(interrupt_t *itp, thread_t *thp);
 void cpu_greg_load(thread_t *thp, CPU_REGISTERS *regs);
 void cpu_reboot(void);
 void cpu_shutdown(void);
-void cpu_start_others(uintptr_t start);
+unsigned cpu_start_others(uintptr_t start);
+
+/* Secondary-CPU start slots (arch/riscv/cpu-misc.c), indexed by logical CPU.
+ * The boot CPU opens a slot and notes the time before starting the hart.
+ * _smpstart swaps in ARRIVED and runs on only if the slot was still OPEN;
+ * cpu_idle() then commits with ARRIVED -> JOINED before it publishes pc_alive.
+ * kext_smp_bringup() gives up on a CPU by moving its slot from OPEN or ARRIVED
+ * to ABANDONED, so whichever side's compare-exchange wins decides, and a hart
+ * that loses parks in wfi without joining anything.
+ */
+#define SMP_SLOT_CLOSED 0U
+#define SMP_SLOT_OPEN 1U
+#define SMP_SLOT_ARRIVED 2U
+#define SMP_SLOT_ABANDONED 3U
+#define SMP_SLOT_JOINED 4U
+extern uint32_t smp_slot[];
+extern uint64_t smp_start_tick[];
+#ifdef CONFIG_DEBUG_INJECT
+bool smp_inject(unsigned cpu, const char *opt);
+#endif
 void plic_init(void);
 void plic_inithart(void);
 void cpu_force_fpu_save(thread_t *thp);

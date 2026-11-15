@@ -10,6 +10,7 @@
  *         SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <stdbool.h>
 #include <startup.h>
 #include <startup-api.h>
 #include <paging.h>
@@ -171,6 +172,155 @@ static void map_page(paddr_t root,
     /* Install the leaf PTE */
     unsigned idx = PX(stop_level, va);
     pgtable[idx] = PA2PTE(pa) | pte_flags;
+}
+
+/* range_step — advance past [va, next) within a range of len bytes left.
+ * Works on the distance rather than on end addresses, so a range that runs to
+ * the very top of the address space (end == 0) is still walked, and a skip
+ * past the last slot cannot wrap to VA 0.
+ */
+static inline size_t range_step(uintptr_t va, uintptr_t next, size_t len)
+{
+    size_t step = (size_t) (next - va); /* modular: correct across the top */
+
+    return step < len ? len - step : 0;
+}
+
+/* unmap_range — drop [va, va + len) from the boot page table, before the MMU
+ * is on.
+ *
+ * A megapage wholly inside the range is cleared at level 1; one the range only
+ * partly covers is split first, so its other pages stay mapped. Unmapped
+ * stretches are skipped. va and len must be page-aligned.
+ */
+static void unmap_range(uintptr_t va, size_t len)
+{
+    while (len) {
+        pte_t *l1 = MAKE_1TO1_PTR(page_directory);
+        pte_t entry = l1[PX(2, va)];
+        uintptr_t next;
+        unsigned idx;
+
+        if (!(entry & PTE_V)) {
+            next = (va | ((1UL << PXSHIFT(2)) - 1)) + 1;
+            len = range_step(va, next, len);
+            va = next;
+            continue;
+        }
+        if (pte_is_leaf(entry))
+            crash("unmap_range: gigapage at %lx\n", (unsigned long) va);
+        l1 = MAKE_1TO1_PTR(PTE2PA(entry));
+        idx = PX(1, va);
+        entry = l1[idx];
+        if (!(entry & PTE_V)) {
+            next = (va | (MEGAPAGE_SIZE - 1)) + 1;
+            len = range_step(va, next, len);
+            va = next;
+            continue;
+        }
+        if (pte_is_leaf(entry)) {
+            if ((va & (MEGAPAGE_SIZE - 1)) == 0 && len >= MEGAPAGE_SIZE) {
+                l1[idx] = 0;
+                len -= MEGAPAGE_SIZE;
+                va += MEGAPAGE_SIZE;
+                continue;
+            }
+            split_megapage(l1, idx, entry);
+            entry = l1[idx];
+        }
+        ((pte_t *) MAKE_1TO1_PTR(PTE2PA(entry)))[PX(0, va)] = 0;
+        len = range_step(va, va + PGSIZE, len);
+        va += PGSIZE;
+    }
+}
+
+/* range_mapped — true if any page of [va, va + len) is mapped in the boot
+ * table. An invalid entry at a level skips everything it would have covered.
+ */
+static bool range_mapped(uintptr_t va, size_t len)
+{
+    while (len) {
+        pte_t *pt = MAKE_1TO1_PTR(page_directory);
+        uintptr_t next = va + PGSIZE;
+
+        for (int level = 2; level >= 0; level--) {
+            pte_t entry = pt[PX(level, va)];
+
+            if (!(entry & PTE_V)) {
+                next = (va | ((1UL << PXSHIFT(level)) - 1)) + 1;
+                break;
+            }
+            if (pte_is_leaf(entry))
+                return true;
+            pt = MAKE_1TO1_PTR(PTE2PA(entry));
+        }
+        len = range_step(va, next, len);
+        va = next;
+    }
+    return false;
+}
+
+/* crash_if_overlap — a no-map range over memory the boot needs is a firmware
+ * bug the kernel cannot run through.
+ */
+static void crash_if_overlap(paddr_t start,
+                             paddr_t end,
+                             paddr_t lo,
+                             paddr_t hi,
+                             const char *what)
+{
+    if (start < hi && end > lo)
+        crash("fdt: no-map range %lx..%lx overlaps %s\n",
+              (unsigned long) start, (unsigned long) end, what);
+}
+
+/* Leave every FDT no-map reservation out of the identity and high-VA maps,
+ * then check that no page of it is still mapped. Each range is rounded outward
+ * to whole pages (losing the rest of a shared page is the safe direction) and
+ * clipped to the physical span the high-VA window can address. Runs after every
+ * other boot mapping is made, so a device or FDT mapping it overlaps is caught
+ * by the checks below rather than silently restored.
+ */
+static void unmap_fdt_nomap(void)
+{
+    const paddr_t pa_limit = (paddr_t) 0 - (paddr_t) KERNEL_VIRT_BASE;
+
+    for (unsigned i = 0; i < fdt_nomap_count; i++) {
+        paddr_t start = TRUNCPG(fdt_nomap[i].start);
+        paddr_t end = fdt_nomap[i].end;
+
+        if (start >= pa_limit)
+            continue; /* beyond anything the boot tables can map */
+        if (end > pa_limit)
+            end = pa_limit;
+        end = ROUNDPG(end); /* pa_limit is page-aligned, so this cannot wrap */
+
+        /* board.c already refused one over the kernel image and workspace. */
+        crash_if_overlap(start, end, (paddr_t) fdt_addr,
+                         (paddr_t) fdt_addr + fdt_size, "the FDT");
+        crash_if_overlap(start, end, initramfs_phys_start, initramfs_phys_end,
+                         "the initramfs");
+        if (uart_base)
+            crash_if_overlap(start, end, uart_base, uart_base + PGSIZE,
+                             "the UART");
+        if (clint_base)
+            crash_if_overlap(start, end, clint_base, clint_base + 0x10000,
+                             "the CLINT");
+        if (plic_base)
+            crash_if_overlap(start, end, plic_base, plic_base + plic_size,
+                             "the PLIC");
+        /* The identity map, then its high-VA mirror. */
+        for (unsigned v = 0; v < 2; v++) {
+            uintptr_t off = v ? KERNEL_VIRT_BASE : 0;
+
+            unmap_range((uintptr_t) start + off, (size_t) (end - start));
+            if (range_mapped((uintptr_t) start + off, (size_t) (end - start)))
+                crash("fdt: no-map range %lx..%lx still mapped\n",
+                      (unsigned long) start, (unsigned long) end);
+        }
+        kprintf("  unmapped no-map [%lx..%lx)\n", (unsigned long) start,
+                (unsigned long) end);
+    }
 }
 
 /**
@@ -464,6 +614,9 @@ void init_mmu(void)
         high_va_map(base, base + size, RISCV_MAP_DEVICE | RISCV_MAP_NOEXEC);
     }
 #endif
+
+    /* Last, so no boot mapping above can put a no-map page back. */
+    unmap_fdt_nomap();
 
     /* Pre-allocate empty L1 page tables for every kernel L2 slot.
      *

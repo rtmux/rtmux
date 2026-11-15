@@ -26,14 +26,13 @@ static void *start_kernel_threads(void *dummy)
     uint64_t min_cycle = ULLONG_MAX;
 
     {
-        extern unsigned hart_ids[];
         for (i = 0; i < num_processors; i++) {
-            unsigned h = hart_ids[i];
+            unsigned h = (unsigned) i;
             if (pcpu_array[h].pc_clockcycles_offset < min_cycle)
                 min_cycle = pcpu_array[h].pc_clockcycles_offset;
         }
         for (i = 0; i < num_processors; i++) {
-            pcpu_array[hart_ids[i]].pc_clockcycles_offset -= min_cycle;
+            pcpu_array[i].pc_clockcycles_offset -= min_cycle;
         }
     }
 #endif
@@ -147,7 +146,6 @@ thread_t *idle_pick_thread(unsigned cpu)
 {
     kdispatch_t *dpp;
     thread_t *thp;
-    extern unsigned hart_ids[];
 
     /* Boot-once gates — set before APs come up, never cleared. */
     if (!smp_dispatch_enabled || !kernel_threads_prp)
@@ -186,7 +184,7 @@ thread_t *idle_pick_thread(unsigned cpu)
      * no nested holds).
      */
     for (int outer = 0; outer < (int) num_processors; outer++) {
-        unsigned src_hart = hart_ids[outer];
+        unsigned src_hart = (unsigned) outer;
         if (src_hart == cpu)
             continue;
         dpp = pcpu_array[src_hart].pc_dispatch;
@@ -241,7 +239,7 @@ void idle(void)
     unsigned cpu;
 
     cpu = get_cpunum();
-    pcpu_array[cpu].pc_alive = true;
+    __atomic_store_n(&pcpu_array[cpu].pc_alive, true, __ATOMIC_RELEASE);
 
     start_kernel_threads(NULL);
 
