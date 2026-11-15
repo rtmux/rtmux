@@ -323,12 +323,14 @@ int rdecl sigevent_notification_roottask(int code,
 void intrevent_preemption(unsigned);
 void intrevent_flush(void);
 
-int viov_to_piov(process_t *prp,
+int viov_to_piov(thread_t *act,
+                 process_t *prp,
                  iov_t *piop,
                  int pparts,
-                 iov_t *viop,
+                 const iov_t *viop,
                  int vparts,
-                 int offset);
+                 size_t voffset,
+                 struct _iov_cursor *curp);
 
 int rdecl debug_process(process_t *prp, debug_process_t *dpp);
 int rdecl debug_thread(process_t *prp, thread_t *thp, debug_thread_t *dtp);

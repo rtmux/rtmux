@@ -18,6 +18,11 @@
  * echo server returns cleanly: a stop opcode on success, a fail opcode on
  * error, so the parent reports the child's outcome without needing to reap it.
  *
+ * Before the timed run the parent also checks msg_readiov on a send part that
+ * straddles a page boundary into a separately allocated frame: the physical
+ * parts it returns must split at the boundary and name the frames mem_offset
+ * reports, not run on past the first frame.
+ *
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -29,10 +34,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <pthread.h>
 #include <unistd.h>
 #include <sys/iomsg.h>
+#include <sys/mman.h>
 #include <sys/rtmux-core.h>
 #include <sys/syspage.h>
+
+#include "../outcome.h"
 
 extern struct syspage_entry *_syspage_ptr;
 
@@ -176,6 +185,644 @@ static int run_server(int chid)
         if (len >= 1 && (unsigned char) buf[0] == OP_FAIL)
             return 1;
     }
+}
+
+/* msg_readiov straddle check. A sender thread in this process sends a part
+ * that starts STRADDLE_HEAD bytes before a page boundary, behind a pad part
+ * that makes the send too long for the kernel's short-message buffer, and the
+ * receiver asks for the straddling part as physical parts. Each physical part
+ * must stay inside the frame that maps its first byte, so with two non-adjacent
+ * frames there must be two parts. A short send first checks that msg_readiov
+ * refuses a message that was buffered and so has no client iov to describe.
+ */
+#define STRADDLE_HEAD 8
+#define STRADDLE_LEN 16
+#define STRADDLE_PAD 512
+#define STRADDLE_TRIES 8
+#define STRADDLE_TIMEOUT_NS 5000000000ULL
+
+struct straddle_ctx {
+    int chid;
+    char *src;
+    int rc;
+};
+
+static void *straddle_sender(void *arg)
+{
+    static char pad[STRADDLE_PAD];
+    struct straddle_ctx *ctx = arg;
+    iov_t siov[2];
+    int coid;
+
+    ctx->rc = -1;
+    coid = connect_attach((uint32_t) 0, 0, ctx->chid, RTMUX_SIDE_CHANNEL, 0);
+    if (coid == -1) {
+        fprintf(stderr, "ipc-roundtrip: straddle connect_attach: %s\n",
+                strerror(errno));
+        return NULL;
+    }
+    SETIOV(&siov[0], pad, sizeof pad);
+    SETIOV(&siov[1], ctx->src, STRADDLE_LEN);
+    if (msg_sendv(coid, &siov[1], 1, NULL, 0) == -1 ||
+        msg_sendv(coid, siov, 2, NULL, 0) == -1)
+        fprintf(stderr, "ipc-roundtrip: straddle msg_sendv: %s\n",
+                strerror(errno));
+    else
+        ctx->rc = 0;
+    (void) __connect_detach((uint64_t) coid);
+    return NULL;
+}
+
+static int page_paddr(const void *va, off_t *pa)
+{
+    size_t contig;
+
+    if (mem_offset(va, NOFD, 1, pa, &contig) == -1) {
+        fprintf(stderr, "ipc-roundtrip: straddle mem_offset: %s\n",
+                strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+static char *map_anon(void *addr, size_t len, int flags)
+{
+    char *p = mmap(addr, len, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANON | flags, NOFD, 0);
+
+    if (p == MAP_FAILED) {
+        fprintf(stderr, "ipc-roundtrip: straddle mmap: %s\n", strerror(errno));
+        return NULL;
+    }
+    p[0] = 1;
+    return p;
+}
+
+/* Map two virtually adjacent pages whose frames are not physically adjacent.
+ * Reserve two pages of address space and release them, then map the upper
+ * page, a spacer page elsewhere, and the lower page, each as its own one-page
+ * mapping touched as soon as it is made. An allocator that hands out frames in
+ * address order, up or down, puts the spacer's frame between the other two, so
+ * the upper page's frame cannot directly follow the lower page's. Frames reused
+ * out of order can still line up, hence the retries. The spacer stays mapped
+ * for the run, and so does a rejected pair, so a retry cannot get those frames
+ * back; at most STRADDLE_TRIES pairs and spacers stay mapped. Physical
+ * adjacency is a property of the allocator, not of the walk under test, so a
+ * host where every try is adjacent skips the check. Return value: 0 with the
+ * pair in *pairp, 1 if every try was adjacent, -1 on error.
+ */
+static int map_split_pair(size_t pg, char **pairp, off_t *pa0, off_t *pa1)
+{
+    for (int i = 0; i < STRADDLE_TRIES; i++) {
+        char *pair = mmap(NULL, 2 * pg, PROT_NONE, MAP_PRIVATE | MAP_ANON,
+                          NOFD, 0);
+
+        if (pair == MAP_FAILED || munmap(pair, 2 * pg) == -1) {
+            fprintf(stderr, "ipc-roundtrip: straddle reserve: %s\n",
+                    strerror(errno));
+            return -1;
+        }
+        if (!map_anon(pair + pg, pg, MAP_FIXED) || !map_anon(NULL, pg, 0) ||
+            !map_anon(pair, pg, MAP_FIXED))
+            return -1;
+        if (page_paddr(pair, pa0) != 0 || page_paddr(pair + pg, pa1) != 0)
+            return -1;
+        if (*pa1 != *pa0 + (off_t) pg) {
+            *pairp = pair;
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* Check that the physical part (pa, len), which must lie within one page,
+ * holds want, by mapping the frame it names. This is how a receiver of physical
+ * parts reaches the bytes, so it is the check that the walk named the right
+ * memory, not just plausible numbers.
+ */
+static int part_holds(off_t pa, size_t len, const char *want, size_t pg)
+{
+    off_t page = pa & ~(off_t) (pg - 1);
+    size_t off = (size_t) (pa - page);
+    char *map;
+    int same;
+
+    map = mmap(NULL, pg, PROT_READ, MAP_PHYS | MAP_SHARED, NOFD, page);
+    if (map == MAP_FAILED) {
+        fprintf(stderr, "ipc-roundtrip: straddle MAP_PHYS %#llx: %s\n",
+                (unsigned long long) page, strerror(errno));
+        return 0;
+    }
+    same = memcmp(map + off, want, len) == 0;
+    (void) munmap(map, pg);
+    return same;
+}
+
+/* Receive one message into a one-byte buffer, leaving its client reply
+ * blocked. The receive is bounded so a sender that failed before sending
+ * cannot hang the run. Returns the rcvid, or -1.
+ */
+static int receive_timed(int chid)
+{
+    const uint64_t timeout = STRADDLE_TIMEOUT_NS;
+    struct _msg_info info;
+    char rbuf[1];
+    int rcvid;
+
+    (void) __timer_timeout(CLOCK_MONOTONIC, RTMUX_TIMEOUT_RECEIVE, NULL,
+                           &timeout, NULL);
+    rcvid = msg_receive(chid, rbuf, sizeof rbuf, &info);
+    if (rcvid == -1)
+        fprintf(stderr, "ipc-roundtrip: readiov msg_receive: %s\n",
+                strerror(errno));
+    return rcvid;
+}
+
+/* Receive one message, ask for it as physical parts from offset, and reply.
+ * Returns msg_readiov's result with its errno in *err, or -2 if the receive or
+ * the reply failed.
+ */
+static int receive_readiov(int chid,
+                           iov_t *piov,
+                           int parts,
+                           int offset,
+                           int *err)
+{
+    int rcvid, n;
+
+    rcvid = receive_timed(chid);
+    if (rcvid == -1)
+        return -2;
+    memset(piov, 0, (size_t) parts * sizeof *piov);
+    n = msg_readiov(rcvid, piov, parts, offset, RTMUX_READIOV_SEND, NULL);
+    *err = n == -1 ? errno : 0;
+    if (msg_reply(rcvid, 0, NULL, 0) == -1) {
+        fprintf(stderr, "ipc-roundtrip: straddle msg_reply: %s\n",
+                strerror(errno));
+        return -2;
+    }
+    return n;
+}
+
+static int check_readiov_straddle(int chid)
+{
+    const size_t pg = __PAGESIZE;
+    struct straddle_ctx ctx = {.chid = chid, .rc = -1};
+    iov_t piov[4];
+    pthread_t tid;
+    off_t pa0, pa1, p0, p1;
+    size_t l0, l1;
+    int n, err, short_ok, ok;
+    char *pair;
+
+    n = map_split_pair(pg, &pair, &pa0, &pa1);
+    if (n == 1) {
+        struct test_counts tc = {0};
+        char why[96];
+
+        snprintf(why, sizeof why,
+                 "no non-adjacent frame pair in %d tries (last %#llx, %#llx)",
+                 STRADDLE_TRIES, (unsigned long long) pa0,
+                 (unsigned long long) pa1);
+        tc_skip(&tc, "ipc-roundtrip: readiov-straddle", why);
+        return 0;
+    }
+    if (n != 0)
+        return -1;
+    ctx.src = pair + pg - STRADDLE_HEAD;
+    for (int i = 0; i < STRADDLE_LEN; i++)
+        ctx.src[i] = (char) (0x40 + i);
+
+    if (pthread_create(&tid, NULL, straddle_sender, &ctx) != EOK) {
+        fprintf(stderr, "ipc-roundtrip: straddle pthread_create failed\n");
+        return -1;
+    }
+
+    n = receive_readiov(chid, piov, 4, 0, &err);
+    if (n == -2)
+        return -1;
+    short_ok = n == -1 && err == EINVAL;
+    printf("ipc-roundtrip: readiov-short %s result=%d errno=%d\n",
+           short_ok ? "PASS" : "FAIL", n, err);
+
+    n = receive_readiov(chid, piov, 4, STRADDLE_PAD, &err);
+    if (n == -2)
+        return -1;
+    (void) pthread_join(tid, NULL);
+    p0 = (off_t) (uintptr_t) GETIOVBASE(&piov[0]);
+    p1 = (off_t) (uintptr_t) GETIOVBASE(&piov[1]);
+    l0 = GETIOVLEN(&piov[0]);
+    l1 = GETIOVLEN(&piov[1]);
+    ok = ctx.rc == 0 && n == 2 && p0 == pa0 + (off_t) (pg - STRADDLE_HEAD) &&
+         l0 == STRADDLE_HEAD && p1 == pa1 &&
+         l1 == STRADDLE_LEN - STRADDLE_HEAD &&
+         part_holds(p0, l0, ctx.src, pg) &&
+         part_holds(p1, l1, ctx.src + STRADDLE_HEAD, pg);
+    printf(
+        "ipc-roundtrip: readiov-straddle %s parts=%d pa0=%#llx pa1=%#llx "
+        "part0=%#llx/%zu part1=%#llx/%zu\n",
+        ok ? "PASS" : "FAIL", n, (unsigned long long) pa0,
+        (unsigned long long) pa1, (unsigned long long) p0, l0,
+        (unsigned long long) p1, l1);
+    (void) munmap(pair, 2 * pg);
+    return short_ok && ok ? 0 : -1;
+}
+
+/* msg_readiov over a large message. A sender thread sends one LARGE_LEN part,
+ * and the receiver asks for it as physical parts, with room for one part per
+ * page so that only the kernel's per-call cap ends a call early. The receiver
+ * continues at the offset the returned parts reach, as any caller must. The
+ * rdtime span of each call bounds that call's non-preemptible span; the p99
+ * and the longest over LARGE_PASSES walks are reported. A walk that takes one
+ * call means the cap is gone, so the check requires more than one.
+ */
+#define LARGE_LEN (64u << 20)
+#define LARGE_PASSES 4
+
+struct large_ctx {
+    int chid;
+    const iov_t *siov;
+    int sparts;
+    int rc;
+};
+
+static void *large_sender(void *arg)
+{
+    struct large_ctx *ctx = arg;
+    int coid;
+
+    ctx->rc = -1;
+    coid = connect_attach((uint32_t) 0, 0, ctx->chid, RTMUX_SIDE_CHANNEL, 0);
+    if (coid == -1) {
+        fprintf(stderr, "ipc-roundtrip: large connect_attach: %s\n",
+                strerror(errno));
+        return NULL;
+    }
+    if (msg_sendv(coid, ctx->siov, ctx->sparts, NULL, 0) == -1)
+        fprintf(stderr, "ipc-roundtrip: large msg_sendv: %s\n",
+                strerror(errno));
+    else
+        ctx->rc = 0;
+    (void) __connect_detach((uint64_t) coid);
+    return NULL;
+}
+
+/* Check that the physical part (pa, len) maps src[0, len): mem_offset must put
+ * src at pa and report at least len physically contiguous bytes from there.
+ */
+static int large_part_ok(const char *src, off_t pa, size_t len)
+{
+    size_t contig;
+    off_t first;
+
+    if (mem_offset(src, NOFD, len, &first, &contig) == -1)
+        return 0;
+    return first == pa && contig >= len;
+}
+
+/* Walk the received message once from offset 0. Returns 0 when the parts cover
+ * exactly LARGE_LEN bytes and, if verify is set, every part names the frames
+ * that map the bytes it covers. *calls counts the walk's calls, and each
+ * call's duration is appended to ticks at *nticks. A walk takes at most parts
+ * calls, since each call covers at least one page.
+ */
+static int large_walk(int rcvid,
+                      iov_t *piov,
+                      int parts,
+                      const char *src,
+                      int verify,
+                      int *calls,
+                      uint64_t *ticks,
+                      size_t *nticks)
+{
+    size_t covered = 0;
+
+    *calls = 0;
+    while (covered < LARGE_LEN) {
+        uint64_t t0, dt;
+        int n;
+
+        if (*calls == parts) {
+            fprintf(stderr, "ipc-roundtrip: large walk overran at %zu\n",
+                    covered);
+            return -1;
+        }
+        t0 = read_time();
+        n = msg_readiov(rcvid, piov, parts, (int) covered, RTMUX_READIOV_SEND,
+                        NULL);
+        dt = read_time() - t0;
+        ++*calls;
+        ticks[(*nticks)++] = dt;
+        if (n <= 0) {
+            fprintf(stderr, "ipc-roundtrip: large msg_readiov at %zu: %d %s\n",
+                    covered, n, n == -1 ? strerror(errno) : "");
+            return -1;
+        }
+        if (n > parts) {
+            fprintf(stderr, "ipc-roundtrip: large walk overran at %zu\n",
+                    covered);
+            return -1;
+        }
+        for (int i = 0; i < n; i++) {
+            off_t pa = (off_t) (uintptr_t) GETIOVBASE(&piov[i]);
+            size_t len = GETIOVLEN(&piov[i]);
+
+            if (len == 0 || len > LARGE_LEN - covered ||
+                (verify && !large_part_ok(src + covered, pa, len))) {
+                fprintf(stderr,
+                        "ipc-roundtrip: large bad part %d at %zu: %#llx/%zu\n",
+                        i, covered, (unsigned long long) pa, len);
+                return -1;
+            }
+            covered += len;
+        }
+    }
+    return 0;
+}
+
+/* The offset skip. The same 64 MiB is sent as SKIP_PARTS entries of SKIP_ENTRY
+ * bytes. A call skips at most SKIP_BUDGET entries, so the check
+ *  - asks without a cursor for the last entry and expects E2BIG, and for an
+ *    entry inside the budget and expects it to map;
+ *  - asks with a cursor for the last entry and expects EINTR until the cursor
+ *    reaches it, in about SKIP_PARTS / SKIP_BUDGET calls, then one part;
+ *  - walks the whole message with one cursor, which takes a number of calls
+ *    linear in SKIP_PARTS, not one that grows with each call's offset.
+ * It reports the p99 and max time of the calls in the walks.
+ */
+#define SKIP_ENTRY 1024u
+#define SKIP_PARTS (LARGE_LEN / SKIP_ENTRY)
+#define SKIP_BUDGET 128u
+#define SKIP_WALK_CAP 16
+/* Most calls a cold jump to the last entry may take. */
+#define SKIP_COLD_CALLS_MAX ((int) (SKIP_PARTS / SKIP_BUDGET + 2))
+#define SKIP_CALLS_MAX (SKIP_PARTS / 16u)
+#define SKIP_TICKS_MAX (SKIP_CALLS_MAX + SKIP_PARTS / SKIP_BUDGET + 8)
+
+/* One msg_readiov at offset, timed into ticks[*nticks] when ticks is set. */
+static int skip_call(int rcvid,
+                     iov_t *piov,
+                     int parts,
+                     size_t offset,
+                     struct _iov_cursor *cur,
+                     uint64_t *ticks,
+                     size_t *nticks)
+{
+    uint64_t t0 = read_time();
+    int n = msg_readiov(rcvid, piov, parts, (int) offset, RTMUX_READIOV_SEND,
+                        cur);
+
+    if (ticks)
+        ticks[(*nticks)++] = read_time() - t0;
+    return n;
+}
+
+static int skip_checks(int rcvid,
+                       char *src,
+                       uint64_t *ticks,
+                       size_t *nticks,
+                       int *calls)
+{
+    struct _iov_cursor cur = {0};
+    iov_t piov[SKIP_WALK_CAP];
+    size_t covered = 0;
+    int n, ncalls = 0;
+
+    n = skip_call(rcvid, piov, 2, LARGE_LEN - SKIP_ENTRY, NULL, NULL, NULL);
+    if (n != -1 || errno != E2BIG) {
+        fprintf(stderr, "ipc-roundtrip: skip no-cursor: %d %s, want E2BIG\n",
+                n, n == -1 ? strerror(errno) : "");
+        return -1;
+    }
+    n = skip_call(rcvid, piov, 2, (SKIP_BUDGET - 1) * SKIP_ENTRY, NULL, NULL,
+                  NULL);
+    if (n < 1 ||
+        !large_part_ok(src + (SKIP_BUDGET - 1) * SKIP_ENTRY,
+                       (off_t) (uintptr_t) GETIOVBASE(&piov[0]), SKIP_ENTRY)) {
+        fprintf(stderr, "ipc-roundtrip: skip within budget: %d\n", n);
+        return -1;
+    }
+    /* A cursor is untrusted: each of these must fail with EINVAL. */
+    for (unsigned k = 0; k < 5; k++) {
+        static const struct _iov_cursor bad[5] = {
+            {.entry = SKIP_PARTS + 1},                /* past the iov */
+            {.entry = 3, .start = 1u << 20},          /* start past offset */
+            {.entry = 0, .start = 1},                 /* start with no entry */
+            {.entry = 1, .start = 1024, .spare = 1},  /* reserved not zero */
+            {.entry = 1, .start = UINT64_MAX},        /* overflowing start */
+        };
+        struct _iov_cursor c = bad[k];
+
+        n = skip_call(rcvid, piov, 2, 2 * SKIP_ENTRY, &c, NULL, NULL);
+        if (n != -1 || errno != EINVAL) {
+            fprintf(stderr, "ipc-roundtrip: skip bad cursor %u: %d %s\n", k, n,
+                    n == -1 ? strerror(errno) : "");
+            return -1;
+        }
+    }
+    /* Cold jump to the last entry: EINTR until the cursor gets there. */
+    do {
+        n = skip_call(rcvid, piov, 2, LARGE_LEN - SKIP_ENTRY, &cur, ticks,
+                      nticks);
+        ncalls++;
+    } while (n == -1 && errno == EINTR && ncalls <= SKIP_COLD_CALLS_MAX);
+    if (n != 1 || GETIOVLEN(&piov[0]) != SKIP_ENTRY ||
+        !large_part_ok(src + LARGE_LEN - SKIP_ENTRY,
+                       (off_t) (uintptr_t) GETIOVBASE(&piov[0]), SKIP_ENTRY) ||
+        ncalls > SKIP_COLD_CALLS_MAX) {
+        fprintf(stderr, "ipc-roundtrip: skip cold: n=%d calls=%d\n", n,
+                ncalls);
+        return -1;
+    }
+    *calls = ncalls;
+    /* Whole message, one cursor. */
+    memset(&cur, 0, sizeof cur);
+    ncalls = 0;
+    while (covered < LARGE_LEN) {
+        n = skip_call(rcvid, piov, SKIP_WALK_CAP, covered, &cur, ticks,
+                      nticks);
+        if (++ncalls > (int) SKIP_CALLS_MAX ||
+            (n == -1 && errno != EINTR) || n == 0) {
+            fprintf(stderr,
+                    "ipc-roundtrip: skip walk at %zu: n=%d calls=%d %s\n",
+                    covered, n, ncalls, n == -1 ? strerror(errno) : "");
+            return -1;
+        }
+        for (int i = 0; i < n; i++)
+            covered += GETIOVLEN(&piov[i]);
+    }
+    *calls += ncalls;
+    return covered == LARGE_LEN ? 0 : -1;
+}
+
+static int check_readiov_skip(int chid, char *src)
+{
+    struct large_ctx ctx = {.chid = chid, .rc = -1};
+    uint64_t cps = cycles_per_sec(), p99_ns = 0, max_ns = 0, *ticks;
+    size_t nticks = 0;
+    iov_t *siov;
+    pthread_t tid;
+    int rcvid, ok, calls = 0;
+
+    siov = malloc(SKIP_PARTS * sizeof *siov);
+    ticks = malloc(SKIP_TICKS_MAX * sizeof *ticks);
+    if (!siov || !ticks) {
+        fprintf(stderr, "ipc-roundtrip: skip: no memory\n");
+        free(siov);
+        free(ticks);
+        return -1;
+    }
+    for (size_t i = 0; i < SKIP_PARTS; i++)
+        SETIOV(&siov[i], src + i * SKIP_ENTRY, SKIP_ENTRY);
+    ctx.siov = siov;
+    ctx.sparts = (int) SKIP_PARTS;
+    if (pthread_create(&tid, NULL, large_sender, &ctx) != EOK) {
+        fprintf(stderr, "ipc-roundtrip: skip pthread_create failed\n");
+        free(siov);
+        free(ticks);
+        return -1;
+    }
+    /* No receive: the sender may still be reading siov, so leave it. */
+    if ((rcvid = receive_timed(chid)) == -1)
+        return -1;
+    ok = skip_checks(rcvid, src, ticks, &nticks, &calls) == 0;
+    if (msg_reply(rcvid, 0, NULL, 0) == -1) {
+        fprintf(stderr, "ipc-roundtrip: skip msg_reply: %s\n",
+                strerror(errno));
+        ok = 0;
+    }
+    (void) pthread_join(tid, NULL);
+    ok = ok && ctx.rc == 0;
+    if (nticks && cps) {
+        qsort(ticks, nticks, sizeof *ticks, cmp_u64);
+        p99_ns = ticks_to_ns(ticks[p99_index(nticks)], cps);
+        max_ns = ticks_to_ns(ticks[nticks - 1], cps);
+    }
+    printf("ipc-roundtrip: readiov-skip %s entries=%u calls=%d samples=%zu "
+           "p99-call-ns=%llu max-call-ns=%llu\n",
+           ok ? "PASS" : "FAIL", SKIP_PARTS, calls, nticks,
+           (unsigned long long) p99_ns, (unsigned long long) max_ns);
+    free(siov);
+    free(ticks);
+    return ok ? 0 : -1;
+}
+
+/* A zero-length entry after the first part is a walk step, not a skip: with the
+ * skip budget almost spent it must not turn a finished part into EINTR. The
+ * message is SKIP_BUDGET entries, an empty one, then a last entry; the call
+ * skips SKIP_BUDGET - 1 entries and has to return the part it found.
+ */
+static int check_readiov_empty(int chid, char *src)
+{
+    /* static: on a receive timeout the sender is left running and still reads
+     * both, as in the other checks.
+     */
+    static struct large_ctx ctx;
+    static iov_t siov[SKIP_BUDGET + 2];
+    struct _iov_cursor cur = {0};
+    iov_t piov[4];
+    pthread_t tid;
+    int rcvid, n, ok;
+
+    ctx.chid = chid;
+    ctx.rc = -1;
+    for (unsigned i = 0; i < SKIP_BUDGET; i++)
+        SETIOV(&siov[i], src + i * SKIP_ENTRY, SKIP_ENTRY);
+    SETIOV(&siov[SKIP_BUDGET], src, 0);
+    SETIOV(&siov[SKIP_BUDGET + 1], src + SKIP_BUDGET * SKIP_ENTRY, SKIP_ENTRY);
+    ctx.siov = siov;
+    ctx.sparts = SKIP_BUDGET + 2;
+    if (pthread_create(&tid, NULL, large_sender, &ctx) != EOK) {
+        fprintf(stderr, "ipc-roundtrip: empty pthread_create failed\n");
+        return -1;
+    }
+    /* No receive: the sender may still be reading siov, so leave it. */
+    if ((rcvid = receive_timed(chid)) == -1)
+        return -1;
+    n = skip_call(rcvid, piov, 4, (SKIP_BUDGET - 1) * SKIP_ENTRY, &cur, NULL,
+                  NULL);
+    ok = n >= 1 && cur.entry >= SKIP_BUDGET - 1;
+    if (!ok)
+        fprintf(stderr, "ipc-roundtrip: empty: n=%d %s entry=%u\n", n,
+                n == -1 ? strerror(errno) : "", cur.entry);
+    if (msg_reply(rcvid, 0, NULL, 0) == -1)
+        ok = 0;
+    (void) pthread_join(tid, NULL);
+    ok = ok && ctx.rc == 0;
+    printf("ipc-roundtrip: readiov-empty %s parts=%d entry=%u\n",
+           ok ? "PASS" : "FAIL", n, cur.entry);
+    return ok ? 0 : -1;
+}
+
+static int check_readiov_large(int chid)
+{
+    const size_t pg = __PAGESIZE;
+    const int parts = (int) (LARGE_LEN / pg);
+    struct large_ctx ctx = {.chid = chid, .rc = -1};
+    char *src;
+    uint64_t cps = cycles_per_sec(), p99_ns = 0, max_ns = 0, *ticks;
+    size_t nticks = 0;
+    int calls = 0, ok = 1;
+    pthread_t tid;
+    iov_t *piov, whole;
+    int rcvid;
+
+    src = mmap(NULL, LARGE_LEN, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANON, NOFD, 0);
+    piov = malloc((size_t) parts * sizeof *piov);
+    ticks = malloc((size_t) LARGE_PASSES * (size_t) parts * sizeof *ticks);
+    if (src == MAP_FAILED || !piov || !ticks) {
+        fprintf(stderr, "ipc-roundtrip: large: no memory\n");
+        goto fail;
+    }
+    for (size_t off = 0; off < LARGE_LEN; off += pg)
+        src[off] = (char) (off / pg);
+    SETIOV(&whole, src, LARGE_LEN);
+    ctx.siov = &whole;
+    ctx.sparts = 1;
+    if (pthread_create(&tid, NULL, large_sender, &ctx) != EOK) {
+        fprintf(stderr, "ipc-roundtrip: large pthread_create failed\n");
+        goto fail;
+    }
+    /* No receive: the sender may still be reading src, so leave it mapped. */
+    if ((rcvid = receive_timed(chid)) == -1) {
+        free(ticks);
+        free(piov);
+        return -1;
+    }
+    for (int pass = 0; pass < LARGE_PASSES && ok; pass++)
+        ok = large_walk(rcvid, piov, parts, src, pass == 0, &calls, ticks,
+                        &nticks) == 0;
+    if (msg_reply(rcvid, 0, NULL, 0) == -1) {
+        fprintf(stderr, "ipc-roundtrip: large msg_reply: %s\n",
+                strerror(errno));
+        ok = 0;
+    }
+    (void) pthread_join(tid, NULL);
+    ok = ok && ctx.rc == 0 && calls > 1;
+    if (nticks && cps) {
+        qsort(ticks, nticks, sizeof *ticks, cmp_u64);
+        p99_ns = ticks_to_ns(ticks[p99_index(nticks)], cps);
+        max_ns = ticks_to_ns(ticks[nticks - 1], cps);
+    }
+    printf("ipc-roundtrip: readiov-large %s bytes=%u calls=%d samples=%zu "
+           "p99-call-ns=%llu max-call-ns=%llu\n",
+           ok ? "PASS" : "FAIL", LARGE_LEN, calls, nticks,
+           (unsigned long long) p99_ns, (unsigned long long) max_ns);
+    free(ticks);
+    free(piov);
+    if (ok)
+        ok = check_readiov_skip(chid, src) == 0 &&
+             check_readiov_empty(chid, src) == 0;
+    (void) munmap(src, LARGE_LEN);
+    return ok ? 0 : -1;
+
+fail:
+    free(ticks);
+    free(piov);
+    if (src != MAP_FAILED)
+        (void) munmap(src, LARGE_LEN);
+    return -1;
 }
 
 /* Client: connect to the parent's channel, retrying briefly in case the send
@@ -376,6 +1023,8 @@ int main(int argc, char **argv)
         fprintf(stderr, "ipc-roundtrip: channel_create: %s\n", strerror(errno));
         return EXIT_FAILURE;
     }
+    if (check_readiov_straddle(chid) != 0 || check_readiov_large(chid) != 0)
+        return EXIT_FAILURE;
 
     snprintf(pid_arg, sizeof pid_arg, "%d", getpid());
     snprintf(chid_arg, sizeof chid_arg, "%d", chid);

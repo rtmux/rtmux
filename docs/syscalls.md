@@ -29,3 +29,18 @@ handler's `a0-a5` restart snapshot.
 | Kernel initramfs loader | `PT_LOAD` file range `p_offset + p_filesz` wraps or exceeds CPIO member | `elf_file_range_overflows()` before pointer arithmetic / `memcpy()` | Loader rejects module |
 | Kernel initramfs loader | `PT_LOAD` VA range, load bias, or page allocation size wraps | `elf_addr_range_overflows()` plus `elf_roundup_overflows()` before allocation / `cpu_map_pages()` | Loader rejects module |
 | Memory manager mapping validation | User VA plus length wraps | `as_validate()` rejects `end < vaddr` before map isolation | `EFAULT` / `EINVAL` by operation |
+
+## msg_readiov
+
+`msg_readiov(rcvid, iov, parts, offset, flags, cursor)` takes six argument
+words (a0-a5). The sixth, `cursor`, points at a `struct _iov_cursor` (entry
+index and byte count of the client's iov before it, plus a reserved word that
+must be zero). The kernel reads it only when `flags` has
+`RTMUX_READIOV_CURSOR`; the libc wrapper sets that bit whenever `cursor` is not
+NULL, so a caller that passes NULL, or one built against the five-argument
+form, is unaffected. The call updates the cursor, so a continuation does not
+rescan the iov entries before its offset. Results: the part count; 0 when no
+bytes remain; `EINTR` when the call spent its skip budget before reaching a
+part (call again, same arguments); `E2BIG` for the same without a cursor;
+`EINVAL` for a cursor that does not fit the iov and offset. See `msg_readiov`
+in `sys/rtmux-core.h`.

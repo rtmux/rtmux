@@ -115,6 +115,7 @@ typedef union kcall_args {
         KARGSLOT(int32_t parts);
         KARGSLOT(uint32_t offset);
         KARGSLOT(uint32_t flags);
+        KARGSLOT(struct _iov_cursor *cursor);
     } msg_readiov;
 
     struct kcall_args_msg_info {

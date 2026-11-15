@@ -7,6 +7,7 @@
 
 #include <core/globals.h>
 #include <unistd.h>
+#include <user-slice.h>
 
 #define SIP_ROTL(x, b) (((x) << (b)) | ((x) >> (64 - (b))))
 #define SIP_ROUND(v0, v1, v2, v3) \
@@ -219,79 +220,245 @@ void rdecl get_rcvinfo(thread_t *thp,
 
 
 
+/* Steps one viov_to_piov call may take once it has produced a part: one per
+ * leaf translation and one per iov entry read. The walk runs with interrupts
+ * on, but the scheduler cannot preempt a kernel call, and a timer expiry that
+ * readies a higher-priority thread is deferred until the call returns. This
+ * caps the non-preemptible span of one msg_readiov call at about 512 KiB of 4
+ * KiB pages, whatever the message length or the caller's output capacity.
+ */
+#define VIOV_STEP_MAX 128
+
+/* Decide whether the walk stops before its next step: once it has a part to
+ * return, after VIOV_STEP_MAX steps or on NEED_PREEMPT. The step that makes the
+ * first part is free, so every call that gets past the offset makes progress.
+ * The entries the offset skips are charged by viov_skip_stop instead.
+ */
+static inline int viov_stop(thread_t *act, int nparts, unsigned *steps)
+{
+    return nparts && (++*steps > VIOV_STEP_MAX || NEED_PREEMPT(act));
+}
+
+/* Decide whether the skip of one more entry must wait for the next call. Every
+ * skipped entry costs a step, so a call spends at most VIOV_STEP_MAX on the
+ * entries before the offset, however many there are. NEED_PREEMPT is not
+ * consulted: the caller could not use an early stop, since the walk has no part
+ * to return and the cursor alone carries the progress.
+ */
+static inline int viov_skip_stop(unsigned *steps)
+{
+    return ++*steps > VIOV_STEP_MAX;
+}
+
+/* Read and check the caller's cursor. It is user input, so it must describe a
+ * position the walk could have stopped at: spare zero, entry within the part
+ * count, start not past the offset (the walk only moves forward), and start
+ * zero when entry is zero. Anything else is rejected, not clamped. A NULL curp
+ * means the start of the iov.
+ * Return value: 0, -EFAULT if the cursor could not be read, or -EINVAL.
+ */
+static int viov_cursor_load(thread_t *act,
+                            const struct _iov_cursor *curp,
+                            int vparts,
+                            size_t voffset,
+                            int *entry,
+                            size_t *start)
+{
+    struct _iov_cursor c;
+
+    *entry = 0;
+    *start = 0;
+    if (!curp)
+        return 0;
+    if (user_slice_get(act, &c, curp, sizeof(c)))
+        return -EFAULT;
+    if (c.spare || c.entry > (unsigned) vparts || c.start > voffset ||
+        (!c.entry && c.start))
+        return -EINVAL;
+    *entry = (int) c.entry;
+    *start = (size_t) c.start;
+    return 0;
+}
+
+/* Write the caller's cursor back: entry holds the next unread byte, and start
+ * bytes of the iov precede it. A NULL curp writes nothing.
+ * Return value: nonzero if the store faulted.
+ */
+static int viov_cursor_store(thread_t *act,
+                             struct _iov_cursor *curp,
+                             int entry,
+                             size_t start)
+{
+    struct _iov_cursor c = {.start = start, .entry = (uint32_t) entry};
+
+    return curp && user_slice_put(act, curp, &c, sizeof(c));
+}
+
+/* Store a finished physical part as entry i of the validated output slice.
+ * Return value: 0, or nonzero if the store faulted.
+ */
+static inline int piov_store(const struct user_slice *out,
+                             int i,
+                             const iov_t *part)
+{
+    return xfer_memcpy((iov_t *) out->base + i, part, sizeof(*part));
+}
+
 /* Convert a virtual iov to a physical iov for a process.
  *
- * Walks the virtual iov (after skipping voffset bytes), translating each page
- * to its physical address and coalescing physically-contiguous runs into as few
- * physical parts as possible. Parameters:
- *   prp     : process whose address space the virtual iov belongs to
- *   piop    : destination physical iov array
- *   pparts  : capacity of piop
- *   viop    : source virtual iov array
- *   vparts  : number of virtual iov entries
+ * Walks the virtual iov (after skipping voffset bytes), translating it one leaf
+ * mapping at a time and coalescing physically-contiguous runs into as few
+ * physical parts as possible. The iov entries and the output array are user
+ * memory in act's address space: each range is checked once and then accessed
+ * only through fault-recovering copies. Only the buffers the entries describe
+ * are translated in prp. The walk can stop early (see viov_stop), so the parts
+ * may cover only a prefix of the iov even with output room to spare; the caller
+ * continues at voffset plus the bytes the parts cover.
+ *
+ * Entries before voffset cost one step each (viov_skip_stop). A cursor lets a
+ * continuation start at the entry where the previous call stopped, so the skips
+ * of a whole message add up to one pass over its entries. Parameters:
+ *   act     : the calling thread, whose address space holds viop and piop
+ *   prp     : process whose address space the described buffers belong to
+ *   piop    : destination physical iov array (user memory, pparts entries)
+ *   pparts  : capacity of piop, at least 1
+ *   viop    : source virtual iov array (user memory), or, when vparts is
+ *             negative, the base of one flat buffer of -vparts bytes
+ *   vparts  : number of virtual iov entries, or a negated flat length
  *   voffset : bytes to skip at the start of the virtual iov
- * Return value: number of physical iov parts produced.
+ *   curp    : user memory holding a struct _iov_cursor, or NULL. Read before
+ *             the walk and updated after it, whatever the result but -EFAULT.
+ * Return value: number of physical iov parts produced, 0 only when no bytes
+ *               remain past voffset, -EINTR if the skip spent its budget
+ *               before a part (cursor advanced; call again), -E2BIG if it did
+ *               with no cursor to advance, -EINVAL for a cursor that does not
+ *               fit the iov and offset, or -EFAULT if an iov entry could
+ *               not be read, names memory outside prp's user range, or a
+ *               physical part could not be written.
  */
-int viov_to_piov(process_t *prp,
+int viov_to_piov(thread_t *act,
+                 process_t *prp,
                  iov_t *piop,
                  int pparts,
-                 iov_t *viop,
+                 const iov_t *viop,
                  int vparts,
-                 int voffset)
+                 size_t voffset,
+                 struct _iov_cursor *curp)
 {
-    char *vaddr;
-    paddr_t paddr;
-    size_t vlen, n;
-    int nparts;
+    const pid_t pid = prp ? prp->pid : 0;
+    const size_t pgsz = vm_ops->pagesize;
+    const iov_t *ents = NULL;
+    struct user_slice in, out;
+    iov_t part, cur;
+    int nparts = 0, i, ret;
+    size_t estart = 0;
+    unsigned steps = 0;
 
-    /* Skip over the offset specified in the virtual iov. */
-    while ((voffset -= (int) GETIOVLEN(viop)) >= 0) {
-        ++viop;
-        if (--vparts == 0) {
-            return 0;
-        }
+    if (user_slice_init(act, piop, (size_t) pparts * sizeof(*piop),
+                        (size_t) pparts * sizeof(*piop), USER_SLICE_WR, &out))
+        return -EFAULT;
+    if (vparts < 0) {
+        /* A flat buffer is its own single entry; nothing to read. */
+        SETIOV(&part, viop, PARTS_TO_LEN(vparts));
+        vparts = 1;
+    } else if (user_slice_init(act, viop, (size_t) vparts * sizeof(*viop),
+                               (size_t) vparts * sizeof(*viop), USER_SLICE_RD,
+                               &in)) {
+        return -EFAULT;
+    } else {
+        ents = (const iov_t *) in.base;
     }
 
-    /* Set vaddr and vlen to point within the current viop entry. voffset is
-     * negative here: negate to get unsigned byte count
-     */
-    vlen = (size_t) (-voffset);
-    vaddr = (GETIOVLEN(viop) - vlen) + (char *) GETIOVBASE(viop);
+    if ((ret = viov_cursor_load(act, curp, vparts, voffset, &i, &estart)))
+        return ret;
+    voffset -= estart;
 
-    /* Step through each virtual part producing one or more physical parts. */
-    for (nparts = 0; pparts;) {
-        for (; pparts && vlen; vlen -= n, vaddr += n) {
-            /* Limit steps to 1 page. */
-            n = min(vlen, vm_ops->pagesize);
+    for (; i < vparts; i++) {
+        uintptr_t vaddr;
+        size_t vlen, n;
 
-            /* Convert virtual addr to physical addr. */
-            if (vm_ops->vaddrinfo(prp ? prp->pid : 0, prp, (uintptr_t) vaddr,
-                                  &paddr, NULL, VI_NORMAL) == PROT_NONE) {
-                paddr = ~(paddr_t) 0;
+        if (viov_stop(act, nparts, &steps))
+            goto done;
+        if (ents && xfer_memcpy(&part, &ents[i], sizeof(part)))
+            return -EFAULT;
+
+        /* Skip entries the offset consumes, then start inside the next. Only a
+         * walk with no part yet is skipping; after the first part voffset is 0
+         * and a zero-length entry is just a step viov_stop charged. A skip that
+         * spends the budget leaves entry i for the next call.
+         */
+        if (voffset >= GETIOVLEN(&part)) {
+            if (!nparts && viov_skip_stop(&steps)) {
+                ret = curp ? -EINTR : -E2BIG;
+                if (viov_cursor_store(act, curp, i, estart))
+                    return -EFAULT;
+                return ret;
             }
-            /* Check if address is contiguous. */
-            if (nparts && paddr == (paddr_t) (uintptr_t) GETIOVBASE(piop - 1) +
-                                       GETIOVLEN(piop - 1)) {
-                SETIOV(piop - 1, GETIOVBASE(piop - 1), GETIOVLEN(piop - 1) + n);
+            voffset -= GETIOVLEN(&part);
+            estart += GETIOVLEN(&part);
+            continue;
+        }
+
+        /* The client can rewrite its iov after the send checked it, and a
+         * kernel VA would translate to a kernel physical address, so recheck
+         * that the entry lies in the client's user range.
+         */
+        if (prp &&
+            user_slice_check((uintptr_t) GETIOVBASE(&part), GETIOVLEN(&part),
+                             SIZE_MAX, prp->boundary_addr))
+            return -EFAULT;
+        vaddr = (uintptr_t) GETIOVBASE(&part) + voffset;
+        vlen = GETIOVLEN(&part) - voffset;
+        voffset = 0;
+
+        for (; vlen; vlen -= n, vaddr += n) {
+            paddr_t paddr;
+            size_t leaf;
+
+            if (viov_stop(act, nparts, &steps))
+                goto done;
+
+            /* Translate vaddr and bound the step by the bytes left in the leaf
+             * that maps it, so a chunk never runs past the end of its frame
+             * into whatever frame happens to follow it physically. An unmapped
+             * address advances to the next page boundary.
+             */
+            if (vm_ops->vaddrinfo(pid, prp, vaddr, &paddr, &leaf, VI_NORMAL) ==
+                PROT_NONE) {
+                paddr = ~(paddr_t) 0;
+                leaf = pgsz - (vaddr & (pgsz - 1));
+            }
+            n = min(vlen, leaf);
+
+            /* An unmapped part (base ~0) never extends: base + len wraps to a
+             * small value that a real frame could match.
+             */
+            if (nparts &&
+                (paddr_t) (uintptr_t) GETIOVBASE(&cur) != ~(paddr_t) 0 &&
+                paddr ==
+                    (paddr_t) (uintptr_t) GETIOVBASE(&cur) + GETIOVLEN(&cur)) {
+                SETIOV(&cur, GETIOVBASE(&cur), GETIOVLEN(&cur) + n);
                 continue;
             }
-            /* Page not contiguous in physical memory so create new part. */
-            SETIOV(piop, (intptr_t) paddr, n);
-            ++piop;
-            --pparts;
-            ++nparts;
-        }
 
-        /* Finished current virtual part. Any more parts? */
-        if (--vparts == 0) {
-            break;
+            /* Not contiguous with cur: emit cur and start a new part. The last
+             * part the caller has room for ends the walk, so the work is
+             * bounded by the output capacity and later entries are never read.
+             */
+            if (nparts && piov_store(&out, nparts - 1, &cur))
+                return -EFAULT;
+            SETIOV(&cur, (uintptr_t) paddr, n);
+            if (++nparts == pparts)
+                goto done;
         }
-        /* Move to next virtual part. */
-        ++viop;
-        vaddr = GETIOVBASE(viop);
-        vlen = GETIOVLEN(viop);
+        estart += GETIOVLEN(&part);
     }
 
+done:
+    if (nparts && piov_store(&out, nparts - 1, &cur))
+        return -EFAULT;
+    if (viov_cursor_store(act, curp, i, estart))
+        return -EFAULT;
     return nparts;
 }
 
