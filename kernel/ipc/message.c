@@ -514,10 +514,18 @@ int kdecl ksys_msg_writev(thread_t *act, struct kcall_args_msg_writev *kap)
  *
  * Like msg_readv, but the source is described as the client's send (or reply)
  * iov and is mapped part-by-part via viov_to_piov. The client is claimed via
- * MSG_DELIVERY for the duration of the walk. Parameters:
+ * MSG_DELIVERY for the duration of the walk. The walk is capped per call (see
+ * VIOV_STEP_MAX), entries skipped by the offset included, so the parts may
+ * cover only a prefix of the message; the caller continues at the offset they
+ * reach, with the cursor the call updated. Parameters:
  *   act : the calling (active) thread (the server)
- *   kap : kcall args (rcvid, destination iov, offset, REPLY/SEND flag)
- * Return value: ENOERROR (transferred length or error reported via KSTATUS).
+ *   kap : kcall args (rcvid, destination iov, offset, REPLY/SEND flag, cursor)
+ * Return value: ENOERROR (part count reported via KSTATUS); EINVAL for a
+ *               nonpositive part count or a short send the kernel buffered;
+ *               ENOTSUP for a client iov array in another process; EINTR if
+ *               the skip spent its budget before a part (call again); E2BIG
+ *               if it did with no cursor; EFAULT if an iov entry cannot be
+ *               read or the result cannot be written.
  */
 int kdecl ksys_msg_readiov(thread_t *act, struct kcall_args_msg_readiov *kap)
 {
@@ -534,6 +542,9 @@ int kdecl ksys_msg_readiov(thread_t *act, struct kcall_args_msg_readiov *kap)
      * slock with the claim held to gate replyv, claim release + MSG_FORCE_RDY
      * drain, force_ready outside (sched_slock-internal, SCHED < CHANNEL rank).
      */
+
+    if (kap->parts <= 0)
+        return EINVAL;
 
     if ((cop = lookup_rcvid((kcall_args_t *) (void *) kap, kap->rcvid, &thp)) ==
         NULL) {
@@ -596,14 +607,33 @@ int kdecl ksys_msg_readiov(thread_t *act, struct kcall_args_msg_readiov *kap)
         src_msg = thp->args.ms.rmsg;
         src_parts = thp->args.ms.rparts;
     } else {
+        /* A short send was copied into the thread's buffer and smsg/sparts were
+         * not recorded (they hold a previous send's values), so there is no
+         * client iov to describe.
+         */
+        if (thp->flags & RTMUX_FLG_THR_BUFF_MSG) {
+            kspinlock_unlock(&cop->channel->lock);
+            return EINVAL;
+        }
         src_msg = thp->args.ms.smsg;
         src_parts = thp->args.ms.sparts;
+    }
+
+    /* viov_to_piov reads an iov array through the caller's address space, so it
+     * can only walk one that lives there. A flat buffer (negative parts) is
+     * described by the saved arguments alone and is translated in the client's
+     * page table, so it works from any process.
+     */
+    if (src_parts > 0 && thp->process != act->process) {
+        kspinlock_unlock(&cop->channel->lock);
+        return ENOTSUP;
     }
     ITF_SET(thp, RTMUX_ITF_MSG_DELIVERY);
     kspinlock_unlock(&cop->channel->lock);
 
-    n = viov_to_piov(thp->process, kap->iov, kap->parts, src_msg, src_parts,
-                     (int) kap->offset);
+    n = viov_to_piov(act, thp->process, kap->iov, kap->parts, src_msg,
+                     src_parts, kap->offset,
+                     (kap->flags & RTMUX_READIOV_CURSOR) ? kap->cursor : NULL);
 
     /* Claim release + MSG_FORCE_RDY drain under channel_slock. */
     kspinlock_lock(&cop->channel->lock);

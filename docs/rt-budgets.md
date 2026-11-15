@@ -638,6 +638,99 @@ reviewed and recorded. The gate is pure static text analysis, so it runs in the
 default make check next to check-lock-rank. Check: make check-preempt-inventory.
 The current tree classifies 141 loops (73 bounded, 9 checkpointed, 59 irqoff).
 
+### msg_readiov walk over a large message
+
+`viov_to_piov` (kernel/ipc/message-core.c), the walk behind `msg_readiov`, used
+to translate every leaf of the client's message in one kernel call, holding the
+client's MSG_DELIVERY claim and coalescing a physically contiguous run with no
+cap. The walk runs with interrupts on, after `ksys_msg_readiov` drops the
+channel lock. Its only kspinlock windows are the two short channel-lock
+sections that take and release the claim, and their length does not depend on
+the message. But the walk is non-preemptible: the scheduler preempts a kernel
+call only at a checkpoint, and a timer trap inside a kernel call only rearms
+the timer, so a timer wake of a higher-priority thread waits for the call to
+return. `nonpreempt_report()` times only kspinlock windows and does not see it.
+
+The walk now stops before its next step after VIOV_STEP_MAX (128) steps, or
+earlier when NEED_PREEMPT shows that an interrupt readied a thread that should
+preempt the caller, as long as it has produced a part. A step is one leaf
+translation or one iov entry read, and the step that makes the first part is
+free, so one call covers about 512 KiB of 4 KiB pages. The call returns the parts so far, and the caller continues at the
+offset they reach, so a count below the output capacity no longer means the
+message has ended (see `msg_readiov` in sys/rtmux-core.h). In the preemption
+inventory the loop is now `bounded`, with `cap:` VIOV_STEP_MAX.
+
+The offset skip is charged and resumable (K21). Each entry the offset skips
+costs one step against the same VIOV_STEP_MAX, so one call spends at most 128
+steps on the entries before the offset, then at most 128 more on the parts. A
+call that spends the skip budget before it has a part cannot return the parts
+so far, because it has none, and a return of 0 already means the message has
+ended. It returns -1 with EINTR instead, having written how far it got to the
+`struct _iov_cursor` the caller passed in the sixth argument. The cursor holds
+the index of the entry that has the next unread byte and the bytes of the iov
+before it. The caller keeps one cursor per message and passes it to every call;
+the kernel starts at the entry it names, so a continuation rereads nothing and the skips of a whole message add
+up to one pass over its entries. A caller that passes no cursor has nowhere to
+keep that progress, so a skip longer than the budget fails with E2BIG. The
+state lives with the caller, not on the reply-blocked client: an rcvid names a
+connection and a thread slot but not one message, so a cursor cached on the
+client could not tell a new message with the same iov address from a
+continuation. The kernel treats the cursor as untrusted input: an entry past the
+part count, a start past the offset, a nonzero start at entry 0, or a nonzero
+reserved field fails with EINVAL (the readiov-skip check covers each). A
+cursor inside those bounds is accepted, and a wrong one only changes which
+bytes of the client's own message the caller's parts describe. The
+interface is documented at `msg_readiov` in sys/rtmux-core.h. Entries of zero
+length count as skips as well, which also bounds a run of them that used to be
+uncharged.
+
+The readiov-skip check measures the case that was worst before: 65536 entries
+of 1 KiB, and a call for the last entry. One call took 55.5 ms in the check
+before this change (it was 20 to 45 ms on other loaded boots). The check now
+asks for the same entry with a cursor and expects EINTR until it arrives, then
+walks the whole message from offset 0 with one cursor and 16 parts of room per
+call, and requires both to finish in a number of calls linear in the entry
+count (the walk has to stay within SKIP_PARTS / 16 calls; a rescan per call
+would not). It also checks that a call without a cursor fails with E2BIG past
+the budget and still works within it.
+
+Not bounded by this: the pre-claim validation loops of `msg_readv` and
+`msg_writev` (kernel/ipc/message.c), which check the caller's own iovec entry
+by entry before the transfer. They hold no claim and no progress, they have no
+cap other than the XFER_IOV_LIMIT test xfermsg applies afterwards, and a
+restart from entry 0 after a preemption could starve behind a periodic
+higher-priority thread, so a plain KSYS_PREEMPT checkpoint does not fit. They
+stay `input_dependent` in the preemption inventory (review Q83), with the
+reason stating this; the transfer that follows them is already checkpointed.
+
+Measured by ipc-roundtrip's readiov-large check (`scripts/qemu-regress.sh
+--mode ipc-roundtrip --timeout 600`). The rdtime span around each call bounds
+that call's non-preemptible span and every interrupts-off window inside it.
+The runs used a loaded local host, not the reference host, and the loaded
+per-call figures sit at its noise floor: the same boot's empty round-trip p99
+was about 335 us, and halving the cap to 64 left the call p99 unchanged
+(164 / 212 us). All numbers are QEMU-TCG figures.
+
+```perf-evidence
+claim: one msg_readiov call over a 64 MiB message no longer walks the whole message without a preemption point
+metric: p99 and max latency of one msg_readiov call (rdtime span, upper bound on its non-preemptible span)
+command: scripts/qemu-regress.sh --mode ipc-roundtrip --timeout 600 (readiov-large line)
+config: local host (48 cores, load average 20 to 35 from other guests), CPUS=1, QEMU 11.0.0 TCG virt 256 MB, bundled OpenSBI, 64 MiB message, 16384-entry output array, 4 walks
+baseline: max 7108400 ns (one boot) and max 7780900 ns, p99 6795300 ns (a second boot): the whole message in 1 call per walk, without the step cap (dev 98d4eb5 plus the readiov-large check)
+result: VIOV_STEP_MAX 128, 128 calls per walk, 512 calls per boot: max 124000 ns on a quieter boot, then p99 212700 to 260000 ns and max 329300 ns to 2197900 ns on four loaded boots (the 2.2 ms max is host descheduling: same cap, same boot class)
+rollback-threshold: a p99 per call above 250000 ns, or a walk that takes one call or fails to cover the message, withdraws the cap claim
+```
+
+```perf-evidence
+claim: a msg_readiov continuation over many short iov entries no longer rescans the entries before its offset, and one call spends a bounded number of steps on them
+metric: time of the one call that skips to the last of 65536 1 KiB entries (before), and p99 and max time per call over the cursor walk of the same message (after)
+command: scripts/qemu-regress.sh --mode ipc-roundtrip --keep-logs --timeout 900 (readiov-skip line)
+config: local host (48 cores, load average 38 to 83 from other guests), CPUS=1, QEMU 11.0.0 TCG virt 256 MB, bundled OpenSBI, 64 MiB message as 65536 entries, 16 parts of output room
+baseline: one call 55454600 ns (dev 2892851, readiov-skip), every skipped entry read on every call
+result: 1521 calls (512 skip-only calls to the last entry, then the 64 MiB walk): p99 127600 ns, max 377200 ns on the first boot; on the rebased tree p99 157200 and 205700 ns, max 353100 and 1017200 ns on two boots at load 71 to 83 (readiov-large, unchanged by this, read p99 290700 and 295400 ns on the same boots, so those p99s are the host floor)
+rollback-threshold: a p99 per call above 250000 ns, or a walk that takes more than SKIP_PARTS / 16 calls, withdraws the claim
+```
+
 ### Wake-to-dispatch preemption latency and the interrupt-wake gap
 
 The wake-to-dispatch probe measures how long a higher-priority thread waits to

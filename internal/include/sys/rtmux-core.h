@@ -482,6 +482,18 @@ struct _thread_runmask {
 /* Define flags for msg_readiov */
 #define RTMUX_READIOV_SEND 0
 #define RTMUX_READIOV_REPLY 1
+#define RTMUX_READIOV_CURSOR 2 /* the cursor argument is set */
+
+/* Where a msg_readiov continuation resumes in the client's iov. A zeroed
+ * cursor means the start of the iov. The kernel reads it before the walk and
+ * writes it back after, so a caller that passes the same cursor to every call
+ * of one message never has the entries before its offset reread.
+ */
+struct _iov_cursor {
+    uint64_t start; /* bytes of the iov that lie before entry */
+    uint32_t entry; /* index of the entry that holds the next unread byte */
+    uint32_t spare; /* zero */
+};
 
 struct _clockperiod {
     unsigned long nsec;
@@ -743,16 +755,41 @@ extern int msg_replyv_r(int __rcvid,
                         int __status,
                         const struct iovec *__iov,
                         int __parts);
+/* msg_readiov describes the client's send (or reply) iov, from __offset, as
+ * physical parts. One call walks a bounded number of pages and skips a bounded
+ * number of entries, so the parts it returns can cover only a prefix of the
+ * message even when __iov has room left. A caller that needs the whole message
+ * calls again at __offset plus the bytes the parts cover, until that reaches
+ * the message length (srcmsglen or dstmsglen in _msg_info). A return of 0
+ * means no bytes remain.
+ *
+ * __cursor keeps the walk linear across those calls. Zero one struct
+ * _iov_cursor before the first call of a message and pass the same one to
+ * each later call; the kernel resumes at the entry it names instead of
+ * rereading every entry before __offset, and updates it. __cursor may be NULL;
+ * the wrapper then leaves RTMUX_READIOV_CURSOR out of the flags, and the kernel
+ * does not read the argument.
+ *
+ * A call that spends its skip budget before it reaches a part returns -1 with
+ * EINTR, having advanced __cursor; call again with the same arguments. Without
+ * a cursor there is nowhere to keep that progress, so a skip longer than the
+ * budget (128 entries) fails with E2BIG. A client iov of more than 128 entries
+ * needs a cursor for an offset past them. The kernel checks the cursor: spare
+ * not zero, entry past the part count, start past __offset, or a nonzero start
+ * at entry 0 fail with EINVAL.
+ */
 extern int msg_readiov(int __rcvid,
                        const struct iovec *__iov,
                        int __parts,
                        int __offset,
-                       int __flags);
+                       int __flags,
+                       struct _iov_cursor *__cursor);
 extern int msg_readiov_r(int __rcvid,
                          const struct iovec *__iov,
                          int __parts,
                          int __offset,
-                         int __flags);
+                         int __flags,
+                         struct _iov_cursor *__cursor);
 extern int msg_read(int __rcvid, void *__msg, int __bytes, int __offset);
 extern int msg_read_r(int __rcvid, void *__msg, int __bytes, int __offset);
 extern int msg_readv(int __rcvid,
