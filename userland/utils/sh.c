@@ -50,6 +50,8 @@ enum sh_op {
     SH_GTGT,
     SH_ERRGT,
     SH_ERRGTGT,
+    SH_DUPOUT, /* >&N */
+    SH_DUPERR, /* 2>&N */
 };
 
 struct sh_token {
@@ -73,6 +75,19 @@ struct sh_func {
     char *name;
     struct sh_script body;
 };
+
+/* The conditions `trap` takes; EXIT is the shell's exit, not a signal. */
+static const struct {
+    const char *name;
+    int sig;
+} sh_trap_sigs[] = {
+    {"EXIT", 0},
+    {"HUP", SIGHUP},
+    {"INT", SIGINT},
+    {"TERM", SIGTERM},
+};
+
+#define SH_NTRAPS ((int) (sizeof(sh_trap_sigs) / sizeof(sh_trap_sigs[0])))
 
 struct sh {
     bool interactive;
@@ -99,7 +114,32 @@ struct sh {
     int heredoc_fd;    /* pending here-document body on stdin, else -1 */
     bool expand_abort; /* a `set -u` failure: skip the command being expanded */
     int errexit_suppress; /* >0 while in a context where `set -e` is ignored */
+    char *traps[SH_NTRAPS]; /* trap actions, see sh_trap_sigs; NULL: none */
+    bool trap_inherited[SH_NTRAPS]; /* from a parent: listed, never run */
 };
+
+#define SH_JOBS 16
+
+struct sh_job {
+    pid_t pgid;
+    pid_t pid; /* the process the shell waits for (the last of a pipeline) */
+    bool stopped;
+    char cmd[48];
+};
+
+static struct sh_job sh_jobs[SH_JOBS];
+static bool sh_jc;          /* the shell owns the terminal's foreground */
+static pid_t sh_jc_pgid;    /* group of the pipeline being started, else 0 */
+static pid_t sh_shell_pgid; /* the shell's own group */
+static char sh_jc_cmd[48];  /* text of the command being started */
+static pid_t sh_last_bg;    /* $!: the most recent background process */
+static pid_t sh_top_pid;    /* $$ when inherited from a parent shell */
+
+/* $$: the shell's pid, which a subshell inherits from its parent. */
+static pid_t sh_pid(void)
+{
+    return sh_top_pid ? sh_top_pid : getpid();
+}
 
 enum sh_key {
     SH_KEY_NULL = 0,
@@ -116,6 +156,10 @@ enum sh_key {
 
 static int run_file(struct sh *sh, const char *path);
 static int run_line(struct sh *sh, const char *line);
+static int run_text(struct sh *sh, const char *text);
+static int script_explode(struct sh_script *sc);
+static int sh_assign(const char *word, char **saved);
+static char *dup_range(const char *s, size_t n);
 static struct sh_func *sh_find_func(struct sh *sh, const char *name);
 static int run_function(struct sh *sh,
                         struct sh_func *fn,
@@ -123,11 +167,11 @@ static int run_function(struct sh *sh,
                         int argc);
 
 static const char *const sh_builtin_names[] = {
-    ":",      ".",    "break", "cd",     "command", "continue",
-    "echo",   "eval", "exec",  "exit",   "export",  "false",
-    "help",   "pwd",  "read",  "return", "set",     "shift",
-    "source", "test", "true",  "type",   "unset",   "waitfor",
-    "[",      "[[",   "jobs",  "fg",     "bg",      NULL,
+    ":",    ".",      "break",   "cd",     "command", "continue", "echo",
+    "eval", "exec",   "exit",    "export", "false",   "help",     "pwd",
+    "read", "return", "set",     "shift",  "source",  "test",     "true",
+    "type", "unset",  "waitfor", "[",      "[[",      "jobs",     "fg",
+    "bg",   "trap",   NULL,
 };
 
 static void sh_free_history(struct sh *sh)
@@ -543,33 +587,6 @@ static int words_add(struct sh_words *w, const char *s)
     return 0;
 }
 
-static int words_add_fields(struct sh_words *w, const char *s)
-{
-    const char *p = s;
-
-    while (*p != '\0') {
-        const char *start;
-        char field[SH_LINE_MAX];
-        size_t len;
-
-        while (*p == ' ' || *p == '\t')
-            p++;
-        if (*p == '\0')
-            break;
-        start = p;
-        while (*p != '\0' && *p != ' ' && *p != '\t')
-            p++;
-        len = (size_t) (p - start);
-        if (len >= sizeof(field))
-            len = sizeof(field) - 1;
-        memcpy(field, start, len);
-        field[len] = '\0';
-        if (words_add(w, field) != 0)
-            return -1;
-    }
-    return 0;
-}
-
 static void trim(char *s)
 {
     char *p = s;
@@ -583,6 +600,12 @@ static void trim(char *s)
     while (n > 0 && (s[n - 1] == '\n' || s[n - 1] == '\r' || s[n - 1] == ' ' ||
                      s[n - 1] == '\t'))
         s[--n] = '\0';
+}
+
+/* Whether the unquoted # at p in line starts a comment: it starts a word. */
+static bool is_comment_start(const char *line, const char *p)
+{
+    return p == line || strchr(" \t;&|<>()", p[-1]) != NULL;
 }
 
 static bool is_name_char(int c)
@@ -903,8 +926,16 @@ static int expand_dollar(struct sh *sh,
         free(owned);
         return 0;
     }
-    if (*p == '$') { /* $$ -> shell process id */
-        snprintf(tmp, sizeof(tmp), "%ld", (long) getpid());
+    if (*p == '$') { /* $$ -> shell process id, a subshell's parent's */
+        snprintf(tmp, sizeof(tmp), "%ld", (long) sh_pid());
+        *pp = p + 1;
+        return append_str(buf, len, cap, tmp);
+    }
+    if (*p == '!') { /* $! -> last background process, empty if none */
+        if (sh_last_bg)
+            snprintf(tmp, sizeof(tmp), "%ld", (long) sh_last_bg);
+        else
+            tmp[0] = '\0';
         *pp = p + 1;
         return append_str(buf, len, cap, tmp);
     }
@@ -929,8 +960,7 @@ static int expand_dollar(struct sh *sh,
         *pp = p + 1;
         return append_str(buf, len, cap, tmp);
     }
-    if (*p == '@' ||
-        *p == '*') { /* join $1..$n (unquoted forms not split yet) */
+    if (*p == '@' || *p == '*') { /* join $1..$n; tokenize splits "$@" */
         *pp = p + 1;
         for (int i = 0; i < sh->nparams; i++) {
             if (i > 0 && append_char(buf, len, cap, ' ') != 0)
@@ -982,90 +1012,112 @@ static void token_free(struct sh_token *tok, int ntok)
         free(tok[i].s);
 }
 
-/* Run `inner` as a command substitution and capture its stdout into *out
- * (malloc'd, trailing newlines stripped). Spawns `sh -c inner` and drains the
- * pipe concurrently, so there is no PIPE_BUF deadlock and output is unbounded.
- * The child inherits environ (all shell variables live there via setenv), which
- * gives correct subshell isolation; shell functions and positional parameters
- * are not visible inside the substitution (revisit once functions land).
- * Returns 0, or -1 on failure (with *out set to "").
+static int sh_spawn_sub(struct sh *sh,
+                        char kind,
+                        char **lines,
+                        int nlines,
+                        int in_fd,
+                        int out_fd,
+                        int err_fd,
+                        int background,
+                        pid_t *pid_out,
+                        const char *label);
+
+/* Read fd to end of file into a malloc'd, NUL-terminated *out (its length,
+ * without the NUL, in *lenp).
+ *
+ * Returns 0, or -1 on a read or allocation failure (*out is then NULL).
  */
-static int capture_command(const char *inner, char **out)
+static int read_all(int fd, char **out, size_t *lenp)
 {
-    int pfd[2];
-    posix_spawn_file_actions_t fa;
-    char *argv[4];
-    pid_t pid;
     char *buf = NULL;
     size_t len = 0;
     size_t cap = 0;
-    char rb[512];
-    ssize_t r;
+
+    for (;;) {
+        ssize_t r;
+
+        if (cap - len < 512) {
+            char *nb = realloc(buf, cap = cap ? cap * 2 : 1024);
+
+            if (!nb)
+                break;
+            buf = nb;
+        }
+        r = read(fd, buf + len, cap - len - 1);
+        if (r < 0 && errno == EINTR)
+            continue;
+        if (r < 0)
+            break;
+        if (r == 0) {
+            buf[len] = '\0';
+            *out = buf;
+            *lenp = len;
+            return 0;
+        }
+        len += (size_t) r;
+    }
+    free(buf);
+    *out = NULL;
+    return -1;
+}
+
+/* Run `inner` as a command substitution and capture its stdout into *out
+ * (malloc'd, trailing newlines stripped). Runs it in a child shell that gets
+ * this shell's state (sh_spawn_sub), and drains the pipe concurrently, so there
+ * is no PIPE_BUF deadlock and output is unbounded.
+ *
+ * Returns 0, or -1 on failure (with *out set to "").
+ */
+static int capture_command(struct sh *sh, const char *inner, char **out)
+{
+    int pfd[2];
+    pid_t pid = -1;
+    char *buf;
+    size_t len;
     int status;
+    bool jc = sh_jc;
 
     *out = strdup("");
     if (!*out)
         return -1;
-    if (pipe(pfd) != 0)
-        return 0;
-    if (posix_spawn_file_actions_init(&fa) != EOK) {
-        close(pfd[0]);
-        close(pfd[1]);
-        return 0;
+    if (pipe(pfd) != 0) {
+        fprintf(stderr, "sh: command substitution: %s\n", strerror(errno));
+        return -1;
     }
+    (void) fcntl(pfd[0], F_SETFD, FD_CLOEXEC);
 
-    /* Point the child's stdout at the pipe and drop the pipe fds it inherits.
-     * Only redirect/close the write end when it is not already fd 1, mirroring
-     * run_external(), so a shell launched with stdout closed is not broken.
+    /* The substitution runs in the shell's own process group, not a job of its
+     * own, so it never takes the terminal.
      */
-    status = EOK;
-    if (pfd[1] != STDOUT_FILENO)
-        status = posix_spawn_file_actions_adddup2(&fa, pfd[1], STDOUT_FILENO);
-    if (status == EOK)
-        status = posix_spawn_file_actions_addclose(&fa, pfd[0]);
-    if (status == EOK && pfd[1] != STDOUT_FILENO)
-        status = posix_spawn_file_actions_addclose(&fa, pfd[1]);
-    if (status != EOK) {
-        posix_spawn_file_actions_destroy(&fa);
-        close(pfd[0]);
-        close(pfd[1]);
-        return 0;
-    }
-    argv[0] = "sh";
-    argv[1] = "-c";
-    argv[2] = (char *) inner;
-    argv[3] = NULL;
-    status = posix_spawnp(&pid, "sh", &fa, NULL, argv, NULL);
-    posix_spawn_file_actions_destroy(&fa);
+    sh_jc = false;
+    status = sh_spawn_sub(sh, 'c', (char **) &inner, 1, -1, pfd[1], -1, 0, &pid,
+                          "sh");
+    sh_jc = jc;
     close(pfd[1]);
-    if (status != EOK) {
+    if (status != 0 || pid <= 0) {
         close(pfd[0]);
-        return 0;
+        if (pid > 0) /* started, but its state could not be sent */
+            (void) waitpid(pid, NULL, 0);
+        return -1;
     }
-    while ((r = read(pfd[0], rb, sizeof(rb))) > 0) {
-        for (ssize_t i = 0; i < r; i++) {
-            if (append_char(&buf, &len, &cap, rb[i]) != 0) {
-                free(buf);
-                close(pfd[0]);
-                (void) waitpid(pid, &status, 0);
-                return -1;
-            }
-        }
-    }
+    status = read_all(pfd[0], &buf, &len);
     close(pfd[0]);
-    (void) waitpid(pid, &status, 0);
+    (void) waitpid(pid, NULL, 0);
+    if (status != 0)
+        return -1;
     while (len > 0 && buf[len - 1] == '\n')
         buf[--len] = '\0';
     free(*out);
-    *out = buf ? buf : strdup("");
-    return *out ? 0 : -1;
+    *out = buf;
+    return 0;
 }
 
-/* Emit a substitution result into the word being built. Double-quoted: append
- * literally. Unquoted: split on IFS whitespace -- the first field joins the
- * current buffer, each later field flushes the buffer as its own token and
- * starts a new one. *produced is set when any field/char is contributed, so the
- * caller can drop a word that is nothing but an empty unquoted substitution.
+/* Emit an expansion result into the word being built. Quoted: append it
+ * literally. Unquoted: split it on IFS whitespace -- a blank ends the word
+ * built so far, if it has any content, as a token of its own. *produced tells
+ * whether the word being built has content, so the caller can drop a word that
+ * is nothing but an empty unquoted expansion.
  *
  * Returns 0, or -1 on allocation failure.
  */
@@ -1078,32 +1130,24 @@ static int emit_sub_result(struct sh_token *tok,
                            const char *text,
                            int *produced)
 {
-    const char *p = text;
-    int first = 1;
-
     if (quote) { /* double quotes: a field, even if empty */
         *produced = 1;
         return append_str(buf, len, cap, text);
     }
-    while (*p != '\0') {
-        while (*p == ' ' || *p == '\t' || *p == '\n')
-            p++;
-        if (*p == '\0')
-            break;
-        if (!first) {
+    for (const char *p = text; *p != '\0'; p++) {
+        if (*p != ' ' && *p != '\t' && *p != '\n') {
+            if (append_char(buf, len, cap, *p) != 0)
+                return -1;
+            *produced = 1;
+        } else if (*produced || (*buf && **buf)) {
             if (token_add(tok, ntok, SH_WORD, *buf ? *buf : "") != 0)
                 return -1;
             free(*buf);
             *buf = NULL;
             *len = 0;
             *cap = 0;
+            *produced = 0;
         }
-        while (*p != '\0' && *p != ' ' && *p != '\t' && *p != '\n') {
-            if (append_char(buf, len, cap, *p++) != 0)
-                return -1;
-        }
-        first = 0;
-        *produced = 1;
     }
     return 0;
 }
@@ -1626,6 +1670,54 @@ static int glob_word(const char *pat, struct sh_words *out)
     return out->n - start;
 }
 
+static bool is_redir_op(enum sh_op op)
+{
+    return op == SH_LT || op == SH_GT || op == SH_GTGT || op == SH_ERRGT ||
+           op == SH_ERRGTGT || op == SH_DUPOUT || op == SH_DUPERR;
+}
+
+static bool is_assignment(const char *s);
+
+/* Whether the word at p, after tok[0,ntok) of its line, is expanded without
+ * field splitting or pathname expansion: NAME=value before the command name or
+ * as an argument of export or readonly (POSIX 2.9.1), or the subject word of
+ * `case`.
+ */
+static bool word_is_unsplit(const struct sh_token *tok, int ntok, const char *p)
+{
+    const char *cmd = NULL;
+    int i = ntok;
+
+    if (ntok > 0 && is_redir_op(tok[ntok - 1].op))
+        return false; /* a redirection target */
+    while (i > 0 && (tok[i - 1].op == SH_WORD || is_redir_op(tok[i - 1].op)))
+        i--;
+    for (; i < ntok && !cmd; i++) {
+        if (is_redir_op(tok[i].op))
+            i++; /* and its target */
+        else if (!is_assignment(tok[i].s))
+            cmd = tok[i].s;
+    }
+    if (cmd && cmd == tok[ntok - 1].s && !strcmp(cmd, "case"))
+        return true;
+    return is_assignment(p) &&
+           (!cmd || !strcmp(cmd, "export") || !strcmp(cmd, "readonly"));
+}
+
+/* Length of the $@, $*, ${@} or ${*} at p, which points at a `$` (0 if it is
+ * none of these); *which gets the @ or *.
+ */
+static size_t all_params_at(const char *p, char *which)
+{
+    bool braced = p[1] == '{';
+    const char *c = p + 1 + braced;
+
+    if ((*c != '@' && *c != '*') || (braced && c[1] != '}'))
+        return 0;
+    *which = *c;
+    return braced ? 4 : 2;
+}
+
 static int tokenize(struct sh *sh, const char *line, struct sh_token *tok)
 {
     int ntok = 0;
@@ -1645,6 +1737,9 @@ static int tokenize(struct sh *sh, const char *line, struct sh_token *tok)
         int word_may_glob = 0;        /* has an unquoted * ? [ metacharacter */
         int word_has_quoted_glob = 0; /* also has a quoted/escaped one */
         int at_word_start = 1;        /* still at the unquoted word start */
+        bool unsplit;                 /* see word_is_unsplit */
+        const char *dq_open = NULL;   /* the `"` that opened the quote */
+        int dq_content = 0;           /* word_has_content before it */
 
         while (*p == ' ' || *p == '\t')
             p++;
@@ -1686,37 +1781,42 @@ static int tokenize(struct sh *sh, const char *line, struct sh_token *tok)
             p++;
             continue;
         }
-        if (*p == '2' && p[1] == '>') {
-            if (p[2] == '&') {
-                char fdword[16];
-                size_t n = 1;
 
-                fdword[0] = '&';
-                p += 3;
+        /* [1|2]> and [1|2]>>, and [1|2]>&N, which duplicates fd N: an
+         * SH_DUPOUT or SH_DUPERR whose target word is the digits of N.
+         */
+        if (*p == '>' || ((*p == '1' || *p == '2') && p[1] == '>')) {
+            bool err = *p == '2';
+            bool app;
+            bool dup;
+
+            p += *p != '>';
+            app = p[1] == '>';
+            dup = !app && p[1] == '&' && isdigit((unsigned char) p[2]);
+            if (token_add(tok, &ntok,
+                          dup   ? (err ? SH_DUPERR : SH_DUPOUT)
+                          : err ? (app ? SH_ERRGTGT : SH_ERRGT)
+                                : (app ? SH_GTGT : SH_GT),
+                          NULL) != 0)
+                goto fail;
+            p += 1 + app + dup;
+            if (dup) {
+                char fdword[16];
+                size_t n = 0;
+
                 while (isdigit((unsigned char) *p) && n + 1 < sizeof(fdword))
                     fdword[n++] = *p++;
                 fdword[n] = '\0';
-                if (token_add(tok, &ntok, SH_ERRGT, NULL) != 0 ||
-                    token_add(tok, &ntok, SH_WORD, fdword) != 0)
+                if (token_add(tok, &ntok, SH_WORD, fdword) != 0)
                     goto fail;
-                continue;
             }
-            if (token_add(tok, &ntok, p[2] == '>' ? SH_ERRGTGT : SH_ERRGT,
-                          NULL) != 0)
-                goto fail;
-            p += p[2] == '>' ? 3 : 2;
             continue;
         }
-        if (*p == '>') {
-            if (token_add(tok, &ntok, p[1] == '>' ? SH_GTGT : SH_GT, NULL) != 0)
-                goto fail;
-            p += p[1] == '>' ? 2 : 1;
-            continue;
-        }
+        unsplit = word_is_unsplit(tok, ntok, p);
         while (*p != '\0') {
             if (quote == 0 &&
                 (*p == ' ' || *p == '\t' || *p == ';' || *p == '&' ||
-                 *p == '|' || *p == '<' || *p == '>' || *p == '#'))
+                 *p == '|' || *p == '<' || *p == '>'))
                 break;
 
             /* Tilde only at the true, unquoted start of the word: standing
@@ -1746,12 +1846,21 @@ static int tokenize(struct sh *sh, const char *line, struct sh_token *tok)
                 continue;
             }
             if (*p == '"' && quote != '\'') {
+                if (quote == 0) {
+                    dq_open = p;
+                    dq_content = word_has_content;
+                }
                 quote = quote == '"' ? 0 : '"';
                 word_has_content = 1;
                 p++;
                 continue;
             }
-            if (*p == '\\' && p[1] != '\0') {
+
+            /* A backslash is literal inside single quotes, and inside double
+             * quotes escapes only $ ` " \ (POSIX 2.2.3).
+             */
+            if (*p == '\\' && p[1] != '\0' && quote != '\'' &&
+                (quote == 0 || strchr("$`\"\\", p[1]))) {
                 p++;
                 if (*p == '*' || *p == '?' || *p == '[')
                     word_has_quoted_glob = 1; /* escaped: keep it literal */
@@ -1811,14 +1920,15 @@ static int tokenize(struct sh *sh, const char *line, struct sh_token *tok)
                     free(buf);
                     goto fail;
                 }
-                if (capture_command(inner, &result) != 0) {
+                if (capture_command(sh, inner, &result) != 0) {
                     free(inner);
                     free(result);
                     free(buf);
                     goto fail;
                 }
                 free(inner);
-                if (emit_sub_result(tok, &ntok, &buf, &len, &cap, quote, result,
+                if (emit_sub_result(tok, &ntok, &buf, &len, &cap,
+                                    quote || unsplit, result,
                                     &word_has_content) != 0) {
                     free(result);
                     free(buf);
@@ -1828,13 +1938,59 @@ static int tokenize(struct sh *sh, const char *line, struct sh_token *tok)
                 continue;
             }
             if (*p == '$' && quote != '\'') {
-                p++;
+                char *val = NULL;
+                size_t vlen = 0;
+                size_t vcap = 0;
+                char which;
+                size_t n = all_params_at(p, &which);
+                int rc;
 
-                /* $NAME/${...}/$? keep the pre-existing behavior of yielding a
-                 * word even when empty, so only substitutions are dropped.
+                /* "$@": a field per positional parameter, the first joined to
+                 * what precedes it and the last to what follows. A "$@" that is
+                 * the whole quoted part and has no parameters is no field.
                  */
-                word_has_content = 1;
-                if (expand_dollar(sh, &p, &buf, &len, &cap) != 0) {
+                if (n && which == '@' && quote == '"' && !unsplit) {
+                    if (sh->nparams == 0 && dq_open == p - 1 && p[n] == '"') {
+                        word_has_content = dq_content;
+                        quote = 0;
+                        p += n + 1;
+                        continue;
+                    }
+                    for (int k = 0; k < sh->nparams; k++) {
+                        if (k > 0) {
+                            if (token_add(tok, &ntok, SH_WORD,
+                                          buf ? buf : "") != 0) {
+                                free(buf);
+                                goto fail;
+                            }
+                            len = 0;
+                            if (buf)
+                                buf[0] = '\0';
+                        }
+                        if (append_str(&buf, &len, &cap, sh->params[k]) != 0) {
+                            free(buf);
+                            goto fail;
+                        }
+                    }
+                    p += n;
+                    continue;
+                }
+
+                /* Anything else expands to one string, which is field-split
+                 * when unquoted: an empty unquoted expansion is no field.
+                 */
+                p++;
+                if (quote || unsplit) {
+                    word_has_content = 1; /* a field, even if empty */
+                    rc = expand_dollar(sh, &p, &buf, &len, &cap);
+                } else {
+                    rc = expand_dollar(sh, &p, &val, &vlen, &vcap);
+                    if (rc == 0 && val)
+                        rc = emit_sub_result(tok, &ntok, &buf, &len, &cap, 0,
+                                             val, &word_has_content);
+                    free(val);
+                }
+                if (rc != 0) {
                     free(buf);
                     goto fail;
                 }
@@ -1857,7 +2013,8 @@ static int tokenize(struct sh *sh, const char *line, struct sh_token *tok)
                 goto fail;
             }
         }
-        if (word_may_glob && !word_has_quoted_glob && buf && buf[0] != '\0') {
+        if (word_may_glob && !word_has_quoted_glob && !unsplit && buf &&
+            buf[0] != '\0') {
             struct sh_words g = {0};
             int m = glob_word(buf, &g);
 
@@ -1903,7 +2060,7 @@ static bool is_assignment(const char *s)
 {
     const char *eq;
 
-    if (!s || !isalpha((unsigned char) s[0]))
+    if (!s || (!isalpha((unsigned char) s[0]) && s[0] != '_'))
         return false;
     eq = strchr(s, '=');
     if (!eq)
@@ -1970,6 +2127,27 @@ static int builtin_test(int argc, char **argv)
         return !strcmp(argv[off], argv[off + 2]) ? 0 : 1;
     if (n >= 3 && !strcmp(argv[off + 1], "!="))
         return strcmp(argv[off], argv[off + 2]) != 0 ? 0 : 1;
+    if (n >= 3 && argv[off + 1][0] == '-') {
+        static const char *const iops[] = {"-eq", "-ne", "-lt",
+                                           "-le", "-gt", "-ge"};
+        char *e1;
+        char *e2;
+        long l = strtol(argv[off], &e1, 10);
+        long r = strtol(argv[off + 2], &e2, 10);
+        int k = 0;
+
+        while (k < 6 && strcmp(argv[off + 1], iops[k]))
+            k++;
+        if (k < 6) {
+            bool t[] = {l == r, l != r, (l < r), l <= r, (l > r), l >= r};
+
+            if (e1 == argv[off] || *e1 || e2 == argv[off + 2] || *e2) {
+                fprintf(stderr, "test: integer expression expected\n");
+                return 2;
+            }
+            return t[k] ? 0 : 1;
+        }
+    }
     return n > 0 && argv[off][0] != '\0' ? 0 : 1;
 }
 
@@ -1996,6 +2174,8 @@ static int builtin_read(char **argv, int in_fd)
         varidx = 2;
     if (!argv[varidx])
         return 1;
+    if (in_fd < 0) /* no pipe or redirection: the shell's own stdin */
+        in_fd = STDIN_FILENO;
     for (;;) {
         char c;
         ssize_t r = read(in_fd, &c, 1);
@@ -2221,21 +2401,6 @@ static int sh_describe(struct sh *sh, const char *name, char mode)
  * and SIGTTOU. A stopped job stays in the table for fg/bg; a background job
  * stays there until it exits.
  */
-#define SH_JOBS 16
-
-struct sh_job {
-    pid_t pgid;
-    pid_t pid; /* the process the shell waits for (the last of a pipeline) */
-    bool stopped;
-    char cmd[48];
-};
-
-static struct sh_job sh_jobs[SH_JOBS];
-static bool sh_jc;          /* the shell owns the terminal's foreground */
-static pid_t sh_jc_pgid;    /* group of the pipeline being started, else 0 */
-static pid_t sh_shell_pgid; /* the shell's own group */
-static char sh_jc_cmd[48];  /* text of the command being started */
-
 static struct sh_job *sh_job_find(pid_t pid)
 {
     for (int i = 0; i < SH_JOBS; i++)
@@ -2383,6 +2548,148 @@ static int builtin_fg_bg(bool fg, char **argv)
     }
 }
 
+/* Signals caught for a trap, run by sh_run_traps between commands. */
+static volatile sig_atomic_t sh_trap_pending[SH_NTRAPS];
+
+static void sh_trap_handler(int sig)
+{
+    for (int i = 1; i < SH_NTRAPS; i++)
+        if (sh_trap_sigs[i].sig == sig)
+            sh_trap_pending[i] = 1;
+}
+
+/* The sh_trap_sigs index a trap condition names (EXIT, INT, SIGINT, 2...), or
+ * -1.
+ */
+static int sh_trap_index(const char *s)
+{
+    char *end;
+    long n = strtol(s, &end, 10);
+
+    if (!strncmp(s, "SIG", 3))
+        s += 3;
+    for (int i = 0; i < SH_NTRAPS; i++)
+        if (!strcmp(s, sh_trap_sigs[i].name) ||
+            (*end == '\0' && end != s && n == sh_trap_sigs[i].sig))
+            return i;
+    return -1;
+}
+
+/* Set trap i to action (NULL: the default, "": ignored), taking it over. */
+static void sh_set_trap(struct sh *sh, int i, char *action)
+{
+    struct sigaction sa = {0};
+
+    free(sh->traps[i]);
+    sh->traps[i] = action;
+    sh->trap_inherited[i] = false;
+    if (i == 0)
+        return;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART;
+    if (!action)
+        /* An interactive shell ignores ^C itself (run_interactive). */
+        sa.sa_handler = sh->interactive && sh_trap_sigs[i].sig == SIGINT
+                            ? SIG_IGN
+                            : SIG_DFL;
+    else
+        sa.sa_handler = *action ? sh_trap_handler : SIG_IGN;
+    sigaction(sh_trap_sigs[i].sig, &sa, NULL);
+}
+
+/* trap [-- ] [ACTION CONDITION...]: with no operands, list the traps in a form
+ * the shell can read back; ACTION `-` resets a condition, "" ignores it. A
+ * first operand that is a number is a condition, so every operand is reset.
+ */
+static int builtin_trap(struct sh *sh, int argc, char **argv)
+{
+    int a = 1;
+    int rc = 0;
+    const char *action;
+
+    if (a < argc && !strcmp(argv[a], "--"))
+        a++;
+    if (a == argc) {
+        for (int i = 0; i < SH_NTRAPS; i++) {
+            if (!sh->traps[i])
+                continue;
+            fputs("trap -- '", stdout);
+            for (const char *c = sh->traps[i]; *c; c++)
+                fputs(*c == '\'' ? "'\\''" : (char[2]){*c, '\0'}, stdout);
+            printf("' %s\n", sh_trap_sigs[i].name);
+        }
+        return 0;
+    }
+    action = argv[a];
+    if ((*action && action[strspn(action, "0123456789")] == '\0') ||
+        a + 1 == argc)
+        action = "-"; /* `trap 2` or `trap INT`: reset */
+    else
+        a++;
+    for (; a < argc; a++) {
+        int i = sh_trap_index(argv[a]);
+        char *copy = NULL;
+
+        if (i < 0) {
+            fprintf(stderr, "trap: %s: bad trap\n", argv[a]);
+            rc = 1;
+            continue;
+        }
+        if (strcmp(action, "-") && !(copy = strdup(action))) {
+            rc = 1;
+            continue;
+        }
+        sh_set_trap(sh, i, copy);
+    }
+    return rc;
+}
+
+/* Run the actions of the signals caught since the last call. A trap action does
+ * not change $?.
+ */
+static void sh_run_traps(struct sh *sh)
+{
+    static bool running;
+
+    if (running)
+        return;
+    running = true;
+    for (int i = 1; i < SH_NTRAPS; i++) {
+        int status = sh->last_status;
+
+        if (!sh_trap_pending[i])
+            continue;
+        sh_trap_pending[i] = 0;
+        if (sh->traps[i] && *sh->traps[i] && !sh->trap_inherited[i]) {
+            (void) run_text(sh, sh->traps[i]);
+            if (!sh->exit_requested)
+                sh->last_status = status;
+        }
+    }
+    running = false;
+}
+
+/* At exit, run the EXIT trap, once, with $? the exit status.
+ *
+ * Returns the status to exit with: the trap's if it ran `exit`.
+ */
+static int sh_exit_trap(struct sh *sh, int status)
+{
+    char *action = sh->traps[0];
+    int rc;
+
+    if (!action || sh->trap_inherited[0]) /* not this shell's own */
+        return status;
+    sh->traps[0] = NULL;
+    sh->last_status = status;
+    sh->exit_requested = false;
+    sh->return_requested = false;
+    sh->loop_break = sh->loop_continue = 0;
+    rc = run_text(sh, action);
+    free(action);
+    return sh->exit_requested ? rc : status;
+}
+
 static int run_builtin(struct sh *sh,
                        char **argv,
                        int argc,
@@ -2414,21 +2721,9 @@ static int run_builtin(struct sh *sh,
                 puts(envp[i]);
             return 0;
         }
-        for (int i = 1; argv[i]; i++) {
-            if (is_assignment(argv[i])) {
-                char *tmp = strdup(argv[i]);
-                char *eq;
-                if (!tmp)
-                    return 1;
-                eq = strchr(tmp, '=');
-                *eq++ = '\0';
-                if (setenv(tmp, eq, 1) != 0) {
-                    free(tmp);
-                    return 1;
-                }
-                free(tmp);
-            }
-        }
+        for (int i = 1; argv[i]; i++)
+            if (is_assignment(argv[i]) && sh_assign(argv[i], NULL) != 0)
+                return 1;
         return 0;
     }
     if (!strcmp(argv[0], "unset")) {
@@ -2486,7 +2781,7 @@ static int run_builtin(struct sh *sh,
     if (!strcmp(argv[0], "help")) {
         puts(
             "builtins: : cd exit export unset set shift pwd echo read source "
-            "exec test waitfor help");
+            "exec test trap waitfor help");
         puts(
             "editing: arrows/home/end, backspace/delete, Ctrl-A/E/U/K/L/D, "
             "Tab");
@@ -2496,6 +2791,8 @@ static int run_builtin(struct sh *sh,
         return builtin_read(argv, in_fd);
     if (!strcmp(argv[0], "waitfor"))
         return builtin_waitfor(argc, argv);
+    if (!strcmp(argv[0], "trap"))
+        return builtin_trap(sh, argc, argv);
     if (!strcmp(argv[0], "jobs"))
         return builtin_jobs();
     if (!strcmp(argv[0], "fg") || !strcmp(argv[0], "bg"))
@@ -2519,7 +2816,7 @@ static int run_builtin(struct sh *sh,
                 return 1;
             }
         }
-        rc = joined ? run_line(sh, joined) : 0;
+        rc = joined ? run_text(sh, joined) : 0;
         free(joined);
         return rc;
     }
@@ -2634,7 +2931,8 @@ static void sh_reap_zombies(void)
             j->stopped = true;
             sh_job_report(j, "Stopped");
         } else {
-            sh_job_report(j, "Done");
+            if (sh_jc)
+                sh_job_report(j, "Done");
             j->pid = 0;
         }
     }
@@ -2643,14 +2941,18 @@ static void sh_reap_zombies(void)
 /* Spawn argv with the given fds. If pid_out is non-NULL, the pid is returned
  * via *pid_out and the function returns 0 without waiting (used to assemble a
  * pipeline that is waited on collectively). Otherwise, the call blocks on
- * waitpid().
+ * waitpid(). background 1 starts a job named `label` (NULL: argv[0]); 2 is an
+ * earlier stage of a background pipeline, which belongs to the job its last
+ * stage starts. close_fd, when not -1, is an fd the child must not inherit.
  */
 static int run_external(char **argv,
                         int in_fd,
                         int out_fd,
                         int err_fd,
                         int background,
-                        pid_t *pid_out)
+                        pid_t *pid_out,
+                        const char *label,
+                        int close_fd)
 {
     posix_spawn_file_actions_t actions;
     posix_spawn_file_actions_t *actions_p = NULL;
@@ -2688,6 +2990,13 @@ static int run_external(char **argv,
         if (err != EOK)
             goto fail;
     }
+    if (close_fd >= 0) {
+        err = posix_spawn_file_actions_addclose(&actions, close_fd);
+        if (err != EOK)
+            goto fail;
+    }
+    if (!label)
+        label = argv[0];
 
     if (sh_jc) {
         /* The first process of a pipeline starts its group; the rest join it.
@@ -2697,9 +3006,13 @@ static int run_external(char **argv,
             (void) posix_spawnattr_setpgroup(attr_p, sh_jc_pgid);
             (void) posix_spawnattr_setflags(attr_p, POSIX_SPAWN_SETPGROUP);
         }
-        snprintf(sh_jc_cmd, sizeof sh_jc_cmd, "%s", argv[0]);
+        snprintf(sh_jc_cmd, sizeof sh_jc_cmd, "%s", label);
     }
-    err = posix_spawnp(&pid, argv[0], actions_p, attr_p, argv, NULL);
+
+    /* Output the shell buffered so far must not land after the child's. */
+    fflush(stdout);
+    fflush(stderr);
+    err = posix_spawnp(&pid, argv[0], actions_p, attr_p, argv, sh_environ());
     posix_spawn_file_actions_destroy(&actions);
     if (attr_p)
         posix_spawnattr_destroy(attr_p);
@@ -2718,14 +3031,17 @@ static int run_external(char **argv,
             (void) kill(-pid, SIGCONT);
         }
     }
+    if (background == 2)
+        return 0;
     if (background) {
         struct sh_job *j =
-            sh_jc ? sh_job_add(sh_jc_pgid, pid, argv[0], false) : NULL;
+            sh_job_add(sh_jc ? sh_jc_pgid : pid, pid, label, false);
 
+        sh_last_bg = pid;
         if (j)
-            printf("[%d] %d\n", sh_job_number(j), pid);
+            fprintf(stderr, "[%d] %d\n", sh_job_number(j), pid);
         else
-            printf("%d\n", pid);
+            fprintf(stderr, "%d\n", pid);
         return 0;
     }
     if (pid_out) {
@@ -2759,6 +3075,264 @@ static int builtin_exec(char **argv, int in_fd, int out_fd, int err_fd)
     execvp(argv[1], &argv[1]);
     fprintf(stderr, "%s: %s\n", argv[1], strerror(errno));
     return 127;
+}
+
+/* Subshell state.
+ *
+ * A builtin, a function, or a compound command that must not run in the shell
+ * itself (it is in the background, or writes into a pipe whose reader is not
+ * running yet) runs in a child `sh -S FD`. The parent writes the state the
+ * child needs to FD, an inherited pipe: a run of NUL-terminated fields that
+ * sh_state_load() reads back in the same order. Values are never quoted, so a
+ * value cannot be mistaken for a field boundary or for shell syntax.
+ *
+ * Variables are not in it: every shell variable lives in environ (setenv),
+ * which the child inherits. The shell has no traps to carry.
+ */
+#define SH_STATE_MAGIC "sh-state-1"
+
+/* The shell a subshell runs: never looked up in PATH, which the script may have
+ * pointed elsewhere.
+ */
+#ifndef SH_SELF_PATH
+#define SH_SELF_PATH "/bin/sh"
+#endif
+
+/* Blob being built; err sticks once an allocation fails. */
+struct sh_wblob {
+    char *b;
+    size_t len;
+    size_t cap;
+    bool err;
+};
+
+static void blob_put(struct sh_wblob *w, const char *s)
+{
+    if (!w->err && (append_str(&w->b, &w->len, &w->cap, s) != 0 ||
+                    append_char(&w->b, &w->len, &w->cap, '\0') != 0))
+        w->err = true;
+}
+
+static void blob_putn(struct sh_wblob *w, long v)
+{
+    char nb[24];
+
+    snprintf(nb, sizeof nb, "%ld", v);
+    blob_put(w, nb);
+}
+
+static void blob_put_lines(struct sh_wblob *w, char **lines, int n)
+{
+    blob_putn(w, n);
+    for (int i = 0; i < n; i++)
+        blob_put(w, lines[i]);
+}
+
+/* Serialise sh's state plus the command to run: kind 'a' is a simple command
+ * that sh_print_argv printed, for run_line; 'c' is command text for run_text;
+ * 's' is script lines for run_script_range.
+ *
+ * Returns the malloc'd blob (its size in *lenp), or NULL on allocation failure.
+ */
+static char *sh_state_blob(struct sh *sh,
+                           char kind,
+                           char **lines,
+                           int nlines,
+                           size_t *lenp)
+{
+    struct sh_wblob w = {0};
+    char cwd[PATH_MAX];
+    char opts[4];
+    int nopt = 0;
+    int njobs = 0;
+    int ntraps = 0;
+    char kb[2] = {kind, '\0'};
+    mode_t mask = umask(0);
+
+    (void) umask(mask);
+
+    /* Where `set -e` is ignored (a condition), it stays ignored in the
+     * subshell.
+     */
+    if (sh->opt_errexit && !sh->errexit_suppress)
+        opts[nopt++] = 'e';
+    if (sh->opt_nounset)
+        opts[nopt++] = 'u';
+    if (sh->opt_xtrace)
+        opts[nopt++] = 'x';
+    opts[nopt] = '\0';
+    if (!getcwd(cwd, sizeof cwd))
+        cwd[0] = '\0';
+    for (int i = 0; i < SH_JOBS; i++)
+        njobs += sh_jobs[i].pid != 0;
+    for (int i = 0; i < SH_NTRAPS; i++)
+        ntraps += sh->traps[i] != NULL;
+    blob_put(&w, SH_STATE_MAGIC);
+    blob_putn(&w, sh->last_status);
+    blob_put(&w, opts);
+    blob_putn(&w, (long) mask);
+    blob_put(&w, cwd);
+    blob_putn(&w, sh_pid());
+    blob_putn(&w, sh_last_bg);
+    blob_put(&w, sh->arg0 ? sh->arg0 : "sh");
+    blob_put_lines(&w, sh->params, sh->nparams);
+    blob_putn(&w, sh->nfuncs);
+    for (int i = 0; i < sh->nfuncs; i++) {
+        blob_put(&w, sh->funcs[i].name);
+        blob_put_lines(&w, sh->funcs[i].body.line, sh->funcs[i].body.count);
+    }
+    blob_putn(&w, ntraps);
+    for (int i = 0; i < SH_NTRAPS; i++) {
+        if (sh->traps[i]) {
+            blob_putn(&w, i);
+            blob_put(&w, sh->traps[i]);
+        }
+    }
+    blob_putn(&w, njobs);
+    for (int i = 0; i < SH_JOBS; i++) {
+        struct sh_job *j = &sh_jobs[i];
+
+        if (!j->pid)
+            continue;
+        blob_putn(&w, i);
+        blob_putn(&w, j->pgid);
+        blob_putn(&w, j->pid);
+        blob_putn(&w, j->stopped);
+        blob_put(&w, j->cmd);
+    }
+    blob_put(&w, kb);
+    blob_put_lines(&w, lines, nlines);
+    if (w.err) {
+        free(w.b);
+        return NULL;
+    }
+    *lenp = w.len;
+    return w.b;
+}
+
+/* Print argv back as one command line that, tokenized again, yields the same
+ * words: every character but a few inert ones is backslash-escaped, a blank is
+ * double-quoted, and an empty word is ''. The child thus neither expands,
+ * splits nor globs a word a second time.
+ *
+ * Returns a malloc'd string, or NULL on allocation failure.
+ */
+static char *sh_print_argv(char **argv, int argc)
+{
+    char *buf = NULL;
+    size_t len = 0;
+    size_t cap = 0;
+
+    for (int i = 0; i < argc; i++) {
+        const char *s = argv[i];
+
+        if (i > 0 && append_char(&buf, &len, &cap, ' ') != 0)
+            goto oom;
+        if (*s == '\0' && append_str(&buf, &len, &cap, "''") != 0)
+            goto oom;
+        for (; *s != '\0'; s++) {
+            char q[4] = {'\\', *s, '\0', '\0'};
+
+            if (isalnum((unsigned char) *s) || strchr("_-./=,:+@%", *s)) {
+                q[0] = *s;
+                q[1] = '\0';
+            } else if (isspace((unsigned char) *s)) {
+                /* Double-quoted: a line trim would eat an escaped blank. */
+                q[0] = q[2] = '"';
+            }
+            if (append_str(&buf, &len, &cap, q) != 0)
+                goto oom;
+        }
+    }
+    return buf ? buf : strdup("");
+
+oom:
+    free(buf);
+    return NULL;
+}
+
+/* Run lines (see sh_state_blob for kind) in a child shell holding sh's state,
+ * with the given stdin/stdout/stderr; label names the job. Background and
+ * pid_out behave as in run_external, which does the spawning, so the child
+ * joins the job's process group; one of them must be set, since the state is
+ * written only once the child is running.
+ *
+ * Returns 0, or nonzero when the child could not be started or given its state
+ * (in the latter case it is still running, and *pid_out is set).
+ */
+static int sh_spawn_sub(struct sh *sh,
+                        char kind,
+                        char **lines,
+                        int nlines,
+                        int in_fd,
+                        int out_fd,
+                        int err_fd,
+                        int background,
+                        pid_t *pid_out,
+                        const char *label)
+{
+    char fdarg[16];
+    char *argv[] = {SH_SELF_PATH, "-S", fdarg, NULL};
+    size_t len;
+    size_t off = 0;
+    char *blob = sh_state_blob(sh, kind, lines, nlines, &len);
+    int pfd[2];
+    int rc;
+
+    if (!blob) {
+        fprintf(stderr, "sh: out of memory\n");
+        return 1;
+    }
+    if (pipe(pfd) != 0) {
+        fprintf(stderr, "sh: pipe: %s\n", strerror(errno));
+        free(blob);
+        return 1;
+    }
+
+    /* Keep the state fd clear of the stdio fds the child's are dup2'ed onto. */
+    if (pfd[0] <= STDERR_FILENO) {
+        int fd = fcntl(pfd[0], F_DUPFD, STDERR_FILENO + 1);
+
+        close(pfd[0]);
+        pfd[0] = fd;
+    }
+    if (pfd[0] < 0) {
+        fprintf(stderr, "sh: fcntl: %s\n", strerror(errno));
+        close(pfd[1]);
+        free(blob);
+        return 1;
+    }
+    snprintf(fdarg, sizeof fdarg, "%d", pfd[0]);
+    rc = run_external(argv, in_fd, out_fd, err_fd, background, pid_out, label,
+                      pfd[1]);
+    close(pfd[0]);
+    if (rc == 0) {
+        /* A child that died before reading its state must not take the shell
+         * down with SIGPIPE.
+         */
+        struct sigaction ign = {.sa_handler = SIG_IGN};
+        struct sigaction old;
+
+        sigemptyset(&ign.sa_mask);
+        sigaction(SIGPIPE, &ign, &old);
+        while (off < len) {
+            ssize_t w = write(pfd[1], blob + off, len - off);
+
+            if (w < 0 && errno == EINTR)
+                continue;
+            if (w <= 0)
+                break;
+            off += (size_t) w;
+        }
+        sigaction(SIGPIPE, &old, NULL);
+        if (off < len) {
+            fprintf(stderr, "sh: subshell state: %s\n", strerror(errno));
+            rc = 1;
+        }
+    }
+    close(pfd[1]);
+    free(blob);
+    return rc;
 }
 
 /* Redirect stdio to the in/out/err fds around a builtin call so commands like
@@ -2807,6 +3381,145 @@ static void sh_redir_restore(int saved[3])
     }
 }
 
+/* Whether name is a special builtin (POSIX 2.15) this shell has. */
+static bool is_special_builtin(const char *name)
+{
+    static const char *const special[] = {
+        ":",      ".",   "break", "continue", "eval",  "exec", "exit",
+        "export", "set", "shift", "return",   "unset", "trap", NULL,
+    };
+
+    for (int i = 0; special[i]; i++)
+        if (!strcmp(special[i], name))
+            return true;
+    return false;
+}
+
+/* Set the variable a NAME=value word names. With saved, first store in *saved
+ * what it was, as "NAME=old", or "NAME" when unset, for sh_unassign.
+ *
+ * Returns 0, or -1 with nothing changed.
+ */
+static int sh_assign(const char *word, char **saved)
+{
+    size_t n = (size_t) (strchr(word, '=') - word);
+    char *name = dup_range(word, n);
+    int rc;
+
+    if (!name)
+        return -1;
+    if (saved) {
+        const char *old = getenv(name);
+        size_t len = n + (old ? strlen(old) + 1 : 0) + 1;
+
+        *saved = malloc(len);
+        if (!*saved) {
+            free(name);
+            return -1;
+        }
+        snprintf(*saved, len, "%s%s%s", name, old ? "=" : "", old ? old : "");
+    }
+    rc = setenv(name, word + n + 1, 1);
+    free(name);
+    if (rc != 0 && saved) {
+        free(*saved);
+        *saved = NULL;
+    }
+    return rc == 0 ? 0 : -1;
+}
+
+/* Undo sh_assign from what it saved, and free that. */
+static void sh_unassign(char *saved)
+{
+    char *eq = strchr(saved, '=');
+
+    if (eq) {
+        *eq = '\0';
+        setenv(saved, eq + 1, 1);
+    } else {
+        sh_unsetenv(saved);
+    }
+    free(saved);
+}
+
+/* Open the redirections in tok[a,b), left to right, into own[]: the new stdin,
+ * stdout and stderr, or -1 where there is none. A `>&N` duplicates what fd N is
+ * at that point, so `>f 2>&1` sends both to f: own[N] once it is redirected,
+ * else pass[N], the fd the command would get, else N itself. The other words
+ * are stored in argv (which may be NULL).
+ *
+ * Returns their count, or -1 after reporting a failed redirection, with own[]
+ * closed.
+ */
+static int sh_open_redirs(struct sh_token *tok,
+                          int a,
+                          int b,
+                          const int pass[3],
+                          int own[3],
+                          char **argv)
+{
+    int argc = 0;
+
+    own[0] = own[1] = own[2] = -1;
+    for (int i = a; i < b; i++) {
+        enum sh_op op = tok[i].op;
+        const char *path;
+        int slot;
+        int fd;
+
+        if (op == SH_WORD) {
+            if (argv)
+                argv[argc] = tok[i].s;
+            argc++;
+            continue;
+        }
+        if (!is_redir_op(op) || i + 1 >= b || tok[i + 1].op != SH_WORD)
+            continue;
+        path = tok[++i].s;
+        slot = op == SH_LT                                             ? 0
+               : op == SH_ERRGT || op == SH_ERRGTGT || op == SH_DUPERR ? 2
+                                                                       : 1;
+        if (op == SH_DUPOUT || op == SH_DUPERR) {
+            long t = strtol(path, NULL, 10); /* digits only (tokenize) */
+
+            if (t <= 2)
+                t = own[t] >= 0 ? own[t] : pass[t] >= 0 ? pass[t] : t;
+            if (t > INT_MAX) {
+                fd = -1;
+                errno = EBADF;
+            } else {
+                fd = dup((int) t);
+            }
+        } else {
+            int flags = slot == 0
+                            ? O_RDONLY
+                            : O_WRONLY | O_CREAT |
+                                  (op == SH_GTGT || op == SH_ERRGTGT ? O_APPEND
+                                                                     : O_TRUNC);
+
+            /* ipc-send: utils ->
+             * roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring
+             */
+            fd = open(path, flags, 0666);
+        }
+        if (fd < 0) {
+            fprintf(stderr, "sh: %s: %s\n", path, strerror(errno));
+            for (int k = 0; k < 3; k++) {
+                close_if_needed(own[k]);
+                own[k] = -1;
+            }
+            return -1;
+        }
+        close_if_needed(own[slot]); /* `cmd <a <b` keeps the last */
+        own[slot] = fd;
+    }
+    return argc;
+}
+
+/* Run the simple command tok[a,b). Set `sub` when it is in the background, or
+ * feeds a pipe whose reader the shell has yet to start: what would run inside
+ * the shell then runs in a child shell (sh_spawn_sub).
+ */
 static int command_from_tokens(struct sh *sh,
                                struct sh_token *tok,
                                int a,
@@ -2815,74 +3528,59 @@ static int command_from_tokens(struct sh *sh,
                                int out_fd,
                                int err_fd,
                                int background,
-                               pid_t *pid_out)
+                               pid_t *pid_out,
+                               int sub)
 {
     char *argv[SH_MAX_TOKENS];
-    int argc = 0;
-    int own_in = -1;
-    int own_out = -1;
-    int own_err = -1;
+    int argc;
+    const int pass[3] = {in_fd, out_fd, err_fd};
+    int own[3];
     int handled = 0;
     int skip_func = 0;
+    int nassign = 0;            /* leading NAME=value words */
+    bool keep = true;           /* whether they outlive the command */
+    char *saved[SH_MAX_TOKENS]; /* what they replaced, for sh_unassign */
     int rc;
-    const char *open_path = NULL;
 
-    for (int i = a; i < b; i++) {
-        if (tok[i].op == SH_WORD) {
-            argv[argc++] = tok[i].s;
-        } else if ((tok[i].op == SH_LT || tok[i].op == SH_GT ||
-                    tok[i].op == SH_GTGT || tok[i].op == SH_ERRGT ||
-                    tok[i].op == SH_ERRGTGT) &&
-                   i + 1 < b && tok[i + 1].op == SH_WORD) {
-            int flags;
-            int fd;
-            open_path = tok[i + 1].s;
-            if (tok[i].op == SH_LT) {
-                /* `cmd <a <b` keeps the last input; close the prior open. */
-                close_if_needed(own_in);
-                own_in = -1;
+    argc = sh_open_redirs(tok, a, b, pass, own, argv);
+    if (argc < 0)
+        return 1;
+    argv[argc] = NULL;
 
-                /* ipc-send: utils ->
-                 * roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring
-                 */
-                own_in = open(tok[i + 1].s, O_RDONLY);
-                if (own_in < 0)
-                    goto open_fail;
-            } else if ((tok[i].op == SH_ERRGT || tok[i].op == SH_ERRGTGT) &&
-                       tok[i + 1].s[0] == '&') {
-                int target = atoi(tok[i + 1].s + 1);
-                close_if_needed(own_err);
-                own_err = -1;
-                if (target == STDOUT_FILENO && own_out >= 0)
-                    own_err = dup(own_out);
-                else
-                    own_err = dup(target);
-                if (own_err < 0)
-                    goto open_fail;
-            } else {
-                flags = O_WRONLY | O_CREAT |
-                        ((tok[i].op == SH_GTGT || tok[i].op == SH_ERRGTGT)
-                             ? O_APPEND
-                             : O_TRUNC);
+    /* A pending here-document feeds stdin of the pipeline's first stage (the
+     * one with no upstream pipe, in_fd < 0), unless an explicit `<` overrides
+     * it.
+     */
+    if (own[0] < 0 && in_fd < 0 && sh->heredoc_fd >= 0)
+        in_fd = sh->heredoc_fd;
+    in_fd = own[0] >= 0 ? own[0] : in_fd;
+    out_fd = own[1] >= 0 ? own[1] : out_fd;
+    err_fd = own[2] >= 0 ? own[2] : err_fd;
 
-                /* ipc-send: utils ->
-                 * roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring
-                 */
-                fd = open(tok[i + 1].s, flags, 0666);
-                if (fd < 0)
-                    goto open_fail;
-                if (tok[i].op == SH_ERRGT || tok[i].op == SH_ERRGTGT) {
-                    close_if_needed(own_err);
-                    own_err = fd;
-                } else {
-                    close_if_needed(own_out);
-                    own_out = fd;
-                }
-            }
-            i++;
+    /* What would run inside the shell -- a lone assignment, a builtin, a
+     * function -- runs in a child shell instead when `sub` is set. The child
+     * gets the words, already expanded, and the redirected fds.
+     */
+    while (nassign < argc && is_assignment(argv[nassign]))
+        nassign++;
+    if (sub && argc > 0) {
+        char **cv = argv + nassign;
+        int cc = argc - nassign;
+        int k = cc >= 2 && !strcmp(cv[0], "command") && strcmp(cv[1], "-v") &&
+                strcmp(cv[1], "-V");
+
+        if (cc == 0 || is_builtin(cv[k]) || (!k && sh_find_func(sh, cv[0]))) {
+            char *line = sh_print_argv(argv, argc);
+
+            if (!line)
+                fprintf(stderr, "sh: out of memory\n");
+            rc = line ? sh_spawn_sub(sh, 'a', &line, 1, in_fd, out_fd, err_fd,
+                                     background, pid_out, argv[0])
+                      : 1;
+            free(line);
+            goto done;
         }
     }
-    argv[argc] = NULL;
 
     /* set -x: trace the expanded simple command to stderr before running it.
      * Redirections are not shown (a documented simplification).
@@ -2896,19 +3594,24 @@ static int command_from_tokens(struct sh *sh,
     rc = 0;
     if (argc == 0)
         goto done;
-    if (argc == 1 && is_assignment(argv[0])) {
-        char *tmp = strdup(argv[0]);
-        char *eq;
-        if (!tmp) {
+
+    /* NAME=value words: alone, they set shell variables. Before a command, they
+     * are in its environment only, except for a special builtin, where they
+     * stay (POSIX 2.9.1.2).
+     */
+    keep = nassign == argc || is_special_builtin(argv[nassign]);
+    for (int i = 0; i < nassign; i++) {
+        if (sh_assign(argv[i], keep ? NULL : &saved[i]) != 0) {
+            nassign = i;
             rc = 1;
             goto done;
         }
-        eq = strchr(tmp, '=');
-        *eq++ = '\0';
-        rc = setenv(tmp, eq, 1) == 0 ? 0 : 1;
-        free(tmp);
-        goto done;
     }
+    if (nassign == argc)
+        goto done;
+    memmove(argv, argv + nassign,
+            (size_t) (argc - nassign + 1) * sizeof(*argv));
+    argc -= nassign;
 
     /* `command NAME [args]` runs NAME as a builtin or external, bypassing a
      * shell function of the same name. `command -v/-V` is the reporting form,
@@ -2921,16 +3624,6 @@ static int command_from_tokens(struct sh *sh,
         argc--;
         skip_func = 1;
     }
-
-    /* A pending here-document feeds stdin of the pipeline's first stage (the
-     * one with no upstream pipe, in_fd < 0), unless an explicit `<` overrides
-     * it.
-     */
-    if (own_in < 0 && in_fd < 0 && sh->heredoc_fd >= 0)
-        in_fd = sh->heredoc_fd;
-    in_fd = own_in >= 0 ? own_in : in_fd;
-    out_fd = own_out >= 0 ? own_out : out_fd;
-    err_fd = own_err >= 0 ? own_err : err_fd;
     if (!strcmp(argv[0], "exec")) {
         rc = builtin_exec(argv, in_fd, out_fd, err_fd);
         handled = 1;
@@ -2955,18 +3648,31 @@ static int command_from_tokens(struct sh *sh,
         sh_redir_restore(saved);
     }
     if (!handled)
-        rc = run_external(argv, in_fd, out_fd, err_fd, background, pid_out);
-    goto done;
-
-open_fail:
-    fprintf(stderr, "sh: %s: %s\n", open_path ? open_path : "?",
-            strerror(errno));
-    rc = 1;
+        rc = run_external(argv, in_fd, out_fd, err_fd, background, pid_out,
+                          NULL, -1);
 done:
-    close_if_needed(own_in);
-    close_if_needed(own_out);
-    close_if_needed(own_err);
+    for (int i = nassign - 1; !keep && i >= 0; i--) /* X=1 X=2: last first */
+        sh_unassign(saved[i]);
+    for (int k = 0; k < 3; k++)
+        close_if_needed(own[k]);
     return rc;
+}
+
+/* Without job control, an asynchronous list reads /dev/null rather than the
+ * shell's input (POSIX), unless a here-document or a redirection says
+ * otherwise.
+ *
+ * Returns the fd to use as its stdin, or -1 for the shell's own.
+ */
+static int sh_bg_stdin(struct sh *sh)
+{
+    if (sh_jc || sh->heredoc_fd >= 0)
+        return -1;
+
+    /* ipc-send: utils ->
+     * roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring
+     */
+    return open("/dev/null", O_RDONLY | O_CLOEXEC);
 }
 
 static int run_pipeline(struct sh *sh,
@@ -3002,17 +3708,27 @@ static int run_pipeline(struct sh *sh,
                     rc = 1;
                     goto wait_and_return;
                 }
+
+                /* The writer must not hold its own pipe's read end. A read end
+                 * on a stdio fd (the shell's was closed) is not dup2'ed by the
+                 * reader's spawn, so it must stay inheritable.
+                 */
+                if (pfd[0] > STDERR_FILENO)
+                    (void) fcntl(pfd[0], F_SETFD, FD_CLOEXEC);
                 out = pfd[1];
             }
             if (background) {
-                rc = command_from_tokens(sh, tok, start, i, input, out, -1, 1,
-                                         NULL);
+                /* One job per pipeline: its last stage's. */
+                if (input < 0)
+                    input = sh_bg_stdin(sh);
+                rc = command_from_tokens(sh, tok, start, i, input, out, -1,
+                                         is_last ? 1 : 2, NULL, 1);
             } else if (!is_last) {
                 /* Foreground intermediate: spawn without waiting; the shell
                  * waits after the last stage exits.
                  */
                 rc = command_from_tokens(sh, tok, start, i, input, out, -1, 0,
-                                         &pid);
+                                         &pid, 1);
                 if (pid > 0 && npids < (int) (sizeof(pids) / sizeof(pids[0])))
                     pids[npids++] = pid;
             } else {
@@ -3020,7 +3736,7 @@ static int run_pipeline(struct sh *sh,
                  * Builtins set pid=-1 and return the status in rc.
                  */
                 rc = command_from_tokens(sh, tok, start, i, input, out, -1, 0,
-                                         &pid);
+                                         &pid, 0);
                 if (pid > 0)
                     last_pid = pid;
                 else
@@ -3186,13 +3902,13 @@ static int split_statements(const char *line, struct sh_stmt *out, int max)
         }
 
         /* A `#` starts a comment only at a word boundary, so it does not
-         * mistake the `#` in a `${VAR#pat}` expansion for one; a `2>&N`
+         * mistake the `#` in a `${VAR#pat}` expansion for one; a `>&N`
          * redirection's `&` is not a separator.
          */
-        if (c == '#' && (p == line || strchr(" \t;&|<>()", p[-1]) != NULL))
+        if (c == '#' && is_comment_start(line, p))
             break;
-        if (c == '2' && p[1] == '>' && p[2] == '&') {
-            p += 3;
+        if (c == '>' && p[1] == '&') {
+            p += 2;
             while (isdigit((unsigned char) *p))
                 p++;
             continue;
@@ -3230,12 +3946,14 @@ fail:
     return -1;
 }
 
-static int run_line(struct sh *sh, const char *line)
+/* Run the list on line as if it continued one whose last command ended in
+ * `prev` with status rc: after SH_AND or SH_OR, its first AND-OR operands may
+ * be skipped.
+ */
+static int run_list(struct sh *sh, const char *line, enum sh_op prev, int rc)
 {
     struct sh_stmt *stmt = malloc(sizeof(*stmt) * SH_MAX_TOKENS);
-    enum sh_op prev = SH_SEMI;
     int nstmt;
-    int rc = 0;
 
     if (!stmt) {
         fprintf(stderr, "sh: out of memory\n");
@@ -3290,6 +4008,7 @@ static int run_line(struct sh *sh, const char *line)
                 stmt[i].sep == SH_SEMI)
                 sh->exit_requested = true;
         }
+        sh_run_traps(sh);
         prev = stmt[i].sep;
         if (sh->exit_requested)
             break;
@@ -3299,6 +4018,11 @@ static int run_line(struct sh *sh, const char *line)
     free(stmt);
     sh->last_status = rc;
     return rc;
+}
+
+static int run_line(struct sh *sh, const char *line)
+{
+    return run_list(sh, line, SH_SEMI, 0);
 }
 
 static int script_add(struct sh_script *sc, const char *line)
@@ -3421,14 +4145,16 @@ static int brace_delta(const char *s)
  *
  * Returns 1 if a definition was consumed, 0 if the line is not one, -1 on
  * error. Handles the body brace on the def line, on the next line, and a
- * one-line `name() { ...; }`.
+ * one-line `name() { ...; }`, after which the rest of the line (`; f &`), if
+ * any, is added to *rest for the caller to run.
  */
 static int heredoc_skip(struct sh_script *sc, int i, int to, char *line);
 
 static int capture_func_def(struct sh *sh,
                             struct sh_script *sc,
                             int *ip,
-                            int to)
+                            int to,
+                            struct sh_script *rest)
 {
     char line[SH_LINE_MAX];
     char name[64];
@@ -3464,14 +4190,40 @@ static int capture_func_def(struct sh *sh,
         if (brace_delta(p) < 0) {
             struct sh_script one = {0};
             char body[SH_LINE_MAX];
-            char *rb;
+            char *rb = body;
+            int depth = 1;
 
+            /* The body ends at the `}` that balances the opening one; a brace
+             * that is quoted or escaped does not count.
+             */
             snprintf(body, sizeof(body), "%s", p);
-            rb = strrchr(body, '}');
-            if (rb)
-                *rb = '\0';
+            for (int q = 0; *rb != '\0'; rb++) {
+                if (*rb == '\\' && q != '\'' && rb[1] != '\0') {
+                    rb++;
+                    continue;
+                }
+                if (q) {
+                    q = *rb == q ? 0 : q;
+                    continue;
+                }
+                if (*rb == '\'' || *rb == '"') {
+                    q = *rb;
+                    continue;
+                }
+                depth += (*rb == '{') - (*rb == '}');
+                if (depth == 0)
+                    break;
+            }
+            if (*rb != '\0') {
+                *rb++ = '\0';
+                rb += strspn(rb, " \t");
+                rb += *rb == ';';
+                if (*rb != '\0' &&
+                    (script_add(rest, rb) != 0 || script_explode(rest) != 0))
+                    return -1;
+            }
             trim(body);
-            if (script_add(&one, body) != 0 ||
+            if (script_add(&one, body) != 0 || script_explode(&one) != 0 ||
                 sh_add_func(sh, name, &one, 0, one.count) != 0) {
                 script_free(&one);
                 return -1;
@@ -3594,8 +4346,7 @@ static bool starts_word(const char *line, const char *word)
         line++;
     n = strlen(word);
     return strncmp(line, word, n) == 0 &&
-           (line[n] == '\0' || line[n] == ' ' || line[n] == '\t' ||
-            line[n] == ';' || line[n] == '\n');
+           (line[n] == '\0' || strchr(" \t;\n|&<>", line[n]));
 }
 
 /* Scan `line` for an unquoted here-document operator (`<<` / `<<-`), skipping
@@ -3633,6 +4384,8 @@ static char *heredoc_find(char *line)
             q = c;
             continue;
         }
+        if (c == '#' && is_comment_start(line, p))
+            break; /* a comment */
         if (c == '`') {
             for (p++; *p && *p != '`'; p++)
                 if (*p == '\\' && p[1])
@@ -3759,6 +4512,87 @@ static int heredoc_skip(struct sh_script *sc, int i, int to, char *line)
     return to - 1;
 }
 
+/* Whether line goes on on the next one: it ends in an unquoted &&, || or |
+ * (before any comment), or in a backslash. *cut gets the length to keep, and
+ * *blank whether to join the next line with a blank.
+ */
+static bool line_continues(const char *line, size_t *cut, bool *blank)
+{
+    bool op = false;  /* the last character is an operator that continues */
+    bool amp = false; /* it is an unquoted & that does not end a && */
+    bool esc = false; /* it is a backslash at the very end */
+    size_t end = 0;   /* just past it */
+    int q = 0;
+
+    for (const char *p = line; *p != '\0'; p++) {
+        if (*p == ' ' || *p == '\t') {
+            if (!q)
+                continue;
+        } else if (!q && *p == '#' && is_comment_start(line, p)) {
+            break;
+        }
+        if (q || *p == '\\' || *p == '\'' || *p == '"') {
+            if (q && *p == '\\' && q == '"' && p[1] != '\0')
+                p++;
+            else if (q)
+                q = *p == q ? 0 : q;
+            else if (*p == '\\' && p[1] != '\0')
+                p++;
+            else if (*p == '\\')
+                esc = true;
+            else
+                q = *p;
+            op = amp = false;
+        } else {
+            op = *p == '|' || (*p == '&' && amp);
+            amp = *p == '&' && !amp;
+        }
+        end = (size_t) (p - line) + 1;
+    }
+    if (q)
+        return false;
+    *cut = esc ? end - 1 : end;
+    *blank = !esc;
+    return esc || op;
+}
+
+/* Join each line of sc that line_continues with the next, at load time, leaving
+ * here-document bodies alone.
+ *
+ * Returns 0, or -1 on allocation failure.
+ */
+static int script_join_lines(struct sh_script *sc)
+{
+    for (int i = 0; i < sc->count; i++) {
+        char t[SH_LINE_MAX];
+        size_t cut;
+        bool blank;
+
+        snprintf(t, sizeof t, "%s", sc->line[i]);
+        trim(t);
+        if (heredoc_find(t)) {
+            i = heredoc_skip(sc, i, sc->count, t);
+            continue;
+        }
+        if (i + 1 < sc->count && line_continues(sc->line[i], &cut, &blank)) {
+            size_t n = strlen(sc->line[i + 1]);
+            char *j = realloc(sc->line[i], cut + blank + n + 1);
+
+            if (!j)
+                return -1;
+            j[cut] = ' ';
+            memcpy(j + cut + blank, sc->line[i + 1], n + 1);
+            sc->line[i] = j;
+            free(sc->line[i + 1]);
+            memmove(&sc->line[i + 1], &sc->line[i + 2],
+                    (size_t) (sc->count - i - 2) * sizeof(*sc->line));
+            sc->count--;
+            i--; /* the joined line may go on again */
+        }
+    }
+    return 0;
+}
+
 static int find_matching(struct sh_script *sc,
                          int from,
                          int to,
@@ -3840,98 +4674,91 @@ static int loop_consume(struct sh *sh)
     return 0;
 }
 
-static int run_if(struct sh *sh, struct sh_script *sc, int *ip, int to)
+/* The runners below take the opening line `at` and the closing line, which
+ * compound_end found; run_block leaves the caller past the latter.
+ */
+static int run_if(struct sh *sh,
+                  struct sh_script *sc,
+                  int at,
+                  int fi_i,
+                  int else_i)
 {
     char cond[SH_LINE_MAX];
     char *thenp;
-    int else_i;
-    int fi_i;
     int then_i;
     int rc;
 
-    snprintf(cond, sizeof(cond), "%s", sc->line[*ip]);
+    snprintf(cond, sizeof(cond), "%s", sc->line[at]);
     trim(cond);
     memmove(cond, cond + 2, strlen(cond + 2) + 1);
     trim(cond);
     thenp = strstr(cond, "; then");
     if (thenp) {
         *thenp = '\0';
-        then_i = *ip + 1;
+        then_i = at + 1;
     } else {
         size_t clen = strlen(cond);
 
         if (clen >= 4 && !strcmp(cond + clen - 4, "then")) {
             cond[clen - 4] = '\0';
-            then_i = *ip + 1;
+            then_i = at + 1;
         } else {
-            then_i = *ip + 2;
+            then_i = at + 2;
         }
     }
     trim(cond);
     sh->errexit_suppress++; /* set -e is ignored while testing the condition */
     rc = run_line(sh, cond);
     sh->errexit_suppress--;
-    fi_i = find_matching(sc, *ip + 1, to, "if", "else", "fi", &else_i);
-    if (fi_i < 0)
-        return 2;
     if (rc == 0)
         rc = run_script_range(sh, sc, then_i, else_i >= 0 ? else_i : fi_i);
     else if (else_i >= 0)
         rc = run_script_range(sh, sc, else_i + 1, fi_i);
-    *ip = fi_i;
     return rc;
 }
 
-static int run_for(struct sh *sh, struct sh_script *sc, int *ip, int to)
+static int run_for(struct sh *sh, struct sh_script *sc, int at, int done_i)
 {
     struct sh_token tok[SH_MAX_TOKENS];
     struct sh_words vals = {0};
     char *var = NULL;
     int ntok;
-    int done_i;
+    bool in;
     int rc = 0;
 
-    ntok = tokenize(sh, sc->line[*ip], tok);
+    ntok = tokenize(sh, sc->line[at], tok);
 
-    /* tok[1] (loop var) and tok[2] ("in") must be words: an operator token
-     * carries s == NULL, so strcmp/strdup on it would dereference NULL. Reject
-     * `for` forms this shell does not accept (e.g. `for i; do`) as a syntax
-     * error rather than crashing.
+    /* tok[1] (loop var) must be a word: an operator token carries s == NULL, so
+     * strcmp/strdup on it would dereference NULL. Without `in`, the loop goes
+     * over "$@".
      */
-    if (ntok < 4 || tok[1].op != SH_WORD || tok[2].op != SH_WORD ||
-        strcmp(tok[0].s, "for") != 0 || strcmp(tok[2].s, "in") != 0) {
+    if (ntok < 2 || tok[1].op != SH_WORD || strcmp(tok[0].s, "for") != 0) {
         token_free(tok, ntok > 0 ? ntok : 0);
         return 2;
     }
+    in = ntok >= 3 && tok[2].op == SH_WORD && !strcmp(tok[2].s, "in");
     var = strdup(tok[1].s);
-    for (int i = 3; i < ntok; i++) {
-        if (tok[i].op == SH_WORD && strcmp(tok[i].s, "do") != 0) {
-            if (words_add_fields(&vals, tok[i].s) != 0) {
-                token_free(tok, ntok);
-                free(var);
-                words_free(&vals);
-                return 1;
-            }
-        }
-    }
+    for (int i = 3; in && i < ntok && rc == 0; i++)
+        if (tok[i].op == SH_WORD && strcmp(tok[i].s, "do") != 0)
+            rc = words_add(&vals, tok[i].s);
+    for (int i = 0; !in && i < sh->nparams && rc == 0; i++)
+        rc = words_add(&vals, sh->params[i]);
     token_free(tok, ntok);
-    done_i = find_done(sc, *ip + 1, to);
-    if (done_i < 0) {
+    if (rc != 0 || !var) {
         free(var);
         words_free(&vals);
-        return 2;
+        return 1;
     }
     sh->loop_depth++;
     for (int i = 0; i < vals.n && !sh->exit_requested; i++) {
         setenv(var, vals.v[i], 1);
-        rc = run_script_range(sh, sc, *ip + 1, done_i);
+        rc = run_script_range(sh, sc, at + 1, done_i);
         if (loop_consume(sh))
             break;
     }
     sh->loop_depth--;
     free(var);
     words_free(&vals);
-    *ip = done_i;
     return rc;
 }
 
@@ -3973,17 +4800,16 @@ static char *find_do_kw(char *s)
 /* while/until COND; do BODY; done. `until` inverts the condition sense. */
 static int run_while(struct sh *sh,
                      struct sh_script *sc,
-                     int *ip,
-                     int to,
+                     int at,
+                     int done_i,
                      int until)
 {
     char cond[SH_LINE_MAX];
     char *dop;
     int do_i;
-    int done_i;
     int rc = 0;
 
-    snprintf(cond, sizeof(cond), "%s", sc->line[*ip]);
+    snprintf(cond, sizeof(cond), "%s", sc->line[at]);
     trim(cond);
     memmove(cond, cond + 5, strlen(cond + 5) + 1); /* drop "while"/"until" */
     trim(cond);
@@ -3995,22 +4821,17 @@ static int run_while(struct sh *sh,
                (dop[-1] == ' ' || dop[-1] == '\t' || dop[-1] == ';'))
             dop--;
         *dop = '\0';
-        do_i = *ip + 1;
+        do_i = at + 1;
     } else {
         /* `do` must be alone on the next line, else the loop is malformed */
         char nl[SH_LINE_MAX];
 
-        if (*ip + 1 >= to)
-            return 2;
-        snprintf(nl, sizeof(nl), "%s", sc->line[*ip + 1]);
+        snprintf(nl, sizeof(nl), "%s", sc->line[at + 1]);
         trim(nl);
         if (strcmp(nl, "do") != 0)
             return 2;
-        do_i = *ip + 2;
+        do_i = at + 2;
     }
-    done_i = find_done(sc, *ip + 1, to);
-    if (done_i < 0)
-        return 2;
     sh->loop_depth++;
     while (!sh->exit_requested) {
         int ok;
@@ -4025,20 +4846,17 @@ static int run_while(struct sh *sh,
             break;
     }
     sh->loop_depth--;
-    *ip = done_i;
     return rc;
 }
 
-static int run_case(struct sh *sh, struct sh_script *sc, int *ip, int to)
+static int run_case(struct sh *sh, struct sh_script *sc, int at, int esac_i)
 {
     struct sh_token tok[SH_MAX_TOKENS];
     char *word = NULL;
     int ntok;
-    int esac_i;
-    int mid;
     int rc = 0;
 
-    ntok = tokenize(sh, sc->line[*ip], tok);
+    ntok = tokenize(sh, sc->line[at], tok);
 
     /* tok[1] (the case word) must be a word; an operator token has s == NULL,
      * so strdup(NULL) would crash. Reject `case ; esac` as a syntax error.
@@ -4051,12 +4869,7 @@ static int run_case(struct sh *sh, struct sh_script *sc, int *ip, int to)
     token_free(tok, ntok);
     if (!word)
         return 1;
-    esac_i = find_matching(sc, *ip + 1, to, "case", NULL, "esac", &mid);
-    if (esac_i < 0) {
-        free(word);
-        return 2;
-    }
-    for (int i = *ip + 1; i < esac_i && !sh->exit_requested; i++) {
+    for (int i = at + 1; i < esac_i && !sh->exit_requested; i++) {
         char line[SH_LINE_MAX];
         char *rp;
         snprintf(line, sizeof(line), "%s", sc->line[i]);
@@ -4076,7 +4889,6 @@ static int run_case(struct sh *sh, struct sh_script *sc, int *ip, int to)
         }
     }
     free(word);
-    *ip = esac_i;
     return rc;
 }
 
@@ -4139,7 +4951,7 @@ static char *expand_string(struct sh *sh, const char *s)
             }
             if (!inner)
                 goto oom;
-            if (capture_command(inner, &result) != 0) {
+            if (capture_command(sh, inner, &result) != 0) {
                 free(inner);
                 free(result);
                 goto oom;
@@ -4312,18 +5124,435 @@ static int run_heredoc(struct sh *sh,
     return rc;
 }
 
+/* Whether statement s starts with one of the words in kw (NULL-terminated). */
+static bool starts_any(const char *s, const char *const *kw)
+{
+    for (; *kw; kw++)
+        if (starts_word(s, *kw))
+            return true;
+    return false;
+}
+
+/* Split a line holding a whole compound command (`while :; do :; done &`) into
+ * the one-keyword-per-line form the block runners expect: a statement per
+ * line, `do`, `then` and `else` on lines of their own, `&&`/`||` lists and a
+ * trailing `&` kept on their line.
+ *
+ * Returns 1 with the lines in *out, or 0 when the line does not open and close
+ * a compound command (a `case`, or a block continued on later lines), which is
+ * then run as before.
+ */
+static int sh_explode(const char *line, struct sh_script *out)
+{
+    static const char *const lead[] = {"do", "then", "else", NULL};
+    static const char *const openers[] = {"if", "for", "while", "until", NULL};
+    static const char *const close[] = {"fi", "done", NULL};
+    struct sh_stmt *st;
+    char cur[SH_LINE_MAX];
+    size_t used = 0;
+    int depth = 0;
+    int opened = 0;
+    int ok = 1;
+    int n;
+
+    /* Cheap filter: a whole compound on one line has a `;` and ends one. */
+    if (!strchr(line, ';') || (!strstr(line, "done") && !strstr(line, "fi")))
+        return 0;
+    st = malloc(sizeof(*st) * SH_MAX_TOKENS);
+    if (!st)
+        return 0;
+    n = split_statements(line, st, SH_MAX_TOKENS);
+    for (int i = 0; i < n && ok; i++) {
+        char *t = st[i].text;
+        int w;
+
+        trim(t);
+        if (used == 0) {
+            for (int k = 0; lead[k]; k++) {
+                if (starts_word(t, lead[k])) {
+                    ok = script_add(out, lead[k]) == 0;
+                    t += strlen(lead[k]);
+                    t += strspn(t, " \t");
+                    break;
+                }
+            }
+            if (starts_word(t, "case"))
+                ok = 0;
+            if (starts_any(t, openers)) {
+                depth++;
+                opened = 1;
+            } else if (starts_any(t, close)) {
+                /* A pipe or redirection stays on the `done`/`fi` line, for
+                 * run_compound.
+                 */
+                if (--depth < 0)
+                    ok = 0;
+            }
+        }
+        if (*t == '\0' && st[i].sep != SH_BG)
+            continue;
+        w = snprintf(cur + used, sizeof cur - used, "%s%s", t,
+                     st[i].sep == SH_AND  ? " && "
+                     : st[i].sep == SH_OR ? " || "
+                     : st[i].sep == SH_BG ? " &"
+                                          : "");
+        if (w < 0 || (size_t) w >= sizeof cur - used) {
+            ok = 0;
+        } else if (st[i].sep == SH_AND || st[i].sep == SH_OR) {
+            used += (size_t) w;
+        } else {
+            ok = script_add(out, cur) == 0;
+            used = 0;
+        }
+    }
+    for (int i = 0; i < n; i++)
+        free(st[i].text);
+    free(st);
+    if (ok && opened && depth == 0 && used == 0)
+        return 1;
+    script_free(out);
+    return 0;
+}
+
+/* Whether s starts with NAME(), a function definition. */
+static bool starts_func_def(const char *s)
+{
+    s += strspn(s, " \t");
+    if (!isalpha((unsigned char) *s) && *s != '_')
+        return false;
+    while (is_name_char((unsigned char) *s))
+        s++;
+    s += strspn(s, " \t");
+    if (*s++ != '(')
+        return false;
+    s += strspn(s, " \t");
+    return *s == ')';
+}
+
+/* Split every line of sc that holds a whole compound command into the
+ * one-keyword-per-line form the block runners expect (sh_explode), once, when
+ * the script is loaded. Here-document bodies are left alone, and so is a
+ * function definition, whose body is split when it is defined.
+ *
+ * Returns 0, or -1 on allocation failure.
+ */
+static int script_explode(struct sh_script *sc)
+{
+    struct sh_script out = {0};
+    int rc = 0;
+
+    for (int i = 0; i < sc->count && rc == 0; i++) {
+        struct sh_script one = {0};
+        char t[SH_LINE_MAX];
+        int last = i;
+
+        snprintf(t, sizeof t, "%s", sc->line[i]);
+        trim(t);
+        if (heredoc_find(t))
+            last = heredoc_skip(sc, i, sc->count, t);
+        else if (!starts_func_def(t) && sh_explode(sc->line[i], &one))
+            last = -1;
+        for (int k = 0; k < one.count && rc == 0; k++)
+            rc = script_add(&out, one.line[k]);
+        for (; i <= last && rc == 0; i++)
+            rc = script_add(&out, sc->line[i]);
+        if (last >= 0)
+            i--;
+        script_free(&one);
+    }
+    if (rc != 0) {
+        script_free(&out);
+        return -1;
+    }
+    script_free(sc);
+    *sc = out;
+    return 0;
+}
+
+/* The line that closes the compound command opening at line i (its fi, done or
+ * esac), or -1 if there is none; *mid gets the line of an if's else, or -1.
+ * This is the one scan of the command's lines.
+ */
+static int compound_end(struct sh_script *sc, int i, int to, int *mid)
+{
+    bool is_if = starts_word(sc->line[i], "if");
+
+    *mid = -1;
+    if (is_if || starts_word(sc->line[i], "case"))
+        return find_matching(sc, i + 1, to, is_if ? "if" : "case",
+                             is_if ? "else" : NULL, is_if ? "fi" : "esac", mid);
+    return find_done(sc, i + 1, to);
+}
+
+/* Run the compound command from line *ip to its closing line end, with an if's
+ * else at line mid, and leave *ip at end.
+ */
+static int run_block(struct sh *sh,
+                     struct sh_script *sc,
+                     int *ip,
+                     int end,
+                     int mid)
+{
+    const char *line = sc->line[*ip];
+    int rc;
+
+    if (starts_word(line, "if"))
+        rc = run_if(sh, sc, *ip, end, mid);
+    else if (starts_word(line, "for"))
+        rc = run_for(sh, sc, *ip, end);
+    else if (starts_word(line, "while") || starts_word(line, "until"))
+        rc = run_while(sh, sc, *ip, end, starts_word(line, "until"));
+    else
+        rc = run_case(sh, sc, *ip, end);
+    *ip = end;
+    return rc;
+}
+
+/* Copy lines [i,end) of sc and then `last` into *sub, a script of its own.
+ *
+ * Returns 0, or -1 on allocation failure.
+ */
+static int sh_sub_script(struct sh_script *sc,
+                         int i,
+                         int end,
+                         const char *last,
+                         struct sh_script *sub)
+{
+    for (int k = i; k < end; k++)
+        if (script_add(sub, sc->line[k]) != 0)
+            return -1;
+    return script_add(sub, last);
+}
+
+/* The first `|` in s outside quotes and command substitutions and that a
+ * backslash does not escape, or NULL.
+ */
+static char *find_pipe(char *line)
+{
+    int depth = 0;   /* inside $( ... ) */
+    bool bq = false; /* inside ` ... ` */
+    char *s = line;
+
+    for (int q = 0; *s != '\0'; s++) {
+        if (*s == '\\' && q != '\'' && s[1] != '\0')
+            s++;
+        else if (q)
+            q = *s == q ? 0 : q;
+        else if (*s == '\'' || *s == '"')
+            q = *s;
+        else if (*s == '`')
+            bq = !bq;
+        else if (*s == '(')
+            depth += depth > 0 || (s > line && s[-1] == '$');
+        else if (*s == ')' && depth > 0)
+            depth--;
+        else if (*s == '|' && depth == 0 && !bq)
+            return s;
+    }
+    return NULL;
+}
+
+/* Run the compound command from line *ip to line end, whose trimmed closing
+ * line `last` goes on after its kw-long keyword with a tail: redirections,
+ * which apply to the whole command; a `|` and a pipeline, which it feeds
+ * from a subshell; and an && or || list. Kept out of run_compound so that a
+ * compound command without a tail does not carry the token array on the stack
+ * while its body runs.
+ */
+static __attribute__((noinline)) int run_compound_tail(struct sh *sh,
+                                                       struct sh_script *sc,
+                                                       int *ip,
+                                                       int end,
+                                                       int mid,
+                                                       char *last,
+                                                       int kw)
+{
+    char *tail = last + kw + strspn(last + kw, " \t");
+    char *pipe_at;
+    const char *rest = NULL;
+    struct sh_stmt *st = malloc(sizeof(*st) * SH_MAX_TOKENS);
+    struct sh_token tok[SH_MAX_TOKENS];
+    int pass[3] = {-1, -1, -1};
+    int own[3] = {-1, -1, -1};
+    int pfd[2] = {-1, -1};
+    enum sh_op sep = SH_SEMI;
+    int words;
+    int ntok;
+    int rc;
+
+    /* The tail's first statement holds the redirections and the pipeline; an
+     * AND-OR list may follow it.
+     */
+    ntok = st ? split_statements(tail, st, SH_MAX_TOKENS) : -1;
+    if (ntok > 1) {
+        size_t cut = strlen(st[0].text);
+
+        sep = st[0].sep;
+        rest = tail + cut + (sep == SH_SEMI ? 1 : 2);
+        tail[cut] = '\0';
+    }
+    for (int k = 0; k < ntok; k++)
+        free(st[k].text);
+    free(st);
+    if (ntok < 0) {
+        fprintf(stderr, "sh: parse error\n");
+        *ip = end;
+        return 2;
+    }
+    pipe_at = find_pipe(tail);
+    if (pipe_at) {
+        *pipe_at++ = '\0';
+        if (pipe(pfd) != 0) {
+            fprintf(stderr, "sh: pipe: %s\n", strerror(errno));
+            *ip = end;
+            return 1;
+        }
+        (void) fcntl(pfd[0], F_SETFD, FD_CLOEXEC);
+        pass[1] = pfd[1]; /* so a 2>&1 duplicates the pipe */
+    }
+
+    sh->expand_abort = false;
+    ntok = tokenize(sh, tail, tok);
+    if (ntok < 0 || sh->expand_abort) {
+        rc = ntok < 0 ? 2 : sh->last_status;
+    } else if ((words = sh_open_redirs(tok, 0, ntok, pass, own, NULL)) != 0) {
+        if (words > 0)
+            fprintf(stderr, "sh: syntax error after `%.*s'\n", kw, last);
+        rc = words > 0 ? 2 : 1;
+    } else if (pipe_at) {
+        /* The compound runs in a subshell writing the pipe, not a job of its
+         * own, while the shell runs the pipeline it feeds with the pipe as its
+         * stdin.
+         */
+        struct sh_script sub = {0};
+        pid_t pid = -1;
+        bool jc = sh_jc;
+        int saved[3];
+
+        last[kw] = '\0'; /* the keyword; the subshell gets no tail */
+        rc = 1;
+        sh_jc = false;
+        if (sh_sub_script(sc, *ip, end, last, &sub) == 0)
+            rc = sh_spawn_sub(sh, 's', sub.line, sub.count, own[0],
+                              own[1] >= 0 ? own[1] : pfd[1], own[2], 0, &pid,
+                              sub.line[0]);
+        sh_jc = jc;
+        script_free(&sub);
+
+        /* The reader sees end of file once the subshell alone holds the write
+         * end, also as a 2>&1 duplicate of it.
+         */
+        for (int k = 0; k < 3; k++) {
+            close_if_needed(own[k]);
+            own[k] = -1;
+        }
+        close(pfd[1]);
+        pfd[1] = -1;
+        if (rc == 0) {
+            if (sh_redir_apply(pfd[0], -1, -1, saved) == 0)
+                rc = run_text(sh, pipe_at);
+            else
+                rc = 1;
+            sh_redir_restore(saved);
+        }
+        if (pid > 0)
+            (void) waitpid(pid, NULL, 0);
+    } else {
+        int saved[3];
+
+        if (sh_redir_apply(own[0], own[1], own[2], saved) != 0) {
+            fprintf(stderr, "sh: redirection failed: %s\n", strerror(errno));
+            rc = 1;
+        } else {
+            rc = run_block(sh, sc, ip, end, mid);
+        }
+        sh_redir_restore(saved);
+    }
+    if (ntok >= 0)
+        token_free(tok, ntok);
+    for (int k = 0; k < 3; k++)
+        close_if_needed(own[k]);
+    close_if_needed(pfd[0]);
+    close_if_needed(pfd[1]);
+    *ip = end;
+    sh->last_status = rc;
+    return rest && !sh->exit_requested ? run_list(sh, rest, sep, rc) : rc;
+}
+
+/* Run the compound command opening at line *ip, and leave *ip at its last line.
+ * A trailing `&` on its closing fi, done or esac runs the whole command in a
+ * background subshell; any other text there is a tail for run_compound_tail.
+ */
+static __attribute__((noinline)) int run_compound_rest(struct sh *sh,
+                                                       struct sh_script *sc,
+                                                       int *ip,
+                                                       int end,
+                                                       int mid)
+{
+    char last[SH_LINE_MAX];
+    struct sh_script sub = {0};
+    size_t n;
+    int kw; /* length of the closing keyword */
+    int in;
+    int rc;
+
+    snprintf(last, sizeof last, "%s", sc->line[end]);
+    trim(last);
+    n = strlen(last);
+    kw = starts_word(last, "fi") ? 2 : 4;
+    if (n < 2 || last[n - 1] != '&' || last[n - 2] == '&')
+        return run_compound_tail(sh, sc, ip, end, mid, last, kw);
+
+    in = sh_bg_stdin(sh);
+    last[n - 1] = '\0';
+    sh_jc_pgid = 0; /* a job of its own */
+    rc = sh_sub_script(sc, *ip, end, last, &sub) == 0
+             ? sh_spawn_sub(sh, 's', sub.line, sub.count, in, -1, -1, 1, NULL,
+                            sub.line[0])
+             : 1;
+    close_if_needed(in);
+    script_free(&sub);
+    *ip = end;
+    return rc;
+}
+
+static int run_compound(struct sh *sh, struct sh_script *sc, int *ip, int to)
+{
+    int mid;
+    int end = compound_end(sc, *ip, to, &mid);
+    const char *tail;
+
+    if (end < 0) {
+        fprintf(stderr, "sh: syntax error: compound command not closed\n");
+        return 2;
+    }
+
+    /* The common case, a bare closing keyword, runs without the stack the tail
+     * and background paths need while the body runs.
+     */
+    tail = sc->line[end] + strspn(sc->line[end], " \t");
+    tail += starts_word(tail, "fi") ? 2 : 4;
+    if (tail[strspn(tail, " \t\r")] == '\0')
+        return run_block(sh, sc, ip, end, mid);
+    return run_compound_rest(sh, sc, ip, end, mid);
+}
+
 static int run_script_range(struct sh *sh,
                             struct sh_script *sc,
                             int from,
                             int to)
 {
+    static const char *const compound[] = {"if",    "for",  "while",
+                                           "until", "case", NULL};
     int rc = 0;
 
     for (int i = from; i < to && !sh->exit_requested && !sh->return_requested &&
                        !sh->loop_break && !sh->loop_continue;
          i++) {
         char line[SH_LINE_MAX];
+        struct sh_script one = {0};
         int def;
+
         snprintf(line, sizeof(line), "%s", sc->line[i]);
         trim(line);
         if (line[0] == '\0' || line[0] == '#')
@@ -4332,23 +5561,18 @@ static int run_script_range(struct sh *sh,
             starts_word(line, "else") || starts_word(line, "fi") ||
             starts_word(line, "done") || starts_word(line, "esac"))
             continue;
-        def = capture_func_def(sh, sc, &i, to);
+        def = capture_func_def(sh, sc, &i, to, &one);
         if (def != 0) {
             if (def < 0)
                 rc = 2;
+            else if (one.count > 0)
+                rc = run_script_range(sh, &one, 0, one.count);
+            script_free(&one);
             continue;
         }
-        if (starts_word(line, "if"))
-            rc = run_if(sh, sc, &i, to);
-        else if (starts_word(line, "for"))
-            rc = run_for(sh, sc, &i, to);
-        else if (starts_word(line, "while"))
-            rc = run_while(sh, sc, &i, to, 0);
-        else if (starts_word(line, "until"))
-            rc = run_while(sh, sc, &i, to, 1);
-        else if (starts_word(line, "case"))
-            rc = run_case(sh, sc, &i, to);
-        else {
+        if (starts_any(line, compound)) {
+            rc = run_compound(sh, sc, &i, to);
+        } else {
             char *hh = heredoc_find(line);
 
             if (hh)
@@ -4395,6 +5619,16 @@ static int run_function(struct sh *sh,
     return rc;
 }
 
+/* Prepare loaded lines to run: continued lines joined, one-line compound
+ * commands split.
+ *
+ * Returns 0, or -1 on allocation failure.
+ */
+static int script_prepare(struct sh_script *sc)
+{
+    return script_join_lines(sc) == 0 ? script_explode(sc) : -1;
+}
+
 static int run_file(struct sh *sh, const char *path)
 {
     struct sh_script sc = {0};
@@ -4409,13 +5643,41 @@ static int run_file(struct sh *sh, const char *path)
         fprintf(stderr, "sh: %s: %s\n", path, strerror(errno));
         return 1;
     }
-    rc = load_script(fd, &sc);
+    rc = load_script(fd, &sc) == 0 ? script_prepare(&sc) : -1;
     close(fd);
     if (rc != 0) {
         script_free(&sc);
         return 1;
     }
     rc = run_script_range(sh, &sc, 0, sc.count);
+    script_free(&sc);
+    return rc;
+}
+
+/* Run command text given as a string (sh -c, eval, the prompt, a subshell) as a
+ * script of its lines, loaded as a file would be, unless it is one line too
+ * long for a script line.
+ */
+static int run_text(struct sh *sh, const char *text)
+{
+    struct sh_script sc = {0};
+    int rc = 0;
+
+    if (strlen(text) >= SH_LINE_MAX && !strchr(text, '\n'))
+        return run_line(sh, text);
+    for (const char *p = text; rc == 0; p++) {
+        const char *nl = strchr(p, '\n');
+        char *l = dup_range(p, nl ? (size_t) (nl - p) : strlen(p));
+
+        rc = l ? script_add(&sc, l) : -1;
+        free(l);
+        if (!nl)
+            break;
+        p = nl;
+    }
+    if (rc == 0)
+        rc = script_prepare(&sc);
+    rc = rc == 0 ? run_script_range(sh, &sc, 0, sc.count) : 1;
     script_free(&sc);
     return rc;
 }
@@ -4466,7 +5728,7 @@ static int run_interactive(struct sh *sh)
         if (line[0] == '\0')
             continue;
         sh_add_history(sh, line);
-        rc = run_line(sh, line);
+        rc = run_text(sh, line);
     }
     if (sh_jc) {
         /* Hand the terminal back to the group we took it from (login, getty).
@@ -4479,22 +5741,178 @@ static int run_interactive(struct sh *sh)
     return rc;
 }
 
+/* Cursor over a state blob from sh_state_blob(). */
+struct sh_blob {
+    char *p;
+    char *end;
+    bool bad; /* a field was missing or malformed */
+};
+
+static char *blob_get(struct sh_blob *b)
+{
+    char *s = b->p;
+    char *nul =
+        b->p < b->end ? memchr(b->p, '\0', (size_t) (b->end - b->p)) : NULL;
+
+    if (!nul) {
+        b->bad = true;
+        return NULL;
+    }
+    b->p = nul + 1;
+    return s;
+}
+
+/* Read a number field in [lo, hi]. */
+static long blob_getn(struct sh_blob *b, long lo, long hi)
+{
+    char *s = blob_get(b);
+    char *e;
+    long v;
+
+    if (!s)
+        return lo;
+    errno = 0;
+    v = strtol(s, &e, 10);
+    if (e == s || *e != '\0' || errno || v < lo || v > hi) {
+        b->bad = true;
+        return lo;
+    }
+    return v;
+}
+
+/* Read a line-count field and then that many lines into *sc. */
+static int blob_get_lines(struct sh_blob *b, struct sh_script *sc)
+{
+    long n = blob_getn(b, 0, INT_MAX);
+
+    for (long i = 0; i < n && !b->bad; i++) {
+        char *s = blob_get(b);
+
+        if (s && script_add(sc, s) != 0)
+            return -1;
+    }
+    return b->bad ? -1 : 0;
+}
+
+/* The child side of sh_spawn_sub: read the state on fd, restore it, run the
+ * command it carries.
+ *
+ * Returns the command's exit status, or 2 when the state is unusable.
+ */
+static int sh_state_run(struct sh *sh, int fd)
+{
+    char *raw;
+    size_t len;
+    struct sh_blob b = {0};
+    struct sh_script sc = {0};
+    const char *kind;
+    int rc = 2;
+    bool ran = false;
+    long n;
+
+    if (read_all(fd, &raw, &len) != 0)
+        goto out;
+    close(fd);
+    b.p = raw;
+    b.end = raw + len;
+    if (!blob_get(&b) || strcmp(raw, SH_STATE_MAGIC) != 0)
+        goto out;
+    sh->last_status = (int) blob_getn(&b, INT_MIN, INT_MAX);
+    for (const char *o = blob_get(&b); o && *o; o++) {
+        sh->opt_errexit |= *o == 'e';
+        sh->opt_nounset |= *o == 'u';
+        sh->opt_xtrace |= *o == 'x';
+    }
+    (void) umask((mode_t) blob_getn(&b, 0, 0777));
+    {
+        const char *cwd = blob_get(&b);
+
+        /* Never run the command in some other directory. */
+        if (cwd && *cwd && chdir(cwd) != 0) {
+            fprintf(stderr, "sh: cd: %s: %s\n", cwd, strerror(errno));
+            goto out;
+        }
+    }
+    sh_top_pid = (pid_t) blob_getn(&b, 1, INT_MAX);
+    sh_last_bg = (pid_t) blob_getn(&b, 0, INT_MAX);
+    sh->arg0 = blob_get(&b);
+    if (blob_get_lines(&b, &sc) != 0 ||
+        sh_set_params(sh, sc.line, sc.count) != 0)
+        goto out;
+    script_free(&sc);
+    n = blob_getn(&b, 0, INT_MAX);
+    for (long i = 0; i < n && !b.bad; i++) {
+        const char *name = blob_get(&b);
+
+        if (blob_get_lines(&b, &sc) != 0 ||
+            sh_add_func(sh, name, &sc, 0, sc.count) != 0)
+            goto out;
+        script_free(&sc);
+    }
+
+    /* The parent's traps: `trap` lists them, but a subshell does not run them
+     * (POSIX 2.13); an ignored signal stays ignored across the exec.
+     */
+    n = blob_getn(&b, 0, SH_NTRAPS);
+    for (long i = 0; i < n && !b.bad; i++) {
+        int t = (int) blob_getn(&b, 0, SH_NTRAPS - 1);
+        const char *action = blob_get(&b);
+
+        if (action && !(sh->traps[t] = strdup(action)))
+            goto out;
+        sh->trap_inherited[t] = true;
+    }
+    n = blob_getn(&b, 0, SH_JOBS);
+    for (long i = 0; i < n && !b.bad; i++) {
+        struct sh_job *j = &sh_jobs[blob_getn(&b, 0, SH_JOBS - 1)];
+        const char *cmd;
+
+        j->pgid = (pid_t) blob_getn(&b, 0, INT_MAX);
+        j->pid = (pid_t) blob_getn(&b, 1, INT_MAX);
+        j->stopped = blob_getn(&b, 0, 1) != 0;
+        cmd = blob_get(&b);
+        snprintf(j->cmd, sizeof j->cmd, "%s", cmd ? cmd : "");
+    }
+    kind = blob_get(&b);
+    if (blob_get_lines(&b, &sc) != 0 || !kind || sc.count < 1 || !kind[0] ||
+        !strchr("acs", kind[0]) || kind[1] != '\0')
+        goto out;
+    ran = true;
+    if (kind[0] == 'a')
+        rc = run_line(sh, sc.line[0]);
+    else if (kind[0] == 'c')
+        rc = run_text(sh, sc.line[0]);
+    else
+        rc = run_script_range(sh, &sc, 0, sc.count);
+out:
+    if (!ran)
+        fprintf(stderr, "sh: bad subshell state\n");
+    script_free(&sc);
+    sh->arg0 = NULL; /* points into raw */
+    free(raw);
+    return rc;
+}
+
 int toolbox_sh_main(int argc, char **argv)
 {
     struct sh sh;
     int opt;
     const char *command = NULL;
+    int state_fd = -1;
 
     memset(&sh, 0, sizeof(sh));
     sh.heredoc_fd = -1;
     optind = 1;
-    while ((opt = getopt(argc, argv, "ic:")) != -1) {
+    while ((opt = getopt(argc, argv, "ic:S:")) != -1) {
         switch (opt) {
         case 'i':
             sh.interactive = true;
             break;
         case 'c':
             command = optarg;
+            break;
+        case 'S': /* internal: a subshell, its state on fd optarg */
+            state_fd = atoi(optarg);
             break;
         default:
             fprintf(stderr, "usage: sh [-i] [-c COMMAND] [SCRIPT]\n");
@@ -4503,7 +5921,9 @@ int toolbox_sh_main(int argc, char **argv)
     }
     if (!getenv("PATH"))
         setenv("PATH", "/bin:/sbin:/usr/bin:/usr/sbin", 1);
-    if (command) {
+    if (state_fd >= 0) {
+        opt = sh_state_run(&sh, state_fd);
+    } else if (command) {
         /* sh -c COMMAND [name [arg...]] */
         if (optind < argc) {
             sh.arg0 = argv[optind];
@@ -4511,7 +5931,7 @@ int toolbox_sh_main(int argc, char **argv)
         } else {
             sh.arg0 = argv[0];
         }
-        opt = run_line(&sh, command);
+        opt = run_text(&sh, command);
     } else if (optind < argc) {
         /* sh SCRIPT [arg...] */
         sh.arg0 = argv[optind];
@@ -4521,6 +5941,9 @@ int toolbox_sh_main(int argc, char **argv)
         sh.arg0 = argv[0];
         opt = run_interactive(&sh);
     }
+    opt = sh_exit_trap(&sh, opt);
+    for (int i = 0; i < SH_NTRAPS; i++)
+        free(sh.traps[i]);
     sh_free_history(&sh);
     sh_free_funcs(&sh);
     for (int i = 0; i < sh.nparams; i++)
