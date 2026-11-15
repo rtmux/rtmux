@@ -156,8 +156,7 @@ int kdecl ksys_thread_destroy(thread_t *act,
      * thread_destroy call so the captured thp can't be vector_rem'd by a
      * concurrent destroyer between our lookup and thread_destroy's own
      * vector_rem. The all-threads path takes the slock briefly around the
-     * snapshot of nentries/nfree; thread_destroyall walks the vector internally
-     * and acquires its own slock per iteration.
+     * thread_destroyall walk, which requires the caller to hold it.
      */
 
     /* __thread_destroy(-1) is no longer valid. Process exit goes through
@@ -206,7 +205,9 @@ int kdecl ksys_thread_destroy(thread_t *act,
     /* We are going to take out all threads. */
 
     /* We force the caller to kill all its sibling threads. */
+    kspinlock_lock(&prp->vec_slock);
     thread_destroyall(act);
+    kspinlock_unlock(&prp->vec_slock);
     return ENOERROR;
 }
 
@@ -227,17 +228,16 @@ int kdecl ksys_thread_destroyall(thread_t *act, struct kcall_args_null *kap)
     thread_t *thp;
     process_t *prp = act->process;
 
-    /* prp->vec_slock around the per-iteration slot lookup; released before
-     * per-thread writes + thread_destroy call (rank-inversion otherwise —
-     * thread_destroy acquires vec_slock internally for vector_rem). Snapshot
-     * nentries under the slock so growth from a concurrent thread_create
-     * doesn't extend our walk past the original count (any newly-created thread
-     * will be killed by the second pass during process exit, or by
-     * thread_destroy(act) below).
+    /* prp->vec_slock around the per-iteration slot lookup and the DETACHED |
+     * KILLSELF / status writes; released before the thread_destroy call
+     * (rank-inversion otherwise — thread_destroy acquires vec_slock internally
+     * for vector_rem). Snapshot nentries under the slock so growth from a
+     * concurrent thread_create doesn't extend our walk past the original count
+     * (any newly-created thread will be killed by the second pass during
+     * process exit, or by thread_destroy(act) below).
      *
-     * Per-thread writes (thp->flags, thp->status) and the thread_destroy call
-     * run with thp captured but unprotected — a thread_t UAF surface
-     * (RCU-retire-on-thread_t is the cohesive fix).
+     * The thread_destroy call runs with thp captured but unprotected — a
+     * thread_t UAF surface (RCU-retire-on-thread_t is the cohesive fix).
      */
 
 
@@ -254,15 +254,23 @@ int kdecl ksys_thread_destroyall(thread_t *act, struct kcall_args_null *kap)
         kspinlock_unlock(&prp->vec_slock);
 
         for (tid = 0; tid < nentries; ++tid) {
+            int kill;
+
+            /* Detach under vec_slock: a joiner tests DETACHED and reserves a
+             * zombie under the same lock, so it cannot slip in between.
+             */
             kspinlock_lock(&prp->vec_slock);
             thp = VECP2(thp, &prp->threads, tid);
-            kspinlock_unlock(&prp->vec_slock);
-
-            if (thp && thp != act &&
-                !(prp->pid == ROOTTASK_PID && thp->tid < num_processors)) {
+            kill = thp && thp != act &&
+                   !(prp->pid == ROOTTASK_PID && thp->tid < num_processors);
+            if (kill) {
                 atomic_or(&thp->flags,
                           (RTMUX_FLG_THR_DETACHED | RTMUX_FLG_THR_KILLSELF));
                 thp->status = 0;
+            }
+            kspinlock_unlock(&prp->vec_slock);
+
+            if (kill) {
                 thread_destroy(thp);
                 atomic_clr(&act->flags, RTMUX_FLG_THR_ONLYME);
                 killed++;

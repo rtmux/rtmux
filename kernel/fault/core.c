@@ -38,7 +38,9 @@ void rdecl deliver_fault(thread_t *thp, siginfo_t *info)
      * (e.g. system thread blocked in msg_receive_notification) so their
      * KILLSELF gets processed.
      */
+    kspinlock_lock(&prp->vec_slock);
     thread_destroyall(thp);
+    kspinlock_unlock(&prp->vec_slock);
 
     {
         int tid;
@@ -53,8 +55,9 @@ void rdecl deliver_fault(thread_t *thp, siginfo_t *info)
          * Read each slot (and nentries) UNDER vec_slock so we always see the
          * current buffer. We must NOT hold vec_slock across force_ready /
          * thread_destroy — thread_destroy takes it itself to vector_rem
-         * (lifecycle.c). The thread_t soul "t" is pool memory and outlives the
-         * vector realloc, so acting on it after dropping the lock is safe.
+         * (lifecycle.c). "t" stays valid after the lock drops because a reaper
+         * frees a thread only after an RCU-sched grace period, and this loop
+         * does not block before thread_destroy.
          */
         for (tid = 0;; ++tid) {
             int got;
@@ -63,7 +66,11 @@ void rdecl deliver_fault(thread_t *thp, siginfo_t *info)
                 kspinlock_unlock(&prp->vec_slock);
                 break;
             }
-            got = (VECP(t, &prp->threads, tid) && t != thp);
+
+            /* VECP2 so an unjoined zombie, whose slot is flagged invalid, is
+             * reaped too; thread_destroyall detached it.
+             */
+            got = ((t = VECP2(t, &prp->threads, tid)) && t != thp);
             kspinlock_unlock(&prp->vec_slock);
             if (got) {
                 force_ready(t, _FORCE_KILL_SELF);

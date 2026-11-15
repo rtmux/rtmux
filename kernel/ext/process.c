@@ -1121,7 +1121,9 @@ void kext_process_shutdown(void *data)
             /* siginfo lives in root_process_t; nothing to stamp here. */
         }
         pcpu_array[get_cpunum()].pc_active_prp = kernel_threads_prp;
+        kspinlock_lock(&prp->vec_slock);
         thread_destroyall(act);
+        kspinlock_unlock(&prp->vec_slock);
     } else {
         /* Caller used to receive prp->siginfo.si_status as the kernel extension
          * return; with siginfo gone from prp, return 0 (success). No kernel

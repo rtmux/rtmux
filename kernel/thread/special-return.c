@@ -254,11 +254,15 @@ void specialret_attr specialret(thread_t *thp)
                        RTMUX_FLG_THR_CANCELSELF);
             break;
 
+        /* Do not detach here. thread_destroy also parks an exiting thread on
+         * KILLSELF (STATE_STACK while roottask frees its stack, or until a
+         * remote hart or FPU context lets go), and detaching it then reaped a
+         * joinable thread before its joiner arrived, failing the join with
+         * ESRCH. A kill that must not leave a zombie sets DETACHED itself.
+         */
         case RTMUX_FLG_THR_KILLSELF:
             atomic_clr((volatile unsigned *) &thp->flags,
                        RTMUX_FLG_THR_KILLSELF);
-            atomic_or((volatile unsigned *) &thp->flags,
-                      RTMUX_FLG_THR_DETACHED);
             thread_destroy(thp);
             break;
 

@@ -492,15 +492,13 @@ if ! grep -q 'RTMUX_TCTL_THREAD_DESTROY_STATS' internal/include/sys/rtmux-core.h
     tests/userland/rt-latency/rcu-lookup-measure.c ||
    ! grep -q 'thread_destroy_expect_active_claim(label)' \
     tests/userland/rt-latency/rcu-lookup-measure.c ||
-   ! grep -q 'stats.destroy_claim_active != calls' \
+   ! grep -q 'stats.destroy_join_wake == 0' \
     tests/userland/rt-latency/rcu-lookup-measure.c ||
-   ! grep -q 'stats.destroy_claim_reserved != 0' \
-    tests/userland/rt-latency/rcu-lookup-measure.c ||
-   ! grep -q 'stats.destroy_join_wake != calls' \
+   ! grep -q 'stats.destroy_join_wake > stats.destroy_claim_active' \
     tests/userland/rt-latency/rcu-lookup-measure.c ||
    ! grep -q 'stats.destroy_join_wake_ns == 0' \
     tests/userland/rt-latency/rcu-lookup-measure.c ||
-   ! grep -q 'stats.destroy_join_post_ready != calls' \
+   ! grep -q 'stats.destroy_join_post_ready != stats.destroy_join_wake' \
     tests/userland/rt-latency/rcu-lookup-measure.c ||
    ! grep -q 'stats.destroy_join_post_ready_ns == 0' \
     tests/userland/rt-latency/rcu-lookup-measure.c ||
@@ -2022,16 +2020,20 @@ fi
 
 if ! awk '
     /void rdecl thread_specret\(thread_t \*thp\)/ { in_specret = 1 }
+    # Both steps must sit inside the WAITTHREAD guard, the clear before the
+    # ready: a parent woken first can join on another hart while the field
+    # still names it, and get EBUSY.
+    in_wait && /^    }$/ { in_wait = 0 }
     in_specret &&
         /if \(thp->join && thp->join->state == STATE_WAITTHREAD\) {/ {
-        saw_wait = NR
+        in_wait = 1
     }
-    in_specret && /ready\(thp->join\);/ { saw_ready = NR }
-    in_specret && /thp->join = NULL;/ { saw_clear = NR }
+    in_wait && /thread_t \*parent = thp->join;/ { saw_parent = NR }
+    in_wait && /thp->join = NULL;/ { saw_clear = NR }
+    in_wait && /ready\(parent\);/ { saw_ready = NR }
     in_specret && /^}/ { in_specret = 0 }
     END {
-        exit !(saw_wait && saw_ready && saw_clear &&
-               saw_wait < saw_ready && saw_ready < saw_clear)
+        exit !(saw_parent && saw_parent < saw_clear && saw_clear < saw_ready)
     }
 ' kernel/thread/lifecycle.c; then
     echo "RCU-sched: thread birth must clear the temporary join handshake" >&2
