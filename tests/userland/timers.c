@@ -20,6 +20,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/rtmux-core.h>
 #include <sys/siginfo.h>
@@ -1118,6 +1119,284 @@ static void test_rlimit_inherit(void)
           detail);
 }
 
+/* K11: RLIMIT_AS and RLIMIT_DATA are enforced when a mapping is created. Only
+ * the soft limit is lowered, so the hard limit stays RLIM_INFINITY and each
+ * case restores the process's limits when it is done.
+ *
+ * The process's usage is not exported, so rlm_usage finds it: with the soft
+ * limit at L bytes a one-page private anonymous mapping fits exactly when
+ * usage + page <= L, so a binary search over L recovers usage to the page. The
+ * cases then set the limit to usage plus RLM_N chunks and check where mapping
+ * stops.
+ */
+#define RLM_PAGE 4096UL
+#define RLM_CHUNK (64UL * 1024)
+#define RLM_N 8
+#define RLM_MAX_PAGES (1UL << 28) /* 1 TiB, above any usage here */
+#define RLM_FAILED ((size_t) -1)
+#define RLM_MALLOC (256UL * 1024) /* above malloc's direct-map threshold */
+
+static int rlm_set(int res, rlim_t cur)
+{
+    struct rlimit rl = {cur, RLIM_INFINITY};
+
+    return setrlimit(res, &rl);
+}
+
+static void *rlm_map(size_t len)
+{
+    return mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1,
+                0);
+}
+
+/* errno of a mapping of len with flags, or 0 if it fit (it is undone). */
+static int rlm_try_mapf(size_t len, int flags)
+{
+    void *p;
+
+    errno = 0;
+    p = mmap(NULL, len, PROT_READ | PROT_WRITE, flags, -1, 0);
+    if (p == MAP_FAILED)
+        return errno ? errno : -1;
+    (void) munmap(p, len);
+    return 0;
+}
+
+static int rlm_try_map(size_t len)
+{
+    return rlm_try_mapf(len, MAP_PRIVATE | MAP_ANON);
+}
+
+/* Bytes of res in use, or RLM_FAILED. Leaves the soft limit at RLIM_INFINITY.
+ */
+static size_t rlm_usage(int res)
+{
+    size_t lo = 0, hi = RLM_MAX_PAGES;
+
+    while (hi - lo > 1) {
+        size_t mid = lo + (hi - lo) / 2;
+
+        if (rlm_set(res, mid * RLM_PAGE) != 0)
+            break;
+        if (rlm_try_map(RLM_PAGE) == 0)
+            hi = mid;
+        else
+            lo = mid;
+    }
+    if (rlm_set(res, RLIM_INFINITY) != 0 || hi - lo > 1 || hi == RLM_MAX_PAGES)
+        return RLM_FAILED;
+    return (hi - 1) * RLM_PAGE;
+}
+
+/* Map RLM_CHUNK pieces into v[] until one fails or max are held. Returns the
+ * count; *err is the failing errno, or 0 if none failed.
+ */
+static int rlm_fill(void **v, int max, int *err)
+{
+    int n = 0;
+
+    *err = 0;
+    while (n < max) {
+        void *p = rlm_map(RLM_CHUNK);
+
+        if (p == MAP_FAILED) {
+            *err = errno;
+            break;
+        }
+        v[n++] = p;
+    }
+    return n;
+}
+
+static void rlm_unmap(void **v, int n)
+{
+    for (int i = 0; i < n; i++)
+        (void) munmap(v[i], RLM_CHUNK);
+}
+
+static void test_rlimit_as(void)
+{
+    void *v[RLM_N + 1], *p;
+    struct rlimit got = {0, 0};
+    size_t use, use2, lim;
+    int n, err, fixed_ok = 1;
+    char detail[160];
+
+    use = rlm_usage(RLIMIT_AS);
+    if (use == RLM_FAILED) {
+        test_fail("rlimit_as: usage probe", strerror(errno));
+        return;
+    }
+    lim = use + RLM_N * RLM_CHUNK;
+    if (rlm_set(RLIMIT_AS, lim) != 0) {
+        test_fail("rlimit_as: setrlimit", strerror(errno));
+        return;
+    }
+    check(getrlimit(RLIMIT_AS, &got) == 0 && got.rlim_cur == lim &&
+              got.rlim_max == RLIM_INFINITY,
+          "rlimit_as: getrlimit reads back the soft limit", "");
+
+    err = rlm_try_map(RLM_N * RLM_CHUNK + RLM_PAGE);
+    check(err == ENOMEM, "rlimit_as: mmap past the limit fails ENOMEM",
+          strerror(err));
+
+    n = rlm_fill(v, RLM_N + 1, &err);
+    snprintf(detail, sizeof detail, "mapped=%d of %d errno=%d", n, RLM_N, err);
+    check(n == RLM_N && err == ENOMEM,
+          "rlimit_as: mapping stops exactly at the limit", detail);
+
+    /* At the limit, a MAP_FIXED remap of a held chunk is net zero. */
+    for (int i = 0; n > 0 && i < 16; i++) {
+        p = mmap(v[0], RLM_CHUNK, PROT_READ | PROT_WRITE,
+                 MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
+        if (p != v[0]) {
+            fixed_ok = 0;
+            break;
+        }
+    }
+    check(n > 0 && fixed_ok,
+          "rlimit_as: MAP_FIXED replacement at the limit is charged net", "");
+    err = rlm_try_map(RLM_PAGE);
+    check(err == ENOMEM, "rlimit_as: limit still full after the replacements",
+          strerror(err));
+
+    /* A growing malloc needs a fresh mapping, so it fails at the limit too. */
+    errno = 0;
+    p = malloc(RLM_MALLOC);
+    err = errno;
+    free(p);
+    check(!p && err == ENOMEM, "rlimit_as: a growing malloc fails ENOMEM",
+          strerror(err));
+
+    rlm_unmap(v, n);
+    (void) rlm_set(RLIMIT_AS, RLIM_INFINITY);
+    p = malloc(RLM_MALLOC);
+    check(p != NULL, "rlimit_as: malloc succeeds after raising the limit", "");
+    free(p);
+    err = rlm_try_map(RLM_N * RLM_CHUNK + RLM_PAGE);
+    check(err == 0, "rlimit_as: raising the limit lets the mapping succeed",
+          strerror(err));
+
+    use2 = rlm_usage(RLIMIT_AS);
+    snprintf(detail, sizeof detail, "before=%zu after=%zu", use, use2);
+    check(use2 == use, "rlimit_as: munmap uncharges exactly (no drift)",
+          detail);
+}
+
+/* Two threads map concurrently against one limit. Both are created (stacks
+ * mapped) and parked before the usage probe, so the probe counts them and the
+ * limit leaves room for exactly RLM_N chunks in total.
+ */
+static _Atomic int rlm_start; /* 1 = limit set, go; -1 = abort */
+
+struct rlm_racer {
+    void *v[RLM_N + 1];
+    int n, err;
+};
+
+static void *rlm_race(void *arg)
+{
+    struct rlm_racer *r = arg;
+    int go;
+
+    while ((go = atomic_load(&rlm_start)) == 0)
+        sched_yield();
+    if (go > 0)
+        r->n = rlm_fill(r->v, RLM_N + 1, &r->err);
+    return NULL;
+}
+
+static void test_rlimit_as_concurrent(void)
+{
+    struct rlm_racer r[2];
+    pthread_t t[2];
+    size_t use = RLM_FAILED;
+    int made = 0;
+    char detail[160];
+
+    memset(r, 0, sizeof r);
+    atomic_store(&rlm_start, 0);
+    while (made < 2 && pthread_create(&t[made], NULL, rlm_race, &r[made]) == 0)
+        made++;
+    if (made == 2)
+        use = rlm_usage(RLIMIT_AS);
+    if (use != RLM_FAILED && rlm_set(RLIMIT_AS, use + RLM_N * RLM_CHUNK) != 0)
+        use = RLM_FAILED;
+    atomic_store(&rlm_start, use != RLM_FAILED ? 1 : -1);
+    for (int i = 0; i < made; i++)
+        (void) pthread_join(t[i], NULL);
+    (void) rlm_set(RLIMIT_AS, RLIM_INFINITY);
+
+    snprintf(detail, sizeof detail, "threads=%d use=%zu got=%d+%d errno=%d,%d",
+             made, use, r[0].n, r[1].n, r[0].err, r[1].err);
+    check(made == 2 && use != RLM_FAILED && r[0].n + r[1].n == RLM_N &&
+              r[0].err == ENOMEM && r[1].err == ENOMEM,
+          "rlimit_as: two concurrent mappers share the limit exactly", detail);
+    rlm_unmap(r[0].v, r[0].n);
+    rlm_unmap(r[1].v, r[1].n);
+}
+
+/* RLIMIT_DATA caps private anonymous memory, which is what malloc grows
+ * through: a growing malloc fails ENOMEM at the limit and succeeds once the
+ * limit is raised. A shared mapping is not data and still fits.
+ */
+#define RLM_MALLOC_MAX 64
+
+static void test_rlimit_data(void)
+{
+    const size_t big = 4 * RLM_MALLOC + RLM_PAGE;
+    void *blk[RLM_MALLOC_MAX], *p;
+    size_t use, lim;
+    int n = 0, err = 0;
+    char detail[160];
+
+    use = rlm_usage(RLIMIT_DATA);
+    if (use == RLM_FAILED) {
+        test_fail("rlimit_data: usage probe", strerror(errno));
+        return;
+    }
+    lim = use + 4 * RLM_MALLOC;
+    if (rlm_set(RLIMIT_DATA, lim) != 0) {
+        test_fail("rlimit_data: setrlimit", strerror(errno));
+        return;
+    }
+
+    err = rlm_try_map(big);
+    check(err == ENOMEM, "rlimit_data: private mmap past the limit fails ENOMEM",
+          strerror(err));
+
+    /* MAP_ELF and MAP_STACK are not a way out: anonymous private memory is
+     * data either way.
+     */
+    err = rlm_try_mapf(big, MAP_PRIVATE | MAP_ANON | MAP_ELF);
+    check(err == ENOMEM, "rlimit_data: MAP_ELF anonymous mmap is charged as data",
+          strerror(err));
+    err = rlm_try_mapf(big, MAP_PRIVATE | MAP_ANON | MAP_STACK);
+    check(err == ENOMEM, "rlimit_data: MAP_STACK anonymous mmap is charged as data",
+          strerror(err));
+
+    err = rlm_try_mapf(big, MAP_SHARED | MAP_ANON);
+    check(err == 0, "rlimit_data: a shared mapping is not charged as data",
+          strerror(err));
+
+    errno = 0;
+    while (n < RLM_MALLOC_MAX && (blk[n] = malloc(RLM_MALLOC)) != NULL) {
+        memset(blk[n], 0xa5, RLM_MALLOC);
+        n++;
+    }
+    err = errno;
+    snprintf(detail, sizeof detail, "allocated=%d errno=%d", n, err);
+    check(n <= 4 && err == ENOMEM,
+          "rlimit_data: a growing malloc fails ENOMEM at the limit", detail);
+
+    (void) rlm_set(RLIMIT_DATA, RLIM_INFINITY);
+    p = malloc(RLM_MALLOC);
+    check(p != NULL, "rlimit_data: malloc succeeds after raising the limit", "");
+    free(p);
+    while (n > 0)
+        free(blk[--n]);
+}
+
 /* Q34: 1 ns nanosleep storm on a tickless hart. The sleeper is pinned to hart 1
  * and a watchdog counter to hart 2; the sleeper checks the watchdog advances in
  * every 100 ms window, i.e. that a storm of sub-tick timer deadlines does not
@@ -1358,5 +1637,8 @@ void test_timers(void)
     test_rlimit_negative();
     test_rlimit_cpu_kill();
     test_rlimit_inherit();
+    test_rlimit_as();
+    test_rlimit_as_concurrent();
+    test_rlimit_data();
     test_nanosleep_1ns_storm();
 }

@@ -1151,8 +1151,9 @@ thread, and every already-admitted process, in particular the protected classes
 (realtime driver/IST processes, critical servers), keeps its full working set.
 Protected classes are safe by construction rather than by a tunable priority
 comparison: nothing is ever reclaimed, so nothing can be victimized. The full
-policy, including the honest gap that the per-process RLIMIT_AS cap is currently
-a stub, is in docs/oom-admission-policy.md.
+policy, including the per-process RLIMIT_AS and RLIMIT_DATA caps checked at map
+time and the gap left by their RLIM_INFINITY defaults, is in
+docs/oom-admission-policy.md.
 
 The memory-growth bound this implies: a realtime process's resident set is
 monotonic and owned. Once it has allocated and touched its working set, that

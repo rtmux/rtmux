@@ -321,6 +321,7 @@ fail1:
  * full). Parameters:
  *   pid     : target process pid
  *   prp     : target process (kernel-side handle)
+ *   info    : process_query_info snapshot of pid, or NULL to take one
  *   ms      : map set describing the new mapping
  *   flags   : mmap flags
  *   preload : number of bytes to fault in up front
@@ -328,6 +329,7 @@ fail1:
  */
 static int rdecl setup_mappings(pid_t pid,
                                 process_t *prp,
+                                const root_proc_info_t *info,
                                 struct map_set *ms,
                                 unsigned flags,
                                 size_t preload)
@@ -363,7 +365,7 @@ static int rdecl setup_mappings(pid_t pid,
 #endif
         todo = (end - start) + 1;
         if (mm->extra_flags & EXTRA_FLAG_PRIMARY_STK) {
-            if (rlimit_blown(pid, RLIMIT_STACK, todo)) {
+            if (rlimit_blown(pid, info, RLIMIT_STACK, 0, todo)) {
                 return ENOMEM;
             }
             tmp->rlimit.stack = todo;
@@ -431,6 +433,30 @@ static int rdecl setup_mappings(pid_t pid,
 }
 
 
+/* rlimit_repl_size — the bytes ms_unmap will uncharge from RLIMIT_AS and
+ * RLIMIT_DATA when it removes the mappings a MAP_FIXED request replaces.
+ * map_create refuses to replace an EXTRA_FLAG_SPECIAL entry, so every entry in
+ * repl is one ms_unmap removes and uncharges.
+ */
+static void rlimit_repl_size(const struct map_set *repl,
+                             size_t *vmem,
+                             size_t *data)
+{
+    const struct mm_map *mm;
+
+    *vmem = 0;
+    *data = 0;
+    if (!repl->first)
+        return;
+    for (mm = repl->first; mm != repl->last->next; mm = mm->next) {
+        size_t len = (mm->end - mm->start) + 1;
+
+        *vmem += len;
+        if (mm->extra_flags & EXTRA_FLAG_RLIMIT_DATA)
+            *data += len;
+    }
+}
+
 /* Create a memory mapping in a process (or the system) address space.
  *
  * The as implementation of mmap. Handles system-memory mappings (!prp:
@@ -480,6 +506,13 @@ int as_mmap(pid_t pid,
     int prp_info_valid = 0;
     if (pid != 0 && process_query_info(pid, &prp_info) == EOK)
         prp_info_valid = 1;
+
+    /* Fail closed: a user mapping without the snapshot would be admitted
+     * against unknown rlimits and loading state. Roottask is exempt, as in
+     * rlimit_blown, so its own mappings never depend on the query.
+     */
+    if (prp && pid != 0 && pid != ROOTTASK_PID && !prp_info_valid)
+        return ENOMEM;
     root_trace(
         "as_mmap ENTER: pid=%d va=%p sz=%lx prot=%x flags=%x fd=%d obp=%p "
         "boff=%lx\n",
@@ -646,18 +679,17 @@ int as_mmap(pid_t pid,
     /* mmap user memory... */
     adp = tmp ? tmp->adp : NULL;
 
-    /* make sure our heap hasn't exceeded its rlimit */
-    if ((flags & (MAP_ANON | MAP_STACK | MAP_ELF | MAP_TYPE)) ==
-        (MAP_ANON | MAP_PRIVATE)) {
-        if (rlimit_blown(pid, RLIMIT_DATA, tmp->rlimit.data + size_requested)) {
-            return ENOMEM;
-        }
+    /* Private anonymous memory is the process's data for RLIMIT_DATA: heap,
+     * thread stacks, and the loader's anonymous (bss) segments; MAP_ELF and
+     * MAP_STACK from a running process change nothing. Only the primary stack,
+     * a MAP_STACK made while the process is loading, is left to RLIMIT_STACK.
+     * Both limits are checked once the mapping's final size and any MAP_FIXED
+     * replacement are known, below.
+     */
+    if ((flags & (MAP_ANON | MAP_TYPE)) == (MAP_ANON | MAP_PRIVATE) &&
+        !((flags & MAP_STACK) && prp_info_valid &&
+          (prp_info.flags & RTMUX_FLG_PROC_LOADING))) {
         extra_flags |= EXTRA_FLAG_RLIMIT_DATA;
-    }
-
-    /* make sure our total vm size hasn't exceeded its rlimit */
-    if (rlimit_blown(pid, RLIMIT_AS, tmp->rlimit.vmem + size_requested)) {
-        return ENOMEM;
     }
 
     tail_vaddr = NULL;
@@ -805,6 +837,33 @@ int as_mmap(pid_t pid,
                    create_flags);
     if (r != EOK)
         goto fail1;
+
+    /* RLIMIT_AS and RLIMIT_DATA. The caller holds this address space's write
+     * lock, so the check here and the accounting after setup_mappings are one
+     * step for every other mapper of the process. A MAP_FIXED request that
+     * replaces existing mappings is charged as the total after the replacement
+     * (the replaced ranges are uncharged by ms_unmap below), so it is refused
+     * only if that total exceeds the limit. On refusal, undo only map_create:
+     * nothing past it (the anon object lock among them) is held yet, so the
+     * fail2 path does not apply.
+     */
+    {
+        const root_proc_info_t *info = prp_info_valid ? &prp_info : NULL;
+        size_t repl_vmem, repl_data;
+
+        rlimit_repl_size(&ms_repl, &repl_vmem, &repl_data);
+        if (rlimit_blown(pid, info, RLIMIT_AS,
+                         sat_sub(tmp->rlimit.vmem, repl_vmem), size) ||
+            ((extra_flags & EXTRA_FLAG_RLIMIT_DATA) &&
+             rlimit_blown(pid, info, RLIMIT_DATA,
+                          sat_sub(tmp->rlimit.data, repl_data), size))) {
+            map_destroy(&ms);
+            if (ms_repl.first)
+                map_coalese(&ms_repl);
+            r = ENOMEM;
+            goto fail1;
+        }
+    }
     mm = ms.first;
     if ((flags & MAP_STACK) && (extra_flags & EXTRA_FLAG_LOADER)) {
         /* If it's a MAP_STACK while we're loading the process, this must be the
@@ -960,7 +1019,8 @@ int as_mmap(pid_t pid,
 
     /* No demand paging: all pages are allocated upfront. */
     preload = size;
-    r = setup_mappings(pid, prp, &ms, (unsigned) flags, preload);
+    r = setup_mappings(pid, prp, prp_info_valid ? &prp_info : NULL, &ms,
+                       (unsigned) flags, preload);
 
     /* RUSH2: What if obj == anmem_obp on entry (think "/proc/self/as") */
     if ((obp == anmem_obp) && ANMEM_MULTI_REFS(obp)) {

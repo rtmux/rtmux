@@ -98,13 +98,13 @@ void kext_query_object_done(void *data)
  * roottask wants to read into a U-mode buffer. See
  * kernel/include/private/root-proc-info.h for the snapshot layout.
  *
- * Post-BKL this snapshot is a field-by-field lockless read, so fields being
- * mutated by the target on another CPU (e.g. fault_siginfo while that process
- * is taking a fatal fault, num_active_threads during teardown) may be observed
- * torn. That is acceptable: every field here is plain advisory data with no
- * embedded pointer the reader dereferences, so a torn value is at worst stale,
- * never unsafe. Writing into the U-mode buffer is fine: the trap saved sstatus
- * has SUM=1 for calls.
+ * Post-BKL this snapshot is a field-by-field lockless read (except the rlimit
+ * arrays, copied under vec_slock), so fields being mutated by the target on
+ * another CPU (e.g. fault_siginfo while that process is taking a fatal fault,
+ * num_active_threads during teardown) may be observed torn. That is acceptable:
+ * every field here is plain advisory data with no embedded pointer the reader
+ * dereferences, so a torn value is at worst stale, never unsafe. Writing into
+ * the U-mode buffer is fine: the trap saved sstatus has SUM=1 for calls.
  */
 void kext_proc_query(void *data)
 {
@@ -140,13 +140,21 @@ void kext_proc_query(void *data)
     out->lcp = prp->lcp;
     out->ocb_list = prp->ocb_list;
     out->siginfo = prp->fault_siginfo;
-    /* Per-process rlimit snapshots for proc_resource handlers. */
+    /* Per-process rlimit snapshots for proc_resource handlers and the RLIMIT_AS
+     * / RLIMIT_DATA checks at map time. kext_proc_set_rlimit rewrites a
+     * soft/hard pair under vec_slock, so copy under it too and a concurrent
+     * setrlimit is seen either before or after, never half done. Copy to the
+     * stack first: no user-buffer store with the spinlock held.
+     */
     {
-        unsigned r;
-        for (r = 0; r < RLIM_NLIMITS; ++r) {
-            out->rlimit_vals_soft[r] = prp->rlimit_vals_soft[r];
-            out->rlimit_vals_hard[r] = prp->rlimit_vals_hard[r];
-        }
+        unsigned long soft[RLIM_NLIMITS], hard[RLIM_NLIMITS];
+
+        kspinlock_lock(&prp->vec_slock);
+        memcpy(soft, prp->rlimit_vals_soft, sizeof soft);
+        memcpy(hard, prp->rlimit_vals_hard, sizeof hard);
+        kspinlock_unlock(&prp->vec_slock);
+        memcpy(out->rlimit_vals_soft, soft, sizeof soft);
+        memcpy(out->rlimit_vals_hard, hard, sizeof hard);
     }
 
     /* pgrp / siginfo / session* live in root_process_t (roottask side); the
@@ -829,23 +837,19 @@ void kext_proc_flags_op(void *data)
     SETKSTATUS(act, EOK);
 }
 
-/* kext_proc_set_rlimit — record RLIMIT_CPU for a process. Heap is PTE_U=0, so
- * roottask (which validated the soft/hard pair) hands it here. The soft limit
- * is seconds; max_cpu_time (what the tick and resched_default enforce against
- * the process's billed running_time) is nanoseconds, RLIM_INFINITY staying
- * infinite and 0 meaning "kill at the next tick" (1 ns), since 0 in
- * max_cpu_time means no limit. max_cpu_time is read locklessly by every hart's
- * tick, so it is stored atomically; the soft/hard arrays are under vec_slock.
- */
-struct kcall_args_proc_set_rlimit {
-    pid_t pid;
-    uint64_t cur;
-    uint64_t max;
-};
-
-/* rlimit_cpu_to_ns — RLIMIT_CPU seconds to the nanosecond max_cpu_time the tick
- * enforces. RLIM_INFINITY (or a value that would overflow) stays infinite; 0
- * becomes 1 ns because max_cpu_time == 0 means "no limit".
+/* kext_proc_set_rlimit — record a settable rlimit (RLIMIT_CPU, RLIMIT_DATA or
+ * RLIMIT_AS) for a process. Heap is PTE_U=0, so roottask (which validated the
+ * soft/hard pair) hands it here. For RLIMIT_CPU the soft limit is seconds;
+ * max_cpu_time (what the tick and resched_default enforce against the process's
+ * billed running_time) is nanoseconds, RLIM_INFINITY staying infinite and 0
+ * meaning "kill at the next tick" (1 ns), since 0 in max_cpu_time means no
+ * limit. max_cpu_time is read locklessly by every hart's tick, so it is stored
+ * atomically; the soft/hard arrays are under vec_slock. RLIMIT_DATA and
+ * RLIMIT_AS are bytes, enforced by roottask at map time from a
+ * process_query_info snapshot. rlimit_cpu_to_ns — RLIMIT_CPU seconds to the
+ * nanosecond max_cpu_time the tick enforces. RLIM_INFINITY (or a value that
+ * would overflow) stays infinite; 0 becomes 1 ns because max_cpu_time == 0
+ * means "no limit".
  */
 uint64_t rlimit_cpu_to_ns(uint64_t secs)
 {
@@ -858,9 +862,14 @@ void kext_proc_set_rlimit(void *data)
 {
     struct kcall_args_proc_set_rlimit *kap = data;
     thread_t *act = get_active_thread(get_cpunum());
-    process_t *prp = lookup_pid_rcu(kap->pid);
-    uint64_t ns = rlimit_cpu_to_ns(kap->cur);
+    int res = kap->resource;
+    process_t *prp;
 
+    if (!rlimit_settable(res)) {
+        kcall_err(act, EINVAL);
+        return;
+    }
+    prp = lookup_pid_rcu(kap->pid);
     if (!prp) {
         rcu_read_unlock(&process_rcu);
         kcall_err(act, ESRCH);
@@ -868,12 +877,12 @@ void kext_proc_set_rlimit(void *data)
     }
     kspinlock_lock(&prp->vec_slock);
 
-    /* Validate against the stored hard limit under the lock that guards it:
-     * roottask's pre-check is a separate read, so two threads of one process
-     * could otherwise interleave a lower and a raise and end with the hard
-     * limit raised. There is no privilege override, so raising is EPERM.
+    /* Validate against the stored hard limit under the lock that guards it: a
+     * check against a separately read snapshot would let two threads of one
+     * process interleave a lower and a raise and end with the hard limit
+     * raised. There is no privilege override, so raising is EPERM.
      */
-    if (kap->cur > kap->max || kap->max > prp->rlimit_vals_hard[RLIMIT_CPU]) {
+    if (kap->cur > kap->max || kap->max > prp->rlimit_vals_hard[res]) {
         int err = kap->cur > kap->max ? EINVAL : EPERM;
 
         kspinlock_unlock(&prp->vec_slock);
@@ -881,9 +890,11 @@ void kext_proc_set_rlimit(void *data)
         kcall_err(act, err);
         return;
     }
-    prp->rlimit_vals_soft[RLIMIT_CPU] = kap->cur;
-    prp->rlimit_vals_hard[RLIMIT_CPU] = kap->max;
-    __atomic_store_n(&prp->max_cpu_time, ns, __ATOMIC_RELAXED);
+    prp->rlimit_vals_soft[res] = kap->cur;
+    prp->rlimit_vals_hard[res] = kap->max;
+    if (res == RLIMIT_CPU)
+        __atomic_store_n(&prp->max_cpu_time, rlimit_cpu_to_ns(kap->cur),
+                         __ATOMIC_RELAXED);
     kspinlock_unlock(&prp->vec_slock);
     rcu_read_unlock(&process_rcu);
     SETKSTATUS(act, EOK);

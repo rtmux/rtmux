@@ -161,7 +161,28 @@ int map_coalese(struct map_set *);
 int map_destroy(struct map_set *);
 void map_set_update(struct map_set *, struct mm_map *, struct mm_map *);
 
-int rdecl rlimit_blown(pid_t pid, int which, size_t new);
+/* sat_sub — a - b, or 0 if b > a: rlimit usage never wraps below zero. */
+static inline size_t sat_sub(size_t a, size_t b)
+{
+    return a > b ? a - b : 0;
+}
+
+/* map_unmap_keeps — ms_unmap leaves an EXTRA_FLAG_SPECIAL entry mapped (and
+ * charged) unless the process is loading or terminating. proc_flags is the
+ * process_query_info flags word, or 0 if no snapshot is available.
+ */
+static inline int map_unmap_keeps(const struct mm_map *mm, unsigned proc_flags)
+{
+    return (mm->extra_flags & EXTRA_FLAG_SPECIAL) &&
+           !(proc_flags & (RTMUX_FLG_PROC_LOADING | RTMUX_FLG_PROC_TERMING));
+}
+
+struct root_proc_info;
+int rdecl rlimit_blown(pid_t pid,
+                       const struct root_proc_info *info,
+                       int which,
+                       size_t cur,
+                       size_t add);
 
 void sysaddr_map(void *);
 

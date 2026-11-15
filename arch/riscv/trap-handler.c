@@ -24,13 +24,11 @@
 #include <sbi.h>
 #include <arch/fault.h>
 #include "trace-ring.h"
-#include <cpu-paging.h> /* PTE_V/R/W/X/U/A/D, PX, PTE2PA */
+#include <sv39-lookup.h> /* PTE_*, PX, PTE2PA, cpu_pte_lookup */
 #include <stdatomic.h>
 #ifdef CONFIG_DEBUG_INJECT
 #include <private/inject.h> /* inject_spin_begin/end */
 #endif
-
-extern pte_t *cpu_pte_lookup(pagetable_t pgdir, uintptr_t vaddr);
 
 /* Recovered-xfer-fault reports to print per boot before going quiet. Assumption
  * class: tuning. Diagnostics only; the recovery itself is unaffected. Revisit
@@ -105,20 +103,23 @@ static uint64_t fault_pte_decode(pagetable_t pgdir,
                                  uintptr_t va,
                                  const char *what)
 {
-    pte_t *pte = cpu_pte_lookup(pgdir, va);
-    uint64_t pv;
+    int level;
+    pte_t pv;
 
-    if (!pte) {
-        kprintf("  %-4s %lx  UNMAPPED\n", what, (unsigned long) va);
+    if (!cpu_pte_lookup(pgdir, va, &level, &pv)) {
+        /* Also reached for a leaf the hardware faults on (W without R, or a
+         * misaligned superpage), which is not a mapping either.
+         */
+        kprintf("  %-4s %lx  UNMAPPED or invalid leaf\n", what,
+                (unsigned long) va);
         return 0;
     }
-    pv = (uint64_t) *pte;
     kprintf("  %-4s %lx  pa=%lx [%c%c%c%c%c%c%c%c]\n", what, (unsigned long) va,
-            (unsigned long) PTE2PA(pv), (pv & PTE_V) ? 'V' : '-',
-            (pv & PTE_R) ? 'R' : '-', (pv & PTE_W) ? 'W' : '-',
-            (pv & PTE_X) ? 'X' : '-', (pv & PTE_U) ? 'U' : '-',
-            (pv & PTE_G) ? 'G' : '-', (pv & PTE_A) ? 'A' : '-',
-            (pv & PTE_D) ? 'D' : '-');
+            (unsigned long) sv39_leaf_paddr(pv, level, va, NULL),
+            (pv & PTE_V) ? 'V' : '-', (pv & PTE_R) ? 'R' : '-',
+            (pv & PTE_W) ? 'W' : '-', (pv & PTE_X) ? 'X' : '-',
+            (pv & PTE_U) ? 'U' : '-', (pv & PTE_G) ? 'G' : '-',
+            (pv & PTE_A) ? 'A' : '-', (pv & PTE_D) ? 'D' : '-');
     return pv;
 }
 
@@ -184,19 +185,17 @@ static void dump_umode_fault(thread_t *act, uint64_t scause)
     n = 0;
     for (a = sp; a < sp + FAULT_STACK_SCAN_BYTES && n < FAULT_STACK_SCAN_MAX;
          a += 8) {
-        pte_t *spte = cpu_pte_lookup(pgdir, a);
+        pte_t se, we;
         uint64_t w;
-        pte_t *wpte;
 
-        if (!spte ||
-            (*spte & (PTE_V | PTE_R | PTE_U)) != (PTE_V | PTE_R | PTE_U))
+        if (!cpu_pte_lookup(pgdir, a, NULL, &se) ||
+            (se & (PTE_V | PTE_R | PTE_U)) != (PTE_V | PTE_R | PTE_U))
             continue;
         w = *(volatile uint64_t *) a;
         if (w == 0 || w >= KERNEL_VIRT_BASE)
             continue;
-        wpte = cpu_pte_lookup(pgdir, (uintptr_t) w);
-        if (wpte &&
-            (*wpte & (PTE_V | PTE_X | PTE_U)) == (PTE_V | PTE_X | PTE_U)) {
+        if (cpu_pte_lookup(pgdir, (uintptr_t) w, NULL, &we) &&
+            (we & (PTE_V | PTE_X | PTE_U)) == (PTE_V | PTE_X | PTE_U)) {
             kprintf("    [sp+%-4lu] %lx\n", (unsigned long) (a - sp),
                     (unsigned long) w);
             n++;
@@ -1290,14 +1289,24 @@ void strap_handler_c(CPU_REGISTERS *regs)
         uint64_t satp = r_satp();
         uint64_t pgdir_pa = (satp & ((1UL << 44) - 1)) << 12;
         pagetable_t pgdir = (pagetable_t) (pgdir_pa + KERNEL_VIRT_BASE);
-        pte_t *pte = cpu_pte_lookup(pgdir, (uintptr_t) stval);
-        if (!pte) {
+        int level;
+        pte_t leaf;
+        if (!cpu_pte_lookup(pgdir, (uintptr_t) stval, &level, &leaf)) {
             unsigned l2_idx = (unsigned) ((stval >> 30) & 0x1ff);
             unsigned l1_idx = (unsigned) ((stval >> 21) & 0x1ff);
             unsigned long l2e = (unsigned long) pgdir[l2_idx];
-            kprintf("  pgwalk: va=%lx UNMAPPED (pgdir@%p L2[%u]=%lx)\n",
+
+            /* Also reached for a leaf the hardware faults on (W without R, or a
+             * misaligned superpage); the raw entries below show which.
+             */
+            kprintf("  pgwalk: va=%lx UNMAPPED or invalid leaf "
+                    "(pgdir@%p L2[%u]=%lx)\n",
                     (unsigned long) stval, pgdir, l2_idx, l2e);
-            if (l2e & PTE_V) {
+
+            /* Descend only through interior entries: an L2 leaf's PPN names the
+             * mapped memory, not an L1 table.
+             */
+            if ((l2e & PTE_V) && !(l2e & (PTE_R | PTE_W | PTE_X))) {
                 pagetable_t l1 =
                     (pagetable_t) ((PTE2PA(l2e)) + KERNEL_VIRT_BASE);
                 unsigned long l1e = (unsigned long) l1[l1_idx];
@@ -1324,9 +1333,10 @@ void strap_handler_c(CPU_REGISTERS *regs)
                 }
             }
         } else {
-            unsigned long pv = (unsigned long) *pte;
+            unsigned long pv = (unsigned long) leaf;
             kprintf("  pgwalk: va=%lx pte=%lx pa=%lx [%c%c%c%c%c%c%c%c]\n",
-                    (unsigned long) stval, pv, (unsigned long) PTE2PA(*pte),
+                    (unsigned long) stval, pv,
+                    (unsigned long) sv39_leaf_paddr(pv, level, stval, NULL),
                     (pv & PTE_V) ? 'V' : '-', (pv & PTE_R) ? 'R' : '-',
                     (pv & PTE_W) ? 'W' : '-', (pv & PTE_X) ? 'X' : '-',
                     (pv & PTE_U) ? 'U' : '-', (pv & (1UL << 5)) ? 'G' : '-',

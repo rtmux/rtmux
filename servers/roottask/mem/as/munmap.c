@@ -146,23 +146,22 @@ int ms_unmap(pid_t pid,
     data.unmap_flags = unmap_flags;
     end_mm = ms->last->next;
     for (mm = ms->first; mm != end_mm; mm = mm->next) {
-        if (mm->extra_flags & EXTRA_FLAG_SPECIAL) {
-            if (!(prp_info_valid &&
-                  (prp_info.flags &
-                   (RTMUX_FLG_PROC_LOADING | RTMUX_FLG_PROC_TERMING)))) {
-                ms->flags |= MI_SKIP_SPECIAL;
-                continue;
-            }
+        if (map_unmap_keeps(mm, prp_info_valid ? prp_info.flags : 0)) {
+            ms->flags |= MI_SKIP_SPECIAL;
+            continue;
         }
         has_unmapped = true;
         if (!(data.unmap_flags & UNMAP_NORLIMIT)) {
             size_t size;
 
+            /* Saturate: an undercount must not wrap into a huge usage figure
+             * that refuses every later mapping.
+             */
             size = (mm->end - mm->start) + 1;
             if (tmp) {
-                tmp->rlimit.vmem -= size;
+                tmp->rlimit.vmem = sat_sub(tmp->rlimit.vmem, size);
                 if (mm->extra_flags & EXTRA_FLAG_RLIMIT_DATA) {
-                    tmp->rlimit.data -= size;
+                    tmp->rlimit.data = sat_sub(tmp->rlimit.data, size);
                 }
             }
         }

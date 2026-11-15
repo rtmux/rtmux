@@ -7,26 +7,40 @@
 
 #include "as.h"
 #include "root-process.h"
+#include <stdint.h>
 #include <sys/resource.h>
+#include <sys/rtmux-core.h>
 
-int rdecl rlimit_blown(pid_t pid, int which, size_t new)
+/* rlimit_blown — non-zero if growing pid's usage of resource `which` from `cur`
+ * by `add` bytes would exceed its soft limit.
+ *
+ * The soft limits live in the kernel-allocated process_t (heap is PTE_U=0), so
+ * they come from a process_query_info snapshot. Callers that already hold one
+ * pass it as `info`; NULL takes a fresh one. The check fails closed: a failed
+ * query, an unknown resource, or a sum that overflows counts as over the limit.
+ * pid 0 (system mappings) and roottask itself are exempt, since they map memory
+ * during boot before any limit could apply and must never be refused by one.
+ */
+int rdecl rlimit_blown(pid_t pid,
+                       const struct root_proc_info *info,
+                       int which,
+                       size_t cur,
+                       size_t add)
 {
-    /* prp->rlimit_vals_soft used to be a direct deref of the kernel- allocated
-     * process_t. In U-mode roottask, that's a PTE_U=0 load fault. Route through
-     * process_query_info + a follow-up kernel extension when we need the
-     * per-RLIMIT soft value. For the boot path we accept RLIM_INFINITY ("no
-     * limit") if the snapshot fails.
-     */
-    root_proc_info_t info;
-    (void) which;
-    (void) new;
-    if (pid == 0)
-        return 0;
-    if (process_query_info(pid, &info) != EOK)
-        return 0;
+    root_proc_info_t snap;
+    unsigned long lim;
 
-    /* TODO: rlimit_vals_soft snapshot — for now treat all checks as pass.
-     * Revisit when we wire a per-rlimit kext call.
-     */
-    return 0;
+    if (pid == 0 || pid == ROOTTASK_PID)
+        return 0;
+    if (add > SIZE_MAX - cur)
+        return 1;
+    if (which < 0 || which >= RLIM_NLIMITS)
+        return 1;
+    if (!info) {
+        if (process_query_info(pid, &snap) != EOK)
+            return 1;
+        info = &snap;
+    }
+    lim = info->rlimit_vals_soft[which];
+    return lim != RLIM_INFINITY && cur + add > lim;
 }

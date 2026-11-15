@@ -80,9 +80,10 @@ typedef struct root_proc_info {
      */
     void *lcp;
 
-    /* Per-process rlimit arrays — used by proc_resource handlers. Read-only
-     * snapshot; writes go through process_set_rlimit (a TODO kernel extension
-     * when an actual setrlimit call lands). Size matches
+    /* Per-process rlimit arrays — used by proc_resource handlers and by the
+     * RLIMIT_DATA / RLIMIT_AS checks at map time (rlimit_blown). Read-only
+     * snapshot, copied under the process's vec_slock so each soft/hard pair is
+     * consistent; writes go through ProcessSetRlimit. Size matches
      * process_t.rlimit_vals_{soft,hard}.
      */
     unsigned long rlimit_vals_soft[RLIM_NLIMITS];
@@ -98,6 +99,27 @@ typedef struct root_proc_info {
     /* Snapshot of credentials (process_t.cred->info). */
     struct _cred_info cred;
 } root_proc_info_t;
+
+/* rlimit_settable — the resources setrlimit can change (PROC_SET_RLIMIT):
+ * RLIMIT_CPU, enforced by the tick, and RLIMIT_DATA / RLIMIT_AS, enforced by
+ * roottask at map time. Shared so roottask's ENOSYS and the kernel's check
+ * cannot disagree.
+ */
+static inline int rlimit_settable(int resource)
+{
+    return resource == RLIMIT_CPU || resource == RLIMIT_DATA ||
+           resource == RLIMIT_AS;
+}
+
+/* PROC_SET_RLIMIT payload: install the soft (cur) / hard (max) pair of a
+ * settable resource for pid. Same format on both sides.
+ */
+struct kcall_args_proc_set_rlimit {
+    pid_t pid;
+    int resource;
+    uint64_t cur;
+    uint64_t max;
+};
 
 /* Kernel PRIV kcall_args payload. Same format on both sides.
  *

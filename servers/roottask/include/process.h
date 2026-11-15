@@ -122,7 +122,7 @@ pid_t ProcessIndexToPid(unsigned index);
 int process_set_ocb_list(pid_t pid, void *head);
 int ProcessExitFinalize(pid_t pid);
 int ProcessFlagsOp(pid_t pid, uint32_t set, uint32_t clear);
-int ProcessSetRlimitCpu(pid_t pid, uint64_t cur, uint64_t max);
+int ProcessSetRlimit(pid_t pid, int resource, uint64_t cur, uint64_t max);
 int process_set_spawn(pid_t pid,
                       uintptr_t initial_ip,
                       uintptr_t initial_sp,
