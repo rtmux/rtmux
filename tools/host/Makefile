@@ -37,7 +37,8 @@ PROGS = $(BUILD_BASE)/mkasmoff $(BUILD_BASE)/mkromfs $(BUILD_BASE)/treeromfs \
         $(BUILD_BASE)/ldso-parse-test $(BUILD_BASE)/ldso-path-test \
         $(BUILD_BASE)/cpio-parser-test $(BUILD_BASE)/spawn-fd-policy-test \
         $(BUILD_BASE)/serial-reply-test $(BUILD_BASE)/outcomes-test \
-        $(BUILD_BASE)/sv39-lookup-test
+        $(BUILD_BASE)/sv39-lookup-test \
+        $(BUILD_BASE)/strftime-test
 
 # Each tool compiles and links its sources in one command, so -MMD cannot give a
 # per-tool dependency file (with several sources it writes one named after each
@@ -76,6 +77,33 @@ $(BUILD_BASE)/serial-reply-test: $(TEST_DIR)/test-serial-reply.c $(SERIAL_DIR)/s
 	$(msg) HOSTCC $(notdir $@)
 	$(Q)$(HOST_CC) -I$(SERIAL_DIR) -I../../include -I../../internal/include $(HOST_CFLAGS) \
 	    -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -o $@ $(TEST_DIR)/test-serial-reply.c
+
+# libc strftime against the host headers, renamed so the host copy is never
+# called. When the host compiler supports AddressSanitizer a second build runs
+# with it, so a byte touched outside the arguments fails host-tests.
+STRFTIME_SRCS = ../../lib/libc/posix/strftime.c ../../lib/libc/posix/time-conv.c
+STRFTIME_FLAGS = -I../../lib/libc/internal -I../../tests/userland -Dstrftime=rtmux_strftime
+STRFTIME_DEPS = $(TEST_DIR)/test-strftime.c $(STRFTIME_SRCS) \
+                ../../lib/libc/internal/time-conv.h ../../tests/userland/strftime-cases.h
+$(BUILD_BASE)/strftime-test: $(STRFTIME_DEPS)
+	@mkdir -p $(@D)
+	$(msg) HOSTCC $(notdir $@)
+	$(Q)$(HOST_CC) $(STRFTIME_FLAGS) $(HOST_CFLAGS) -o $@ \
+	    $(TEST_DIR)/test-strftime.c $(STRFTIME_SRCS)
+
+$(BUILD_BASE)/strftime-asan-test: $(STRFTIME_DEPS)
+	@mkdir -p $(@D)
+	$(msg) HOSTCC $(notdir $@)
+	$(Q)if echo 'int main(void){return 0;}' | \
+	    $(HOST_CC) $(SAN_FLAGS) -x c - -o $@.probe 2>/dev/null; then ok=1; else ok=0; fi; \
+	rm -f $@.probe; \
+	if [ $$ok = 1 ]; then \
+	    $(HOST_CC) $(STRFTIME_FLAGS) $(HOST_CFLAGS) $(SAN_FLAGS) -o $@ \
+	        $(TEST_DIR)/test-strftime.c $(STRFTIME_SRCS); \
+	else \
+	    printf '#!/bin/sh\necho "strftime-test: SKIP ASan (unsupported)"\n' > $@; \
+	    chmod +x $@; \
+	fi
 
 cap-table-test: $(BUILD_BASE)/cap-table-test
 	$(Q)$<
@@ -176,7 +204,8 @@ host-tests: $(BUILD_BASE)/path-normalize-test $(BUILD_BASE)/cap-table-test \
             $(BUILD_BASE)/ldso-parse-test $(BUILD_BASE)/ldso-path-test \
             $(BUILD_BASE)/cpio-parser-test $(BUILD_BASE)/spawn-fd-policy-test \
             $(BUILD_BASE)/serial-reply-test $(BUILD_BASE)/outcomes-test \
-            $(BUILD_BASE)/sv39-lookup-test
+            $(BUILD_BASE)/sv39-lookup-test \
+            $(BUILD_BASE)/strftime-test $(BUILD_BASE)/strftime-asan-test
 	$(Q)$<
 	$(Q)$(BUILD_BASE)/cap-table-test
 	$(Q)$(BUILD_BASE)/bootstrap-manifest-test
@@ -190,6 +219,8 @@ host-tests: $(BUILD_BASE)/path-normalize-test $(BUILD_BASE)/cap-table-test \
 	$(Q)$(BUILD_BASE)/serial-reply-test
 	$(Q)$(BUILD_BASE)/outcomes-test >/dev/null
 	$(Q)$(BUILD_BASE)/sv39-lookup-test
+	$(Q)$(BUILD_BASE)/strftime-test
+	$(Q)$(BUILD_BASE)/strftime-asan-test
 	$(Q)$(PYTHON) $(TEST_DIR)/test-capability-namespace-doc.py
 	$(Q)$(PYTHON) $(TEST_DIR)/test-management-ipc-lock.py
 	$(Q)HOST_CC="$(HOST_CC)" $(PYTHON) -I $(TEST_DIR)/test-lkl-iommu-contract.py
@@ -357,7 +388,7 @@ host-fuzz:
 	    -print_final_stats=1 $(FUZZ_CORPUS)/vfprintf
 
 clean:
-	$(Q)rm -f $(PROGS)
+	$(Q)rm -f $(PROGS) $(BUILD_BASE)/strftime-asan-test
 	$(Q)rm -rf $(FUZZ_OUT)
 
 .PHONY: all clean host-tests cap-table-test host-sanitize host-fuzz

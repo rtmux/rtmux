@@ -43,6 +43,8 @@ void test_sync(void);
 int sync_pi_large_pid_child(void);
 void test_printf(void);
 void test_setjmp(void);
+void test_time(void);
+void test_strftime(void);
 void test_signals(void);
 void test_vfs(void);
 void test_native_file_io(void);

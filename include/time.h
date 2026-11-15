@@ -102,6 +102,14 @@ extern struct tm *localtime_r(const time_t *__timer, struct tm *__tm);
 extern char *asctime_r(const struct tm *__tp, char *__buf);
 extern char *ctime_r(const time_t *__timer, char *__buf);
 
+extern time_t mktime(struct tm *__tp);
+extern time_t timegm(struct tm *__tp);
+extern double difftime(time_t __time1, time_t __time0);
+extern void tzset(void);
+extern char *tzname[2];
+extern long timezone; /* XSI: seconds west of UTC of standard time */
+extern int daylight;  /* XSI: non-zero if TZ names a DST zone */
+
 __END_DECLS
 #endif
 
