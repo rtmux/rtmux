@@ -1193,6 +1193,11 @@ int main(int argc, char *argv[])
         printf("=== RTMux Syscall Conformance Test Suite ===\n\n");
         return run_laps(atoi(argv[2]));
     }
+    if (argc == 2 && !strcmp(argv[1], "--native-file-io")) {
+        printf("=== RTMux Native File I/O Regression ===\n\n");
+        test_native_file_io();
+        return finish(1);
+    }
     printf("=== RTMux Syscall Conformance Test Suite ===\n\n");
 
     for (i = 0; i < sizeof test_suites / sizeof test_suites[0]; i++) {
