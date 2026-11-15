@@ -62,3 +62,24 @@
 (assert act)          ; but acted anyway (no revalidation)
 (check-sat) ; expect sat
 (pop 1)
+
+; Invariant 6 broken: SchedSet writes the effective priority too (the old
+; behaviour), dropping a PI boost that is still in effect.
+(push 1)
+(declare-const base2 (_ BitVec 8)) (declare-const pil (_ BitVec 8))
+(declare-const eff2 (_ BitVec 8))
+(assert (= eff2 base2))   ; bug: the new base overwrites the boost
+(assert (bvult eff2 pil)) ; the waiter's loan is lost
+(check-sat) ; expect sat
+(pop 1)
+
+; Invariant 7 broken: the REPLY walk has no hop cap and follows the whole
+; chain, doing more than D hops of work for one change.
+(push 1)
+(declare-const L (_ BitVec 8)) (declare-const D (_ BitVec 8))
+(declare-const boosted (_ BitVec 8))
+(assert (= D #x08))
+(assert (= boosted L))     ; bug: no cap
+(assert (bvugt boosted D)) ; unbounded work
+(check-sat) ; expect sat
+(pop 1)

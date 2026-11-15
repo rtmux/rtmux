@@ -28,7 +28,6 @@ int kdecl ksys_msg_current(thread_t *act, struct kcall_args_msg_current *kap)
     connect_t *cop;
     thread_t *thp;
     int do_pi = 0;
-    uint8_t new_prio = 0;
     kdispatch_t *new_dpp = NULL;
 
 
@@ -117,7 +116,6 @@ int kdecl ksys_msg_current(thread_t *act, struct kcall_args_msg_current *kap)
      */
     if ((cop->channel->flags & RTMUX_FLG_CHF_FIXED_PRIORITY) == 0) {
         do_pi = 1;
-        new_prio = thp->priority;
         new_dpp = thp->dpp;
     }
 
@@ -125,10 +123,22 @@ int kdecl ksys_msg_current(thread_t *act, struct kcall_args_msg_current *kap)
 
     /* PI propagation — outside cop->lock to honor SCHED-vs-CONNECT rank. */
     if (do_pi) {
-        act->real_priority = new_prio;
-        /* TODO: confirm adjust_priority() is needed here as well as below. */
+        /* act now serves thp, which lends its priority until act replies. Read
+         * thp's priority after act->client = thp is published, not snapshotted
+         * under cop->lock: a REPLY propagation that raced the snapshot fails
+         * its swap against the generation this lend starts, so a stale value
+         * here would stay.
+         */
         CRITICAL_INHERIT(act, thp);
-        adjust_priority(act, new_prio, new_dpp, 1);
+        thread_lend_msg(act, __atomic_load_n(&thp->priority, __ATOMIC_ACQUIRE),
+                        true);
+        (void) thread_prio_update_dpp(act, new_dpp, 1);
+    } else {
+        /* A fixed-priority channel lends nothing. Drop the loan an earlier
+         * client left, or a REPLY propagation from thp would relend it.
+         */
+        thread_lend_msg(act, 0, false);
+        thread_prio_update(act);
     }
 
     return EOK;

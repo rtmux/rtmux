@@ -134,7 +134,7 @@ Every path below must deboost or transfer ownership correctly:
 | thread exit while blocked | thread teardown | unlink from blocked turnstile, recompute old owner |
 | process death while owning | `process_term`, thread teardown | mark owner dying, wake or error waiters, clear held-turnstile list |
 | mutex destroy with waiters | `mutex_destroy` path | mark destroyed, wake waiters with error, remove boosts |
-| priority change | `adjust_priority_default`, `__sched_set` | recompute effective priority from base plus all owned turnstiles |
+| priority change | `sched_thread` (`__sched_set`), `sched_ss_update`/`sched_ss_adjust` | set the base only (`thread_set_base_prio`), then reapply `max(base, loans)`; see "Base and Effective Priority" |
 | condvar reacquire | `ksys_sync_condvar_wait` re-lock leg | move from CV wait to mutex turnstile without collision-mixing |
 
 When a non-winning waiter leaves the queue, recompute the owner's boost from
@@ -186,6 +186,135 @@ until all owner-held-list and blocked-on references are gone.
   owner through a recycled TID;
 - SMP stress with `CONFIG_LOCK_DEBUG` enabled.
 
+## Base and Effective Priority
+
+Every thread has a base priority, `thread_t.real_priority`, that only its own
+scheduling parameters change: `SchedSet` (`sched_thread`), and the sporadic
+server's drop to its low priority and return to its normal one
+(`sched_ss_update`, `sched_ss_adjust`). None of these is a loan. Other threads
+lend it priority through three fields beside it:
+
+- `pi_loan`: the highest waiter on any PI turnstile it owns, and its held
+  PRIO_PROTECT ceiling floor. It is the cached result of
+  `sync_pi_target_locked()`, refreshed under `sync_pi_slock` whenever an owned
+  turnstile's waiters or the ceiling set change. Ceilings are therefore part of
+  this model, not a separate path.
+- `msg_loan`: the request (a client REPLY-blocked on this thread) or the
+  notification it is serving. It packs the priority, a request flag and a
+  generation that every new loan bumps (`thread_lend_msg`).
+- `pend_loan`: the highest send or notification still queued on the channel it
+  serves. A queued send raises it on the channel's server threads; a receive
+  or reply resets it to the queue head, storing it under `chp->lock` so that a
+  send queued meanwhile raises it again afterwards.
+
+The IPC paths write the two message fields with plain atomics: no lock and no
+allocation on the fast path.
+
+The scheduler runs the thread at its effective priority, `max(base, pi_loan,
+msg_loan, pend_loan)`, cached in `thread_t.priority`. A loan is a floor: a
+server serving a lower-priority client runs at its own base. Writes to these
+fields go only through `kernel/include/thread-prio.h` (`thread_set_base_prio`,
+`thread_lend_msg`, `thread_relend_msg`, `thread_set_pend_loan`,
+`thread_raise_pend_loan`, `thread_init_prio`; `pi_loan` only in
+`kernel/sync/wait.c`), enforced by `make check-prio-writes`.
+
+`prio_apply()` turns the inputs into `thread_t.priority` through
+`adjust_priority()`, under `sync_pi_slock` (ranked below the dispatch, channel
+and sync locks `adjust_priority` takes). Every writer of an input calls it
+after its store, so the last one to take the lock reads every store made
+before it; the loop re-reads after each adjust until the priority matches. An
+unlocked comparison, after a fence, skips the lock when nothing changes. The
+rendezvous fast path stores the effective priority directly into a receiver
+that is on no queue and then calls `thread_prio_settle()`, which is that same
+comparison.
+
+A thread created by a server while it serves a request starts at the
+request's priority, so a process spawned through roottask inherits its
+spawner's priority as POSIX requires; otherwise a new thread starts at its
+creator's base (`thread_inherit_prio`). PI loans are never inherited.
+
+### When a message loan starts and ends
+
+| Event | Loan |
+| --- | --- |
+| receive of a request (rendezvous, from the send queue, `MsgCurrent`) | `msg_loan` = sender's effective priority, new generation, request flag; `pend_loan` = head of the send queue after it |
+| receive of a notification, or a remote (`COF_NETCON`) message | `msg_loan` = its priority, new generation, no request flag, until the next receive |
+| receive on a `RTMUX_FLG_CHF_FIXED_PRIORITY` channel | `msg_loan` = 0 |
+| send or notification queued with no receiver | `pend_loan` raised to its priority on each thread whose `last_chid` is the channel, whatever that thread's current priority |
+| `MsgReply` / `MsgError` that leaves the thread with no client | the request loan ends; if the call completed an exchange on the channel the thread serves, `pend_loan` = the send-queue head read as the client was unlinked |
+| reply to an older client while serving a newer one | unchanged: the newer client's loan stays |
+| the client leaves REPLY by timeout, signal, cancellation or death | `force_ready` clears the server's `client` link but does not touch its priority, because it runs where another thread cannot be rescheduled; the loan ends at the server's next `MsgReply` or `MsgError` (which then fails with `ESRCH`) or `MsgReceive` |
+| server thread dies | its client's `args.ms.server` is cleared before `tthread_rcu` drains; nothing is lent any more |
+
+Until one of those ends it, a stale loan can only hold a server above its base
+(over-boost): no path lowers a thread below a loan that is still live.
+
+### REPLY propagation
+
+A priority change carries along the wait-for chain in `prio_chain_walk()`
+(`kernel/sync/wait.c`). From a thread whose effective priority changed:
+
+- if it waits on a PI turnstile, the owner is recomputed (as before, with the
+  waiter's priority folded into the owner's `pi_loan`);
+- if it is REPLY-blocked, its server's request loan is set to its new effective
+  priority, and the walk continues from that server, through further REPLY,
+  SEND or mutex waits;
+- if it is SEND-blocked, the `pend_loan` of the channel's server threads is
+  raised to the send-queue head, and the walk ends there.
+
+So a priority-60 waiter on a mutex whose owner is REPLY-blocked on a
+priority-10 server runs that server at 60, and the loan follows changes in both
+directions: when the waiter times out or is cancelled, the owner's recompute
+walks the same chain and lowers the server again (`prio-loan` case 2).
+
+The server is found under the lock of the channel the client waits on
+(`prio_ipc_hop_find`): with the client's state and `blocked_on` rechecked there,
+`args.ms` is the live member of the reused `args` union, and the server must
+still name the client as its `client`. The server's loan generation is read
+before that check, and the update is a compare-and-swap on it
+(`thread_relend_msg`): a receive sets the new client before bumping the
+generation, so a walk that saw the old client can never overwrite the new
+client's loan.
+
+Bounds and policies:
+
+- Depth: at most `CONFIG_PRIO_REPLY_DEPTH` IPC hops per walk (Kconfig, default
+  8, range 1..64; `prio.reply_depth` in `/sys/kstats`), plus at most
+  `SYNC_PI_MAX_DEPTH` turnstiles. Past the IPC bound the walk stops: the
+  threads beyond it keep the priority they had (they are not boosted, and a
+  later change that fits the bound still reaches them), and
+  `prio.reply_depth_overflow` counts the stop. No error is returned: the thread
+  whose change started the walk is not deadlocked. `prio-loan` case 5 builds a
+  chain one longer than the bound and checks both.
+- Cycles: a mutex-only cycle returns `EDEADLK` as before. An IPC hop that comes
+  back to the contending waiter (it holds the request its mutex's owner waits
+  on) is also a cycle and returns `EDEADLK` to that waiter instead of blocking
+  forever (`prio-loan` case 4). The failed lock then walks the owner's chain
+  again unconditionally (`sync_pi_recompute_chain`), taking the contender's
+  floor back out of every thread it reached.
+- Re-sorting: every adjust re-sorts the thread in the queue it waits on: the
+  dispatch queue, a channel send queue (`adjust_priority_default`), or its
+  sync chain (`sync_chain_requeue_waiter_locked`, which first finds the thread
+  on that chain under the chain lock, since `wait_key` and the links alias other
+  state once it has left).
+- Simultaneous loans: a thread holding a PI mutex and serving a message runs
+  at the larger of the two, and losing one leaves the other (`prio-loan`
+  case 1).
+- Concurrent walks: two walks lending for the same client retry their
+  compare-and-swap until the one that reads the client's latest priority
+  stores it; a walk that finds a newer generation leaves it.
+- Not followed: the condvar wait leg, which holds a chain lock, recomputes the
+  two owners it touches without walking on; the sporadic drop of a thread
+  already blocked under the dispatch lock (`SS_STOP_RUNNING_LOCKED`) stores
+  its effective priority directly, and the next loan or base change reapplies
+  it (the other sporadic drop and the replenishment go through
+  `thread_prio_update_dpp`); a SEND-blocked sender's lower priority does not
+  lower `pend_loan`, which is reset at the next receive or reply.
+- Known window, unchanged from before: a contender bound to a turnstile but not
+  yet queued on it contributes its priority only through its own walk's
+  floor, so a concurrent recompute of the owner in that window can drop it
+  until the contender is queued and the turnstile maximum is next refreshed.
+
 ## Section 13 SMT refinement table
 
 The N-hart SRR + bounded-PI safety invariants are machine-checked at the spec
@@ -195,11 +324,16 @@ point, and the runtime probe that covers the lock-free C the model does not:
 
 | Invariant (SMT assertion) | Concrete function / linearization point | Covering probe |
 | --- | --- | --- |
-| No priority leak: effective priority returns to base once the last waiter leaves | `adjust_priority()` deboost recompute from the owner's remaining owned turnstiles on the unlock / timeout / cancel / owner-death path (`kernel/sched/dispatch.c`); linearizes at the effective-priority recompute under the chain lock when the waiter set empties | `rt-check` PI rows in `docs/rt-budgets.md`; the `pi-inversion` test |
-| A boost never lowers the owner below its waiter | `sync_pi_propagate()` `target = max(sync_pi_target_locked(owner), waiter->priority)` (`kernel/sync/wait.c:576-584`); linearizes at the `adjust_priority` under `sync_pi_slock` | `pi-inversion` / `pi-inversion-xfail`; `rt-check` |
-| Bounded PI walk: a cycle or over-deep chain returns `EDEADLK` (no unbounded spinlock work) | `sync_pi_propagate()` visited-stamp + `SYNC_PI_MAX_DEPTH` cap + self-cycle check (`kernel/sync/wait.c:551-570`); linearizes at the revisit / cap / self test at each iteration head | `CONFIG_LOCK_DEBUG` bounded chain-lock hold; `rt-check` |
+| No priority leak: effective priority returns to base once the last waiter leaves | `sync_pi_recompute_owner()` refreshes `pi_loan` from the owner's remaining owned turnstiles (`sync_pi_target_locked`) and `prio_apply()` reapplies `max(base, loans)` on the unlock / timeout / cancel / owner-death path (`kernel/sync/wait.c`); linearizes at the `pi_loan` store under `sync_pi_slock` when the waiter set empties | `rt-check` PI rows in `docs/rt-budgets.md`; the `pi-inversion` test; `prio-loan` cases 1 and 2 |
+| A boost never lowers the owner below its waiter | `prio_chain_walk()` turnstile step: `sync_pi_target_locked(owner, floor)` with `floor = waiter->priority` folds the waiter into `pi_loan` (`kernel/sync/wait.c`); linearizes at that store under `sync_pi_slock` | `pi-inversion` / `pi-inversion-xfail`; `rt-check` |
+| Bounded PI walk: a cycle or over-deep chain returns `EDEADLK` (no unbounded spinlock work) | `prio_chain_walk()` visited-stamp + `SYNC_PI_MAX_DEPTH` cap + self-cycle check, the last also on an IPC hop back to the waiter (`kernel/sync/wait.c`); linearizes at the revisit / cap / self test at each iteration head | `CONFIG_LOCK_DEBUG` bounded chain-lock hold; `rt-check`; `prio-loan` case 4 |
 | No thread runs on two harts | the locked ready-list unlink in `select_thread_default()` / `dispatch_unlink_ready()` (`kernel/sched/dispatch.c:206,257`; `runcpu`/`STATE_RUNNING` are published afterward, not the claim); linearizes at the ready-node unlink under the dispatch lock | `CONFIG_LOCK_DEBUG` under SMP; the `thread_destroy` "stuck active on hart" FATAL guard; reference-host `CPUS=8` `rt-check` |
-| No transition acts on a stale (recycled `pid`,`tid`) receiver | `sync_turnstile_owner_pin()` process-vector resolve + `tid` recheck + `tthread_pin()`, plus the stale-owner guard that refuses an already-cleared owner word (`kernel/sync/wait.c:336-339,421`); linearizes at the `tid` recheck and pin before first use | the RCU litmus (`tests/litmus/rcu-sched-qs-publish.litmus`); the `blocked_on`/`rcvid` UAF regression; `rt-check` |
+| No transition acts on a stale (recycled `pid`,`tid`) receiver | `sync_lookup_owner_pin()` process-vector resolve + `tid` recheck + `tthread_pin()`, plus the stale-owner guard that refuses an already-cleared owner word (`kernel/sync/wait.c`); linearizes at the `tid` recheck and pin before first use | the RCU litmus (`tests/litmus/rcu-sched-qs-publish.litmus`); the `blocked_on`/`rcvid` UAF regression; `rt-check` |
+| Base and loans are separate: a base change keeps every live loan, and the base returns once the loans end | `thread_effective_prio()` = `max(real_priority, pi_loan, msg_loan, pend_loan)` (`kernel/include/thread-prio.h`); `sched_thread()` and the sporadic drop/return write only `thread_set_base_prio()`; linearizes at `prio_apply()`'s adjust after the base or loan store | `prio-loan` cases 1, 3 and 6; `make check-prio-writes` |
+| Bounded REPLY propagation: at most `CONFIG_PRIO_REPLY_DEPTH` hops, and a longer chain is counted | `prio_chain_walk()` REPLY step `++hops > CONFIG_PRIO_REPLY_DEPTH` stop + `prio_reply_depth_overflow` (`kernel/sync/wait.c`); linearizes at the hop test | `prio-loan` case 5 (`/sys/kstats` `prio.reply_depth`, `prio.reply_depth_overflow`) |
+
+Invariants 6 and 7 (the last two rows) model the base/loan split and the REPLY
+hop bound.
 
 The SMT proves only that the invariants are self-consistent as stated; the
 linked C is validated by the named probes, per the section 13 gate philosophy
@@ -212,14 +346,13 @@ the receiving server thread for the duration of a request, so a high-priority
 client is not head-of-line blocked behind the server's low base priority. Two
 paths apply the donation:
 
-- Rendezvous (a receiver is already waiting): the receiver thread runs at the
-  sender's message-driven priority and partition, assigned before it returns to
-  user mode (kernel/ipc/fastmsg.c, the receiver-found branch sets
-  thp->real_priority = thp->priority = sender->priority and inherits
-  sender->dpp).
+- Rendezvous (a receiver is already waiting): the sender lends its priority to
+  the receiver for the request (kernel/ipc/fastmsg.c, the receiver-found branch
+  lends `sender->priority` as the receiver's request loan and runs it at its
+  effective priority, inheriting sender->dpp). The receiver's base is untouched.
 - Send-block (no receiver waiting): the server threads that last used the channel
-  are raised to the sender's priority if they are below it, so the message is
-  serviced at the client's priority rather than the server's base.
+  raise their `pend_loan` to the sender's priority, so the message is serviced
+  at the client's priority rather than the server's base.
 
 Supported donation boundary (verified by tests/userland/rt-latency/
 ipc-priority-donation.c, in the rt-check gate; it exercises the rendezvous and
@@ -231,16 +364,17 @@ transitive paths, not the send-block scan):
   priority is serviced at that lower priority, not the earlier higher one, so a
   donation does not survive into the next unrelated request. The receive path
   overwrites the effective priority with each new sender; the test checks this
-  per-request tracking, not that the server thread is separately observed back at
-  its base between requests.
+  per-request tracking; `prio-loan` (syscall-testing) checks that a server is
+  back at its base after the reply.
 - Transitivity: a server that is itself blocked on a second server (client to A
   to B, A sending to B while reply-blocked on it) passes the donation through, so
   B also observes the client's priority.
 
-The donation stays within fixed-priority scheduling: the rendezvous path runs the
-receiver at the sender's message-driven priority, the send-block scan only raises
-a server thread that is below the sender (never lowers it), and the effective
-priority does not persist into an unrelated later request. It cannot preempt a
+The donation stays within fixed-priority scheduling: the rendezvous path lends
+the sender's priority, the send-block scan only raises a server thread that is
+below the sender (never lowers it), and the loan ends with the reply, so it does
+not persist into an unrelated later request. A loan is a floor, never a cap: a
+server whose base is above its client's priority serves it at its base. It cannot preempt a
 server that is already running a handler on the client's behalf; that
 availability bound, not a donation gap, is what the LKL client path hits below.
 

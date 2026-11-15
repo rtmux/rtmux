@@ -32,15 +32,15 @@ count() { printf '%s\n' "$1" | grep -c "^$2\$" || true; }
 out=$(z3 "$MODEL")
 printf '%s\n' "$out"
 if [ "$(count "$out" unknown)" -ne 0 ] ||
-   [ "$(count "$out" sat)" -ne 5 ] ||
-   [ "$(count "$out" unsat)" -ne 5 ]; then
-    echo "SRR/PI SMT: model did not verify (expected 5 sat + 5 unsat, no unknown)" >&2
+   [ "$(count "$out" sat)" -ne 7 ] ||
+   [ "$(count "$out" unsat)" -ne 7 ]; then
+    echo "SRR/PI SMT: model did not verify (expected 7 sat + 7 unsat, no unknown)" >&2
     exit 1
 fi
 cert_assert "$MODEL: $(count "$out" sat) sat, $(count "$out" unsat) unsat, $(count "$out" unknown) unknown"
 
 pout=$(z3 "$PLANTED")
-if [ "$(count "$pout" sat)" -ne 5 ] || [ "$(count "$pout" unsat)" -ne 0 ]; then
+if [ "$(count "$pout" sat)" -ne 7 ] || [ "$(count "$pout" unsat)" -ne 0 ]; then
     echo "SRR/PI SMT: planted-bug model did not go all-sat; an invariant check is vacuous" >&2
     printf '%s\n' "$pout"
     exit 1

@@ -1014,8 +1014,16 @@ static int sendv_body(thread_t *act,
             !(cop->flags & COF_NETCON) &&
             !(chp->flags & RTMUX_FLG_CHF_FIXED_PRIORITY) &&
             !IS_SCHED_SS(sender)) {
-            /* By default the receiver runs with message driven priority. */
-            thp->real_priority = thp->priority = sender->priority;
+            /* By default the receiver runs with message driven priority: the
+             * sender lends its priority for the request (thp->client was set
+             * above), and nothing is queued behind it, or thp would not have
+             * been waiting. thp is on no queue, so store the effective priority
+             * directly; settle below reconciles a loan change that raced the
+             * store.
+             */
+            thread_lend_msg(thp, sender->priority, true);
+            thread_set_pend_loan(thp, 0);
+            thp->priority = (uint8_t) thread_effective_prio(thp);
             thp->dpp = sender->dpp;
             CRITICAL_INHERIT(thp, sender);
 
@@ -1052,13 +1060,18 @@ static int sendv_body(thread_t *act,
 #else
             block_and_ready(thp);
 #endif
+            thread_prio_settle(thp);
         } else {
             if ((chp->flags & RTMUX_FLG_CHF_FIXED_PRIORITY) == 0) {
                 /* By default the receiver runs with message driven priority. */
-                thp->real_priority = thp->priority = sender->priority;
+                thread_lend_msg(thp, sender->priority, true);
                 thp->dpp = sender->dpp;
                 CRITICAL_INHERIT(thp, sender);
+            } else {
+                thread_lend_msg(thp, 0, false);
             }
+            thread_set_pend_loan(thp, 0);
+            thread_prio_settle(thp); /* thp is on no queue yet */
             sender->state =
                 STATE_REPLY; /* Must be set before calling block_and_ready() */
             _TRACE_TH_EMIT_STATE(sender, REPLY);
@@ -1284,10 +1297,15 @@ static int sendv_body(thread_t *act,
             if (VECP(thp, &chp->process->threads, i) &&
                 thp->last_chid == chp->chid) {
                 int may_run = may_thread_run(thp);
-                if (thp->priority < sender->priority) {
-                    adjust_priority(thp, sender->priority,
-                                    may_run ? thp->dpp : sender->dpp, 1);
-                    thp->real_priority = thp->priority;
+
+                /* A loan for the pending send, whether or not another loan
+                 * already holds thp higher; it is reset when this thread next
+                 * receives or replies.
+                 */
+                if (thp->pend_loan < sender->priority) {
+                    thread_raise_pend_loan(thp, sender->priority);
+                    (void) thread_prio_update_dpp(
+                        thp, may_run ? thp->dpp : sender->dpp, 1);
                 } else {
                     if (!may_run) {
                         /* server threads are higher prio, but have no budget.
@@ -1353,7 +1371,7 @@ int kdecl ksys_msg_sendv(thread_t *act, struct kcall_args_msg_sendv *kap)
      * and the send failing all at once; the soul then stays until exit.
      */
     if (held)
-        (void) connect_client_drop(held, act->real_priority);
+        (void) connect_client_drop(held, thread_base_prio(act));
     return r;
 }
 
@@ -1366,6 +1384,21 @@ int kdecl ksys_msg_sendv(thread_t *act, struct kcall_args_msg_sendv *kap)
  *   kap : kcall args (coid, priority, notification code, notification value)
  * Return value: EOK on success; an errno on failure.
  */
+/* A received notification lends its priority to its receiver until the next
+ * receive; a fixed-priority channel lends nothing and drops a loan left from an
+ * earlier receive. Either way the receiver moves to its process's default
+ * partition, as message-driven priority always did.
+ */
+static void notification_lend(thread_t *thp, channel_t *chp, unsigned prio)
+{
+    bool fixed = (chp->flags & RTMUX_FLG_CHF_FIXED_PRIORITY) != 0;
+
+    thread_lend_msg(thp, fixed ? 0 : prio, false);
+    if (!thread_prio_update_dpp(thp, thp->process->default_dpp, 1) &&
+        thp->dpp != thp->process->default_dpp)
+        adjust_priority(thp, thp->priority, thp->process->default_dpp, 1);
+}
+
 int kdecl ksys_msg_sendnotification(thread_t *act,
                                     struct kcall_args_msg_sendnotification *kap)
 {
@@ -1506,15 +1539,7 @@ int kdecl ksys_msg_sendnotification(thread_t *act,
 #endif
             kspinlock_unlock(&chp->lock);
 
-            /* By default the receiver runs with message driven priority. */
-            if (thp->priority != prio &&
-                (chp->flags & RTMUX_FLG_CHF_FIXED_PRIORITY) == 0) {
-                adjust_priority(thp, prio, thp->process->default_dpp, 1);
-                thp->real_priority = thp->priority;
-            } else if (thp->dpp != thp->process->default_dpp) {
-                adjust_priority(thp, thp->priority, thp->process->default_dpp,
-                                1);
-            }
+            notification_lend(thp, chp, prio);
 
             /* Note - since this is a user-delivered notification, it cannot
              * have the VTID flag on @@Add assert
@@ -1741,6 +1766,8 @@ restart_recv:
              * of the slock drop.
              */
             notification_remove(chp->process, &chp->send_queue, pup);
+            /* Under chp->lock, so a send queued meanwhile raises after it. */
+            thread_set_pend_loan(act, channel_pending_loan_locked(chp));
         } else if (IMTO(thp, STATE_REPLY)) {
             /* Don't claim — leave for force_ready outside the lock. */
             imto_bounce = 1;
@@ -1785,29 +1812,28 @@ restart_recv:
         act->timeout_flags = 0;
 
         /* By default the receiver runs with message driven priority. RUSH: Fix
-         * for partition inheritance
+         * for partition inheritance Drop the client link before the new loan,
+         * so a REPLY propagation from that client sees the new generation
+         * (thread_lend_msg).
          */
-        if (act->priority != notification_priority &&
-            (chp->flags & RTMUX_FLG_CHF_FIXED_PRIORITY) == 0) {
-            adjust_priority(act, notification_priority,
-                            act->process->default_dpp, 1);
-            act->real_priority = act->priority;
-        } else if (act->dpp != act->process->default_dpp) {
-            adjust_priority(act, act->priority, act->process->default_dpp, 1);
-        }
-
         if ((thp = act->client) != 0) {
             /* need to clear client's server field */
             act->client = 0;
             thp->args.ms.server = 0;
         }
+        notification_lend(act, chp, notification_priority);
 
+        /* The lend can lower act and switch it out here, and the trap path
+         * writes a returned status only while act still runs: publish it.
+         */
         if (xferstat) {
-            return EFAULT;
+            kcall_err(act, EFAULT);
+            return ENOERROR;
         }
         _TRACE_COMM_IPC_RET(act);
 
-        return EOK;
+        SETKSTATUS(act, EOK);
+        return ENOERROR;
     }
 
     if (imto_bounce) {
@@ -1987,6 +2013,8 @@ restart_recv:
          */
         kspinlock_lock(&chp->lock);
         pril_rem(&chp->send_queue, thp);
+        /* Under chp->lock, so a send queued meanwhile raises after it. */
+        thread_set_pend_loan(act, channel_pending_loan_locked(chp));
         if (thp->state == STATE_SEND) {
             thp->state = STATE_REPLY;
             snap_time(&thp->timestamp_last_block, 0);
@@ -2015,14 +2043,17 @@ restart_recv:
         /* By default the receiver runs with message driven priority. RUSH: Fix
          * for partition inheritance
          */
-        if ((act->priority != thp->priority || act->dpp != thp->dpp) &&
-            (chp->flags & RTMUX_FLG_CHF_FIXED_PRIORITY) == 0) {
-            CRITICAL_INHERIT(act, thp);
-            adjust_priority(act, thp->priority, thp->dpp, 1);
-            if (act->real_priority != act->priority)
-                act->real_priority = act->priority;
+        if ((chp->flags & RTMUX_FLG_CHF_FIXED_PRIORITY) == 0) {
+            if (act->priority != thp->priority || act->dpp != thp->dpp)
+                CRITICAL_INHERIT(act, thp);
+            else
+                CRITICAL_CLEAR(act);
+            thread_lend_msg(act, thp->priority, true); /* act->client = thp */
+            (void) thread_prio_update_dpp(act, thp->dpp, 1);
         } else {
             CRITICAL_CLEAR(act);
+            thread_lend_msg(act, 0, false);
+            thread_prio_update(act);
         }
 
         return ENOERROR;
@@ -2187,7 +2218,29 @@ restart_recv:
  *   kap : kcall args (rcvid, reply iov smsg/sparts, status)
  * Return value: EOK on success; an errno on fault/lookup failure.
  */
-int kdecl ksys_msg_replyv(thread_t *act, struct kcall_args_msg_replyv *kap)
+/* Caller holds chp->lock, having just unlinked a replied client. If that left
+ * act with no client on the channel it serves, reset its pending-send loan to
+ * the queue head here, under the lock, so a send queued meanwhile raises it
+ * afterwards rather than being overwritten. Sets *changedp when it changed.
+ */
+static void reply_pending_loan_locked(thread_t *act,
+                                      channel_t *chp,
+                                      bool *changedp)
+{
+    unsigned pending;
+
+    if (act->client || act->last_chid != chp->chid)
+        return;
+    pending = channel_pending_loan_locked(chp);
+    if (act->pend_loan != pending) {
+        thread_set_pend_loan(act, pending);
+        *changedp = true;
+    }
+}
+
+static int msg_replyv_body(thread_t *act,
+                           struct kcall_args_msg_replyv *kap,
+                           bool *changedp)
 {
     connect_t *cop;
     thread_t *thp;
@@ -2516,6 +2569,7 @@ int kdecl ksys_msg_replyv(thread_t *act, struct kcall_args_msg_replyv *kap)
      */
     kspinlock_lock(&chp->lock);
     LINKPRIL_REM(thp);
+    reply_pending_loan_locked(act, chp, changedp);
 
     /* Completed under the lock: a force_ready (ConnectDetach's EBADF sweep)
      * that wins the lock after our release sees blocked_on != cop and leaves
@@ -2560,6 +2614,7 @@ xfer_err:
      */
     kspinlock_lock(&chp->lock);
     LINKPRIL_REM(thp);
+    reply_pending_loan_locked(act, chp, changedp);
     /* Complete the exchange under the lock; see ksys_msg_replyv. */
     if (thp->blocked_on == cop)
         thp->blocked_on = NULL;
@@ -2589,7 +2644,9 @@ xfer_err:
  * Return value: EOK on success; ESRCH if the rcvid no longer names a
  *               reply-blocked client.
  */
-int kdecl ksys_msg_error(thread_t *act, struct kcall_args_msg_error *kap)
+static int msg_error_body(thread_t *act,
+                          struct kcall_args_msg_error *kap,
+                          bool *changedp)
 {
     connect_t *cop;
     thread_t *thp;
@@ -2726,6 +2783,7 @@ int kdecl ksys_msg_error(thread_t *act, struct kcall_args_msg_error *kap)
      */
     kspinlock_lock(&chp->lock);
     LINKPRIL_REM(thp);
+    reply_pending_loan_locked(act, chp, changedp);
     /* Complete the exchange under the lock; see ksys_msg_replyv. */
     if (thp->blocked_on == cop)
         thp->blocked_on = NULL;
@@ -2740,4 +2798,51 @@ int kdecl ksys_msg_error(thread_t *act, struct kcall_args_msg_error *kap)
 
     act->restart = NULL;
     return EOK;
+}
+
+/* A server's request loan ends when it has no client left: it replied to (or
+ * errored) the client that lent it, or that client already left by timeout,
+ * signal or teardown (the reply then fails, but the loan is just as stale).
+ * `pend_changed` says the body reset the pending-send loan under chp->lock
+ * (reply_pending_loan_locked). A notification loan stays until the next
+ * receive, and replying to an older client while serving a newer one keeps the
+ * newer client's loan.
+ *
+ * Dropping a loan can switch act out right here, and the trap path writes a
+ * returned status only while act is still running, so publish the status first
+ * and return ENOERROR.
+ */
+static int msg_reply_loan_end(thread_t *act, bool pend_changed, int r)
+{
+    bool end_request;
+
+    if (__atomic_load_n(&act->client, __ATOMIC_ACQUIRE) != NULL)
+        return r;
+    end_request = thread_msg_loan_is_request(act);
+    if (!end_request && !pend_changed)
+        return r;
+    if (r != ENOERROR) {
+        kcall_err(act, r);
+        r = ENOERROR;
+    }
+    if (end_request)
+        thread_lend_msg(act, 0, false);
+    thread_prio_update(act);
+    return r;
+}
+
+int kdecl ksys_msg_replyv(thread_t *act, struct kcall_args_msg_replyv *kap)
+{
+    bool pend_changed = false;
+    int r = msg_replyv_body(act, kap, &pend_changed);
+
+    return msg_reply_loan_end(act, pend_changed, r);
+}
+
+int kdecl ksys_msg_error(thread_t *act, struct kcall_args_msg_error *kap)
+{
+    bool pend_changed = false;
+    int r = msg_error_body(act, kap, &pend_changed);
+
+    return msg_reply_loan_end(act, pend_changed, r);
 }

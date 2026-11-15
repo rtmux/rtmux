@@ -21,15 +21,17 @@ int(pthread_mutex_unlock)(pthread_mutex_t *mutex)
         unsigned long depth =
             (unsigned long) mutex->count & RTMUX_SYNC_COUNTMASK;
 
-        if ((mutex->count & RTMUX_SYNC_PRIOCEILING) != 0) {
-            /* The ceiling sits in disjoint high bits, so decrement only the
-             * low-16 depth. A recursive unlock (depth > 1) stays held entirely
-             * in user space; the final unlock drops to depth 0 and enters the
-             * kernel to lift the ceiling boost and release/hand off the owner
-             * (owner stays == self until that kcall, so no self-serve race).
+        if ((mutex->count & (RTMUX_SYNC_PRIOCEILING | RTMUX_SYNC_ROBUST)) !=
+            0) {
+            /* A PRIO_PROTECT ceiling sits in disjoint high bits, so decrement
+             * only the low-16 depth. A recursive unlock (depth > 1) stays held
+             * entirely in user space; the final unlock drops to depth 0 and
+             * enters the kernel to lift the ceiling boost or drop the robust
+             * holder record, and to release/hand off the owner (owner stays ==
+             * self until that kcall, so no self-serve race).
              */
-            unsigned long d =
-                (unsigned long) mutex->count & RTMUX_SYNC_PPDEPTHMASK;
+            unsigned long d = (unsigned long) mutex->count &
+                              rtmux_sync_depth_mask(mutex->count);
             if (d > 1) {
                 --mutex->count;
                 return EOK;
@@ -37,8 +39,7 @@ int(pthread_mutex_unlock)(pthread_mutex_t *mutex)
             if (d == 1)
                 --mutex->count;
 
-            /* Final unlock of the ceiling mutex: the lock is really released.
-             */
+            /* Final unlock: the lock is really released. */
             __ulock_debug_release(mutex);
             return __rtmux_pthread_ret(sync_mutex_unlock_r((sync_t *) mutex));
         }

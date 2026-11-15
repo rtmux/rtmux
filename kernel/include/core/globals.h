@@ -416,6 +416,9 @@ EXT void(rdecl *adjust_priority)(thread_t *thp,
 EXT void(rdecl *resched)(void);
 EXT void(rdecl *yield)(void);
 
+/* Base/effective priority accessors; need adjust_priority above. */
+#include <thread-prio.h>
+
 
 /* SMP variables */
 EXT int smp_dispatch_enabled

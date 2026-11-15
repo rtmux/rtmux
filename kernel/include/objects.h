@@ -45,6 +45,7 @@ typedef struct notification_entry notification_t;
 typedef struct syncevent_entry sync_event_t;
 typedef struct sync_entry ksync_t;
 typedef struct turnstile_entry turnstile_t;
+struct robust_hold;
 
 /* Opaque identity token for a sync object's wait queue. Today it is the user
  * sync_t's virtual address; process-shared syncs will key on a physical address
@@ -559,6 +560,13 @@ typedef struct thread_entry { /* Also used for vthread_entry */
                                         */
     turnstile_t
         *owned_turnstiles; /* turnstiles currently boosting this owner */
+    /* Robust mutexes this thread holds (under sync_pi_slock), and one spare
+     * record kept so a lock after an unlock does not allocate. Only the thread
+     * itself touches the spare. See kernel/sync/wait.c.
+     */
+    struct robust_hold *robust_held;
+    struct robust_hold *robust_spare;
+    unsigned robust_nheld; /* length of robust_held (under sync_pi_slock) */
     thread_t *restart;
 
     /* The following is used to hold arguments when a thread blocks to make them
@@ -767,6 +775,31 @@ typedef struct thread_entry { /* Also used for vthread_entry */
     unsigned held_ceiling_n; /* wide enough that no realizable nesting wraps */
     uint8_t held_ceiling_floor;
     bool held_ceiling_saturated;
+
+    /* Priority loans (docs/pi-pc-design.md "Base and Effective Priority").
+     * real_priority is the thread's own base; these carry what other threads
+     * lend it, and the effective priority (thp->priority) is the maximum of all
+     * four. They are plain words so the IPC fast path lends without allocating
+     * or taking a lock.
+     *
+     * msg_loan: the request (a client in REPLY on this thread) or notification
+     * being served; priority, request flag and generation packed as described
+     * in <thread-prio.h>.
+     *
+     * pend_loan: the highest send or notification still queued on the channel
+     * this thread serves; raised when one is queued, reset from the queue head
+     * when this thread receives or replies.
+     *
+     * pi_loan: the highest priority a PI waiter or a PRIO_PROTECT ceiling
+     * lends: the cached result of the owned-turnstile walk, refreshed under
+     * sync_pi_slock (sync_pi_target_locked).
+     *
+     * Only the accessors in <thread-prio.h> and kernel/sync/wait.c write these
+     * and real_priority; scripts/check-prio-writes.sh enforces that.
+     */
+    uint64_t msg_loan;
+    uint8_t pend_loan;
+    uint8_t pi_loan;
 
     /* timestamp_last_block value the stall detector has already reported for
      * this thread (stall_scan_roottask_waiters, CONFIG_STALL_DETECTOR). Written

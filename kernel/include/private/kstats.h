@@ -72,6 +72,10 @@ struct kcall_args_soul_stats {
     uint64_t *timer_intr; /* caller buffer: STIMER interrupts taken, per hart */
     unsigned timer_n;     /* capacity of timer_intr in entries */
     unsigned timer_count; /* out: online harts (set even if timer_n is short) */
+    uint64_t prio_reply_overflow; /* out: priority walks that stopped at
+                                   * CONFIG_PRIO_REPLY_DEPTH
+                                   */
+    unsigned prio_reply_depth;    /* out: CONFIG_PRIO_REPLY_DEPTH */
     int ret;
 };
 

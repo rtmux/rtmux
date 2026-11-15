@@ -14,7 +14,46 @@
 #include <sys/procmsg.h>
 #include "pinode.h"
 
-static pthread_mutex_t text_mutex = PTHREAD_MUTEX_INITIALIZER;
+/* Both locks inherit priority; devtext_init() sets them up. The watcher thread
+ * runs below the dispatch workers and holds text_mutex again each time its
+ * timed wait ends, so with a plain mutex a preempted watcher stalls every
+ * worker that closes /dev/text, and each blocked worker makes the pool start
+ * another.
+ *
+ * text_mutex guards the typed-ahead ring, the armed notifications and the
+ * termios state. text_out_mutex orders console output only, and no path writes
+ * to the console while holding text_mutex, so a worker that closes or polls the
+ * device never waits for a console write.
+ */
+static pthread_mutex_t text_mutex;
+static pthread_mutex_t text_out_mutex;
+
+/* Lock one of the mutexes above. A priority-inheriting lock can fail with
+ * EAGAIN when the kernel has no turnstile to give it, and the callers could not
+ * proceed without the lock, so retry after a short sleep, which unlike a yield
+ * lets a lower-priority thread run.
+ */
+static void text_lock(pthread_mutex_t *m)
+{
+    int err;
+
+    while ((err = pthread_mutex_lock(m)) == EAGAIN) {
+        struct timespec ts = {.tv_sec = 0, .tv_nsec = 1000000L};
+
+        nanosleep(&ts, NULL);
+    }
+    if (err != EOK)
+        crash();
+}
+
+/* Write to the console in order with every other writer. */
+static void text_console_write(const char *buf, size_t len)
+{
+    text_lock(&text_out_mutex);
+    root_console_write(buf, len);
+    pthread_mutex_unlock(&text_out_mutex);
+}
+
 static dev_t text_devno;
 
 /* Terminal state for /dev/console (minimal termios support for early userland)
@@ -107,8 +146,10 @@ static int text_next(int to_ring)
 {
     for (;;) {
         int c, sig = 0;
+        char echo[2];
+        size_t echo_len = 0;
 
-        pthread_mutex_lock(&text_mutex);
+        text_lock(&text_mutex);
         if (!to_ring && text_ahead_head != text_ahead_tail) {
             c = text_ahead[text_ahead_tail++ % TEXT_AHEAD];
             pthread_mutex_unlock(&text_mutex);
@@ -138,11 +179,13 @@ static int text_next(int to_ring)
                 ;
         }
         if ((text_termios.c_lflag & ECHO) && c < ' ') {
-            char echo[2] = {'^', (char) (c + '@')};
-
-            root_console_write(echo, 2);
+            echo[0] = '^';
+            echo[1] = (char) (c + '@');
+            echo_len = sizeof echo;
         }
         pthread_mutex_unlock(&text_mutex);
+        if (echo_len)
+            text_console_write(echo, echo_len);
         if (proc_jobctl_signal_fg(ROOTTASK_PID, text_sid, sig) == ESRCH) {
             text_sid = 0; /* the session is gone: stop claiming the keys */
         }
@@ -160,7 +203,7 @@ static void *text_watcher(void *arg)
     int armed = 0;
 
     (void) arg;
-    pthread_mutex_lock(&text_mutex);
+    text_lock(&text_mutex);
     for (;;) {
         struct timespec until;
         long ms = armed ? TEXT_WATCH_ARMED_MS : TEXT_WATCH_MS;
@@ -177,7 +220,7 @@ static void *text_watcher(void *arg)
             continue;
         pthread_mutex_unlock(&text_mutex);
         (void) text_next(1);
-        pthread_mutex_lock(&text_mutex);
+        text_lock(&text_mutex);
 
         /* A poller may have armed while the lock was dropped; its signal was
          * missed, so look again to pick the short interval for it.
@@ -268,12 +311,11 @@ static int text_read(ioserv_context_t *ctp, io_read_t *msg, void *ocb)
     /* ECHO: terminal driver responsibility per POSIX */
     if (text_termios.c_lflag & ECHO) {
         char ch = (char) c;
-        pthread_mutex_lock(&text_mutex);
+
         if (ch == '\r' || ch == '\n')
-            root_console_write("\r\n", 2);
+            text_console_write("\r\n", 2);
         else if (ch >= ' ')
-            root_console_write(&ch, 1);
-        pthread_mutex_unlock(&text_mutex);
+            text_console_write(&ch, 1);
     }
 
     *(char *) msg = (char) c;
@@ -321,10 +363,8 @@ static int text_write(ioserv_context_t *ctp, io_write_t *msg, void *ocb)
     if (msg->i.nbytes > (int32_t) (ctp->msg_max_size - sizeof msg->i)) {
         msg->i.nbytes = (int32_t) (ctp->msg_max_size - sizeof msg->i);
     }
-    pthread_mutex_lock(&text_mutex);
-    root_console_write((char *) (&msg->i) + sizeof msg->i,
+    text_console_write((char *) (&msg->i) + sizeof msg->i,
                        (size_t) msg->i.nbytes);
-    pthread_mutex_unlock(&text_mutex);
     _IO_SET_WRITE_NBYTES(ctp, msg->i.nbytes);
     return EOK;
 }
@@ -444,7 +484,7 @@ static int text_devctl(ioserv_context_t *ctp, io_devctl_t *msg, void *ocb)
         if (msg->i.nbytes < (int32_t) sizeof data->qsel)
             return EINVAL;
         if (data->qsel == TCIFLUSH || data->qsel == TCIOFLUSH) {
-            pthread_mutex_lock(&text_mutex);
+            text_lock(&text_mutex);
             text_ahead_tail = text_ahead_head;
             while (root_console_getchar() >= 0)
                 ;
@@ -471,17 +511,13 @@ static int text_devctl(ioserv_context_t *ctp, io_devctl_t *msg, void *ocb)
         case TCIOFF: {
             char ch = (char) text_termios.c_cc[VSTOP];
 
-            pthread_mutex_lock(&text_mutex);
-            root_console_write(&ch, 1);
-            pthread_mutex_unlock(&text_mutex);
+            text_console_write(&ch, 1);
             break;
         }
         case TCION: {
             char ch = (char) text_termios.c_cc[VSTART];
 
-            pthread_mutex_lock(&text_mutex);
-            root_console_write(&ch, 1);
-            pthread_mutex_unlock(&text_mutex);
+            text_console_write(&ch, 1);
             break;
         }
         case TCOOFF:
@@ -522,7 +558,7 @@ static int text_notify(ioserv_context_t *ctp, io_notify_t *msg, void *ocb)
     if ((msg->i.flags & (unsigned) _NOTIFY_COND_INPUT) &&
         text_ahead_head == text_ahead_tail)
         (void) text_next(1);
-    pthread_mutex_lock(&text_mutex);
+    text_lock(&text_mutex);
     if (text_ahead_head != text_ahead_tail)
         trig |= _NOTIFY_COND_INPUT;
     ret = ioserv_notify(ctp, msg, text_notify_lists, trig, 0, NULL);
@@ -537,7 +573,7 @@ static int text_close_dup(ioserv_context_t *ctp, io_close_t *msg, void *ocb)
 {
     (void) msg;
     (void) ocb;
-    pthread_mutex_lock(&text_mutex);
+    text_lock(&text_mutex);
     ioserv_notify_remove(ctp, text_notify_lists);
     pthread_mutex_unlock(&text_mutex);
     return EOK;
@@ -607,6 +643,18 @@ static const ioserv_connect_ops_t text_connect_funcs = {
  */
 void devtext_init(void)
 {
+    {
+        /* Priority inheritance: see the comment at text_mutex. */
+        pthread_mutexattr_t mattr;
+
+        if (pthread_mutexattr_init(&mattr) != EOK ||
+            pthread_mutexattr_setprotocol(&mattr, PTHREAD_PRIO_INHERIT) !=
+                EOK ||
+            pthread_mutex_init(&text_mutex, &mattr) != EOK ||
+            pthread_mutex_init(&text_out_mutex, &mattr) != EOK)
+            crash();
+        pthread_mutexattr_destroy(&mattr);
+    }
     /* Sensible terminal defaults so the shell gets ECHO | ICANON */
     text_termios.c_iflag = ICRNL | BRKINT;
     text_termios.c_oflag = OPOST | ONLCR;

@@ -276,6 +276,9 @@ POSIX_NAMES = {
     "pthread_mutexattr_setprotocol",
     "pthread_mutexattr_setpshared",
     "pthread_mutexattr_settype",
+    "pthread_mutexattr_getrobust",
+    "pthread_mutexattr_setrobust",
+    "pthread_mutex_consistent",
     "pthread_mutex_getprioceiling",
     "pthread_mutex_setprioceiling",
     "pthread_barrier_init",
@@ -678,6 +681,12 @@ STUB_OVERRIDES = {
 }
 
 DESIGN_NOTES = {
+    "pthread_mutex_consistent": "clears the inconsistent state an EOWNERDEAD "
+    "lock left; an unlock without it makes the mutex ENOTRECOVERABLE",
+    "pthread_mutexattr_setrobust": "a robust mutex always locks and unlocks "
+    "through the kernel, which hands it to the next waiter (or the next "
+    "locker) with EOWNERDEAD when the owning thread or process dies; works "
+    "process-shared and with PRIO_INHERIT/PRIO_PROTECT",
     "crypt": "XSI; SHA-512 modular form ($6$salt$hash) only (from FreeBSD)",
     "pthread_attr_setscope": "PTHREAD_SCOPE_SYSTEM only; PTHREAD_SCOPE_PROCESS is "
     "correctly ENOTSUP and an unknown scope is EINVAL (RTMux threads are 1:1 "

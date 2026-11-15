@@ -127,7 +127,7 @@ endif
 PTHREAD_SRCS = pthread-self.c pthread-equal.c \
                pthread-mutex-init.c pthread-mutex-destroy.c \
                pthread-mutex-lock.c pthread-mutex-unlock.c pthread-mutex-trylock.c \
-               pthread-mutex-timedlock.c \
+               pthread-mutex-timedlock.c pthread-mutex-consistent.c \
                pthread-ulock-debug.c \
                pthread-mutexattr-init.c pthread-mutexattr-destroy.c \
                pthread-mutexattr-protocol.c \

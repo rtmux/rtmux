@@ -17,8 +17,8 @@
 ; CONFIG_LOCK_DEBUG probes (see the refinement table in docs/pi-pc-design.md).
 ; Priorities are 8-bit, higher value = more urgent (PI boosts the number up).
 ;
-; Faithful to: sync_pi_propagate visited-stamp + depth cap (wait.c:551-563),
-; boost target = max(pi_target, waiter->priority) (wait.c:577-579), deboost
+; Faithful to: prio_chain_walk visited-stamp + depth cap (kernel/sync/wait.c),
+; boost target = max(pi_target, waiter->priority) (sync_pi_target_locked), deboost
 ; recompute-from-remaining (docs/pi-pc-design.md "On unlock..."), the atomic
 ; STATE_RUNNING claim (kernel/sched/dispatch.c), and the tthread generation
 ; revalidation against recycled (pid,tid) (docs/pi-pc-design.md "Owner identity").
@@ -56,8 +56,8 @@
 
 ; ---------------------------------------------------------------------------
 ; Invariant 2: a PI boost never lowers the owner below the waiter that triggered
-; it.  sync_pi_propagate sets target = max(pi_target, waiter->priority)
-; (wait.c:577-579), so the boosted owner outranks or ties the waiter.
+; it.  prio_chain_walk sets target = max(pi_target, waiter->priority)
+; (sync_pi_target_locked), so the boosted owner outranks or ties the waiter.
 (push 1)
 (declare-const pit (_ BitVec 8)) ; existing pi target for the owner
 (declare-const wp  (_ BitVec 8)) ; requesting waiter priority
@@ -78,8 +78,8 @@
 
 ; ---------------------------------------------------------------------------
 ; Invariant 3: bounded PI-walk termination.  The walk records each turnstile in
-; a visited stamp and stops on a revisit (wait.c:556-562), at depth 16
-; (wait.c:551), or when the owner is the original waiter (wait.c:570).  So a
+; a visited stamp and stops on a revisit (prio_chain_walk), at depth 16
+; (SYNC_PI_MAX_DEPTH), or when the owner is the original waiter.  So a
 ; cyclic or over-deep wait chain terminates with EDEADLK instead of spinning
 ; unbounded under the chain lock (unbounded propagation there is a realtime
 ; bug).  result: 0 = EOK (reached an unblocked owner), 1 = EDEADLK.
@@ -132,8 +132,8 @@
 ; Invariant 5: no transition acts on a stale receiver.  A turnstile owner is a
 ; raw (pid, tid) word; sync_turnstile_owner_pin resolves it through the process
 ; vector, checks the resolved thread's tid matches, and pins it
-; (wait.c:336-339); a stale-owner guard additionally refuses to re-pin an
-; already-cleared identical owner word (wait.c:421).  thread_t carries no
+; (sync_lookup_owner_pin); a stale-owner guard additionally refuses to re-pin an
+; already-cleared identical owner word (sync_turnstile_record_owner).  thread_t carries no
 ; generation field, so a recycled slot is caught by the tid mismatch, the pin
 ; failure, or the stale-owner guard -- not a generation compare.  A transition
 ; proceeds only when all of those pass: act = pid_ok & tid_ok & pin_ok & !stale.
@@ -153,5 +153,62 @@
 (assert (= act (and pid_ok tid_ok pin_ok (not stale))))
 (assert (not tid_ok)) ; the slot was recycled to a different tid
 (assert act)          ; negation: acted despite the tid mismatch
+(check-sat) ; unsat
+(pop 1)
+
+; ---------------------------------------------------------------------------
+; Invariant 6: base and loans are separate.  A thread's effective priority is
+; max(base, pi_loan, msg_loan) (thread_effective_prio, kernel/include/
+; thread-prio.h).  SchedSet and the sporadic drop/return write the base only
+; (thread_set_base_prio), so after a base change from base to base2 every live
+; loan still holds the thread up, and once both loans end it runs at base2.
+(push 1)
+(declare-const base (_ BitVec 8)) (declare-const base2 (_ BitVec 8))
+(declare-const pil (_ BitVec 8)) (declare-const msl (_ BitVec 8))
+(declare-const eff (_ BitVec 8)) (declare-const eff2 (_ BitVec 8))
+(assert (= eff (umax base (umax pil msl))))
+(assert (= eff2 (umax base2 (umax pil msl))))
+(assert (bvult base2 base)) (assert (bvugt pil base)) ; lowered while boosted
+(assert (= eff2 eff))
+(check-sat) ; sanity: sat (SchedSet lowers the base, the boost holds)
+(pop 1)
+
+(push 1)
+(declare-const base2 (_ BitVec 8))
+(declare-const pil (_ BitVec 8)) (declare-const msl (_ BitVec 8))
+(declare-const eff2 (_ BitVec 8))
+(assert (= eff2 (umax base2 (umax pil msl))))
+; negation: a loan is lost, or no loan is left and eff is not the base
+(assert (or (bvult eff2 pil) (bvult eff2 msl)
+            (and (= pil #x00) (= msl #x00) (not (= eff2 base2)))))
+(check-sat) ; unsat
+(pop 1)
+
+; ---------------------------------------------------------------------------
+; Invariant 7: bounded REPLY propagation.  prio_chain_walk (kernel/sync/wait.c)
+; lends a REPLY-blocked thread's priority to its server one hop at a time and
+; stops after CONFIG_PRIO_REPLY_DEPTH hops (D, default 8), counting the stop in
+; prio_reply_depth_overflow.  For a REPLY chain of length L the walk boosts
+; min(L, D) servers, and it records an overflow exactly when L > D; it never
+; does more than D hops of work for one change.
+(push 1)
+(declare-const L (_ BitVec 8)) (declare-const D (_ BitVec 8))
+(declare-const boosted (_ BitVec 8)) (declare-const overflow Bool)
+(assert (= D #x08))
+(assert (= boosted (ite (bvugt L D) D L)))
+(assert (= overflow (bvugt L D)))
+(assert (bvugt L D))
+(check-sat) ; sanity: sat (a chain longer than the bound overflows)
+(pop 1)
+
+(push 1)
+(declare-const L (_ BitVec 8)) (declare-const D (_ BitVec 8))
+(declare-const boosted (_ BitVec 8)) (declare-const overflow Bool)
+(assert (bvuge D #x01)) (assert (bvule D #x40)) ; Kconfig range 1..64
+(assert (= boosted (ite (bvugt L D) D L)))
+(assert (= overflow (bvugt L D)))
+; negation: more than D hops, a silent stop, or a short chain cut off
+(assert (or (bvugt boosted D) (and (bvugt L D) (not overflow))
+            (and (bvule L D) (not (= boosted L)))))
 (check-sat) ; unsat
 (pop 1)

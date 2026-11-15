@@ -43,6 +43,7 @@ int rlimit_cpu_child(void);
 int rlimit_inherit_child(void);
 int rlimit_inherit_grandchild(void);
 void test_sync(void);
+void test_prio_loan(void);
 int sync_pi_large_pid_child(void);
 void test_printf(void);
 void test_setjmp(void);

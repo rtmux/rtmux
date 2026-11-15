@@ -49,6 +49,8 @@ static const char *const _errlist[] = {
     [ENOSYS] = "Function not implemented",
     [ENOTEMPTY] = "Directory not empty",
     [ENAMETOOLONG] = "File name too long",
+    [EOWNERDEAD] = "Owner died",
+    [ENOTRECOVERABLE] = "State not recoverable",
 };
 
 static char _unknown_buf[32];

@@ -1085,7 +1085,9 @@ static void test_sys_kstats(void)
               kstats_get(snap, "thread.live") <= kstats_get(snap, "soul.thread.used") + 2 &&
               kstats_get(snap, "timeout.live") >= 0 &&
               kstats_get(snap, "timeout.live") <= kstats_get(snap, "thread.live") &&
-              lines == (int) (3 * (sizeof pools / sizeof pools[0]) + 5 + (size_t) harts),
+              kstats_get(snap, "prio.reply_depth") > 0 &&
+              kstats_get(snap, "prio.reply_depth_overflow") >= 0 &&
+              lines == (int) (3 * (sizeof pools / sizeof pools[0]) + 7 + (size_t) harts),
           "sys_kstats_format documented keys appear exactly once",
           "a documented key is missing, duplicated, or extra");
 

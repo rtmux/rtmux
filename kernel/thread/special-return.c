@@ -237,9 +237,13 @@ void specialret_attr specialret(thread_t *thp)
             atomic_clr((volatile unsigned *) &thp->flags,
                        RTMUX_FLG_THR_ACQUIRE_MUTEX);
 
-            /* Timeout always overrides the lock result. KSTATUS holds -errno.
+            /* Timeout overrides the lock result, except the robust-mutex
+             * results: EOWNERDEAD must reach the caller, which now holds an
+             * inconsistent mutex it has to repair, and ENOTRECOVERABLE says it
+             * holds no mutex at all. KSTATUS holds -errno.
              */
-            if (status == -ETIMEDOUT) {
+            if (status == -ETIMEDOUT && (int) KSTATUS(thp) != -EOWNERDEAD &&
+                (int) KSTATUS(thp) != -ENOTRECOVERABLE) {
                 SETKSTATUS(thp, status);
             }
 

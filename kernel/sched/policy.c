@@ -280,8 +280,8 @@ int kdecl ksys_sched_set(thread_t *act, struct kcall_args_sched_set *kap)
         /* @@@ Run the entire thread list adjusting by the delta amount?
          * PROBLEM: sched_thread does more range checking than adjust_priority
          * does. for(tid = 0 ; tid < prp->threads.nentries ; ++tid) { if(thp =
-         * VECP(thp, &prp->threads, tid)) { adjust_priority(thp, thp->priority +
-         * delta, thp->dpp); thp->real_priority += delta; } }
+         * VECP(thp, &prp->threads, tid)) { thread_set_base_prio(thp,
+         * thread_base_prio(thp) + delta); thread_prio_update(thp); } }
          */
     } else if (sched_set_noop_status(thp, kap->policy, &param, &status)) {
         if (status != EOK) {
