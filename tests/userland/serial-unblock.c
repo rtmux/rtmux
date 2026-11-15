@@ -4,7 +4,7 @@
  *
  * serial-unblock: a reader parked in dev-serial-8250 that dies must not strand
  * the driver. The harness (init + scripts/qemu-regress.sh) starts the driver,
- * then writes one byte to the UART after "serial-unblock: WAITING".
+ * and writes to the UART each byte the guest asks for with serial_inject().
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -27,7 +27,7 @@
 #define SERIAL_BYTE 'x'
 #define SERIAL_ERR_EXIT 100 /* child open()/read() failed */
 
-static void sleep_ms(long ms)
+void sleep_ms(long ms)
 {
     struct timespec ts = {.tv_sec = ms / 1000,
                           .tv_nsec = (ms % 1000) * 1000000L};
@@ -55,6 +55,33 @@ int serial_unblock_child(int announce)
         return SERIAL_ERR_EXIT + 1;
     }
     return (unsigned char) c;
+}
+
+/* Ask the harness to write byte c to the UART. It reads the request from the
+ * console log, so the byte arrives within about a second.
+ */
+static void inject(const char *tag, int *seq, int c)
+{
+    printf("%s-inject: %d %02x\n", tag, (*seq)++, (unsigned) (unsigned char) c);
+    fflush(stdout);
+}
+
+void serial_inject(int c)
+{
+    static int seq;
+
+    inject("serial", &seq, c);
+}
+
+/* The same for a byte meant for the console (/dev/text), asked for before the
+ * serial driver starts. Its sequence is separate, because it is asked for by a
+ * separate syscall_testing run.
+ */
+void console_inject(int c)
+{
+    static int seq;
+
+    inject("console", &seq, c);
 }
 
 static pid_t spawn_reader(int announce)
@@ -179,8 +206,7 @@ void test_serial_unblock(void)
     if (early)
         return;
 
-    printf("serial-unblock: WAITING\n");
-    fflush(stdout);
+    serial_inject(SERIAL_BYTE);
     check(wait_for(b, &status, 20000) == b && WIFEXITED(status) &&
               WEXITSTATUS(status) == SERIAL_BYTE,
           "serial_unblock replacement got the injected byte",

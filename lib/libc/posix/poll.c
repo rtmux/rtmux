@@ -8,6 +8,7 @@
  */
 
 #include <errno.h>
+#include <pthread.h>
 #include <time.h>
 #include <sys/poll.h>
 #include <sys/stat.h>
@@ -22,15 +23,16 @@
  * currently satisfied, using the _IO_NOTIFY "poll and disarm" action, and map
  * the result to revents. A service with no notify handler answers ENOSYS; a
  * regular file or directory is genuinely always ready, so it satisfies the
- * requested read/write events at once. Any other ENOSYS descriptor (a service
- * that can block on I/O but has no notify handler yet, e.g. serial or a socket)
- * is not pollable, so report POLLERR rather than a false always-ready that
- * would provoke a blocking read. A bad descriptor is POLLNVAL. POLLERR/POLLNVAL
- * are reported regardless of the requested events. The POLL action also disarms
- * any notification a prior _NOTIFY_ACTION_CONDARM left on the descriptor, so
- * this doubles as the disarm pass after a blocking wait. A service reports the
+ * requested read/write events at once. Any other ENOSYS descriptor is not
+ * pollable, so report POLLERR rather than a false always-ready that would
+ * provoke a blocking read. A bad descriptor is POLLNVAL. POLLERR/POLLNVAL are
+ * reported regardless of the requested events. The POLL action also disarms any
+ * notification a prior _NOTIFY_ACTION_CONDARM left on the descriptor, so this
+ * doubles as the disarm pass after a blocking wait. A service reports the
  * output-only POLLHUP/POLLERR conditions (e.g. a pipe read end whose writer
- * closed) through the extended flags field, which is folded into revents here.
+ * closed) through the extended flags field, folded into revents here. A service
+ * that runs out of memory answering is neither ready nor in error: that returns
+ * -1, and poll() fails with EAGAIN rather than report a false POLLERR.
  */
 static short poll_query(int fd, short events)
 {
@@ -55,6 +57,8 @@ static short poll_query(int fd, short events)
 
         if (errno == EBADF)
             return POLLNVAL;
+        if (errno == ENOMEM)
+            return -1;
         if (errno != ENOSYS)
             return POLLERR;
 
@@ -83,22 +87,72 @@ static short poll_query(int fd, short events)
 
 /* Non-blocking pass: set every descriptor's revents and return the ready count.
  * A negative descriptor is ignored. Because poll_query issues the POLL action,
- * this also disarms any notification still armed from a prior wait.
+ * this also disarms any notification still armed from a prior wait. Every
+ * descriptor is visited even after a service runs out of memory, so none is
+ * left armed; the pass then returns -1 with errno set to EAGAIN.
  */
 static int poll_scan(struct pollfd *fds, nfds_t nfds)
 {
-    int ready = 0;
+    int ready = 0, nomem = 0;
     nfds_t i;
 
     for (i = 0; i < nfds; i++) {
+        short revents;
+
         fds[i].revents = 0;
         if (fds[i].fd < 0)
             continue;
-        fds[i].revents = poll_query(fds[i].fd, fds[i].events);
-        if (fds[i].revents)
+        revents = poll_query(fds[i].fd, fds[i].events);
+        if (revents == -1) {
+            nomem = 1;
+            continue;
+        }
+        fds[i].revents = revents;
+        if (revents)
             ready++;
     }
+    if (nomem) {
+        errno = EAGAIN; /* POSIX: internal allocation failed */
+        return -1;
+    }
     return ready;
+}
+
+/* Cancellation cleanup for a wait: poll is a cancellation point, and a thread
+ * cancelled while blocked never reaches the disarm pass, so its arms would stay
+ * on the descriptors and later fire at a connection the process has reused.
+ */
+struct poll_set {
+    struct pollfd *fds;
+    nfds_t nfds;
+};
+
+static void poll_disarm(void *arg)
+{
+    const struct poll_set *set = arg;
+    int saved = errno;
+
+    (void) poll_scan(set->fds, set->nfds);
+    errno = saved;
+}
+
+/* The private channel a wait receives readiness pulses on. */
+struct poll_chan {
+    int chid;
+    int coid;
+};
+
+/* Leaves errno as it was, so a caller's result survives the release. */
+static void poll_chan_release(void *arg)
+{
+    const struct poll_chan *ch = arg;
+    int saved = errno;
+
+    if (ch->coid != -1)
+        __connect_detach((uint64_t) ch->coid);
+    if (ch->chid != -1)
+        (void) channel_destroy(ch->chid);
+    errno = saved;
 }
 
 /* Arm a readiness notification on fd that delivers a pulse to coid when a
@@ -108,7 +162,9 @@ static int poll_scan(struct pollfd *fds, nfds_t nfds)
  * descriptor is ready now.
  *
  * Returns the satisfied revents (non-zero, fd not armed), 0 (armed, a pulse
- * will follow), or POLLNVAL/POLLERR on error.
+ * will follow), or POLLNVAL/POLLERR on error. A service that could not record
+ * the arm (ENOMEM) returns -1: the descriptor is neither ready nor in error, so
+ * poll() must fail with EAGAIN rather than report a condition.
  */
 static short poll_arm(int fd, short events, int coid)
 {
@@ -134,6 +190,8 @@ static short poll_arm(int fd, short events, int coid)
             return 0;
         if (errno == EBADF)
             return POLLNVAL;
+        if (errno == ENOMEM)
+            return -1;
         return POLLERR;
     }
 
@@ -148,7 +206,7 @@ static short poll_arm(int fd, short events, int coid)
 }
 
 /* Arm every waitable descriptor, filling revents for any already ready.
- * Returns the ready count.
+ * Returns the ready count, or -1 when a service could not record an arm.
  */
 static int poll_arm_all(struct pollfd *fds, nfds_t nfds, int coid)
 {
@@ -156,11 +214,16 @@ static int poll_arm_all(struct pollfd *fds, nfds_t nfds, int coid)
     nfds_t i;
 
     for (i = 0; i < nfds; i++) {
+        short revents;
+
         fds[i].revents = 0;
         if (fds[i].fd < 0)
             continue;
-        fds[i].revents = poll_arm(fds[i].fd, fds[i].events, coid);
-        if (fds[i].revents)
+        revents = poll_arm(fds[i].fd, fds[i].events, coid);
+        if (revents == -1)
+            return -1;
+        fds[i].revents = revents;
+        if (revents)
             ready++;
     }
     return ready;
@@ -189,6 +252,7 @@ static int poll_wait_channel(struct pollfd *fds,
                              int chid,
                              int coid)
 {
+    struct poll_set set = {.fds = fds, .nfds = nfds};
     struct timespec deadline;
     int ready, err = 0;
 
@@ -202,11 +266,16 @@ static int poll_wait_channel(struct pollfd *fds,
         }
     }
 
+    pthread_cleanup_push(poll_disarm, &set);
     for (;;) {
         struct _notification pulse;
         int rc;
 
         ready = poll_arm_all(fds, nfds, coid);
+        if (ready < 0) {
+            err = EAGAIN; /* POSIX: internal allocation failed */
+            break;
+        }
         if (ready > 0)
             break;
         if (timeout_ms >= 0 && poll_deadline_passed(&deadline))
@@ -254,6 +323,7 @@ static int poll_wait_channel(struct pollfd *fds,
          * a racer already consumed the readiness, re-arm and keep waiting.
          */
     }
+    pthread_cleanup_pop(0);
 
     /* Disarm every armed descriptor. On success poll_scan also collects the
      * authoritative ready set; on an error exit its result is discarded (and it
@@ -261,32 +331,45 @@ static int poll_wait_channel(struct pollfd *fds,
      */
     if (ready < 0)
         (void) poll_scan(fds, nfds);
-    else
-        ready = poll_scan(fds, nfds);
+    else if ((ready = poll_scan(fds, nfds)) < 0)
+        err = EAGAIN;
     if (err)
         errno = err;
     return ready;
 }
 
-static int poll_block(struct pollfd *fds, nfds_t nfds, int timeout_ms)
+/* Make the private channel. A fixed-priority channel: a delivered readiness
+ * pulse must not drag the polling thread down to the pulse's (process) priority
+ * on wake.
+ *
+ * Returns 0, or -1 with errno set.
+ */
+static int poll_chan_create(struct poll_chan *ch)
 {
-    int ready;
-
-    /* A fixed-priority channel: a delivered readiness pulse must not drag the
-     * polling thread down to the pulse's (process) priority on wake.
-     */
-    int chid = channel_create(RTMUX_FLG_CHF_FIXED_PRIORITY);
-    if (chid == -1)
+    ch->coid = -1;
+    if ((ch->chid = channel_create(RTMUX_FLG_CHF_FIXED_PRIORITY)) == -1)
         return -1;
-    int coid = connect_attach(0, 0, chid, RTMUX_SIDE_CHANNEL, 0);
-    if (coid == -1) {
-        (void) channel_destroy(chid);
+    ch->coid = connect_attach(0, 0, ch->chid, RTMUX_SIDE_CHANNEL, 0);
+    if (ch->coid == -1) {
+        int saved = errno;
+
+        (void) channel_destroy(ch->chid);
+        errno = saved;
         return -1;
     }
+    return 0;
+}
 
-    ready = poll_wait_channel(fds, nfds, timeout_ms, chid, coid);
-    __connect_detach((uint64_t) coid);
-    (void) channel_destroy(chid);
+static int poll_block(struct pollfd *fds, nfds_t nfds, int timeout_ms)
+{
+    struct poll_chan ch;
+    int ready;
+
+    if (poll_chan_create(&ch) == -1)
+        return -1;
+    pthread_cleanup_push(poll_chan_release, &ch);
+    ready = poll_wait_channel(fds, nfds, timeout_ms, ch.chid, ch.coid);
+    pthread_cleanup_pop(1);
     return ready;
 }
 
@@ -327,16 +410,31 @@ int poll(struct pollfd *fds, nfds_t nfds, int timeout_ms)
     return poll_block(fds, nfds, timeout_ms);
 }
 
+/* A pselect wait: its channel and the signal mask it replaced. */
+struct poll_psel {
+    struct poll_chan ch;
+    sigset_t oldmask;
+    unsigned seq;
+};
+
+/* Cancellation cleanup: give the process back its signal mask and the pselect
+ * wake slot, which would otherwise stay claimed by a dead thread.
+ */
+static void poll_psel_cancel(void *arg)
+{
+    struct poll_psel *ps = arg;
+
+    (void) __libc_signal_pselect_end(ps->ch.coid, &ps->oldmask, ps->seq);
+    poll_chan_release(&ps->ch);
+}
+
 int __poll_pselect(struct pollfd *fds,
                    nfds_t nfds,
                    int timeout_ms,
                    const sigset_t *sigmask)
 {
-    sigset_t oldmask;
-    unsigned seq;
-    int chid = -1;
-    int coid = -1;
-    int ready;
+    struct poll_psel ps = {.ch = {.chid = -1, .coid = -1}};
+    int ready, saved;
 
     if (!sigmask)
         return poll(fds, nfds, timeout_ms);
@@ -345,36 +443,27 @@ int __poll_pselect(struct pollfd *fds,
         return -1;
     }
 
-    if (timeout_ms != 0) {
-        chid = channel_create(RTMUX_FLG_CHF_FIXED_PRIORITY);
-        if (chid == -1)
-            return -1;
-        coid = connect_attach(0, 0, chid, RTMUX_SIDE_CHANNEL, 0);
-        if (coid == -1) {
-            (void) channel_destroy(chid);
-            return -1;
-        }
-    }
+    if (timeout_ms != 0 && poll_chan_create(&ps.ch) == -1)
+        return -1;
 
-    if (__libc_signal_pselect_begin(sigmask, coid, &oldmask, &seq) == -1) {
-        if (coid != -1)
-            __connect_detach((uint64_t) coid);
-        if (chid != -1)
-            (void) channel_destroy(chid);
+    if (__libc_signal_pselect_begin(sigmask, ps.ch.coid, &ps.oldmask,
+                                    &ps.seq) == -1) {
+        poll_chan_release(&ps.ch);
         return -1;
     }
 
+    pthread_cleanup_push(poll_psel_cancel, &ps);
     ready = poll_scan(fds, nfds);
     if (ready == 0 && timeout_ms != 0)
-        ready = poll_wait_channel(fds, nfds, timeout_ms, chid, coid);
-    if (__libc_signal_pselect_end(coid, &oldmask, seq)) {
-        errno = EINTR;
+        ready =
+            poll_wait_channel(fds, nfds, timeout_ms, ps.ch.chid, ps.ch.coid);
+    pthread_cleanup_pop(0);
+    saved = errno;
+    if (__libc_signal_pselect_end(ps.ch.coid, &ps.oldmask, ps.seq)) {
+        saved = EINTR;
         ready = -1;
     }
-
-    if (coid != -1)
-        __connect_detach((uint64_t) coid);
-    if (chid != -1)
-        (void) channel_destroy(chid);
+    errno = saved;
+    poll_chan_release(&ps.ch);
     return ready;
 }

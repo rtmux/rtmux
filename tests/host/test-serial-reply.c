@@ -4,7 +4,11 @@
  * The window between the liveness check and the reply (a reader dying there)
  * cannot be hit on demand from a guest test, so this compiles the shared
  * serial service and stubs the IPC calls: a failed msg_reply must leave the
- * cooked byte for the next reader, a successful one must consume it.
+ * cooked byte for the next reader, a successful one must consume it. It also
+ * drives the _IO_NOTIFY handler: readiness is level-sensitive, an arm is woken
+ * once by input, a repeated entry asking for nothing keeps it, and a close
+ * drops it. The shared notification lists (lib/libc/ioserv/notify-list.c) are
+ * linked in.
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -82,6 +86,147 @@ int msg_reply(int rcvid, int status, const void *msg, int bytes)
     return reply_result;
 }
 
+static int deliver_calls;
+static int deliver_rcvid = -1;
+
+int msg_deliver_event(int rcvid, const struct sigevent *event)
+{
+    (void) event;
+    deliver_rcvid = rcvid;
+    deliver_calls++;
+    return 0;
+}
+
+/* One _IO_NOTIFY from client thread rcvid on open coid; returns the handler's
+ * status and leaves the satisfied conditions in *sat.
+ */
+static int notify(int rcvid, int coid, int action, unsigned cond, unsigned *sat)
+{
+    ioserv_context_t ctp;
+    io_notify_t msg;
+    int rc;
+
+    memset(&ctp, 0, sizeof ctp);
+    memset(&msg, 0, sizeof msg);
+    ctp.rcvid = rcvid;
+    ctp.info.scoid = 7;
+    ctp.info.coid = coid;
+    msg.i.type = _IO_NOTIFY;
+    msg.i.action = action;
+    msg.i.flags = cond;
+    SIGEV_NOTIFICATION_INIT(&msg.i.event, 5, -1, 0, 0);
+    rc = ser_notify(&ctp, &msg, NULL);
+    *sat = msg.o.flags;
+    return rc;
+}
+
+static void close_open(int coid)
+{
+    ioserv_context_t ctp;
+
+    memset(&ctp, 0, sizeof ctp);
+    ctp.info.scoid = 7;
+    ctp.info.coid = coid;
+    (void) ser_close_dup(&ctp, NULL, NULL);
+}
+
+/* Nodes on the input list: all of them, or only those still armed. */
+static int input_nodes(int armed_only)
+{
+    const ioserv_notify_event_t *e;
+    int n = 0;
+
+    for (e = ser_notify_lists[IOSERV_NOTIFY_INPUT].list; e; e = e->next)
+        if (!armed_only || SIGEV_GET_TYPE(&e->event) != SIGEV_NONE)
+            n++;
+    return n;
+}
+
+static void test_notify(void)
+{
+    unsigned sat;
+
+    serial_flush_input();
+
+    /* Output never waits; idle input arms and answers EAGAIN. */
+    assert(notify(10, 3, _NOTIFY_ACTION_CONDARM, _NOTIFY_COND_OUTPUT, &sat) !=
+               EAGAIN &&
+           sat == _NOTIFY_COND_OUTPUT);
+    assert(notify(10, 3, _NOTIFY_ACTION_CONDARM, _NOTIFY_COND_INPUT, &sat) ==
+           EAGAIN);
+    assert(input_nodes(1) == 1);
+
+    /* A repeated entry for the descriptor asking for nothing keeps the arm. */
+    assert(notify(10, 3, _NOTIFY_ACTION_CONDARM, 0, &sat) == EAGAIN);
+    assert(input_nodes(1) == 1);
+
+    /* A byte wakes the poller once and disarms it. */
+    rx_next = 'p';
+    rx_notification_handler(NULL, 0, 0, NULL);
+    assert(deliver_calls == 1 && deliver_rcvid == 10);
+    assert(input_nodes(1) == 0);
+
+    /* Data already queued is reported at once: no arm, no notification. */
+    assert(notify(11, 3, _NOTIFY_ACTION_CONDARM, _NOTIFY_COND_INPUT, &sat) !=
+               EAGAIN &&
+           (sat & _NOTIFY_COND_INPUT));
+    assert(input_nodes(1) == 0);
+    serial_flush_input();
+
+    /* A partial canonical line is not readable; its newline makes it so. */
+    ser_termios.c_lflag |= ICANON;
+    assert(notify(12, 3, _NOTIFY_ACTION_CONDARM, _NOTIFY_COND_INPUT, &sat) ==
+           EAGAIN);
+    rx_next = 'q';
+    rx_notification_handler(NULL, 0, 0, NULL);
+    assert(deliver_calls == 1 && input_nodes(1) == 1);
+    rx_next = '\n';
+    rx_notification_handler(NULL, 0, 0, NULL);
+    assert(deliver_calls == 2 && deliver_rcvid == 12);
+    ser_termios.c_lflag &= ~(tcflag_t) ICANON;
+    serial_flush_input();
+
+    /* The POLL pass disarms; a close drops only its own open's arms. */
+    assert(notify(13, 3, _NOTIFY_ACTION_CONDARM, _NOTIFY_COND_INPUT, &sat) ==
+           EAGAIN);
+    (void) notify(13, 3, _NOTIFY_ACTION_POLL, _NOTIFY_COND_INPUT, &sat);
+    assert(sat == 0 && input_nodes(1) == 0);
+    assert(notify(14, 3, _NOTIFY_ACTION_CONDARM, _NOTIFY_COND_INPUT, &sat) ==
+           EAGAIN);
+    assert(notify(15, 4, _NOTIFY_ACTION_CONDARM, _NOTIFY_COND_INPUT, &sat) ==
+           EAGAIN);
+    assert(input_nodes(1) == 2);
+    close_open(4);
+    assert(input_nodes(1) == 1 &&
+           ser_notify_lists[IOSERV_NOTIFY_INPUT].list->coid == 3);
+    close_open(3);
+    assert(input_nodes(0) == 0);
+
+    /* The poll pass and a ready reply allocate nothing, so they cannot fail
+     * with ENOMEM: only recording an arm does.
+     */
+    assert(notify(16, 5, _NOTIFY_ACTION_POLL, _NOTIFY_COND_INPUT, &sat) !=
+               ENOMEM &&
+           input_nodes(0) == 0);
+    assert(notify(16, 5, _NOTIFY_ACTION_CONDARM, _NOTIFY_COND_OUTPUT, &sat) !=
+               EAGAIN &&
+           sat == _NOTIFY_COND_OUTPUT &&
+           ser_notify_lists[IOSERV_NOTIFY_OUTPUT].list == NULL);
+
+    /* A disarmed arm no longer counts as a waiter. */
+    assert(notify(17, 5, _NOTIFY_ACTION_CONDARM, _NOTIFY_COND_INPUT, &sat) ==
+           EAGAIN);
+    assert(ioserv_notify_armed(ser_notify_lists, IOSERV_NOTIFY_INPUT, 1));
+    (void) notify(17, 5, _NOTIFY_ACTION_POLL, _NOTIFY_COND_INPUT, &sat);
+    assert(!ioserv_notify_armed(ser_notify_lists, IOSERV_NOTIFY_INPUT, 1));
+    close_open(5);
+    assert(input_nodes(0) == 0);
+    rx_next = 'r';
+    rx_notification_handler(NULL, 0, 0, NULL);
+    assert(deliver_calls == 2);
+    serial_flush_input();
+}
+
 static void park_reader(void)
 {
     pending_rcvid = 42;
@@ -116,6 +261,8 @@ int main(void)
     rx_notification_handler(NULL, 0, 0, NULL);
     assert(reply_calls == 3 && reply_byte == 'b');
     assert(cooked_peek() == -1);
+
+    test_notify();
 
     printf("serial-reply: ok\n");
     return 0;

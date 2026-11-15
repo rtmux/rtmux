@@ -846,9 +846,15 @@ int main(int argc, char *argv[])
     }
     if (argc == 3 && !strcmp(argv[1], "--serial-unblock-child"))
         return serial_unblock_child(!strcmp(argv[2], "announce"));
+    if (argc == 2 && !strcmp(argv[1], "--console-poll")) {
+        printf("=== RTMux Console Poll Test ===\n\n");
+        test_console_poll();
+        return finish(1);
+    }
     if (argc == 2 && !strcmp(argv[1], "--serial-unblock")) {
         printf("=== RTMux Serial Unblock Test ===\n\n");
         test_serial_unblock();
+        test_serial_poll();
         return finish(1);
     }
     if (argc == 2 && !strcmp(argv[1], "--spawn-storm")) {

@@ -80,6 +80,15 @@ static int text_signal_char(int c)
 static int text_ahead[TEXT_AHEAD];
 static unsigned text_ahead_head, text_ahead_tail;
 
+/* Armed readiness notifications (_IO_NOTIFY), under text_mutex like the ring.
+ * The console raises no interrupt, so the watcher thread looks for input while
+ * a poller is armed and wakes it once the ring has a character.
+ */
+static ioserv_notify_t text_notify_lists[IOSERV_NOTIFY_COUNT];
+
+/* Signalled when a poller arms, so the watcher starts looking at once. */
+static pthread_cond_t text_watch_cond;
+
 /* Static stack: the watcher is made with __thread_create before the message
  * pool runs, as pthread_create cannot get a stack from a roottask worker.
  */
@@ -140,15 +149,42 @@ static int text_next(int to_ring)
     }
 }
 
+/* How often the watcher looks at the console: a poller waiting on it is woken
+ * within TEXT_WATCH_ARMED_MS of a key press. The console raises no interrupt.
+ */
+#define TEXT_WATCH_MS 50
+#define TEXT_WATCH_ARMED_MS 10
+
 static void *text_watcher(void *arg)
 {
-    (void) arg;
-    for (;;) {
-        struct timespec ts = {.tv_nsec = 50 * 1000000L};
+    int armed = 0;
 
-        nanosleep(&ts, NULL);
-        if (text_sid)
-            (void) text_next(1);
+    (void) arg;
+    pthread_mutex_lock(&text_mutex);
+    for (;;) {
+        struct timespec until;
+        long ms = armed ? TEXT_WATCH_ARMED_MS : TEXT_WATCH_MS;
+
+        clock_gettime(CLOCK_MONOTONIC, &until);
+        until.tv_nsec += ms * 1000000L;
+        if (until.tv_nsec >= 1000000000L) {
+            until.tv_sec++;
+            until.tv_nsec -= 1000000000L;
+        }
+        (void) pthread_cond_timedwait(&text_watch_cond, &text_mutex, &until);
+        armed = ioserv_notify_armed(text_notify_lists, IOSERV_NOTIFY_INPUT, 1);
+        if (!text_sid && !armed)
+            continue;
+        pthread_mutex_unlock(&text_mutex);
+        (void) text_next(1);
+        pthread_mutex_lock(&text_mutex);
+
+        /* A poller may have armed while the lock was dropped; its signal was
+         * missed, so look again to pick the short interval for it.
+         */
+        armed = ioserv_notify_armed(text_notify_lists, IOSERV_NOTIFY_INPUT, 1);
+        if (armed && text_ahead_head != text_ahead_tail)
+            ioserv_notify_trigger(text_notify_lists, 1, IOSERV_NOTIFY_INPUT);
     }
     return NULL;
 }
@@ -470,6 +506,43 @@ static int text_devctl(ioserv_context_t *ctp, io_devctl_t *msg, void *ocb)
     return EOK;
 }
 
+/* _IO_NOTIFY for poll() and select(). Input is ready once a read would return a
+ * character at once: what the console holds is moved into the ring first, so a
+ * character typed before the poller armed is seen. Output is written
+ * synchronously, so it is always ready. The ring is checked and the arm made
+ * under text_mutex, which the watcher also takes before it wakes pollers, so a
+ * character it queues after the check still finds the arm.
+ */
+static int text_notify(ioserv_context_t *ctp, io_notify_t *msg, void *ocb)
+{
+    unsigned trig = _NOTIFY_COND_OUTPUT;
+    int ret;
+
+    (void) ocb;
+    if ((msg->i.flags & (unsigned) _NOTIFY_COND_INPUT) &&
+        text_ahead_head == text_ahead_tail)
+        (void) text_next(1);
+    pthread_mutex_lock(&text_mutex);
+    if (text_ahead_head != text_ahead_tail)
+        trig |= _NOTIFY_COND_INPUT;
+    ret = ioserv_notify(ctp, msg, text_notify_lists, trig, 0, NULL);
+    if (ret == EAGAIN)
+        pthread_cond_signal(&text_watch_cond);
+    pthread_mutex_unlock(&text_mutex);
+    return ret;
+}
+
+/* A closed open takes its arms with it. */
+static int text_close_dup(ioserv_context_t *ctp, io_close_t *msg, void *ocb)
+{
+    (void) msg;
+    (void) ocb;
+    pthread_mutex_lock(&text_mutex);
+    ioserv_notify_remove(ctp, text_notify_lists);
+    pthread_mutex_unlock(&text_mutex);
+    return EOK;
+}
+
 /* _IO_OPENFD: roottask opens a second connection to the terminal when it makes
  * it a session's controlling terminal (_PROC_SESSION_TCSETSID).
  */
@@ -493,7 +566,9 @@ static const ioserv_ops_t text_io_funcs = {
     .write = text_write,
     .stat = text_stat,
     .devctl = text_devctl,
+    .notify = text_notify,
     .openfd = text_openfd,
+    .close_dup = text_close_dup,
 };
 
 /* Open handler for /dev/text — bind the connection with its io flags.
@@ -551,7 +626,12 @@ void devtext_init(void)
 
     {
         struct _thread_attr attr;
+        pthread_condattr_t cattr;
 
+        pthread_condattr_init(&cattr);
+        pthread_condattr_setclock(&cattr, CLOCK_MONOTONIC);
+        pthread_cond_init(&text_watch_cond, &cattr);
+        pthread_condattr_destroy(&cattr);
         memset(&attr, 0, sizeof attr);
         attr.stackaddr = text_watcher_stack;
         attr.stacksize = sizeof text_watcher_stack;

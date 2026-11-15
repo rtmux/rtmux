@@ -409,15 +409,20 @@ if test "$rtmux_run" = "trace-negative"; then
 fi
 
 # Serial reader-death regression: the driver must drop a parked reader that was
-# SIGKILLed. The host writes one byte to the UART once the test prints
-# "serial-unblock: WAITING".
+# SIGKILLed, and poll and select must see terminal readiness. The host writes
+# each byte the test asks for with a "serial-inject: <seq> <hex>" line. Console
+# (/dev/text) readiness is checked first, while no driver owns the UART, with
+# bytes asked for by "console-inject: <seq> <hex>" lines.
 if test "$rtmux_run" = "serial-unblock"; then
     /sbin/logger
     /sbin/virtio-mmio
     /sbin/virtio-mmio --register-boot
     echo "RTMux serial-unblock: BEGIN"
+    serial_fail=0
+    /bin/syscall_testing --console-poll || serial_fail=1
     /bin/dev-serial-8250 &
-    if waitfor /dev/ser1 5 && /bin/syscall_testing --serial-unblock; then
+    waitfor /dev/ser1 5 && /bin/syscall_testing --serial-unblock || serial_fail=1
+    if test "$serial_fail" = "0"; then
         echo "RTMux serial-unblock: PASS"
     else
         echo "RTMux serial-unblock: FAIL"

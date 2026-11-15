@@ -99,7 +99,7 @@ IOSERV_SRCS = open-bind.c handler.c io-handler.c \
               mmap-handler.c status.c \
               notify-handler.c openfd-handler.c \
               unblock-handler.c devino.c data.c \
-              detach-id.c
+              detach-id.c notify-list.c
 
 POSIX1D_SRCS = posix-spawnattr-getpgroup.c \
                posix-spawnattr-getsched.c posix-spawnattr-getsig.c \
