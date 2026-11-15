@@ -890,6 +890,7 @@ check-libc-abi: libc
 	$(msg) CHECK "libc.so export surface"
 	$(Q)$(PYTHON) scripts/check-libc-abi.py --self-test
 	$(Q)$(PYTHON) scripts/check-libc-abi.py --readelf "$(READELF)" --so "$(LIBC_SO)"
+	$(Q)$(PYTHON) scripts/check-sysconf-names.py
 
 check-rt-budgets:
 	$(msg) CHECK docs/rt-budgets.md

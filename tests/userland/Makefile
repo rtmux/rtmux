@@ -11,7 +11,8 @@ include ../../userland/lib/common.mk
 SRCS = main.c timers.c sync.c printf-test.c setjmp-test.c signals-test.c \
        time-test.c strftime-test.c \
        notifications.c vfs.c posix-options.c capgate.c trace-negative.c \
-       user-ptr-negative.c serial-unblock.c leak.c native-io-boundaries.c
+       user-ptr-negative.c serial-unblock.c leak.c native-io-boundaries.c \
+       qsort-test.c report.c getopt-test.c env-test.c sysconf-test.c
 OBJS = $(SRCS:%.c=$(OBJDIR)/%.o)
 # Single-file helper programs built by the rules below, outside the main binary.
 PROBE_OBJS = $(addprefix $(OBJDIR)/, crypttest.o setuid-probe.o preload-probe.o \

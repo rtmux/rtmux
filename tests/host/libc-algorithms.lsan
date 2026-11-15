@@ -1,0 +1,4 @@
+# LeakSanitizer suppressions for the host libc suites: getenv.c never frees
+# environment strings or outgrown vectors (see its header comment).
+leak:env_reserve
+leak:setenv

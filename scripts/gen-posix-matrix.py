@@ -767,7 +767,7 @@ COVERAGE_HEADERS = [
     "include/sys/wait.h",
     "include/sys/utsname.h",
 ]
-COVERAGE_EXCLUDE = {"chroot", "issetugid"}  # issetugid: BSD, not POSIX
+COVERAGE_EXCLUDE = {"chroot", "getpagesize", "issetugid"}  # BSD, not POSIX
 
 
 def validate_header_coverage():

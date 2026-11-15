@@ -45,6 +45,14 @@ int _conf_get(const long *list, int name, long *value, char *str)
                 break;
             }
             if (item & _CONF_INDIRECT) {
+                /* A value entry would load a whole long through a pointer to a
+                 * field that may be narrower: that put the next field in the
+                 * upper half of sysconf(_SC_PAGESIZE). Use a _CONF_FCN
+                 * accessor.
+                 */
+                if (cmd == _CONF_VALUE) {
+                    break;
+                }
                 num = *(long *) num;
             }
             if (cmd == _CONF_VALUE) {

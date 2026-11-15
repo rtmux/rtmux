@@ -36,11 +36,11 @@ static int roottask_confstr_seed(int cmd, int name, const char *str)
 }
 
 /* This is here to make internal calls to sysconf() not send a message to the
- * proc service.
+ * proc service. See sysconf.c for why the page size goes through a function.
  */
 static const long roottask_internal_table[] = {
-    _CONF_VALUE_NUM | _CONF_INDIRECT | _SC_PAGESIZE,
-    (intptr_t) &root_vm_ops.pagesize, _CONF_END};
+    _CONF_VALUE_NUM | _CONF_FCN | _SC_PAGESIZE, (intptr_t) roottask_sc_pagesize,
+    _CONF_END};
 
 
 /* The syspage build_info record, or NULL when the section is absent, shorter

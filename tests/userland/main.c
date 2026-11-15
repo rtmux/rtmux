@@ -47,6 +47,9 @@ static const struct test_suite test_suites[] = {
     TEST_SUITE(setjmp),
     TEST_SUITE(time),
     TEST_SUITE(strftime),
+    TEST_SUITE(qsort),
+    TEST_SUITE(getopt),
+    TEST_SUITE(env),
     TEST_SUITE(signals),
     TEST_SUITE(notifications),
     TEST_SUITE(capgate),
@@ -54,13 +57,11 @@ static const struct test_suite test_suites[] = {
     TEST_SUITE_NAMED("user-ptr-negative", user_ptr_negative),
     TEST_SUITE(vfs),
     TEST_SUITE_NAMED("posix-options", posix_options),
+    TEST_SUITE(sysconf),
     TEST_SUITE(gauges),
 #undef TEST_SUITE_NAMED
 #undef TEST_SUITE
 };
-
-/* Test infrastructure */
-static struct test_counts counts;
 
 static volatile uintptr_t fault_addr_seed = 1U;
 
@@ -69,8 +70,8 @@ static volatile uintptr_t fault_addr_seed = 1U;
  */
 static int finish(int require_run)
 {
-    tc_summary(&counts);
-    return tc_status(&counts, require_run) ? EXIT_FAILURE : EXIT_SUCCESS;
+    tc_summary(&suite_counts);
+    return tc_status(&suite_counts, require_run) ? EXIT_FAILURE : EXIT_SUCCESS;
 }
 
 #define FAULT_RECOVERY_CHECK(name, expr, detail) \
@@ -114,33 +115,6 @@ struct pthread_cancel_child_ctx {
     pthread_t target;
 };
 
-void test_ok(const char *name)
-{
-    tc_ok(&counts, name);
-}
-
-void test_fail(const char *name, const char *detail)
-{
-    tc_fail(&counts, name, detail);
-}
-
-void test_gap(const char *name, const char *anchor, const char *expected, const char *observed)
-{
-    tc_gap(&counts, name, anchor, expected, observed);
-}
-
-void test_skip(const char *name, const char *reason)
-{
-    tc_skip(&counts, name, reason);
-}
-
-void check(int cond, const char *name, const char *detail)
-{
-    if (cond)
-        test_ok(name);
-    else
-        test_fail(name, detail);
-}
 
 static int join_must_be_canceled(pthread_t tid)
 {
@@ -798,17 +772,17 @@ static int run_laps(int laps)
     for (int lap = 1; lap <= laps; lap++) {
         int lap_failed;
 
-        counts = (struct test_counts) {0};
+        suite_counts = (struct test_counts) {0};
         printf("lap=%d BEGIN\n", lap);
         for (size_t i = 0; i < sizeof test_suites / sizeof test_suites[0]; i++) {
             printf("%s[%s]\n", i == 0 ? "" : "\n", test_suites[i].name);
             test_suites[i].run();
             leak_suite_delta(lap, test_suites[i].name);
         }
-        lap_failed = counts.failed + leak_lap_check(lap);
-        tc_summary(&counts);
+        lap_failed = suite_counts.failed + leak_lap_check(lap);
+        tc_summary(&suite_counts);
         /* A lap that ran no case (every one skipped) is not a pass. */
-        if (!lap_failed && tc_status(&counts, 1))
+        if (!lap_failed && tc_status(&suite_counts, 1))
             lap_failed = 1;
         total_failed += lap_failed;
         printf("lap=%d %s\n", lap, lap_failed ? "FAIL" : "PASS");
@@ -817,9 +791,13 @@ static int run_laps(int laps)
     return total_failed ? EXIT_FAILURE : EXIT_SUCCESS;
 }
 
+char **test_initial_envp;
+
 int main(int argc, char *argv[])
 {
     size_t i;
+
+    test_initial_envp = argv + argc + 1; /* argv is NULL-terminated, envp follows */
 
     if (argc == 3 && !strcmp(argv[1], "--pthread-cancel-child"))
         return pthread_cancel_child(argv[2]);
@@ -891,6 +869,8 @@ int main(int argc, char *argv[])
     }
     if (argc == 3 && !strcmp(argv[1], "--loader-execvp-child"))
         return loader_execvp_child(argv[2]);
+    if (argc == 3 && !strcmp(argv[1], "--env-expect"))
+        return env_expect_child(argv[2]);
     if (argc == 3 && !strcmp(argv[1], "--spawn-echo-child"))
         return spawn_echo_child(argv[2]);
     if (argc == 2 && !strcmp(argv[1], "--spawn-full-fd-child"))

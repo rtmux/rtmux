@@ -193,6 +193,9 @@
         getlogin;
         getlogin_r;
         getopt;
+        getopt_long;
+        getopt_long_only;
+        getpagesize;
         getpgrp;
         getpid;
         getppid;
@@ -350,6 +353,7 @@
         opterr;
         optind;
         optopt;
+        optreset;
         pathconf;
         pause;
         perror;
@@ -489,6 +493,7 @@
         puts;
         pwrite;
         qsort;
+        qsort_r;
         raise;
         rand_r;
         read;

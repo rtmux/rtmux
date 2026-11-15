@@ -23,6 +23,9 @@ struct pshared_region {
 #define PSHARED_ITERS 300
 #define PSHARED_ITERS_ARG "300"
 
+/* Counters behind the hooks below (report.c). */
+extern struct test_counts suite_counts;
+
 void test_ok(const char *name);
 void test_fail(const char *name, const char *detail);
 void check(int cond, const char *name, const char *detail);
@@ -45,6 +48,10 @@ void test_printf(void);
 void test_setjmp(void);
 void test_time(void);
 void test_strftime(void);
+void test_qsort(void);
+void test_getopt(void);
+void test_env(void);
+int env_expect_child(const char *assignment);
 void test_signals(void);
 void test_vfs(void);
 void test_native_file_io(void);
@@ -58,6 +65,13 @@ int serial_unblock_child(int announce);
 int disconnect_under_alloc_failure(void);
 int disconnect_child(const char *pid_arg, const char *chid_arg);
 void test_posix_options(void);
+void test_sysconf(void);
+
+/* The initial envp, found after main()'s argv rather than through environ,
+ * which libc or a setenv() may have moved. The auxiliary vector follows its
+ * NULL terminator.
+ */
+extern char **test_initial_envp;
 void test_capgate(void);
 void test_leak(void);
 void test_gauges(void);

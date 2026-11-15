@@ -17,27 +17,43 @@
 #include <string.h>
 #include <unistd.h>
 
-int getlogin_r(char *name, size_t namesize)
+#include "env-lock.h"
+
+/* Copy src into name[namesize], or ERANGE. */
+static int copy_out(char *name, size_t namesize, const char *src)
 {
-    const char *login = getenv("LOGNAME");
-    struct passwd pw, *result;
-    char pwbuf[256];
-    size_t len;
+    size_t len = strlen(src);
 
-    if (!login || !*login) {
-        int rc = getpwuid_r(getuid(), &pw, pwbuf, sizeof pwbuf, &result);
-        if (rc != 0)
-            return rc;
-        if (!result)
-            return ENXIO; /* no passwd entry for the current uid */
-        login = result->pw_name;
-    }
-
-    len = strlen(login);
     if (len + 1 > namesize)
         return ERANGE;
-    memcpy(name, login, len + 1);
+    memcpy(name, src, len + 1);
     return 0;
+}
+
+int getlogin_r(char *name, size_t namesize)
+{
+    const char *login;
+    struct passwd pw, *result;
+    char pwbuf[256];
+    int rc = -1;
+
+    /* Copy $LOGNAME under the environment lock: getlogin_r is thread-safe, and
+     * a concurrent setenv may rewrite the value in place.
+     */
+    __env_lock();
+    login = getenv("LOGNAME");
+    if (login && *login)
+        rc = copy_out(name, namesize, login);
+    __env_unlock();
+    if (rc >= 0)
+        return rc;
+
+    rc = getpwuid_r(getuid(), &pw, pwbuf, sizeof pwbuf, &result);
+    if (rc != 0)
+        return rc;
+    if (!result)
+        return ENXIO; /* no passwd entry for the current uid */
+    return copy_out(name, namesize, result->pw_name);
 }
 
 char *getlogin(void)

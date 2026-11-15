@@ -15,6 +15,7 @@
 #include <limits.h>
 #include <sys/stat.h>
 
+#include "env-lock.h"
 extern char **environ;
 
 enum {
@@ -317,6 +318,7 @@ int posix_spawn(pid_t *restrict pid,
     int *temp_fds = NULL;
     size_t ntemp_fds = 0;
     bool fact_has_open;
+    bool env_locked = false;
 
     if (!path || *path == '\0')
         return EINVAL;
@@ -407,6 +409,13 @@ int posix_spawn(pid_t *restrict pid,
     {
         size_t argenv = 0, nv = 0, ne = 0;
 
+        /* Hold the environment lock from here until argv and envp are copied: a
+         * concurrent setenv may edit environ, or rewrite in place a value that
+         * any vector the caller built can point at, which would change a length
+         * between counting and copying.
+         */
+        __env_lock();
+        env_locked = true;
         if (argv)
             for (arg = argv; *arg; arg++, nv++)
                 argenv += strlen(*arg) + 1;
@@ -443,6 +452,8 @@ int posix_spawn(pid_t *restrict pid,
             while ((*dst++ = *src++))
                 ;
     }
+    __env_unlock();
+    env_locked = false;
 
     SETIOV(iov + 0, &msg, sizeof msg);
     SETIOV(iov + 1, _attrp, msg.i.attr_bytes);
@@ -454,6 +465,9 @@ int posix_spawn(pid_t *restrict pid,
     r = (*pid == -1) ? errno : EOK;
 
 cleanup:
+    if (env_locked)
+        __env_unlock();
+
     /* Single teardown for every post-materialize exit. data/iov are NULL-init
      * and every pointer is freed exactly once; error paths set r and jump here.
      */
