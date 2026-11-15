@@ -7,12 +7,14 @@
 
 #include "externs.h"
 #include "private.h"
-#include <alloca.h>
 #include <limits.h>
 #include <spawn.h>
 #include <sys/posix-spawn.h>
 
 #define SPAWN_FD_TARGET_MAX (UINT16_MAX - 1)
+
+/* Largest _PROC_POSIX_SPAWN proc_pspawn() copies whole: ARG_MAX with room. */
+#define PSPAWN_MSG_MAX (256u * 1024u)
 
 /* 							Internal Support Routines */
 
@@ -125,6 +127,59 @@ static int fill_struct_inheritance(struct inheritance *inherit,
     return EOK;
 }
 
+/* fact_list_get — the actions of a file-actions object as a heap array of *num
+ * entries, which the caller frees. The sender sets the action count, so the
+ * list is not put on the worker stack.
+ *
+ * Returns: EOK on success, otherwise an errno and *list is NULL.
+ */
+static int fact_list_get(posix_spawn_file_actions_t *factp,
+                         posix_spawn_file_actions_list_t **list,
+                         unsigned *num)
+{
+    int num_fact = 0;
+    int r;
+
+    *list = NULL;
+    if ((r = rtmux_spawn_file_getactions(factp, &num_fact, NULL)) != EOK)
+        return r;
+    CRASHCHECK(num_fact > 0);
+    num_fact = -num_fact;
+    if (!(*list = calloc((size_t) num_fact + 1, sizeof(**list))))
+        return ENOMEM;
+    if ((r = rtmux_spawn_file_getactions(factp, &num_fact, *list)) != EOK) {
+        free(*list);
+        *list = NULL;
+        return r;
+    }
+    CRASHCHECK(num_fact < 0);
+    *num = (unsigned) num_fact;
+    return EOK;
+}
+
+/* Highest child fd an action targets, or -1 when the action is invalid. */
+static int fact_target_fd(const posix_spawn_file_actions_list_t *fact)
+{
+    int fd;
+
+    switch (fact->type) {
+    case posix_file_action_type_CLOSE:
+        fd = fact->_type.close.fd;
+        break;
+    case posix_file_action_type_DUP:
+        if (fact->_type.dup.fd < 0)
+            return -1;
+        fd = fact->_type.dup.new_fd;
+        break;
+    case posix_file_action_type_OPEN:
+        fd = fact->_type.open->new_fd;
+        break;
+    default:
+        return -1;
+    }
+    return fd < 0 || fd > SPAWN_FD_TARGET_MAX ? -1 : fd;
+}
+
 /** calc_fdcnt
  *
  * Figure out from the file actions object, how many entries are required in the
@@ -138,55 +193,27 @@ static int fill_struct_inheritance(struct inheritance *inherit,
  */
 static int calc_fdcnt(posix_spawn_file_actions_t *factp, unsigned *fdcnt)
 {
-    int num_fact, highest_fd;
     posix_spawn_file_actions_list_t *fact_list;
-    unsigned i;
+    unsigned i, num_fact;
+    int highest_fd = -1;
     int r;
 
-    /* determine how much space to leave for fdmap entries */
-    num_fact = 0;
-    if ((r = rtmux_spawn_file_getactions(factp, &num_fact, NULL)) != EOK)
+    if ((r = fact_list_get(factp, &fact_list, &num_fact)) != EOK)
         return r;
-    CRASHCHECK(num_fact > 0);
-    num_fact = -num_fact;
-    if (!(fact_list = alloca((size_t) num_fact * sizeof(*fact_list))))
-        return ENOMEM;
-    if ((r = rtmux_spawn_file_getactions(factp, &num_fact, fact_list)) != EOK)
-        return r;
-    CRASHCHECK(num_fact < 0);
-
-    highest_fd = -1;
-
-    /* now run the actions list looking for the highest 'fd' to be operated on
-     */
     for (i = *fdcnt = 0; i < num_fact; i++) {
-        int fd = -1;
-        switch (fact_list[i].type) {
-        case posix_file_action_type_CLOSE:
-            fd = fact_list[i]._type.close.fd;
-            if (fd < 0 || fd > SPAWN_FD_TARGET_MAX)
-                return EINVAL;
+        int fd = fact_target_fd(&fact_list[i]);
+
+        if (fd < 0) {
+            r = EINVAL;
             break;
-        case posix_file_action_type_DUP:
-            if (fact_list[i]._type.dup.fd < 0 ||
-                fact_list[i]._type.dup.new_fd < 0 ||
-                fact_list[i]._type.dup.new_fd > SPAWN_FD_TARGET_MAX)
-                return EINVAL;
-            fd = fact_list[i]._type.dup.new_fd;
-            break;
-        case posix_file_action_type_OPEN:
-            fd = fact_list[i]._type.open->new_fd;
-            if (fd < 0 || fd > SPAWN_FD_TARGET_MAX)
-                return EINVAL;
-            break;
-        default:
-            return EINVAL;
         }
         if (fd > highest_fd)
             highest_fd = fd;
     }
-    *fdcnt = (unsigned) max(highest_fd + 1, 3);
-    return EOK;
+    free(fact_list);
+    if (r == EOK)
+        *fdcnt = (unsigned) max(highest_fd + 1, 3);
+    return r;
 }
 
 /** add_fdmap
@@ -201,19 +228,11 @@ static int add_fdmap(posix_spawn_file_actions_t *factp,
                      unsigned fdcnt)
 {
     posix_spawn_file_actions_list_t *fact_list;
-    int r, num_fact = 0;
-    unsigned i;
+    unsigned i, num_fact;
+    int r;
 
-    num_fact = 0;
-    if ((r = rtmux_spawn_file_getactions(factp, &num_fact, NULL)) != EOK)
+    if ((r = fact_list_get(factp, &fact_list, &num_fact)) != EOK)
         return r;
-    CRASHCHECK(num_fact > 0);
-    num_fact = -num_fact;
-    if (!(fact_list = alloca((size_t) num_fact * sizeof(*fact_list))))
-        return ENOMEM;
-    if ((r = rtmux_spawn_file_getactions(factp, &num_fact, fact_list)) != EOK)
-        return r;
-    CRASHCHECK(num_fact < 0);
 
     /* first, initialize entire fdmap to inherit */
     for (i = 0; i < fdcnt; i++) {
@@ -223,36 +242,35 @@ static int add_fdmap(posix_spawn_file_actions_t *factp,
     /* now process the specific file actions provided entering them at the
      * appropriate fdmap index
      */
-    for (i = 0; i < num_fact; i++) {
-        switch (fact_list[i].type) {
+    for (i = 0; i < num_fact && r == EOK; i++) {
+        const posix_spawn_file_actions_list_t *fact = &fact_list[i];
+        int fd, new_fd;
+
+        switch (fact->type) {
         case posix_file_action_type_CLOSE:
-            if (fact_list[i]._type.close.fd < 0 ||
-                fact_list[i]._type.close.fd >= (int) fdcnt)
-                return EINVAL;
-            fdmap[fact_list[i]._type.close.fd] = SPAWN_FDCLOSED;
+            fd = fact->_type.close.fd;
+            if (fd < 0 || fd >= (int) fdcnt)
+                r = EINVAL;
+            else
+                fdmap[fd] = SPAWN_FDCLOSED;
             break;
         case posix_file_action_type_DUP:
-            if (fact_list[i]._type.dup.fd < 0 ||
-                fact_list[i]._type.dup.new_fd < 0 ||
-                fact_list[i]._type.dup.new_fd >= (int) fdcnt)
-                return EINVAL;
-            if (fact_list[i]._type.dup.fd < (int) fdcnt &&
-                fdmap[fact_list[i]._type.dup.fd] == SPAWN_FDCLOSED)
-                return EBADF;
-            if (fact_list[i]._type.dup.fd == fact_list[i]._type.dup.new_fd)
-                break;
-            fdmap[fact_list[i]._type.dup.new_fd] =
-                fact_list[i]._type.dup.fd < (int) fdcnt
-                    ? fdmap[fact_list[i]._type.dup.fd]
-                    : fact_list[i]._type.dup.fd;
+            fd = fact->_type.dup.fd;
+            new_fd = fact->_type.dup.new_fd;
+            if (fd < 0 || new_fd < 0 || new_fd >= (int) fdcnt)
+                r = EINVAL;
+            else if (fd < (int) fdcnt && fdmap[fd] == SPAWN_FDCLOSED)
+                r = EBADF;
+            else if (fd != new_fd)
+                fdmap[new_fd] = fd < (int) fdcnt ? fdmap[fd] : fd;
             break;
-        case posix_file_action_type_OPEN:
-            return EINVAL;
-        default:
-            return EINVAL;
+        default: /* open actions arrive here already opened, as dup2 */
+            r = EINVAL;
+            break;
         }
     }
-    return EOK;
+    free(fact_list);
+    return r;
 }
 
 /** parse_pspawn_msg (temporary)
@@ -327,6 +345,7 @@ static int parse_pspawn_msg(pid_t ppid,
      */
     spawn_msg_len = sizeof(new_msg->i);
     if (pspawn_add_size(&spawn_msg_len, fdmap_size) != EOK ||
+        pspawn_add_size(&spawn_msg_len, msg->i.cwdlen) != EOK ||
         pspawn_add_size(&spawn_msg_len, msg->i.pathlen) != EOK ||
         pspawn_add_size(&spawn_msg_len, msg->i.argenv_bytes) != EOK)
         return E2BIG;
@@ -344,6 +363,7 @@ static int parse_pspawn_msg(pid_t ppid,
     new_msg->i.nargv = msg->i.nargv;
     new_msg->i.narge = msg->i.narge;
     new_msg->i.nbytes = msg->i.argenv_bytes;
+    new_msg->i.cwdlen = msg->i.cwdlen;
 
     /* now, add the 'fdmap' in the new message as required */
     if (factp_p) {
@@ -360,6 +380,10 @@ static int parse_pspawn_msg(pid_t ppid,
                          sizeof(new_msg->i.nbytes) + fdmap_size);
     p = (uint8_t *) ((char *) (msg + 1) + msg->i.attr_bytes +
                      msg->i.filact_bytes + msg->i.filact_obytes);
+
+    /* the child cwd trails the posix message but precedes the path here */
+    memcpy(p_new, p + msg->i.pathlen + msg->i.argenv_bytes, msg->i.cwdlen);
+    p_new += msg->i.cwdlen;
     memcpy(p_new, p, new_msg->i.pathlen);
 
     /* add in remaining args and env */
@@ -392,67 +416,88 @@ static int parse_pspawn_msg(pid_t ppid,
     return EOK;
 }
 
+/* Bytes the header declares for itself and its trailing regions. 64-bit sum:
+ * the uint32 byte counts could otherwise overflow.
+ */
+static uint64_t pspawn_declared_len(const proc_posixspawn_t *msg)
+{
+    return (uint64_t) sizeof(*msg) + msg->i.attr_bytes + msg->i.filact_bytes +
+           msg->i.filact_obytes + msg->i.pathlen + msg->i.argenv_bytes +
+           msg->i.cwdlen;
+}
+
 /** proc_pspawn
  *
- * Implement posix_spawn() Currently we receive a _PROC_POSIX_SPAWN message and
- * then reformat it into a _PROC_SPAWN message with parse_pspawn_msg(). See
- * rationale comment below
+ * Implement posix_spawn(): receive a _PROC_POSIX_SPAWN message and rebuild it
+ * as a _PROC_SPAWN with parse_pspawn_msg(). A message longer than the receive
+ * buffer (large argv/envp) is first read whole into a heap copy, up to
+ * PSPAWN_MSG_MAX, so the rebuilt message carries every byte and its loader
+ * never reads the sender's buffer, whose layout differs.
  */
 int proc_pspawn(ioserv_context_t *ctp, void *vmsg)
 {
     proc_posixspawn_t *msg = vmsg;
     proc_spawn_t *spawn_msg = NULL;
-
-    /* For now, we will not handle multipart messages. If all of the
-     * proc_posixspawn_t message could not be sent, none will be processed
-     */
-    if (ctp->info.srcmsglen > ctp->info.msglen)
-        return EMSGSIZE;
+    void *whole = NULL;
+    uint64_t len;
+    int r;
 
     /* The client declares the sizes of the attr / file-action / path / argenv
      * sub-regions that follow the header. parse_pspawn_msg() uses them for
-     * pointer arithmetic into the received buffer, so reject a message whose
-     * declared regions do not fit within msglen before any of them is walked.
-     * Floor-check the header first: the size fields below live in the header,
-     * so msglen must cover it before they are read. 64-bit sum: the uint32 byte
-     * counts could otherwise overflow.
+     * pointer arithmetic into the message, so reject a message whose declared
+     * regions are not all in it before any of them is walked. Floor-check the
+     * header first: the size fields below live in the header, so msglen must
+     * cover it before they are read.
      */
     if (ctp->info.msglen < sizeof(*msg))
         return EMSGSIZE;
-    if ((uint64_t) sizeof(*msg) + msg->i.attr_bytes + msg->i.filact_bytes +
-            msg->i.filact_obytes + msg->i.pathlen + msg->i.argenv_bytes >
-        ctp->info.msglen)
+    len = pspawn_declared_len(msg);
+    if (len > ctp->info.srcmsglen)
         return EMSGSIZE;
 
     if (ctp->info.flags & RTMUX_MI_ENDIAN_DIFF)
         return ENOTSUP;
-
-    switch (msg->i.subtype) {
-    case _PROC_SPAWN_START: {
-        int r;
-
-        if ((r = parse_pspawn_msg(ctp->info.pid, msg, &spawn_msg)) == EOK) {
-            size_t spawn_msg_len = sizeof(*spawn_msg) + spawn_msg->i.searchlen +
-                                   spawn_msg->i.pathlen +
-                                   spawn_msg->i.nfds * sizeof(int32_t) +
-                                   spawn_msg->i.nbytes;
-
-            ioserv_context_t ctp2 = *ctp;
-
-            ctp2.info.flags &= (uint16_t) ~RTMUX_MI_ENDIAN_DIFF;
-            ctp2.msg = (ioserv_msg_t *) spawn_msg;
-            ctp2.info.srcmsglen = (uint32_t) spawn_msg_len;
-            ctp2.info.msglen = (uint32_t) spawn_msg_len;
-
-            CRASHCHECK(ctp2.info.srcmsglen > ctp2.info.msglen);
-            r = proc_spawn(&ctp2, spawn_msg);
-        }
-        if (spawn_msg) {
-            free(spawn_msg);
-        }
-        return r;
-    }
-    default:
+    if (msg->i.subtype != _PROC_SPAWN_START)
         return ENOSYS;
+
+    if (len > ctp->info.msglen) {
+        int head = (int) ctp->info.msglen, tail;
+
+        if (len > PSPAWN_MSG_MAX)
+            return E2BIG;
+        tail = (int) len - head;
+        if (!(whole = malloc((size_t) len)))
+            return ENOMEM;
+
+        /* The checked header comes from the receive buffer; only the tail is
+         * read from the sender.
+         */
+        memcpy(whole, msg, (size_t) head);
+        if (msg_read(ctp->rcvid, (char *) whole + head, tail, head) != tail) {
+            free(whole);
+            return EFAULT;
+        }
+        msg = whole;
     }
+
+    r = parse_pspawn_msg(ctp->info.pid, msg, &spawn_msg);
+    /* spawn_msg has every byte it needs: drop the copy before the load. */
+    free(whole);
+    if (r == EOK) {
+        size_t spawn_msg_len = sizeof(*spawn_msg) + spawn_msg->i.searchlen +
+                               spawn_msg->i.cwdlen + spawn_msg->i.pathlen +
+                               spawn_msg->i.nfds * sizeof(int32_t) +
+                               spawn_msg->i.nbytes;
+        ioserv_context_t ctp2 = *ctp;
+
+        ctp2.info.flags &= (uint16_t) ~RTMUX_MI_ENDIAN_DIFF;
+        ctp2.msg = (ioserv_msg_t *) spawn_msg;
+        ctp2.info.srcmsglen = (uint32_t) spawn_msg_len;
+        ctp2.info.msglen = (uint32_t) spawn_msg_len;
+
+        CRASHCHECK(ctp2.info.srcmsglen > ctp2.info.msglen);
+        r = proc_spawn(&ctp2, spawn_msg);
+    }
+    free(spawn_msg);
+    return r;
 }

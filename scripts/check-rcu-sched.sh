@@ -2878,20 +2878,20 @@ if ! awk '
         in_set = 1
     }
     in_set && /kspinlock_lock\(&thread_as_slock\);/ { saw_lock = NR }
-    in_set && /process_pin\(prp\)/ { saw_pin = NR }
-    in_set && /old = thp->as_prp;/ { saw_old = NR }
+    in_set && /prp->as_borrow_closed \? ESRCH : process_pin\(prp\)/ { saw_pin = NR }
+    in_set && /thread_as_unbind\(thp\);/ { saw_unbind = NR }
+    in_set && /thread_as_link\(thp, prp\);/ { saw_link = NR }
     in_set && /thp->as_prp = prp;/ { saw_assign = NR }
-    in_set && /process_unpin\(old\)/ { saw_unpin = NR }
     in_set && /kspinlock_unlock\(&thread_as_slock\);/ { saw_unlock = NR }
     in_set && /^}/ { in_set = 0 }
     END {
-        exit !(saw_lock && saw_pin && saw_old && saw_assign && saw_unpin &&
-               saw_unlock && saw_lock < saw_pin && saw_pin < saw_old &&
-               saw_old < saw_assign && saw_assign < saw_unpin &&
-               saw_unpin < saw_unlock)
+        exit !(saw_lock && saw_pin && saw_unbind && saw_link && saw_assign &&
+               saw_unlock && saw_lock < saw_pin && saw_pin < saw_unbind &&
+               saw_unbind < saw_link && saw_link < saw_assign &&
+               saw_assign < saw_unlock)
     }
 ' kernel/thread/lifecycle.c; then
-    echo "RCU-sched: thread_set_as_prp must serialize and pin new foreign process before retaining it" >&2
+    echo "RCU-sched: thread_set_as_prp must serialize, refuse a closed address space, pin it, drop the old borrow and link the new one before retaining it" >&2
     exit 1
 fi
 
@@ -2901,17 +2901,31 @@ if ! awk '
     }
     in_clear && /kspinlock_lock\(&thread_as_slock\);/ { saw_lock = NR }
     in_clear && /if \(thp->as_prp == prp\)/ { saw_if = NR }
-    in_clear && /thp->as_prp = NULL;/ { saw_clear = NR }
-    in_clear && /process_unpin\(prp\)/ { saw_unpin = NR }
+    in_clear && /thread_as_unbind\(thp\);/ { saw_unbind = NR }
     in_clear && /kspinlock_unlock\(&thread_as_slock\);/ { saw_unlock = NR }
     in_clear && /^}/ { in_clear = 0 }
     END {
-        exit !(saw_lock && saw_if && saw_clear && saw_unpin && saw_unlock &&
-               saw_lock < saw_if && saw_if < saw_clear &&
-               saw_clear < saw_unpin && saw_unpin < saw_unlock)
+        exit !(saw_lock && saw_if && saw_unbind && saw_unlock &&
+               saw_lock < saw_if && saw_if < saw_unbind &&
+               saw_unbind < saw_unlock)
     }
 ' kernel/thread/lifecycle.c; then
     echo "RCU-sched: thread_clear_as_prp_if must clear matching retained bindings under thread_as_slock" >&2
+    exit 1
+fi
+
+if ! awk '
+    /static void thread_as_unbind\(thread_t \*thp\)/ { in_unb = 1 }
+    in_unb && /\*thp->as_borrow_pprev = thp->as_borrow_next;/ { saw_unlink = NR }
+    in_unb && /process_unpin\(prp\);/ { saw_unpin = NR }
+    in_unb && /thp->as_prp = NULL;/ { saw_null = NR }
+    in_unb && /^}/ { in_unb = 0 }
+    END {
+        exit !(saw_unlink && saw_unpin && saw_null &&
+               saw_unlink < saw_unpin && saw_unpin < saw_null)
+    }
+' kernel/thread/lifecycle.c; then
+    echo "RCU-sched: thread_as_unbind must unlink the borrower, drop its pin, then clear as_prp" >&2
     exit 1
 fi
 
@@ -2992,25 +3006,37 @@ if ! awk '
 fi
 
 if ! awk '
-    /static void process_clear_as_bindings\(process_t \*target\)/ {
+    /static unsigned process_clear_as_bindings\(process_t \*target\)/ {
         in_clear = 1
     }
-    in_clear && /rcu_read_lock\(&process_rcu\);/ { saw_rcu = NR }
-    in_clear && /vector_lookup\(&process_vector/ { saw_process = NR }
-    in_clear && /kspinlock_lock\(&owner->vec_slock\);/ { saw_lock = NR }
+    in_clear && /thread_as_release_borrowers\(target\);/ { saw_borrow = NR }
+    in_clear && /kspinlock_lock\(&target->vec_slock\);/ { saw_lock = NR }
     in_clear && /thread_clear_as_prp_if\(thp, target\)/ { saw_clear = NR }
-    in_clear && /kspinlock_unlock\(&owner->vec_slock\);/ { saw_unlock = NR }
-    in_clear && /rcu_read_unlock\(&process_rcu\);/ { saw_rcu_unlock = NR }
+    in_clear && /kspinlock_unlock\(&target->vec_slock\);/ { saw_unlock = NR }
+    in_clear && /process_vector/ { saw_scan = NR }
     in_clear && /^}/ { in_clear = 0 }
     END {
-        exit !(saw_rcu && saw_process && saw_lock && saw_clear &&
-               saw_unlock && saw_rcu_unlock &&
-               saw_rcu < saw_process && saw_process < saw_lock &&
-               saw_lock < saw_clear && saw_clear < saw_unlock &&
-               saw_unlock < saw_rcu_unlock)
+        exit !(saw_borrow && saw_lock && saw_clear && saw_unlock && !saw_scan &&
+               saw_borrow < saw_lock && saw_lock < saw_clear &&
+               saw_clear < saw_unlock)
     }
 ' kernel/ext/process.c; then
-    echo "RCU-sched: process_clear_as_bindings must scan all live thread vectors under RCU" >&2
+    echo "RCU-sched: process_clear_as_bindings must release the borrower list, then the target's own threads, without scanning process_vector" >&2
+    exit 1
+fi
+
+if ! awk '
+    /unsigned rdecl thread_as_release_borrowers\(process_t \*prp\)/ { in_rel = 1 }
+    in_rel && /kspinlock_lock\(&thread_as_slock\);/ && !saw_lock { saw_lock = NR }
+    in_rel && /prp->as_borrow_closed = true;/ { saw_close = NR }
+    in_rel && /thread_as_unbind\(thp\);/ { saw_detach = NR }
+    in_rel && /^}/ { in_rel = 0 }
+    END {
+        exit !(saw_lock && saw_close && saw_detach &&
+               saw_lock < saw_close && saw_close < saw_detach)
+    }
+' kernel/thread/lifecycle.c; then
+    echo "RCU-sched: thread_as_release_borrowers must close the list, then unbind each borrower under thread_as_slock" >&2
     exit 1
 fi
 

@@ -16,6 +16,8 @@
 #include <sys/stat.h>
 
 #include "env-lock.h"
+#include "posix.h"
+
 extern char **environ;
 
 enum {
@@ -30,16 +32,95 @@ static void close_temp_fds(int fds[], size_t nfds)
     }
 }
 
-static bool has_action_type(_posix_spawn_file_actions_t *fact, int type)
+#define ACTION_BIT(t) (1U << (t))
+
+/* The set of action types present, as ACTION_BIT()s, in one pass. */
+static unsigned action_types(const _posix_spawn_file_actions_t *fact)
 {
+    unsigned types = 0;
+
     for (unsigned i = 0; i < fact->num_entries; i++) {
-        if (fact->action[i].type == type)
-            return true;
+        if (fact->action[i].type < 32)
+            types |= ACTION_BIT(fact->action[i].type);
     }
-    return false;
+    return types;
+}
+
+/* Working buffers for path resolution. cwd[0] is '\0' until a chdir or fchdir
+ * action sets it, and the child then starts in cwd.
+ */
+struct spawn_paths {
+    char cwd[PATH_MAX + 1];
+    char scratch[PATH_MAX + 1];
+};
+
+/* Write dir/rel to out. Returns EOK or ENAMETOOLONG. */
+static int join_path(char *out, const char *dir, const char *rel)
+{
+    size_t dlen = strlen(dir), rlen = strlen(rel);
+
+    /* drop trailing slashes, all of them for "/", so the join is "/rel" */
+    while (dlen > 0 && dir[dlen - 1] == '/')
+        dlen--;
+    if (dlen + 1 + rlen > PATH_MAX)
+        return ENAMETOOLONG;
+    memmove(out, dir, dlen);
+    out[dlen] = '/';
+    memcpy(out + dlen + 1, rel, rlen + 1);
+    return EOK;
+}
+
+/* Resolve a relative path against the directory the earlier chdir/fchdir
+ * actions left, the way openat() would against a descriptor for it.
+ *
+ * Returns the path to use, or NULL with *err set. An empty path stays ENOENT
+ * rather than naming the directory itself.
+ */
+static const char *child_path(struct spawn_paths *paths,
+                              const char *path,
+                              int *err)
+{
+    if (path[0] == '\0') {
+        *err = ENOENT;
+        return NULL;
+    }
+    if (!paths->cwd[0] || path[0] == '/')
+        return path;
+    *err = join_path(paths->scratch, paths->cwd, path);
+    return *err == EOK ? paths->scratch : NULL;
+}
+
+/* Run a chdir or fchdir action against the simulated child descriptor table
+ * map[]. The target must be a directory the caller may search, as chdir()
+ * requires.
+ *
+ * Returns EOK or the errno the spawn fails with.
+ */
+static int run_chdir_action(const posix_spawn_file_actions_list_t *action,
+                            const int map[],
+                            struct spawn_paths *paths)
+{
+    const char *dir;
+    int err;
+
+    if (action->type == posix_file_action_type_CHDIR) {
+        dir = child_path(paths, action->_type.chdir_path, &err);
+        if (!dir)
+            return err;
+    } else {
+        int pfd = map[action->_type.fchdir_fd];
+
+        if (pfd == SPAWN_FDCLOSED)
+            return EBADF;
+        if (__atfd_abspath(pfd, ".", paths->scratch, sizeof paths->scratch))
+            return errno;
+        dir = paths->scratch;
+    }
+    return __chdir_resolve(dir, paths->cwd, sizeof paths->cwd) ? errno : EOK;
 }
 
 static int materialize_open_actions(_posix_spawn_file_actions_t *fact,
+                                    struct spawn_paths *paths,
                                     _posix_spawn_file_actions_t **out,
                                     int **temps_out,
                                     size_t *ntemps_out)
@@ -86,6 +167,14 @@ static int materialize_open_actions(_posix_spawn_file_actions_t *fact,
                 return EINVAL;
             if (action->_type.open->new_fd > (int) max_fd)
                 max_fd = (unsigned) action->_type.open->new_fd;
+            break;
+        case posix_file_action_type_CHDIR:
+            break;
+        case posix_file_action_type_FCHDIR:
+            if (action->_type.fchdir_fd > SPAWN_FD_TARGET_MAX)
+                return EBADF;
+            if (action->_type.fchdir_fd > (int) max_fd)
+                max_fd = (unsigned) action->_type.fchdir_fd;
             break;
         default:
             return EINVAL;
@@ -147,9 +236,12 @@ static int materialize_open_actions(_posix_spawn_file_actions_t *fact,
             literal_slot[action->_type.close.fd] = false;
             break;
         case posix_file_action_type_DUP:
-            if (map[action->_type.dup.fd] == SPAWN_FDCLOSED ||
-                fcntl(map[action->_type.dup.fd], F_GETFD) == -1) {
-                ret = errno ? errno : EBADF;
+            if (map[action->_type.dup.fd] == SPAWN_FDCLOSED) {
+                ret = EBADF;
+                goto fail;
+            }
+            if (fcntl(map[action->_type.dup.fd], F_GETFD) == -1) {
+                ret = errno;
                 goto fail;
             }
             if (action->_type.dup.fd == action->_type.dup.new_fd)
@@ -161,10 +253,20 @@ static int materialize_open_actions(_posix_spawn_file_actions_t *fact,
                 literal_slot[action->_type.dup.fd];
             break;
         case posix_file_action_type_OPEN: {
-            int fd = open(action->_type.open->path,
-                          (int) action->_type.open->flags | O_CLOEXEC,
-                          (mode_t) action->_type.open->mode);
+            const char *opath =
+                child_path(paths, action->_type.open->path, &ret);
+            int fd;
 
+            if (!opath)
+                goto fail;
+
+            /* O_NOCTTY: the caller must not acquire a terminal it opens for the
+             * child; that the child does not either is allowed, since acquiring
+             * one on open is implementation-defined.
+             */
+            fd = open(opath,
+                      (int) action->_type.open->flags | O_CLOEXEC | O_NOCTTY,
+                      (mode_t) action->_type.open->mode);
             if (fd == -1) {
                 ret = errno;
                 goto fail;
@@ -184,6 +286,12 @@ static int materialize_open_actions(_posix_spawn_file_actions_t *fact,
                 cloexec_slot[action->_type.open->new_fd] = false;
             break;
         }
+        case posix_file_action_type_CHDIR:
+        case posix_file_action_type_FCHDIR:
+            ret = run_chdir_action(action, map, paths);
+            if (ret != EOK)
+                goto fail;
+            break;
         default:
             ret = EINVAL;
             goto fail;
@@ -281,13 +389,16 @@ fail:
  * _PROC_POSIX_SPAWN message and sends it to roottask's process service.
  * roottask builds the new process from there.
  *
- * The path must be absolute (start with '/'); use posix_spawnp() if you want a
- * $PATH search.
+ * File actions run in the order they were added. A relative path resolves
+ * against the directory the chdir/fchdir actions leave, or against the caller's
+ * cwd when there are none; use posix_spawnp() for a $PATH search. The actions
+ * run here in the caller, so opens and directory searches are checked against
+ * the caller's ids even when POSIX_SPAWN_RESETIDS is set.
  *
  * Errors:
  *   EOK     - success.  *pid is set to the new pid.
  *   EINVAL  - bad path / malformed posix_spawnattr_t / file_actions.
- *   ENOENT  - relative path, or roottask could not open the image.
+ *   ENOENT  - roottask could not open the image, or a file action failed.
  *   ENOMEM  - couldn't allocate the message iov or the argenv staging buffer.
  *   EIO     - internal error in the libc spawnattr machinery.
  *
@@ -317,16 +428,14 @@ int posix_spawn(pid_t *restrict pid,
     _posix_spawn_file_actions_t *materialized_factp = NULL;
     int *temp_fds = NULL;
     size_t ntemp_fds = 0;
-    bool fact_has_open;
+    unsigned types = 0;
+    bool fact_has_open, fact_has_chdir, image_known;
+    struct spawn_paths *paths = NULL;
+    size_t cwdlen = 0;
     bool env_locked = false;
 
     if (!path || *path == '\0')
         return EINVAL;
-    if (*path != '/')
-        return ENOENT;
-    /* pathlen rides the wire as a uint16_t; reject before it truncates. */
-    if (strlen(path) + 1 > UINT16_MAX)
-        return ENAMETOOLONG;
     if (!pid)
         pid = &_pid;
 
@@ -347,23 +456,69 @@ int posix_spawn(pid_t *restrict pid,
         /* may be NULL for a valid but unset object — that's ok */
     }
 
-    fact_has_open =
-        _factp && has_action_type(_factp, posix_file_action_type_OPEN);
+    if (_factp)
+        types = action_types(_factp);
+    fact_has_open = types & ACTION_BIT(posix_file_action_type_OPEN);
+    fact_has_chdir = types & (ACTION_BIT(posix_file_action_type_CHDIR) |
+                              ACTION_BIT(posix_file_action_type_FCHDIR));
+    /* only open and chdir actions, and a relative image, resolve paths */
+    if (fact_has_open || fact_has_chdir || *path != '/') {
+        paths = malloc(sizeof(*paths));
+        if (!paths)
+            return ENOMEM;
+        paths->cwd[0] = '\0';
+    }
+
+    /* Fail on a missing image before an open action can create a file. A
+     * relative image under chdir actions is known only once they have run.
+     */
+    image_known = *path == '/' || !fact_has_chdir;
+    if (fact_has_open && image_known && stat(path, &dummy) == -1) {
+        r = errno;
+        goto cleanup;
+    }
     if (_factp) {
-        if (fact_has_open && stat(path, &dummy) == -1)
-            return errno;
-        r = materialize_open_actions(_factp, &materialized_factp, &temp_fds,
-                                     &ntemp_fds);
+        r = materialize_open_actions(_factp, paths, &materialized_factp,
+                                     &temp_fds, &ntemp_fds);
         if (r != EOK)
-            return r;
+            goto cleanup;
         _factp = materialized_factp;
     }
+
+    /* roottask wants an absolute image path; the child's cwd is the base. */
+    if (*path != '/') {
+        const char *base = paths->cwd[0]
+                               ? paths->cwd
+                               : getcwd(paths->scratch, sizeof paths->scratch);
+
+        if (!base) {
+            r = errno;
+            goto cleanup;
+        }
+        r = join_path(paths->scratch, base, path);
+        if (r != EOK)
+            goto cleanup;
+        path = paths->scratch;
+        if (fact_has_open && !image_known && stat(path, &dummy) == -1) {
+            r = errno;
+            goto cleanup;
+        }
+    }
+    /* pathlen rides the wire as a uint16_t; reject before it truncates. */
+    if (strlen(path) + 1 > UINT16_MAX) {
+        r = ENAMETOOLONG;
+        goto cleanup;
+    }
+    if (paths && paths->cwd[0])
+        cwdlen = strlen(paths->cwd) + 1;
 
     /* The on-the-wire attr blob is the POSIX-visible spawn attribute object. */
     msg.i.type = _PROC_POSIX_SPAWN;
     msg.i.subtype = _PROC_SPAWN_START;
     msg.i.pathlen = (uint16_t) (strlen(path) + 1);
     msg.i.attr_bytes = (uint32_t) sizeof(*_attrp);
+    msg.i.cwdlen = (uint16_t) cwdlen;
+    memset(msg.i.reserved, 0, sizeof(msg.i.reserved));
 
     iov = calloc(num_iovs = 6, sizeof(*iov));
     if (!iov) {
@@ -440,7 +595,8 @@ int posix_spawn(pid_t *restrict pid,
         r = ENOMEM;
         goto cleanup;
     }
-    SETIOV(iov + 5 + factp_open_iovs, data, 0); /* unused slot */
+    /* the child cwd trails the message; an empty iov when there is none */
+    SETIOV(iov + 5 + factp_open_iovs, paths ? paths->cwd : data, cwdlen);
 
     if (argv) {
         for (arg = argv; (src = *arg); arg++)
@@ -476,5 +632,6 @@ cleanup:
     close_temp_fds(temp_fds, ntemp_fds);
     free(temp_fds);
     free(materialized_factp);
+    free(paths);
     return r;
 }

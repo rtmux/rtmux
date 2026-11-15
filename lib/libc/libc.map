@@ -206,6 +206,7 @@
         getpwuid_r;
         getrlimit;
         getrusage;
+        getsid;
         getsubopt;
         gettimeofday;
         getuid;
@@ -367,8 +368,10 @@
         posix_mem_offset;
         posix_memalign;
         posix_spawn;
+        posix_spawn_file_actions_addchdir;
         posix_spawn_file_actions_addclose;
         posix_spawn_file_actions_adddup2;
+        posix_spawn_file_actions_addfchdir;
         posix_spawn_file_actions_addopen;
         posix_spawn_file_actions_destroy;
         posix_spawn_file_actions_init;

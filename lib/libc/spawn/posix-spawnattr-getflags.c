@@ -33,7 +33,7 @@ int posix_spawnattr_setflags(posix_spawnattr_t *attrp, short flags)
     const short supported = POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_SETSIGMASK |
                             POSIX_SPAWN_RESETIDS | POSIX_SPAWN_SETSIGDEF |
                             POSIX_SPAWN_SETSCHEDULER |
-                            POSIX_SPAWN_SETSCHEDPARAM;
+                            POSIX_SPAWN_SETSCHEDPARAM | POSIX_SPAWN_SETSID;
     _posix_spawnattr_t *_attrp;
     int rc;
 

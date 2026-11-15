@@ -205,6 +205,7 @@ extern int getgroups(int __gidsetsize, gid_t __grouplist[]);
 extern pid_t getpgrp(void);
 extern pid_t getpid(void);
 extern pid_t getppid(void);
+extern pid_t getsid(pid_t __pid);
 extern uid_t getuid(void);
 extern int issetugid(void);
 extern int getpagesize(void); /* legacy; prefer sysconf(_SC_PAGESIZE) */

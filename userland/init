@@ -20,12 +20,14 @@ export PATH
 mainfs=/dev/nvme0n1p8
 rtmux_run=
 rtmux_laps=
+rtmux_spawn_procs=0
 if read cmdline < /sys/cmdline; then
     for arg in $cmdline; do
         case "$arg" in
             mainfs=*) mainfs=${arg#mainfs=} ;;
             rtmux.run=*) rtmux_run=${arg#rtmux.run=} ;;
             rtmux.laps=*) rtmux_laps=${arg#rtmux.laps=} ;;
+            rtmux.spawn_procs=*) rtmux_spawn_procs=${arg#rtmux.spawn_procs=} ;;
         esac
     done
 fi
@@ -933,7 +935,7 @@ if test "$mount_ok" = "1"; then
         echo
         echo "RTMux spawn-storm: BEGIN"
         /bin/pipe &
-        if /bin/syscall_testing --spawn-storm; then
+        if /bin/syscall_testing --spawn-storm "$rtmux_spawn_procs"; then
             echo "RTMux spawn-storm: PASS"
         else
             echo "RTMux spawn-storm: FAIL"

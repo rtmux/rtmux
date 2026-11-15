@@ -779,13 +779,20 @@ check-trace-modes: check-qemu-deps $(AUTOCONF_H) $(VER_FILE) startup initramfs
 # 8 threads x 100 concurrent posix_spawn, on 4 harts and on 2. This storm exposed two
 # SMP defects (ready-queue corruption and an exit-path hang). Each
 # boot takes about 100 s on 4 harts and over 200 s on 2 on a loaded host.
+# SPAWN_STORM_PROCS=N keeps N idle processes alive across the storm on an
+# instrumented kernel and prints the per-boot teardown cost (pshut) and longest
+# interrupts-off window (irqoff), so teardown can be compared across N.
 SPAWN_STORM_REPEAT ?= 5
+SPAWN_STORM_PROCS ?=
+SPAWN_STORM_ARGS = $(if $(SPAWN_STORM_PROCS),--procs $(SPAWN_STORM_PROCS))
 check-spawn-storm: check-qemu-deps $(AUTOCONF_H) $(VER_FILE) startup initramfs
 	$(msg) CHECK "concurrent spawn storm ($(SPAWN_STORM_REPEAT) boots on 4 harts, 2 on 2)"
 	$(Q)rc=0; \
 	CPUS=4 ./scripts/qemu-regress.sh --mode spawn-storm --repeat $(SPAWN_STORM_REPEAT) \
+	    $(SPAWN_STORM_ARGS) \
 	    --timeout 600 || { echo "  FAILED   spawn-storm (4 harts)"; rc=1; }; \
 	CPUS=2 ./scripts/qemu-regress.sh --mode spawn-storm --repeat 2 --timeout 600 \
+	    $(SPAWN_STORM_ARGS) \
 	    || { echo "  FAILED   spawn-storm (2 harts)"; rc=1; }; \
 	exit $$rc
 

@@ -205,6 +205,7 @@ getpwuid	FUNC	GLOBAL	DEFAULT	-
 getpwuid_r	FUNC	GLOBAL	DEFAULT	-
 getrlimit	FUNC	GLOBAL	DEFAULT	-
 getrusage	FUNC	GLOBAL	DEFAULT	-
+getsid	FUNC	GLOBAL	DEFAULT	-
 getsubopt	FUNC	GLOBAL	DEFAULT	-
 gettimeofday	FUNC	GLOBAL	DEFAULT	-
 getuid	FUNC	GLOBAL	DEFAULT	-
@@ -366,8 +367,10 @@ poll	FUNC	GLOBAL	DEFAULT	-
 posix_mem_offset	FUNC	GLOBAL	DEFAULT	-
 posix_memalign	FUNC	GLOBAL	DEFAULT	-
 posix_spawn	FUNC	GLOBAL	DEFAULT	-
+posix_spawn_file_actions_addchdir	FUNC	GLOBAL	DEFAULT	-
 posix_spawn_file_actions_addclose	FUNC	GLOBAL	DEFAULT	-
 posix_spawn_file_actions_adddup2	FUNC	GLOBAL	DEFAULT	-
+posix_spawn_file_actions_addfchdir	FUNC	GLOBAL	DEFAULT	-
 posix_spawn_file_actions_addopen	FUNC	GLOBAL	DEFAULT	-
 posix_spawn_file_actions_destroy	FUNC	GLOBAL	DEFAULT	-
 posix_spawn_file_actions_init	FUNC	GLOBAL	DEFAULT	-

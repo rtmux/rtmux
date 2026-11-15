@@ -281,9 +281,9 @@ int kdecl ksys_channel_create(thread_t *act,
  * connect authority (the creator plus every delegated client). Caps match on
  * the object pointer, so a stale cap over the freed channel could authorize a
  * connect to whatever object later reuses the soul. Revoke them everywhere
- * before the soul is recycled. Traversal mirrors process_clear_as_bindings():
- * process_rcu read side, cap_lock is a leaf taken per process, so no lock-rank
- * concern with a held chvec lock. No-op for public or non-global channels.
+ * before the soul is recycled. Traversal: process_rcu read side, cap_lock is a
+ * leaf taken per process, so no lock-rank concern with a held chvec lock. No-op
+ * for public or non-global channels.
  */
 static void global_channel_revoke_gates(channel_t *chp)
 {

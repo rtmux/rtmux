@@ -12,6 +12,7 @@
  * by thread_waaa().
  */
 
+#include <errno.h>
 #include <unistd.h>
 #include <sys/rtmux-core.h>
 #include <sys/storage.h>
@@ -84,6 +85,27 @@ pid_t getppid(void)
         return 1;
     }
     return msg.o.ppid;
+}
+
+/* getsid — the session leader's pid for `pid`, or for the caller when 0. proc
+ * answers EPERM for a process in another session and ESRCH for no process.
+ */
+pid_t getsid(pid_t pid)
+{
+    proc_getsetid_t msg = {
+        .i.type = _PROC_GETSETID,
+        .i.subtype = _PROC_ID_GETID,
+        .i.pid = pid,
+    };
+
+    if (pid < 0) {
+        errno = ESRCH;
+        return -1;
+    }
+    if (msg_sendnc(ROOTTASK_COID, &msg.i, sizeof msg.i, &msg.o, sizeof msg.o) ==
+        -1)
+        return -1;
+    return msg.o.sid;
 }
 
 pid_t setsid(void)

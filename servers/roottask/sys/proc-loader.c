@@ -15,6 +15,7 @@
 #include <sys/stat.h>
 #include <sys/mount.h>
 #include <sys/rtmux-core.h>
+#include <sys/pathmsg.h>
 
 #include <devctl/common.h>
 
@@ -46,6 +47,19 @@ static void loader_preclose_fdmap(struct loader_context *lcp)
         if (pfd[i] == SPAWN_FDCLOSED)
             (void) close((int) i);
     }
+}
+
+/* Make the child's working directory cwd[len], the absolute path posix_spawn()
+ * computed from its chdir/fchdir file actions. The parent checked the
+ * directory; this runs as the child, so proc updates the child's cwd.
+ *
+ * Returns EOK or an errno for the spawn to fail with.
+ */
+static int loader_chdir(const char *cwd, uint16_t len)
+{
+    if (len < 2 || cwd[0] != '/' || memchr(cwd, '\0', len) != cwd + len - 1)
+        return EINVAL;
+    return __chdir_send(cwd) == 0 ? EOK : errno;
 }
 
 extern void *_mmap2(void *addr,
@@ -459,8 +473,12 @@ static void loader_args(struct loader_context *lcp,
         CRASHCHECK(!orig_exefile);
         strcpy(strings + interp_name_len + interp_arg_len, orig_exefile);
     }
-    /* can only modify "p" and "nbytes" */
-    if (lcp->ctx.msgsize - (p - lcp->msg.filler) > lcp->msg.spawn.i.nbytes) {
+
+    /* can only modify "p" and "nbytes". The arguments are inline when the
+     * context holds them all: proc_spawn() keeps a whole message that ends
+     * exactly at the last argument byte.
+     */
+    if (lcp->ctx.msgsize - (p - lcp->msg.filler) >= lcp->msg.spawn.i.nbytes) {
         memcpy(strings + interplen, p, lcp->msg.spawn.i.nbytes);
     } else {
         proc_spawn_args_t args;
@@ -748,7 +766,7 @@ static int boot_image_hash_fd(int fd, uint64_t *hashp)
 void *loader_load(void *parm)
 {
     struct loader_context *lcp = parm;
-    const char *p;
+    const char *p, *search;
     int fd;
     int status;
     uid_t uid;
@@ -825,6 +843,18 @@ void *loader_load(void *parm)
             LOADER_EXIT(errno);
         }
     }
+
+    /* fd_map[nfds], search[searchlen], cwd[cwdlen], path[], then argv/env */
+    p = (const char *) &lcp->msg.spawn.i +
+        (sizeof lcp->msg.spawn.i + lcp->msg.spawn.i.nfds * sizeof(int32_t));
+    search = p;
+    p += lcp->msg.spawn.i.searchlen;
+
+    /* File actions run after the attributes: the chdir ones end here. */
+    if (lcp->msg.spawn.i.cwdlen &&
+        (status = loader_chdir(p, lcp->msg.spawn.i.cwdlen)) != EOK)
+        LOADER_EXIT(status);
+    p += lcp->msg.spawn.i.cwdlen;
     loader_preclose_fdmap(lcp);
 
     /* proc_spawn set saved_user_id to 0, so this will work... */
@@ -833,14 +863,10 @@ void *loader_load(void *parm)
     (void) setreuid(geteuid(), 0);
     (void) setregid(getegid(), getgid());
 
-    p = (const char *) &lcp->msg.spawn.i +
-        (sizeof lcp->msg.spawn.i + lcp->msg.spawn.i.nfds * sizeof(int32_t));
     if (lcp->msg.spawn.i.parms.flags & SPAWN_SEARCH_PATH) {
-        if (searchpath(p + lcp->msg.spawn.i.searchlen, p, buffer,
-                       sizeof buffer) == -1) {
+        if (searchpath(p, search, buffer, sizeof buffer) == -1) {
             LOADER_EXIT(errno);
         }
-        p += lcp->msg.spawn.i.searchlen;
     } else {
         if (is_exec(p) == -1) {
             LOADER_EXIT(errno);

@@ -283,6 +283,17 @@ typedef struct process_entry {
      * vectors/credentials/object pools.
      */
     volatile unsigned pin_count;
+
+    /* Threads of other processes that run in this address space (as_prp == this
+     * process, process != this process). Each linked thread holds one pin_count
+     * reference, but the pin count is not the list length: kcalls that promote
+     * an RCU lookup pin the process too. as_borrow_closed is set once, when
+     * teardown releases the borrowers, and refuses every later borrow, so the
+     * list stays empty from then until mdestroy. Both fields are guarded by
+     * thread_as_slock (kernel/thread/lifecycle.c).
+     */
+    thread_t *as_borrowers;
+    bool as_borrow_closed;
     ulong_t rlimit_vals_soft[RLIM_NLIMITS];
     ulong_t rlimit_vals_hard[RLIM_NLIMITS];
 
@@ -711,6 +722,13 @@ typedef struct thread_entry { /* Also used for vthread_entry */
      * then waits for this counter to reach zero before object_free().
      */
     volatile unsigned pin_count;
+
+    /* Link on as_prp->as_borrowers while as_prp is another process's address
+     * space; as_borrow_pprev is NULL while unlinked. Guarded by
+     * thread_as_slock.
+     */
+    thread_t *as_borrow_next;
+    thread_t **as_borrow_pprev;
 
     /* Saved syscall argument registers (a0..a5), captured at every kcall entry.
      * KCALL_RESTART restores these into the saved register frame before the

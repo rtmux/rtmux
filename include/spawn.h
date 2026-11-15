@@ -75,6 +75,12 @@ extern int posix_spawn_file_actions_addopen(
     const char *restrict path,
     int oflags,
     mode_t omode);
+extern int posix_spawn_file_actions_addchdir(
+    posix_spawn_file_actions_t *restrict fact_p,
+    const char *restrict path);
+extern int posix_spawn_file_actions_addfchdir(
+    posix_spawn_file_actions_t *fact_p,
+    int fd);
 
 extern int posix_spawn(pid_t *restrict pid,
                        const char *restrict path,
@@ -95,6 +101,7 @@ extern int posix_spawnp(pid_t *restrict pid,
     0x00000004 /* set members of sigdefault to SIG_DFL */
 #define POSIX_SPAWN_RESETIDS 0x00000020      /* reset effective IDs */
 #define POSIX_SPAWN_SETSCHEDULER 0x00000040  /* set scheduling policy */
+#define POSIX_SPAWN_SETSID 0x00000200        /* create a new session */
 #define POSIX_SPAWN_SETSCHEDPARAM 0x00000400 /* set scheduling parameters */
 
 extern int rtmux_spawn_waitfd(pid_t *restrict pid,
