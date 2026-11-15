@@ -96,11 +96,14 @@ $(BUILD_BASE)/libc-algorithms-test: $(TEST_DIR)/test-libc-algorithms.c $(LIBC_AL
 # The shared serial service is compiled against the tree's own headers with the
 # IPC calls stubbed (the host libc has no ssp/string.h, so fortify is off).
 SERIAL_DIR = ../../userland/dev-serial-common
-$(BUILD_BASE)/serial-reply-test: $(TEST_DIR)/test-serial-reply.c $(SERIAL_DIR)/serial-service.h
+NOTIFY_LIST = ../../lib/libc/ioserv/notify-list.c
+$(BUILD_BASE)/serial-reply-test: $(TEST_DIR)/test-serial-reply.c $(SERIAL_DIR)/serial-service.h \
+                                 $(NOTIFY_LIST)
 	@mkdir -p $(@D)
 	$(msg) HOSTCC $(notdir $@)
 	$(Q)$(HOST_CC) -I$(SERIAL_DIR) -I../../include -I../../internal/include $(HOST_CFLAGS) \
-	    -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -o $@ $(TEST_DIR)/test-serial-reply.c
+	    -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -o $@ $(TEST_DIR)/test-serial-reply.c \
+	    $(NOTIFY_LIST)
 
 # libc strftime against the host headers, renamed so the host copy is never
 # called. When the host compiler supports AddressSanitizer a second build runs

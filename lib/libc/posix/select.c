@@ -42,9 +42,15 @@ static int select_timeout_ms(const struct timeval *tv)
  * array, wait with poll(), then translate the returned events back. A
  * descriptor is read-ready on POLLIN/POLLHUP/POLLERR, write-ready on
  * POLLOUT/POLLERR, and exception-ready on POLLPRI; an invalid descriptor
- * (POLLNVAL) fails the whole call with EBADF, as POSIX requires. The return
- * value is the total number of ready (descriptor, condition) pairs, so a
- * descriptor ready for two conditions counts twice.
+ * (POLLNVAL) fails the whole call with EBADF, as POSIX requires. A valid
+ * descriptor whose service cannot report readiness comes back from poll() as
+ * POLLERR and so selects ready rather than failing: POSIX reserves EBADF for an
+ * invalid descriptor, and leaves select() on file types other than regular
+ * files, terminals, FIFOs, pipes and sockets unspecified. A service that runs
+ * out of memory recording a wait makes poll(), and so select(), fail with
+ * EAGAIN, an additional error POSIX permits (XSH 2.3) rather than a false
+ * readiness. The return value is the total number of ready (descriptor,
+ * condition) pairs, so a descriptor ready for two conditions counts twice.
  */
 static int select_poll(int nfds,
                        fd_set *readfds,

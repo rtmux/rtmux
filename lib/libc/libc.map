@@ -234,6 +234,11 @@
         ioserv_msgreadv;
         ioserv_msgwrite;
         ioserv_msgwritev;
+        ioserv_notify;
+        ioserv_notify_init;
+        ioserv_notify_ready;
+        ioserv_notify_remove;
+        ioserv_notify_trigger;
         ioserv_ocb;
         ioserv_open_bind;
         ioserv_reply_counters_format;

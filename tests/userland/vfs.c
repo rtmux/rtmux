@@ -1985,6 +1985,213 @@ static void test_posix_poll_readiness(void)
           "a negative descriptor must be ignored with revents 0");
 }
 
+/* /dev/null and /dev/zero never block, so poll reports them readable and
+ * writable at once and select counts them ready; a condition they never raise
+ * (POLLPRI) waits out its timeout instead of reporting POLLERR.
+ */
+static void test_posix_poll_null_devices(void)
+{
+    static const char *const devs[] = {"/dev/null", "/dev/zero"};
+
+    for (size_t i = 0; i < sizeof devs / sizeof devs[0]; i++) {
+        struct pollfd pfd;
+        fd_set rset, wset;
+        struct timeval tv = {0};
+        char name[64];
+        int fd = open(devs[i], O_RDWR);
+
+        if (fd < 0) {
+            snprintf(name, sizeof name, "poll %s open", devs[i]);
+            test_fail(name, strerror(errno));
+            continue;
+        }
+        pfd = (struct pollfd){.fd = fd, .events = POLLIN | POLLOUT};
+        snprintf(name, sizeof name, "poll %s readable and writable", devs[i]);
+        check(poll(&pfd, 1, 0) == 1 &&
+                  pfd.revents == (POLLRDNORM | POLLOUT),
+              name,
+              "a device that never blocks must poll POLLRDNORM|POLLOUT only");
+
+        pfd = (struct pollfd){.fd = fd, .events = POLLPRI};
+        snprintf(name, sizeof name, "poll %s POLLPRI times out", devs[i]);
+        check(poll(&pfd, 1, 50) == 0 && pfd.revents == 0, name,
+              "a condition the device never raises must not report POLLERR");
+
+        FD_ZERO(&rset);
+        FD_ZERO(&wset);
+        FD_SET(fd, &rset);
+        FD_SET(fd, &wset);
+        snprintf(name, sizeof name, "select %s ready", devs[i]);
+        check(select(fd + 1, &rset, &wset, NULL, &tv) == 2 &&
+                  FD_ISSET(fd, &rset) && FD_ISSET(fd, &wset),
+              name, "select must count a never-blocking device ready both ways");
+        (void) close(fd);
+    }
+}
+
+/* A service in this process whose _IO_NOTIFY handler misbehaves on demand, to
+ * check how poll() takes a service that runs out of memory, and that a poll
+ * cancelled while it waits takes its arms away.
+ */
+#define POLL_FAULT_PATH "/poll-fault-test"
+
+enum {
+    POLL_FAULT_NOMEM_ALL, /* every _IO_NOTIFY fails with ENOMEM */
+    POLL_FAULT_NOMEM_ARM, /* not ready; recording an arm fails with ENOMEM */
+    POLL_FAULT_WAIT,      /* not ready; arms are recorded and never fire */
+};
+
+static atomic_int poll_fault_mode;
+static atomic_int poll_fault_arms;    /* arms recorded in POLL_FAULT_WAIT */
+static atomic_int poll_fault_disarms; /* POLL passes seen in POLL_FAULT_WAIT */
+static int poll_fault_ocb;
+
+static int poll_fault_open(ioserv_context_t *ctp,
+                           io_open_t *msg,
+                           void *handle,
+                           void *extra)
+{
+    (void) msg;
+    (void) handle;
+    (void) extra;
+    return ioserv_open_bind(ctp, &poll_fault_ocb, NULL) == -1 ? errno : EOK;
+}
+
+static int poll_fault_notify(ioserv_context_t *ctp, io_notify_t *msg, void *ocb)
+{
+    int mode = atomic_load(&poll_fault_mode);
+    int action = msg->i.action;
+
+    (void) ocb;
+    if (mode == POLL_FAULT_NOMEM_ALL)
+        return ENOMEM;
+    if (action == _NOTIFY_ACTION_CONDARM) {
+        if (mode == POLL_FAULT_NOMEM_ARM)
+            return ENOMEM;
+        atomic_fetch_add(&poll_fault_arms, 1);
+        return EAGAIN;
+    }
+    if (action == _NOTIFY_ACTION_POLL && mode == POLL_FAULT_WAIT)
+        atomic_fetch_add(&poll_fault_disarms, 1);
+    memset(&msg->o, 0, sizeof msg->o);
+    return IOSERV_PTR(ctp, &msg->o, sizeof msg->o);
+}
+
+static const ioserv_connect_ops_t poll_fault_connect_ops = {
+    .nfuncs = IOSERV_CONNECT_NFUNCS,
+    .open = poll_fault_open,
+};
+
+static const ioserv_ops_t poll_fault_io_ops = {
+    .nfuncs = IOSERV_IO_NFUNCS,
+    .notify = poll_fault_notify,
+};
+
+static void *poll_fault_server(void *raw)
+{
+    dispatch_context_t *ctp = dispatch_context_alloc(raw);
+
+    while (ctp && (ctp = dispatch_block(ctp)))
+        (void) dispatch_handler(ctp);
+    return NULL;
+}
+
+static void *poll_fault_waiter(void *raw)
+{
+    struct pollfd pfd = {.fd = *(int *) raw, .events = POLLIN};
+
+    (void) poll(&pfd, 1, 20000);
+    return NULL;
+}
+
+static void test_posix_poll_service_faults(void)
+{
+    struct pollfd pfd;
+    fd_set rset;
+    struct timeval tv = {0};
+    dispatch_t *dpp;
+    pthread_t server, waiter;
+    int id, fd, rc, err, arms, disarms;
+
+    if (!(dpp = dispatch_create())) {
+        test_fail("poll fault service dispatch", strerror(errno));
+        return;
+    }
+    /* SELF: roottask resolves a path to a server in the caller's own process
+     * only for a mount that asks for it, and the client here is that process.
+     */
+    id = ioserv_attach(dpp, NULL, POLL_FAULT_PATH, _FTYPE_ANY,
+                       IOSERV_FLAG_DIR | IOSERV_FLAG_SELF,
+                       &poll_fault_connect_ops, &poll_fault_io_ops, NULL);
+    if (id == -1) {
+        test_skip("poll fault service", "cannot attach a test path");
+        (void) dispatch_destroy(dpp);
+        return;
+    }
+    if (pthread_create(&server, NULL, poll_fault_server, dpp) != 0) {
+        test_fail("poll fault service thread", "pthread_create failed");
+        (void) ioserv_detach(dpp, id, 0);
+        (void) dispatch_destroy(dpp);
+        return;
+    }
+    fd = open(POLL_FAULT_PATH "/node", O_RDONLY);
+    if (fd < 0) {
+        test_fail("poll fault service open", strerror(errno));
+        goto out;
+    }
+
+    /* Out of memory answering the poll pass: an error, not POLLERR. */
+    atomic_store(&poll_fault_mode, POLL_FAULT_NOMEM_ALL);
+    pfd = (struct pollfd){.fd = fd, .events = POLLIN};
+    errno = 0;
+    rc = poll(&pfd, 1, 0);
+    err = errno;
+    check(rc == -1 && err == EAGAIN, "poll service ENOMEM fails with EAGAIN",
+          "a service out of memory must not be reported as POLLERR");
+    FD_ZERO(&rset);
+    FD_SET(fd, &rset);
+    errno = 0;
+    rc = select(fd + 1, &rset, NULL, NULL, &tv);
+    err = errno;
+    check(rc == -1 && err == EAGAIN, "select service ENOMEM fails with EAGAIN",
+          "select must not count a service out of memory as ready");
+
+    /* Out of memory recording the arm of a blocking wait. */
+    atomic_store(&poll_fault_mode, POLL_FAULT_NOMEM_ARM);
+    pfd = (struct pollfd){.fd = fd, .events = POLLIN};
+    errno = 0;
+    rc = poll(&pfd, 1, 100);
+    err = errno;
+    check(rc == -1 && err == EAGAIN, "poll arm ENOMEM fails with EAGAIN",
+          "a service that cannot record an arm must not be reported as POLLERR");
+
+    /* A poll cancelled while it waits disarms what it armed. */
+    atomic_store(&poll_fault_mode, POLL_FAULT_WAIT);
+    atomic_store(&poll_fault_arms, 0);
+    atomic_store(&poll_fault_disarms, 0);
+    if (pthread_create(&waiter, NULL, poll_fault_waiter, &fd) != 0) {
+        test_fail("poll cancel waiter", "pthread_create failed");
+        goto out_fd;
+    }
+    for (int i = 0; i < 100 && atomic_load(&poll_fault_arms) == 0; i++)
+        sleep_ms(10);
+    sleep_ms(50);
+    disarms = atomic_load(&poll_fault_disarms);
+    (void) pthread_cancel(waiter);
+    (void) pthread_join(waiter, NULL);
+    arms = atomic_load(&poll_fault_arms);
+    check(arms == 1 && atomic_load(&poll_fault_disarms) > disarms,
+          "poll cancelled while waiting disarms",
+          "a cancelled poll must send the disarm pass for what it armed");
+out_fd:
+    (void) close(fd);
+out:
+    (void) ioserv_detach(dpp, id, 0);
+    (void) pthread_cancel(server);
+    (void) pthread_join(server, NULL);
+    (void) dispatch_destroy(dpp);
+}
+
 /* Make a pipe read end readable ~50 ms from now, while a blocked poll waits. */
 static void *poll_wake_writer(void *raw)
 {
@@ -2282,6 +2489,288 @@ static void test_posix_select(void)
 
     (void) close(fds[0]);
     (void) close(fds[1]);
+}
+
+/* poll() and select() readiness on a terminal (dev-serial-8250 at /dev/ser1).
+ * Run by the serial-unblock mode, whose harness writes each byte asked for by
+ * serial_inject() to the UART within about a second. Covers an idle line
+ * timing out, a close while polled, two pollers waking on the same byte, a
+ * queued byte being reported at once, and a partial canonical line staying
+ * unreadable until its terminator arrives.
+ */
+#define SERIAL_POLL_DEV "/dev/ser1"
+
+/* How a serial poller waits: poll() on one entry, select(), or poll() with a
+ * second entry for the same descriptor asking only for POLLPRI, which a
+ * terminal never raises and which must not cancel the first entry's arm.
+ */
+enum { SERIAL_WAIT_POLL, SERIAL_WAIT_SELECT, SERIAL_WAIT_POLL_REPEAT };
+
+struct serial_poller {
+    int fd;
+    int how;
+    int timeout_ms;
+    atomic_int done;
+    int rc;
+    int ready; /* 1 readable, 0 not, -1 POLLNVAL */
+};
+
+/* One readability wait on fd, in the given SERIAL_WAIT_* way. */
+static int serial_poll_once(int fd, int how, int timeout_ms, int *ready)
+{
+    int rc;
+
+    if (how == SERIAL_WAIT_SELECT) {
+        struct timeval tv = {.tv_sec = timeout_ms / 1000,
+                             .tv_usec = (timeout_ms % 1000) * 1000};
+        fd_set rset;
+
+        FD_ZERO(&rset);
+        FD_SET(fd, &rset);
+        rc = select(fd + 1, &rset, NULL, NULL, &tv);
+        *ready = rc > 0 && FD_ISSET(fd, &rset);
+    } else {
+        struct pollfd pfd[2] = {{.fd = fd, .events = POLLIN},
+                                {.fd = fd, .events = POLLPRI}};
+
+        rc = poll(pfd, how == SERIAL_WAIT_POLL_REPEAT ? 2 : 1, timeout_ms);
+        *ready = rc > 0 && (pfd[0].revents & POLLIN);
+        if (rc > 0 && (pfd[0].revents & POLLNVAL))
+            *ready = -1;
+    }
+    return rc;
+}
+
+static void *serial_poller_thread(void *raw)
+{
+    struct serial_poller *p = raw;
+
+    p->rc = serial_poll_once(p->fd, p->how, p->timeout_ms, &p->ready);
+    atomic_store(&p->done, 1);
+    return NULL;
+}
+
+static int serial_poller_start(pthread_t *tid, struct serial_poller *p)
+{
+    atomic_init(&p->done, 0);
+    if (pthread_create(tid, NULL, serial_poller_thread, p) == 0)
+        return 0;
+    test_fail("serial_poll poller thread", "pthread_create failed");
+    return -1;
+}
+
+/* Read one byte only once poll says it is there, so a lost injection fails the
+ * check instead of hanging the test. Returns the byte or -1.
+ */
+static int serial_poll_read_ready(int fd)
+{
+    char ch;
+    int ready;
+
+    if (serial_poll_once(fd, SERIAL_WAIT_POLL, 0, &ready) != 1 || ready != 1 ||
+        read(fd, &ch, 1) != 1)
+        return -1;
+    return (unsigned char) ch;
+}
+
+void test_serial_poll(void)
+{
+    struct serial_poller a = {0}, b = {0}, c = {0}, d = {0};
+    struct pollfd pfd;
+    struct termios t, saved;
+    pthread_t ta, tb, tc, td;
+    int fd, fd2, rc, ready, c1, c2;
+
+    printf("[serial-poll]\n");
+    fd = open(SERIAL_POLL_DEV, O_RDWR);
+    if (fd < 0) {
+        test_fail("serial_poll open", strerror(errno));
+        return;
+    }
+    if (tcgetattr(fd, &saved) != 0) {
+        test_fail("serial_poll tcgetattr", strerror(errno));
+        (void) close(fd);
+        return;
+    }
+    t = saved;
+    t.c_lflag &= ~(tcflag_t) (ICANON | ECHO);
+    if (tcsetattr(fd, TCSAFLUSH, &t) != 0) {
+        test_fail("serial_poll tcsetattr", strerror(errno));
+        goto out;
+    }
+
+    /* Idle line: a bounded wait times out with nothing ready. */
+    rc = serial_poll_once(fd, SERIAL_WAIT_POLL, 50, &ready);
+    check(rc == 0, "serial_poll idle poll times out",
+          "poll({ser, POLLIN}, 50) on an idle line must return 0");
+    rc = serial_poll_once(fd, SERIAL_WAIT_SELECT, 50, &ready);
+    check(rc == 0, "serial_poll idle select times out",
+          "select on an idle line must return 0");
+
+    /* Output is synchronous, so the line is always writable. */
+    pfd = (struct pollfd){.fd = fd, .events = POLLOUT};
+    check(poll(&pfd, 1, 0) == 1 && (pfd.revents & POLLOUT),
+          "serial_poll writable", "a terminal must poll POLLOUT");
+
+    /* Close while polled: the armed notification goes with the open, and the
+     * poller ends at its timeout instead of hanging or waking spuriously.
+     */
+    fd2 = open(SERIAL_POLL_DEV, O_RDWR);
+    if (fd2 < 0) {
+        test_fail("serial_poll second open", strerror(errno));
+        goto out;
+    }
+    c.fd = fd2;
+    c.timeout_ms = 600;
+    if (serial_poller_start(&tc, &c) != 0) {
+        (void) close(fd2);
+        goto out;
+    }
+    sleep_ms(200);
+    (void) close(fd2);
+    (void) pthread_join(tc, NULL);
+    check(c.rc == 0 || (c.rc == 1 && c.ready == -1), "serial_poll close while polled",
+          "a poll whose descriptor was closed must time out or report POLLNVAL");
+
+    /* Concurrent pollers, by poll, by select and by poll with a repeated entry
+     * for the descriptor, all wake on the one injected byte, which none
+     * consumes.
+     */
+    a.fd = b.fd = d.fd = fd;
+    a.timeout_ms = b.timeout_ms = d.timeout_ms = 20000;
+    b.how = SERIAL_WAIT_SELECT;
+    d.how = SERIAL_WAIT_POLL_REPEAT;
+    if (serial_poller_start(&ta, &a) != 0)
+        goto out;
+    if (serial_poller_start(&tb, &b) != 0) {
+        (void) pthread_join(ta, NULL);
+        goto out;
+    }
+    if (serial_poller_start(&td, &d) != 0) {
+        (void) pthread_join(ta, NULL);
+        (void) pthread_join(tb, NULL);
+        goto out;
+    }
+    sleep_ms(300);
+    check(!atomic_load(&a.done) && !atomic_load(&b.done) && !atomic_load(&d.done),
+          "serial_poll pollers wait on an idle line",
+          "a poller returned before any byte arrived");
+    serial_inject('y');
+    (void) pthread_join(ta, NULL);
+    (void) pthread_join(tb, NULL);
+    (void) pthread_join(td, NULL);
+    check(a.rc == 1 && a.ready == 1, "serial_poll poll wakes on injected byte",
+          "poll({ser, POLLIN}) must return 1 once a byte arrives");
+    check(b.rc == 1 && b.ready == 1, "serial_poll select wakes on injected byte",
+          "select must report the line readable once a byte arrives");
+    check(d.rc == 1 && d.ready == 1, "serial_poll repeated entry keeps the arm",
+          "a second pollfd for the same terminal must not cancel the first's wait");
+
+    /* The byte is still queued: both calls report it at once. */
+    rc = serial_poll_once(fd, SERIAL_WAIT_POLL, 50, &ready);
+    check(rc == 1 && ready == 1, "serial_poll queued byte polls readable",
+          "data present before poll must be reported");
+    rc = serial_poll_once(fd, SERIAL_WAIT_SELECT, 50, &ready);
+    check(rc == 1 && ready == 1, "serial_poll queued byte selects readable",
+          "data present before select must be reported");
+    check(serial_poll_read_ready(fd) == 'y', "serial_poll read injected byte",
+          "wrong byte, or no byte to read");
+    rc = serial_poll_once(fd, SERIAL_WAIT_POLL, 50, &ready);
+    check(rc == 0, "serial_poll drained line idle again",
+          "a drained line must not poll readable");
+
+    /* Canonical mode: 'z' alone is a partial line and must not be readable;
+     * the CR (ICRNL: newline) completes it and wakes a blocked poller.
+     */
+    t.c_lflag |= ICANON;
+    if (tcsetattr(fd, TCSANOW, &t) != 0) {
+        test_fail("serial_poll canonical tcsetattr", strerror(errno));
+        goto out;
+    }
+    serial_inject('z');
+    rc = serial_poll_once(fd, SERIAL_WAIT_POLL, 3000, &ready);
+    check(rc == 0, "serial_poll partial canonical line not readable",
+          "a line without its terminator must not poll readable");
+    a = (struct serial_poller){.fd = fd, .timeout_ms = 20000};
+    if (serial_poller_start(&ta, &a) != 0)
+        goto out;
+    sleep_ms(300);
+    check(!atomic_load(&a.done), "serial_poll canonical poller waits",
+          "a poller returned on a partial line");
+    serial_inject('\r');
+    (void) pthread_join(ta, NULL);
+    check(a.rc == 1 && a.ready == 1, "serial_poll line terminator wakes poller",
+          "completing a canonical line must make it readable");
+    c1 = serial_poll_read_ready(fd);
+    c2 = serial_poll_read_ready(fd);
+    check(c1 == 'z' && c2 == '\n', "serial_poll read completed line",
+          "the completed line must read back as \"z\\n\"");
+out:
+    (void) tcsetattr(fd, TCSANOW, &saved);
+    (void) close(fd);
+}
+
+/* poll() and select() readiness on the console (/dev/text). Run by the
+ * serial-unblock mode before the serial driver starts, so the bytes the harness
+ * writes for console_inject() reach the console. Covers an idle console timing
+ * out, output always ready, a poller and a select waking on a typed character,
+ * and a typed character being reported at once until it is read.
+ */
+void test_console_poll(void)
+{
+    struct serial_poller a = {0}, b = {0};
+    struct pollfd pfd;
+    pthread_t ta, tb;
+    int fd, rc, ready;
+
+    printf("[console-poll]\n");
+    fd = open("/dev/text", O_RDWR);
+    if (fd < 0) {
+        test_fail("console_poll open", strerror(errno));
+        return;
+    }
+
+    rc = serial_poll_once(fd, SERIAL_WAIT_POLL, 50, &ready);
+    check(rc == 0, "console_poll idle poll times out",
+          "poll({/dev/text, POLLIN}, 50) with nothing typed must return 0");
+    rc = serial_poll_once(fd, SERIAL_WAIT_SELECT, 50, &ready);
+    check(rc == 0, "console_poll idle select times out",
+          "select on an idle console must return 0");
+    pfd = (struct pollfd){.fd = fd, .events = POLLOUT};
+    check(poll(&pfd, 1, 0) == 1 && pfd.revents == POLLOUT,
+          "console_poll writable", "the console must poll POLLOUT only");
+
+    a.fd = b.fd = fd;
+    a.timeout_ms = b.timeout_ms = 20000;
+    b.how = SERIAL_WAIT_SELECT;
+    if (serial_poller_start(&ta, &a) != 0)
+        goto out;
+    if (serial_poller_start(&tb, &b) != 0) {
+        (void) pthread_join(ta, NULL);
+        goto out;
+    }
+    sleep_ms(300);
+    check(!atomic_load(&a.done) && !atomic_load(&b.done),
+          "console_poll pollers wait on an idle console",
+          "a poller returned before anything was typed");
+    console_inject('k');
+    (void) pthread_join(ta, NULL);
+    (void) pthread_join(tb, NULL);
+    check(a.rc == 1 && a.ready == 1, "console_poll poll wakes on typed byte",
+          "poll({/dev/text, POLLIN}) must return 1 once a byte is typed");
+    check(b.rc == 1 && b.ready == 1, "console_poll select wakes on typed byte",
+          "select must report the console readable once a byte is typed");
+
+    rc = serial_poll_once(fd, SERIAL_WAIT_POLL, 50, &ready);
+    check(rc == 1 && ready == 1, "console_poll typed byte polls readable",
+          "a byte typed before poll must be reported");
+    check(serial_poll_read_ready(fd) == 'k', "console_poll read typed byte",
+          "wrong byte, or no byte to read");
+    rc = serial_poll_once(fd, SERIAL_WAIT_POLL, 50, &ready);
+    check(rc == 0, "console_poll drained console idle again",
+          "a drained console must not poll readable");
+out:
+    (void) close(fd);
 }
 
 /* A pipe end carries a fixed direction: lseek on a pipe is ESPIPE, writing the
@@ -9053,6 +9542,8 @@ void test_vfs(void)
     test_posix_open_creat_excl_existing();
     test_posix_fstat_file_types();
     test_posix_poll_readiness();
+    test_posix_poll_null_devices();
+    test_posix_poll_service_faults();
     test_posix_poll_blocking();
     test_posix_poll_hup();
     test_posix_select();

@@ -520,7 +520,8 @@ Options:
                     syslog-wrap (CONFIG_ROOTTASK_SYSLOG_SIZE=4096; /sys/log
                     wrap and EOVERFLOW),
                     serial-unblock (dev-serial-8250 drops a SIGKILLed parked
-                    reader; the host injects one UART byte),
+                    reader, and poll/select see terminal readiness;
+                    the host injects each UART byte the guest asks for),
                     irq-notify (guest IRQ notification smoke; run it with
                     EMU_QEMU_OPTS="-dtb X" to boot a patched DTB; every
                     latency attempt must end ok, none early or timeout),
@@ -2182,9 +2183,12 @@ run_one()
         wrap_timeout=$((TIMEOUT + ${HANG_DUMP_TIMEOUT:-120} + 20)) # headroom for the dump
     fi
 
-    # serial-unblock feeds one byte to the guest UART (QEMU's stdio) once the
-    # guest prints "serial-unblock: WAITING"; every other mode reads nothing.
-    local stdin_src=/dev/null serial_fifo= serial_fd= serial_sent=0
+    # serial-unblock feeds the guest UART (QEMU's stdio) the bytes the guest
+    # asks for: each "serial-inject: <seq> <hex>" line, seq counting from 0,
+    # sends the byte 0x<hex> once, and so does each "console-inject: <seq>
+    # <hex>" line, counted separately. Every other mode reads nothing.
+    local stdin_src=/dev/null serial_fifo= serial_fd= serial_sent=0 serial_hex=
+    local console_sent=0
     if [ "$MODE" = "serial-unblock" ]; then
         serial_fifo="$(mktemp -u "/tmp/rtmux-serial-unblock-fifo.XXXXXX")"
         mkfifo "$serial_fifo" || return 1
@@ -2201,11 +2205,18 @@ run_one()
             kill "$runner" 2>/dev/null || true
             break
         fi
-        if [ -n "$serial_fd" ] && [ "$serial_sent" -eq 0 ] &&
-           grep -Fq 'serial-unblock: WAITING' "$log"; then
-            printf x >&"$serial_fd"
-            serial_sent=1
-        fi
+        while [ -n "$serial_fd" ] &&
+              serial_hex="$(grep -m1 -aoE \
+                  "console-inject: $console_sent [0-9a-f]{2}" "$log")"; do
+            printf "\\x${serial_hex##* }" >&"$serial_fd"
+            console_sent=$((console_sent + 1))
+        done
+        while [ -n "$serial_fd" ] &&
+              serial_hex="$(grep -m1 -aoE \
+                  "serial-inject: $serial_sent [0-9a-f]{2}" "$log")"; do
+            printf "\\x${serial_hex##* }" >&"$serial_fd"
+            serial_sent=$((serial_sent + 1))
+        done
         if [ "$pass_seen" -eq 0 ] &&
            grep -q "$PASS_GREP" "$PASS_MARKER" "$log"; then
             pass_seen=1

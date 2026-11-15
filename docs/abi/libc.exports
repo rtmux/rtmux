@@ -233,6 +233,11 @@ ioserv_msgread	FUNC	GLOBAL	DEFAULT	-
 ioserv_msgreadv	FUNC	GLOBAL	DEFAULT	-
 ioserv_msgwrite	FUNC	GLOBAL	DEFAULT	-
 ioserv_msgwritev	FUNC	GLOBAL	DEFAULT	-
+ioserv_notify	FUNC	GLOBAL	DEFAULT	-
+ioserv_notify_init	FUNC	GLOBAL	DEFAULT	-
+ioserv_notify_ready	FUNC	GLOBAL	DEFAULT	-
+ioserv_notify_remove	FUNC	GLOBAL	DEFAULT	-
+ioserv_notify_trigger	FUNC	GLOBAL	DEFAULT	-
 ioserv_ocb	FUNC	GLOBAL	DEFAULT	-
 ioserv_open_bind	FUNC	GLOBAL	DEFAULT	-
 ioserv_reply_counters_format	FUNC	GLOBAL	DEFAULT	-

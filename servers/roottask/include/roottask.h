@@ -41,6 +41,7 @@ void *loader_load(void *lcp);
 
 /* devnull.c */
 void devnull_init(void);
+int devnull_notify(ioserv_context_t *ctp, io_notify_t *msg, void *ocb);
 
 /* devtty.c */
 void devtty_init(void);
