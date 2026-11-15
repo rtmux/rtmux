@@ -13,8 +13,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stddef.h>
 #include <semaphore.h>
 #include <pthread.h>
@@ -857,9 +859,22 @@ int main(int argc, char *argv[])
         test_serial_poll();
         return finish(1);
     }
-    if (argc == 2 && !strcmp(argv[1], "--spawn-storm")) {
+    if ((argc == 2 || argc == 3) && !strcmp(argv[1], "--spawn-storm")) {
+        /* Optional count of idle processes kept alive across the storm. */
+        char *end = NULL;
+        unsigned long residents = 0;
+
+        if (argc == 3) {
+            errno = 0;
+            residents = strtoul(argv[2], &end, 10);
+            if (!isdigit((unsigned char) argv[2][0]) || *end || errno ||
+                (unsigned) residents != residents) {
+                printf("--spawn-storm: bad resident count '%s'\n", argv[2]);
+                return EXIT_FAILURE;
+            }
+        }
         printf("=== RTMux Concurrent Spawn Storm ===\n\n[spawn-storm]\n");
-        test_spawn_concurrent();
+        test_spawn_storm((unsigned) residents);
         return finish(1);
     }
     if (argc == 2 && !strcmp(argv[1], "--trace-negative")) {
@@ -879,6 +894,8 @@ int main(int argc, char *argv[])
         return env_expect_child(argv[2]);
     if (argc == 3 && !strcmp(argv[1], "--spawn-echo-child"))
         return spawn_echo_child(argv[2]);
+    if (argc >= 2 && !strcmp(argv[1], "--spawn-bigargs-child"))
+        return spawn_bigargs_child(argc, argv);
     if (argc == 2 && !strcmp(argv[1], "--spawn-full-fd-child"))
         return spawn_full_fd_child();
     if (argc == 2 && !strcmp(argv[1], "--loader-negative")) {
@@ -1048,6 +1065,48 @@ int main(int argc, char *argv[])
          * stdio flush and atexit handlers that exit() would run.
          */
         _exit(atoi(argv[2]));
+    }
+    if (argc >= 3 && !strcmp(argv[1], "--expect-cwd")) {
+        /* argv[2] is the expected cwd; any further arguments are descriptors
+         * the file actions must have left open.
+         */
+        char cwd[PATH_MAX + 1];
+        struct stat st;
+
+        if (!getcwd(cwd, sizeof cwd) || strcmp(cwd, argv[2]) != 0)
+            return 2;
+        for (int i = 3; i < argc; i++) {
+            if (fstat(atoi(argv[i]), &st) != 0)
+                return 3;
+        }
+        return EXIT_SUCCESS;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--expect-setsid")) {
+        int fd;
+
+        if (getsid(0) != getpid() || getpgrp() != getpid())
+            return 2;
+        /* The parent stayed in the old session, which getsid refuses. */
+        errno = 0;
+        if (getsid(getppid()) != -1 || errno != EPERM)
+            return 5;
+        /* /dev/tty opens only for a session with a controlling terminal. */
+        fd = open("/dev/tty", O_RDWR);
+        if (fd != -1) {
+            (void) close(fd);
+            return 3;
+        }
+        return errno == ENXIO ? EXIT_SUCCESS : 4;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--getsid-hold")) {
+        /* Say it is running, then stay alive until stdin reaches EOF. */
+        char c;
+
+        if (write(STDOUT_FILENO, "r", 1) != 1)
+            return 2;
+        while (read(STDIN_FILENO, &c, 1) == 1)
+            ;
+        return EXIT_SUCCESS;
     }
     if (argc == 2 && !strcmp(argv[1], "--expect-resetids")) {
         return getuid() == geteuid() && getgid() == getegid() ? EXIT_SUCCESS

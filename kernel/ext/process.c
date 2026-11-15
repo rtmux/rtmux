@@ -81,26 +81,27 @@ static void process_child_locks_unlock(process_t *a, process_t *b)
     }
 }
 
-static void process_clear_as_bindings(process_t *target)
+/* Detach every thread from target's address space before it is destroyed: the
+ * threads of other processes that borrow it, from target's own borrower list,
+ * then target's own threads. Neither step looks at any other process, so the
+ * cost does not grow with the number of processes in the system.
+ * Returns how many threads it visited.
+ */
+static unsigned process_clear_as_bindings(process_t *target)
 {
-    process_t *owner;
     thread_t *thp;
-    int pidx, tid;
+    int tid;
+    unsigned visited = thread_as_release_borrowers(target);
 
-    rcu_read_lock(&process_rcu);
-    for (pidx = 1; pidx < process_vector.nentries; ++pidx) {
-        owner = vector_lookup(&process_vector, (unsigned) pidx);
-        if (!owner)
-            continue;
-
-        kspinlock_lock(&owner->vec_slock);
-        for (tid = 0; tid < owner->threads.nentries; ++tid) {
-            if (VECP(thp, &owner->threads, tid))
-                thread_clear_as_prp_if(thp, target);
+    kspinlock_lock(&target->vec_slock);
+    for (tid = 0; tid < target->threads.nentries; ++tid) {
+        if (VECP(thp, &target->threads, tid)) {
+            thread_clear_as_prp_if(thp, target);
+            visited++;
         }
-        kspinlock_unlock(&owner->vec_slock);
     }
-    rcu_read_unlock(&process_rcu);
+    kspinlock_unlock(&target->vec_slock);
+    return visited;
 }
 
 /* kext_process_create — allocate and initialize a new process_t.
@@ -170,6 +171,8 @@ void kext_process_create(void *data)
      */
     kspinlock_init(&prp->vec_slock, LOCK_CLASS_PROCVEC, "process_t.vec_slock");
     prp->pin_count = 0;
+    prp->as_borrowers = NULL;
+    prp->as_borrow_closed = false;
     if (rtmux_cap_table_init(&prp->endpoint_caps, prp->endpoint_cap_slots,
                              RTMUX_PROCESS_ENDPOINT_CAP_SLOTS) != EOK) {
         object_free(NULL, &process_souls, prp);
@@ -352,7 +355,8 @@ void kext_process_destroyall(void *data)
     for (unsigned tid = 0; tid < prp->threads.nentries; ++tid) {
         thread_t *t = vector_lookup2(&prp->threads, tid);
 
-        if (!t || t == thp || t->state != STATE_STOPPED || tthread_pin(t) != EOK)
+        if (!t || t == thp || t->state != STATE_STOPPED ||
+            tthread_pin(t) != EOK)
             continue;
         kspinlock_unlock(&prp->vec_slock);
         unparked |= exit_ready_stopped(t);
@@ -966,12 +970,101 @@ struct kcall_args_process_shutdown {
     int exec;
 };
 
+#if defined(CONFIG_INSTRUMENTATION)
+/* Address-space teardown cost (section 18 companion to the irqoff report).
+ * "unbind" spans process_clear_as_bindings through process_wait_unpinned, the
+ * part whose cost used to grow with the number of processes in the system, and
+ * "visited" counts the threads process_clear_as_bindings looked at; "total"
+ * spans the whole address-space branch of kext_process_shutdown through
+ * mdestroy. Updated lock-free by any hart, read racily by the report.
+ */
+static uint64_t pshut_count, pshut_unbind_sum, pshut_unbind_max;
+static uint64_t pshut_visit_sum, pshut_visit_max;
+static uint64_t pshut_total_sum, pshut_total_max;
+
+static void pshut_max(uint64_t *slot, uint64_t cyc)
+{
+    uint64_t cur = __atomic_load_n(slot, __ATOMIC_RELAXED);
+
+    while (cyc > cur &&
+           !__atomic_compare_exchange_n(slot, &cur, cyc, 0, __ATOMIC_RELAXED,
+                                        __ATOMIC_RELAXED))
+        ;
+}
+
+static void pshut_record(uint64_t t0,
+                         uint64_t t1,
+                         uint64_t t2,
+                         unsigned visited)
+{
+    __atomic_fetch_add(&pshut_count, 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&pshut_visit_sum, visited, __ATOMIC_RELAXED);
+    pshut_max(&pshut_visit_max, visited);
+    __atomic_fetch_add(&pshut_unbind_sum, t1 - t0, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&pshut_total_sum, t2 - t0, __ATOMIC_RELAXED);
+    pshut_max(&pshut_unbind_max, t1 - t0);
+    pshut_max(&pshut_total_max, t2 - t0);
+}
+
+static inline uint64_t pshut_ticks(void)
+{
+    return cpu_clock_ticks();
+}
+
+/* Print the teardown cost in ns. Called throttled from clock_handler next to
+ * nonpreempt_report(), outside any lock.
+ */
+void process_shutdown_report(void)
+{
+    uint64_t cps = qtimeptr->cycles_per_sec ? qtimeptr->cycles_per_sec : 1;
+    uint64_t n = __atomic_load_n(&pshut_count, __ATOMIC_RELAXED);
+    uint64_t visit_sum = __atomic_load_n(&pshut_visit_sum, __ATOMIC_RELAXED);
+    uint64_t visit_max = __atomic_load_n(&pshut_visit_max, __ATOMIC_RELAXED);
+    uint64_t unbind_sum = __atomic_load_n(&pshut_unbind_sum, __ATOMIC_RELAXED);
+    uint64_t unbind_max = __atomic_load_n(&pshut_unbind_max, __ATOMIC_RELAXED);
+    uint64_t total_sum = __atomic_load_n(&pshut_total_sum, __ATOMIC_RELAXED);
+    uint64_t total_max = __atomic_load_n(&pshut_total_max, __ATOMIC_RELAXED);
+
+    static uint64_t last_n;
+
+    if (__atomic_exchange_n(&last_n, n, __ATOMIC_RELAXED) == n)
+        return;
+    kprintf(
+        "pshut: count=%llu visited_avg=%llu visited_max=%llu "
+        "unbind_avg_ns=%llu unbind_max_ns=%llu "
+        "total_avg_ns=%llu total_max_ns=%llu\n",
+        (unsigned long long) n, (unsigned long long) (visit_sum / n),
+        (unsigned long long) visit_max,
+        (unsigned long long) (unbind_sum / n * 1000000000ULL / cps),
+        (unsigned long long) (unbind_max * 1000000000ULL / cps),
+        (unsigned long long) (total_sum / n * 1000000000ULL / cps),
+        (unsigned long long) (total_max * 1000000000ULL / cps));
+}
+#else
+static inline uint64_t pshut_ticks(void)
+{
+    return 0;
+}
+
+static inline void pshut_record(uint64_t t0,
+                                uint64_t t1,
+                                uint64_t t2,
+                                unsigned visited)
+{
+    (void) t0;
+    (void) t1;
+    (void) t2;
+    (void) visited;
+}
+#endif
+
 /* kext_process_shutdown — tear down a process's address space.
  *
- * Walks prp->threads and NULLs every thp->as_prp, then IPI- coordinates remote
- * harts off the dying as via IPI_TLB_SAFE + ack-wait + MSG_DELIVERY drain
- * before calling vm_ops->mdestroy(prp). If the process has no address space,
- * instead notifies the parent and destroys the calling thread.
+ * Releases every thread bound to prp's address space (prp's borrower list, then
+ * prp->threads) and NULLs its thp->as_prp, then IPI- coordinates remote harts
+ * off the dying as via IPI_TLB_SAFE + ack-wait + MSG_DELIVERY drain before
+ * calling vm_ops->mdestroy(prp). If the process has no address space, instead
+ * notifies the parent and destroys the calling thread.
  *
  * prp->vec_slock guards the prp->threads walk. The IPI_TLB_SAFE round- trip is
  * load-bearing and runs without a slock. Parameters:
@@ -990,11 +1083,20 @@ void kext_process_shutdown(void *data)
     }
 
     if (prp->memory) {
+        uint64_t pshut_t0 = pshut_ticks();
+
         /* Make sure no native or foreign thread retains this as before it is
          * removed.
          */
-        process_clear_as_bindings(prp);
+        unsigned pshut_visited = process_clear_as_bindings(prp);
+
+        /* The borrower list is closed and drained now, so only transient pins
+         * (kcalls holding a promoted lookup) remain to drain.
+         */
+        if (prp->as_borrowers || !prp->as_borrow_closed)
+            crash();
         process_wait_unpinned(prp);
+        uint64_t pshut_t1 = pshut_ticks();
 
         /* Force every remote hart still pointing at the dying as to swap to the
          * roottask as before we free prp->memory. Once the dying pgdir PA is
@@ -1103,6 +1205,7 @@ void kext_process_shutdown(void *data)
 #endif
 
         vm_ops->mdestroy(prp);
+        pshut_record(pshut_t0, pshut_t1, pshut_ticks(), pshut_visited);
 
         if (prp->memory || pcpu_array[get_cpunum()].pc_as_prp == prp) {
             crash();

@@ -314,6 +314,7 @@ const struct sigevent *clock_handler(void *dummy, int id)
             if (qtp->nsec - irqoff_last_report >= 1000000000ULL) {
                 irqoff_last_report = qtp->nsec;
                 nonpreempt_report();
+                process_shutdown_report();
 
                 /* Composite idle deadline, diagnostics only for now: show the
                  * winning owner plus every owner's own candidate (relative to

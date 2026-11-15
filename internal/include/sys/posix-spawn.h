@@ -34,6 +34,9 @@ typedef enum {
     posix_file_action_type_CLOSE = 1,
     posix_file_action_type_DUP = 2,
     posix_file_action_type_OPEN = 3,
+    /* chdir actions never reach proc: libc folds them into the child cwd */
+    posix_file_action_type_CHDIR = 4,
+    posix_file_action_type_FCHDIR = 5,
 } posix_file_action_type;
 
 typedef struct {
@@ -66,6 +69,8 @@ typedef struct {
         _posix_spawn_file_actions_close_t close;
         _posix_spawn_file_actions_dup_t dup;
         _posix_spawn_file_actions_open_t *open; /* treat as READONLY */
+        char *chdir_path;  /* CHDIR: heap copy of the addchdir() path */
+        int32_t fchdir_fd; /* FCHDIR */
     } _type;
 } posix_spawn_file_actions_list_t;
 

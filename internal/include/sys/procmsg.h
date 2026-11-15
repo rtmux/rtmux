@@ -122,7 +122,7 @@ struct inheritance {
 #define SPAWN_SETSIGDEF POSIX_SPAWN_SETSIGDEF
 #define SPAWN_SETSIGIGN 0x00000008
 #define SPAWN_TCSETPGROUP 0x00000080
-#define SPAWN_SETSID 0x00000200
+#define SPAWN_SETSID POSIX_SPAWN_SETSID
 #define SPAWN_EXPLICIT_SCHED POSIX_SPAWN_SETSCHEDPARAM
 #define SPAWN_EXPLICIT_CPU 0x00000800
 #define SPAWN_SETSTACKMAX 0x00001000
@@ -183,10 +183,14 @@ struct _proc_spawn {
     uint16_t nfds;
     uint16_t nargv;
     uint16_t narge;
-    uint16_t reserved;
+    /* bytes of cwd[] with its null, or 0: a non-empty cwd is an absolute path
+     * the loader makes the child's working directory before it resolves the
+     * image (posix_spawn() chdir/fchdir file actions)
+     */
+    uint16_t cwdlen;
     size_t nbytes; /* Number of bytes of argv + arge with nulls */
-    /* int32_t fd_map[nfds] char search[searchlen] char path[pathlen] char
-     * argv[nargv][] char arge[narge][]
+    /* int32_t fd_map[nfds] char search[searchlen] char cwd[cwdlen]
+     * char path[pathlen] char argv[nargv][] char arge[narge][]
      */
 };
 
@@ -313,13 +317,15 @@ struct _proc_posix_spawn {
     uint16_t pathlen;
     uint16_t nargv;
     uint16_t narge;
-    uint16_t reserved[3];
+    uint16_t cwdlen; /* bytes of the child cwd with its null, or 0 */
+    uint16_t reserved[2];
     uint32_t filact_bytes;  /* size of the _posix_spawn_file_actions_t */
     uint32_t filact_obytes; /* size of the _posix_spawn_file_actions_t.open */
     uint32_t argenv_bytes;  /* Number of bytes of argv + arge with nulls */
     uint32_t attr_bytes;    /* size of the _posix_spawnattr_t */
-    /* _posix_spawnattr_t attr; _posix_spawn_file_actions_t filact char
-     * path[pathlen] char argv[nargv][] char arge[narge][]
+    /* _posix_spawnattr_t attr; _posix_spawn_file_actions_t filact
+     * _posix_spawn_file_actions_open_t open[] char path[pathlen]
+     * char argv[nargv][] char arge[narge][] char cwd[cwdlen]
      */
 };
 

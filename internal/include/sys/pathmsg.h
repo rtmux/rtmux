@@ -30,4 +30,16 @@
 
 enum { _PATH_RESOLVE = _PATH_MSG_BASE, _PATH_CHDIR, _PATH_CHROOT };
 
+#ifndef __CDEFS_H_INCLUDED
+#include <sys/cdefs.h>
+#endif
+
+__BEGIN_DECLS
+/* Send _PATH_CHDIR for an absolute path, relative to the process root, to
+ * make it the sender's cwd (lib/libc/posix/chdir.c). The spawn loader uses it
+ * to give a child the cwd its posix_spawn() chdir file actions chose.
+ */
+int __chdir_send(const char *path) __hidden;
+__END_DECLS
+
 #endif

@@ -213,6 +213,7 @@ POSIX_NAMES = {
     "timer_settime",
     "umask",
     "getppid",
+    "getsid",
     "pthread_cancel",
     "pthread_create",
     "pthread_detach",
@@ -312,8 +313,10 @@ POSIX_NAMES = {
     "pthread_setspecific",
     "pthread_testcancel",
     "posix_spawn",
+    "posix_spawn_file_actions_addchdir",
     "posix_spawn_file_actions_addclose",
     "posix_spawn_file_actions_adddup2",
+    "posix_spawn_file_actions_addfchdir",
     "posix_spawn_file_actions_addopen",
     "posix_spawn_file_actions_destroy",
     "posix_spawn_file_actions_init",
@@ -588,9 +591,26 @@ STUB_OVERRIDES = {
     ),
     "posix_spawnattr_setflags": (
         "implemented",
-        "stores supported spawn flags, including POSIX_SPAWN_RESETIDS; "
-        "RESETIDS resets child effective ids to real ids unless setuid/setgid "
-        "file bits override them",
+        "stores supported spawn flags, including POSIX_SPAWN_RESETIDS and "
+        "POSIX_SPAWN_SETSID; RESETIDS resets child effective ids to real ids "
+        "unless setuid/setgid file bits override them; a SETSID child leads a "
+        "new session with no controlling terminal (regression-tested)",
+    ),
+    "posix_spawn_file_actions_addchdir": (
+        "implemented",
+        "POSIX.1-2024; runs in order with the other file actions at spawn "
+        "time: later relative addopen paths and a relative image path resolve "
+        "against it, and the final directory becomes the child cwd; ordered "
+        "open/chdir/open, chained relative chdir, relative image, ENOENT for "
+        "a missing directory, and temp-descriptor cleanup are regression-tested",
+    ),
+    "posix_spawn_file_actions_addfchdir": (
+        "implemented",
+        "POSIX.1-2024; the descriptor is looked up at spawn time in the child "
+        "descriptor table the earlier actions produced (fchdir after addopen "
+        "and adddup2 works, after addclose is EBADF, on a file is ENOTDIR); "
+        "the directory is found by the path it was opened with, so a "
+        "descriptor whose path libc cannot recover fails with ENOSYS",
     ),
     "poll": (
         "implemented",

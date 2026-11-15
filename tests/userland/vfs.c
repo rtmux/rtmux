@@ -3105,6 +3105,9 @@ static void test_posix_session_jobcontrol(void)
           "setsid must return the caller's pid as the new session id");
     check(getpgrp() == getpid(), "getpgrp tracks setsid",
           "setsid must make the caller's process group equal its pid");
+    check(getsid(0) == getpid() && getsid(getpid()) == getpid(),
+          "getsid tracks setsid",
+          "a session leader's session id must be its own pid");
     errno = 0;
     check(setsid() == -1 && errno == EPERM, "setsid rejects group leader",
           "setsid must fail once the caller is a process-group leader");
@@ -7171,6 +7174,601 @@ static void test_spawnattr_resetids_runtime(void)
           "POSIX_SPAWN_RESETIDS must reset child effective ids to real ids");
 }
 
+/* Spawn path with the given actions, attributes and environment (NULL for the
+ * caller's). Returns the posix_spawn() result; on success *code is the child's
+ * exit status, or -1 if it did not exit normally.
+ */
+static int spawn_wait_code(const char *path,
+                           const posix_spawn_file_actions_t *actions,
+                           const posix_spawnattr_t *attr,
+                           char *argv[],
+                           char *envp[],
+                           pid_t *pid_out,
+                           int *code)
+{
+    pid_t pid = (pid_t) -1;
+    int status;
+    int rc;
+
+    *code = -1;
+    rc = posix_spawn(&pid, path, actions, attr, argv, envp);
+    if (pid_out)
+        *pid_out = pid;
+    if (rc == EOK && wait_child_exit(pid, &status, 500) && WIFEXITED(status))
+        *code = WEXITSTATUS(status);
+    return rc;
+}
+
+static unsigned spawn_count_open_fds(void)
+{
+    long max = sysconf(_SC_OPEN_MAX);
+    unsigned n = 0;
+
+    for (long fd = 0; fd < max; fd++)
+        if (fcntl((int) fd, F_GETFD) != -1)
+            n++;
+    return n;
+}
+
+static void test_spawnattr_setsid(void)
+{
+    posix_spawnattr_t attr;
+    char *argv[] = {"syscall_testing", "--expect-setsid", NULL};
+    short flags = 0;
+    int code;
+    int rc;
+
+    rc = posix_spawnattr_init(&attr);
+    if (rc != EOK) {
+        test_fail("spawnattr setsid init", strerror(rc));
+        return;
+    }
+    rc = posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSID);
+    check(rc == EOK && posix_spawnattr_getflags(&attr, &flags) == EOK &&
+              flags == POSIX_SPAWN_SETSID,
+          "spawnattr setsid round trip",
+          "POSIX_SPAWN_SETSID must be accepted and stored");
+    if (rc == EOK) {
+        rc = spawn_wait_code("/bin/syscall_testing", NULL, &attr, argv, NULL,
+                             NULL, &code);
+        check(rc == EOK && code == 0, "spawnattr setsid runtime",
+              "a SETSID child must lead a new session with no controlling "
+              "terminal");
+    }
+    (void) posix_spawnattr_destroy(&attr);
+}
+
+/* One chdir/fchdir file-action scenario: the setup adds the actions, then the
+ * spawn must return want_rc and, on success, the child must see cwd `want`.
+ */
+struct spawn_chdir_case {
+    const char *name;
+    const char *path;   /* image, NULL for syscall_testing; a relative one
+                         * resolves after the actions */
+    const char *want;   /* expected child cwd */
+    const char *fds[3]; /* descriptors the child must find open */
+    int want_rc;
+};
+
+static void run_spawn_chdir_case(const struct spawn_chdir_case *c,
+                                 posix_spawn_file_actions_t *actions)
+{
+    char *argv[7] = {"syscall_testing", "--expect-cwd", (char *) c->want};
+    char detail[96];
+    pid_t pid;
+    int code;
+    int rc;
+    int nargs = 3;
+
+    for (int i = 0; i < 3 && c->fds[i]; i++)
+        argv[nargs++] = (char *) c->fds[i];
+    argv[nargs] = NULL;
+    rc = spawn_wait_code(c->path ? c->path : "/bin/syscall_testing", actions,
+                         NULL, argv, NULL, &pid, &code);
+    (void) posix_spawn_file_actions_destroy(actions);
+    snprintf(detail, sizeof detail, "rc=%d want=%d code=%d", rc, c->want_rc,
+             code);
+    if (c->want_rc != EOK)
+        check(rc == c->want_rc && pid == (pid_t) -1, c->name, detail);
+    else
+        check(rc == EOK && code == 0, c->name, detail);
+}
+
+static void test_spawn_file_actions_chdir(void)
+{
+    const char shm_file[] = "/dev/shmem/spawn-chdir-f2";
+    const char created[] = "/dev/shmem/spawn-chdir-created";
+    posix_spawn_file_actions_t fa;
+    char saved[PATH_MAX + 1];
+    char shm[PATH_MAX + 1];
+    char dirfd_arg[16];
+    unsigned before;
+    int fd, dfd;
+
+    if (!getcwd(saved, sizeof saved) || chdir("/dev/shmem") != 0 ||
+        !getcwd(shm, sizeof shm) || chdir(saved) != 0) {
+        test_fail("spawn chdir fixture", strerror(errno));
+        return;
+    }
+
+    check(posix_spawn_file_actions_init(&fa) == EOK &&
+              posix_spawn_file_actions_addfchdir(&fa, -1) == EBADF &&
+              posix_spawn_file_actions_addchdir(&fa, NULL) == EINVAL,
+          "spawn addfchdir/addchdir argument checks",
+          "a negative fd is EBADF and a NULL path EINVAL");
+    (void) posix_spawn_file_actions_destroy(&fa);
+
+    /* addchdir to an absolute directory. */
+    (void) posix_spawn_file_actions_init(&fa);
+    (void) posix_spawn_file_actions_addchdir(&fa, "/dev/shmem");
+    run_spawn_chdir_case(
+        &(struct spawn_chdir_case){
+            "spawn addchdir sets child cwd", NULL, shm, {NULL}, EOK},
+        &fa);
+
+    /* A relative chdir resolves against the previous one. */
+    (void) posix_spawn_file_actions_init(&fa);
+    (void) posix_spawn_file_actions_addchdir(&fa, "/dev");
+    (void) posix_spawn_file_actions_addchdir(&fa, "shmem");
+    run_spawn_chdir_case(
+        &(struct spawn_chdir_case){
+            "spawn relative addchdir chains", NULL, shm, {NULL}, EOK},
+        &fa);
+
+    /* A relative image path resolves in the directory the actions leave. */
+    (void) posix_spawn_file_actions_init(&fa);
+    (void) posix_spawn_file_actions_addchdir(&fa, "/bin");
+    run_spawn_chdir_case(
+        &(struct spawn_chdir_case){"spawn relative image after addchdir",
+                                   "syscall_testing",
+                                   "/bin",
+                                   {NULL},
+                                   EOK},
+        &fa);
+
+    /* After a chdir, an empty chdir or open path is still ENOENT. */
+    (void) posix_spawn_file_actions_init(&fa);
+    (void) posix_spawn_file_actions_addchdir(&fa, "/dev");
+    (void) posix_spawn_file_actions_addchdir(&fa, "");
+    run_spawn_chdir_case(
+        &(struct spawn_chdir_case){
+            "spawn empty addchdir after addchdir is ENOENT", NULL, shm, {NULL},
+            ENOENT},
+        &fa);
+    (void) posix_spawn_file_actions_init(&fa);
+    (void) posix_spawn_file_actions_addchdir(&fa, "/dev");
+    (void) posix_spawn_file_actions_addopen(&fa, 3, "", O_RDONLY, 0);
+    run_spawn_chdir_case(
+        &(struct spawn_chdir_case){
+            "spawn empty addopen after addchdir is ENOENT", NULL, shm, {NULL},
+            ENOENT},
+        &fa);
+
+    /* Without chdir actions a relative image resolves in the caller's cwd. */
+    if (chdir("/bin") == 0) {
+        char *argv[] = {"syscall_testing", "--expect-cwd", "/bin", NULL};
+        int code;
+        int rc = spawn_wait_code("syscall_testing", NULL, NULL, argv, NULL,
+                                 NULL, &code);
+
+        (void) chdir(saved);
+        check(rc == EOK && code == 0, "spawn relative image in caller cwd",
+              "a relative path must resolve against the caller's cwd");
+    } else {
+        test_fail("spawn relative image fixture", strerror(errno));
+    }
+
+    /* A missing directory fails the spawn with ENOENT and no child. */
+    (void) posix_spawn_file_actions_init(&fa);
+    (void) posix_spawn_file_actions_addchdir(&fa, "/missing-spawn-chdir");
+    run_spawn_chdir_case(
+        &(struct spawn_chdir_case){
+            "spawn addchdir missing dir is ENOENT", NULL, shm, {NULL}, ENOENT},
+        &fa);
+
+    /* open, chdir, open: f1 resolves in the caller's cwd, f2 in the new one.
+     * Each file exists only where the right resolution looks for it.
+     */
+    fd = open(shm_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0 || chdir("/dev") != 0) {
+        test_fail("spawn chdir ordered fixture", strerror(errno));
+        if (fd >= 0)
+            (void) close(fd);
+        (void) chdir(saved);
+        return;
+    }
+    (void) close(fd);
+    (void) posix_spawn_file_actions_init(&fa);
+    (void) posix_spawn_file_actions_addopen(&fa, 3, "zero", O_RDONLY, 0);
+    (void) posix_spawn_file_actions_addchdir(&fa, shm);
+    (void) posix_spawn_file_actions_addopen(&fa, 4, "spawn-chdir-f2", O_RDONLY,
+                                            0);
+    run_spawn_chdir_case(
+        &(struct spawn_chdir_case){
+            "spawn addopen/addchdir/addopen order", NULL, shm, {"3", "4"}, EOK},
+        &fa);
+    (void) chdir(saved);
+    (void) unlink(shm_file);
+
+    /* fchdir to a descriptor an earlier addopen produced. */
+    (void) posix_spawn_file_actions_init(&fa);
+    (void) posix_spawn_file_actions_addopen(&fa, 5, "/dev/shmem", O_RDONLY, 0);
+    (void) posix_spawn_file_actions_addfchdir(&fa, 5);
+    run_spawn_chdir_case(
+        &(struct spawn_chdir_case){
+            "spawn addopen then addfchdir", NULL, shm, {"5"}, EOK},
+        &fa);
+
+    /* fchdir to an addopen of a file is ENOTDIR. */
+    (void) posix_spawn_file_actions_init(&fa);
+    (void) posix_spawn_file_actions_addopen(&fa, 5, "/dev/zero", O_RDONLY, 0);
+    (void) posix_spawn_file_actions_addfchdir(&fa, 5);
+    run_spawn_chdir_case(
+        &(struct spawn_chdir_case){"spawn addfchdir non-directory is ENOTDIR",
+                                   NULL,
+                                   shm,
+                                   {NULL},
+                                   ENOTDIR},
+        &fa);
+
+    dfd = open("/dev/shmem", O_RDONLY);
+    if (dfd < 0) {
+        test_fail("spawn fchdir dirfd fixture", strerror(errno));
+        return;
+    }
+    snprintf(dirfd_arg, sizeof dirfd_arg, "%d", dfd);
+
+    /* fchdir follows the descriptor an earlier dup2 placed. */
+    (void) posix_spawn_file_actions_init(&fa);
+    (void) posix_spawn_file_actions_adddup2(&fa, dfd, 6);
+    (void) posix_spawn_file_actions_addfchdir(&fa, 6);
+    run_spawn_chdir_case(
+        &(struct spawn_chdir_case){
+            "spawn adddup2 then addfchdir", NULL, shm, {"6"}, EOK},
+        &fa);
+
+    /* fchdir of a descriptor an earlier addclose closed is EBADF, even though
+     * the caller still has it open.
+     */
+    (void) posix_spawn_file_actions_init(&fa);
+    (void) posix_spawn_file_actions_addclose(&fa, dfd);
+    (void) posix_spawn_file_actions_addfchdir(&fa, dfd);
+    run_spawn_chdir_case(
+        &(struct spawn_chdir_case){
+            "spawn addclose then addfchdir is EBADF", NULL, shm, {NULL}, EBADF},
+        &fa);
+    (void) close(dfd);
+
+    /* A failing chdir after an open must not leak the parent's temporary
+     * descriptor.
+     */
+    (void) unlink(created);
+    before = spawn_count_open_fds();
+    (void) posix_spawn_file_actions_init(&fa);
+    (void) posix_spawn_file_actions_addopen(&fa, 7, created, O_WRONLY | O_CREAT,
+                                            0600);
+    (void) posix_spawn_file_actions_addchdir(&fa, "/missing-spawn-chdir");
+    run_spawn_chdir_case(
+        &(struct spawn_chdir_case){
+            "spawn addchdir failure after addopen", NULL, shm, {NULL}, ENOENT},
+        &fa);
+    check(spawn_count_open_fds() == before,
+          "spawn addchdir failure closes temps",
+          "a failed spawn must close the descriptors its actions opened");
+    (void) unlink(created);
+}
+
+/* Large-argument spawns. roottask receives at most one proc message union
+ * inline (a few KiB); the rest of a longer message stays with the sender. A
+ * native _PROC_SPAWN that long is streamed: the loader fetches its arguments
+ * with _PROC_SPAWN_ARGS at their offset in the sender's message. posix_spawn()
+ * sends another layout, which roottask must read whole and rebuild. Every
+ * pattern string is SPAWN_BIG_LEN bytes counting its NUL and derives from its
+ * index, so the child rebuilds each one and compares it byte for byte.
+ */
+enum { SPAWN_BIG_LEN = 1024, SPAWN_BIG_HIGH_FD = 1000 };
+
+static void spawn_big_fill(char *buf, unsigned idx, bool env)
+{
+    int n = env ? snprintf(buf, SPAWN_BIG_LEN, "BIGENV%u=", idx) : 0;
+
+    for (int k = n; k < SPAWN_BIG_LEN - 1; k++)
+        buf[k] = (char) (0x21 + (idx * 31u + (unsigned) k * 7u) % 94u);
+    buf[SPAWN_BIG_LEN - 1] = '\0';
+}
+
+static bool spawn_big_matches(const char *s, unsigned idx, bool env)
+{
+    char want[SPAWN_BIG_LEN];
+
+    if (!s)
+        return false;
+    spawn_big_fill(want, idx, env);
+    return memcmp(s, want, SPAWN_BIG_LEN) == 0;
+}
+
+/* Child: argv is name, mode, nargs, nenv, fd, then nargs pattern strings; the
+ * environment must be exactly nenv pattern strings, and fd (unless -1) open.
+ */
+int spawn_bigargs_child(int argc, char *argv[])
+{
+    unsigned nargs, nenv;
+    int fd;
+    struct stat st;
+
+    if (argc < 5)
+        return 2;
+    nargs = (unsigned) atoi(argv[2]);
+    nenv = (unsigned) atoi(argv[3]);
+    fd = atoi(argv[4]);
+    if ((unsigned) argc != 5 + nargs)
+        return 3;
+    for (unsigned i = 0; i < nargs; i++)
+        if (!spawn_big_matches(argv[5 + i], i, false))
+            return 4;
+    if (!environ)
+        return 8;
+    for (unsigned i = 0; i < nenv; i++)
+        if (!spawn_big_matches(environ[i], i, true))
+            return 5;
+    if (environ[nenv])
+        return 6;
+    if (fd != -1 && fstat(fd, &st) != 0)
+        return 7;
+    return EXIT_SUCCESS;
+}
+
+/* Spawn the child with nargs + nenv pattern strings and, when fd != -1, fd
+ * as a copy of stdout. `native` sends a _PROC_SPAWN through rtmux_spawn()
+ * instead of posix_spawn(). Returns the spawn result; *code as for
+ * spawn_wait_code().
+ */
+static int spawn_big(bool native,
+                     unsigned nargs,
+                     unsigned nenv,
+                     int fd,
+                     int *code)
+{
+    posix_spawn_file_actions_t fa, *fap = NULL;
+    char nums[3][16];
+    char **argv = calloc(6 + nargs, sizeof(*argv));
+    char **envp = calloc(1 + nenv, sizeof(*envp));
+    char *pool = malloc((size_t) (nargs + nenv) * SPAWN_BIG_LEN + 1);
+    int *fd_map = NULL;
+    int rc = ENOMEM;
+
+    *code = -1;
+    if (!argv || !envp || !pool)
+        goto out;
+    snprintf(nums[0], sizeof nums[0], "%u", nargs);
+    snprintf(nums[1], sizeof nums[1], "%u", nenv);
+    snprintf(nums[2], sizeof nums[2], "%d", fd);
+    argv[0] = "syscall_testing";
+    argv[1] = "--spawn-bigargs-child";
+    argv[2] = nums[0];
+    argv[3] = nums[1];
+    argv[4] = nums[2];
+    for (unsigned i = 0; i < nargs; i++) {
+        argv[5 + i] = pool + (size_t) i * SPAWN_BIG_LEN;
+        spawn_big_fill(argv[5 + i], i, false);
+    }
+    for (unsigned i = 0; i < nenv; i++) {
+        envp[i] = pool + (size_t) (nargs + i) * SPAWN_BIG_LEN;
+        spawn_big_fill(envp[i], i, true);
+    }
+    if (native) {
+        int nfds = fd != -1 ? fd + 1 : 3;
+        pid_t pid;
+        int status;
+
+        /* The fd map rides ahead of the arguments, so a long one moves the
+         * offset the streamed arguments are fetched from.
+         */
+        if (!(fd_map = malloc((size_t) nfds * sizeof(*fd_map))))
+            goto out;
+        for (int i = 0; i < nfds; i++)
+            fd_map[i] = i < 3 ? i : SPAWN_FDCLOSED;
+        if (fd != -1)
+            fd_map[fd] = 1;
+        pid =
+            rtmux_spawn("/bin/syscall_testing", nfds, fd_map, NULL, argv, envp);
+        rc = pid == -1 ? errno : EOK;
+        if (rc == EOK && wait_child_exit(pid, &status, 500) &&
+            WIFEXITED(status))
+            *code = WEXITSTATUS(status);
+        goto out;
+    }
+    if (fd != -1) {
+        if ((rc = posix_spawn_file_actions_init(&fa)) != EOK)
+            goto out;
+        fap = &fa;
+        if ((rc = posix_spawn_file_actions_adddup2(fap, 1, fd)) != EOK)
+            goto out;
+    }
+    rc = spawn_wait_code("/bin/syscall_testing", fap, NULL, argv, envp, NULL,
+                         code);
+out:
+    if (fap)
+        (void) posix_spawn_file_actions_destroy(fap);
+    free(fd_map);
+    free(pool);
+    free(envp);
+    free(argv);
+    return rc;
+}
+
+static void test_spawn_large_arguments(void)
+{
+    static const struct {
+        const char *name;
+        bool native;
+        unsigned nargs, nenv;
+        bool high_fd;
+    } cases[] = {
+        /* sizes either side of the inline limit, then 32 KiB of argv plus
+         * 32 KiB of envp
+         */
+        {"spawn 4 KiB envp", false, 2, 4, false},
+        {"spawn 32 KiB argv", false, 32, 0, false},
+        {"spawn 32 KiB envp", false, 2, 32, false},
+        {"spawn 64 KiB argv+envp byte for byte", false, 32, 32, false},
+        /* a request that fits inline, but the dup2 target needs a 4 KiB
+         * fdmap, which pushes the _PROC_SPAWN roottask builds past it
+         */
+        {"spawn high-fd dup2 with tiny arguments", false, 0, 0, true},
+        {"spawn high-fd dup2 with 4 KiB arguments", false, 2, 2, true},
+        {"spawn 64 KiB arguments with a high-fd dup2", false, 32, 32, true},
+        /* the streamed native path, with and without a long fd map */
+        {"native spawn streams 32 KiB envp", true, 2, 32, false},
+        {"native spawn streams 64 KiB arguments", true, 32, 32, false},
+        {"native spawn streams arguments after a long fd map", true, 32, 32,
+         true},
+    };
+    /* the highest descriptor a child may have */
+    long open_max = sysconf(_SC_OPEN_MAX);
+    int high_fd = (int) (open_max > 0 && open_max <= SPAWN_BIG_HIGH_FD + 1
+                             ? open_max - 1
+                             : SPAWN_BIG_HIGH_FD);
+    char detail[64];
+    int code;
+
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        int rc = spawn_big(cases[i].native, cases[i].nargs, cases[i].nenv,
+                           cases[i].high_fd ? high_fd : -1, &code);
+
+        snprintf(detail, sizeof detail, "rc=%d (%s) child=%d", rc, strerror(rc),
+                 code);
+        check(rc == EOK && code == 0, cases[i].name, detail);
+    }
+}
+
+/* Spawn a --getsid-hold child, with POSIX_SPAWN_SETSID when `setsid`, and wait
+ * until it runs. It exits once *hold is closed. Returns its pid, or -1.
+ */
+static pid_t getsid_hold_spawn(bool setsid, int *hold)
+{
+    char *argv[] = {"syscall_testing", "--getsid-hold", NULL};
+    posix_spawn_file_actions_t fa;
+    posix_spawnattr_t attr;
+    int in[2], out[2];
+    pid_t pid = (pid_t) -1;
+    char c;
+    int rc;
+
+    *hold = -1;
+    if (pipe(in) != 0)
+        return -1;
+    if (pipe(out) != 0) {
+        (void) close(in[0]);
+        (void) close(in[1]);
+        return -1;
+    }
+    /* Only this child may hold the write end, or its EOF never comes. */
+    (void) fcntl(in[1], F_SETFD, FD_CLOEXEC);
+    (void) fcntl(out[0], F_SETFD, FD_CLOEXEC);
+    (void) posix_spawn_file_actions_init(&fa);
+    (void) posix_spawn_file_actions_adddup2(&fa, in[0], 0);
+    (void) posix_spawn_file_actions_adddup2(&fa, out[1], 1);
+    (void) posix_spawn_file_actions_addclose(&fa, in[0]);
+    (void) posix_spawn_file_actions_addclose(&fa, out[1]);
+    (void) posix_spawnattr_init(&attr);
+    if (setsid)
+        (void) posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSID);
+    rc = posix_spawn(&pid, "/bin/syscall_testing", &fa, &attr, argv, NULL);
+    (void) posix_spawnattr_destroy(&attr);
+    (void) posix_spawn_file_actions_destroy(&fa);
+    (void) close(in[0]);
+    (void) close(out[1]);
+    if (rc == EOK && read(out[0], &c, 1) == 1) {
+        *hold = in[1];
+    } else {
+        (void) close(in[1]);
+        if (rc == EOK)
+            (void) wait_child_exit(pid, &(int) {0}, 500);
+        pid = (pid_t) -1;
+    }
+    (void) close(out[0]);
+    return pid;
+}
+
+/* Release a getsid_hold_spawn() child and reap it. True when it saw EOF and
+ * exited cleanly rather than being killed.
+ */
+static bool getsid_hold_release(pid_t pid, int hold)
+{
+    int status;
+
+    (void) close(hold);
+    return wait_child_exit(pid, &status, 500) && WIFEXITED(status) &&
+           WEXITSTATUS(status) == 0;
+}
+
+/* getsid table: the caller, a child in the caller's session, a child leading
+ * its own session, and pids that name no process. Each row gives the expected
+ * result, or -1 with the expected errno. POSIX lets getsid refuse a process in
+ * another session with EPERM, and RTMux does.
+ */
+static void test_getsid_cases(void)
+{
+    pid_t self = getsid(0);
+    pid_t child, leader;
+    int child_hold, leader_hold;
+    char detail[64];
+
+    check(self > 0, "getsid self",
+          "getsid(0) must report the caller's session");
+    child = getsid_hold_spawn(false, &child_hold);
+    leader = getsid_hold_spawn(true, &leader_hold);
+    check(child != (pid_t) -1 && leader != (pid_t) -1, "getsid spawn holders",
+          "the getsid table needs two live children");
+    if (self > 0 && child != (pid_t) -1 && leader != (pid_t) -1) {
+        const struct {
+            const char *name;
+            pid_t pid;
+            pid_t want;
+            int want_errno;
+        } cases[] = {
+            {"getsid self by pid", getpid(), self, 0},
+            {"getsid child shares session", child, self, 0},
+            {"getsid other session is EPERM", leader, -1, EPERM},
+            {"getsid negative pid is ESRCH", -2, -1, ESRCH},
+            {"getsid INT_MAX pid is ESRCH", INT_MAX, -1, ESRCH},
+        };
+
+        for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+            pid_t got;
+            int err;
+
+            errno = 0;
+            got = getsid(cases[i].pid);
+            err = errno;
+            snprintf(detail, sizeof detail, "got %d errno %d, want %d errno %d",
+                     (int) got, err, (int) cases[i].want, cases[i].want_errno);
+            check(got == cases[i].want &&
+                      (got != -1 || err == cases[i].want_errno),
+                  cases[i].name, detail);
+        }
+    }
+    if (leader != (pid_t) -1)
+        check(getsid_hold_release(leader, leader_hold),
+              "getsid session leader released",
+              "the held session leader must exit on EOF");
+    if (child != (pid_t) -1) {
+        bool clean = getsid_hold_release(child, child_hold);
+        pid_t got;
+        int err;
+
+        /* A reaped child's pid names no process. */
+        errno = 0;
+        got = getsid(child);
+        err = errno;
+        snprintf(detail, sizeof detail, "clean exit %d, got %d errno %d",
+                 (int) clean, (int) got, err);
+        check(clean && got == -1 && err == ESRCH, "getsid reaped pid is ESRCH",
+              detail);
+    }
+}
+
 static int name_fd_matches(int fd, const name_attach_t *attach)
 {
     struct _server_info info;
@@ -9196,6 +9794,7 @@ static void test_posix_at_fd_relative(void)
  * legitimately fail the spawn with EBADF.
  */
 enum { SPAWN_WORKERS = 8, SPAWN_ROUNDS = 100, SPAWN_REPORT_FD = 3 };
+enum { SPAWN_RESIDENTS_MAX = 256 };
 
 struct spawn_worker {
     pthread_t th;
@@ -9415,17 +10014,6 @@ static void spawn_join(struct spawn_worker *w)
         (void) pthread_join(w[i].th, NULL);
 }
 
-static unsigned spawn_count_open_fds(void)
-{
-    long max = sysconf(_SC_OPEN_MAX);
-    unsigned n = 0;
-
-    for (long fd = 0; fd < max; fd++)
-        if (fcntl((int) fd, F_GETFD) != -1)
-            n++;
-    return n;
-}
-
 static int spawn_count_dup_pids(const struct spawn_worker *w)
 {
     int dup = 0;
@@ -9497,6 +10085,74 @@ void test_spawn_concurrent(void)
         check(!bad_spawn && !bad_report && !bad_exit && !dup_pid &&
                   fds_before == fds_after,
               "spawn_concurrent 8x100 exact argv/envp, unique pids, no fd leak",
+              detail);
+    }
+}
+
+/* Run the spawn storm with residents idle processes alive across it: each is
+ * /bin/cat (the small toolbox binary) blocked reading a pipe until EOF. The
+ * kernel's pshut and irqoff lines (CONFIG_INSTRUMENTATION) printed before the
+ * "storm done" marker cover the storm's exits at that process count.
+ */
+void test_spawn_storm(unsigned residents)
+{
+    static pid_t pids[SPAWN_RESIDENTS_MAX];
+    char *argv[] = {"cat", NULL};
+    char *envp[] = {NULL};
+    unsigned spawned = 0, bad_exit = 0;
+    char detail[96];
+    int p[2];
+
+    if (residents > SPAWN_RESIDENTS_MAX || pipe(p) != 0) {
+        test_fail("spawn_storm residents fixture",
+                  residents > SPAWN_RESIDENTS_MAX ? "too many" : strerror(errno));
+        return;
+    }
+    /* A resident that kept the write end open would never see EOF. */
+    if (fcntl(p[0], F_SETFD, FD_CLOEXEC) != 0 || fcntl(p[1], F_SETFD, FD_CLOEXEC) != 0) {
+        test_fail("spawn_storm residents fixture", strerror(errno));
+        (void) close(p[0]);
+        (void) close(p[1]);
+        return;
+    }
+    for (; spawned < residents; spawned++) {
+        posix_spawn_file_actions_t fa;
+        int rc = posix_spawn_file_actions_init(&fa);
+
+        if (!rc) {
+            rc = posix_spawn_file_actions_adddup2(&fa, p[0], STDIN_FILENO);
+            if (!rc)
+                rc = posix_spawn_file_actions_addopen(&fa, STDOUT_FILENO, "/dev/null",
+                                                      O_WRONLY, 0);
+            if (!rc)
+                rc = posix_spawn(&pids[spawned], "/bin/cat", &fa, NULL, argv, envp);
+            (void) posix_spawn_file_actions_destroy(&fa);
+        }
+        if (rc) {
+            snprintf(detail, sizeof detail, "resident %u: %s", spawned, strerror(rc));
+            test_fail("spawn_storm residents", detail);
+            break;
+        }
+    }
+    printf("spawn_storm: residents=%u\n", spawned);
+    if (spawned == residents) {
+        test_spawn_concurrent();
+        sleep(2); /* let one more pshut/irqoff report land before the marker */
+        printf("spawn_storm: storm done residents=%u\n", spawned);
+    }
+    (void) close(p[1]);
+    (void) close(p[0]);
+    for (unsigned i = 0; i < spawned; i++) {
+        int status;
+
+        if (waitpid(pids[i], &status, 0) != pids[i] || !WIFEXITED(status) ||
+            WEXITSTATUS(status) != 0)
+            bad_exit++;
+    }
+    if (residents) {
+        snprintf(detail, sizeof detail, "%u of %u residents exited badly", bad_exit,
+                 spawned);
+        check(spawned == residents && !bad_exit, "spawn_storm residents spawn and exit",
               detail);
     }
 }
@@ -9616,6 +10272,10 @@ void test_vfs(void)
     test_spawnp_absolute_path();
     test_spawnattr_flags();
     test_spawnattr_resetids_runtime();
+    test_spawnattr_setsid();
+    test_spawn_file_actions_chdir();
+    test_spawn_large_arguments();
+    test_getsid_cases();
     test_proc_lifecycle_burst_wait();
     test_proc_wait_handle_stale_after_reap();
     test_kill_zero_after_reap();

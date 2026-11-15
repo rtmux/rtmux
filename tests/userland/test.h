@@ -57,6 +57,7 @@ void test_vfs(void);
 void test_native_file_io(void);
 void test_native_io_boundaries(void);
 int spawn_echo_child(const char *tag);
+int spawn_bigargs_child(int argc, char *argv[]);
 void test_posix_cap_boundary(void);
 int posix_cap_boundary_child(void);
 void test_notifications(void);
@@ -100,6 +101,7 @@ void *test_unmapped_user_addr(void);
 
 void test_trace_negative(void);
 void test_spawn_concurrent(void);
+void test_spawn_storm(unsigned residents);
 void test_user_ptr_negative(void);
 int capgate_child_connect(const char *chid_arg);
 int capgate_child_dup_attack(int argc, char **argv);

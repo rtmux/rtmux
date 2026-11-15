@@ -89,6 +89,7 @@ static pid_t spawn_common(const char *path,
     msg.i.narge = (uint16_t) narge;
 
     msg.i.nfds = (uint16_t) fd_count;
+    msg.i.cwdlen = 0;
 
     coid = ROOTTASK_COID;
 

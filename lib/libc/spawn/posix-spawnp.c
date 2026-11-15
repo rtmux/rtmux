@@ -38,21 +38,12 @@ int posix_spawnp(pid_t *restrict pid,
 {
     if (!file || *file == '\0')
         return EINVAL;
-    if (strchr(file, '/')) {
-        char full[PATH_MAX + 1];
-        size_t len;
-        int n;
 
-        if (*file == '/')
-            return posix_spawn(pid, file, file_actions, attrp, argv, envp);
-        if (!getcwd(full, sizeof(full)))
-            return errno;
-        len = strlen(full);
-        n = snprintf(full + len, sizeof(full) - len, "/%s", file);
-        if (n < 0 || (size_t) n >= sizeof(full) - len)
-            return ENAMETOOLONG;
-        return posix_spawn(pid, full, file_actions, attrp, argv, envp);
-    }
+    /* A path with a slash is not searched; posix_spawn() resolves a relative
+     * one against the directory the chdir file actions leave.
+     */
+    if (strchr(file, '/'))
+        return posix_spawn(pid, file, file_actions, attrp, argv, envp);
 
     int num_paths;
     int r = -1;
@@ -82,7 +73,11 @@ int posix_spawnp(pid_t *restrict pid,
     for (i = 0; i < num_paths; i++) {
         struct stat dummy;
 
-        if (!strcmp(env_path[i], "./")) {
+        /* Resolve a relative $PATH entry against the caller's cwd, as the
+         * stat() below does, so posix_spawn() cannot resolve it against the
+         * directory chdir file actions leave and run a different file.
+         */
+        if (env_path[i][0] != '/') {
             char *b;
             int trys = 5;
 
@@ -95,7 +90,17 @@ int posix_spawnp(pid_t *restrict pid,
                 continue;  /* try next $PATH entry */
             }
             size_t len = strlen(path);
-            int n = snprintf(path + len, sizeof(path) - len, "/%s", file);
+            size_t elen = strlen(env_path[i]);
+            int n;
+
+            while (elen > 0 && env_path[i][elen - 1] == '/')
+                elen--;
+            /* "" and "." name the cwd itself; "./" was the old special case */
+            if (elen == 1 && env_path[i][0] == '.')
+                elen = 0;
+            n = snprintf(path + len, sizeof(path) - len, "%s%.*s%s%s",
+                         len > 1 ? "/" : "", (int) elen, env_path[i],
+                         elen ? "/" : "", file);
 
             if (n < 0 || (size_t) n >= sizeof(path) - len) {
                 r = ENAMETOOLONG;

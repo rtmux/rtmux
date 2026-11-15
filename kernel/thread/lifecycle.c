@@ -38,6 +38,8 @@ static void thread_recycle_reset(thread_t *thp)
     thp->internal_flags = 0;
     thp->timestamp_last_block = 0;
     thp->as_prp = NULL;
+    thp->as_borrow_next = NULL;
+    thp->as_borrow_pprev = NULL;
     atomic_store_explicit(&thp->async_flags, 0, memory_order_relaxed);
     thp->dpp = NULL;
     thp->timeout_flags = 0;
@@ -863,30 +865,78 @@ static bool tthread_wait_unpinned(thread_t *thp)
     return waited;
 }
 
+/* Whether thp running in prp's address space borrows it. A thread's own process
+ * needs neither a pin nor a list entry; any other address space gets both.
+ */
+static inline bool thread_as_is_borrow(const thread_t *thp,
+                                       const process_t *prp)
+{
+    return prp && prp != thp->process;
+}
+
+/* Link thp on prp->as_borrowers. Caller holds thread_as_slock and the pin that
+ * the link owns.
+ */
+static void thread_as_link(thread_t *thp, process_t *prp)
+{
+    if (thp->as_borrow_pprev)
+        crash();
+    thp->as_borrow_next = prp->as_borrowers;
+    if (prp->as_borrowers)
+        prp->as_borrowers->as_borrow_pprev = &thp->as_borrow_next;
+    thp->as_borrow_pprev = &prp->as_borrowers;
+    prp->as_borrowers = thp;
+}
+
+/* Detach thp from its address space: if it borrows one, unlink it and drop the
+ * pin the link owned; either way clear as_prp. Caller holds thread_as_slock.
+ */
+static void thread_as_unbind(thread_t *thp)
+{
+    process_t *prp = thp->as_prp;
+
+    if (thread_as_is_borrow(thp, prp)) {
+        if (!thp->as_borrow_pprev)
+            crash();
+        *thp->as_borrow_pprev = thp->as_borrow_next;
+        if (thp->as_borrow_next)
+            thp->as_borrow_next->as_borrow_pprev = thp->as_borrow_pprev;
+        thp->as_borrow_next = NULL;
+        thp->as_borrow_pprev = NULL;
+        process_unpin(prp);
+    }
+    thp->as_prp = NULL;
+}
+
+/* Set the address space thp runs in. A borrow of another process's address
+ * space pins that process and links thp on its as_borrowers list, so teardown
+ * finds every borrower without scanning the system.
+ *
+ * Returns ESRCH if prp's teardown has already released its borrowers: mdestroy
+ * is next, and a borrow now would outlive it.
+ */
 int rdecl thread_set_as_prp(thread_t *thp, process_t *prp)
 {
-    process_t *old;
-    int status;
+    bool borrow;
+    int status = EOK;
 
     if (!thp)
         return ESRCH;
     kspinlock_lock(&thread_as_slock);
     if (thp->as_prp == prp)
         goto out;
-    if (prp && prp != thp->process) {
-        status = process_pin(prp);
-        if (status != EOK) {
-            kspinlock_unlock(&thread_as_slock);
-            return status;
-        }
-    }
-    old = thp->as_prp;
+    borrow = thread_as_is_borrow(thp, prp);
+    if (borrow)
+        status = prp->as_borrow_closed ? ESRCH : process_pin(prp);
+    if (status != EOK)
+        goto out;
+    thread_as_unbind(thp);
+    if (borrow)
+        thread_as_link(thp, prp);
     thp->as_prp = prp;
-    if (old && old != thp->process)
-        process_unpin(old);
 out:
     kspinlock_unlock(&thread_as_slock);
-    return EOK;
+    return status;
 }
 
 void rdecl thread_clear_as_prp_if(thread_t *thp, process_t *prp)
@@ -895,12 +945,37 @@ void rdecl thread_clear_as_prp_if(thread_t *thp, process_t *prp)
         return;
 
     kspinlock_lock(&thread_as_slock);
-    if (thp->as_prp == prp) {
-        thp->as_prp = NULL;
-        if (prp && prp != thp->process)
-            process_unpin(prp);
+    if (thp->as_prp == prp)
+        thread_as_unbind(thp);
+    kspinlock_unlock(&thread_as_slock);
+}
+
+/* Refuse new borrows of prp's address space and release every thread that still
+ * borrows it, for kext_process_shutdown before mdestroy.
+ *
+ * Costs O(borrowers of prp), not O(threads in the system). thread_as_slock is
+ * dropped between borrowers, so each interrupts-off window covers one unlink:
+ * once as_borrow_closed is set the list only shrinks, and a borrower that
+ * switches away or exits on another hart meanwhile unlinks itself under the
+ * same lock.
+ *
+ * Returns how many borrowers it released.
+ */
+unsigned rdecl thread_as_release_borrowers(process_t *prp)
+{
+    thread_t *thp;
+    unsigned released = 0;
+
+    kspinlock_lock(&thread_as_slock);
+    prp->as_borrow_closed = true;
+    while ((thp = prp->as_borrowers)) {
+        thread_as_unbind(thp);
+        released++;
+        kspinlock_unlock(&thread_as_slock);
+        kspinlock_lock(&thread_as_slock);
     }
     kspinlock_unlock(&thread_as_slock);
+    return released;
 }
 
 

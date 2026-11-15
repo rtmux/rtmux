@@ -385,4 +385,6 @@ uint64_t cpu_clock_ticks(void);
 #if defined(CONFIG_INSTRUMENTATION)
 /* section 18 interrupt-disabled window stats dump (globals.c). */
 void nonpreempt_report(void);
+/* Address-space teardown cost dump (kernel/ext/process.c). */
+void process_shutdown_report(void);
 #endif

@@ -13,6 +13,7 @@ TIMEOUT=180
 TIMEOUT_SET=0
 REPEAT=1
 LAPS=
+PROCS=
 KEEP_LOGS=0
 GDB_ON_TIMEOUT=0
 REQUIRE_SUPPORTED=0
@@ -580,6 +581,12 @@ Options:
   --repeat N        Number of boots to run (default: 1)
   --laps N          syscall-testing/leak-gate: run the suite N times in one boot
                     (guest rtmux.laps=N) and require N 'lap=<n> PASS' lines
+  --procs N         spawn-storm: keep N idle processes alive across the storm
+                    (guest rtmux.spawn_procs=N) and print the kernel's teardown
+                    cost (pshut) and longest interrupts-off window (irqoff)
+                    logged before the storm ends (cumulative since boot: the
+                    storm's 800 exits are all but one of the pshut samples);
+                    forces CONFIG_INSTRUMENTATION=y; at most 256 residents
   --gdb-on-timeout  On a timeout, dump every hart through a live gdb stub
                     (scripts/gdb/dump-state.gdb) into build/lkl-logs/MODE-N.dump
                     before killing QEMU; implies --keep-logs
@@ -1194,6 +1201,10 @@ while [ $# -gt 0 ]; do
             LAPS="$2"
             shift 2
             ;;
+        --procs)
+            PROCS="$2"
+            shift 2
+            ;;
         --keep-logs)
             KEEP_LOGS=1
             shift
@@ -1243,6 +1254,27 @@ case "$LAPS" in
     *)
         if [ "$MODE" != "syscall-testing" ] && [ "$MODE" != "leak-gate" ]; then
             echo "qemu-regress: --laps is only valid with --mode syscall-testing or leak-gate" >&2
+            exit 2
+        fi
+        ;;
+esac
+
+case "$PROCS" in
+    "") ;;
+    *[!0-9]*)
+        echo "qemu-regress: --procs needs a non-negative integer" >&2
+        exit 2
+        ;;
+    *)
+        if [ "$MODE" != "spawn-storm" ]; then
+            echo "qemu-regress: --procs is only valid with --mode spawn-storm" >&2
+            exit 2
+        fi
+        # Normalize (the guest echoes the parsed count) and bound it by the
+        # guest fixture's resident table.
+        PROCS=$(printf '%s' "$PROCS" | sed 's/^0*//'); PROCS=${PROCS:-0}
+        if [ "${#PROCS}" -gt 3 ] || [ "$PROCS" -gt 256 ]; then
+            echo "qemu-regress: --procs is at most 256" >&2
             exit 2
         fi
         ;;
@@ -1634,6 +1666,10 @@ if [ "$MODE" = "lkl-fsd-crash" ] || [ "$MODE" = "lkl-netd-crash" ] ||
     BAD_RE='FATAL|CRASH|Kernel panic|panic:|lkl-host: panic|FREED-ACTIVE|__kernel_restore bad ptr|/usr unavailable|Undefined symbol|No such file or directory|Bad file descriptor'
 fi
 
+# spawn-storm --procs measures teardown cost, which only an instrumented kernel
+# reports (pshut and irqoff lines from clock_handler).
+[ -n "$PROCS" ] && NEEDS_INSTRUMENTATION=1
+
 if [ "$NEEDS_LKL_SERVERS" -eq 1 ] || [ "$NEEDS_INSTRUMENTATION" -eq 1 ] ||
    [ "$NEEDS_DEBUG_INJECT" -eq 1 ] || [ "$NEEDS_STALL_DETECTOR" -eq 1 ] ||
    [ "$NEEDS_SYSLOG_SMALL" -eq 1 ]; then
@@ -2018,6 +2054,39 @@ dump_hang_state()
     fi
 }
 
+# report_spawn_storm_cost LOG: print the last pshut line and each hart's last
+# irqoff line logged before the guest's "storm done" marker, so they cover the
+# storm at PROCS resident processes and not the residents' own exits after it.
+report_spawn_storm_cost()
+{
+    local log="$1" out rc
+
+    out=$(tr -d '\r' <"$log" | awk -v procs="$PROCS" '
+        /spawn_storm: storm done residents=/ { done = ($NF == "residents=" procs); exit }
+        match($0, /pshut: .*/) { pshut = substr($0, RSTART) }
+        match($0, /irqoff: cpu=[0-9]+ .*/) {
+            line = substr($0, RSTART)
+            split(line, f, " ")
+            last[f[2]] = line
+        }
+        END {
+            if (!done) {
+                print "  FAIL     spawn-storm did not finish its storm with " procs " residents"
+                exit 1
+            }
+            if (pshut == "") {
+                print "  FAIL     spawn-storm logged no pshut line (CONFIG_INSTRUMENTATION=y?)"
+                exit 1
+            }
+            print "  procs=" procs " " pshut
+            for (c in last)
+                print "  procs=" procs " " last[c]
+        }')
+    rc=$?
+    printf '%s\n' "$out" | sort -s -k2,2 -k3,3
+    return $rc
+}
+
 # check_hartwatch_reports LOG: neighbour-watchdog verdict. hart-watchdog needs
 # exactly one report, naming the injected hart, at 2000..2500 ms of silence (the
 # stall lasts 3 s, and the report must land within 2.5 s of the last progress);
@@ -2167,6 +2236,9 @@ run_one()
     fi
     if [ -n "$LAPS" ]; then
         cmd+=("rtmux.laps=${LAPS}")
+    fi
+    if [ -n "$PROCS" ]; then
+        cmd+=("rtmux.spawn_procs=${PROCS}")
     fi
     if [ "${#EXTRA_ARGS[@]}" -gt 0 ]; then
         cmd+=("${EXTRA_ARGS[@]}")
@@ -2420,6 +2492,10 @@ run_one()
 
     if [ "$MODE" = "roottask-wait-watch" ]; then
         check_roottask_wait_reports "$log" || return 1
+    fi
+
+    if [ "$MODE" = "spawn-storm" ] && [ -n "$PROCS" ]; then
+        report_spawn_storm_cost "$log" || return 1
     fi
 
     if [ "$MODE" = "logger-restart" ]; then

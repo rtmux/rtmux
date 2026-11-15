@@ -57,7 +57,7 @@ silently.
 | `kernel/irq/interrupt.c` and `arch/riscv/trap-handler.c` | interrupt metadata `LOCK_CLASS_INTREVENT`; scheduler wake path | `INTREVENT -> SCHED` for readying attached ISTs; hard-IRQ code does not allocate or block. |
 | `kernel/ipc/channel.c` | process vector `LOCK_CLASS_PROCVEC`; channel `LOCK_CLASS_CHANNEL`; connect `LOCK_CLASS_CONNECT` | `PROCVEC -> CHANNEL -> CONNECT`; drop object locks before scheduler block/ready. |
 | `kernel/ipc/message.c` | channel/connect locks plus scheduler locks | Queue mutation under `CHANNEL`/`CONNECT`; state transition through scheduler helpers after queue membership is published. |
-| `kernel/thread/lifecycle.c` | process vector `LOCK_CLASS_PROCVEC`; thread scalar `LOCK_CLASS_THREAD`; scheduler locks | `PROCVEC -> THREAD -> SCHED` only for bounded local state changes; teardown does not walk arbitrary foreign queues. |
+| `kernel/thread/lifecycle.c` | process vector `LOCK_CLASS_PROCVEC`; thread scalar `LOCK_CLASS_THREAD`; scheduler locks | `PROCVEC -> THREAD -> SCHED` only for bounded local state changes; teardown does not walk arbitrary foreign queues. `thread_as_slock` (`LOCK_CLASS_THREAD`) guards `thread_t.as_prp` and each address space's borrower list; address-space teardown walks that list and the dying process's own threads, never other processes (see `process_t.as_borrowers` in `objects.h`). |
 | `kernel/object/core.c` and allocators | memory partition `LOCK_CLASS_MEMPART`; physical allocator `LOCK_CLASS_PA` | `MEMPART -> PA`; allocator locks are leaf locks and not held across IPC/scheduler state changes. |
 | `kernel/debug/*` | debug/crash `LOCK_CLASS_DEBUG` | Crash/debug locks are terminal.  Avoid acquiring ordinary subsystem locks once held. |
 
