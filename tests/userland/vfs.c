@@ -240,6 +240,86 @@ static void test_native_combined_io(void)
 
 }
 
+/* A write grows the file before copying the client's data. When the copy
+ * faults, the file must be left as it was: same size, same bytes, same
+ * position, and no bytes from the failed copy past the old end.
+ */
+static void test_native_failed_write_no_growth(void)
+{
+    const char path[] = "/dev/shmem/rtmux-failed-write";
+    const size_t page = (size_t) __PAGESIZE;
+    unsigned char *buf = MAP_FAILED, tail[64];
+    struct stat st;
+    int fd = -1, zero = 1;
+
+    (void) unlink(path);
+    fd = open(path, O_CREAT | O_EXCL | O_RDWR, 0600);
+    if (fd == -1) {
+        test_fail("native failed write fixture", strerror(errno));
+        return;
+    }
+    check(write(fd, "abcd", 4) == 4, "native failed write fixture data",
+          "4 bytes");
+
+    /* Two pages, the second unmapped: the IPC prefix copies, the server's
+     * msgreadv faults on the second page after the file has grown.
+     */
+    buf = mmap(NULL, 2 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON,
+               NOFD, 0);
+    if (buf == MAP_FAILED) {
+        test_fail("native failed write buffer", strerror(errno));
+        goto done;
+    }
+    memset(buf, 'x', page);
+    if (munmap(buf + page, page) != 0) {
+        test_fail("native failed write unmap", strerror(errno));
+        goto done;
+    }
+
+    errno = 0;
+    check(write(fd, buf, 2 * page) == -1 && errno == EFAULT,
+          "native write from faulting buffer fails", "expected EFAULT");
+    check(fstat(fd, &st) == 0 && st.st_size == 4,
+          "native failed write leaves size unchanged",
+          "growth must be undone when the copy fails");
+    check(lseek(fd, 0, SEEK_CUR) == 4,
+          "native failed write leaves position unchanged", "expected 4");
+
+    errno = 0;
+    check(
+        pwrite(fd, buf, 2 * page, (off_t) (16 * page)) == -1 && errno == EFAULT,
+        "native pwrite past end from faulting buffer fails", "expected EFAULT");
+    check(fstat(fd, &st) == 0 && st.st_size == 4,
+          "native failed pwrite leaves size unchanged",
+          "growth must be undone when the copy fails");
+
+    /* Grow again: the bytes the faulted copy wrote past the old end must be
+     * gone, so the gap reads as zeros.
+     */
+    check(pwrite(fd, "z", 1, (off_t) sizeof tail + 4) == 1,
+          "native regrow after failed write", "1 byte");
+    if (pread(fd, tail, sizeof tail, 4) != (ssize_t) sizeof tail) {
+        zero = 0;
+    } else {
+        for (size_t i = 0; i < sizeof tail; i++)
+            zero &= tail[i] == 0;
+    }
+    check(zero, "native failed write leaves no bytes past old end",
+          "the gap after regrowth must read as zeros");
+    {
+        char head[4];
+
+        check(pread(fd, head, sizeof head, 0) == 4 &&
+                  memcmp(head, "abcd", 4) == 0,
+              "native failed write keeps existing data", "expected abcd");
+    }
+done:
+    if (buf != MAP_FAILED)
+        (void) munmap(buf, page);
+    (void) close(fd);
+    (void) unlink(path);
+}
+
 static void test_native_large_write(void)
 {
     const char path[] = "/dev/shmem/rtmux-large-write";
@@ -539,6 +619,7 @@ done:
     check(unlink(path) == 0, "native file unlink", "fixture cleanup");
     test_native_combined_io();
     test_native_large_write();
+    test_native_failed_write_no_growth();
     test_native_short_reads();
     test_native_rw_validation();
     test_native_io_boundaries();
