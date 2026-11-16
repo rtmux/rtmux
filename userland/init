@@ -146,7 +146,14 @@ if test "$rtmux_run" = "debug-inject"; then
             ok=4
         fi
     fi
+    # A PI mutex waiter that has published itself but not yet queued must not
+    # be stranded by another unlock.
     if test "$ok" = 4; then
+        if /bin/syscall_testing --mutex-waiting-republish; then
+            ok=5
+        fi
+    fi
+    if test "$ok" = 5; then
         echo "RTMux debug-inject: PASS"
     else
         echo "RTMux debug-inject: FAIL"

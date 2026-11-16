@@ -3946,3 +3946,99 @@ int condvar_reacquire_alloc_failure(void)
     pthread_mutex_destroy(&cvr_mutex);
     return 0;
 }
+
+/* mutex_waiting_republish: a PI mutex waiter that is still publishing itself
+ * (WAITING set, chain lock dropped to propagate priority, not yet queued) must
+ * not be stranded when another unlock rewrites the lock word from the queued
+ * waiters alone. The fixture stalls the late waiter B in that window with the
+ * debug injection call, lets the holder hand the mutex to the queued waiter W,
+ * and has W keep it until B has queued. W then releases in user space; if
+ * WAITING was lost, B sleeps on a free mutex for ever. Needs /bin/inject and
+ * two harts; otherwise the case is skipped.
+ */
+#define MWR_STALL_MS 1500L
+#define MWR_WAIT_MS 3000L
+
+static pthread_mutex_t mwr_mutex;
+static atomic_int mwr_w_release;
+static atomic_int mwr_b_done;
+
+static void *mwr_w(void *arg)
+{
+    (void) arg;
+    pthread_mutex_lock(&mwr_mutex); /* queues behind the main thread */
+    while (!atomic_load(&mwr_w_release))
+        sleep_ms(5);
+    pthread_mutex_unlock(&mwr_mutex);
+    return NULL;
+}
+
+static void *mwr_b(void *arg)
+{
+    (void) arg;
+    (void) test_pin_mask(2U); /* its stall must not hold up the others */
+    pthread_mutex_lock(&mwr_mutex);
+    pthread_mutex_unlock(&mwr_mutex);
+    atomic_store(&mwr_b_done, 1);
+    return NULL;
+}
+
+int mutex_waiting_republish(void)
+{
+    pthread_mutexattr_t ma;
+    pthread_t w, b;
+    char ms[16];
+    char pid[16];
+
+    if (sysconf(_SC_NPROCESSORS_ONLN) < 2 || inject_run("alloc-status", NULL, NULL) != 0)
+        return TC_EXIT_SKIP;
+    snprintf(pid, sizeof pid, "%d", (int) getpid());
+    snprintf(ms, sizeof ms, "%ld", MWR_STALL_MS);
+    pthread_mutexattr_init(&ma);
+    pthread_mutexattr_setprotocol(&ma, PTHREAD_PRIO_INHERIT);
+    if (pthread_mutex_init(&mwr_mutex, &ma) != 0) {
+        test_fail("mutex_waiting_republish fixture", "pthread_mutex_init");
+        pthread_mutexattr_destroy(&ma);
+        return 0;
+    }
+    pthread_mutexattr_destroy(&ma);
+    atomic_store(&mwr_b_done, 0);
+    atomic_store(&mwr_w_release, 0);
+    (void) test_pin_mask(1U);
+
+    if (pthread_mutex_lock(&mwr_mutex) != 0) {
+        test_fail("mutex_waiting_republish fixture", "pthread_mutex_lock");
+        goto out;
+    }
+    if (pthread_create(&w, NULL, mwr_w, NULL) != 0) {
+        test_fail("mutex_waiting_republish fixture", "pthread_create");
+        goto out;
+    }
+    sleep_ms(50); /* W is queued, so the unlock below hands the mutex to it */
+    if (inject_run("stall-lock", pid, ms) != 0) {
+        test_fail("mutex_waiting_republish fixture", "inject refused");
+        goto out;
+    }
+    if (pthread_create(&b, NULL, mwr_b, NULL) != 0) {
+        test_fail("mutex_waiting_republish fixture", "pthread_create");
+        goto out;
+    }
+    sleep_ms(100); /* B is inside its stall: published, not yet queued */
+    pthread_mutex_unlock(&mwr_mutex); /* hands the mutex to W alone */
+    sleep_ms(MWR_STALL_MS + 400); /* B has left its stall and queued */
+    atomic_store(&mwr_w_release, 1);
+
+    for (long i = 0; i < MWR_WAIT_MS / 10 && !atomic_load(&mwr_b_done); i++)
+        sleep_ms(10);
+    check(atomic_load(&mwr_b_done),
+          "PI mutex waiter published but not yet queued is not stranded",
+          "the late waiter slept on a mutex released in user space");
+    if (atomic_load(&mwr_b_done)) {
+        (void) pthread_join(w, NULL);
+        (void) pthread_join(b, NULL);
+        pthread_mutex_destroy(&mwr_mutex);
+    }
+out:
+    (void) test_pin_mask(~0U);
+    return 0;
+}

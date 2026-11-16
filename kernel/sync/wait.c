@@ -2064,6 +2064,7 @@ retry_contended:
         sync_turnstile_bind_waiter(ts, act);
         waiter_bound = 1;
         kspinlock_unlock(&c->lock);
+        inject_mutex_lock_stall(act->process);
         rc = sync_pi_propagate(act, ts);
         kspinlock_lock(&c->lock);
         if (rc != EOK) {
@@ -2074,15 +2075,16 @@ retry_contended:
                 waiter_bound = 0;
             }
             if (!sync_has_waiter(c, key)) {
-                unsigned long owner_word =
-                    *(volatile unsigned long *) &sync->owner;
-
-                /* A special word (the owner died meanwhile) has no waiting bit
-                 * to clear.
+                /* Clear the bit in place: a load and store of the whole word
+                 * could write back an owner that unlocked, or locked, in user
+                 * space in between. A waiter still propagating republishes the
+                 * bit itself once it is queued. A special word (the owner died
+                 * meanwhile) has no waiting bit to clear.
                  */
-                if (!mutex_word_special(owner_word))
-                    *(volatile unsigned long *) &sync->owner =
-                        owner_word & ~RTMUX_SYNC_WAITING;
+                if (!mutex_word_special(
+                        *(volatile unsigned long *) &sync->owner))
+                    atomic_clr_64((volatile unsigned long *) &sync->owner,
+                                  RTMUX_SYNC_WAITING);
                 sync_turnstile_set_owner_thread_locked(ts, NULL, 0, 0);
                 sync_turnstile_free_idle_locked(c, ts);
             }
@@ -2121,18 +2123,31 @@ retry_contended:
     if (pi_enabled)
         sync_turnstile_update_max_locked(c, ts);
 
+    /* A PI lock dropped the chain lock to propagate priority after the first
+     * publish above. Another waiter's failed propagation (no queued waiter
+     * left, so it cleared WAITING) or an unlock handoff (it rewrote the word
+     * from the queued waiters only) can erase the bit meanwhile; republish it
+     * now that this waiter is queued. A non-PI lock never dropped the lock. A
+     * special word (the owner died meanwhile; the death scan runs under this
+     * chain lock) has no waiting bit and must not gain one.
+     */
+    if (pi_enabled &&
+        !mutex_word_special(*(volatile unsigned long *) &sync->owner))
+        atomic_or_64((volatile unsigned long *) &sync->owner,
+                     RTMUX_SYNC_WAITING);
+
     /* Lost-wakeup guard (futex re-check). The holder releases the mutex
      * entirely in user space: pthread_mutex_unlock clears the owner-id bits of
      * the lock word (keeping RTMUX_SYNC_WAITING; see __mutex_release_owner in
      * cpucfg.h) and only enters ksys_sync_mutex_unlock when that release
      * observed RTMUX_SYNC_WAITING. The chain lock does NOT serialize that
      * user-side release. So between the under-lock mutex_try_acquire above and
-     * the atomic_or that sets WAITING, the holder can release: its clear
-     * returns an owner word WITHOUT the waiting bit, so it skips the wake — and
-     * a waiter that blocked at that moment would sleep forever on a mutex whose
-     * owner slot is already free (0x80000000: free + WAITING, which
-     * mutex_try_acquire treats as "not free", so every later locker piles up
-     * behind the first one too).
+     * the atomic_or that sets WAITING (the first, or the PI republish), the
+     * holder can release: its clear returns an owner word WITHOUT the waiting
+     * bit, so it skips the wake — and a waiter that blocked at that moment
+     * would sleep forever on a mutex whose owner slot is already free
+     * (0x80000000: free + WAITING, which mutex_try_acquire treats as "not
+     * free", so every later locker piles up behind the first one too).
      *
      * Re-read owner under the chain lock now that WAITING is published. If the
      * owner slot is free, the release landed in the window: take the mutex here

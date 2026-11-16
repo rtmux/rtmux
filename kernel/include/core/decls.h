@@ -346,10 +346,15 @@ void cpu_force_fpu_save(thread_t *thp);
 #ifdef CONFIG_DEBUG_INJECT
 int inject_should_fail_alloc(process_t *prp,
                              soul_t *soulp); /* debug/inject.c */
+void inject_mutex_lock_stall(process_t *prp);
 bool inject_should_fail_sched_set(thread_t *act, bool lowered);
 void inject_note_sched_return(thread_t *act, bool displaced);
 int inject_should_fail_turnstile(process_t *prp); /* debug/inject.c */
 #else
+static inline void inject_mutex_lock_stall(process_t *prp)
+{
+    (void) prp;
+}
 static inline bool inject_should_fail_sched_set(thread_t *act, bool lowered)
 {
     (void) act;

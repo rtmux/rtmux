@@ -76,6 +76,7 @@ int test_pin_mask(unsigned mask);
 int condloan_create(pthread_t *tid, int prio, void *(*fn)(void *), void *arg);
 int sched_set_error_after_lowering(void);
 int condvar_reacquire_alloc_failure(void);
+int mutex_waiting_republish(void);
 int disconnect_child(const char *pid_arg, const char *chid_arg);
 void test_posix_options(void);
 void test_sysconf(void);
