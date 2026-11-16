@@ -57,12 +57,12 @@ void cpu_tlb_flush_complete(void)
 
     atomic_thread_fence(memory_order_seq_cst);
     for (int hi = 0; hi < num_processors; hi++) {
-        unsigned hart = (unsigned) hi;
+        unsigned cpu = (unsigned) hi;
 
-        /* Skip ourselves and any hart not yet online (pc_alive == false). A
+        /* Skip ourselves and any CPU not yet online (cpu_online() false). A
          * not-yet-online hart cannot service an IPI to ack, so waiting on it
          * would hang early boot — a TLB flush from cpiofs_init (roottask
-         * bring-up) races secondary-hart start. Mirrors the pc_alive gate in
+         * bring-up) races secondary-hart start. Mirrors the cpu_online gate in
          * smp_icache_sync().
          *
          * Coherence: a hart is skippable here because it holds no TLB entry the
@@ -73,8 +73,7 @@ void cpu_tlb_flush_complete(void)
          * alive its TLB is clean, and while it is not alive it has not touched
          * the flushed VAs.
          */
-        if (hart == self ||
-            !__atomic_load_n(&pcpu_array[hart].pc_alive, __ATOMIC_ACQUIRE)) {
+        if (cpu == self || !cpu_online(cpu)) {
             wait[hi] = false;
             continue;
         }
@@ -90,25 +89,25 @@ void cpu_tlb_flush_complete(void)
          */
         wait[hi] = true;
         ticket[hi] =
-            atomic_fetch_add_explicit(&pcpu_array[hart].pc_tlb_flush_req, 1,
+            atomic_fetch_add_explicit(&pcpu_array[cpu].pc_tlb_flush_req, 1,
                                       memory_order_release) +
             1;
-        SENDIPI(hart, IPI_TLB_FLUSH);
+        SENDIPI(cpu, IPI_TLB_FLUSH);
     }
 
     for (int hi = 0; hi < num_processors; hi++) {
-        unsigned hart = (unsigned) hi;
+        unsigned cpu = (unsigned) hi;
         unsigned spins = 0;
 
         if (!wait[hi]) /* self, or a hart that was offline — not waited */
             continue;
-        while ((int) (atomic_load_explicit(&pcpu_array[hart].pc_tlb_flush_done,
+        while ((int) (atomic_load_explicit(&pcpu_array[cpu].pc_tlb_flush_done,
                                            memory_order_acquire) -
                       ticket[hi]) < 0) {
             interrupt_enable();
             interrupt_disable();
             if ((++spins & 0x3ff) == 0)
-                SENDIPI(hart, IPI_TLB_FLUSH);
+                SENDIPI(cpu, IPI_TLB_FLUSH);
         }
     }
 #endif

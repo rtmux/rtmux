@@ -131,15 +131,15 @@ void hartwatch_tick(void)
      * is free, not only on this hart's next unrelated print.
      */
     kprintf_flush_parked(HARTWATCH_LOCK_RETRIES);
-    if (n < 2 || !pcpu_array[self].pc_alive)
+    if (n < 2 || !cpu_online(self))
         return;
     si = self;
     if (si >= n)
         return;
     for (unsigned k = 1; k < n; k++) {
-        unsigned h = (si + k) % n;
-        if (__atomic_load_n(&pcpu_array[h].pc_alive, __ATOMIC_ACQUIRE)) {
-            target = h;
+        unsigned cpu = (si + k) % n;
+        if (cpu_online(cpu)) {
+            target = cpu;
             break;
         }
     }

@@ -553,8 +553,8 @@ static void sh_run_traps_on_tty(struct sh *sh, const struct termios *saved)
  * while it is made, and unblocked only inside pselect, which then returns at
  * once if one is caught.
  *
- * Returns true when stdin can be read (or has failed, which read reports), false
- * when a signal ended the wait, with its action pending.
+ * Returns true when stdin can be read (or has failed, which read reports),
+ * false when a signal ended the wait, with its action pending.
  */
 static bool sh_await_input(struct sh *sh)
 {
@@ -1353,7 +1353,10 @@ static int capture_command(struct sh *sh, const char *inner, char **out)
     return 0;
 }
 
-static int emit_field(struct sh_token *tok, int *ntok, const char *s, bool glob);
+static int emit_field(struct sh_token *tok,
+                      int *ntok,
+                      const char *s,
+                      bool glob);
 
 /* Emit an expansion result into the word being built. Quoted: append it
  * literally. Unquoted: split it at the characters of IFS (POSIX 2.6.5). A run
@@ -1362,9 +1365,9 @@ static int emit_field(struct sh_token *tok, int *ntok, const char *s, bool glob)
  * nothing between them make an empty field. A white space run beside one of
  * these belongs to it. *produced tells whether the word being built has
  * content, so the caller can drop a word that is nothing but an empty unquoted
- * expansion. *glob tells whether the field being built has an unquoted * ? or
- * [ in it, which, unless noglob, makes the finished field a pattern for
- * pathname expansion (POSIX 2.6.6 applies it to the result of an expansion).
+ * expansion. *glob tells whether the field being built has an unquoted * ? or [
+ * in it, which, unless noglob, makes the finished field a pattern for pathname
+ * expansion (POSIX 2.6.6 applies it to the result of an expansion).
  *
  * Returns 0, or -1 on allocation failure.
  */
@@ -1910,13 +1913,15 @@ static char *expand_word(struct sh *sh, const char *s, bool pattern, int xf)
         case SH_U_DOLLAR:
             at++;
 
-            /* An unquoted ${...} in a word that is itself field-split keeps
-             * the marks it made, which the loop below must not mark again.
+            /* An unquoted ${...} in a word that is itself field-split keeps the
+             * marks it made, which the loop below must not mark again.
              */
-            premarked = u.kind == SH_U_BRACE && !quoted && !pattern &&
-                        (xf & XF_SPLIT);
+            premarked =
+                u.kind == SH_U_BRACE && !quoted && !pattern && (xf & XF_SPLIT);
             rc = expand_dollar(sh, &at, &val, &vlen, &vcap,
-                               quoted ? XF_DQ : premarked ? XF_SPLIT : 0);
+                               quoted      ? XF_DQ
+                               : premarked ? XF_SPLIT
+                                           : 0);
             if (u.kind == SH_U_DOLLAR) /* a brace unit was consumed whole */
                 sc.p = at;
             t = val;
@@ -2392,10 +2397,10 @@ static int tokenize(struct sh *sh, const char *line, struct sh_token *tok)
                 } else {
                     rc = expand_dollar(sh, &p, &val, &vlen, &vcap, XF_SPLIT);
                     if (rc == 0 && val)
-                        rc = emit_sub_result(
-                            tok, &ntok, &buf, &len, &cap, 0, val,
-                            u.kind == SH_U_BRACE, &word_has_content,
-                            &word_may_glob, &word_has_quoted_glob);
+                        rc = emit_sub_result(tok, &ntok, &buf, &len, &cap, 0,
+                                             val, u.kind == SH_U_BRACE,
+                                             &word_has_content, &word_may_glob,
+                                             &word_has_quoted_glob);
                     free(val);
                 }
                 if (rc != 0) {
@@ -2426,9 +2431,9 @@ static int tokenize(struct sh *sh, const char *line, struct sh_token *tok)
                 buf = strdup("");
             if (!buf)
                 goto fail;
-            if (emit_field(tok, &ntok, buf,
-                           word_may_glob && !word_has_quoted_glob && !unsplit) !=
-                0) {
+            if (emit_field(
+                    tok, &ntok, buf,
+                    word_may_glob && !word_has_quoted_glob && !unsplit) != 0) {
                 free(buf);
                 goto fail;
             }
@@ -3391,11 +3396,12 @@ static int run_external(char **argv,
     if (err != EOK)
         goto fail;
     actions_p = &actions;
-    /* A descriptor that is closed for the command is not closed in the child:
-     * a closed slot is the first one the child's own opens take (cat would read
+
+    /* A descriptor that is closed for the command is not closed in the child: a
+     * closed slot is the first one the child's own opens take (cat would read
      * its file from fd 1 and write to it), and spawn leaves this shell's own
-     * descriptor unusable after a close action on stdout. The child gets one
-     * on which every transfer fails with EBADF instead, as it would on a closed
+     * descriptor unusable after a close action on stdout. The child gets one on
+     * which every transfer fails with EBADF instead, as it would on a closed
      * one, held open so the slot stays taken.
      */
     for (int k = 0; k < 3; k++) {
@@ -5609,7 +5615,8 @@ static int case_explode(const char *line, struct sh_script *out)
         sh_unit_next(&sc, &u);
         if (u.kind == SH_U_END)
             return 0;
-        if (u.kind == SH_U_LIT && sc.quote == 0 && (*at == ' ' || *at == '\t')) {
+        if (u.kind == SH_U_LIT && sc.quote == 0 &&
+            (*at == ' ' || *at == '\t')) {
             p = at;
             break;
         }
@@ -5622,7 +5629,8 @@ static int case_explode(const char *line, struct sh_script *out)
     if (script_add(out, buf) != 0)
         return 0;
 
-    /* The arms, which end at ;; ; the last one, at the esac that is a command. */
+    /* The arms, which end at ;; ; the last one, at the esac that is a command.
+     */
     arm = p;
     sc = (struct sh_scan){p, 0};
     for (;;) {
@@ -5811,8 +5819,8 @@ static int sh_sub_script(struct sh_script *sc,
     return script_add(sub, last);
 }
 
-/* The length of the keyword that closes a compound command: fi, done, esac or
- * a brace group's }.
+/* The length of the keyword that closes a compound command: fi, done, esac or a
+ * brace group's }.
  */
 static int closer_len(const char *line)
 {
@@ -5955,10 +5963,9 @@ static __attribute__((noinline)) int run_compound_tail(struct sh *sh,
 /* Run the compound command opening at line *ip, and leave *ip at its last line.
  * A trailing `&` on its closing fi, done or esac runs the whole command in a
  * background subshell; any other text there is a tail for run_compound_tail.
- */
-/* The & that ends the first statement of tail, the text after a closing
- * keyword (so the compound command is to run in the background), or NULL;
- * *rest gets what follows it.
+ * The & that ends the first statement of tail, the text after a closing keyword
+ * (so the compound command is to run in the background), or NULL; *rest gets
+ * what follows it.
  */
 static char *tail_background(char *tail, const char **rest)
 {
@@ -5997,7 +6004,7 @@ static __attribute__((noinline)) int run_compound_rest(struct sh *sh,
         return run_compound_tail(sh, sc, ip, end, mid, last, kw);
 
     in = sh_bg_stdin(sh);
-    *amp = '\0'; /* the subshell gets the closing line without the & */
+    *amp = '\0';    /* the subshell gets the closing line without the & */
     sh_jc_pgid = 0; /* a job of its own */
     rc = sh_sub_script(sc, *ip, end, last, &sub) == 0
              ? sh_spawn_sub(sh, 's', sub.line, sub.count, in, -1, -1, 1, NULL,
@@ -6008,8 +6015,9 @@ static __attribute__((noinline)) int run_compound_rest(struct sh *sh,
     *ip = end;
     sh->last_status = rc;
     rest += strspn(rest, " \t");
-    return *rest != '\0' && !sh->exit_requested ? run_list(sh, rest, SH_SEMI, rc)
-                                                : rc;
+    return *rest != '\0' && !sh->exit_requested
+               ? run_list(sh, rest, SH_SEMI, rc)
+               : rc;
 }
 
 static int run_compound(struct sh *sh, struct sh_script *sc, int *ip, int to)
@@ -6038,9 +6046,8 @@ static int run_script_range(struct sh *sh,
                             int from,
                             int to)
 {
-    static const char *const compound[] = {"if",   "for",  "while",
-                                           "until", "case", "{",
-                                           NULL};
+    static const char *const compound[] = {"if",   "for", "while", "until",
+                                           "case", "{",   NULL};
     int rc = 0;
 
     for (int i = from; i < to && !sh->exit_requested && !sh->return_requested &&

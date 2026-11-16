@@ -23,13 +23,13 @@ static void unit_next(struct sh_scan *sc, struct sh_unit *u, int nest);
  * open it) is not a closer.
  */
 struct group {
-    char word[8];    /* the plain word being read, if it is short enough */
-    size_t wlen;     /* its length, or sizeof word once it is too long */
-    bool cmd;        /* the next word is at command position */
-    bool plain;      /* the word being read has only plain characters */
-    int subject;     /* after `case`: 1 for its word, 2 when `in` is next */
-    int ncase;       /* case commands open */
-    unsigned pat;    /* bit per case, the innermost lowest: a pattern is next */
+    char word[8]; /* the plain word being read, if it is short enough */
+    size_t wlen;  /* its length, or sizeof word once it is too long */
+    bool cmd;     /* the next word is at command position */
+    bool plain;   /* the word being read has only plain characters */
+    int subject;  /* after `case`: 1 for its word, 2 when `in` is next */
+    int ncase;    /* case commands open */
+    unsigned pat; /* bit per case, the innermost lowest: a pattern is next */
 };
 
 static bool word_is(const struct group *g, const char *kw)
@@ -40,7 +40,7 @@ static bool word_is(const struct group *g, const char *kw)
 /* The word that just ended is complete. */
 static void group_word(struct group *g)
 {
-    static const char *const lead[] = {"then", "do",    "else", "elif", "if",
+    static const char *const lead[] = {"then",  "do",    "else", "elif", "if",
                                        "while", "until", "!",    "{",    "}"};
     bool at_cmd = g->cmd;
 

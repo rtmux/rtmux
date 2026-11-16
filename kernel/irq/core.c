@@ -468,10 +468,9 @@ int rdecl interrupt_mask(unsigned level, interrupt_t *itp)
             ilp->info->flags & INTR_FLAG_SMP_BROADCAST_MASK) {
             unsigned mycpu = get_cpunum();
 
-            for (unsigned _hi = 0; _hi < num_processors; ++_hi) {
-                unsigned h = _hi;
-                if (h != mycpu)
-                    SENDIPI(h, IPI_INTR_MASK);
+            for (unsigned cpu = 0; cpu < num_processors; ++cpu) {
+                if (cpu != mycpu && cpu_online(cpu))
+                    SENDIPI(cpu, IPI_INTR_MASK);
             }
         }
 #endif
@@ -518,10 +517,9 @@ int rdecl interrupt_unmask(unsigned level, interrupt_t *itp)
             ilp->info->flags & INTR_FLAG_SMP_BROADCAST_UNMASK) {
             unsigned mycpu = get_cpunum();
 
-            for (unsigned _hi = 0; _hi < num_processors; ++_hi) {
-                unsigned h = _hi;
-                if (h != mycpu)
-                    SENDIPI(h, IPI_INTR_UNMASK);
+            for (unsigned cpu = 0; cpu < num_processors; ++cpu) {
+                if (cpu != mycpu && cpu_online(cpu))
+                    SENDIPI(cpu, IPI_INTR_UNMASK);
             }
         }
 #endif

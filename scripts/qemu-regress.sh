@@ -1043,12 +1043,26 @@ check_smp_bringup()
 {
     local log="$1"
 
+    # Nothing may send an IPI to a CPU that was dropped at bring-up: send_ipi
+    # refuses one and reports it, so the line must not appear.
+    if grep -aq 'send_ipi: cpu [0-9]* was dropped at bring-up' "$log"; then
+        echo "  FAIL     ${MODE}: an IPI was sent to a dropped CPU"
+        grep -a 'send_ipi: cpu' "$log"
+        return 1
+    fi
+
     case "$MODE" in
     smp-hart-start-fail)
         require_log_patterns "$log" "injected start failure" \
             'cpu_start_others: hart [0-9]+ \(cpu 3\) failed' \
             'smp: hart [0-9]+ \(cpu 3\) did not start, dropped' \
             'smp: 3 harts online[[:space:]]*$' || return 1
+        ;;
+    smp-ap-crash-early)
+        require_log_patterns "$log" "crash before join" \
+            'cpu_start_others: hart [0-9]+ \(cpu 3\) failed' \
+            'injected crash on cpu 2 before it joined' \
+            'crash rendezvous: 3 arrived, 3 expected' || return 1
         ;;
     smp-hart-start-late)
         require_log_patterns "$log" "late hart" \
@@ -1128,9 +1142,10 @@ setup_fdt_cpu_status_or_skip()
 }
 
 # patch_fdt_resv_dts IN OUT: add a /memreserve/ entry and a /reserved-memory
-# node holding a no-map child with two reg pairs, a plain child and a reusable
-# child. Properties must precede subnodes, so the node goes in before the
-# root's first child.
+# node holding a no-map child with two reg pairs, a plain child, a reusable
+# child and 32 more plain children, and pad the root with 64 KiB of cells.
+# Properties must precede subnodes, so the node goes in before the root's
+# first child.
 patch_fdt_resv_dts()
 {
     awk '
@@ -1138,6 +1153,13 @@ patch_fdt_resv_dts()
             print; print "/memreserve/ 0x8c400000 0x10000;"; hdr = 1; next
         }
         /^\t[^\t].*\{$/ && !root {
+            # A large property on the root: the FDT grows by 64 KiB, so the
+            # startup path parses a bigger tree and the printed stack
+            # watermark covers it.
+            printf "\trtmux-fdt-pad = <"
+            for (i = 0; i < 16384; i++)
+                printf "0x0%s", (i < 16383 ? " " : "")
+            print ">;"
             print "\treserved-memory {"
             print "\t\t#address-cells = <0x02>;"
             print "\t\t#size-cells = <0x02>;"
@@ -1153,6 +1175,12 @@ patch_fdt_resv_dts()
             print "\t\t\treg = <0x00 0x8c300000 0x00 0x10000>;"
             print "\t\t\treusable;"
             print "\t\t};"
+            for (i = 0; i < 32; i++) {
+                a = 2354053120 + i * 131072
+                printf "\t\trtmux-resv-extra%d@%x {\n", i, a
+                printf "\t\t\treg = <0x00 0x%x 0x00 0x10000>;\n", a
+                print "\t\t};"
+            }
             print "\t};"
             print; root = 1; next
         }
@@ -1180,6 +1208,8 @@ setup_fdt_resv_or_skip()
 # before it prints "unmapped").
 check_fdt_resv()
 {
+    local line top ws used size
+
     require_log_patterns "$1" "reserved-memory fixture" \
         'fdt: reserved mmode_resv0@8c000000 \[8c000000\.\.8c010000\) no-map' \
         'fdt: reserved mmode_resv0@8c000000 \[8c100000\.\.8c110000\) no-map' \
@@ -1188,7 +1218,20 @@ check_fdt_resv()
         'fdt: reserved /memreserve/ \[8c400000\.\.8c410000\)[[:space:]]*$' \
         'unmapped no-map \[8c000000\.\.8c010000\)' \
         'unmapped no-map \[8c100000\.\.8c110000\)' \
-        '^  PASS  fdt-reserved-memory outside[[:space:]]*$'
+        'fdt: reserved rtmux-resv-extra31@8c8e0000 ' \
+        'boot: stack \[[0-9a-f]+\.\.[0-9a-f]+\) used [0-9]+ of [0-9]+ bytes, workspace \[[0-9a-f]+\.\.[0-9a-f]+\) disjoint' \
+        '^  PASS  fdt-reserved-memory outside[[:space:]]*$' || return 1
+    # The workspace must start at or above the stack top, and the stack must
+    # not have used more than its size.
+    line="$(grep -a 'boot: stack ' "$1" | head -n 1)"
+    top="$(sed -E 's/.*stack \[[0-9a-f]+\.\.([0-9a-f]+)\).*/\1/' <<<"$line")"
+    ws="$(sed -E 's/.*workspace \[([0-9a-f]+)\.\..*/\1/' <<<"$line")"
+    used="$(sed -E 's/.*used ([0-9]+) of ([0-9]+) bytes.*/\1/' <<<"$line")"
+    size="$(sed -E 's/.*used ([0-9]+) of ([0-9]+) bytes.*/\2/' <<<"$line")"
+    if [ $((16#$ws)) -lt $((16#$top)) ] || [ "$used" -gt "$size" ]; then
+        echo "  FAIL     ${MODE}: boot stack and workspace overlap: $line"
+        return 1
+    fi
 }
 
 # check_fdt_cpu_status LOG PLACEMENT: OpenSBI picks the boot hart by lottery, so
@@ -1638,6 +1681,20 @@ case "$MODE" in
         CPUS=4
         export CPUS
         ;;
+    smp-ap-crash-early)
+
+        # K32: the last of 4 harts fails to start and cpu 2 crashes after it
+        # committed to joining but before it is online, with cpu 1 online. The
+        # crash dump must complete, and its rendezvous must have waited for
+        # the exact set: cpu 0, cpu 1 and the crashing cpu 2.
+        BEGIN_MARKER='Boot command line:'
+        PASS_MARKER='=== END CRASH DUMP ==='
+        FAIL_MARKER='*** /usr unavailable'
+        MODE_ARG="rtmux.inject=hart-start-fail rtmux.inject=ap-crash-early"
+        NEEDS_DEBUG_INJECT=1
+        CPUS=4
+        export CPUS
+        ;;
     smp-sparse-harts|smp-too-many-harts)
 
         # K3: 10 harts against PROCESSORS_MAX=8. sparse-harts disables cpu@1..8
@@ -1867,6 +1924,11 @@ if [ "$MODE" = "lkl-fsd-crash" ] || [ "$MODE" = "lkl-netd-crash" ] ||
    [ "$MODE" = "lkl-netd-restart" ] || [ "$MODE" = "lkl-netd-stale" ] ||
    [ "$MODE" = "lkl-fsd-restart" ]; then
     BAD_RE='FATAL|CRASH|Kernel panic|panic:|lkl-host: panic|FREED-ACTIVE|__kernel_restore bad ptr|/usr unavailable|Undefined symbol|No such file or directory|Bad file descriptor'
+fi
+
+# smp-ap-crash-early crashes on purpose and checks the dump itself.
+if [ "$MODE" = "smp-ap-crash-early" ]; then
+    BAD_RE='FATAL|Kernel panic|panic:|FREED-ACTIVE|__kernel_restore bad ptr|/usr unavailable|Undefined symbol'
 fi
 
 # spawn-storm --procs measures teardown cost, which only an instrumented kernel
@@ -2742,7 +2804,7 @@ run_one()
     fi
 
     case "$MODE" in
-    smp-hart-start-fail|smp-hart-start-late|smp-sparse-harts|smp-too-many-harts)
+    smp-hart-start-fail|smp-hart-start-late|smp-ap-crash-early|smp-sparse-harts|smp-too-many-harts)
         check_smp_bringup "$log" || return 1
         ;;
     esac

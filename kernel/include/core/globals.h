@@ -234,6 +234,7 @@ extern paddr_t plic_base;
 extern size_t plic_size;
 extern paddr_t clint_base;
 EXT uint64_t legal_cpu_bitmask;
+EXT uint64_t online_cpu_mask;
 EXT uintptr_t run_ker_stack_bot;
 EXT uintptr_t run_ker_stack_top;
 EXT struct cpupage_entry *_cpupage_ptr;

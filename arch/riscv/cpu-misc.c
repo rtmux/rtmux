@@ -392,15 +392,28 @@ void halt(void)
  *
  * Parameters:
  *   cpu : logical CPU of the target (ipicmds[] is indexed by it; the SBI call
- *         names its hart as the mask base, so any hart ID works)
+ *         names its hart as the mask base, so any hart ID works); a CPU dropped
+ *         at bring-up gets nothing
  *   cmd : IPI command bits to OR into the target's pending word
  */
 void rdecl send_ipi(unsigned cpu, int cmd)
 {
     extern unsigned hart_ids[];
 
-    if (num_processors <= 1)
+    if (num_processors <= 1 || cpu >= num_processors)
         return;
+
+    /* A hart that was dropped at bring-up never joined and never will; there is
+     * nobody to take the interrupt. Callers are meant to have tested
+     * cpu_online(), so count the attempt (qemu-regress reports the warning) and
+     * send nothing.
+     */
+    if (!((__atomic_load_n(&legal_cpu_bitmask, __ATOMIC_RELAXED) >> cpu) & 1)) {
+        if (__atomic_fetch_add(&pcpu_array[cpu].pc_ipi_refused, 1,
+                               __ATOMIC_RELAXED) == 0)
+            LOGF_W("send_ipi: cpu %u was dropped at bring-up\n", cpu);
+        return;
+    }
 
     if (cmd != 0) {
         atomic_fetch_or_explicit(&pcpu_array[cpu].pc_ipicmds, (unsigned) cmd,
@@ -441,7 +454,7 @@ void cpu_icache_sync_all(void)
      * want of a PLIC context), so one mask from base 0 names them all.
      */
     for (i = 0; i < num_processors; ++i) {
-        if (i != self && pcpu_array[i].pc_alive)
+        if (i != self && cpu_online(i))
             mask |= 1UL << hart_ids[i];
     }
     if (mask != 0)
@@ -479,6 +492,9 @@ void cpu_idle(unsigned cpu)
                                          false, __ATOMIC_ACQ_REL,
                                          __ATOMIC_ACQUIRE))
             halt();
+#ifdef CONFIG_DEBUG_INJECT
+        smp_inject_ap_crash(cpu);
+#endif
     }
 
     /* Discard every translation cached during _smpstart bring-up before we
@@ -490,6 +506,7 @@ void cpu_idle(unsigned cpu)
      * anything walked between that point and here.
      */
     sfence_vma();
+    __atomic_or_fetch(&online_cpu_mask, 1ULL << cpu, __ATOMIC_RELEASE);
     __atomic_store_n(&pcpu_array[cpu].pc_alive, true, __ATOMIC_RELEASE);
 
     /* Set PLIC threshold to 0 so this hart can receive external interrupts.

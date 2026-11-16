@@ -22,11 +22,6 @@ static inline void rcu_cpu_relax(void)
     __asm__ volatile(".word 0x0100000f" ::: "memory");
 }
 
-static inline int rcu_cpu_alive(unsigned cpu)
-{
-    return __atomic_load_n(&pcpu_array[cpu].pc_alive, __ATOMIC_ACQUIRE);
-}
-
 void rcu_sched_quiescent(void)
 {
     unsigned cpu = get_cpunum();
@@ -190,7 +185,7 @@ static unsigned rcu_sched_busy_peers(struct rcu_sched_busy *detail)
         if (__atomic_load_n(&pcpu_array[cpu].pc_rcu_waiting,
                             __ATOMIC_ACQUIRE) != 0)
             continue;
-        if (!rcu_cpu_alive(cpu))
+        if (!cpu_online(cpu))
             continue;
         peers++;
         rcu_sched_busy_add_peer(detail, cpu);
@@ -216,7 +211,7 @@ void rcu_sched_wait(rcu_epoch_t goal)
                 __atomic_load_n(&pcpu_array[cpu].pc_rcu_waiting,
                                 __ATOMIC_ACQUIRE) != 0)
                 break;
-            if (!rcu_cpu_alive(cpu))
+            if (!cpu_online(cpu))
                 break;
             depth = __atomic_load_n(&in_kcall[cpu], __ATOMIC_RELAXED);
             if (depth == 0 &&

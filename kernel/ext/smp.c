@@ -32,7 +32,8 @@ extern unsigned hart_ids[];
 /* Debug-only boot options that make the bring-up failure paths reachable under
  * QEMU: "rtmux.inject=hart-start-fail" fails the SBI start of the last CPU, and
  * "rtmux.inject=hart-start-late" starts it only after the wait for it has
- * expired, so it must park.
+ * expired, so it must park. "rtmux.inject=ap-crash-early" crashes another CPU
+ * before it joins (smp_inject_ap_crash).
  */
 static bool smp_cmdline_has(const char *opt)
 {
@@ -51,12 +52,39 @@ static bool smp_cmdline_has(const char *opt)
     return false;
 }
 
-/* smp_inject — true if the boot option opt is set and cpu is the last CPU, the
- * one the injected bring-up faults hit.
+/* smp_inject_at — true if the boot option opt is set and cpu is target. */
+static bool smp_inject_at(unsigned cpu, unsigned target, const char *opt)
+{
+    return cpu == target && smp_cmdline_has(opt);
+}
+
+/* smp_inject — true if opt is set and cpu is the last CPU, the one the injected
+ * bring-up faults hit.
  */
 bool smp_inject(unsigned cpu, const char *opt)
 {
-    return cpu == num_processors - 1 && smp_cmdline_has(opt);
+    return smp_inject_at(cpu, num_processors - 1, opt);
+}
+
+/* smp_inject_ap_crash — "rtmux.inject=ap-crash-early" crashes the CPU before
+ * the last one at the point where it has committed to joining but is not online
+ * yet, once CPU 1 is online, so the crash has an online sibling to quiesce and
+ * a CPU (the dropped last one) that never joins. Called with interrupts off.
+ */
+void smp_inject_ap_crash(unsigned cpu)
+{
+    uint64_t t0, ticks;
+
+    if (num_processors < 4 ||
+        !smp_inject_at(cpu, num_processors - 2, "rtmux.inject=ap-crash-early"))
+        return;
+    t0 = cpu_clock_ticks();
+    ticks = qtimeptr->cycles_per_sec / 1000 * SMP_START_WAIT_MS;
+    while (!cpu_online(1) && cpu_clock_ticks() - t0 < ticks)
+        MEM_BARRIER_RW();
+    if (!cpu_online(1))
+        kprintf("smp: inject: cpu 1 never came online, crashing anyway\n");
+    crash("injected crash on cpu %u before it joined", cpu);
 }
 #endif
 
@@ -119,6 +147,7 @@ static void smp_drop_cpu(unsigned cpu)
     kprintf("smp: hart %u (cpu %u) did not start, dropped\n", hart_ids[cpu],
             cpu);
     __atomic_and_fetch(&legal_cpu_bitmask, ~(1ULL << cpu), __ATOMIC_RELEASE);
+    __atomic_and_fetch(&online_cpu_mask, ~(1ULL << cpu), __ATOMIC_RELEASE);
 }
 #endif
 

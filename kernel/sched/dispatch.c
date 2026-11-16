@@ -188,17 +188,20 @@ static void kick_idle_hart(thread_t *thp)
 {
     unsigned mycpu = get_cpunum();
     uint64_t legal = __atomic_load_n(&LEGAL_CPU_BITMASK, __ATOMIC_RELAXED);
+    uint64_t live = legal & cpu_online_snapshot();
 
     for (unsigned h = 0; h < num_processors; h++) {
-        thread_t *act = get_active_thread(h);
+        thread_t *act;
 
         /* A dropped CPU keeps the idle thread init_objects() gave it, so it
-         * would look asleep and absorb the kick; skip it as select_cpu does.
+         * would look asleep and absorb the kick; skip it, and a CPU that has
+         * not joined yet, which cannot take the interrupt.
          */
-        if (!(legal & (1ULL << h)))
+        if (!cpu_in_mask(live, h) || h == mycpu ||
+            (thp->runmask & (1u << h)) != 0)
             continue;
-        if (h != mycpu && (thp->runmask & (1u << h)) == 0 && act &&
-            act == pcpu_array[h].pc_idle_thp) {
+        act = get_active_thread(h);
+        if (act && act == pcpu_array[h].pc_idle_thp) {
             SENDIPI(h, IPI_RESCHED);
             return;
         }
@@ -307,10 +310,14 @@ static thread_t *rdecl select_thread_default(int cpu, int prio)
         SCHED_UNLOCK(pcpu_array[cpu].pc_dispatch);
 
         for (int idx = 0; idx < (int) num_processors; idx++) {
-            unsigned hart = (unsigned) idx;
-            if (hart == (unsigned) cpu)
+            unsigned other = (unsigned) idx;
+
+            /* Not cpu_online(): a thread queued on an AP before it joined or
+             * was dropped is only ever taken from its queue here.
+             */
+            if (other == (unsigned) cpu)
                 continue;
-            kdispatch_t *odpp = pcpu_array[hart].pc_dispatch;
+            kdispatch_t *odpp = pcpu_array[other].pc_dispatch;
             if (!odpp)
                 continue;
             SCHED_LOCK(odpp);
@@ -583,15 +590,20 @@ void rdecl sched_account_restart(void)
  */
 uint64_t rdecl sched_account_read(thread_t *thp, uint64_t now)
 {
-    for (unsigned hart = 0; hart < num_processors; hart++) {
-        struct pcpu *pc = &pcpu_array[hart];
+    uint64_t online = cpu_online_snapshot();
+
+    for (unsigned cpu = 0; cpu < num_processors; cpu++) {
+        struct pcpu *pc = &pcpu_array[cpu];
+
+        if (!cpu_in_mask(online, cpu))
+            continue;
 
         /* runcpu is set by mark_running on the hart that now runs thp, so a
          * hart that still names thp after it was handed to another (yield/
          * resched enqueue, then mark_running) is skipped.
          */
         if (__atomic_load_n(&pc->pc_curthread, __ATOMIC_ACQUIRE) != thp ||
-            thp->runcpu != hart)
+            thp->runcpu != cpu)
             continue;
         for (int tries = 0; tries < 3; tries++) {
             unsigned s1 =
@@ -1111,8 +1123,13 @@ static void force_ready_msgxfer(thread_t *thp, unsigned err)
      * the msgxfer, and send ipi to preempt that one
      */
     {
+        uint64_t online = cpu_online_snapshot();
+
         for (int _hi = 0; _hi < num_processors; _hi++) {
             unsigned h = (unsigned) _hi;
+
+            if (!cpu_in_mask(online, h))
+                continue;
 
             /* Load the hart's active thread once: it clears to NULL whenever
              * that hart blocks into idle, so a second get_active_thread(h)

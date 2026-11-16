@@ -312,7 +312,11 @@ static void stall_dump(void)
 
     kprintf("-- Per-CPU active thread --\n");
     for (cpu = 0; cpu < num_processors; cpu++) {
-        thread_t *thp = get_active_thread(cpu);
+        thread_t *thp;
+
+        if (!cpu_online(cpu))
+            continue;
+        thp = get_active_thread(cpu);
         if (!thp) {
             kprintf("  cpu%u: <none>\n", cpu);
             continue;

@@ -76,6 +76,7 @@ struct tm *_gmtime(const time_t *timer, struct tm *tmbuf);
 /* Memory management */
 void *ws_alloc(size_t);
 paddr_t boot_in_use_end(void);
+void boot_layout_check(void);
 void add_sysram(void);
 void avoid_ram(paddr_t, size_t size);
 void add_ram(paddr_t start, uint64_t size);

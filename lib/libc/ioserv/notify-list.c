@@ -142,6 +142,7 @@ int ioserv_notify(ioserv_context_t *ctp,
         if (!(flags & 1u))
             continue;
         pp = notify_find(ctp, &nop[i]);
+
         /* A hangup already known is the reply: the client is not left waiting,
          * so nothing is armed for it.
          */

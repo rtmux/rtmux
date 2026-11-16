@@ -159,7 +159,11 @@ void crash_quiesce_self(void) __attribute__((noreturn));
 
 /* Structured logging macros */
 #define LOGF_E(fmt, ...) kprintf("ERROR: " fmt, ##__VA_ARGS__)
-#define LOGF_W(fmt, ...) kprintf("WARNING: " fmt, ##__VA_ARGS__)
+
+/* Rate-limited per call site by the KPRINTF_RATELIMITED limiter: a warning that
+ * fires in a loop prints its burst, then at most one line a second.
+ */
+#define LOGF_W(fmt, ...) KPRINTF_RATELIMITED("WARNING: " fmt, ##__VA_ARGS__)
 #define LOGF_I(fmt, ...) kprintf(fmt, ##__VA_ARGS__)
 #define LOGF_D(fmt, ...)                 \
     do {                                 \

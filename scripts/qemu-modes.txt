@@ -76,6 +76,7 @@ shutdown-sync
 shutdown-sync-ignore
 shutdown-sync-negative
 shutdown-sync-wedge
+smp-ap-crash-early
 smp-hart-start-fail
 smp-hart-start-late
 smp-invariants

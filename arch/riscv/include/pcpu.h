@@ -155,7 +155,8 @@ struct pcpu {
      * by one tick. Cross-hart rule: single writer, any reader.
      */
     atomic_ulong pc_timer_progress;
-    uint8_t pc_pad[72];         /* keep sizeof(struct pcpu) power-of-two */
+    atomic_uint pc_ipi_refused; /* IPIs sent to this CPU after it was dropped */
+    uint8_t pc_pad[68];         /* keep sizeof(struct pcpu) power-of-two */
 };
 
 #ifndef __cplusplus

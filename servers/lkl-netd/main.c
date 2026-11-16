@@ -810,10 +810,10 @@ static int netd_open(ioserv_context_t *ctp,
          * block (106 fixed bytes and 6 counters), 769 bytes in all, against the
          * 1024 of ocb->text.
          */
-        _Static_assert(256 + 14 * 20 + sizeof(RTMUX_LKL_NETD_CMDLINE) - 1 +
-                               106 + 6 * 20 <=
-                           sizeof(((struct netd_ocb *) 0)->text),
-                       "/net/stats must fit the ocb text buffer");
+        _Static_assert(
+            256 + 14 * 20 + sizeof(RTMUX_LKL_NETD_CMDLINE) - 1 + 106 + 6 * 20 <=
+                sizeof(((struct netd_ocb *) 0)->text),
+            "/net/stats must fit the ocb text buffer");
 
         if ((msg->connect.ioflag & _IO_FLAG_WR) != 0) {
             free(ocb);

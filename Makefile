@@ -746,8 +746,8 @@ HART_WATCHDOG_MODES = debug-inject hart-watchdog hart-watchdog-console \
                       hart-watchdog-idle roottask-wait-watch
 # Secondary-hart bring-up: a failed or late start, sparse hart IDs, and more
 # harts than PROCESSORS_MAX.
-SMP_BRINGUP_MODES = smp-hart-start-fail smp-hart-start-late smp-sparse-harts \
-                    smp-too-many-harts
+SMP_BRINGUP_MODES = smp-hart-start-fail smp-hart-start-late smp-ap-crash-early \
+                    smp-sparse-harts smp-too-many-harts
 GUEST_MISC_MODES = posix-cap-boundary sh-posix serial-unblock trace-negative syslog-wrap \
                    shutdown-sync-wedge
 # Each rebuilds the kernel with instrumentation, so they are slower than the others.

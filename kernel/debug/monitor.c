@@ -497,6 +497,10 @@ static void mon_dump_ghost_running(void)
              */
             bool is_idle = false;
             for (unsigned i = 0; i < num_processors; i++) {
+                /* Not cpu_online(): init_objects() leaves the idle thread of a
+                 * dropped or not-yet-joined CPU in STATE_RUNNING with no
+                 * pc_curthread, which would read as a ghost.
+                 */
                 if (pcpu_array[i].pc_idle_thp == thp) {
                     is_idle = true;
                     break;
@@ -509,10 +513,9 @@ static void mon_dump_ghost_running(void)
              * none — that's a real ghost.
              */
             int owner = -1;
-            for (unsigned i = 0; i < num_processors; i++) {
-                unsigned hart = i;
-                if (pcpu_array[hart].pc_curthread == thp) {
-                    owner = (int) hart;
+            for (unsigned cpu = 0; cpu < num_processors; cpu++) {
+                if (cpu_online(cpu) && pcpu_array[cpu].pc_curthread == thp) {
+                    owner = (int) cpu;
                     break;
                 }
             }
@@ -779,9 +782,12 @@ void __attribute__((noreturn)) monitor_loop(void)
          * = held, u = unlocked).
          */
         mon_puts("sched=");
-        for (unsigned i = 0; i < num_processors; i++) {
-            unsigned hart = i;
-            struct dispatch_entry *dpp = pcpu_array[hart].pc_dispatch;
+        for (unsigned cpu = 0; cpu < num_processors; cpu++) {
+            struct dispatch_entry *dpp = pcpu_array[cpu].pc_dispatch;
+            if (!cpu_online(cpu)) {
+                mon_putc('-');
+                continue;
+            }
             if (!dpp) {
                 mon_putc('?');
                 continue;
@@ -799,7 +805,11 @@ void __attribute__((noreturn)) monitor_loop(void)
          */
         for (unsigned i = 0; i < num_processors; i++) {
             unsigned hart = i;
-            thread_t *thp = get_active_thread(hart);
+            thread_t *thp;
+
+            if (!cpu_online(hart))
+                continue;
+            thp = get_active_thread(hart);
             mon_puts(" h");
             mon_put_dec(hart);
             mon_putc(':');
