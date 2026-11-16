@@ -5,9 +5,8 @@
 # records NAME in $res; the final line is "sh-posix: PASS" iff every check
 # passed.
 #
-# Uses only shell features that are already implemented (no functions, command
-# groups, or arithmetic yet), so the suite itself never depends on an
-# unimplemented feature.
+# The suite uses only features the shell has; the cases where it once differed
+# from dash are in gaps.sh, which also runs under dash.
 #
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -626,6 +625,169 @@ test "$?" != 0 && echo "  ok trap-bad" || res="${res}trap-bad "
 out=$(sh -c "trap '1; echo bye' EXIT; :" 2>/dev/null)
 test "$out" = bye && echo "  ok trap-digit-action" || res="${res}trap-digit-action "
 test "$PC" = 3 && echo "  ok prefix-special" || res="${res}prefix-special "
+# --- IFS (POSIX 2.6.5) --------------------------------------------------------
+# splitting at the characters of IFS; two non-blank delimiters bound an empty
+# field, a trailing one does not
+IFS=:
+x="a:b::c:"
+set -- $x
+test "$#" = 4 && test "$1" = a && test "$3" = "" && test "$4" = c &&
+    echo "  ok ifs-split" || res="${res}ifs-split "
+x=":a"
+set -- $x
+test "$#" = 2 && test "$1" = "" && echo "  ok ifs-leading" || res="${res}ifs-leading "
+# a quoted expansion is not split; "$*" joins with the first character of IFS
+set -- "$x"
+test "$#" = 1 && echo "  ok ifs-quoted" || res="${res}ifs-quoted "
+set -- p q r
+test "$*" = p:q:r && echo "  ok ifs-star" || res="${res}ifs-star "
+set -- $(echo a:b)
+test "$#" = 2 && echo "  ok ifs-cmdsub" || res="${res}ifs-cmdsub "
+# blanks in IFS run together and trim; one beside another delimiter is part of it
+IFS=' :'
+x=" a  b : c "
+set -- $x
+test "$#" = 3 && test "$1" = a && test "$2" = b && test "$3" = c &&
+    echo "  ok ifs-blank-delim" || res="${res}ifs-blank-delim "
+x="a :b"
+set -- $x
+test "$#" = 2 && echo "  ok ifs-delim-pair" || res="${res}ifs-delim-pair "
+x="a  :b"
+set -- $x
+test "$#" = 2 && test "$2" = b && echo "  ok ifs-blank-run-delim" || res="${res}ifs-blank-run-delim "
+# a quoted word in ${...} is one field, even where it holds an IFS character
+IFS=:
+unset hv
+set -- ${hv:-"a:b"}
+test "$#" = 1 && test "$1" = a:b && echo "  ok ifs-quoted-word" || res="${res}ifs-quoted-word "
+set -- ${hv:-c:d}
+test "$#" = 2 && echo "  ok ifs-unquoted-word" || res="${res}ifs-unquoted-word "
+IFS=' :'
+# an empty IFS splits nothing; an unset one is blank, tab and newline
+IFS=
+x="a b:c"
+set -- $x
+test "$#" = 1 && echo "  ok ifs-empty" || res="${res}ifs-empty "
+set -- p q
+test "$*" = pq && echo "  ok ifs-empty-star" || res="${res}ifs-empty-star "
+unset IFS
+x="  a   b  "
+set -- $x
+test "$#" = 2 && test "$*" = "a b" && echo "  ok ifs-unset" || res="${res}ifs-unset "
+# read splits the line the same way, and the last variable keeps the rest
+IFS=: read ra rb rc <<EOF
+a:b:c:d
+EOF
+test "$ra" = a && test "$rb" = b && test "$rc" = c:d && echo "  ok ifs-read" || res="${res}ifs-read "
+test -z "${IFS+set}" && echo "  ok ifs-read-scoped" || res="${res}ifs-read-scoped "
+IFS= read -r rl <<EOF
+  lead and trail  
+EOF
+test "$rl" = "  lead and trail  " && echo "  ok ifs-read-keep" || res="${res}ifs-read-keep "
+read ra rb <<EOF
+   one   two three  
+EOF
+test "$ra" = one && test "$rb" = "two three" && echo "  ok read-trim" || res="${res}read-trim "
+IFS=' :' read ra rb rc <<EOF
+a :b::c
+EOF
+test "$ra" = a && test "$rb" = b && test "$rc" = :c && echo "  ok ifs-read-delim" || res="${res}ifs-read-delim "
+
+# one delimiter at the end of the line ends the last field; a run keeps its empty ones
+IFS=: read ra rb <<EOF
+a:b:
+EOF
+test "$ra" = a && test "$rb" = b && echo "  ok ifs-read-trailing" || res="${res}ifs-read-trailing "
+IFS=: read ra rb <<EOF
+a:b::
+EOF
+test "$rb" = "b::" && echo "  ok ifs-read-trailing-run" || res="${res}ifs-read-trailing-run "
+
+# --- closing and duplicating descriptors --------------------------------------
+# >&WORD duplicates the descriptor WORD expands to; >&- closes: every write fails
+out=$(sh -c 'echo hi >&$1' sh 1 2>/dev/null)
+test "$out" = hi && echo "  ok dup-fd-var" || res="${res}dup-fd-var "
+out=$(sh -c 'echo hi >&$1' sh 2 2>/dev/null)
+test -z "$out" && echo "  ok dup-fd-err" || res="${res}dup-fd-err "
+out=$(sh -c 'fd=2; echo hi >&$fd' 2>&1)
+test "$out" = hi && echo "  ok dup-fd-expand" || res="${res}dup-fd-expand "
+echo x | cat >&- 2>/dev/null
+test "$?" != 0 && echo "  ok close-out" || res="${res}close-out "
+echo x | cat 2>&- >/dev/null
+test "$?" = 0 && echo "  ok close-err-unused" || res="${res}close-err-unused "
+sh -c 'echo a >&99' 2>/dev/null
+test "$?" != 0 && echo "  ok dup-bad-fd" || res="${res}dup-bad-fd "
+sh -c 'echo a >&x' 2>/dev/null
+test "$?" != 0 && echo "  ok dup-bad-word" || res="${res}dup-bad-word "
+out=$(echo seen; echo gone >&- 2>/dev/null; echo after)
+test "$out" = "$(printf 'seen\nafter')" && echo "  ok close-scoped" || res="${res}close-scoped "
+
+# --- an assignment-only command's status --------------------------------------
+x=$(false)
+test "$?" = 1 && echo "  ok assign-status" || res="${res}assign-status "
+x=$(exit 3)
+test "$?" = 3 && echo "  ok assign-status-3" || res="${res}assign-status-3 "
+x=$(true) y=$(exit 5)
+test "$?" = 5 && echo "  ok assign-status-last" || res="${res}assign-status-last "
+false
+x=7
+test "$?" = 0 && echo "  ok assign-status-plain" || res="${res}assign-status-plain "
+false
+x=$(echo ok)
+test "$?" = 0 && echo "  ok assign-status-ok" || res="${res}assign-status-ok "
+
+# --- "$@" with no parameters ----------------------------------------------------
+set --
+set -- "$@$@"
+test "$#" = 0 && echo "  ok at-at-empty" || res="${res}at-at-empty "
+set -- a "$@" b
+test "$#" = 2 && echo "  ok at-empty-between" || res="${res}at-empty-between "
+set --
+set -- "$@" ""
+test "$#" = 1 && echo "  ok at-empty-then-empty" || res="${res}at-empty-then-empty "
+set -- 1 2
+set -- "$@$@"
+test "$#" = 3 && test "$2" = 21 && echo "  ok at-at-joined" || res="${res}at-at-joined "
+set --
+
+# --- trap: an action runs as soon as an interactive shell's read is interrupted
+# The reader is a shell with a prompt reading commands from a pipe. A sibling
+# kills it with TERM while it waits for its next line, and its trap action
+# wakes the feeder, which sends that line only then: if the action had to wait
+# for a line, the feeder would give up (30 s) and "after" would come first.
+Q="'"
+FEED="trap go=1 HUP; echo \"trap ${Q}echo trapped; kill -HUP \$\$${Q} TERM\";"
+FEED="$FEED echo \"sh -c ${Q}sleep 1; kill -TERM \\\$1${Q} x \\\$\\\$ &\"; i=0;"
+FEED="$FEED while test -z \"\$go\" && test \"\$i\" -lt 30; do sleep 1; i=\$((i + 1)); done;"
+FEED="$FEED echo \"echo after\""
+out=$(sh -c "$FEED" | sh 2>&1)
+tail=${out#*trapped}
+head=${out%%trapped*}
+test "$tail" != "$out" && test "${tail#*after}" != "$tail" &&
+    test "${head#*after}" = "$head" && echo "  ok trap-read-interrupt" ||
+    res="${res}trap-read-interrupt "
+
+# --- the quote and substitution scanner, against a reference shell ------------
+# 260 cases: each line goes through eval here, and its fields must be the ones
+# dash made of it (tests/host/gen-sh-quote-cases.py)
+if test -f /bin/sh-posix-quote-run && test -f /bin/sh-posix-quote-cases; then
+    qt=$(sh /bin/sh-posix-quote-run /bin/sh-posix-quote-cases 2>&1)
+    qs=$?
+    echo "$qt"
+    test "$qs" = 0 && echo "  ok quote-table" || res="${res}quote-table "
+else
+    res="${res}quote-table-missing "
+fi
+# --- the gaps against a reference shell ---------------------------------------
+# gaps.sh holds the cases where this shell once differed from dash, with what
+# dash makes of each; it passes under dash as it is
+if test -f /bin/sh-posix-gaps; then
+    SH=sh sh /bin/sh-posix-gaps 2>&1
+    gs=$?
+    test "$gs" = 0 && echo "  ok gaps" || res="${res}gaps "
+else
+    res="${res}gaps-missing "
+fi
 # ----------------------------------------------------------------------------
 if test -z "$res"; then
     echo "sh-posix: PASS"

@@ -5,6 +5,7 @@
  */
 
 #include "toolbox.h"
+#include "sh-scan.h"
 
 #include <ctype.h>
 #include <dirent.h>
@@ -18,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/select.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <termios.h>
@@ -114,6 +116,7 @@ struct sh {
     int heredoc_fd;    /* pending here-document body on stdin, else -1 */
     bool expand_abort; /* a `set -u` failure: skip the command being expanded */
     int errexit_suppress; /* >0 while in a context where `set -e` is ignored */
+    int subst_status; /* status of the last command substitution, -1: none */
     char *traps[SH_NTRAPS]; /* trap actions, see sh_trap_sigs; NULL: none */
     bool trap_inherited[SH_NTRAPS]; /* from a parent: listed, never run */
 };
@@ -152,8 +155,11 @@ enum sh_key {
     SH_KEY_DELETE,
     SH_KEY_HOME,
     SH_KEY_END,
+    SH_KEY_INTR, /* the read was interrupted by a signal */
 };
 
+static void sh_run_traps(struct sh *sh);
+static bool sh_traps_pending(void);
 static int run_file(struct sh *sh, const char *path);
 static int run_line(struct sh *sh, const char *line);
 static int run_text(struct sh *sh, const char *text);
@@ -165,6 +171,37 @@ static int run_function(struct sh *sh,
                         struct sh_func *fn,
                         char **argv,
                         int argc);
+
+/* How a ${...} expansion's result will be used (expand_dollar, expand_braced).
+ */
+#define XF_SPLIT                                                          \
+    1           /* it is field-split: a quoted blank is marked, see below \
+                 */
+#define XF_DQ 2 /* it is inside double quotes */
+
+/* A quoted IFS character in a ${...} result that is going to be field-split is
+ * preceded by this byte, which emit_sub_result removes, so it does not split
+ * the field; so is a data byte equal to it.
+ */
+#define SH_QUOTED_BLANK '\001'
+
+/* After that byte, this one stands for an empty quoted string in such a result:
+ * a field of its own, though it has no character.
+ */
+#define SH_QUOTED_EMPTY '\002'
+
+/* In the fds of a command, a descriptor that `>&-` closes (-1 is "not set"). */
+#define SH_FD_CLOSED (-2)
+
+static int unit_arith(struct sh *sh,
+                      const struct sh_unit *u,
+                      bool diag,
+                      char *nb);
+static int unit_cmdsub(struct sh *sh,
+                       const struct sh_unit *u,
+                       bool dq,
+                       char **result);
+static char *expand_word(struct sh *sh, const char *s, bool pattern, int xf);
 
 static const char *const sh_builtin_names[] = {
     ":",    ".",      "break",   "cd",     "command", "continue", "echo",
@@ -236,8 +273,11 @@ static int sh_read_key(void)
 {
     char c;
     char seq[3];
+    ssize_t r = read(STDIN_FILENO, &c, 1);
 
-    if (read(STDIN_FILENO, &c, 1) != 1)
+    if (r < 0 && errno == EINTR)
+        return SH_KEY_INTR;
+    if (r != 1)
         return SH_KEY_NULL;
     if (c != '\033')
         return (unsigned char) c;
@@ -463,10 +503,92 @@ static void sh_apply_completion(const char *prompt,
     }
 }
 
-static int sh_read_line(struct sh *sh,
-                        const char *prompt,
-                        char *out,
-                        size_t outsz)
+/* Make a trapped signal end (restart false) or not end (true) a blocked read:
+ * while the shell waits for a command line, its action has to run at once.
+ */
+static void sh_trap_restart(struct sh *sh, bool restart)
+{
+    for (int i = 1; i < SH_NTRAPS; i++) {
+        struct sigaction sa;
+
+        if (!sh->traps[i] || !*sh->traps[i] ||
+            sigaction(sh_trap_sigs[i].sig, NULL, &sa) != 0)
+            continue;
+        sa.sa_flags =
+            restart ? sa.sa_flags | SA_RESTART : sa.sa_flags & ~SA_RESTART;
+        sigaction(sh_trap_sigs[i].sig, &sa, NULL);
+    }
+}
+
+/* Run the pending trap actions from inside a read. They are commands like any
+ * other, so a signal that arrives while one runs must not end its waits:
+ * restart is back on for them, and off again for the read, for the traps they
+ * set too.
+ */
+static void sh_run_traps_in_read(struct sh *sh)
+{
+    if (!sh_traps_pending())
+        return;
+    sh_trap_restart(sh, true);
+    sh_run_traps(sh);
+    sh_trap_restart(sh, false);
+}
+
+/* Run the pending trap actions while the line editor has the terminal raw: with
+ * the saved modes back, so their output and the commands they run see a normal
+ * terminal, and raw again for the editor.
+ */
+static void sh_run_traps_on_tty(struct sh *sh, const struct termios *saved)
+{
+    struct termios raw_again;
+
+    tcsetattr(STDIN_FILENO, TCSANOW, saved);
+    sh_write_all("\r\n");
+    sh_run_traps_in_read(sh);
+    (void) sh_enable_raw(&raw_again);
+}
+
+/* Wait for input on stdin without losing a trapped signal that arrives between
+ * the check for one that is pending and the read: those signals are blocked
+ * while it is made, and unblocked only inside pselect, which then returns at
+ * once if one is caught.
+ *
+ * Returns true when stdin can be read (or has failed, which read reports), false
+ * when a signal ended the wait, with its action pending.
+ */
+static bool sh_await_input(struct sh *sh)
+{
+    sigset_t block;
+    sigset_t old;
+    fd_set rd;
+    bool armed = false;
+    int r;
+
+    sigemptyset(&block);
+    for (int i = 1; i < SH_NTRAPS; i++) {
+        if (sh->traps[i] && *sh->traps[i]) {
+            sigaddset(&block, sh_trap_sigs[i].sig);
+            armed = true;
+        }
+    }
+    if (!armed)
+        return true;
+    sigprocmask(SIG_BLOCK, &block, &old);
+    if (sh_traps_pending()) {
+        sigprocmask(SIG_SETMASK, &old, NULL);
+        return false;
+    }
+    FD_ZERO(&rd);
+    FD_SET(STDIN_FILENO, &rd);
+    r = pselect(STDIN_FILENO + 1, &rd, NULL, NULL, NULL, &old);
+    sigprocmask(SIG_SETMASK, &old, NULL);
+    return r >= 0 || errno != EINTR;
+}
+
+static int sh_read_line_body(struct sh *sh,
+                             const char *prompt,
+                             char *out,
+                             size_t outsz)
 {
     struct termios saved;
     char buf[SH_LINE_MAX];
@@ -479,17 +601,48 @@ static int sh_read_line(struct sh *sh,
         return -1;
     raw = sh->interactive && sh_enable_raw(&saved) == 0;
     if (!raw) {
+        /* Not a terminal: one line, a byte at a time. A signal that is trapped
+         * ends the read, runs its action, and the read goes on.
+         */
         fputs(prompt, stdout);
         fflush(stdout);
-        if (!fgets(out, (int) outsz, stdin))
-            return -1;
-        return 0;
+        while (len + 1 < outsz) {
+            char ch;
+            ssize_t r;
+
+            /* A signal caught since the last read has not interrupted one. */
+            sh_run_traps_in_read(sh);
+            if (!sh_await_input(sh))
+                continue;
+            r = read(STDIN_FILENO, &ch, 1);
+            if (r < 0 && errno == EINTR)
+                continue;
+            if (r <= 0)
+                break;
+            out[len++] = ch;
+            if (ch == '\n')
+                break;
+        }
+        out[len] = '\0';
+        return len == 0 ? -1 : 0;
     }
     buf[0] = '\0';
     sh_write_all(prompt);
     for (;;) {
-        int c = sh_read_key();
+        int c;
 
+        if (sh_traps_pending()) { /* caught since the last key */
+            sh_run_traps_on_tty(sh, &saved);
+            sh_refresh_line(prompt, buf, pos);
+        }
+        if (!sh_await_input(sh))
+            continue; /* a trapped signal came in: run it first */
+        c = sh_read_key();
+        if (c == SH_KEY_INTR) { /* a trapped signal: run it, then go on */
+            sh_run_traps_on_tty(sh, &saved);
+            sh_refresh_line(prompt, buf, pos);
+            continue;
+        }
         if (c == SH_KEY_NULL || c == 4) {
             tcsetattr(STDIN_FILENO, TCSANOW, &saved);
             return -1;
@@ -598,8 +751,15 @@ static void trim(char *s)
         memmove(s, p, strlen(p) + 1);
     n = strlen(s);
     while (n > 0 && (s[n - 1] == '\n' || s[n - 1] == '\r' || s[n - 1] == ' ' ||
-                     s[n - 1] == '\t'))
+                     s[n - 1] == '\t')) {
+        size_t bs = 0;
+
+        while (bs < n - 1 && s[n - 2 - bs] == '\\')
+            bs++;
+        if (bs % 2 && s[n - 1] != '\n' && s[n - 1] != '\r')
+            break; /* a blank that a backslash makes part of the word */
         s[--n] = '\0';
+    }
 }
 
 /* Whether the unquoted # at p in line starts a comment: it starts a word. */
@@ -676,7 +836,33 @@ static bool is_valid_varname(const char *s)
     return true;
 }
 
-/* Join $1..$n with a single space into a fresh buffer ("" when empty). */
+/* IFS, the characters that separate fields: its value, or blank, tab and
+ * newline when it is unset. An empty IFS splits nothing.
+ */
+static const char *ifs_value(void)
+{
+    const char *v = getenv("IFS");
+
+    return v ? v : " \t\n";
+}
+
+/* Whether c is an IFS white space character: a blank, tab or newline in IFS,
+ * which runs together and is trimmed from the ends of the fields.
+ */
+static bool ifs_is_space(const char *ifs, int c)
+{
+    return (c == ' ' || c == '\t' || c == '\n') && strchr(ifs, c) != NULL;
+}
+
+/* The character that joins the parameters in "$*": the first of IFS, a blank
+ * when it is unset, and none when it is empty (0).
+ */
+static char ifs_joiner(void)
+{
+    return ifs_value()[0];
+}
+
+/* Join $1..$n with the joiner of "$*" into a fresh buffer ("" when empty). */
 static char *sh_join_params(struct sh *sh)
 {
     char *buf = NULL;
@@ -684,7 +870,8 @@ static char *sh_join_params(struct sh *sh)
     size_t cap = 0;
 
     for (int i = 0; i < sh->nparams; i++) {
-        if ((i > 0 && append_char(&buf, &len, &cap, ' ') != 0) ||
+        if ((i > 0 && ifs_joiner() &&
+             append_char(&buf, &len, &cap, ifs_joiner()) != 0) ||
             append_str(&buf, &len, &cap, sh->params[i]) != 0) {
             free(buf);
             return NULL;
@@ -776,38 +963,64 @@ static void nounset_check(struct sh *sh, const char *name, const char *value)
         sh->exit_requested = true;
 }
 
+/* s with a mark before each byte that equals the mark, so that a field-split
+ * result tells its own marks from the data. Frees s.
+ */
+static char *mark_literal(char *s)
+{
+    size_t n = strlen(s);
+    size_t extra = 0;
+    char *r;
+    char *w;
+
+    for (size_t i = 0; i < n; i++)
+        extra += s[i] == SH_QUOTED_BLANK;
+    if (extra == 0)
+        return s;
+    r = malloc(n + extra + 1);
+    if (!r) {
+        free(s);
+        return NULL;
+    }
+    for (w = r, n = 0; s[n] != '\0'; n++) {
+        if (s[n] == SH_QUOTED_BLANK)
+            *w++ = SH_QUOTED_BLANK;
+        *w++ = s[n];
+    }
+    *w = '\0';
+    free(s);
+    return r;
+}
+
 /* Parse and expand ${ ... }. On entry *pp points just past '{'; on return just
  * past the matching '}'. Supports length (${#name}), ${@}/${*},
  * defaults/assign/ error/alt (${n:-w} ${n-w} ${n:=w} ${n=w} ${n:?w} ${n?w}
  * ${n:+w} ${n+w}), and prefix/suffix trims (${n#pat} ${n##pat} ${n%pat}
- * ${n%%pat}). The word/pattern is taken literally (no nested expansion yet).
+ * ${n%%pat}). The word of a default or alternative expands in turn, and a
+ * pattern keeps its quoting.
  *
  * Returns malloc'd; "" on error.
  */
-static char *expand_braced(struct sh *sh, const char **pp)
+static char *expand_braced(struct sh *sh, const char **pp, int xf)
 {
-    const char *p = *pp;
-    const char *start = p;
+    struct sh_scan sc = {*pp - 2, 0}; /* at the $ of ${ */
+    struct sh_unit u;
     char *content;
     char *name;
     const char *op;
     const char *value;
-    size_t clen;
     size_t nlen;
     int colon = 0;
+    bool from_word = false; /* result is a word expand_word marked */
     char *result;
 
-    while (*p != '\0' && *p != '}')
-        p++;
-    if (*p != '}')
+    sh_unit_next(&sc, &u);
+    if (u.kind != SH_U_BRACE || !u.closed)
         return strdup("");
-    clen = (size_t) (p - start);
-    content = malloc(clen + 1);
+    content = dup_range(u.body, u.body_len);
     if (!content)
         return strdup("");
-    memcpy(content, start, clen);
-    content[clen] = '\0';
-    *pp = p + 1;
+    *pp = sc.p;
 
     /* ${#name} -> length of the value ($# count is handled in expand_dollar).
      */
@@ -847,13 +1060,16 @@ static char *expand_braced(struct sh *sh, const char **pp)
         result = strdup(cur);
     } else if (*op == '#' || *op == '%') {
         int longest = op[1] == *op;
-        const char *pat = op + (longest ? 2 : 1);
+        char *pat = expand_word(sh, op + (longest ? 2 : 1), true, 0);
 
         nounset_check(sh, name, value);
-        result = sh_trim(cur, pat, *op == '#', longest);
+        result = pat ? sh_trim(cur, pat, *op == '#', longest) : strdup(cur);
+        free(pat);
     } else {
         int missing;
         const char *word;
+        char *wexp = NULL;
+        char *wplain = NULL;
 
         if (*op == ':') {
             colon = 1;
@@ -861,37 +1077,51 @@ static char *expand_braced(struct sh *sh, const char **pp)
         }
         missing = value == NULL || (colon && value[0] == '\0');
         word = op[0] != '\0' ? op + 1 : "";
+
+        /* Only the word that is used is expanded, as POSIX 2.6.2 says. */
+        if ((*op == '-' && missing) || (*op == '+' && !missing))
+            wexp = expand_word(sh, word, false, xf);
+        else if ((*op == '=' && missing) || (*op == '?' && missing))
+            wplain = expand_word(sh, word, false, xf & XF_DQ);
         switch (*op) {
         case '-':
-            result = strdup(missing ? word : cur);
+            result = missing ? wexp : strdup(cur);
+            from_word = missing;
             break;
         case '=':
             if (!missing)
                 result = strdup(cur);
+            else if (!wplain)
+                result = NULL;
             else if (!is_valid_varname(name))
                 result = braced_fail(sh, name, "cannot assign in this way");
-            else if (setenv(name, word, 1) != 0)
+            else if (setenv(name, wplain, 1) != 0)
                 result = braced_fail(sh, name, "assignment failed");
             else
-                result = strdup(word);
+                result = strdup(wplain);
             break;
         case '?':
             if (missing)
                 result = braced_fail(
-                    sh, name, word[0] ? word : "parameter null or not set");
+                    sh, name,
+                    wplain && wplain[0] ? wplain : "parameter null or not set");
             else
                 result = strdup(cur);
             break;
         case '+':
-            result = strdup(missing ? "" : word);
+            result = missing ? strdup("") : wexp;
+            from_word = !missing;
             break;
         default:
             result = strdup(cur);
             break;
         }
+        free(wplain);
     }
     free(name);
     free(content);
+    if ((xf & XF_SPLIT) && !from_word && result)
+        result = mark_literal(result);
     return result;
 }
 
@@ -899,7 +1129,8 @@ static int expand_dollar(struct sh *sh,
                          const char **pp,
                          char **buf,
                          size_t *len,
-                         size_t *cap)
+                         size_t *cap,
+                         int xf)
 {
     const char *p = *pp;
     char name[96];
@@ -915,7 +1146,7 @@ static int expand_dollar(struct sh *sh,
     }
     if (*p == '{') {
         p++;
-        owned = expand_braced(sh, &p);
+        owned = expand_braced(sh, &p, xf);
         *pp = p;
         if (!owned)
             return -1;
@@ -961,9 +1192,11 @@ static int expand_dollar(struct sh *sh,
         return append_str(buf, len, cap, tmp);
     }
     if (*p == '@' || *p == '*') { /* join $1..$n; tokenize splits "$@" */
+        char sep = *p == '@' ? ' ' : ifs_joiner();
+
         *pp = p + 1;
         for (int i = 0; i < sh->nparams; i++) {
-            if (i > 0 && append_char(buf, len, cap, ' ') != 0)
+            if (i > 0 && sep && append_char(buf, len, cap, sep) != 0)
                 return -1;
             if (append_str(buf, len, cap, sh->params[i]) != 0)
                 return -1;
@@ -1076,6 +1309,8 @@ static int capture_command(struct sh *sh, const char *inner, char **out)
     char *buf;
     size_t len;
     int status;
+    int ws;
+    pid_t reaped;
     bool jc = sh_jc;
 
     *out = strdup("");
@@ -1103,7 +1338,12 @@ static int capture_command(struct sh *sh, const char *inner, char **out)
     }
     status = read_all(pfd[0], &buf, &len);
     close(pfd[0]);
-    (void) waitpid(pid, NULL, 0);
+    while ((reaped = waitpid(pid, &ws, 0)) < 0 && errno == EINTR)
+        ;
+    sh->subst_status = reaped < 0        ? 1
+                       : WIFEXITED(ws)   ? WEXITSTATUS(ws)
+                       : WIFSIGNALED(ws) ? 128 + WTERMSIG(ws)
+                                         : 1;
     if (status != 0)
         return -1;
     while (len > 0 && buf[len - 1] == '\n')
@@ -1113,11 +1353,18 @@ static int capture_command(struct sh *sh, const char *inner, char **out)
     return 0;
 }
 
+static int emit_field(struct sh_token *tok, int *ntok, const char *s, bool glob);
+
 /* Emit an expansion result into the word being built. Quoted: append it
- * literally. Unquoted: split it on IFS whitespace -- a blank ends the word
- * built so far, if it has any content, as a token of its own. *produced tells
- * whether the word being built has content, so the caller can drop a word that
- * is nothing but an empty unquoted expansion.
+ * literally. Unquoted: split it at the characters of IFS (POSIX 2.6.5). A run
+ * of IFS white space ends the word built so far, if it has any content, as a
+ * token of its own; so does each other IFS character, and two of these with
+ * nothing between them make an empty field. A white space run beside one of
+ * these belongs to it. *produced tells whether the word being built has
+ * content, so the caller can drop a word that is nothing but an empty unquoted
+ * expansion. *glob tells whether the field being built has an unquoted * ? or
+ * [ in it, which, unless noglob, makes the finished field a pattern for
+ * pathname expansion (POSIX 2.6.6 applies it to the result of an expansion).
  *
  * Returns 0, or -1 on allocation failure.
  */
@@ -1128,108 +1375,89 @@ static int emit_sub_result(struct sh_token *tok,
                            size_t *cap,
                            int quote,
                            const char *text,
-                           int *produced)
+                           bool marks,
+                           int *produced,
+                           int *glob,
+                           int *noglob)
 {
+    const char *ifs = ifs_value();
+    enum { CONTENT, SPACE_ENDED, SPACE_SKIPPED, DELIM } last = CONTENT;
+
     if (quote) { /* double quotes: a field, even if empty */
         *produced = 1;
         return append_str(buf, len, cap, text);
     }
     for (const char *p = text; *p != '\0'; p++) {
-        if (*p != ' ' && *p != '\t' && *p != '\n') {
-            if (append_char(buf, len, cap, *p) != 0)
-                return -1;
+        bool quoted_char = false;
+
+        if (marks && *p == SH_QUOTED_BLANK && p[1] == SH_QUOTED_EMPTY) {
+            p++; /* an empty quoted string: a field, if nothing else */
+            last = CONTENT;
             *produced = 1;
-        } else if (*produced || (*buf && **buf)) {
-            if (token_add(tok, ntok, SH_WORD, *buf ? *buf : "") != 0)
+            continue;
+        }
+        if (marks && *p == SH_QUOTED_BLANK && p[1] != '\0') {
+            p++; /* quoted in a ${...} word: no split, and no longer a mark */
+            quoted_char = true;
+        } else if (strchr(ifs, *p) != NULL) {
+            bool space = ifs_is_space(ifs, (unsigned char) *p);
+
+            if (space) {
+                /* A white space run: the first ends the word if it has content,
+                 * and the rest, like leading white space, is skipped.
+                 */
+                if (last != CONTENT)
+                    continue;
+                if (!(*produced || (*buf && **buf))) {
+                    last = SPACE_SKIPPED;
+                    continue;
+                }
+                last = SPACE_ENDED;
+            } else if (last == SPACE_ENDED) {
+                last = DELIM; /* it ends the field the white space ended */
+                continue;
+            } else {
+                last = DELIM;
+            }
+            if (emit_field(tok, ntok, *buf ? *buf : "", *glob && !*noglob) != 0)
                 return -1;
             free(*buf);
             *buf = NULL;
             *len = 0;
             *cap = 0;
             *produced = 0;
+            *glob = 0;
+            *noglob = 0; /* what was quoted went with the field */
+            continue;
         }
+        last = CONTENT;
+        if (!quoted_char && strchr("*?[", *p))
+            *glob = 1;
+        if (append_char(buf, len, cap, *p) != 0)
+            return -1;
+        *produced = 1;
     }
     return 0;
 }
 
-/* Read the body of $( ... ) from *pp (positioned just past "$("), tracking
- * nested parens and quotes; advances *pp past the matching ')'. Malloc'd.
+/* The command text of a $( ... ) or ` ... ` unit, malloc'd. A backtick body
+ * loses the backslash before ` \ and $, and before " inside double quotes.
  */
-static char *read_paren_sub(const char **pp)
+static char *sub_text(const struct sh_unit *u, bool dq)
 {
-    const char *p = *pp;
-    char *buf = NULL;
-    size_t len = 0;
-    size_t cap = 0;
-    int depth = 1;
-    int q = 0;
+    char *r = dup_range(u->body, u->body_len);
+    char *w = r;
 
-    while (*p != '\0') {
-        char ch = *p;
-
-        if (q) {
-            if (q == '"' && ch == '\\' && p[1] != '\0') {
-                /* escaped char inside double quotes: keep the backslash and the
-                 * escaped char verbatim so a \" does not end the quote early.
-                 */
-                if (append_char(&buf, &len, &cap, ch) != 0) {
-                    free(buf);
-                    return NULL;
-                }
-                p++;
-                ch = *p;
-            } else if (ch == q) {
-                q = 0;
-            }
-        } else if (ch == '\\' && p[1] != '\0') {
-            if (append_char(&buf, &len, &cap, ch) != 0) {
-                free(buf);
-                return NULL;
-            }
-            p++;
-            ch = *p;
-        } else if (ch == '\'' || ch == '"') {
-            q = ch;
-        } else if (ch == '(') {
-            depth++;
-        } else if (ch == ')') {
-            if (--depth == 0) {
-                p++;
-                break;
-            }
-        }
-        if (append_char(&buf, &len, &cap, ch) != 0) {
-            free(buf);
-            return NULL;
-        }
-        p++;
+    if (!r || u->kind != SH_U_BQ)
+        return r;
+    for (const char *c = r; *c != '\0'; c++) {
+        if (*c == '\\' &&
+            (c[1] == '`' || c[1] == '\\' || c[1] == '$' || (dq && c[1] == '"')))
+            c++;
+        *w++ = *c;
     }
-    *pp = p;
-    return buf ? buf : strdup("");
-}
-
-/* Read the body of a `...` command substitution from *pp (just past the opening
- * backtick), unescaping \` \\ \$; advances *pp past the closing backtick.
- */
-static char *read_backtick(const char **pp)
-{
-    const char *p = *pp;
-    char *buf = NULL;
-    size_t len = 0;
-    size_t cap = 0;
-
-    while (*p != '\0' && *p != '`') {
-        if (*p == '\\' && (p[1] == '`' || p[1] == '\\' || p[1] == '$'))
-            p++;
-        if (append_char(&buf, &len, &cap, *p++) != 0) {
-            free(buf);
-            return NULL;
-        }
-    }
-    if (*p == '`')
-        p++;
-    *pp = p;
-    return buf ? buf : strdup("");
+    *w = '\0';
+    return r;
 }
 
 /* Recursive-descent integer evaluator for $(( ... )). Works on long; an unset
@@ -1556,45 +1784,161 @@ static long arith_lor(struct arith_ctx *a)
     return v;
 }
 
-/* Read the body of $(( ... )) from *pp (positioned just past "$(("), balancing
- * inner parens. Advances *pp past the closing "))" and sets *closed=1; on a
- * malformed close (single ) or EOF) sets *closed=0 and consumes a stray ) so
- * the caller does not loop. Malloc'd body.
+/* Evaluate the $(( ... )) unit u into nb (32 bytes). A malformed expression is
+ * 0, with a diagnostic when diag is set.
+ *
+ * Returns 0, or -1 on allocation failure.
  */
-static char *read_arith(const char **pp, int *closed)
+static int unit_arith(struct sh *sh,
+                      const struct sh_unit *u,
+                      bool diag,
+                      char *nb)
 {
-    const char *p = *pp;
-    const char *start = p;
-    int depth = 0;
-    char *r;
-    size_t n;
+    char *expr = dup_range(u->body, u->body_len);
+    struct arith_ctx a;
+    long val;
 
-    while (*p != '\0') {
-        if (*p == '(') {
-            depth++;
-        } else if (*p == ')') {
-            if (depth == 0)
-                break;
-            depth--;
+    if (!expr)
+        return -1;
+    a.p = expr;
+    a.sh = sh;
+    a.err = 0;
+    a.dead = 0;
+    a.depth = 0;
+    val = arith_lor(&a);
+    arith_skip(&a);
+    if (!u->closed || a.err || *a.p != '\0') {
+        if (diag)
+            fprintf(stderr, "sh: arithmetic error: %s\n", expr);
+        val = 0;
+    }
+    free(expr);
+    snprintf(nb, 32, "%ld", val);
+    return 0;
+}
+
+/* Run the $( ... ) or ` ... ` unit u as a command substitution into *result
+ * (malloc'd, trailing newlines stripped).
+ *
+ * Returns 0, or -1 on failure.
+ */
+static int unit_cmdsub(struct sh *sh,
+                       const struct sh_unit *u,
+                       bool dq,
+                       char **result)
+{
+    char *inner = sub_text(u, dq);
+    int rc;
+
+    if (!inner)
+        return -1;
+    rc = capture_command(sh, inner, result);
+    free(inner);
+    if (rc != 0) {
+        free(*result);
+        *result =
+            NULL; /* a caller that frees its copy must not free it twice */
+    }
+    return rc;
+}
+
+/* Expand the text of a ${name op word} word or of a trim pattern: quote
+ * removal, and parameter, command and arithmetic expansion. A pattern keeps the
+ * glob characters it quoted literal with a backslash. A word whose result is
+ * field-split (XF_SPLIT) marks its quoted blanks. In double quotes (XF_DQ) a
+ * word's single quotes are literal, as the reference shell has it.
+ *
+ * Returns the malloc'd result, or NULL on failure.
+ */
+static char *expand_word(struct sh *sh, const char *s, bool pattern, int xf)
+{
+    struct sh_scan sc = {s, 0};
+    struct sh_unit u;
+    char *buf = NULL;
+    size_t len = 0;
+    size_t cap = 0;
+
+    for (;;) {
+        const char *at = sc.p;
+        char *val = NULL;
+        size_t vlen = 0;
+        size_t vcap = 0;
+        char nb[32];
+        const char *t = NULL; /* text to add, quoted when sc.quote or ESC */
+        const char *ifs;
+        bool quoted;
+        bool premarked = false;
+        int rc = 0;
+
+        sh_unit_next(&sc, &u);
+        quoted = sc.quote != 0 || u.kind == SH_U_ESC;
+        switch (u.kind) {
+        case SH_U_END:
+            return buf ? buf : strdup("");
+        case SH_U_QOPEN:
+            if (*at == '\'' && (xf & XF_DQ) && !pattern) {
+                sc.quote = 0; /* a literal ' */
+                rc = append_char(&buf, &len, &cap, '\'');
+            } else if ((xf & XF_SPLIT) && !pattern) {
+                rc = append_char(&buf, &len, &cap, SH_QUOTED_BLANK);
+                if (rc == 0)
+                    rc = append_char(&buf, &len, &cap, SH_QUOTED_EMPTY);
+            }
+            break;
+        case SH_U_QCLOSE:
+            break;
+        case SH_U_ESC:
+            nb[0] = at[1];
+            nb[1] = '\0';
+            t = nb;
+            break;
+        case SH_U_LIT:
+            nb[0] = *at;
+            nb[1] = '\0';
+            t = nb;
+            break;
+        case SH_U_ARITH:
+            rc = unit_arith(sh, &u, true, nb);
+            t = nb;
+            break;
+        case SH_U_PAREN:
+        case SH_U_BQ:
+            rc = unit_cmdsub(sh, &u, sc.quote == '"', &val);
+            t = val;
+            break;
+        case SH_U_BRACE:
+        case SH_U_DOLLAR:
+            at++;
+
+            /* An unquoted ${...} in a word that is itself field-split keeps
+             * the marks it made, which the loop below must not mark again.
+             */
+            premarked = u.kind == SH_U_BRACE && !quoted && !pattern &&
+                        (xf & XF_SPLIT);
+            rc = expand_dollar(sh, &at, &val, &vlen, &vcap,
+                               quoted ? XF_DQ : premarked ? XF_SPLIT : 0);
+            if (u.kind == SH_U_DOLLAR) /* a brace unit was consumed whole */
+                sc.p = at;
+            t = val;
+            break;
         }
-        p++;
+        ifs = ifs_value(); /* after the unit: ${IFS=...} may set it */
+        for (; rc == 0 && t && *t; t++) {
+            if (quoted && pattern && strchr("*?[]\\!", *t))
+                rc = append_char(&buf, &len, &cap, '\\');
+            else if ((xf & XF_SPLIT) && !pattern && !premarked &&
+                     (*t == SH_QUOTED_BLANK ||
+                      (quoted && (strchr(ifs, *t) || strchr("*?[", *t)))))
+                rc = append_char(&buf, &len, &cap, SH_QUOTED_BLANK);
+            if (rc == 0)
+                rc = append_char(&buf, &len, &cap, *t);
+        }
+        free(val);
+        if (rc != 0) {
+            free(buf);
+            return NULL;
+        }
     }
-    n = (size_t) (p - start);
-    r = malloc(n + 1);
-    if (r) {
-        memcpy(r, start, n);
-        r[n] = '\0';
-    }
-    if (*p == ')' && p[1] == ')') {
-        *closed = 1;
-        p += 2;
-    } else {
-        *closed = 0;
-        if (*p == ')')
-            p++;
-    }
-    *pp = p;
-    return r;
 }
 
 static int glob_cmp(const void *a, const void *b)
@@ -1670,6 +2014,27 @@ static int glob_word(const char *pat, struct sh_words *out)
     return out->n - start;
 }
 
+/* Add field s as a word, or the sorted names it matches if glob says it is a
+ * pattern (a pattern that matches nothing stays a word).
+ *
+ * Returns 0, or -1 on allocation failure.
+ */
+static int emit_field(struct sh_token *tok, int *ntok, const char *s, bool glob)
+{
+    if (glob && *s != '\0') {
+        struct sh_words g = {0};
+        int m = glob_word(s, &g);
+        int rc = m < 0 ? -1 : 0;
+
+        for (int i = 0; i < g.n && rc == 0; i++)
+            rc = token_add(tok, ntok, SH_WORD, g.v[i]);
+        words_free(&g);
+        if (m != 0)
+            return rc;
+    }
+    return token_add(tok, ntok, SH_WORD, s);
+}
+
 static bool is_redir_op(enum sh_op op)
 {
     return op == SH_LT || op == SH_GT || op == SH_GTGT || op == SH_ERRGT ||
@@ -1718,6 +2083,45 @@ static size_t all_params_at(const char *p, char *which)
     return braced ? 4 : 2;
 }
 
+/* Whether line has a quote or a substitution that never ends, as a POSIX shell
+ * takes it for a syntax error before running any of the line. A comment is not
+ * read. On failure the error is reported, the status is 2 and a shell that is
+ * not interactive ends.
+ */
+static bool line_is_complete(struct sh *sh, const char *line)
+{
+    struct sh_scan sc = {line, 0};
+    struct sh_unit u;
+    const char *why = NULL;
+
+    for (;;) {
+        const char *p = sc.p;
+
+        sh_unit_next(&sc, &u);
+        if (u.kind == SH_U_END)
+            break;
+        if (!u.closed) {
+            why = u.kind == SH_U_BRACE   ? "missing }"
+                  : u.kind == SH_U_BQ    ? "unterminated `"
+                  : u.kind == SH_U_ARITH ? "unterminated $(("
+                                         : "unterminated $(";
+            break;
+        }
+        if (u.kind == SH_U_LIT && sc.quote == 0 && *p == '#' &&
+            is_comment_start(line, p))
+            return true;
+    }
+    if (!why && sc.quote != 0)
+        why = "unterminated quoted string";
+    if (!why)
+        return true;
+    fprintf(stderr, "sh: syntax error: %s\n", why);
+    sh->last_status = 2;
+    if (!sh->interactive)
+        sh->exit_requested = true;
+    return false;
+}
+
 static int tokenize(struct sh *sh, const char *line, struct sh_token *tok)
 {
     int ntok = 0;
@@ -1738,8 +2142,11 @@ static int tokenize(struct sh *sh, const char *line, struct sh_token *tok)
         int word_has_quoted_glob = 0; /* also has a quoted/escaped one */
         int at_word_start = 1;        /* still at the unquoted word start */
         bool unsplit;                 /* see word_is_unsplit */
-        const char *dq_open = NULL;   /* the `"` that opened the quote */
-        int dq_content = 0;           /* word_has_content before it */
+        int dq_content = 0;           /* word_has_content before the quote */
+        int dq_bare =
+            0; /* in "...": 1 empty so far, 2 only bare "$@", else 0 */
+        struct sh_scan sc;
+        struct sh_unit u;
 
         while (*p == ' ' || *p == '\t')
             p++;
@@ -1782,8 +2189,9 @@ static int tokenize(struct sh *sh, const char *line, struct sh_token *tok)
             continue;
         }
 
-        /* [1|2]> and [1|2]>>, and [1|2]>&N, which duplicates fd N: an
-         * SH_DUPOUT or SH_DUPERR whose target word is the digits of N.
+        /* [1|2]> and [1|2]>>, and [1|2]>&WORD, which duplicates the fd WORD
+         * expands to, or closes the fd for -: an SH_DUPOUT or SH_DUPERR whose
+         * target is the word that follows.
          */
         if (*p == '>' || ((*p == '1' || *p == '2') && p[1] == '>')) {
             bool err = *p == '2';
@@ -1792,7 +2200,7 @@ static int tokenize(struct sh *sh, const char *line, struct sh_token *tok)
 
             p += *p != '>';
             app = p[1] == '>';
-            dup = !app && p[1] == '&' && isdigit((unsigned char) p[2]);
+            dup = !app && p[1] == '&';
             if (token_add(tok, &ntok,
                           dup   ? (err ? SH_DUPERR : SH_DUPOUT)
                           : err ? (app ? SH_ERRGTGT : SH_ERRGT)
@@ -1800,16 +2208,6 @@ static int tokenize(struct sh *sh, const char *line, struct sh_token *tok)
                           NULL) != 0)
                 goto fail;
             p += 1 + app + dup;
-            if (dup) {
-                char fdword[16];
-                size_t n = 0;
-
-                while (isdigit((unsigned char) *p) && n + 1 < sizeof(fdword))
-                    fdword[n++] = *p++;
-                fdword[n] = '\0';
-                if (token_add(tok, &ntok, SH_WORD, fdword) != 0)
-                    goto fail;
-            }
             continue;
         }
         unsplit = word_is_unsplit(tok, ntok, p);
@@ -1839,31 +2237,40 @@ static int tokenize(struct sh *sh, const char *line, struct sh_token *tok)
                 }
             }
             at_word_start = 0;
-            if (*p == '\'' && quote != '"') {
-                quote = quote == '\'' ? 0 : '\'';
-                word_has_content = 1;
+            sc.p = p;
+            sc.quote = quote;
+            sh_unit_next(&sc, &u);
+            if (u.kind == SH_U_QOPEN || u.kind == SH_U_QCLOSE) {
+                if (u.kind == SH_U_QOPEN) {
+                    dq_content = word_has_content;
+                    dq_bare = *p == '"';
+                }
+                quote = sc.quote;
                 p++;
+
+                /* A "..." of nothing but "$@" with no parameters is no field,
+                 * not even an empty one.
+                 */
+                word_has_content =
+                    u.kind == SH_U_QCLOSE && dq_bare == 2 ? dq_content : 1;
                 continue;
             }
-            if (*p == '"' && quote != '\'') {
-                if (quote == 0) {
-                    dq_open = p;
-                    dq_content = word_has_content;
-                }
-                quote = quote == '"' ? 0 : '"';
-                word_has_content = 1;
-                p++;
-                continue;
+            if (quote == '"') {
+                char which;
+                bool bare = (u.kind == SH_U_DOLLAR || u.kind == SH_U_BRACE) &&
+                            all_params_at(p, &which) && which == '@' &&
+                            sh->nparams == 0;
+
+                dq_bare = bare && dq_bare ? 2 : 0;
             }
 
-            /* A backslash is literal inside single quotes, and inside double
-             * quotes escapes only $ ` " \ (POSIX 2.2.3).
+            /* An escaped character is literal; a quoted glob metacharacter
+             * stays literal too.
              */
-            if (*p == '\\' && p[1] != '\0' && quote != '\'' &&
-                (quote == 0 || strchr("$`\"\\", p[1]))) {
+            if (u.kind == SH_U_ESC) {
                 p++;
                 if (*p == '*' || *p == '?' || *p == '[')
-                    word_has_quoted_glob = 1; /* escaped: keep it literal */
+                    word_has_quoted_glob = 1;
                 word_has_content = 1;
                 if (append_char(&buf, &len, &cap, *p++) != 0) {
                     free(buf);
@@ -1871,33 +2278,14 @@ static int tokenize(struct sh *sh, const char *line, struct sh_token *tok)
                 }
                 continue;
             }
-            if (*p == '$' && p[1] == '(' && p[2] == '(' && quote != '\'') {
-                /* arithmetic expansion $(( expr )) */
-                char *expr;
+            if (u.kind == SH_U_ARITH) {
                 char nb[32];
-                struct arith_ctx a;
-                long val;
-                int closed;
 
-                p += 3;
-                expr = read_arith(&p, &closed);
-                if (!expr) {
+                p += u.len;
+                if (unit_arith(sh, &u, true, nb) != 0) {
                     free(buf);
                     goto fail;
                 }
-                a.p = expr;
-                a.sh = sh;
-                a.err = 0;
-                a.dead = 0;
-                a.depth = 0;
-                val = arith_lor(&a);
-                arith_skip(&a);
-                if (!closed || a.err || *a.p != '\0') {
-                    fprintf(stderr, "sh: arithmetic error: %s\n", expr);
-                    val = 0;
-                }
-                free(expr);
-                snprintf(nb, sizeof(nb), "%ld", val);
                 word_has_content = 1;
                 if (append_str(&buf, &len, &cap, nb) != 0) {
                     free(buf);
@@ -1905,31 +2293,18 @@ static int tokenize(struct sh *sh, const char *line, struct sh_token *tok)
                 }
                 continue;
             }
-            if (((*p == '$' && p[1] == '(') || *p == '`') && quote != '\'') {
-                char *inner;
+            if (u.kind == SH_U_PAREN || u.kind == SH_U_BQ) {
                 char *result;
 
-                if (*p == '`') {
-                    p++;
-                    inner = read_backtick(&p);
-                } else {
-                    p += 2;
-                    inner = read_paren_sub(&p);
-                }
-                if (!inner) {
+                p += u.len;
+                if (unit_cmdsub(sh, &u, quote == '"', &result) != 0) {
                     free(buf);
                     goto fail;
                 }
-                if (capture_command(sh, inner, &result) != 0) {
-                    free(inner);
-                    free(result);
-                    free(buf);
-                    goto fail;
-                }
-                free(inner);
                 if (emit_sub_result(tok, &ntok, &buf, &len, &cap,
-                                    quote || unsplit, result,
-                                    &word_has_content) != 0) {
+                                    quote || unsplit, result, false,
+                                    &word_has_content, &word_may_glob,
+                                    &word_has_quoted_glob) != 0) {
                     free(result);
                     free(buf);
                     goto fail;
@@ -1937,7 +2312,7 @@ static int tokenize(struct sh *sh, const char *line, struct sh_token *tok)
                 free(result);
                 continue;
             }
-            if (*p == '$' && quote != '\'') {
+            if (u.kind == SH_U_DOLLAR || u.kind == SH_U_BRACE) {
                 char *val = NULL;
                 size_t vlen = 0;
                 size_t vcap = 0;
@@ -1950,12 +2325,11 @@ static int tokenize(struct sh *sh, const char *line, struct sh_token *tok)
                  * the whole quoted part and has no parameters is no field.
                  */
                 if (n && which == '@' && quote == '"' && !unsplit) {
-                    if (sh->nparams == 0 && dq_open == p - 1 && p[n] == '"') {
-                        word_has_content = dq_content;
-                        quote = 0;
-                        p += n + 1;
+                    if (sh->nparams == 0) {
+                        p += n; /* nothing, and no field of its own */
                         continue;
                     }
+                    dq_bare = 0;
                     for (int k = 0; k < sh->nparams; k++) {
                         if (k > 0) {
                             if (token_add(tok, &ntok, SH_WORD,
@@ -1976,18 +2350,52 @@ static int tokenize(struct sh *sh, const char *line, struct sh_token *tok)
                     continue;
                 }
 
+                /* Unquoted $@ and $*: each parameter is a field of its own, and
+                 * is then split on IFS by itself; an empty one is no field.
+                 */
+                if (n && !quote && !unsplit) {
+                    for (int k = 0; k < sh->nparams; k++) {
+                        if (k > 0 && word_has_content) {
+                            if (emit_field(tok, &ntok, buf ? buf : "",
+                                           word_may_glob &&
+                                               !word_has_quoted_glob) != 0) {
+                                free(buf);
+                                goto fail;
+                            }
+                            free(buf);
+                            buf = NULL;
+                            len = cap = 0;
+                            word_has_content = 0;
+                            word_may_glob = 0;
+                            word_has_quoted_glob = 0;
+                        }
+                        if (emit_sub_result(tok, &ntok, &buf, &len, &cap, 0,
+                                            sh->params[k], false,
+                                            &word_has_content, &word_may_glob,
+                                            &word_has_quoted_glob) != 0) {
+                            free(buf);
+                            goto fail;
+                        }
+                    }
+                    p += n;
+                    continue;
+                }
+
                 /* Anything else expands to one string, which is field-split
                  * when unquoted: an empty unquoted expansion is no field.
                  */
                 p++;
                 if (quote || unsplit) {
                     word_has_content = 1; /* a field, even if empty */
-                    rc = expand_dollar(sh, &p, &buf, &len, &cap);
+                    rc = expand_dollar(sh, &p, &buf, &len, &cap,
+                                       quote ? XF_DQ : 0);
                 } else {
-                    rc = expand_dollar(sh, &p, &val, &vlen, &vcap);
+                    rc = expand_dollar(sh, &p, &val, &vlen, &vcap, XF_SPLIT);
                     if (rc == 0 && val)
-                        rc = emit_sub_result(tok, &ntok, &buf, &len, &cap, 0,
-                                             val, &word_has_content);
+                        rc = emit_sub_result(
+                            tok, &ntok, &buf, &len, &cap, 0, val,
+                            u.kind == SH_U_BRACE, &word_has_content,
+                            &word_may_glob, &word_has_quoted_glob);
                     free(val);
                 }
                 if (rc != 0) {
@@ -2013,36 +2421,14 @@ static int tokenize(struct sh *sh, const char *line, struct sh_token *tok)
                 goto fail;
             }
         }
-        if (word_may_glob && !word_has_quoted_glob && !unsplit && buf &&
-            buf[0] != '\0') {
-            struct sh_words g = {0};
-            int m = glob_word(buf, &g);
-
-            if (m < 0) {
-                words_free(&g);
-                free(buf);
-                goto fail;
-            }
-            if (m > 0) {
-                for (int i = 0; i < g.n; i++) {
-                    if (token_add(tok, &ntok, SH_WORD, g.v[i]) != 0) {
-                        words_free(&g);
-                        free(buf);
-                        goto fail;
-                    }
-                }
-                words_free(&g);
-                free(buf);
-                continue; /* word replaced by its matches */
-            }
-            words_free(&g); /* no match: fall through to the literal word */
-        }
         if (word_has_content || (buf && buf[0] != '\0')) {
             if (!buf)
                 buf = strdup("");
             if (!buf)
                 goto fail;
-            if (token_add(tok, &ntok, SH_WORD, buf) != 0) {
+            if (emit_field(tok, &ntok, buf,
+                           word_may_glob && !word_has_quoted_glob && !unsplit) !=
+                0) {
                 free(buf);
                 goto fail;
             }
@@ -2168,7 +2554,8 @@ static int builtin_read(char **argv, int in_fd)
     int varidx = 1;
     int nvars = 0;
     int got = 0;
-    const char *p;
+    const char *ifs;
+    char *p;
 
     if (argv[1] && !strcmp(argv[1], "-r"))
         varidx = 2;
@@ -2202,31 +2589,59 @@ static int builtin_read(char **argv, int in_fd)
 
     while (argv[varidx + nvars])
         nvars++;
+
+    /* Fields at the characters of IFS (POSIX 2.6.5); the last variable gets the
+     * rest of the line, less the IFS white space at its end.
+     */
+    ifs = ifs_value();
     p = buf;
     for (int vi = 0; vi < nvars; vi++) {
-        while (*p == ' ' || *p == '\t')
+        char *field;
+        size_t fl;
+        char save;
+        int rc;
+
+        while (*p != '\0' && ifs_is_space(ifs, (unsigned char) *p))
             p++;
+        field = p;
         if (vi == nvars - 1) {
-            char rest[SH_LINE_MAX];
-            size_t rl;
+            fl = strlen(p);
+            while (fl > 0 && ifs_is_space(ifs, (unsigned char) p[fl - 1]))
+                fl--;
 
-            snprintf(rest, sizeof(rest), "%s", p);
-            rl = strlen(rest);
-            while (rl > 0 && (rest[rl - 1] == ' ' || rest[rl - 1] == '\t'))
-                rest[--rl] = '\0';
-            if (setenv(argv[varidx + vi], rest, 1) != 0)
-                return 1;
+            /* One delimiter at the end ends the last field, as it would between
+             * two; a run of them keeps its empty fields.
+             */
+            size_t before = fl > 0 ? fl - 1 : 0;
+
+            while (before > 0 &&
+                   ifs_is_space(ifs, (unsigned char) p[before - 1]))
+                before--;
+            if (fl > 0 && strchr(ifs, p[fl - 1]) &&
+                (before == 0 || !strchr(ifs, p[before - 1]))) {
+                fl--;
+                while (fl > 0 && ifs_is_space(ifs, (unsigned char) p[fl - 1]))
+                    fl--;
+            }
         } else {
-            char field[SH_LINE_MAX];
-            size_t fl = 0;
-
-            while (*p != '\0' && *p != ' ' && *p != '\t' &&
-                   fl + 1 < sizeof(field))
-                field[fl++] = *p++;
-            field[fl] = '\0';
-            if (setenv(argv[varidx + vi], field, 1) != 0)
-                return 1;
+            while (*p != '\0' && !strchr(ifs, *p))
+                p++;
+            fl = (size_t) (p - field);
+            if (*p != '\0' && ifs_is_space(ifs, (unsigned char) *p)) {
+                while (*p != '\0' && ifs_is_space(ifs, (unsigned char) *p))
+                    p++;
+                if (*p != '\0' && strchr(ifs, *p))
+                    p++; /* a delimiter beside white space is one with it */
+            } else if (*p != '\0') {
+                p++;
+            }
         }
+        save = field[fl];
+        field[fl] = '\0';
+        rc = setenv(argv[varidx + vi], field, 1);
+        field[fl] = save;
+        if (rc != 0)
+            return 1;
     }
     return 0;
 }
@@ -2644,6 +3059,15 @@ static int builtin_trap(struct sh *sh, int argc, char **argv)
     return rc;
 }
 
+/* Whether a trapped signal was caught and its action has not run. */
+static bool sh_traps_pending(void)
+{
+    for (int i = 1; i < SH_NTRAPS; i++)
+        if (sh_trap_pending[i])
+            return true;
+    return false;
+}
+
 /* Run the actions of the signals caught since the last call. A trap action does
  * not change $?.
  */
@@ -2958,6 +3382,7 @@ static int run_external(char **argv,
     posix_spawn_file_actions_t *actions_p = NULL;
     posix_spawnattr_t attr;
     posix_spawnattr_t *attr_p = NULL;
+    int placeholder[3] = {-1, -1, -1}; /* /dev/null for a closed slot */
     pid_t pid;
     int status = 0;
     int err;
@@ -2966,6 +3391,25 @@ static int run_external(char **argv,
     if (err != EOK)
         goto fail;
     actions_p = &actions;
+    /* A descriptor that is closed for the command is not closed in the child:
+     * a closed slot is the first one the child's own opens take (cat would read
+     * its file from fd 1 and write to it), and spawn leaves this shell's own
+     * descriptor unusable after a close action on stdout. The child gets one
+     * on which every transfer fails with EBADF instead, as it would on a closed
+     * one, held open so the slot stays taken.
+     */
+    for (int k = 0; k < 3; k++) {
+        int *fd = k == 0 ? &in_fd : k == 1 ? &out_fd : &err_fd;
+
+        if (*fd != SH_FD_CLOSED)
+            continue;
+        *fd = open("/dev/null", O_RDONLY);
+        if (*fd < 0) {
+            err = errno;
+            goto fail;
+        }
+        placeholder[k] = *fd;
+    }
     if (in_fd >= 0 && in_fd != STDIN_FILENO) {
         err = posix_spawn_file_actions_adddup2(&actions, in_fd, STDIN_FILENO);
         if (err != EOK)
@@ -3013,6 +3457,8 @@ static int run_external(char **argv,
     fflush(stdout);
     fflush(stderr);
     err = posix_spawnp(&pid, argv[0], actions_p, attr_p, argv, sh_environ());
+    for (int k = 0; k < 3; k++)
+        close_if_needed(placeholder[k]);
     posix_spawn_file_actions_destroy(&actions);
     if (attr_p)
         posix_spawnattr_destroy(attr_p);
@@ -3055,6 +3501,8 @@ static int run_external(char **argv,
     return 128;
 
 fail:
+    for (int k = 0; k < 3; k++)
+        close_if_needed(placeholder[k]);
     if (actions_p)
         posix_spawn_file_actions_destroy(&actions);
     fprintf(stderr, "%s: %s\n", argv[0], strerror(err));
@@ -3064,6 +3512,12 @@ fail:
 static int builtin_exec(char **argv, int in_fd, int out_fd, int err_fd)
 {
     if (!argv[1]) {
+        if (in_fd == SH_FD_CLOSED)
+            close(STDIN_FILENO);
+        if (out_fd == SH_FD_CLOSED)
+            close(STDOUT_FILENO);
+        if (err_fd == SH_FD_CLOSED)
+            close(STDERR_FILENO);
         if (in_fd >= 0 && in_fd != STDIN_FILENO)
             dup2(in_fd, STDIN_FILENO);
         if (out_fd >= 0 && out_fd != STDOUT_FILENO)
@@ -3342,22 +3796,27 @@ static int sh_spawn_sub(struct sh *sh,
  */
 static int sh_redir_apply(int in_fd, int out_fd, int err_fd, int saved[3])
 {
+    const int want[3] = {in_fd, out_fd, err_fd};
+
     saved[0] = saved[1] = saved[2] = -1;
-    if (in_fd >= 0 && in_fd != STDIN_FILENO) {
-        saved[0] = dup(STDIN_FILENO);
-        if (saved[0] < 0 || dup2(in_fd, STDIN_FILENO) < 0)
-            return -1;
+
+    /* Every descriptor is saved before any is closed, so that a copy never
+     * takes the number of a slot that is about to be closed.
+     */
+    for (int k = 0; k < 3; k++) {
+        if (want[k] != SH_FD_CLOSED && (want[k] < 0 || want[k] == k))
+            continue;
+        if (k == STDOUT_FILENO)
+            fflush(stdout);
+        else if (k == STDERR_FILENO)
+            fflush(stderr);
+        saved[k] = dup(k);
+        if (saved[k] < 0 && !(want[k] == SH_FD_CLOSED && errno == EBADF))
+            return -1; /* closing what is already closed is no error */
     }
-    if (out_fd >= 0 && out_fd != STDOUT_FILENO) {
-        fflush(stdout);
-        saved[1] = dup(STDOUT_FILENO);
-        if (saved[1] < 0 || dup2(out_fd, STDOUT_FILENO) < 0)
-            return -1;
-    }
-    if (err_fd >= 0 && err_fd != STDERR_FILENO) {
-        fflush(stderr);
-        saved[2] = dup(STDERR_FILENO);
-        if (saved[2] < 0 || dup2(err_fd, STDERR_FILENO) < 0)
+    for (int k = 0; k < 3; k++) {
+        if (want[k] == SH_FD_CLOSED ? (close(k) < 0 && errno != EBADF)
+                                    : saved[k] >= 0 && dup2(want[k], k) < 0)
             return -1;
     }
     return 0;
@@ -3367,6 +3826,7 @@ static void sh_redir_restore(int saved[3])
 {
     if (saved[1] >= 0) {
         fflush(stdout);
+        clearerr(stdout); /* a write to a closed stdout failed */
         dup2(saved[1], STDOUT_FILENO);
         close(saved[1]);
     }
@@ -3479,15 +3939,20 @@ static int sh_open_redirs(struct sh_token *tok,
         slot = op == SH_LT                                             ? 0
                : op == SH_ERRGT || op == SH_ERRGTGT || op == SH_DUPERR ? 2
                                                                        : 1;
-        if (op == SH_DUPOUT || op == SH_DUPERR) {
-            long t = strtol(path, NULL, 10); /* digits only (tokenize) */
+        if ((op == SH_DUPOUT || op == SH_DUPERR) && !strcmp(path, "-")) {
+            fd = SH_FD_CLOSED; /* closed in the command, not in the shell */
+        } else if (op == SH_DUPOUT || op == SH_DUPERR) {
+            char *end;
+            long t = strtol(path, &end, 10);
 
-            if (t <= 2)
-                t = own[t] >= 0 ? own[t] : pass[t] >= 0 ? pass[t] : t;
-            if (t > INT_MAX) {
+            if (end == path || *end != '\0' || t < 0 || t > INT_MAX ||
+                (t <= 2 && (own[t] == SH_FD_CLOSED ||
+                            (own[t] == -1 && pass[t] == SH_FD_CLOSED)))) {
                 fd = -1;
                 errno = EBADF;
             } else {
+                if (t <= 2)
+                    t = own[t] >= 0 ? own[t] : pass[t] >= 0 ? pass[t] : t;
                 fd = dup((int) t);
             }
         } else {
@@ -3502,7 +3967,7 @@ static int sh_open_redirs(struct sh_token *tok,
              */
             fd = open(path, flags, 0666);
         }
-        if (fd < 0) {
+        if (fd < 0 && fd != SH_FD_CLOSED) {
             fprintf(stderr, "sh: %s: %s\n", path, strerror(errno));
             for (int k = 0; k < 3; k++) {
                 close_if_needed(own[k]);
@@ -3553,9 +4018,9 @@ static int command_from_tokens(struct sh *sh,
      */
     if (own[0] < 0 && in_fd < 0 && sh->heredoc_fd >= 0)
         in_fd = sh->heredoc_fd;
-    in_fd = own[0] >= 0 ? own[0] : in_fd;
-    out_fd = own[1] >= 0 ? own[1] : out_fd;
-    err_fd = own[2] >= 0 ? own[2] : err_fd;
+    in_fd = own[0] != -1 ? own[0] : in_fd;
+    out_fd = own[1] != -1 ? own[1] : out_fd;
+    err_fd = own[2] != -1 ? own[2] : err_fd;
 
     /* What would run inside the shell -- a lone assignment, a builtin, a
      * function -- runs in a child shell instead when `sub` is set. The child
@@ -3607,8 +4072,10 @@ static int command_from_tokens(struct sh *sh,
             goto done;
         }
     }
-    if (nassign == argc)
+    if (nassign == argc) { /* the status of the last substitution, else 0 */
+        rc = sh->subst_status > 0 ? sh->subst_status : 0;
         goto done;
+    }
     memmove(argv, argv + nassign,
             (size_t) (argc - nassign + 1) * sizeof(*argv));
     argc -= nassign;
@@ -3636,7 +4103,15 @@ static int command_from_tokens(struct sh *sh,
             rc = 1;
             goto done;
         }
+        clearerr(stdout); /* an error of an earlier write is not this one's */
         rc = run_builtin(sh, argv, argc, in_fd, &handled);
+        if (handled && (fflush(stdout) != 0 || ferror(stdout))) {
+            fprintf(stderr, "sh: %s: write error: %s\n", argv[0],
+                    strerror(errno));
+            clearerr(stdout);
+            if (rc == 0)
+                rc = 1;
+        }
         if (!handled && !skip_func) {
             struct sh_func *fn = sh_find_func(sh, argv[0]);
 
@@ -3807,110 +4282,34 @@ static char *dup_range(const char *s, size_t n)
  */
 static int split_statements(const char *line, struct sh_stmt *out, int max)
 {
+    struct sh_scan sc = {line, 0};
+    struct sh_unit u;
     const char *seg = line;
-    const char *p = line;
+    const char *end = NULL; /* where a comment cuts the line off */
     int n = 0;
-    int quote = 0;
 
     for (;;) {
+        const char *p = sc.p;
         char c = *p;
 
-        if (c == '\0')
+        sh_unit_next(&sc, &u);
+        if (u.kind == SH_U_END)
             break;
-        if (quote == '\'') {
-            if (c == '\'')
-                quote = 0;
-            p++;
-            continue;
-        }
-        if (c == '\\') {
-            if (p[1] == '\0') {
-                p++;
-                break;
-            }
-            p += 2;
-            continue;
-        }
-        if (c == '\'' && quote != '"') {
-            quote = '\'';
-            p++;
-            continue;
-        }
-        if (c == '"') {
-            quote = quote == '"' ? 0 : '"';
-            p++;
-            continue;
-        }
-        if (quote != 0) {
-            p++;
-            continue;
-        }
-
-        /* Unquoted below. Skip over command substitutions and ${...} so a `;`,
-         * `&&`, or `||` inside them is not mistaken for a statement separator.
-         */
-        if (c == '`') {
-            p++;
-            while (*p != '\0' && *p != '`') {
-                if (*p == '\\' && p[1] != '\0')
-                    p++;
-                p++;
-            }
-            if (*p == '`')
-                p++;
-            continue;
-        }
-        if (c == '$' && p[1] == '(') {
-            int depth = 1;
-            int q2 = 0;
-
-            p += 2;
-            while (*p != '\0') {
-                if (q2) {
-                    if (q2 == '"' && *p == '\\' && p[1] != '\0')
-                        p++; /* skip escaped char inside double quotes */
-                    else if (*p == q2)
-                        q2 = 0;
-                } else if (*p == '\\' && p[1] != '\0') {
-                    p++;
-                } else if (*p == '\'' || *p == '"') {
-                    q2 = *p;
-                } else if (*p == '(') {
-                    depth++;
-                } else if (*p == ')' && --depth == 0) {
-                    p++;
-                    break;
-                }
-                p++;
-            }
-            continue;
-        }
-        if (c == '$' && p[1] == '{') {
-            int depth = 1;
-
-            p += 2;
-            while (*p != '\0') {
-                if (*p == '{')
-                    depth++;
-                else if (*p == '}' && --depth == 0) {
-                    p++;
-                    break;
-                }
-                p++;
-            }
-            continue;
-        }
+        if (u.kind != SH_U_LIT || sc.quote != 0)
+            continue; /* quoted, escaped or a substitution: never a separator */
 
         /* A `#` starts a comment only at a word boundary, so it does not
          * mistake the `#` in a `${VAR#pat}` expansion for one; a `>&N`
          * redirection's `&` is not a separator.
          */
-        if (c == '#' && is_comment_start(line, p))
+        if (c == '#' && is_comment_start(line, p)) {
+            end = p;
             break;
+        }
         if (c == '>' && p[1] == '&') {
-            p += 2;
-            while (isdigit((unsigned char) *p))
-                p++;
+            sc.p = p + 2;
+            while (isdigit((unsigned char) *sc.p))
+                sc.p++;
             continue;
         }
         if (c == ';' || c == '&' || (c == '|' && p[1] == '|')) {
@@ -3929,13 +4328,13 @@ static int split_statements(const char *line, struct sh_stmt *out, int max)
             if (n >= max || !(out[n].text = dup_range(seg, (size_t) (p - seg))))
                 goto fail;
             out[n++].sep = sep;
-            p += adv;
-            seg = p;
-            continue;
+            sc.p = p + adv;
+            seg = sc.p;
         }
-        p++;
     }
-    if (n >= max || !(out[n].text = dup_range(seg, (size_t) (p - seg))))
+    if (!end)
+        end = sc.p;
+    if (n >= max || !(out[n].text = dup_range(seg, (size_t) (end - seg))))
         goto fail;
     out[n++].sep = SH_SEMI;
     return n;
@@ -3952,9 +4351,12 @@ fail:
  */
 static int run_list(struct sh *sh, const char *line, enum sh_op prev, int rc)
 {
-    struct sh_stmt *stmt = malloc(sizeof(*stmt) * SH_MAX_TOKENS);
+    struct sh_stmt *stmt;
     int nstmt;
 
+    if (!line_is_complete(sh, line))
+        return 2;
+    stmt = malloc(sizeof(*stmt) * SH_MAX_TOKENS);
     if (!stmt) {
         fprintf(stderr, "sh: out of memory\n");
         return 2;
@@ -3973,6 +4375,7 @@ static int run_list(struct sh *sh, const char *line, enum sh_op prev, int rc)
             int ntok;
 
             sh->expand_abort = false;
+            sh->subst_status = -1;
             ntok = tokenize(sh, stmt[i].text, tok);
 
             if (ntok < 0) {
@@ -4122,21 +4525,38 @@ static void sh_free_funcs(struct sh *sh)
     sh->funcs_cap = 0;
 }
 
-/* Count net brace depth contributed by a line. Naive: every { and } counts,
- * including those inside quotes or comments, so a body line like `echo "}"`
- * would end the function early. Full accuracy needs tokenization; this suffices
- * for typical function bodies that do not put literal braces in strings.
+/* Scan s for the braces that open and close a function body, adding to *depth
+ * for each unquoted { and subtracting for each }; a brace that is quoted,
+ * escaped or part of a ${...} or a substitution does not count.
+ *
+ * Returns, if stop, the } that brings *depth to 0, else NULL.
  */
+static const char *brace_scan(const char *s, int *depth, bool stop)
+{
+    struct sh_scan sc = {s, 0};
+    struct sh_unit u;
+
+    for (;;) {
+        const char *at = sc.p;
+
+        sh_unit_next(&sc, &u);
+        if (u.kind == SH_U_END)
+            return NULL;
+        if (u.kind != SH_U_LIT || sc.quote != 0)
+            continue;
+        if (*at == '{')
+            ++*depth;
+        else if (*at == '}' && --*depth == 0 && stop)
+            return at;
+    }
+}
+
+/* The net brace depth a line contributes. */
 static int brace_delta(const char *s)
 {
     int d = 0;
 
-    for (const char *c = s; *c != '\0'; c++) {
-        if (*c == '{')
-            d++;
-        else if (*c == '}')
-            d--;
-    }
+    (void) brace_scan(s, &d, false);
     return d;
 }
 
@@ -4190,30 +4610,14 @@ static int capture_func_def(struct sh *sh,
         if (brace_delta(p) < 0) {
             struct sh_script one = {0};
             char body[SH_LINE_MAX];
-            char *rb = body;
+            char *rb;
             int depth = 1;
 
-            /* The body ends at the `}` that balances the opening one; a brace
-             * that is quoted or escaped does not count.
-             */
+            /* The body ends at the `}` that balances the opening one. */
             snprintf(body, sizeof(body), "%s", p);
-            for (int q = 0; *rb != '\0'; rb++) {
-                if (*rb == '\\' && q != '\'' && rb[1] != '\0') {
-                    rb++;
-                    continue;
-                }
-                if (q) {
-                    q = *rb == q ? 0 : q;
-                    continue;
-                }
-                if (*rb == '\'' || *rb == '"') {
-                    q = *rb;
-                    continue;
-                }
-                depth += (*rb == '{') - (*rb == '}');
-                if (depth == 0)
-                    break;
-            }
+            rb = (char *) brace_scan(body, &depth, true);
+            if (!rb)
+                rb = body + strlen(body);
             if (*rb != '\0') {
                 *rb++ = '\0';
                 rb += strspn(rb, " \t");
@@ -4358,70 +4762,25 @@ static bool starts_word(const char *line, const char *word)
  */
 static char *heredoc_find(char *line)
 {
-    char *p = line;
-    int q = 0;
+    struct sh_scan sc = {line, 0};
+    struct sh_unit u;
 
-    for (; *p; p++) {
-        char c = *p;
+    for (;;) {
+        char *p = (char *) sc.p;
 
-        if (q == '\'') {
-            if (c == '\'')
-                q = 0;
+        sh_unit_next(&sc, &u);
+        if (u.kind == SH_U_END)
+            return NULL;
+        if (u.kind != SH_U_LIT || sc.quote != 0)
             continue;
+        if (*p == '#' && is_comment_start(line, p))
+            return NULL; /* a comment */
+        if (*p == '<' && p[1] == '<') {
+            if (p[2] != '<')
+                return p;
+            sc.p = p + 3; /* a here-string */
         }
-        if (q == '"') {
-            if (c == '\\' && p[1])
-                p++;
-            else if (c == '"')
-                q = 0;
-            continue;
-        }
-        if (c == '\\' && p[1]) {
-            p++;
-            continue;
-        }
-        if (c == '\'' || c == '"') {
-            q = c;
-            continue;
-        }
-        if (c == '#' && is_comment_start(line, p))
-            break; /* a comment */
-        if (c == '`') {
-            for (p++; *p && *p != '`'; p++)
-                if (*p == '\\' && p[1])
-                    p++;
-            if (!*p)
-                break;
-            continue;
-        }
-        if (c == '$' && p[1] == '(') {
-            int depth = 1;
-            int qq = 0;
-
-            for (p += 2; *p; p++) {
-                if (qq) {
-                    if (qq == '"' && *p == '\\' && p[1])
-                        p++;
-                    else if (*p == qq)
-                        qq = 0;
-                } else if (*p == '\\' && p[1]) {
-                    p++;
-                } else if (*p == '\'' || *p == '"') {
-                    qq = *p;
-                } else if (*p == '(') {
-                    depth++;
-                } else if (*p == ')' && --depth == 0) {
-                    break;
-                }
-            }
-            if (!*p)
-                break;
-            continue;
-        }
-        if (c == '<' && p[1] == '<' && p[2] != '<')
-            return p;
     }
-    return NULL;
 }
 
 /* Parse a here-document delimiter starting at `hh` (the `<<`). Copies the word
@@ -4518,38 +4877,35 @@ static int heredoc_skip(struct sh_script *sc, int i, int to, char *line)
  */
 static bool line_continues(const char *line, size_t *cut, bool *blank)
 {
+    struct sh_scan sc = {line, 0};
+    struct sh_unit u;
     bool op = false;  /* the last character is an operator that continues */
     bool amp = false; /* it is an unquoted & that does not end a && */
     bool esc = false; /* it is a backslash at the very end */
     size_t end = 0;   /* just past it */
-    int q = 0;
 
-    for (const char *p = line; *p != '\0'; p++) {
-        if (*p == ' ' || *p == '\t') {
-            if (!q)
-                continue;
-        } else if (!q && *p == '#' && is_comment_start(line, p)) {
+    for (;;) {
+        const char *p = sc.p;
+        bool plain; /* an unquoted character with no meaning of its own */
+
+        sh_unit_next(&sc, &u);
+        if (u.kind == SH_U_END)
             break;
-        }
-        if (q || *p == '\\' || *p == '\'' || *p == '"') {
-            if (q && *p == '\\' && q == '"' && p[1] != '\0')
-                p++;
-            else if (q)
-                q = *p == q ? 0 : q;
-            else if (*p == '\\' && p[1] != '\0')
-                p++;
-            else if (*p == '\\')
-                esc = true;
-            else
-                q = *p;
-            op = amp = false;
-        } else {
+        plain = u.kind == SH_U_LIT && sc.quote == 0;
+        if (plain && (*p == ' ' || *p == '\t'))
+            continue;
+        if (plain && *p == '#' && is_comment_start(line, p))
+            break;
+        if (plain && *p != '\\') {
             op = *p == '|' || (*p == '&' && amp);
             amp = *p == '&' && !amp;
+        } else {
+            esc = plain; /* only a lone backslash is a plain \ */
+            op = amp = false;
         }
-        end = (size_t) (p - line) + 1;
+        end = (size_t) (sc.p - line);
     }
-    if (q)
+    if (sc.quote)
         return false;
     *cut = esc ? end - 1 : end;
     *blank = !esc;
@@ -4593,6 +4949,8 @@ static int script_join_lines(struct sh_script *sc)
     return 0;
 }
 
+static bool starts_func_def(const char *s);
+
 static int find_matching(struct sh_script *sc,
                          int from,
                          int to,
@@ -4608,7 +4966,9 @@ static int find_matching(struct sh_script *sc,
         char tmp[SH_LINE_MAX];
         snprintf(tmp, sizeof(tmp), "%s", sc->line[i]);
         trim(tmp);
-        if (starts_word(tmp, open1))
+        if (starts_word(tmp, open1) ||
+            (!strcmp(open1, "{") && starts_func_def(tmp) && tmp[0] != '\0' &&
+             tmp[strlen(tmp) - 1] == '{')) /* a function opens a group too */
             depth++;
         if (depth == 0 && mid && starts_word(tmp, mid))
             *mid_out = i;
@@ -4726,7 +5086,8 @@ static int run_for(struct sh *sh, struct sh_script *sc, int at, int done_i)
     bool in;
     int rc = 0;
 
-    ntok = tokenize(sh, sc->line[at], tok);
+    ntok = line_is_complete(sh, sc->line[at]) ? tokenize(sh, sc->line[at], tok)
+                                              : -1;
 
     /* tok[1] (loop var) must be a word: an operator token carries s == NULL, so
      * strcmp/strdup on it would dereference NULL. Without `in`, the loop goes
@@ -4773,28 +5134,20 @@ static int run_for(struct sh *sh, struct sh_script *sc, int at, int done_i)
  */
 static char *find_do_kw(char *s)
 {
-    int q = 0;
+    struct sh_scan sc = {s, 0};
+    struct sh_unit u;
 
-    for (char *p = s; *p != '\0'; p++) {
-        if (q) {
-            if (*p == q)
-                q = 0;
-            continue;
-        }
-        if (*p == '\'' || *p == '"') {
-            q = *p;
-            continue;
-        }
-        if (*p == '\\' && p[1] != '\0') {
-            p++;
-            continue;
-        }
-        if (p[0] == 'd' && p[1] == 'o' &&
+    for (;;) {
+        char *p = (char *) sc.p;
+
+        sh_unit_next(&sc, &u);
+        if (u.kind == SH_U_END)
+            return NULL;
+        if (u.kind == SH_U_LIT && sc.quote == 0 && p[0] == 'd' && p[1] == 'o' &&
             (p == s || p[-1] == ' ' || p[-1] == '\t' || p[-1] == ';') &&
             (p[2] == '\0' || p[2] == ' ' || p[2] == '\t' || p[2] == ';'))
             return p;
     }
-    return NULL;
 }
 
 /* while/until COND; do BODY; done. `until` inverts the condition sense. */
@@ -4849,6 +5202,30 @@ static int run_while(struct sh *sh,
     return rc;
 }
 
+/* Whether word matches one of the alternatives of a case pattern list, a|b|c,
+ * which may open with the ( that POSIX allows.
+ */
+static bool case_pattern_matches(const char *list, const char *word)
+{
+    char *pats = strdup(list + (*list == '('));
+    char *alt = pats;
+    bool hit = false;
+
+    while (pats && alt) {
+        char *bar = (char *) sh_scan_find(alt, "|");
+
+        if (bar)
+            *bar = '\0';
+        trim(alt);
+        hit = fnmatch(alt, word, 0) == 0;
+        if (hit || !bar)
+            break;
+        alt = bar + 1;
+    }
+    free(pats);
+    return hit;
+}
+
 static int run_case(struct sh *sh, struct sh_script *sc, int at, int esac_i)
 {
     struct sh_token tok[SH_MAX_TOKENS];
@@ -4856,7 +5233,8 @@ static int run_case(struct sh *sh, struct sh_script *sc, int at, int esac_i)
     int ntok;
     int rc = 0;
 
-    ntok = tokenize(sh, sc->line[at], tok);
+    ntok = line_is_complete(sh, sc->line[at]) ? tokenize(sh, sc->line[at], tok)
+                                              : -1;
 
     /* tok[1] (the case word) must be a word; an operator token has s == NULL,
      * so strdup(NULL) would crash. Reject `case ; esac` as a syntax error.
@@ -4879,7 +5257,7 @@ static int run_case(struct sh *sh, struct sh_script *sc, int at, int esac_i)
             continue;
         *rp++ = '\0';
         trim(line);
-        if (fnmatch(line, word, 0) == 0) {
+        if (case_pattern_matches(line, word)) {
             char *end = strstr(rp, ";;");
             if (end)
                 *end = '\0';
@@ -4906,72 +5284,46 @@ static char *expand_string(struct sh *sh, const char *s)
     const char *p = s;
 
     while (*p) {
+        struct sh_scan sc = {p, 0};
+        struct sh_unit u;
+
+        /* No quote removal: ' and " are text, and only $ ` and \ are special.
+         */
         if (*p == '\\' && (p[1] == '$' || p[1] == '`' || p[1] == '\\')) {
             p++;
             if (append_char(&buf, &len, &cap, *p++) != 0)
                 goto oom;
             continue;
         }
-        if (p[0] == '$' && p[1] == '(' && p[2] == '(') {
-            char *expr;
-            char nb[32];
-            struct arith_ctx a;
-            long val;
-            int closed;
-
-            p += 3;
-            expr = read_arith(&p, &closed);
-            if (!expr)
-                goto oom;
-            a.p = expr;
-            a.sh = sh;
-            a.err = 0;
-            a.dead = 0;
-            a.depth = 0;
-            val = arith_lor(&a);
-            arith_skip(&a);
-            if (!closed || a.err || *a.p != '\0')
-                val = 0;
-            free(expr);
-            snprintf(nb, sizeof(nb), "%ld", val);
-            if (append_str(&buf, &len, &cap, nb) != 0)
+        if (*p != '$' && *p != '`') {
+            if (append_char(&buf, &len, &cap, *p++) != 0)
                 goto oom;
             continue;
         }
-        if ((p[0] == '$' && p[1] == '(') || p[0] == '`') {
-            char *inner;
+        sh_unit_next(&sc, &u);
+        if (u.kind == SH_U_ARITH) {
+            char nb[32];
+
+            p += u.len;
+            if (unit_arith(sh, &u, false, nb) != 0 ||
+                append_str(&buf, &len, &cap, nb) != 0)
+                goto oom;
+        } else if (u.kind == SH_U_PAREN || u.kind == SH_U_BQ) {
             char *result;
 
-            if (*p == '`') {
-                p++;
-                inner = read_backtick(&p);
-            } else {
-                p += 2;
-                inner = read_paren_sub(&p);
-            }
-            if (!inner)
+            p += u.len;
+            if (unit_cmdsub(sh, &u, false, &result) != 0)
                 goto oom;
-            if (capture_command(sh, inner, &result) != 0) {
-                free(inner);
-                free(result);
-                goto oom;
-            }
-            free(inner);
             if (append_str(&buf, &len, &cap, result) != 0) {
                 free(result);
                 goto oom;
             }
             free(result);
-            continue;
-        }
-        if (*p == '$') {
+        } else {
             p++;
-            if (expand_dollar(sh, &p, &buf, &len, &cap) != 0)
+            if (expand_dollar(sh, &p, &buf, &len, &cap, XF_DQ) != 0)
                 goto oom;
-            continue;
         }
-        if (append_char(&buf, &len, &cap, *p++) != 0)
-            goto oom;
     }
     if (!buf)
         buf = strdup("");
@@ -5152,11 +5504,15 @@ static int sh_explode(const char *line, struct sh_script *out)
     size_t used = 0;
     int depth = 0;
     int opened = 0;
+    int braces = 0; /* the line has a { or } word of a brace group */
     int ok = 1;
     int n;
 
-    /* Cheap filter: a whole compound on one line has a `;` and ends one. */
-    if (!strchr(line, ';') || (!strstr(line, "done") && !strstr(line, "fi")))
+    /* Cheap filter: a whole compound on one line has a `;` and ends one, and a
+     * brace group has its braces.
+     */
+    if (!starts_word(line, "{") && !strchr(line, '}') &&
+        (!strchr(line, ';') || (!strstr(line, "done") && !strstr(line, "fi"))))
         return 0;
     st = malloc(sizeof(*st) * SH_MAX_TOKENS);
     if (!st)
@@ -5176,6 +5532,11 @@ static int sh_explode(const char *line, struct sh_script *out)
                     break;
                 }
             }
+            while (starts_word(t, "{")) {
+                ok = script_add(out, "{") == 0;
+                t += 1 + strspn(t + 1, " \t");
+                braces = 1;
+            }
             if (starts_word(t, "case"))
                 ok = 0;
             if (starts_any(t, openers)) {
@@ -5187,6 +5548,8 @@ static int sh_explode(const char *line, struct sh_script *out)
                  */
                 if (--depth < 0)
                     ok = 0;
+            } else if (starts_word(t, "}")) {
+                braces = 1; /* its balance is the block scanner's to check */
             }
         }
         if (*t == '\0' && st[i].sep != SH_BG)
@@ -5208,10 +5571,129 @@ static int sh_explode(const char *line, struct sh_script *out)
     for (int i = 0; i < n; i++)
         free(st[i].text);
     free(st);
-    if (ok && opened && depth == 0 && used == 0)
+    if (ok && used == 0 && ((opened && depth == 0) || (braces && !opened)))
         return 1;
     script_free(out);
     return 0;
+}
+
+/* Split a case command that is all on one line (`case W in a) x;; b) y;; esac`)
+ * into the lines run_case reads: `case W in`, a line for each arm, and the
+ * `esac` with whatever follows it.
+ *
+ * Returns 1 with the lines in *out, or 0 when the line is not one.
+ */
+static int case_explode(const char *line, struct sh_script *out)
+{
+    struct sh_scan sc;
+    struct sh_unit u;
+    const char *p = line + strspn(line, " \t");
+    const char *head;
+    const char *arm;
+    const char *esac = NULL;
+    char buf[SH_LINE_MAX];
+    int ok = 1;
+
+    if (!starts_word(p, "case") || !strstr(p, "esac"))
+        return 0;
+    head = p;
+    p += 4 + strspn(p + 4, " \t");
+
+    /* The word, which ends at the first blank outside quotes and substitutions,
+     * and the `in` after it.
+     */
+    sc = (struct sh_scan){p, 0};
+    for (;;) {
+        const char *at = sc.p;
+
+        sh_unit_next(&sc, &u);
+        if (u.kind == SH_U_END)
+            return 0;
+        if (u.kind == SH_U_LIT && sc.quote == 0 && (*at == ' ' || *at == '\t')) {
+            p = at;
+            break;
+        }
+    }
+    p += strspn(p, " \t");
+    if (!starts_word(p, "in"))
+        return 0;
+    p += 2;
+    snprintf(buf, sizeof buf, "%.*s", (int) (p - head), head);
+    if (script_add(out, buf) != 0)
+        return 0;
+
+    /* The arms, which end at ;; ; the last one, at the esac that is a command. */
+    arm = p;
+    sc = (struct sh_scan){p, 0};
+    for (;;) {
+        const char *at = sc.p;
+        bool end_arm = false;
+
+        sh_unit_next(&sc, &u);
+        if (u.kind == SH_U_END)
+            break;
+        if (u.kind != SH_U_LIT || sc.quote != 0)
+            continue;
+        if (starts_word(at, "case")) {
+            const char *b = at;
+
+            while (b > arm && (b[-1] == ' ' || b[-1] == '\t'))
+                b--;
+
+            /* A case command inside an arm has ;; and esac of its own, which
+             * this scan would take for the arm's: leave the line whole.
+             */
+            if (b == arm || strchr(";&|()", b[-1])) {
+                script_free(out);
+                return 0;
+            }
+        }
+        if (*at == ';' && at[1] == ';') {
+            sc.p = at + 2;
+            end_arm = true;
+        } else if (starts_word(at, "esac") &&
+                   (at == arm || at[-1] == ' ' || at[-1] == '\t' ||
+                    at[-1] == ';')) {
+            const char *b = at;
+
+            while (b > arm && (b[-1] == ' ' || b[-1] == '\t'))
+                b--;
+            if (b == arm || b[-1] == ';' || b[-1] == ')') {
+                esac = at;
+                end_arm = true;
+            }
+        }
+        if (!end_arm)
+            continue;
+        {
+            const char *stop = esac ? esac : at;
+            size_t n = (size_t) (stop - arm);
+            char *t = dup_range(arm, n);
+
+            if (!t) {
+                script_free(out);
+                return 0;
+            }
+            trim(t);
+            n = strlen(t);
+            while (n > 0 && t[n - 1] == ';')
+                t[--n] = '\0';
+            trim(t);
+            if (*t != '\0') {
+                snprintf(buf, sizeof buf, "%s ;;", t);
+                ok = script_add(out, buf) == 0;
+            }
+            free(t);
+        }
+        if (esac || !ok)
+            break;
+        arm = sc.p;
+    }
+    if (!esac || !ok) {
+        script_free(out);
+        return 0;
+    }
+    return script_add(out, esac) == 0 ? 1 : 0;
 }
 
 /* Whether s starts with NAME(), a function definition. */
@@ -5250,7 +5732,8 @@ static int script_explode(struct sh_script *sc)
         trim(t);
         if (heredoc_find(t))
             last = heredoc_skip(sc, i, sc->count, t);
-        else if (!starts_func_def(t) && sh_explode(sc->line[i], &one))
+        else if (!starts_func_def(t) && (case_explode(sc->line[i], &one) ||
+                                         sh_explode(sc->line[i], &one)))
             last = -1;
         for (int k = 0; k < one.count && rc == 0; k++)
             rc = script_add(&out, one.line[k]);
@@ -5278,6 +5761,8 @@ static int compound_end(struct sh_script *sc, int i, int to, int *mid)
     bool is_if = starts_word(sc->line[i], "if");
 
     *mid = -1;
+    if (starts_word(sc->line[i], "{"))
+        return find_matching(sc, i + 1, to, "{", NULL, "}", mid);
     if (is_if || starts_word(sc->line[i], "case"))
         return find_matching(sc, i + 1, to, is_if ? "if" : "case",
                              is_if ? "else" : NULL, is_if ? "fi" : "esac", mid);
@@ -5302,6 +5787,8 @@ static int run_block(struct sh *sh,
         rc = run_for(sh, sc, *ip, end);
     else if (starts_word(line, "while") || starts_word(line, "until"))
         rc = run_while(sh, sc, *ip, end, starts_word(line, "until"));
+    else if (starts_word(line, "{"))
+        rc = run_script_range(sh, sc, *ip + 1, end);
     else
         rc = run_case(sh, sc, *ip, end);
     *ip = end;
@@ -5324,32 +5811,18 @@ static int sh_sub_script(struct sh_script *sc,
     return script_add(sub, last);
 }
 
-/* The first `|` in s outside quotes and command substitutions and that a
- * backslash does not escape, or NULL.
+/* The length of the keyword that closes a compound command: fi, done, esac or
+ * a brace group's }.
  */
+static int closer_len(const char *line)
+{
+    return starts_word(line, "fi") ? 2 : starts_word(line, "}") ? 1 : 4;
+}
+
+/* The first `|` in line outside quotes, escapes and substitutions, or NULL. */
 static char *find_pipe(char *line)
 {
-    int depth = 0;   /* inside $( ... ) */
-    bool bq = false; /* inside ` ... ` */
-    char *s = line;
-
-    for (int q = 0; *s != '\0'; s++) {
-        if (*s == '\\' && q != '\'' && s[1] != '\0')
-            s++;
-        else if (q)
-            q = *s == q ? 0 : q;
-        else if (*s == '\'' || *s == '"')
-            q = *s;
-        else if (*s == '`')
-            bq = !bq;
-        else if (*s == '(')
-            depth += depth > 0 || (s > line && s[-1] == '$');
-        else if (*s == ')' && depth > 0)
-            depth--;
-        else if (*s == '|' && depth == 0 && !bq)
-            return s;
-    }
-    return NULL;
+    return (char *) sh_scan_find(line, "|");
 }
 
 /* Run the compound command from line *ip to line end, whose trimmed closing
@@ -5412,7 +5885,7 @@ static __attribute__((noinline)) int run_compound_tail(struct sh *sh,
     }
 
     sh->expand_abort = false;
-    ntok = tokenize(sh, tail, tok);
+    ntok = line_is_complete(sh, tail) ? tokenize(sh, tail, tok) : -1;
     if (ntok < 0 || sh->expand_abort) {
         rc = ntok < 0 ? 2 : sh->last_status;
     } else if ((words = sh_open_redirs(tok, 0, ntok, pass, own, NULL)) != 0) {
@@ -5434,7 +5907,7 @@ static __attribute__((noinline)) int run_compound_tail(struct sh *sh,
         sh_jc = false;
         if (sh_sub_script(sc, *ip, end, last, &sub) == 0)
             rc = sh_spawn_sub(sh, 's', sub.line, sub.count, own[0],
-                              own[1] >= 0 ? own[1] : pfd[1], own[2], 0, &pid,
+                              own[1] != -1 ? own[1] : pfd[1], own[2], 0, &pid,
                               sub.line[0]);
         sh_jc = jc;
         script_free(&sub);
@@ -5483,6 +5956,26 @@ static __attribute__((noinline)) int run_compound_tail(struct sh *sh,
  * A trailing `&` on its closing fi, done or esac runs the whole command in a
  * background subshell; any other text there is a tail for run_compound_tail.
  */
+/* The & that ends the first statement of tail, the text after a closing
+ * keyword (so the compound command is to run in the background), or NULL;
+ * *rest gets what follows it.
+ */
+static char *tail_background(char *tail, const char **rest)
+{
+    struct sh_stmt *st = malloc(sizeof(*st) * SH_MAX_TOKENS);
+    char *amp = NULL;
+    int n = st ? split_statements(tail, st, SH_MAX_TOKENS) : -1;
+
+    if (n > 0 && st[0].sep == SH_BG) {
+        amp = tail + strlen(st[0].text);
+        *rest = amp + 1;
+    }
+    for (int i = 0; i < n; i++)
+        free(st[i].text);
+    free(st);
+    return amp;
+}
+
 static __attribute__((noinline)) int run_compound_rest(struct sh *sh,
                                                        struct sh_script *sc,
                                                        int *ip,
@@ -5491,20 +5984,20 @@ static __attribute__((noinline)) int run_compound_rest(struct sh *sh,
 {
     char last[SH_LINE_MAX];
     struct sh_script sub = {0};
-    size_t n;
-    int kw; /* length of the closing keyword */
+    const char *rest = "";
+    char *amp;
+    int kw = closer_len(sc->line[end] + strspn(sc->line[end], " \t"));
     int in;
     int rc;
 
     snprintf(last, sizeof last, "%s", sc->line[end]);
     trim(last);
-    n = strlen(last);
-    kw = starts_word(last, "fi") ? 2 : 4;
-    if (n < 2 || last[n - 1] != '&' || last[n - 2] == '&')
+    amp = tail_background(last + kw + strspn(last + kw, " \t"), &rest);
+    if (!amp)
         return run_compound_tail(sh, sc, ip, end, mid, last, kw);
 
     in = sh_bg_stdin(sh);
-    last[n - 1] = '\0';
+    *amp = '\0'; /* the subshell gets the closing line without the & */
     sh_jc_pgid = 0; /* a job of its own */
     rc = sh_sub_script(sc, *ip, end, last, &sub) == 0
              ? sh_spawn_sub(sh, 's', sub.line, sub.count, in, -1, -1, 1, NULL,
@@ -5513,7 +6006,10 @@ static __attribute__((noinline)) int run_compound_rest(struct sh *sh,
     close_if_needed(in);
     script_free(&sub);
     *ip = end;
-    return rc;
+    sh->last_status = rc;
+    rest += strspn(rest, " \t");
+    return *rest != '\0' && !sh->exit_requested ? run_list(sh, rest, SH_SEMI, rc)
+                                                : rc;
 }
 
 static int run_compound(struct sh *sh, struct sh_script *sc, int *ip, int to)
@@ -5531,7 +6027,7 @@ static int run_compound(struct sh *sh, struct sh_script *sc, int *ip, int to)
      * and background paths need while the body runs.
      */
     tail = sc->line[end] + strspn(sc->line[end], " \t");
-    tail += starts_word(tail, "fi") ? 2 : 4;
+    tail += closer_len(tail);
     if (tail[strspn(tail, " \t\r")] == '\0')
         return run_block(sh, sc, ip, end, mid);
     return run_compound_rest(sh, sc, ip, end, mid);
@@ -5542,8 +6038,9 @@ static int run_script_range(struct sh *sh,
                             int from,
                             int to)
 {
-    static const char *const compound[] = {"if",    "for",  "while",
-                                           "until", "case", NULL};
+    static const char *const compound[] = {"if",   "for",  "while",
+                                           "until", "case", "{",
+                                           NULL};
     int rc = 0;
 
     for (int i = from; i < to && !sh->exit_requested && !sh->return_requested &&
@@ -5679,6 +6176,19 @@ static int run_text(struct sh *sh, const char *text)
         rc = script_prepare(&sc);
     rc = rc == 0 ? run_script_range(sh, &sc, 0, sc.count) : 1;
     script_free(&sc);
+    return rc;
+}
+
+static int sh_read_line(struct sh *sh,
+                        const char *prompt,
+                        char *out,
+                        size_t outsz)
+{
+    int rc;
+
+    sh_trap_restart(sh, false);
+    rc = sh_read_line_body(sh, prompt, out, outsz);
+    sh_trap_restart(sh, true);
     return rc;
 }
 
