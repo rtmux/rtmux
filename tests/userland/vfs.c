@@ -2575,6 +2575,68 @@ static int serial_poll_read_ready(int fd)
     return (unsigned char) ch;
 }
 
+/* Hang the line up (output speed B0) a moment after the poller starts. */
+static void *tty_hangup_setter(void *arg)
+{
+    int fd = (int) (intptr_t) arg;
+    struct termios t;
+
+    sleep_ms(300);
+    if (tcgetattr(fd, &t) == 0 && cfsetospeed(&t, B0) == 0)
+        (void) tcsetattr(fd, TCSANOW, &t);
+    return NULL;
+}
+
+/* A poll that asks for no event waits for hangup alone: it times out on a live
+ * line, ends at once when the line is hung up (B0) and keeps reporting it until
+ * a speed is set again.
+ */
+static void tty_hangup_check(const char *name, int fd)
+{
+    char what[96];
+    struct termios saved;
+    struct pollfd pfd = {.fd = fd, .events = 0};
+    struct timespec t0, t1;
+    pthread_t th;
+    long ms;
+    int rc;
+
+    if (tcgetattr(fd, &saved) != 0) {
+        test_fail(name, "hangup tcgetattr failed");
+        return;
+    }
+    if (saved.c_ospeed == B0)
+        cfsetospeed(&saved, B38400);
+    snprintf(what, sizeof what, "%s hangup-only poll times out on a live line", name);
+    rc = poll(&pfd, 1, 100);
+    check(rc == 0, what, "poll with no events must wait for hangup alone");
+
+    if (pthread_create(&th, NULL, tty_hangup_setter, (void *) (intptr_t) fd) != 0) {
+        test_fail(name, "hangup thread failed");
+        return;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    rc = poll(&pfd, 1, 10000);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    (void) pthread_join(th, NULL);
+    ms = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+    snprintf(what, sizeof what, "%s hangup-only poll returns at once on hangup", name);
+    check(rc == 1 && (pfd.revents & POLLHUP) && ms < 5000, what,
+          "a hangup-only poll must return POLLHUP when the line is hung up");
+    pfd = (struct pollfd){.fd = fd, .events = POLLOUT};
+    snprintf(what, sizeof what, "%s hung-up line reports POLLHUP, not POLLOUT", name);
+    check(poll(&pfd, 1, 0) == 1 && (pfd.revents & POLLHUP) &&
+              !(pfd.revents & POLLOUT),
+          what, "a hung-up line must report POLLHUP at once and not be writable");
+    pfd.events = 0;
+
+    (void) tcsetattr(fd, TCSANOW, &saved);
+    pfd.revents = 0;
+    snprintf(what, sizeof what, "%s hangup ends when a speed is set", name);
+    check(poll(&pfd, 1, 50) == 0, what,
+          "setting a speed again must end the hangup");
+}
+
 void test_serial_poll(void)
 {
     struct serial_poller a = {0}, b = {0}, c = {0}, d = {0};
@@ -2613,6 +2675,7 @@ void test_serial_poll(void)
     pfd = (struct pollfd){.fd = fd, .events = POLLOUT};
     check(poll(&pfd, 1, 0) == 1 && (pfd.revents & POLLOUT),
           "serial_poll writable", "a terminal must poll POLLOUT");
+    tty_hangup_check("serial_poll", fd);
 
     /* Close while polled: the armed notification goes with the open, and the
      * poller ends at its timeout instead of hanging or waking spuriously.
@@ -2741,6 +2804,7 @@ void test_console_poll(void)
     pfd = (struct pollfd){.fd = fd, .events = POLLOUT};
     check(poll(&pfd, 1, 0) == 1 && pfd.revents == POLLOUT,
           "console_poll writable", "the console must poll POLLOUT only");
+    tty_hangup_check("console_poll", fd);
 
     a.fd = b.fd = fd;
     a.timeout_ms = b.timeout_ms = 20000;

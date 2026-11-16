@@ -44,6 +44,7 @@ http_pid=
 udp_pid=
 dns_pid=
 payload_pid=
+poll_pid=
 LAST_LOG=
 IOMMU_METADATA_DTB=
 IOMMU_METADATA_DTS=
@@ -58,7 +59,7 @@ FDT_CPU_BASE_OPTS=
 cleanup()
 {
     kill "${http_pid:-}" "${udp_pid:-}" "${dns_pid:-}" "${payload_pid:-}" \
-        2>/dev/null || true
+        "${poll_pid:-}" 2>/dev/null || true
     rm -f "${IOMMU_METADATA_DTB:-}" "${IOMMU_METADATA_DTS:-}" \
         "${IOMMU_METADATA_ERR:-}" "${FDT_CPU_DTB:-}" "${FDT_CPU_DTS:-}" \
         "${FDT_RESV_DTB:-}" "${FDT_RESV_DTS:-}"
@@ -543,7 +544,10 @@ Options:
                     host-authored ext4 with hardlinks/sparse/big dir),
                     lkl-netd-crash, lkl-netd-direct-denied, lkl-netd-http,
                     lkl-netd-http-split, lkl-netd-http-isolated, lkl-netd-revoke,
-                    lkl-netd-stale,
+                    lkl-netd-stale, lkl-netd-poll (poll() on lkl-netd data
+                    sockets, against a host peer on 127.0.0.1:8004-8008),
+                    lkl-netd-poll-spent (the same with no notify retries
+                    left, so every arm takes the last-attempt path),
                     lkl-multi (boots lkl-fsd and lkl-netd together and
                     exercises both domains concurrently), or lkl-multi-crash
                     (crashes lkl-netd mid-workload and checks lkl-fsd survives),
@@ -1253,6 +1257,17 @@ mode_needs_net_helpers()
     return 1
 }
 
+# lkl-netd-poll polls sockets against a peer whose behaviour the test picks by
+# port, so it needs the poll peer below rather than the HTTP, UDP and DNS
+# helpers.
+mode_needs_poll_helper()
+{
+    case "$MODE" in
+        lkl-netd-poll|lkl-netd-poll-spent) return 0 ;;
+    esac
+    return 1
+}
+
 mode_needs_payload_helper()
 {
     case "$MODE" in
@@ -1737,7 +1752,7 @@ case "$MODE" in
         NEEDS_LKL_SERVERS=1
         [ "$TIMEOUT_SET" -eq 0 ] && TIMEOUT=60
         ;;
-    lkl-fsd-crash|lkl-fsd-tree|lkl-fsd-tree-split|lkl-fsd-tree-isolated|lkl-fsd-tricky|lkl-fsd-restart|lkl-netd-crash|lkl-netd-direct-denied|lkl-netd-http|lkl-netd-http-split|lkl-netd-http-isolated|lkl-netd-revoke|lkl-netd-restart|lkl-netd-stale|lkl-multi|lkl-multi-crash|lkl-multi-stress)
+    lkl-fsd-crash|lkl-fsd-tree|lkl-fsd-tree-split|lkl-fsd-tree-isolated|lkl-fsd-tricky|lkl-fsd-restart|lkl-netd-crash|lkl-netd-direct-denied|lkl-netd-http|lkl-netd-http-split|lkl-netd-http-isolated|lkl-netd-revoke|lkl-netd-restart|lkl-netd-stale|lkl-netd-poll|lkl-netd-poll-spent|lkl-multi|lkl-multi-crash|lkl-multi-stress)
         BEGIN_MARKER="RTMux ${MODE}: BEGIN"
         PASS_MARKER="RTMux ${MODE}: PASS"
         FAIL_MARKER="RTMux ${MODE}: FAIL"
@@ -2983,6 +2998,69 @@ PY
     if ! kill -0 "$payload_pid" 2>/dev/null; then
         echo "qemu-regress: failed to start payload helper on 127.0.0.1:8003" >&2
         cat /tmp/rtmux-lkl-payload.log >&2
+        exit 1
+    fi
+fi
+
+# The poll peer of lkl-netd-poll: a TCP server per behaviour (see
+# tests/userland/rt-latency/lkl-netd-poll-test.c). 8004 is idle, 8005 sends
+# "hello" a second after accept, 8006 resets after a second, 8007 closes after
+# a second, 8008 sends "hello" after two seconds.
+if mode_needs_poll_helper; then
+    python3 - <<'PY' >/tmp/rtmux-lkl-poll.log 2>&1 &
+import socket
+import struct
+import threading
+import time
+
+def peer(conn, delay, action):
+    try:
+        time.sleep(delay)
+        if action == "send":
+            conn.sendall(b"hello")
+        elif action == "reset":
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                            struct.pack("ii", 1, 0))
+            conn.close()
+            return
+        elif action == "fin":
+            conn.close()
+            return
+        conn.settimeout(60)
+        while conn.recv(4096):
+            pass
+    except OSError:
+        pass
+    finally:
+        conn.close()
+
+def listener(port):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("127.0.0.1", port))
+    s.listen(64)
+    return s
+
+def serve(s, delay, action):
+    while True:
+        conn, _ = s.accept()
+        threading.Thread(target=peer, args=(conn, delay, action),
+                         daemon=True).start()
+
+# Bind every port here, so that one already taken ends the helper at once.
+for port, delay, action in ((8004, 0, "idle"), (8005, 1, "send"),
+                            (8006, 1, "reset"), (8007, 1, "fin"),
+                            (8008, 2, "send")):
+    threading.Thread(target=serve, args=(listener(port), delay, action),
+                     daemon=True).start()
+while True:
+    time.sleep(3600)
+PY
+    poll_pid=$!
+    sleep 1
+    if ! kill -0 "$poll_pid" 2>/dev/null; then
+        echo "qemu-regress: failed to start poll helper on 127.0.0.1:8004-8008" >&2
+        cat /tmp/rtmux-lkl-poll.log >&2
         exit 1
     fi
 fi

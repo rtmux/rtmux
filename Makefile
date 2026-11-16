@@ -261,6 +261,8 @@ LKL_QEMU_MODES = \
     lkl-netd-crash:180 \
     lkl-netd-revoke:180 \
     lkl-netd-stale:180 \
+    lkl-netd-poll:300 \
+    lkl-netd-poll-spent:300 \
     lkl-netd-http:300 \
     lkl-fsd-restart:180 \
     lkl-fsd-tree-split:180 \

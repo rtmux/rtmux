@@ -11,6 +11,19 @@
 #include <sys/ioserv-private.h>
 #include "internal.h"
 
+/* Whether the message at ctp->offset is a lone _IO_NOTIFY that the service
+ * asked to dispatch without the object lock (IOSERV_OPS_NOTIFY_UNLOCKED). A
+ * lone message is at offset 0 and carries no combine flag.
+ */
+static int _ioserv_notify_unlocked(const ioserv_context_t *ctp,
+                                   const ioserv_msg_t *msg,
+                                   const struct binding *binding)
+{
+    return msg->type == _IO_NOTIFY && ctp->offset == 0 &&
+           !(msg->combine.combine_len & _IO_COMBINE_FLAG) && binding->funcs &&
+           (binding->funcs->flags & IOSERV_OPS_NOTIFY_UNLOCKED);
+}
+
 static void _ioserv_unlock(ioserv_context_t *ctp, struct binding *binding)
 {
     _ioserv_func_t func;
@@ -97,8 +110,9 @@ int _ioserv_io_handler(ioserv_context_t *ctp,
             if (func) {
                 _ioserv_func_t lock;
 
-                if (!locked && (lock = _ioserv_io_func(binding->funcs,
-                                                       _IO_RSVD_LOCK_OCB))) {
+                if (!locked && !_ioserv_notify_unlocked(ctp, msg, binding) &&
+                    (lock =
+                         _ioserv_io_func(binding->funcs, _IO_RSVD_LOCK_OCB))) {
                     int rcvid2 = ctp->rcvid;
 
                     ctp->rcvid = rcvid;

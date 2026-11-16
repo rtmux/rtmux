@@ -1127,10 +1127,12 @@ static int pipe_service_closeocb(ioserv_context_t *ctp,
             unblock_clients(&pipe->waiting[IOSERV_NOTIFY_OUTPUT], NULL, -1,
                             EPIPE);
             ioserv_notify_trigger(pipe->notify, INT_MAX, IOSERV_NOTIFY_OUTPUT);
+            ioserv_notify_trigger(pipe->notify, INT_MAX, IOSERV_NOTIFY_OBAND);
         }
         if (flags & PIPE_OCB_LAST_WRITER) {
             unblock_clients(&pipe->waiting[IOSERV_NOTIFY_INPUT], NULL, -1, EOK);
             ioserv_notify_trigger(pipe->notify, INT_MAX, IOSERV_NOTIFY_INPUT);
+            ioserv_notify_trigger(pipe->notify, INT_MAX, IOSERV_NOTIFY_OBAND);
         }
         if (flags & PIPE_OCB_LAST_INUSE) {
             pipe->attr.nbytes = 0;

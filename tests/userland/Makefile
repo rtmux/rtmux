@@ -117,6 +117,7 @@ INSTALL_BIN = syscall_testing \
               rt-latency/lkl-contain-test \
               rt-latency/lkl-runmask \
               rt-latency/lkl-backpressure-test \
+              rt-latency/lkl-netd-poll-test \
               rt-latency/lkl-iommu-probe \
               rt-latency/rcu-lookup-measure \
               rt-latency/revoke-stress \

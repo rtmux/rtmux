@@ -13,7 +13,8 @@ PROGS = $(BUILD_BASE)/rt-latency $(BUILD_BASE)/timer-jitter \
         $(BUILD_BASE)/lkl-multi-test $(BUILD_BASE)/lkl-fsd-read-test \
         $(BUILD_BASE)/lkl-supervisor $(BUILD_BASE)/lkl-stale-handle-test \
         $(BUILD_BASE)/lkl-contain-test $(BUILD_BASE)/lkl-runmask \
-        $(BUILD_BASE)/lkl-backpressure-test $(BUILD_BASE)/lkl-iommu-probe \
+        $(BUILD_BASE)/lkl-backpressure-test $(BUILD_BASE)/lkl-netd-poll-test \
+        $(BUILD_BASE)/lkl-iommu-probe \
         $(BUILD_BASE)/tracelogger $(BUILD_BASE)/rcu-lookup-measure \
         $(BUILD_BASE)/revoke-stress $(BUILD_BASE)/ipc-roundtrip \
         $(BUILD_BASE)/ipc-priority-donation $(BUILD_BASE)/mem-pressure \
@@ -32,7 +33,8 @@ PROGS = $(BUILD_BASE)/rt-latency $(BUILD_BASE)/timer-jitter \
 SRCS = latency.c timer-jitter.c pi-inversion-xfail.c lkl-gate.c lkl-measure.c \
        lkl-native-test.c lkl-multi-test.c lkl-fsd-read-test.c lkl-supervisor.c \
        lkl-stale-handle-test.c lkl-contain-test.c lkl-runmask.c \
-       lkl-backpressure-test.c lkl-iommu-probe.c tracelogger.c \
+       lkl-backpressure-test.c lkl-netd-poll-test.c lkl-iommu-probe.c \
+       tracelogger.c \
        rcu-lookup-measure.c revoke-stress.c ipc-roundtrip.c \
        ipc-priority-donation.c mem-pressure.c irq-notify.c tickless-idle.c \
        monotonic-time.c rr-fairness.c sporadic-budget.c logger-restart.c \
@@ -109,6 +111,11 @@ $(BUILD_BASE)/lkl-runmask: $(OBJDIR)/lkl-runmask.o $(CRT0_O) $(LIBC_SO)
 	$(Q)$(LD) -nostdlib -o $@ $(CRT0_O) $< $(LIBC_SO)
 
 $(BUILD_BASE)/lkl-backpressure-test: $(OBJDIR)/lkl-backpressure-test.o $(CRT0_O) $(LIBC_SO)
+	@mkdir -p $(@D)
+	$(msg) LD $@
+	$(Q)$(LD) -nostdlib -o $@ $(CRT0_O) $< $(LIBC_SO)
+
+$(BUILD_BASE)/lkl-netd-poll-test: $(OBJDIR)/lkl-netd-poll-test.o $(CRT0_O) $(LIBC_SO)
 	@mkdir -p $(@D)
 	$(msg) LD $@
 	$(Q)$(LD) -nostdlib -o $@ $(CRT0_O) $< $(LIBC_SO)
