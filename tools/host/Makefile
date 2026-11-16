@@ -39,6 +39,7 @@ PROGS = $(BUILD_BASE)/mkasmoff $(BUILD_BASE)/mkromfs $(BUILD_BASE)/treeromfs \
         $(BUILD_BASE)/serial-reply-test $(BUILD_BASE)/outcomes-test \
         $(BUILD_BASE)/sv39-lookup-test \
         $(BUILD_BASE)/strftime-test \
+        $(BUILD_BASE)/sh-scan-test \
         $(BUILD_BASE)/libc-algorithms-test
 
 # Each tool compiles and links its sources in one command, so -MMD cannot give a
@@ -131,6 +132,16 @@ $(BUILD_BASE)/strftime-asan-test: $(STRFTIME_DEPS)
 	    printf '#!/bin/sh\necho "strftime-test: SKIP ASan (unsupported)"\n' > $@; \
 	    chmod +x $@; \
 	fi
+
+# The toolbox shell's quote and substitution scanner, against a table of quoting
+# cases whose fields were made by a reference shell (gen-sh-quote-cases.py).
+SH_DIR = ../../userland/utils
+$(BUILD_BASE)/sh-scan-test: $(TEST_DIR)/test-sh-scan.c $(SH_DIR)/sh-scan.c $(SH_DIR)/sh-scan.h \
+                            $(TEST_DIR)/sh-quote-cases.h
+	@mkdir -p $(@D)
+	$(msg) HOSTCC $(notdir $@)
+	$(Q)$(HOST_CC) -I$(SH_DIR) -I$(TEST_DIR) $(HOST_CFLAGS) -o $@ \
+	    $(TEST_DIR)/test-sh-scan.c $(SH_DIR)/sh-scan.c
 
 cap-table-test: $(BUILD_BASE)/cap-table-test
 	$(Q)$<
@@ -233,7 +244,7 @@ host-tests: $(BUILD_BASE)/path-normalize-test $(BUILD_BASE)/cap-table-test \
             $(BUILD_BASE)/serial-reply-test $(BUILD_BASE)/outcomes-test \
             $(BUILD_BASE)/sv39-lookup-test \
             $(BUILD_BASE)/strftime-test $(BUILD_BASE)/strftime-asan-test \
-            $(BUILD_BASE)/libc-algorithms-test
+            $(BUILD_BASE)/sh-scan-test $(BUILD_BASE)/libc-algorithms-test
 	$(Q)$<
 	$(Q)$(BUILD_BASE)/cap-table-test
 	$(Q)$(BUILD_BASE)/bootstrap-manifest-test
@@ -249,6 +260,9 @@ host-tests: $(BUILD_BASE)/path-normalize-test $(BUILD_BASE)/cap-table-test \
 	$(Q)$(BUILD_BASE)/sv39-lookup-test
 	$(Q)$(BUILD_BASE)/strftime-test
 	$(Q)$(BUILD_BASE)/strftime-asan-test
+	$(Q)$(BUILD_BASE)/sh-scan-test
+	$(Q)if command -v dash >/dev/null; then \
+	    $(PYTHON) $(TEST_DIR)/gen-sh-quote-cases.py --check; fi
 	$(Q)out=$$($(BUILD_BASE)/libc-algorithms-test) || { printf '%s\n' "$$out"; exit 1; }
 	$(Q)$(PYTHON) $(TEST_DIR)/test-capability-namespace-doc.py
 	$(Q)$(PYTHON) $(TEST_DIR)/test-management-ipc-lock.py

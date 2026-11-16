@@ -153,6 +153,9 @@ install: all
 	$(Q)cp $(PRELOAD_PROBE) $(INITRAMFS_DIR)/lib/preload-probe.so
 	$(Q)$(STRIP) --strip-unneeded $(INITRAMFS_DIR)/lib/preload-probe.so
 	$(Q)cp sh-posix/test.sh $(INITRAMFS_DIR)/bin/sh-posix-test
+	$(Q)cp sh-posix/quote-run.sh $(INITRAMFS_DIR)/bin/sh-posix-quote-run
+	$(Q)cp sh-posix/quote-cases.dat $(INITRAMFS_DIR)/bin/sh-posix-quote-cases
+	$(Q)cp sh-posix/gaps.sh $(INITRAMFS_DIR)/bin/sh-posix-gaps
 	$(Q)cp toolbox/test.sh $(INITRAMFS_DIR)/bin/toolbox-test
 
 clean: $(RT_LATENCY_CLEAN) $(LOCK_RANK_STRESS_CLEAN) $(NAMESPACE_ROUNDTRIP_CLEAN)
