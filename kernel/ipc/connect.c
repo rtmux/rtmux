@@ -617,13 +617,17 @@ int _connect_detach(process_t *prp, int coid_arg)
     vec = ((unsigned) coid_arg & RTMUX_SIDE_CHANNEL) ? &prp->chancons
                                                      : &prp->fdcons;
     coid = (unsigned) coid_arg & ~RTMUX_SIDE_CHANNEL;
-    if (!(cop = vector_lookup2(vec, coid)) || cop->type != TYPE_CONNECTION)
+    kspinlock_lock(&prp->vec_slock);
+    if (!(cop = vector_lookup2(vec, coid)) || cop->type != TYPE_CONNECTION) {
+        kspinlock_unlock(&prp->vec_slock);
         return EINVAL;
+    }
     server_side = vec == &prp->chancons &&
                   !(cop->flags & RTMUX_FLG_COF_GLOBAL) && cop->channel &&
                   cop->channel->process == prp && coid == cop->scoid;
 
     vector_rem(vec, coid);
+    kspinlock_unlock(&prp->vec_slock);
     if (cop->links == 0) {
         connect_soul_free(prp, cop);
     } else {
