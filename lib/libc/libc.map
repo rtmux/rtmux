@@ -21,6 +21,7 @@
         __interrupt_attach_event;
         __interrupt_mask;
         __interrupt_unmask;
+        __rtmux_mallocstats;
         __rtmux_syschan_init;
         __sched_get;
         __sched_get_r;

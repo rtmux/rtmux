@@ -23,6 +23,7 @@
 #ifndef __WAIT_H_INCLUDED
 #include <sys/wait.h>
 #endif
+#include <sys/mallocstats.h>
 
 #ifndef NULL
 #define NULL _NULL

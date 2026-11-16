@@ -16,9 +16,19 @@
 #include <errno.h>
 #include "malloc-core.h"
 
+/* POSIX.1-2024: a request that cannot be satisfied sets errno to ENOMEM. A
+ * zero-size request may return NULL without being a failure.
+ */
+static void *nomem(void *p, int failed_request)
+{
+    if (!p && failed_request)
+        errno = ENOMEM;
+    return p;
+}
+
 void *malloc(size_t size)
 {
-    return __crt_malloc(size);
+    return nomem(__crt_malloc(size), size != 0);
 }
 
 void free(void *ptr)
@@ -28,12 +38,22 @@ void free(void *ptr)
 
 void *calloc(size_t nmemb, size_t size)
 {
-    return __crt_calloc(nmemb, size);
+    return nomem(__crt_calloc(nmemb, size), nmemb != 0 && size != 0);
 }
 
 void *realloc(void *ptr, size_t size)
 {
-    return __crt_realloc(ptr, size);
+    return nomem(__crt_realloc(ptr, size), size != 0);
+}
+
+int __rtmux_mallocstats(struct __rtmux_mallocstats *st)
+{
+    if (!st) {
+        errno = EINVAL;
+        return -1;
+    }
+    __crt_mallocstats(st);
+    return 0;
 }
 
 int posix_memalign(void **memptr, size_t alignment, size_t size)

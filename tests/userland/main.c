@@ -58,6 +58,7 @@ static const struct test_suite test_suites[] = {
     TEST_SUITE(qsort),
     TEST_SUITE(getopt),
     TEST_SUITE(env),
+    TEST_SUITE_NAMED("malloc-stats", malloc_stats),
     TEST_SUITE(signals),
     TEST_SUITE(notifications),
     TEST_SUITE(capgate),

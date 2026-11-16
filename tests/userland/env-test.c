@@ -122,6 +122,33 @@ static void test_env_putenv(void)
     check(ok, "unsetenv of a putenv string leaves it intact", "caller string changed");
 }
 
+/* The allocator's counters: the host counting allocator, or in the guest the
+ * libc's own statistics (__rtmux_mallocstats). calls is the allocations made so
+ * far, live the bytes held, and bytes (host only) the bytes ever requested.
+ */
+struct alloc_snap {
+    unsigned long long calls, live, bytes;
+};
+
+static void alloc_snap(struct alloc_snap *s)
+{
+#ifdef LIBC_HOST_TEST
+    struct host_alloc_stats h;
+
+    host_alloc_snapshot(&h);
+    s->calls = h.calls;
+    s->live = h.live;
+    s->bytes = h.bytes;
+#else
+    struct __rtmux_mallocstats m;
+
+    __rtmux_mallocstats(&m);
+    s->calls = m.allocs;
+    s->live = m.bytes_in_use;
+    s->bytes = 0;
+#endif
+}
+
 static size_t env_len(void)
 {
     size_t n = 0;
@@ -164,6 +191,88 @@ static void test_env_reassign(void)
           "the program's vector was written");
 }
 
+/* Strings libc allocated, reached again through the program's own vectors or
+ * through the arguments of the call that replaces its vector: none of them may
+ * be freed, and a copied vector keeps libc's ownership, so copying environ in
+ * every round of a loop leaves the heap flat too.
+ */
+static void test_env_alias(void)
+{
+    static char *empty[] = {NULL};
+    static char *joined[] = {"UU=1", NULL};
+    char *held[2], *copy[16], *both[3], val[16];
+    char *interior, *w = NULL, *name, *astart = NULL;
+    struct alloc_snap first = {0}, last;
+    int ok;
+
+    /* A pointer into the middle of an allocated string is a live entry. */
+    ok = setenv("X", "Y=1", 1) == 0;
+    interior = getenv("X");
+    held[0] = interior;
+    held[1] = NULL;
+    environ = held;
+    ok = ok && setenv("Q", "1", 1) == 0 && !strcmp(interior, "Y=1") &&
+         !strcmp(getenv("Y"), "1") && !strcmp(getenv("Q"), "1");
+    check(ok, "a vector entry pointing into a libc string keeps it allocated",
+          "the string was freed or lost");
+
+    /* Two entries into one buffer: A=B=old, and B=old inside it. Changing A
+     * must not reuse the buffer under B.
+     */
+    ok = setenv("A", "B=old", 1) == 0;
+    for (size_t i = 0; environ[i]; i++) {
+        if (!strncmp(environ[i], "A=", 2))
+            astart = environ[i];
+    }
+    both[0] = astart;
+    both[1] = astart ? astart + 2 : NULL;
+    both[2] = NULL;
+    environ = both;
+    ok = ok && astart && setenv("A", "x", 1) == 0 && !strcmp(getenv("A"), "x") &&
+         getenv("B") && !strcmp(getenv("B"), "old");
+    check(ok, "a buffer two entries point into is not reused in place", "B was overwritten");
+
+    /* putenv of a string libc allocated, after the program emptied environ. */
+    ok = setenv("W", "v", 1) == 0;
+    for (size_t i = 0; environ[i]; i++) {
+        if (!strncmp(environ[i], "W=", 2))
+            w = environ[i];
+    }
+    environ = empty;
+    ok = ok && w && putenv(w) == 0 && !strcmp(getenv("W"), "v");
+    check(ok, "putenv of a libc string survives the replacement of its vector",
+          "the argument was freed before it was stored");
+
+    /* unsetenv with a name that points into a libc string. */
+    ok = setenv("K1", "UU", 1) == 0;
+    name = getenv("K1");
+    environ = joined;
+    ok = ok && unsetenv(name) == 0 && !getenv("UU") && !strcmp(name, "UU");
+    check(ok, "unsetenv with a name inside a libc string reads it to the end",
+          "the name was freed under the call");
+
+    /* Copy, assign, change: ownership follows the copy, so nothing leaks. */
+    ok = 1;
+    for (int i = 0; i < MANY && ok; i++) {
+        size_t n = env_len();
+
+        if (n >= sizeof copy / sizeof *copy)
+            break;
+        memcpy(copy, environ, (n + 1) * sizeof *copy);
+        environ = copy;
+        snprintf(val, sizeof val, "c%04d", i);
+        ok = setenv("CP", val, 1) == 0 && !strcmp(getenv("CP"), val);
+        if (i == 1)
+            alloc_snap(&first);
+    }
+    alloc_snap(&last);
+    check(ok, "1000 copies of environ with setenv keep every value", "a value was wrong");
+    check(last.live == first.live, "1000 copies of environ leave the heap flat",
+          "owned strings lost their ownership and leaked");
+    /* environ must not outlive the vectors on this frame. */
+    environ = NULL;
+}
+
 /* A program that keeps assigning environ and then changing it: libc frees the
  * vector it replaces, and the strings it allocated that the new vector does not
  * hold, so the heap stays flat. A string the program's vector does hold (a copy
@@ -175,26 +284,20 @@ static void test_env_reassign_loop(void)
     char *copy[16];
     char val[16];
     int ok = 1;
-#ifdef LIBC_HOST_TEST
-    struct host_alloc_stats first, last;
-#endif
+    struct alloc_snap first = {0}, last;
 
     for (int i = 0; i < MANY && ok; i++) {
         environ = base;
         snprintf(val, sizeof val, "r%04d", i); /* same length each round */
         ok = setenv("A", val, 1) == 0 && setenv("T", val, 1) == 0 && !strcmp(getenv("A"), val) &&
              !strcmp(getenv("T"), val) && !strcmp(getenv("U"), "2") && !strcmp(base[0], "T=1");
-#ifdef LIBC_HOST_TEST
         if (i == 1)
-            host_alloc_snapshot(&first);
-#endif
+            alloc_snap(&first);
     }
+    alloc_snap(&last);
     check(ok, "1000 environ reassignments with setenv keep every value", "a value was wrong");
-#ifdef LIBC_HOST_TEST
-    host_alloc_snapshot(&last);
     check(last.live == first.live, "1000 environ reassignments leave the heap flat",
           "the vectors or strings leaked");
-#endif
 
     /* The program copies environ, assigns the copy, and libc replaces it. */
     ok = setenv("KEEP", "kept", 1) == 0 && env_len() < sizeof copy / sizeof *copy;
@@ -209,6 +312,8 @@ static void test_env_reassign_loop(void)
     environ = NULL;
     ok = setenv("N", "1", 1) == 0 && !strcmp(getenv("N"), "1") && !getenv("KEEP");
     check(ok, "environ = NULL then setenv starts afresh", "old variables remained");
+
+    test_env_alias();
 }
 
 /* 1000 distinct names: the vector grows geometrically, so environ changes
@@ -221,14 +326,10 @@ static void test_env_growth(void)
     char **last = NULL;
     unsigned moves = 0;
     int ok = 1;
-#ifdef LIBC_HOST_TEST
-    struct host_alloc_stats before, after;
-#endif
+    struct alloc_snap before, after;
 
     environ = NULL;
-#ifdef LIBC_HOST_TEST
-    host_alloc_snapshot(&before);
-#endif
+    alloc_snap(&before);
     for (int i = 0; i < MANY && ok; i++) {
         snprintf(name, sizeof name, "V%d", i);
         ok = setenv(name, "x", 1) == 0;
@@ -237,40 +338,43 @@ static void test_env_growth(void)
             last = environ;
         }
     }
+    alloc_snap(&after);
     for (int i = 0; i < MANY && ok; i++) {
         snprintf(name, sizeof name, "V%d", i);
         ok = getenv(name) && !strcmp(getenv(name), "x");
     }
-    printf("  INFO  %d distinct setenv: environ moved %u times\n", MANY, moves);
+    printf("  INFO  %d distinct setenv: environ moved %u times, %llu allocations\n", MANY, moves,
+           after.calls - before.calls);
     check(ok && moves <= 8, "1000 distinct setenv grow the vector geometrically",
           "a variable was lost or the vector moved too often");
-#ifdef LIBC_HOST_TEST
-    host_alloc_snapshot(&after);
-    printf("  INFO  %d distinct setenv: %lu allocations, %lu bytes\n", MANY,
-           after.calls - before.calls, after.bytes - before.bytes);
     /* One string each, plus a vector and a side array per move, at most 4n
      * slots in total over all moves: O(n).
      */
-    check(after.calls - before.calls <= MANY + 2 * moves &&
-              after.bytes - before.bytes <= MANY * 8 + 8 * MANY * sizeof(char *) * 2,
-          "1000 distinct setenv do O(n) allocation in total", "allocation is not linear");
+    check(after.calls - before.calls <= MANY + 2 * moves,
+          "1000 distinct setenv do O(n) allocations in total", "allocation count is not linear");
+    {
+        char detail[64];
+
+        snprintf(detail, sizeof detail, "%llu allocations, want 1014", after.calls - before.calls);
+        check(after.calls - before.calls == 1014, "1000 distinct setenv make 1014 allocations",
+              detail);
+    }
+#ifdef LIBC_HOST_TEST
+    check(after.bytes - before.bytes <= MANY * 8 + 8 * MANY * sizeof(char *) * 2,
+          "1000 distinct setenv do O(n) allocated bytes in total", "allocated bytes not linear");
 #endif
 
     char *p = getenv("V0");
     char **vec = environ;
-#ifdef LIBC_HOST_TEST
-    host_alloc_snapshot(&before);
-#endif
+    alloc_snap(&before);
     for (int i = 0; i < MANY && ok; i++) {
         snprintf(val, sizeof val, "%c", 'a' + i % 26);
         ok = setenv("V0", val, 1) == 0 && getenv("V0") == p && environ == vec;
     }
+    alloc_snap(&after);
     check(ok, "1000 overwrites of one name reuse its buffer", "the string or vector moved");
-#ifdef LIBC_HOST_TEST
-    host_alloc_snapshot(&after);
     check(after.calls == before.calls && after.live == before.live,
           "1000 overwrites of one name leave the heap flat", "the overwrites allocated");
-#endif
 }
 
 #ifdef LIBC_HOST_TEST
@@ -325,36 +429,35 @@ int env_expect_child(const char *assignment)
 }
 #endif
 
-/* The process environment as strings and a vector the program owns. environ may
- * be libc's own vector, which libc frees when the program assigns environ and
- * then changes it, so the tests restore this copy and not the saved pointer.
+/* A private copy of the environment: a vector and strings of the test's own,
+ * which libc never frees. The tests assign environ freely, and libc frees what
+ * it replaces, so the vector and strings in place when the suite starts cannot
+ * be restored afterwards.
  */
-static char *saved_vec[64];
-static char saved_str[4096];
-
-static char **save_environ(void)
+static char **env_copy(void)
 {
-    size_t used = 0, n = 0;
+    size_t n = env_len();
+    char **vec = calloc(n + 1, sizeof *vec);
 
-    if (!environ)
-        return NULL;
-    for (; environ[n]; n++) {
-        size_t len = strlen(environ[n]) + 1;
-
-        if (n + 1 >= sizeof saved_vec / sizeof saved_vec[0] ||
-            used + len > sizeof saved_str)
-            break;
-        saved_vec[n] = memcpy(saved_str + used, environ[n], len);
-        used += len;
+    for (size_t i = 0; vec && i < n; i++) {
+        if (!(vec[i] = strdup(environ[i]))) {
+            while (i--)
+                free(vec[i]);
+            free(vec);
+            return NULL;
+        }
     }
-    saved_vec[n] = NULL;
-    return saved_vec;
+    return vec;
 }
 
 void test_env(void)
 {
-    char **saved = save_environ();
+    char **saved = env_copy();
 
+    if (!saved) {
+        test_skip("environment", "no memory to save the environment");
+        return;
+    }
     test_env_basic();
     test_env_putenv();
     test_env_reassign();

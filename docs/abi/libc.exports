@@ -20,6 +20,7 @@ __get_errno_ptr	FUNC	GLOBAL	DEFAULT	-
 __interrupt_attach_event	FUNC	WEAK	DEFAULT	-
 __interrupt_mask	FUNC	WEAK	DEFAULT	-
 __interrupt_unmask	FUNC	WEAK	DEFAULT	-
+__rtmux_mallocstats	FUNC	GLOBAL	DEFAULT	-
 __rtmux_syschan_init	FUNC	GLOBAL	DEFAULT	-
 __sched_get	FUNC	WEAK	DEFAULT	-
 __sched_get_r	FUNC	WEAK	DEFAULT	-

@@ -38,7 +38,8 @@ PROGS = $(BUILD_BASE)/mkasmoff $(BUILD_BASE)/mkromfs $(BUILD_BASE)/treeromfs \
         $(BUILD_BASE)/cpio-parser-test $(BUILD_BASE)/spawn-fd-policy-test \
         $(BUILD_BASE)/serial-reply-test $(BUILD_BASE)/outcomes-test \
         $(BUILD_BASE)/sv39-lookup-test \
-        $(BUILD_BASE)/strftime-test $(BUILD_BASE)/sh-scan-test $(BUILD_BASE)/tz-test
+        $(BUILD_BASE)/strftime-test $(BUILD_BASE)/sh-scan-test $(BUILD_BASE)/tz-test \
+        $(BUILD_BASE)/malloc-stats-test \
         $(BUILD_BASE)/libc-algorithms-test
 
 # Each tool compiles and links its sources in one command, so -MMD cannot give a
@@ -175,6 +176,30 @@ $(BUILD_BASE)/tz-asan-test: $(TZ_DEPS)
 tz-asan-real:
 	$(call build-tz-test,$(SAN_FLAGS),$(BUILD_BASE)/tz-asan-test)
 
+# The allocator's counters, with the real malloc-core.c linked in. The same source
+# without the counters (MALLOC_NO_STATS) is the baseline of host-bench-malloc.
+MALLOC_FLAGS = -I../../lib/common -I../../lib/libc/alloc -idirafter ../../include \
+               -D__hidden= -DMALLOC_HOST_TEST -pthread
+MALLOC_DEPS = $(TEST_DIR)/test-malloc-stats.c ../../lib/libc/alloc/malloc-core.c \
+              ../../lib/libc/alloc/malloc-core.h ../../include/sys/mallocstats.h
+$(BUILD_BASE)/malloc-stats-test: $(MALLOC_DEPS)
+	@mkdir -p $(@D)
+	$(msg) HOSTCC $(notdir $@)
+	$(Q)$(HOST_CC) $(MALLOC_FLAGS) $(HOST_CFLAGS) -o $@ \
+	    $(TEST_DIR)/test-malloc-stats.c ../../lib/libc/alloc/malloc-core.c
+
+$(BUILD_BASE)/malloc-nostats-bench: $(MALLOC_DEPS)
+	@mkdir -p $(@D)
+	$(msg) HOSTCC $(notdir $@)
+	$(Q)$(HOST_CC) $(MALLOC_FLAGS) -DMALLOC_NO_STATS $(HOST_CFLAGS) -o $@ \
+	    $(TEST_DIR)/test-malloc-stats.c ../../lib/libc/alloc/malloc-core.c
+
+# Best of 7 runs each of 2e6 malloc/free pairs, with and without the counters.
+host-bench-malloc: $(BUILD_BASE)/malloc-stats-test $(BUILD_BASE)/malloc-nostats-bench
+	@echo "with counters:"; $(BUILD_BASE)/malloc-stats-test bench
+	@echo "without counters:"; $(BUILD_BASE)/malloc-nostats-bench bench
+.PHONY: host-bench-malloc
+
 $(BUILD_BASE)/strftime-asan-test: $(STRFTIME_DEPS)
 	@mkdir -p $(@D)
 	$(msg) HOSTCC $(notdir $@)
@@ -301,7 +326,8 @@ host-tests: $(BUILD_BASE)/path-normalize-test $(BUILD_BASE)/cap-table-test \
             $(BUILD_BASE)/sv39-lookup-test \
             $(BUILD_BASE)/strftime-test $(BUILD_BASE)/strftime-asan-test \
             $(BUILD_BASE)/sh-scan-test $(BUILD_BASE)/libc-algorithms-test \
-            $(BUILD_BASE)/tz-test $(BUILD_BASE)/tz-asan-test $(TZ_ZONES)/.stamp
+            $(BUILD_BASE)/tz-test $(BUILD_BASE)/tz-asan-test $(TZ_ZONES)/.stamp \
+            $(BUILD_BASE)/malloc-stats-test
 	$(Q)$<
 	$(Q)$(BUILD_BASE)/cap-table-test
 	$(Q)$(BUILD_BASE)/bootstrap-manifest-test
@@ -317,10 +343,12 @@ host-tests: $(BUILD_BASE)/path-normalize-test $(BUILD_BASE)/cap-table-test \
 	$(Q)$(BUILD_BASE)/sv39-lookup-test
 	$(Q)$(BUILD_BASE)/strftime-test
 	$(Q)$(BUILD_BASE)/strftime-asan-test
-	$(Q)$(BUILD_BASE)/sh-scan-test $(Q)if command -v dash >/dev/null; then \
-	    $(PYTHON) $(TEST_DIR)/gen-sh-quote-cases.py --check; fi \
-	    $(Q)RTMUX_TZDIR=$(abspath $(TZ_ZONES))/ $(BUILD_BASE)/tz-test \
-	    $(Q)RTMUX_TZDIR=$(abspath $(TZ_ZONES))/ $(BUILD_BASE)/tz-asan-test
+	$(Q)$(BUILD_BASE)/sh-scan-test
+	$(Q)if command -v dash >/dev/null; then \
+	    $(PYTHON) $(TEST_DIR)/gen-sh-quote-cases.py --check; fi
+	$(Q)RTMUX_TZDIR=$(abspath $(TZ_ZONES))/ $(BUILD_BASE)/tz-test
+	$(Q)RTMUX_TZDIR=$(abspath $(TZ_ZONES))/ $(BUILD_BASE)/tz-asan-test
+	$(Q)$(BUILD_BASE)/malloc-stats-test
 	$(Q)out=$$($(BUILD_BASE)/libc-algorithms-test) || { printf '%s\n' "$$out"; exit 1; }
 	$(Q)$(PYTHON) $(TEST_DIR)/test-capability-namespace-doc.py
 	$(Q)$(PYTHON) $(TEST_DIR)/test-management-ipc-lock.py
