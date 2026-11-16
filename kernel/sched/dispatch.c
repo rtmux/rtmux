@@ -7,6 +7,13 @@
 
 #include <core/globals.h>
 
+/* A killing force_ready rereads a sync waiter's state at most this many times
+ * while the waker that unlinked it readies it (usually a window of a few
+ * instructions, longer for a broadcast); past it force_ready returns 0 and
+ * leaves the wakeup to the waker.
+ */
+#define FORCE_READY_WAKER_SPINS 100000u
+
 /* Scheduler Rosetta Stone (comments/prose only; no symbol renames):
  *
  *   kdispatch_t              = per-CPU runqueue state
@@ -170,6 +177,7 @@ static int dispatch_unlink_ready(kdispatch_t *dpp, thread_t *thp)
     }
 
     LINK3_REM(*queue, &thp->link3_link, thread_t);
+    THR_EV(thp);
     if (!DISPATCH_THP(dpp, thp->priority))
         DISPATCH_CLR(dpp, thp);
     return 1;
@@ -408,6 +416,7 @@ static thread_t *rdecl select_thread_default(int cpu, int prio)
     }
 
     LINK3_REM(DISPATCH_LST(dpp, (thp)->priority), &(thp)->link3_link, thread_t);
+    THR_EV(thp);
 
     /* If that list is now empty, clear the readybit.   */
     if (!DISPATCH_THP(dpp, (thp)->priority)) {
@@ -432,7 +441,9 @@ static void rdecl mark_running_default(thread_t *new)
 
     old = get_active_thread(get_cpunum());
     was_intr = new->state == STATE_INTR;
+    THR_EV(new);
     if (!new->process) {
+        thr_trace_dump(new);
         kprintf(
             "FATAL: mark_running cpu=%u new=%p tid=%d process=NULL type=%u "
             "state=%u\n",
@@ -1152,91 +1163,6 @@ static void force_ready_msgxfer(thread_t *thp, unsigned err)
 }
 #endif
 
-/**
- * Resettle the priorities of synchronization object owners after one of the
- * elements in the chain has adjusted its prioirity (down). The first pass is
- * used really to determine what kind of synchronization object is being worked
- * on (using the state as an overload) and the second pass uses the state of the
- * owner of that synchronization object to determine if there is a chain to
- * follow or not.
- */
-static void rdecl priority_chain_drop(thread_t *thp, int why)
-{
-    ksync_t *syp;
-    thread_t *next_owner;
-    unsigned restore_priority;
-
-    do {
-        /* Synchronizaion object switch */
-        switch (why) {
-        case STATE_MUTEX: {
-            restore_priority = thread_effective_prio(thp);
-            if ((syp = thp->mutex_holdlist) &&
-                (next_owner = pril_first(&syp->waiting))) {
-                if (restore_priority < next_owner->priority) {
-                    restore_priority = next_owner->priority;
-                }
-            }
-            if (thp->priority > restore_priority) {
-                adjust_priority(thp, restore_priority, thp->dpp, 1);
-            } else {
-                thp = NULL;
-            }
-            break;
-        }
-
-        case STATE_REPLY:
-        case STATE_SEND:
-            /* TODO: Chain through the I/O service */
-        default:
-            thp = NULL;
-        }
-
-        /* No change is expected */
-        if (!thp) {
-            break;
-        }
-
-        /* Synchronization object owner switch */
-        switch (thp->state) {
-        case STATE_MUTEX: {
-            process_t *prp;
-            int id;
-            unsigned long owner;
-
-            /* If we are not at the head of the list, then we aren't affecting
-             * anything
-             */
-            syp = thp->blocked_on;
-            if (pril_first(&syp->waiting) != thp) {
-                thp = NULL;
-                break;
-            }
-
-            /* Find the owner of the mutex we are blocked on and move to it */
-            owner = thp->args.mu.owner;
-            id = SYNC_PINDEX(owner);
-            if (id && id < process_vector.nentries &&
-                VECP(prp, &process_vector, id)) {
-                thp = vector_lookup(&prp->threads, SYNC_TID(owner));
-                why = STATE_MUTEX;
-            } else {
-                thp = NULL;
-            }
-            break;
-        }
-
-        case STATE_SEND:
-        case STATE_REPLY:
-            /* TODO: Chain through the I/O service */
-        default:
-            thp = NULL;
-        }
-
-
-    } while (thp);
-}
-
 /* Force a blocked thread out of its wait state.
  *
  * Unwinds whatever the thread is blocked on (message reply/send/receive,
@@ -1286,6 +1212,9 @@ int rdecl force_ready(thread_t *thp, unsigned err)
      */
     bool unlinked = false;
 
+    /* Rereads of a sync waiter's state by a kill, while its wakeup settles. */
+    unsigned sync_wait_spins = 0;
+
     /* Set when control reaches the STATE_RECEIVE arm from the STATE_REPLY arm;
      * fr_chp (possibly NULL: channel gone) is then authoritative and blocked_on
      * must not be reinterpreted as a channel.
@@ -1298,6 +1227,7 @@ int rdecl force_ready(thread_t *thp, unsigned err)
         atomic_clr(&thp->flags, RTMUX_FLG_THR_BUFF_MSG);
     }
 
+reread_state:
     switch (thp->state) {
     case STATE_READY:
 #if CONFIG_PROCESSORS_MAX > 1 && defined(CONFIG_SMP_MSGOPT)
@@ -1466,6 +1396,7 @@ int rdecl force_ready(thread_t *thp, unsigned err)
             }
             LINKPRIL_REM(thp);
             thp->blocked_on = NULL; /* == cop, checked above under the lock */
+            IPC_BLK(thp);
             kspinlock_unlock(&fr_chp->lock);
             unlinked = true;
         }
@@ -1538,8 +1469,10 @@ int rdecl force_ready(thread_t *thp, unsigned err)
          * outlive cop. The REPLY fall-through into STATE_RECEIVE uses fr_chp,
          * not blocked_on, so clearing it here is safe.
          */
-        if (thp->blocked_on == cop)
+        if (thp->blocked_on == cop) {
             thp->blocked_on = NULL;
+            IPC_BLK(thp);
+        }
         if (connect_links_drop(cop)) {
             connect_detach(cop, thp->priority);
         }
@@ -1689,8 +1622,10 @@ int rdecl force_ready(thread_t *thp, unsigned err)
          * keep the drain-before-null ordering to preserve this invariant.
          */
         if (!cop || !cop->channel) {
-            if (thp->blocked_on == cop)
+            if (thp->blocked_on == cop) {
                 thp->blocked_on = NULL;
+                IPC_BLK(thp);
+            }
             if (cop && connect_links_drop(cop))
                 connect_detach(cop, thp->priority);
             break;
@@ -1726,6 +1661,7 @@ int rdecl force_ready(thread_t *thp, unsigned err)
          * free cop (see the STATE_REPLY case above).
          */
         thp->blocked_on = NULL; /* == cop, checked above under the lock */
+        IPC_BLK(thp);
         kspinlock_unlock(&cop->channel->lock);
 
         if (connect_links_drop(cop)) {
@@ -1734,13 +1670,9 @@ int rdecl force_ready(thread_t *thp, unsigned err)
         break;
     }
 
-    case STATE_MUTEX: {
-        thread_t *thp2;
-        process_t *prp;
-        ksync_t *syp;
-        int id;
-        unsigned long owner;
-
+    case STATE_MUTEX:
+    case STATE_CONDVAR:
+    case STATE_SEM:
         CRASHCHECK(TYPE_MASK(thp->type) != TYPE_THREAD);
 
         /* Spin-wait for any in-flight wait-state transition to complete before
@@ -1750,98 +1682,31 @@ int rdecl force_ready(thread_t *thp, unsigned err)
         while (thp->internal_flags & RTMUX_ITF_WAIT_PENDING)
             __asm__ volatile("" ::: "memory");
         cpu_smp_mb();
-        if (sync_chain_force_ready(thp)) {
-            break;
-        }
 
-        /* Hold sync_slock across the whole MUTEX block so a concurrent
-         * sync_mutex_unlock observes a coherent wait-list / args.mu.owner
-         * state. Use the _locked variants of mutex_holdlist_* to avoid
-         * recursive acquire on the non-reentrant kspinlock.
-         *
-         * Read blocked_on UNDER sync_slock — sync_wakeup clears it after
-         * pril_rem (closing the adjust_priority stale-rem-add race); if it is
-         * NULL here the waiter has already been removed from its mutex
-         * waitlist, so fall through to the lower-half cleanup.
+        /* The state above was read unlocked: thp may have been woken, and be
+         * running or waiting elsewhere, by the time its chain is locked. Never
+         * ready or unlink it then. A one-shot unblock (interrupt, timeout,
+         * cancel) that lost the race to a wakeup is moot and is dropped. A kill
+         * must still take hold of the thread wherever it went, and a thread a
+         * waker unlinked has to be waited for first, or destroying it now would
+         * let the waker ready a dead thread. blocked_on is NULL for every chain
+         * waiter, so there is no other wait list to unlink it from. Test
+         * window: thp may be woken and move on before the chain is found and
+         * locked.
          */
-        kspinlock_lock(&sync_slock);
-        syp = thp->blocked_on;
-        if (syp && pril_first(&syp->waiting) == thp) {
-            thread_t *first;
+        inject_force_ready_stall(thp);
+        if (!sync_chain_force_ready(thp)) {
+            if (!(err & _FORCE_KILL_SELF))
+                return 1;
 
-            /* Remove the thread from the mutex list */
-            owner = thp->args.mu.owner;
-            if (owner != 0) {
-                mutex_holdlist_rem_locked(syp);
-            }
-            pril_rem(&syp->waiting, thp);
-
-            /* Clear blocked_on under sync_slock — same race rationale as the
-             * STATE_CONDVAR/SEM case below. A concurrent adjust_priority
-             * STATE_MUTEX arm reads blocked_on under sync_slock and does
-             * rem+add if non-null; clearing here makes it skip the stale rem.
+            /* The waker may still hold thp, so never ready it from here: past
+             * the bound report that another party will (as for a message
+             * claim), and let the caller retry or defer.
              */
-            thp->blocked_on = NULL;
-
-            /* Identify the owner of the mutex, could be null if orphaned */
-            thp2 = NULL;
-            id = SYNC_PINDEX(owner);
-            if (id && id < process_vector.nentries &&
-                VECP(prp, &process_vector, id)) {
-                thp2 = vector_lookup(&prp->threads, SYNC_TID(owner));
-            }
-
-            first = pril_first(&syp->waiting);
-            if (first && TYPE_MASK(first->type) == TYPE_THREAD) {
-                if (thp2) {
-                    mutex_holdlist_add_locked(thp2, syp);
-                } else {
-                    owner = 0;
-                }
-                first->args.mu.owner = owner;
-            }
-            kspinlock_unlock(&sync_slock);
-
-            /* Re-adjust the boosted mutex owner if required */
-            if (thp2 && (thp != thp2) && (thp->priority == thp2->priority) &&
-                (thp2->priority > thp2->real_priority)) {
-                priority_chain_drop(thp2, STATE_MUTEX);
-            }
-
-            break;
-        }
-        kspinlock_unlock(&sync_slock);
-    }
-        /* Fall Through */
-    case STATE_CONDVAR:
-    case STATE_SEM:
-        /* Spin-wait if the waiter is still mid-transition. */
-        while (thp->internal_flags & RTMUX_ITF_WAIT_PENDING)
-            __asm__ volatile("" ::: "memory");
-        if (sync_chain_force_ready(thp)) {
-            break;
-        }
-        /* blocked_on can be NULL here even though state is still CONDVAR/SEM —
-         * sync_wakeup clears blocked_on under sync_slock immediately after
-         * pril_rem, while the state→READY transition happens later (inside
-         * ready_default). If state==CONDVAR with !blocked_on, the waiter is
-         * already off its sync waiting list, so skip the redundant pril_rem.
-         *
-         * After pril_rem we ALSO clear blocked_on under the same lock, matching
-         * sync_wakeup's post-condition: a concurrent adjust_priority_default
-         * reads !blocked_on and skips its rem+add cycle (which would otherwise
-         * walk stale prev/next pointers and re-attach a removed pril). Cache
-         * the pointer to avoid a double-read under the lock.
-         */
-        {
-            ksync_t *bound;
-            kspinlock_lock(&sync_slock);
-            bound = (ksync_t *) thp->blocked_on;
-            if (bound) {
-                pril_rem(&bound->waiting, thp);
-                thp->blocked_on = NULL;
-            }
-            kspinlock_unlock(&sync_slock);
+            if (++sync_wait_spins >= FORCE_READY_WAKER_SPINS)
+                return 0;
+            cpu_smp_mb();
+            goto reread_state;
         }
         break;
 
@@ -1925,8 +1790,8 @@ int rdecl force_ready(thread_t *thp, unsigned err)
 /* block takes sched_slock around the dispatch mutation (FIND_HIGHEST,
  * mark_running, set_active_thread). The pre-mutation snap_time/ timeout_start
  * touch per-thread fields only and stay outside the lock. Callers MUST NOT hold
- * sched_slock on entry; cross-callers (unready, block_and_ready_default,
- * priority_chain_drop) drop it before calling.
+ * sched_slock on entry; cross-callers (unready, block_and_ready_default) drop
+ * it before calling.
  */
 void rdecl block(void)
 {
@@ -1975,6 +1840,7 @@ void rdecl block(void)
         break;
     default:
         thp->blocked_on = NULL;
+        IPC_BLK(thp);
     }
 
     /* Mark execution and schedule a replenishment if needed */
@@ -2062,6 +1928,7 @@ static void rdecl block_release(kspinlock_t *to_release)
         break;
     default:
         thp->blocked_on = NULL;
+        IPC_BLK(thp);
     }
 
     if (thp != act) {
@@ -2127,8 +1994,8 @@ unready_release_and_exit(thread_t *thp, int newstate, kspinlock_t *to_release)
  *
  * Callers MUST NOT hold sched_slock on entry. Direct callers in this file:
  * force_ready, adjust_priority_default (drops its lock around the internal
- * ready() calls), and priority_chain_drop. External callers (sync_wakeup) drop
- * sync_slock first per the SCHED < SYNC rank order.
+ * ready() calls). External callers (sync_wakeup) drop sync_slock first per the
+ * SCHED < SYNC rank order.
  */
 static void rdecl ready_default(thread_t *thp)
 {
@@ -2139,6 +2006,8 @@ static void rdecl ready_default(thread_t *thp)
 
     chk_dispatch(1);
     chk_thread(thp);
+    THR_EV(thp);
+    sync_chains_assert_readied(thp);
 
     if (thp->timeout_flags)
         timeout_stop(thp);
@@ -2751,7 +2620,7 @@ static void rdecl resched_default(void)
 
     /* DO NOT preempt a thread that is mid-sync- transition. The WAIT_PENDING
      * flag is set inside cv_wait / mutex_lock / sem_wait between
-     * "pril_add(syp->waiting, act)" and the final "unready + blocked_on +
+     * "sync_enqueue(chain, act)" and the final "unready + blocked_on +
      * cpu_smp_mb + flag clear" sequence. Demoting act during that window
      *   - sets act->state = STATE_READY,
      *   - LINK3s act onto cpu1's dispatch queue,
@@ -2759,7 +2628,7 @@ static void rdecl resched_default(void)
      * mark_runnings act on cpu2 while cpu1's cv_wait body is still mid-frame on
      * cpu1's kernel stack. Two CPUs end up "running" the same thread
      * (dispatch-double-entry), and the cv_wait body on cpu2 sees act already on
-     * syp->waiting → CV_WAIT REENTRY.
+     * its sync chain → CV_WAIT REENTRY.
      *
      * Under the BKL era this was masked because BKL acquire disabled SIE: timer
      * ISR couldn't fire and call resched_default. Under the Sync*-only no-BKL
@@ -3175,90 +3044,10 @@ static void rdecl adjust_priority_default(thread_t *thp,
         break;
     }
 
-    case STATE_CONDVAR:
-    case STATE_SEM: {
-        ksync_t *syp;
-        uint8_t cur_state;
-
-        /* The switch dispatch read thp->state outside sync_slock. A concurrent
-         * sync_wakeup on another CPU can pril_rem + ready (state→READY) between
-         * that read and the pril_rem below. Without a re-check we'd pril_rem a
-         * thread that's no longer on syp->waiting (corruption / walk-off-end),
-         * and pril_add would re-attach the thread to a wait list it has already
-         * left — the upstream cause of the CV_WAIT REENTRY / sync_mutex_lock
-         * pril_add-while- still-on-CV-waiter corruption hunt.
-         *
-         * Take sync_slock, re-read state + blocked_on under it. If the thread
-         * is no longer in this case, fall through to the priority-only path.
-         */
-        kspinlock_lock(&sync_slock);
-        cur_state = thp->state;
-        syp = thp->blocked_on;
-        if ((cur_state == STATE_CONDVAR || cur_state == STATE_SEM) && syp) {
-            pril_rem(&syp->waiting, thp);
-            thp->priority = (uint8_t) prio;
-            pril_add(&syp->waiting, thp);
-            kspinlock_unlock(&sync_slock);
-        } else {
-            kspinlock_unlock(&sync_slock);
-            thp->priority = (uint8_t) prio;
-        }
-        break;
-    }
-
-    case STATE_MUTEX: {
-        ksync_t *syp;
-        thread_t *first;
-        process_t *prp;
-        unsigned long owner;
-        unsigned id;
-        uint8_t cur_state;
-
-        /* Mirror the CONDVAR/SEM fix above. The switch dispatch read thp->state
-         * outside sync_slock; a concurrent force_ready (cross-CPU
-         * sync_mutex_unlock cascade) can pril_rem + ready (state→READY) between
-         * the read and our pril_rem. Take sync_slock first, re-read state +
-         * blocked_on under it. If the thread is no longer in MUTEX, just adjust
-         * priority and bail.
-         */
-        kspinlock_lock(&sync_slock);
-        cur_state = thp->state;
-        syp = thp->blocked_on;
-        if (cur_state == STATE_MUTEX && syp) {
-            first = pril_first(&syp->waiting);
-
-            owner = first->args.mu.owner;
-            if (owner != 0) {
-                first->args.mu.owner = 0;
-                mutex_holdlist_rem_locked(syp);
-            }
-
-            /* Reposition the item on the waiting list to match new priority */
-            pril_rem(&syp->waiting, thp);
-            thp->priority = (uint8_t) prio;
-            pril_add(&syp->waiting, thp);
-
-            /* Put back on mutex hold list in proper place */
-            if (owner != 0) {
-                id = SYNC_PINDEX(owner);
-                if (id && id < process_vector.nentries &&
-                    VECP(prp, &process_vector, id)) {
-                    thp = vector_lookup(&prp->threads, SYNC_TID(owner));
-                    if (thp) {
-                        mutex_holdlist_add_locked(thp, syp);
-                        first = pril_first(&syp->waiting);
-                        first->args.mu.owner = owner;
-                    }
-                }
-            }
-            kspinlock_unlock(&sync_slock);
-        } else {
-            kspinlock_unlock(&sync_slock);
-            thp->priority = (uint8_t) prio;
-        }
-        break;
-    }
-
+    /* STATE_MUTEX, STATE_CONDVAR and STATE_SEM waiters sit on a sync chain, not
+     * on a ksync_t list (blocked_on is NULL or stale for them): the new
+     * priority is stored here and prio_apply repositions them on the chain.
+     */
     default:
         thp->priority = (uint8_t) prio;
     }

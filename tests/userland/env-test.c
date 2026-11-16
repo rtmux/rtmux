@@ -316,6 +316,42 @@ static void test_env_reassign_loop(void)
     test_env_alias();
 }
 
+/* A large environment: every round the program copies it, assigns the copy, and
+ * changes one variable. libc must find which of its thousands of strings the
+ * copy holds without a quadratic scan, or the heap grows every round.
+ */
+static void test_env_large(void)
+{
+    enum { BIG = 4000, ROUNDS = 40 };
+    char name[16], val[16];
+    char **copy = calloc(BIG + 8, sizeof *copy);
+    struct alloc_snap first = {0}, last;
+    int ok = copy != NULL;
+
+    environ = NULL;
+    for (int i = 0; i < BIG && ok; i++) {
+        snprintf(name, sizeof name, "BIG%d", i);
+        ok = setenv(name, "value", 1) == 0;
+    }
+    for (int r = 0; r < ROUNDS && ok; r++) {
+        size_t n = env_len();
+
+        memcpy(copy, environ, (n + 1) * sizeof *copy);
+        environ = copy;
+        snprintf(val, sizeof val, "r%04d", r);
+        ok = setenv("CHURN", val, 1) == 0 && !strcmp(getenv("CHURN"), val) &&
+             !strcmp(getenv("BIG0"), "value") && !strcmp(getenv("BIG3999"), "value");
+        if (r == 1)
+            alloc_snap(&first);
+    }
+    alloc_snap(&last);
+    check(ok, "environment of 4000 variables survives repeated copies", "a variable was lost");
+    check(last.live == first.live, "copies of a large environment leave the heap flat",
+          "strings of a large environment lost their ownership and leaked");
+    environ = NULL;
+    free(copy);
+}
+
 /* 1000 distinct names: the vector grows geometrically, so environ changes
  * O(log n) times; 1000 same-size overwrites of one name allocate nothing, so
  * neither the string nor environ moves.
@@ -396,6 +432,25 @@ static void test_env_alloc_failure(void)
     ok = ok && setenv("B", "2", 1) == 0 && !strcmp(getenv("B"), "2");
     check(ok, "setenv out of memory fails with ENOMEM and changes nothing",
           "environment changed or wrong errno");
+
+    /* A variable the program's vector already has: libc takes its vector over
+     * only once nothing can fail any more, so a failure at any step leaves the
+     * program's vector in place.
+     */
+    ok = 1;
+    for (long k = 0; k < 3; k++) {
+        environ = initial;
+        host_alloc_fail_after(k);
+        errno = 0;
+        ok = ok && setenv("A", "a longer value", 1) == -1 && errno == ENOMEM &&
+             environ == initial && !strcmp(initial[0], "A=1");
+        host_alloc_fail_after(-1);
+    }
+    environ = initial;
+    ok = ok && setenv("A", "a longer value", 1) == 0 && !strcmp(getenv("A"), "a longer value") &&
+         !strcmp(initial[0], "A=1");
+    check(ok, "a failed setenv of a supplied variable leaves the program's vector in place",
+          "environ was replaced before the failure");
 }
 #else
 /* posix_spawn with a NULL envp reads environ under the environment lock: the
@@ -462,6 +517,7 @@ void test_env(void)
     test_env_putenv();
     test_env_reassign();
     test_env_reassign_loop();
+    test_env_large();
     test_env_growth();
 #ifdef LIBC_HOST_TEST
     test_env_alloc_failure();

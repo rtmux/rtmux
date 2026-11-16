@@ -635,6 +635,7 @@ connect_t *rdecl remote_ipc_send(kcall_args_t *kap,
     _TRACE_TH_EMIT_STATE(act, REPLY);
     block();
     act->blocked_on = cop;
+    IPC_BLK(act);
 
     /* LINKPRIL_BEG on remote_ipc.chp->reply_queue under remote_ipc.chp->lock.
      * Released before notification_deliver / force_ready (both take SCHED).
@@ -773,6 +774,7 @@ int rdecl remote_ipc_msg(thread_t *act, connect_t *cop, unsigned prio)
     if ((thp) && !(thp->internal_flags & RTMUX_ITF_RCVNOTIFICATION)) {
         atomic_or(&thp->flags, RTMUX_FLG_THR_SHORT_MSG);
         thp->blocked_on = act;
+        IPC_BLK(thp);
 
         /* Indicate that there is a receiver depending on data in our thread_t
          * object.
@@ -811,6 +813,7 @@ int rdecl remote_ipc_msg(thread_t *act, connect_t *cop, unsigned prio)
         _TRACE_TH_EMIT_STATE(act, NET_REPLY);
         block_and_ready(thp);
         act->blocked_on = cop;
+        IPC_BLK(act);
 
         /* Link the now reply blocked sending thread in the reply queue.
          *
@@ -843,6 +846,7 @@ int rdecl remote_ipc_msg(thread_t *act, connect_t *cop, unsigned prio)
     _TRACE_TH_EMIT_STATE(act, NET_SEND);
     block();
     act->blocked_on = cop;
+    IPC_BLK(act);
 
     /* pril_add on chp->send_queue under chp->lock. Recheck ->destroying in the
      * same window, mirroring the send-block guard in ksys_msg_sendv: a
@@ -871,6 +875,7 @@ int rdecl remote_ipc_msg(thread_t *act, connect_t *cop, unsigned prio)
          */
         atomic_clr((volatile unsigned *) &act->flags, RTMUX_FLG_THR_BUFF_MSG);
         act->blocked_on = NULL;
+        IPC_BLK(act);
         SETKSTATUS(act, -ESRCH);
         ready(act);
         return ESRCH;

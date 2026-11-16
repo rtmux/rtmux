@@ -45,6 +45,7 @@ static void xfer_restorestate(thread_t *act)
 
         if ((thp = act->blocked_on)) {
             act->blocked_on = 0;
+            IPC_BLK(act);
             if (thp->internal_flags & RTMUX_ITF_MSG_DELIVERY) {
                 atomic_clr((volatile unsigned *) &thp->internal_flags,
                            RTMUX_ITF_MSG_DELIVERY);

@@ -149,7 +149,8 @@ static const struct toolbox_applet applets[] = {
      "inject spin-irqoff HART MS | spin-console HART MS | hang-hart HART | "
      "fail-alloc POOL PID | fail-turnstile PID | alloc-status | "
      "fail-sched-set PID COUNT | sched-set-status | "
-     "sched-set-displaced MIN | stall-lock PID MS"},
+     "sched-set-displaced MIN | stall-lock PID MS | "
+     "stall-force-ready PID MS"},
     {"kill", applet_kill, "kill [-SIG] PID ..."},
     {"login", applet_login, "login [USER]"},
     {"less", applet_less, "less [FILE ...]"},
@@ -3149,6 +3150,9 @@ static int applet_inject(int argc, char **argv)
     } else if (argc == 4 && !strcmp(argv[1], "stall-lock")) {
         rc = inject_call(INJECT_OP_STALL_MUTEX_LOCK, strtoul(argv[2], NULL, 0),
                          strtoul(argv[3], NULL, 0));
+    } else if (argc == 4 && !strcmp(argv[1], "stall-force-ready")) {
+        rc = inject_call(INJECT_OP_STALL_FORCE_READY, strtoul(argv[2], NULL, 0),
+                         strtoul(argv[3], NULL, 0));
     } else if (argc == 2 && !strcmp(argv[1], "alloc-status")) {
         rc = inject_call(INJECT_OP_ALLOC_STATUS, 0, 0);
         if (rc >= 0)
@@ -3159,7 +3163,8 @@ static int applet_inject(int argc, char **argv)
                 "usage: inject spin-irqoff HART MS | spin-console HART MS | "
                 "hang-hart HART | fail-alloc POOL PID | fail-turnstile PID | "
                 "alloc-status | fail-sched-set PID COUNT | sched-set-status | "
-                "sched-set-displaced MIN | stall-lock PID MS\n");
+                "sched-set-displaced MIN | stall-lock PID MS | "
+                "stall-force-ready PID MS\n");
         return 2;
     }
     return rc == 0 ? 0 : 1;

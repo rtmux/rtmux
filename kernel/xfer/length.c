@@ -47,6 +47,8 @@ int xferlen(thread_t *thp, iov_t *iov, int parts)
 
     SET_XFER_ENV(&env);
     if ((status = xfer_setjmp(*GET_XFER_ENV()))) {
+        /* A fault longjmps here with the fault handler still armed. */
+        SET_XFER_HANDLER(0);
         return status;
     }
 

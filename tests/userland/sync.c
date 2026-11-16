@@ -4042,3 +4042,115 @@ out:
     (void) test_pin_mask(~0U);
     return 0;
 }
+
+/* condvar_interrupt_stale: force_ready reads a waiter's state without a lock,
+ * so an interrupt of a condvar wait can find the waiter already woken and
+ * asleep elsewhere by the time it reaches the wait chain. It must then leave
+ * the thread alone: the nanosleep the waiter went on to must run its course,
+ * not end early with an error. The fixture stalls the interrupt in that window
+ * with the debug injection call and signals the condvar meanwhile. Needs
+ * /bin/inject; otherwise the case is skipped.
+ */
+#define CIS_STALL_MS 800L
+#define CIS_SLEEP_MS 1200L
+
+static pthread_mutex_t cis_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t cis_cond = PTHREAD_COND_INITIALIZER;
+static int cis_flag;
+static atomic_int cis_state; /* 1 waiting, 2 woken and asleep, 3 slept */
+static atomic_int cis_sleep_rc;
+static sem_t cis_go;
+
+static void *cis_waiter(void *arg)
+{
+    struct timespec ts = {CIS_SLEEP_MS / 1000, (CIS_SLEEP_MS % 1000) * 1000000L};
+
+    (void) arg;
+    (void) test_pin_mask(2U);
+    pthread_mutex_lock(&cis_mutex);
+    atomic_store(&cis_state, 1);
+    while (!cis_flag)
+        pthread_cond_wait(&cis_cond, &cis_mutex);
+    pthread_mutex_unlock(&cis_mutex);
+    atomic_store(&cis_state, 2);
+    atomic_store(&cis_sleep_rc, nanosleep(&ts, NULL));
+    atomic_store(&cis_state, 3);
+    return NULL;
+}
+
+static void *cis_signaler(void *arg)
+{
+    (void) arg;
+    (void) test_pin_mask(2U); /* not the hart that is stalled */
+    sem_wait(&cis_go);
+    sleep_ms(100); /* the interrupt is inside its stall by now */
+    pthread_mutex_lock(&cis_mutex);
+    cis_flag = 1;
+    pthread_cond_signal(&cis_cond);
+    pthread_mutex_unlock(&cis_mutex);
+    return NULL;
+}
+
+int condvar_interrupt_stale(void)
+{
+    pthread_t w, s;
+    struct timespec t0, t1;
+    char pid[16];
+    char ms[16];
+    long stalled;
+    int ir;
+
+    if (inject_run("alloc-status", NULL, NULL) != 0)
+        return TC_EXIT_SKIP;
+    snprintf(pid, sizeof pid, "%d", (int) getpid());
+    snprintf(ms, sizeof ms, "%ld", CIS_STALL_MS);
+    cis_flag = 0;
+    sem_init(&cis_go, 0, 0);
+    atomic_store(&cis_state, 0);
+    atomic_store(&cis_sleep_rc, 0);
+    (void) test_pin_mask(1U);
+    if (pthread_create(&w, NULL, cis_waiter, NULL) != 0) {
+        test_fail("condvar_interrupt_stale fixture", "pthread_create");
+        goto out;
+    }
+    while (atomic_load(&cis_state) < 1)
+        sleep_ms(5);
+    sleep_ms(50); /* the waiter is inside pthread_cond_wait */
+    if (inject_run("stall-force-ready", pid, ms) != 0) {
+        test_fail("condvar_interrupt_stale fixture", "inject refused");
+        goto release;
+    }
+    if (pthread_create(&s, NULL, cis_signaler, NULL) != 0) {
+        test_fail("condvar_interrupt_stale fixture", "pthread_create");
+        goto release;
+    }
+    sleep_ms(50); /* the signaler is blocked on its hart */
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    sem_post(&cis_go);
+    ir = thread_ctl(RTMUX_TCTL_INTERRUPT, (void *) (long) w); /* stalls */
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    stalled = (t1.tv_sec - t0.tv_sec) * 1000L +
+              (t1.tv_nsec - t0.tv_nsec) / 1000000L;
+    check(ir == 0 && stalled >= CIS_STALL_MS - 100,
+          "the injected stall held the interrupt in its window",
+          "the interrupt was not stalled");
+    (void) pthread_join(s, NULL);
+    sleep_ms(200); /* a spurious wake of the sleep would have landed by now */
+    check(atomic_load(&cis_state) == 2,
+          "an interrupt that lost the race leaves the woken waiter alone",
+          "the waiter's sleep ended early");
+    (void) pthread_join(w, NULL);
+    check(atomic_load(&cis_sleep_rc) == 0,
+          "the waiter's sleep runs its course after a lost interrupt",
+          "nanosleep reported an error");
+    goto out;
+release: /* the waiter is still parked on the condvar: let it go */
+    pthread_mutex_lock(&cis_mutex);
+    cis_flag = 1;
+    pthread_cond_signal(&cis_cond);
+    pthread_mutex_unlock(&cis_mutex);
+    (void) pthread_join(w, NULL);
+out:
+    (void) test_pin_mask(~0U);
+    return 0;
+}

@@ -29,7 +29,7 @@
 
 void *__crt_malloc(size_t);
 void *__crt_calloc(size_t, size_t);
-void *__crt_realloc(void *, size_t);
+void *__crt_realloc(void *, size_t, int *);
 void __crt_free(void *);
 void *__crt_aligned_alloc_offset(size_t, size_t, size_t);
 void __crt_mallocstats(struct __rtmux_mallocstats *);
@@ -164,6 +164,29 @@ static void test_peak(void)
           "64 allocations and 64 frees");
 }
 
+/* A pointer that is not a block is refused and counted as a failed request;
+ * nothing is allocated, freed, or written.
+ */
+static void test_invalid_pointer(void)
+{
+    static char junk[128];
+    struct __rtmux_mallocstats a, b;
+    int bad = 0;
+
+    a = snap();
+    CHECK(__crt_realloc(junk + 64, 100, &bad) == NULL && bad,
+          "realloc of a foreign pointer fails and is flagged");
+    b = snap();
+    CHECK(b.failed == a.failed + 1 && b.allocs == a.allocs &&
+              b.frees == a.frees && b.bytes_in_use == a.bytes_in_use,
+          "the invalid pointer counts one failure and nothing else");
+
+    /* A genuine shortage is not flagged as an invalid pointer. */
+    bad = 1;
+    CHECK(__crt_realloc(NULL, SIZE_MAX, &bad) == NULL && !bad,
+          "an oversized request is a shortage, not an invalid pointer");
+}
+
 static void test_realloc_and_align(void)
 {
     struct __rtmux_mallocstats a, b;
@@ -171,11 +194,11 @@ static void test_realloc_and_align(void)
 
     a = snap();
     p = __crt_malloc(24);
-    q = __crt_realloc(p, 24); /* same block: nothing to count */
+    q = __crt_realloc(p, 24, NULL); /* same block: nothing to count */
     b = snap();
     CHECK(q == p && b.allocs == a.allocs + 1 && b.frees == a.frees,
           "realloc to the same size is in place");
-    p = __crt_realloc(q, 1000); /* moves: one allocation and one free */
+    p = __crt_realloc(q, 1000, NULL); /* moves: one allocation and one free */
     b = snap();
     CHECK(b.allocs == a.allocs + 2 && b.frees == a.frees + 1 &&
               b.bytes_in_use == a.bytes_in_use + bucket(1000),
@@ -278,6 +301,7 @@ int main(int argc, char **argv)
     test_counts();
     test_failures();
     test_peak();
+    test_invalid_pointer();
     test_realloc_and_align();
     test_threads();
     printf("malloc-stats: %s (%ld checks, %d failures)\n",

@@ -153,7 +153,14 @@ if test "$rtmux_run" = "debug-inject"; then
             ok=5
         fi
     fi
+    # An interrupt of a condition wait that lost the race with the wakeup must
+    # leave the woken thread alone.
     if test "$ok" = 5; then
+        if /bin/syscall_testing --condvar-interrupt-stale; then
+            ok=6
+        fi
+    fi
+    if test "$ok" = 6; then
         echo "RTMux debug-inject: PASS"
     else
         echo "RTMux debug-inject: FAIL"

@@ -646,6 +646,8 @@ static void thread_destroy_wait_inactive(thread_t *thp, process_t *prp)
  */
 static void thread_soul_free(process_t *prp, thread_t *thp)
 {
+    THR_EV(thp);
+    sync_chains_assert_not_queued(thp, "freed");
     cap_revoke_object_all_tables(thp);
     object_free(prp, &thread_souls, thp);
 }
@@ -1469,6 +1471,8 @@ void rdecl thread_destroy(thread_t *thp)
      */
     int self_reap = (thp == get_active_thread(get_cpunum()));
 
+    THR_EV(thp);
+
     /* Destroy-claim — see banner on thread_t::destroy_claim in objects.h.
      * Atomically claim destruction of this thread.
      *
@@ -1977,6 +1981,8 @@ void rdecl thread_destroy(thread_t *thp)
          * instrumented path frees through object_free_track_heap_detail, so it
          * cannot share that helper.
          */
+        THR_EV(thp);
+        sync_chains_assert_not_queued(thp, "freed");
         cap_revoke_object_all_tables(thp);
         object_free_track_heap_detail(prp, &thread_souls, thp,
                                       &stats_object_free_heap,

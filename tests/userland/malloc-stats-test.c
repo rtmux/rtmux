@@ -110,6 +110,22 @@ void test_malloc_stats(void)
     check(p == NULL && errno == ENOMEM, "a failed realloc sets ENOMEM", "no ENOMEM from realloc");
     free(q);
 
+    /* A pointer malloc never returned is a caller error: EINVAL, counted as a
+     * failed request, and nothing else moves.
+     */
+    {
+        static char junk[128];
+
+        a = snap();
+        errno = 0;
+        p = realloc(junk + 64, 100);
+        b = snap();
+        check(p == NULL && errno == EINVAL && b.failed == a.failed + 1 && b.allocs == a.allocs &&
+                  b.frees == a.frees && b.bytes_in_use == a.bytes_in_use,
+              "realloc of an invalid pointer sets EINVAL and is counted",
+              "wrong errno or counters for an invalid pointer");
+    }
+
     a = snap();
     free(NULL);
     b = snap();

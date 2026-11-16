@@ -324,11 +324,9 @@ void rdecl sync_wakeup(ksync_t *syp, int all)
          * to syp->waiting. (Setting state to READY here would close the race
          * too but breaks ready_default's state==READY-at-entry invariant;
          * clearing blocked_on is the narrower fix.)
-         *
-         * Force_ready's STATE_MUTEX / STATE_CONDVAR / STATE_SEM cases
-         * NULL-check blocked_on before deref — see dispatch.c.
          */
         thp->blocked_on = NULL;
+        IPC_BLK(thp);
 
         /* This screws up the ETIMEDOUT return code from sync_condvar_wait.
          * Instead, we EOK the status when the thread goes onto the waiting
@@ -609,10 +607,11 @@ void rdecl synchash_rem(paddr_t addr,
                                   (1 << STATE_MUTEX))) !=
                                 (RTMUX_FLG_TIMEOUT_ACTIVE |
                                  (1 << STATE_MUTEX))) {
-                                /* force_ready's STATE_MUTEX path takes
-                                 * sync_slock via mutex_holdlist_rem — drop our
-                                 * hold around it. Deadlock: force ready with
-                                 * EOWNERDEAD (signals removed)
+                                /* force_ready takes its own locks (wait chain,
+                                 * PI, scheduler) and never expects a caller's
+                                 * kspinlock held — drop sync_slock around it.
+                                 * Deadlock: force ready with EOWNERDEAD
+                                 * (signals removed)
                                  */
                                 kspinlock_unlock(&sync_slock);
                                 force_ready(thp, EOWNERDEAD);
@@ -643,9 +642,9 @@ void rdecl synchash_rem(paddr_t addr,
                         /* Force ready any threads blocked on the sync */
                         do {
                             if (TYPE_MASK(thp->type) == TYPE_THREAD) {
-                                /* force_ready's STATE_MUTEX path takes
-                                 * sync_slock via mutex_holdlist_rem — drop our
-                                 * hold around it.
+                                /* force_ready takes its own locks (wait chain,
+                                 * PI, scheduler) and never expects a caller's
+                                 * kspinlock held — drop sync_slock around it.
                                  */
                                 kspinlock_unlock(&sync_slock);
                                 force_ready(thp, EINVAL);

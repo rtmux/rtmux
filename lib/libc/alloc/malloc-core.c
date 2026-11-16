@@ -445,13 +445,18 @@ void __crt_free(void *cp)
     alloc_unlock();
 }
 
-void *__crt_realloc(void *cp, size_t nbytes)
+/* realloc. A pointer that is not a live block counts as a failed request, and
+ * *bad (if not NULL) is set to tell it from an allocation failure.
+ */
+void *__crt_realloc(void *cp, size_t nbytes, int *bad)
 {
     size_t onb;
     int i;
     union overhead *op, op1;
     char *res;
 
+    if (bad)
+        *bad = 0;
     if (!cp)
         return __crt_malloc(nbytes);
     memcpy(&op1, cp2op(cp), sizeof(op1));
@@ -475,7 +480,7 @@ void *__crt_realloc(void *cp, size_t nbytes)
 
             usable = (size_t) (((char *) op + blksz) - (char *) cp);
         } else {
-            return NULL;
+            goto invalid;
         }
         if (nbytes <= usable)
             return cp;
@@ -502,7 +507,7 @@ void *__crt_realloc(void *cp, size_t nbytes)
         return res;
     }
     if (op->ov_magic != MAGIC)
-        return NULL;
+        goto invalid;
     i = op->ov_index;
 
     /* Usable payload is the bucket size minus the header for every bucket:
@@ -529,4 +534,10 @@ void *__crt_realloc(void *cp, size_t nbytes)
     memcpy(res, cp, (nbytes < onb) ? nbytes : onb);
     __crt_free(cp);
     return res;
+
+invalid:
+    stat_fail();
+    if (bad)
+        *bad = 1;
+    return NULL;
 }

@@ -110,6 +110,8 @@ def kptr(v):
     except gdb.error:
         return False
 
+stuck_reply = []
+reply_threads = []
 try:
     pv = gdb.parse_and_eval("process_vector")
     nproc = int(pv["nentries"])
@@ -164,6 +166,9 @@ try:
                         if int(q) == int(first):
                             break
                 elif st == 6:  # REPLY: blocked_on is the connection
+                    reply_threads.append(thp)
+                    if int(thp["blocked_on"]) == 0:
+                        stuck_reply.append(thp)
                     cop = thp["blocked_on"].cast(
                         gdb.lookup_type("connect_t").pointer())
                     print("  REPLYWAIT thp %s cop %s scoid %d channel %s syscall 0x%x "
@@ -179,5 +184,87 @@ try:
                 print("  (detail failed: %s)" % e)
 except gdb.error as e:
     print("thread walk failed: %s" % e)
+
+# CONFIG_DEBUG_INJECT builds record every IPC write of blocked_on: print the
+# newest events and, for each thread found REPLY-blocked with a NULL blocked_on,
+# every recorded event that touched it.
+try:
+    ring = gdb.parse_and_eval("ipc_blk_ring")
+    nring = int(gdb.parse_and_eval("sizeof(ipc_blk_ring)/sizeof(ipc_blk_ring[0])"))
+    idx = int(gdb.parse_and_eval("ipc_blk_idx"))
+    def ev(e):
+        try:
+            f = e["file"].string().split("/")[-1]
+        except Exception:
+            f = "?"
+        return ("t=%d cpu%d %s:%d thp %s state %d itf 0x%x blocked_on %s" %
+                (int(e["t"]), int(e["cpu"]), f, int(e["line"]), e["thp"],
+                 int(e["state"]), int(e["itf"]), e["blocked_on"]))
+    print("=== ipc blocked_on trace: %d events, newest 40 ===" % idx)
+    for k in range(max(0, idx - 40), idx):
+        print("  #%d %s" % (k, ev(ring[k % nring])))
+    for pt in stuck_reply:
+        print("=== trace for REPLY thread %s with NULL blocked_on ===" % pt)
+        for k in range(max(0, idx - nring), idx):
+            e = ring[k % nring]
+            if int(e["thp"]) == int(pt):
+                print("  #%d %s" % (k, ev(e)))
+    for pt in reply_threads:
+        if pt in stuck_reply:
+            continue
+        print("=== trace for REPLY thread %s ===" % pt)
+        for k in range(max(0, idx - nring), idx):
+            e = ring[k % nring]
+            if int(e["thp"]) == int(pt):
+                print("  #%d %s" % (k, ev(e)))
+except gdb.error as e:
+    print("ipc trace unavailable: %s" % e)
+
+# The lifecycle ring of the same threads: readies, dequeues, state changes.
+try:
+    tring = gdb.parse_and_eval("thr_ring")
+    ntr = int(gdb.parse_and_eval("sizeof(thr_ring)/sizeof(thr_ring[0])"))
+    tidx = int(gdb.parse_and_eval("thr_idx"))
+    for pt in reply_threads:
+        print("=== lifecycle trace for REPLY thread %s ===" % pt)
+        for k in range(max(0, tidx - ntr), tidx):
+            e = tring[k % ntr]
+            if int(e["thp"]) == int(pt):
+                try:
+                    f = e["file"].string().split("/")[-1]
+                except Exception:
+                    f = "?"
+                print("  #%d t=%d cpu%d %s:%d state %d itf 0x%x ra %s" %
+                      (k, int(e["t"]), int(e["cpu"]), f, int(e["line"]),
+                       int(e["state"]), int(e["itf"]), e["ra"]))
+except gdb.error as e:
+    print("thread trace unavailable: %s" % e)
+
+# Every thread on a sync wait chain must wait on a sync object (state MUTEX,
+# CONDVAR or SEM). One that does not left the chain without being unlinked: its
+# next/prev links are reused elsewhere, and a later waker can ready or hand a
+# message to a thread that waits on nothing.
+try:
+    chains = gdb.parse_and_eval("sync_chains")
+    nch = int(gdb.parse_and_eval("sizeof(sync_chains)/sizeof(sync_chains[0])"))
+    print("=== sync chains ===")
+    for ci in range(nch):
+        try:
+            t = chains[ci]["head"]
+            n = 0
+            while int(t) != 0 and n < 256:
+                tt = t.dereference()
+                st = int(tt["state"])
+                if st not in (13, 14, 17):
+                    print("  chain %d holds thp %s pid %d tid %d state %d "
+                          "wait_key %#x" %
+                          (ci, t, int(tt["process"]["pid"]), int(tt["tid"]), st,
+                           int(tt["args"]["mu"]["wait_key"])))
+                t = tt["next"]["thread"]
+                n += 1
+        except gdb.error as e:
+            print("  chain %d walk failed: %s" % (ci, e))
+except gdb.error as e:
+    print("sync chain walk unavailable: %s" % e)
 print("DUMP COMPLETE: %d harts" % len(threads))
 end

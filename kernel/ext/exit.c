@@ -204,6 +204,7 @@ void kext_exit_destroy_threads(void *arg)
                         thp->next.thread = NULL;
                         thp->prev.thread = NULL;
                         thp->blocked_on = NULL;
+                        IPC_BLK(thp);
 
                         /* Stamp the thread dead in the same lock window that
                          * verified it is REPLY/SEND and unlinked it. A stamp

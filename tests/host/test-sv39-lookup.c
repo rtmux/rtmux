@@ -70,6 +70,64 @@ static void check(pagetable_t root, const struct leaf_case *c)
     }
 }
 
+static int allocs;
+
+/* Allocator for sv39_walk_slot: a zeroed host table, linked as the kernel does
+ * (valid, PPN of the table).
+ */
+static pte_t test_alloc(void)
+{
+    pagetable_t t = new_table();
+
+    allocs++;
+    return PA2PTE((uintptr_t) t) | PTE_V;
+}
+
+/* Walkers that stop at a superpage leaf: with and without alloc, the slot walk
+ * returns no L0 slot with EEXIST (a missing table is ENOENT); and it allocates
+ * nothing.
+ */
+static void check_walk_slot(pagetable_t root)
+{
+    int err = 0;
+    int before = allocs;
+
+    /* 2 MiB leaf at L1[3] and 1 GiB leaf at L2[2] (set up by main). */
+    assert(!sv39_walk_slot(root, 0x40600000UL + 0x1000UL, NULL, &err));
+    assert(err == EEXIST);
+    assert(!sv39_walk_slot(root, 0x40600000UL + 0x1000UL, test_alloc, &err));
+    assert(err == EEXIST);
+    assert(!sv39_walk_slot(root, 0x80000000UL + 0x5000UL, NULL, &err));
+    assert(err == EEXIST);
+    assert(!sv39_walk_slot(root, 0x80000000UL + 0x5000UL, test_alloc, &err));
+    assert(err == EEXIST);
+    assert(allocs == before);
+
+    /* A mapped 4 KiB page: both walks reach its L0 slot. */
+    pte_t *slot = sv39_walk_slot(root, 0x40805000UL, NULL, &err);
+    assert(slot && slot == sv39_lookup_leaf(root, 0x40805000UL, NULL, NULL));
+    assert(sv39_walk_slot(root, 0x40805000UL, test_alloc, &err) == slot);
+    assert(allocs == before);
+
+    /* A hole: no alloc ends with ENOENT, alloc builds the tables and returns
+     * an empty slot the caller can fill.
+     */
+    assert(!sv39_walk_slot(root, 0xC0000000UL, NULL, &err) && err == ENOENT);
+    slot = sv39_walk_slot(root, 0xC0000000UL, test_alloc, &err);
+    assert(slot && !*slot && allocs == before + 2);
+}
+
+/* Bits 54..63 of a PTE are attributes (Svpbmt, Svnapot), never address. */
+static void check_ppn_mask(void)
+{
+    pte_t e = PA2PTE(0x90007000UL) | LEAF_RW | (3UL << 61) | (1UL << 63) |
+              (1UL << 54);
+
+    assert(PTE2PA(e) == 0x90007000UL);
+    /* The top PPN bit (PA bit 55) survives the mask. */
+    assert(PTE2PA(PA2PTE(1UL << 55) | PTE_V) == (1UL << 55));
+}
+
 int main(void)
 {
     pagetable_t root = new_table();
@@ -123,6 +181,12 @@ int main(void)
     assert(!sv39_lookup_leaf(root, 0x40600010UL, NULL, NULL));
     root[2] = PA2PTE(0x140000000UL | MIB2) | LEAF_RW;
     assert(!sv39_lookup_leaf(root, 0x80000010UL, NULL, NULL));
+
+    /* Restore the superpages and compare the slot walks against them. */
+    l1[3] = PA2PTE(0x88200000UL) | LEAF_RW;
+    root[2] = PA2PTE(0x140000000UL) | LEAF_RW;
+    check_walk_slot(root);
+    check_ppn_mask();
 
     free(l0);
     free(l1);

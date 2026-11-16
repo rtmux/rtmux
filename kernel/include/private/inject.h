@@ -65,6 +65,14 @@
  */
 #define INJECT_OP_STALL_MUTEX_LOCK 10
 
+/* STALL_FORCE_READY(pid, ms): the next force_ready of a thread of that process
+ * that read it as a condvar, semaphore or mutex waiter stalls for ms
+ * milliseconds before it takes the wait chain lock, the window in which the
+ * waiter can be woken and block elsewhere. ALLOC_STATUS reports whether the
+ * stall was taken.
+ */
+#define INJECT_OP_STALL_FORCE_READY 11
+
 #define INJECT_SPIN_MAX_MS 10000
 
 /* Injected interrupts-off spins, for intrevent_flush()'s debug spin watchdog: a

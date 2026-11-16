@@ -593,7 +593,21 @@ static __inline__ void __attribute__((__unused__)) atomic_boundary()
 
 /* xfer handler accessors */
 
+#ifdef CONFIG_DEBUG_INJECT
+/* Debug builds remember who armed or cleared the handler last, so a handler
+ * left armed when a kcall returns can be named (xfer_handler_check_exit).
+ */
+void xfer_handler_trace(const char *file, int line, const void *handler);
+void xfer_handler_check_exit(void);
+#define SET_XFER_HANDLER(handler)                                         \
+    do {                                                                  \
+        xfer_handler_trace(__FILE__, __LINE__, (const void *) (handler)); \
+        get_pcpu()->pc_xfer_handlers = (handler);                         \
+    } while (0)
+#else
 #define SET_XFER_HANDLER(handler) get_pcpu()->pc_xfer_handlers = handler
+#define xfer_handler_check_exit() ((void) 0)
+#endif
 #define GET_XFER_HANDLER() (get_pcpu()->pc_xfer_handlers)
 
 /* The xfer fault-recovery longjmp target. Like the handler table above, this

@@ -113,48 +113,37 @@ void cpu_tlb_flush_complete(void)
 #endif
 }
 
-/* sv39_walk — traverse the Sv39 page table for a virtual address.
+/* sv39_new_table — zeroed intermediate table for sv39_walk_slot.
  *
- * If alloc is true, allocates intermediate page table pages via pa_alloc() (the
- * vm_ops physical allocator). All VA↔PA conversions go through PA_TO_VA /
- * VA_TO_PA — no PA==VA assumption.
- *
- * Returns a pointer to the L0 PTE, or NULL on failure.
+ * Comes from pa_alloc() (the vm_ops physical allocator), reached through
+ * PA_TO_VA, and is marked as pa_alloc'd so cpu_pgdir_free gives it back to pa
+ * rather than the kernel heap. Returns the linking PTE, or 0 on failure.
  */
-static pte_t *sv39_walk(pagetable_t pgdir, uintptr_t va, int alloc)
+static pte_t sv39_new_table(void)
 {
-    for (int level = 2; level > 0; level--) {
-        pte_t *pte = &pgdir[PX(level, va)];
-        if (*pte & PTE_V) {
-            pgdir = (pagetable_t) PA_TO_VA(PTE2PA(*pte));
-        } else {
-            if (!alloc)
-                return NULL;
+    struct pa_quantum *pq;
+    memsize_t resv = 0;
+    paddr_t paddr;
 
-            /* Allocate a new intermediate page table page */
-            struct pa_quantum *pq;
-            memsize_t resv = 0;
-            paddr_t paddr;
+    pq = pa_alloc(__PAGESIZE, __PAGESIZE, PAQ_COLOUR_NONE, 0, NULL,
+                  restrict_proc, resv);
+    if (!pq)
+        return 0;
+    pq->flags |= PAQ_FLAG_SYSTEM;
 
-            pq = pa_alloc(__PAGESIZE, __PAGESIZE, PAQ_COLOUR_NONE, 0, NULL,
-                          restrict_proc, resv);
-            if (!pq)
-                return NULL;
-            pq->flags |= PAQ_FLAG_SYSTEM;
+    paddr = pa_quantum_to_paddr(pq);
+    CPU_ZERO_PAGE((pagetable_t) PA_TO_VA(paddr), __PAGESIZE, 0);
+    return PA2PTE(paddr) | PTE_V | PTE_SW_PA;
+}
 
-            paddr = pa_quantum_to_paddr(pq);
-            pgdir = (pagetable_t) PA_TO_VA(paddr);
-
-            /* Zero the new page table */
-            CPU_ZERO_PAGE(pgdir, __PAGESIZE, 0);
-
-            /* Install the PDE pointing to the new page, marked as pa_alloc'd so
-             * cpu_pgdir_free gives it back to pa rather than the kernel heap.
-             */
-            *pte = PA2PTE(paddr) | PTE_V | PTE_SW_PA;
-        }
-    }
-    return &pgdir[PX(0, va)];
+/* sv39_walk — the L0 PTE slot for va, creating tables when alloc is set.
+ *
+ * Returns NULL on failure with *errp set; see sv39_walk_slot, which also stops
+ * at a superpage leaf.
+ */
+static pte_t *sv39_walk(pagetable_t pgdir, uintptr_t va, int alloc, int *errp)
+{
+    return sv39_walk_slot(pgdir, va, alloc ? sv39_new_table : NULL, errp);
 }
 
 /* cpu_pte_manipulate — create, modify, or remove Sv39 page table entries.
@@ -188,9 +177,10 @@ int cpu_pte_manipulate(struct mm_pte_manipulate *data)
 
     for (curr = data->start; curr < data->end; curr += __PAGESIZE) {
         if (op & (PTE_OP_MAP | PTE_OP_BAD)) {
-            pte_t *pte = sv39_walk(pgdir, curr, 1);
+            int err = ENOMEM;
+            pte_t *pte = sv39_walk(pgdir, curr, 1, &err);
             if (!pte)
-                return ENOMEM;
+                return err;
 
             if (curr < KERNEL_VIRT_BASE && (bits & PTE_U)) {
                 extern char _text_start[], _end[];
@@ -219,23 +209,25 @@ int cpu_pte_manipulate(struct mm_pte_manipulate *data)
             data->paddr += __PAGESIZE;
             data->tlb_flush_pending = 1;
 
-        } else if (op & PTE_OP_UNMAP) {
-            pte_t *pte = sv39_walk(pgdir, curr, 0);
-            if (pte && (*pte & PTE_V)) {
-                *pte = 0;
-                data->tlb_flush_pending = 1;
-            }
+        } else if (op & (PTE_OP_UNMAP | PTE_OP_PROT)) {
+            int err = ENOENT;
+            pte_t *pte = sv39_walk(pgdir, curr, 0, &err);
 
-        } else if (op & PTE_OP_PROT) {
-            pte_t *pte = sv39_walk(pgdir, curr, 0);
+            /* A superpage covers curr: it can be neither unmapped nor
+             * re-protected one 4 KiB page at a time, so say so rather than
+             * report success. A missing table (ENOENT) has nothing to change.
+             */
+            if (!pte && err == EEXIST)
+                return err;
             if (pte && (*pte & PTE_V)) {
-                *pte = (*pte & PTE_PADDR_BITS) | bits;
+                *pte = (op & PTE_OP_UNMAP) ? 0 : (*pte & PTE_PADDR_BITS) | bits;
                 data->tlb_flush_pending = 1;
             }
 
         } else if (op & PTE_OP_PREALLOC) {
-            if (!sv39_walk(pgdir, curr, 1))
-                return ENOMEM;
+            int err = ENOMEM;
+            if (!sv39_walk(pgdir, curr, 1, &err))
+                return err;
         }
     }
 
@@ -294,7 +286,7 @@ void cpu_pte_mark_user(uintptr_t start, uintptr_t end)
 
     for (uintptr_t va = start & ~(uintptr_t) (__PAGESIZE - 1); va < end;
          va += __PAGESIZE) {
-        pte_t *pte = sv39_walk(pgdir, va, 0);
+        pte_t *pte = sv39_walk(pgdir, va, 0, NULL);
         if (pte && (*pte & PTE_V))
             *pte |= PTE_U;
     }
@@ -365,26 +357,15 @@ int cpu_uvaddr_to_paddr(uintptr_t vaddr, paddr_t *pa)
     if (vaddr >= MAXVA)
         return -1;
 
-    for (int level = 2; level >= 0; level--) {
-        pte_t *pte = &pgdir[PX(level, vaddr)];
+    int level;
+    pte_t e;
 
-        if (!(*pte & PTE_V))
-            return -1;
-
-        /* A leaf carries R/W/X; an interior node does not. The leaf's page
-         * spans 4 KiB << (9 * level), so mask the offset with PXSHIFT(level).
-         */
-        if (*pte & (PTE_R | PTE_W | PTE_X)) {
-            uintptr_t pgmask = ((uintptr_t) 1 << PXSHIFT(level)) - 1;
-
-            if (!(*pte & PTE_U)) /* user address must map a user-accessible page */
-                return -1;
-            *pa = (paddr_t) (PTE2PA(*pte) | (vaddr & pgmask));
-            return 0;
-        }
-        pgdir = (pagetable_t) PA_TO_VA(PTE2PA(*pte));
-    }
-    return -1; /* walked past L0 without a leaf — not a valid mapping */
+    if (!sv39_lookup_leaf(pgdir, vaddr, &level, &e))
+        return -1;    /* unmapped, or a leaf the hardware faults on */
+    if (!(e & PTE_U)) /* user address must map a user-accessible page */
+        return -1;
+    *pa = (paddr_t) sv39_leaf_paddr(e, level, vaddr, NULL);
+    return 0;
 }
 
 /* cpu_sysvaddr_find — find a system virtual address for a region.

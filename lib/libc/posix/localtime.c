@@ -30,9 +30,17 @@
  * through the same rule code as a TZ rule string. A name is relative to the
  * zone directory and may not contain "." or ".." components. A file is read
  * once, outside tz_lock, and kept for the life of the process, so tm_zone
- * pointers stay valid; at most TZ_FILES_MAX distinct files are kept, and a TZ
- * naming another selects UTC. A file that is missing when TZ is first seen is
- * not looked for again until TZ changes.
+ * pointers stay valid. The kept files are a list, one per name, so the count is
+ * bounded by the files in the zone directory, not by a table. A TZ that names a
+ * file that is missing or invalid selects UTC, and the failure is remembered:
+ * conversions do not look again, so they never open a file after the first. An
+ * explicit tzset() does look again, so a program can call it once the zone
+ * directory appears (a late mount, a zone installed later).
+ *
+ * The image ships a subset of the tz database (scripts/gen-zoneinfo.sh lists
+ * it: the zones in scripts/zoneinfo-2025b.zi). Any other geographic name finds
+ * no file and selects UTC, as an unreadable one does; a program that needs a
+ * zone outside the set uses the POSIX rule form, which needs no file.
  *
  * Thread safety: the parsed zone is shared state under tz_lock, a priority-
  * inheritance mutex, and every conversion reads TZ again, so a setenv takes
@@ -93,9 +101,6 @@
 /* Distinct zone names kept for the life of the process. */
 #define TZ_NAMES_MAX 32
 
-/* Distinct zone files kept for the life of the process, each about 3 KiB. */
-#define TZ_FILES_MAX 64
-
 #ifndef TZNAME_MAX
 #define TZNAME_MAX 255
 #endif
@@ -135,6 +140,7 @@ struct tz_loaded {
     struct tz_zone footer; /* the footer rule; names point at footer_std/dst */
     char footer_std[TZNAME_MAX + 1], footer_dst[TZNAME_MAX + 1];
     struct tz_zone zone; /* the summary tz_snapshot hands out */
+    struct tz_loaded *next;
 };
 
 char *tzname[2] = {(char *) "UTC", (char *) "UTC"};
@@ -156,6 +162,8 @@ static pthread_mutex_t tz_lock = PTHREAD_MUTEX_INITIALIZER; /* host tests */
 #endif
 /* TZ as last parsed; the initial "" matches the initial UTC `zone`. */
 static char tz_cached[TZ_STR_MAX + 1];
+/* tz_cached names a zone file that did not load: only tzset() looks again. */
+static int tz_cached_failed;
 static struct tz_zone zone = {.std_name = utc_name, .dst_name = utc_name};
 
 /* Interned zone names. Slots are never reused, so names handed out in tm_zone
@@ -164,11 +172,11 @@ static struct tz_zone zone = {.std_name = utc_name, .dst_name = utc_name};
 static char tz_names[TZ_NAMES_MAX][TZNAME_MAX + 1];
 static int tz_name_count;
 
-/* Zone files kept so far, newest last; an entry is complete before it is
- * published, under tz_lock, and is never freed or changed.
+/* Zone files kept so far, newest first. An entry is complete before it is
+ * published (a release store under tz_lock) and is never freed or changed, so a
+ * reader walks the list without the lock.
  */
-static struct tz_loaded *tz_files[TZ_FILES_MAX];
-static int tz_file_count;
+static struct tz_loaded *tz_files;
 
 /* Parse up to `maxdig` digits, at least one, into *out. */
 static int get_num(const char **p, int maxdig, int *out)
@@ -335,12 +343,16 @@ static size_t tz_len(const char *s)
     return n;
 }
 
-/* The kept zone file named `name`, or NULL. Caller holds tz_lock. */
+/* The kept zone file named `name`, or NULL. Lock-free: the list is published
+ * with a release store and its entries never change.
+ */
 static const struct tz_loaded *find_loaded(const char *name)
 {
-    for (int i = 0; i < tz_file_count; i++) {
-        if (!strcmp(tz_files[i]->name, name))
-            return tz_files[i];
+    for (const struct tz_loaded *ld =
+             __atomic_load_n(&tz_files, __ATOMIC_ACQUIRE);
+         ld; ld = ld->next) {
+        if (!strcmp(ld->name, name))
+            return ld;
     }
     return NULL;
 }
@@ -403,9 +415,10 @@ fail:
 }
 
 /* The zone file TZ names (without a leading colon), kept on first use; NULL if
- * there is none or no room for another. The scan under the lock is bounded by
- * TZ_FILES_MAX; the read and parse run outside it. Threads that first see a
- * name together each read it, and the extra copies are freed.
+ * there is none. The lookup walks the list without the lock and the read and
+ * parse run outside it; the lock covers only the check for a lost race and the
+ * push. Threads that first see a name together each read it, and the extra
+ * copies are freed.
  */
 static const struct tz_loaded *get_loaded(const char *name)
 {
@@ -414,21 +427,20 @@ static const struct tz_loaded *get_loaded(const char *name)
 
     if (!__tzfile_name_ok(name))
         return NULL;
-    pthread_mutex_lock(&tz_lock);
     ld = find_loaded(name);
-    pthread_mutex_unlock(&tz_lock);
     if (ld || !(fresh = load_zone(name)))
         return ld;
 
     pthread_mutex_lock(&tz_lock);
     ld = find_loaded(name);
-    if (!ld && tz_file_count < TZ_FILES_MAX) {
-        tz_files[tz_file_count++] = fresh;
+    if (!ld) {
+        fresh->next = tz_files;
+        __atomic_store_n(&tz_files, fresh, __ATOMIC_RELEASE);
         ld = fresh;
         fresh = NULL;
     }
     pthread_mutex_unlock(&tz_lock);
-    if (fresh) { /* lost a race, or no room */
+    if (fresh) { /* lost a race */
         free((void *) fresh->file);
         free(fresh);
     }
@@ -436,18 +448,19 @@ static const struct tz_loaded *get_loaded(const char *name)
 }
 
 /* Copy the zone that TZ names into *out. TZ is parsed, outside tz_lock, only
- * when it differs from the last one; the lock covers a bounded compare, the
- * interning and the copy. A zone file is read the first time TZ names it, which
- * tzset() does ahead of time for a program that must not do file I/O later.
+ * when it differs from the last one (or, with retry, when it named a zone file
+ * that did not load); the lock covers a bounded compare, the interning and the
+ * copy. A zone file is read the first time TZ names it, which tzset() does
+ * ahead of time for a program that must not do file I/O later.
  */
-static void tz_snapshot(struct tz_zone *out)
+static void tz_snapshot(struct tz_zone *out, int retry)
 {
     const char *s = getenv("TZ");
     char std[TZNAME_MAX + 1], dst[TZNAME_MAX + 1];
     const struct tz_loaded *ld = NULL;
     struct tz_zone z;
     size_t len;
-    int ok;
+    int ok, failed;
 
     if (!s)
         s = "";
@@ -459,7 +472,7 @@ static void tz_snapshot(struct tz_zone *out)
     }
 
     pthread_mutex_lock(&tz_lock);
-    if (!memcmp(s, tz_cached, len + 1)) {
+    if (!memcmp(s, tz_cached, len + 1) && !(retry && tz_cached_failed)) {
         *out = zone;
         pthread_mutex_unlock(&tz_lock);
         return;
@@ -473,6 +486,13 @@ static void tz_snapshot(struct tz_zone *out)
     }
 
     pthread_mutex_lock(&tz_lock);
+    if (!ok && *s && !ld) {
+        /* Under the lock, so a push by another thread that loaded this same
+         * file is seen, and UTC is not published over its result.
+         */
+        ld = find_loaded(s + (*s == ':'));
+    }
+    failed = !ok && *s && !ld && __tzfile_name_ok(s + (*s == ':'));
     if (ok) {
         /* Store both names or neither, so a failed TZ wastes no slot. */
         int need = !find_name(std) +
@@ -488,6 +508,7 @@ static void tz_snapshot(struct tz_zone *out)
     if (!ok)
         z = ld ? ld->zone : utc_zone;
     memcpy(tz_cached, s, len + 1);
+    tz_cached_failed = failed;
     zone = z;
     tzname[0] = (char *) z.std_name;
     tzname[1] = (char *) z.dst_name;
@@ -501,7 +522,7 @@ void tzset(void)
 {
     struct tz_zone z;
 
-    tz_snapshot(&z);
+    tz_snapshot(&z, 1);
 }
 
 static long long floor_div(long long a, long long b)
@@ -672,7 +693,7 @@ struct tm *localtime_r(const time_t *tp, struct tm *tm)
         errno = EOVERFLOW;
         return NULL;
     }
-    tz_snapshot(&z);
+    tz_snapshot(&z, 0);
     zone_info(&z, *tp, &info);
     return fill_tm(*tp, &info, tm);
 }
@@ -810,7 +831,7 @@ time_t mktime(struct tm *tm)
     long long t = __tm_to_secs(tm);
 
     /* One snapshot serves both lookups, even if TZ changes meanwhile. */
-    tz_snapshot(&z);
+    tz_snapshot(&z, 0);
     if (z.loaded) {
         t = file_local_to_utc(&z, t, tm->tm_isdst);
     } else {
