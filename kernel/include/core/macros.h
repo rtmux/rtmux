@@ -213,15 +213,6 @@
     (((flags) & (PTHREAD_CANCEL_DISABLE | PTHREAD_CANCEL_PENDING)) == \
      PTHREAD_CANCEL_PENDING)
 
-/* Safe TLS flags access: the thread's TLS may be in user address space, which
- * is not accessible from S-mode when the kernel SATP is active. Only
- * dereference TLS if it's in kernel space.
- */
-#define TLS_FLAGS_SAFE(thp)                              \
-    (((uintptr_t) (thp)->un.lcl.tls >= KERNEL_VIRT_BASE) \
-         ? (thp)->un.lcl.tls->__flags                    \
-         : 0)
-
 /* Thread-state bit sets */
 
 #define STATE_CANCEL_BITS                                                \

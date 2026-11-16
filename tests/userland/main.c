@@ -1034,6 +1034,18 @@ int main(int argc, char *argv[])
             test_skip("sched_set_error_after_lowering", "fault injection unavailable");
         return finish(1);
     }
+    if (argc == 2 && !strcmp(argv[1], "--condvar-reacquire-alloc-failure")) {
+        printf("[condvar_reacquire_alloc_failure]\n");
+        if (condvar_reacquire_alloc_failure() == TC_EXIT_SKIP)
+            test_skip("condvar_reacquire_alloc_failure", "fault injection unavailable");
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--mutex-waiting-republish")) {
+        printf("[mutex_waiting_republish]\n");
+        if (mutex_waiting_republish() == TC_EXIT_SKIP)
+            test_skip("mutex_waiting_republish", "fault injection unavailable");
+        return finish(1);
+    }
     if (argc == 3 && !strcmp(argv[1], "--serial-unblock-child"))
         return serial_unblock_child(!strcmp(argv[2], "announce"));
     if (argc == 2 && !strcmp(argv[1], "--console-poll")) {
@@ -1084,6 +1096,8 @@ int main(int argc, char *argv[])
         return loader_execvp_child(argv[2]);
     if (argc == 3 && !strcmp(argv[1], "--env-expect"))
         return env_expect_child(argv[2]);
+    if (argc == 2 && !strcmp(argv[1], "--orphan-exit-mid"))
+        return orphan_exit_mid();
     if (argc == 3 && !strcmp(argv[1], "--spawn-echo-child"))
         return spawn_echo_child(argv[2]);
     if (argc >= 2 && !strcmp(argv[1], "--spawn-bigargs-child"))
@@ -1289,6 +1303,27 @@ int main(int argc, char *argv[])
             return 3;
         }
         return errno == ENXIO ? EXIT_SUCCESS : 4;
+    }
+    if ((argc == 2 || argc == 3) && !strcmp(argv[1], "--session-probe")) {
+        /* Report this process's view of its session and group, after joining
+         * the group argv[2] if given and otherwise leading its own (setpgid),
+         * on one line; then stay alive until stdin reaches EOF, so that the
+         * parent can probe it.
+         */
+        char line[128], c;
+        pid_t sid = getsid(0), pg0 = getpgrp();
+        int rc, err, n;
+
+        errno = 0;
+        rc = setpgid(0, argc == 3 ? (pid_t) atoi(argv[2]) : 0);
+        err = rc == 0 ? 0 : errno;
+        n = snprintf(line, sizeof line, "sid=%d pg0=%d rc=%d err=%d pg1=%d\n",
+                     (int) sid, (int) pg0, rc, err, (int) getpgrp());
+        if (n < 0 || write(STDOUT_FILENO, line, (size_t) n) != n)
+            return 2;
+        while (read(STDIN_FILENO, &c, 1) == 1)
+            ;
+        return EXIT_SUCCESS;
     }
     if (argc == 2 && !strcmp(argv[1], "--getsid-hold")) {
         /* Say it is running, then stay alive until stdin reaches EOF. */

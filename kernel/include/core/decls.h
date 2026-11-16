@@ -206,6 +206,7 @@ int(xfer_memcpy)(void *dst, const void *src, size_t len);
 int xfer_probe(void *loc, unsigned words, int write);
 int xfer_atomic_or_user(volatile unsigned *uaddr, unsigned bits);
 int xfer_fetch_or_user(volatile unsigned *uaddr, unsigned bits, unsigned *oldp);
+unsigned tls_flags_load(thread_t *thp);
 int(xfer_cpy_diov)(thread_t *thpd,
                    iov_t *dst,
                    uint8_t *saddr,
@@ -345,9 +346,15 @@ void cpu_force_fpu_save(thread_t *thp);
 #ifdef CONFIG_DEBUG_INJECT
 int inject_should_fail_alloc(process_t *prp,
                              soul_t *soulp); /* debug/inject.c */
+void inject_mutex_lock_stall(process_t *prp);
 bool inject_should_fail_sched_set(thread_t *act, bool lowered);
 void inject_note_sched_return(thread_t *act, bool displaced);
+int inject_should_fail_turnstile(process_t *prp); /* debug/inject.c */
 #else
+static inline void inject_mutex_lock_stall(process_t *prp)
+{
+    (void) prp;
+}
 static inline bool inject_should_fail_sched_set(thread_t *act, bool lowered)
 {
     (void) act;

@@ -157,6 +157,7 @@ int roottask_main(int argc, char **argv)
          * run. roottask is pid 1; it has no parent (parent_pid = 0).
          */
         root_process_init(ROOTTASK_PID, 0);
+        root_process_boot_session(ROOTTASK_PID);
         root_proc(ROOTTASK_PID)->debug_name = strdup("roottask");
 
         /* Cache the adp pointer too. process_create's kcall_args adp_out

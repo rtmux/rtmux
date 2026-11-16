@@ -322,11 +322,12 @@ int process_query_info(pid_t pid, root_proc_info_t *info)
         if (tmp->siginfo.si_signo != 0)
             info->siginfo = tmp->siginfo;
         info->session = tmp->session;
+        info->sess_leader = root_session_leader(tmp);
         if (tmp->session) {
-            info->sess_leader = tmp->session->leader;
             info->sess_pgrp = tmp->session->pgrp;
             info->sess_fd = tmp->session->fd;
         } else {
+            info->sess_pgrp = 0;
             info->sess_fd = -1;
         }
     }

@@ -326,8 +326,18 @@ int proc_terminate(message_context_t *ctp,
          * and process_destroy_call both tolerate that).
          */
         (void) ProcessFlagsOp(pid, RTMUX_FLG_PROC_ZOMBIE, 0);
+
+        /* A parent destroyed after the check above handed the child to roottask
+         * before it was a zombie, so no reap was requested. Roottask never
+         * waits for a child, so a zombie it adopted would stay for ever: look
+         * again now that ZOMBIE is set and reap it here. The kernel clears
+         * ZOMBIE when it takes the reap on itself, so a cleared flag means that
+         * is under way and must not be repeated.
+         */
         if (process_query_info(pid, &qinfo_zomb) == EOK &&
-            (qinfo_zomb.flags & RTMUX_FLG_PROC_WAITDONE)) {
+            ((qinfo_zomb.flags & RTMUX_FLG_PROC_WAITDONE) ||
+             (qinfo_zomb.parent_pid == ROOTTASK_PID &&
+              (qinfo_zomb.flags & RTMUX_FLG_PROC_ZOMBIE)))) {
             process_destroy_call(pid);
         }
     }

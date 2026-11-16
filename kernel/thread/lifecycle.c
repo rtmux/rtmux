@@ -59,6 +59,7 @@ static void thread_recycle_reset(thread_t *thp)
     thp->owned_turnstiles = NULL;
     thp->robust_held = NULL;
     thp->robust_spare = NULL;
+    thp->ts_spare = NULL;
     thp->robust_nheld = 0;
     thp->restart = NULL;
     thp->iovchk_iov = NULL;
@@ -1125,6 +1126,7 @@ int rdecl thread_create(thread_t *act,
     thp->owned_turnstiles = NULL;
     thp->robust_held = NULL;
     thp->robust_spare = NULL;
+    thp->ts_spare = NULL;
     thp->robust_nheld = 0;
     thp->held_ceiling_n = 0;
     thp->held_ceiling_floor = 0;
@@ -1395,6 +1397,26 @@ void fpu_drop_claims(thread_t *thp)
     }
 }
 
+/* Give up what a dying thread holds in the sync layer: its mutex hold list, the
+ * robust mutexes it owns, and the waiters of mutexes it held (see
+ * sync_thread_cleanup). Shared by thread_destroy and by proc_exit, which stamps
+ * some threads dead without running thread_destroy's teardown. Repeating it is
+ * harmless.
+ */
+void rdecl thread_sync_teardown(thread_t *thp)
+{
+    ksync_t *syp;
+
+    while ((syp = thp->mutex_holdlist)) {
+        thread_t *waiting = pril_first(&syp->waiting);
+
+        CRASHCHECK(waiting->args.mu.owner == 0);
+        mutex_holdlist_rem(syp);
+        waiting->args.mu.owner = 0;
+    }
+    sync_thread_cleanup(thp);
+}
+
 /* Destroy a thread.
  *
  * Atomically claims the thread, defers destruction of a victim still running a
@@ -1411,7 +1433,6 @@ void rdecl thread_destroy(thread_t *thp)
 {
     process_t *prp = thp->process;
     unsigned i;
-    ksync_t *syp;
     thread_t *jthp = NULL;
     int join_owned = 0;
     int last_active = 0; /* set iff this reap emptied prp->threads */
@@ -1613,14 +1634,7 @@ void rdecl thread_destroy(thread_t *thp)
             kcall_op_thread_destroy_hook(thp);
         }
 
-        /* purge mutex hold list */
-        while ((syp = thp->mutex_holdlist)) {
-            thread_t *waiting = pril_first(&syp->waiting);
-            CRASHCHECK(waiting->args.mu.owner == 0);
-            mutex_holdlist_rem(syp);
-            waiting->args.mu.owner = 0;
-        }
-        sync_thread_cleanup(thp);
+        thread_sync_teardown(thp);
 
         /* clear client field */
         if (thp->client != 0) {

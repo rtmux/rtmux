@@ -35,7 +35,7 @@ struct jc_snap {
     pid_t pid;
     pid_t ppid;
     pid_t pgrp;
-    pid_t sid; /* session leader pid, 0 when there is no session */
+    pid_t sid; /* session leader pid; roottask's for the system session */
     pid_t fg;  /* foreground group of the session's terminal */
     int fd;    /* roottask's descriptor to the terminal, or -1 */
     unsigned flags;
@@ -55,9 +55,9 @@ static int jc_snapshot(pid_t pid, struct jc_snap *s)
     s->pid = pid;
     s->ppid = qinfo.parent_pid;
     s->pgrp = qinfo.pgrp ? qinfo.pgrp : pid;
-    s->sid = qinfo.session ? qinfo.sess_leader : 0;
+    s->sid = qinfo.sess_leader;
     s->fg = qinfo.sess_pgrp;
-    s->fd = qinfo.session ? qinfo.sess_fd : -1;
+    s->fd = qinfo.sess_fd;
     s->flags = qinfo.flags;
     s->chp = qinfo.sys_chp;
     root_proc_unlock(pid);

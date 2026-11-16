@@ -100,16 +100,12 @@ int proc_setpgid(ioserv_context_t *ctp, proc_setpgid_t *msg)
             goto out_unlock;
         }
 
-        /* If pid is a session leader or not in the same session return EPERM */
+        /* If pid is a session leader or not in the same session return EPERM. A
+         * process with no session is in the system session, as for getsid.
+         */
         if ((qinfo2.flags & RTMUX_FLG_PROC_SLEADER) ||
-            tmp1->session != tmp2->session) {
+            root_session_leader(tmp1) != root_session_leader(tmp2)) {
             ret = EPERM;
-            goto out_unlock;
-        }
-
-        /* If session is null for either prp1 or prp2 return ESRCH */
-        if (!tmp1->session || !tmp2->session) {
-            ret = ESRCH;
             goto out_unlock;
         }
 
@@ -121,12 +117,12 @@ int proc_setpgid(ioserv_context_t *ctp, proc_setpgid_t *msg)
             if (msg->i.pgid != pid1) {
                 pid_t leader1, leader3;
 
-                leader1 = tmp1->session->leader;
+                leader1 = root_session_leader(tmp1);
 
                 if (msg->i.pgid == pid2) {
                     prp3 = prp2;
                     pid3 = pid2;
-                    leader3 = root_proc(pid3)->session->leader;
+                    leader3 = root_session_leader(root_proc(pid3));
                 } else {
                     /* Careful.. unlock prp1/prp2 first */
                     root_proc_unlock(pid1);
@@ -141,13 +137,7 @@ int proc_setpgid(ioserv_context_t *ctp, proc_setpgid_t *msg)
                         ret = EPERM;
                         goto out_unlock;
                     }
-                    /* Defensive */
-                    if (!root_proc(pid3)->session) {
-                        ret = ESRCH;
-                        goto out_unlock;
-                    }
-
-                    leader3 = root_proc(pid3)->session->leader;
+                    leader3 = root_session_leader(root_proc(pid3));
                     root_proc_unlock(pid3);
                     prp3 = NULL;
 
@@ -174,5 +164,11 @@ out_unlock:
         root_proc_unlock(pid3);
     if (prp2 && prp2 != prp1)
         root_proc_unlock(pid2);
-    return proc_error(ret, pid1);
+
+    /* prp1 is NULL when joining another group dropped it (see above); it must
+     * not be unlocked a second time.
+     */
+    if (prp1)
+        root_proc_unlock(pid1);
+    return ret;
 }

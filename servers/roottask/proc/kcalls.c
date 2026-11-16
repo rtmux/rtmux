@@ -187,7 +187,7 @@ static process_t *process_create_locked(pid_t parent_pid,
          * so its children are in group parent_pid. Each member holds one link
          * on the session; root_process_fini drops it.
          */
-        child_tmp->pgrp = parent_tmp->pgrp ? parent_tmp->pgrp : parent_pid;
+        child_tmp->pgrp = root_process_pgrp(parent_tmp);
         if (parent_tmp->session) {
             child_tmp->session = parent_tmp->session;
             (void) atomic_add_value(&child_tmp->session->links, 1);

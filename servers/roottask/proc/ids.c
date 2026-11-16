@@ -9,16 +9,6 @@
 #include "private.h"
 #include "root-process.h"
 
-/* session_id — the session ID a snapshot reports: its session leader's pid. A
- * process that never joined a session (no ancestor called setsid) belongs to
- * the system session, which roottask leads, as getppid() reports roottask for a
- * process with no parent.
- */
-static pid_t session_id(const root_proc_info_t *qinfo)
-{
-    return qinfo->session ? qinfo->sess_leader : ROOTTASK_PID;
-}
-
 /* proc_getsetid — handle a _PROC_GETSETID message.
  *
  * Implements getid (pgrp / ppid / sid / cred) plus set*id / set*gid variants,
@@ -61,7 +51,7 @@ int proc_getsetid(ioserv_context_t *ctp, proc_getsetid_t *msg)
 
     switch (msg->i.subtype) {
     case _PROC_ID_GETID: {
-        pid_t sess = session_id(&qinfo);
+        pid_t sess = qinfo.sess_leader;
 
         /* The reply overlays the request (o.pgrp shares i.pid's bytes), so
          * locked_pid, taken above, is the only copy of the target from here.
@@ -83,7 +73,7 @@ int proc_getsetid(ioserv_context_t *ctp, proc_getsetid_t *msg)
             if (!root_proc_lock(ctp->info.pid))
                 return ESRCH;
             if (process_query_info(ctp->info.pid, &self) != EOK ||
-                session_id(&self) != sess)
+                self.sess_leader != sess)
                 return proc_error(EPERM, ctp->info.pid);
             root_proc_unlock(ctp->info.pid);
         }

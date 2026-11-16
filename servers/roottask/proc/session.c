@@ -235,23 +235,22 @@ int proc_msg_session(ioserv_context_t *ctp, proc_session_t *msg)
         prp = root_proc_lock(ctp->info.pid);
         if (!prp)
             return EPERM;
-        if (process_query_info(ctp->info.pid, &qinfo) != EOK ||
-            !root_proc(ctp->info.pid)->session) {
+        if (process_query_info(ctp->info.pid, &qinfo) != EOK) {
             root_proc_unlock(ctp->info.pid);
             return EPERM;
         }
-        leader = root_proc(ctp->info.pid)->session->leader;
+        leader = qinfo.sess_leader;
         root_proc_unlock(ctp->info.pid);
 
         target = root_proc_lock(pgrp);
         if (!target) {
             return EPERM;
         }
-        if (root_proc(pgrp)->pgrp != pgrp || !root_proc(pgrp)->session) {
+        if (root_proc(pgrp)->pgrp != pgrp) {
             root_proc_unlock(pgrp);
             return EPERM;
         }
-        if (root_proc(pgrp)->session->leader != leader) {
+        if (root_session_leader(root_proc(pgrp)) != leader) {
             root_proc_unlock(pgrp);
             return EPERM;
         }

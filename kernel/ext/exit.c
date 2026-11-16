@@ -295,10 +295,10 @@ void kext_exit_destroy_threads(void *arg)
                 atomic_or(&thp->flags, RTMUX_FLG_THR_DETACHED);
 
                 /* A thread stamped dead here skips thread_destroy's teardown
-                 * (including its sync cleanup), yet may hold a robust mutex:
-                 * hand those on now.
+                 * (including its sync cleanup), yet may hold a mutex: hand
+                 * those on now.
                  */
-                sync_thread_cleanup(thp);
+                thread_sync_teardown(thp);
             }
             thread_destroy(thp);
         }

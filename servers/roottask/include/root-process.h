@@ -62,10 +62,10 @@ typedef union path_object path_object_t;
  */
 typedef struct root_process_entry {
     pid_t pid;                            /* full pid; 0 = slot free */
-    pid_t parent_pid;                     /* mirror of parent->pid; needed
-                                           * by root_proc_lock_parent without
-                                           * dereferencing the kernel-half
-                                           * process_t.parent pointer
+    pid_t parent_pid;                     /* parent at spawn; stale once
+                                           * the kernel reparents the child,
+                                           * so only a fallback for
+                                           * root_proc_lock_parent
                                            */
     struct proc_mux_lock *lock;           /* roottask-side process mux —
                                            * lazily allocated by acquire_lock
@@ -193,8 +193,22 @@ static inline root_process_t *root_proc(pid_t pid)
     return &root_process[ROOT_PINDEX(pid)];
 }
 
+/* The one rule for a process with no session: it belongs to the system session,
+ * which roottask leads. Boot gives roottask that session and every process
+ * inherits one (root_process_boot_session), so no process is without one after
+ * startup; every reader of a session id still goes through this, or through
+ * root_proc_info_t.sess_leader, which process_query_info fills by it, so that
+ * getsid, setpgid, kill and the job-control checks cannot disagree.
+ */
+pid_t root_session_leader(const root_process_t *p);
+
+/* The one rule for a process group: a process that joined none is in its own.
+ */
+pid_t root_process_pgrp(const root_process_t *p);
+
 void root_process_init(pid_t pid, pid_t parent_pid); /* claim slot at create */
-void root_process_fini(pid_t pid); /* release slot at destroy */
+void root_process_boot_session(pid_t pid); /* give pid a session it leads */
+void root_process_fini(pid_t pid);         /* release slot at destroy */
 void memcap_process_fini(root_process_t *tmp);
 
 /* root_proc_info_t — see kernel/include/private/root-proc-info.h for the shared

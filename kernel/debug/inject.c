@@ -78,6 +78,55 @@ void inject_note_sched_return(thread_t *act, bool displaced)
         atomic_fetch_add_explicit(&sched_displaced, 1, memory_order_release);
 }
 
+/* The pid whose next turnstile allocation fails, or -1: consumed like
+ * armed_soul so exactly one allocation takes the failure.
+ */
+static atomic_int armed_ts_pid = -1;
+
+int inject_should_fail_turnstile(process_t *prp)
+{
+    int pid = atomic_load_explicit(&armed_ts_pid, memory_order_acquire);
+
+    if (pid < 0 || !prp || prp->pid != pid ||
+        !atomic_compare_exchange_strong_explicit(&armed_ts_pid, &pid, -1,
+                                                 memory_order_acq_rel,
+                                                 memory_order_relaxed))
+        return 0;
+    atomic_store_explicit(&consumed, 1, memory_order_release);
+    return 1;
+}
+
+/* The pid whose next contended PI mutex lock stalls, or -1, and for how long.
+ * Consumed like armed_ts_pid.
+ */
+static atomic_int armed_stall_pid = -1;
+static atomic_uint armed_stall_ms;
+
+/* Called from the contended lock path with the chain lock dropped, after the
+ * waiter published itself and before it queues.
+ */
+void inject_mutex_lock_stall(process_t *prp)
+{
+    int pid = atomic_load_explicit(&armed_stall_pid, memory_order_acquire);
+    uint64_t ms;
+    uint64_t end;
+
+    if (pid < 0 || !prp || prp->pid != pid)
+        return;
+    /* Read the duration the arm published before claiming it. */
+    ms = atomic_load_explicit(&armed_stall_ms, memory_order_relaxed);
+    if (!atomic_compare_exchange_strong_explicit(&armed_stall_pid, &pid, -1,
+                                                 memory_order_acq_rel,
+                                                 memory_order_relaxed))
+        return;
+    end = r_time() + ms * (qtimeptr->cycles_per_sec / 1000);
+    atomic_store_explicit(&consumed, 1, memory_order_release);
+    inject_spin_begin();
+    while (r_time() < end)
+        ;
+    inject_spin_end();
+}
+
 /* Called from object_alloc before it touches the free list. Ordinary allocation
  * only: the reserved path (object_alloc_reserved) must never fail this way.
  */
@@ -153,6 +202,22 @@ void kext_debug_inject(void *data)
         atomic_store_explicit(&armed_pid, (int) kap->arg1,
                               memory_order_relaxed);
         atomic_store_explicit(&armed_soul, (unsigned) kap->arg0,
+                              memory_order_release);
+        break;
+    case INJECT_OP_FAIL_NEXT_TURNSTILE:
+        atomic_store_explicit(&consumed, 0, memory_order_relaxed);
+        atomic_store_explicit(&armed_ts_pid, (int) kap->arg0,
+                              memory_order_release);
+        break;
+    case INJECT_OP_STALL_MUTEX_LOCK:
+        if (kap->arg1 == 0 || kap->arg1 > INJECT_SPIN_MAX_MS) {
+            ret = EINVAL;
+            break;
+        }
+        atomic_store_explicit(&consumed, 0, memory_order_relaxed);
+        atomic_store_explicit(&armed_stall_ms, (unsigned) kap->arg1,
+                              memory_order_relaxed);
+        atomic_store_explicit(&armed_stall_pid, (int) kap->arg0,
                               memory_order_release);
         break;
     case INJECT_OP_ALLOC_STATUS:

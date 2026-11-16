@@ -230,7 +230,9 @@ waiter (or stores `RTMUX_SYNC_DEAD` for the next locker) through the kernel
 direct map, after checking under `as_slock` that the new owner's mapping, or
 the dead owner's, still leads to the mutex's physical key (the "ROBUST
 MUTEXES" comment in `kernel/sync/wait.c`). A non-robust shared mutex whose
-owner dies stays locked.
+owner dies is left `RTMUX_SYNC_NOTRECOVERABLE` (see "OWNER DEATH" in
+`kernel/sync/wait.c`): its waiters and later blocking lockers fail with
+`ENOTRECOVERABLE`.
 
 ## Priority inheritance across processes — scoped OUT of v1
 

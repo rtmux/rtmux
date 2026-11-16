@@ -566,6 +566,13 @@ typedef struct thread_entry { /* Also used for vthread_entry */
      */
     struct robust_hold *robust_held;
     struct robust_hold *robust_spare;
+
+    /* One idle turnstile kept for this thread's next contended PI lock, so that
+     * a condvar wait can reserve it before it gives the mutex up: the reacquire
+     * on wake then cannot fail for want of memory. Only the thread itself
+     * touches it. See kernel/sync/wait.c.
+     */
+    turnstile_t *ts_spare;
     unsigned robust_nheld; /* length of robust_held (under sync_pi_slock) */
     thread_t *restart;
 

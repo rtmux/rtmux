@@ -290,7 +290,7 @@ int kdecl ksys_interrupt_wait(thread_t *act,
     int unmask_requested = (wflags & RTMUX_INTR_WAIT_FLAGS_UNMASK) ? 1 : 0;
     int fast = (wflags & RTMUX_INTR_WAIT_FLAGS_FAST) ? 1 : 0;
 
-    if (PENDCAN(TLS_FLAGS_SAFE(act))) {
+    if (PENDCAN(tls_flags_load(act))) {
         SETKIP_FUNC(act, act->process->canstub);
         return ENOERROR;
     }

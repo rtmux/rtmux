@@ -77,6 +77,10 @@ int(pthread_mutex_trylock)(pthread_mutex_t *mutex)
     if (mutex->owner == RTMUX_SYNC_DESTROYED) {
         return EINVAL;
     }
+    /* Left so by an owner that died holding a mutex that is not robust. */
+    if (mutex->owner == RTMUX_SYNC_NOTRECOVERABLE) {
+        return ENOTRECOVERABLE;
+    }
 
     return EBUSY;
 }
