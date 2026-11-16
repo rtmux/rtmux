@@ -55,7 +55,7 @@ POSIX1_SRCS = sleep.c write.c read.c close.c fstat.c fdatasync.c fsync.c sync.c 
               tcgetattr.c tcsetattr.c tcgetpgrp.c tcflush.c tcdrain.c \
               tcflow.c tcsendbreak.c termios-speed.c \
               statvfs.c poll.c select.c resource.c fcntl.c signal.c iodir.c _exit.c exec.c raise.c unlink.c \
-              gettimeofday.c localtime.c time-conv.c strftime.c setjmp.c uname.c
+              gettimeofday.c localtime.c tzfile.c time-conv.c strftime.c setjmp.c uname.c
 
 ifeq ($(ARCH),riscv)
 POSIX1_ASM_SRCS = _setjmp.S

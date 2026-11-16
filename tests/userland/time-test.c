@@ -5,8 +5,8 @@
  * time_test - gmtime, localtime, mktime, timegm and the POSIX TZ parser.
  *
  * Covers the pre-epoch and overflow edges of gmtime, the cost bound of the
- * conversion (no loop over years), timegm round trips over representable
- * times, and mktime across both DST transitions of TZ=EST5EDT,M3.2.0,M11.1.0,
+ * conversion (no loop over years), timegm round trips over representable times,
+ * and mktime across both DST transitions of TZ=EST5EDT,M3.2.0,M11.1.0,
  * including the spring-forward gap and both sides of the fall-back fold.
  *
  * SPDX-License-Identifier: Apache-2.0
@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 #include "test.h"
 
 #define US_TZ "EST5EDT,M3.2.0,M11.1.0"
@@ -87,8 +88,8 @@ static uint64_t now_ns(void)
     return (uint64_t) ts.tv_sec * 1000000000ULL + (uint64_t) ts.tv_nsec;
 }
 
-/* Check that a call failed with EOVERFLOW. Use as
- * expect_overflow(name, (errno = 0, f(...)) == failure_value).
+/* Check that a call failed with EOVERFLOW. Use as expect_overflow(name, (errno
+ * = 0, f(...)) == failure_value).
  */
 static void expect_overflow(const char *name, int failed)
 {
@@ -193,8 +194,9 @@ static void test_gmtime_bound(void)
              (unsigned long long) near_ns, (unsigned long long) far_ns,
              (unsigned long long) max_ns);
     printf("  INFO  gmtime cost %s\n", detail);
-    /* Bounded either absolutely or relative to a near year, so a preempted
-     * run on a slow host does not fail a cost that does not grow.
+
+    /* Bounded either absolutely or relative to a near year, so a preempted run
+     * on a slow host does not fail a cost that does not grow.
      */
     check((far_ns < 50000 || far_ns < 4 * near_ns) &&
               (max_ns < 50000 || max_ns < 4 * near_ns),
@@ -251,7 +253,9 @@ static void test_tz_parse(void)
         "EST5EDT,M3.2.0",
         "EST5EDT,M3.2.0,M11.1.0x",
         "EST5EDT,J0,J365",
-        ":America/New_York",
+        ":Nowhere/Missing",
+        "Nowhere/Missing",
+        "../zoneinfo/Europe/Berlin",
         "",
         "<EST5",
         "TOOLONGNAMEXXXXXXXXXXXXXXXXXXXXXXXXXXXXX5",
@@ -483,6 +487,80 @@ static void test_tz_name_store(void)
           "EST no longer parses");
 }
 
+/* Zone files, when the image ships /usr/share/zoneinfo: Europe/Berlin in winter
+ * and summer, in the years the footer rule covers, and through mktime.
+ */
+static void test_zone_files(void)
+{
+    time_t t;
+    struct tm tm;
+
+    if (access("/usr/share/zoneinfo/Europe/Berlin", R_OK)) {
+        test_skip("geographic time zones",
+                  "no /usr/share/zoneinfo on this image");
+        return;
+    }
+    set_tz("Europe/Berlin");
+    check(!strcmp(tzname[0], "CET") && !strcmp(tzname[1], "CEST") &&
+              timezone == -3600 && daylight == 1,
+          "TZ=Europe/Berlin sets tzname/timezone/daylight", "CET/CEST -3600 1");
+    t = 1736942400; /* 2025-01-15 12:00 UTC */
+    expect_tm("Berlin winter", localtime_r(&t, &tm), "2025-01-15 13:00:00", 0,
+              3600, "CET");
+    t = 1752580800; /* 2025-07-15 12:00 UTC */
+    expect_tm("Berlin summer", localtime_r(&t, &tm), "2025-07-15 14:00:00", 1,
+              7200, "CEST");
+    t = 2519510400LL; /* 2049-11-03 00:00 UTC, past the table: the footer rule
+                       */
+    expect_tm("Berlin by the footer rule", localtime_r(&t, &tm),
+              "2049-11-03 01:00:00", 0, 3600, "CET");
+    t = 1743296400; /* 2025-03-30 01:00 UTC, the spring-forward instant */
+    expect_tm("Berlin at the spring transition", localtime_r(&t, &tm),
+              "2025-03-30 03:00:00", 1, 7200, "CEST");
+    t--;
+    expect_tm("Berlin just before the spring transition", localtime_r(&t, &tm),
+              "2025-03-30 01:59:59", 0, 3600, "CET");
+
+    /* The fall-back fold, 2025-10-26 02:30 local, with each tm_isdst. */
+    memset(&tm, 0, sizeof tm);
+    tm.tm_year = 125;
+    tm.tm_mon = 9;
+    tm.tm_mday = 26;
+    tm.tm_hour = 2;
+    tm.tm_min = 30;
+    tm.tm_isdst = 1;
+    check(mktime(&tm) == 1761438600 && tm.tm_isdst == 1,
+          "mktime in the fold, DST", "2025-10-26 00:30 UTC");
+    tm.tm_isdst = 0;
+    check(mktime(&tm) == 1761442200 && tm.tm_isdst == 0,
+          "mktime in the fold, standard", "2025-10-26 01:30 UTC");
+
+    /* A wrong tm_isdst away from any transition selects that offset, as for a
+     * rule zone, and the result is normalized.
+     */
+    memset(&tm, 0, sizeof tm);
+    tm.tm_year = 125;
+    tm.tm_mon = 6;
+    tm.tm_mday = 15;
+    tm.tm_hour = 12;
+    tm.tm_isdst = 0;
+    check(mktime(&tm) == 1752577200 && tm.tm_isdst == 1 && tm.tm_hour == 13,
+          "mktime in summer with tm_isdst 0", "11:00 UTC, shown as 13:00 CEST");
+    memset(&tm, 0, sizeof tm);
+    tm.tm_year = 125;
+    tm.tm_mon = 0;
+    tm.tm_mday = 15;
+    tm.tm_hour = 12;
+    tm.tm_isdst = 1;
+    check(mktime(&tm) == 1736935200 && tm.tm_isdst == 0 && tm.tm_hour == 11,
+          "mktime in winter with tm_isdst 1", "10:00 UTC, shown as 11:00 CET");
+
+    set_tz(":Europe/Berlin");
+    t = 1752580800;
+    expect_tm("a leading colon names the file", localtime_r(&t, &tm),
+              "2025-07-15 14:00:00", 1, 7200, "CEST");
+}
+
 void test_time(void)
 {
     /* Restore the caller's TZ afterwards, not just unset it. */
@@ -495,6 +573,7 @@ void test_time(void)
     test_tz_parse();
     test_dst_edges();
     test_tz_name_store();
+    test_zone_files();
     set_tz(saved_tz);
     free(saved_tz);
 }

@@ -38,8 +38,7 @@ PROGS = $(BUILD_BASE)/mkasmoff $(BUILD_BASE)/mkromfs $(BUILD_BASE)/treeromfs \
         $(BUILD_BASE)/cpio-parser-test $(BUILD_BASE)/spawn-fd-policy-test \
         $(BUILD_BASE)/serial-reply-test $(BUILD_BASE)/outcomes-test \
         $(BUILD_BASE)/sv39-lookup-test \
-        $(BUILD_BASE)/strftime-test \
-        $(BUILD_BASE)/sh-scan-test \
+        $(BUILD_BASE)/strftime-test $(BUILD_BASE)/sh-scan-test $(BUILD_BASE)/tz-test
         $(BUILD_BASE)/libc-algorithms-test
 
 # Each tool compiles and links its sources in one command, so -MMD cannot give a
@@ -118,6 +117,63 @@ $(BUILD_BASE)/strftime-test: $(STRFTIME_DEPS)
 	$(msg) HOSTCC $(notdir $@)
 	$(Q)$(HOST_CC) $(STRFTIME_FLAGS) $(HOST_CFLAGS) -o $@ \
 	    $(TEST_DIR)/test-strftime.c $(STRFTIME_SRCS)
+
+# libc localtime, mktime and the TZif reader against the host libc as reference
+# (Europe/Berlin over 10^5 times, plus fixture zone files). The time functions
+# are renamed, in one translation unit each, so the host copies are never
+# called; with AddressSanitizer a second build also traps stray accesses.
+TZ_DIR_SRC = ../../lib/libc/posix
+TZ_RENAME = -Dgmtime_r=rtmux_gmtime_r -Dgmtime=rtmux_gmtime \
+            -Dlocaltime_r=rtmux_localtime_r -Dlocaltime=rtmux_localtime \
+            -Dmktime=rtmux_mktime -Dtimegm=rtmux_timegm -Dtzset=rtmux_tzset \
+            -Dtzname=rtmux_tzname -Dtimezone=rtmux_timezone \
+            -Ddaylight=rtmux_daylight -Ddifftime=rtmux_difftime \
+            -Dasctime_r=rtmux_asctime_r -Dasctime=rtmux_asctime \
+            -Dctime_r=rtmux_ctime_r -Dctime=rtmux_ctime
+TZ_CFLAGS = -I../../lib/libc/internal -D__hidden= -DLIBC_HOST_TEST
+TZ_DEPS = $(TEST_DIR)/test-tz.c $(TZ_DIR_SRC)/localtime.c $(TZ_DIR_SRC)/tzfile.c \
+          $(TZ_DIR_SRC)/time-conv.c ../../lib/libc/internal/tzfile.h \
+          ../../lib/libc/internal/time-conv.h
+# $(1): sanitizer flags, $(2): output.
+define build-tz-test
+	$(Q)$(HOST_CC) $(TZ_CFLAGS) $(TZ_RENAME) $(HOST_CFLAGS) $(1) -c \
+	    $(TZ_DIR_SRC)/localtime.c -o $(2).localtime.o
+	$(Q)$(HOST_CC) $(TZ_CFLAGS) $(HOST_CFLAGS) $(1) -c \
+	    $(TZ_DIR_SRC)/tzfile.c -o $(2).tzfile.o
+	$(Q)$(HOST_CC) $(TZ_CFLAGS) $(HOST_CFLAGS) $(1) -c \
+	    $(TZ_DIR_SRC)/time-conv.c -o $(2).time-conv.o
+	$(Q)$(HOST_CC) $(HOST_CFLAGS) $(1) -o $(2) $(TEST_DIR)/test-tz.c \
+	    $(2).localtime.o $(2).tzfile.o $(2).time-conv.o
+	$(Q)rm -f $(2).localtime.o $(2).tzfile.o $(2).time-conv.o
+endef
+# The zone files the image ships, compiled once for the tests to read.
+TZ_ZONES = $(BUILD_BASE)/zoneinfo
+$(TZ_ZONES)/.stamp: ../../scripts/gen-zoneinfo.sh ../../scripts/zoneinfo-2025b.zi
+	@mkdir -p $(@D)
+	$(msg) ZONEINFO $(notdir $(TZ_ZONES))
+	$(Q)../../scripts/gen-zoneinfo.sh $(TZ_ZONES) && touch $@
+
+$(BUILD_BASE)/tz-test: $(TZ_DEPS)
+	@mkdir -p $(@D)
+	$(msg) HOSTCC $(notdir $@)
+	$(call build-tz-test,,$@)
+
+# Without sanitizer support the "binary" is a script that reports the skip.
+$(BUILD_BASE)/tz-asan-test: $(TZ_DEPS)
+	@mkdir -p $(@D)
+	$(msg) HOSTCC $(notdir $@)
+	$(Q)if echo 'int main(void){return 0;}' | \
+	    $(HOST_CC) $(SAN_FLAGS) -x c - -o $@.probe 2>/dev/null; then \
+	    rm -f $@.probe; $(MAKE) --no-print-directory tz-asan-real; \
+	else \
+	    rm -f $@.probe; \
+	    printf '#!/bin/sh\necho "tz-test: SKIP ASan (unsupported)"\n' > $@; \
+	    chmod +x $@; \
+	fi
+
+.PHONY: tz-asan-real
+tz-asan-real:
+	$(call build-tz-test,$(SAN_FLAGS),$(BUILD_BASE)/tz-asan-test)
 
 $(BUILD_BASE)/strftime-asan-test: $(STRFTIME_DEPS)
 	@mkdir -p $(@D)
@@ -244,7 +300,8 @@ host-tests: $(BUILD_BASE)/path-normalize-test $(BUILD_BASE)/cap-table-test \
             $(BUILD_BASE)/serial-reply-test $(BUILD_BASE)/outcomes-test \
             $(BUILD_BASE)/sv39-lookup-test \
             $(BUILD_BASE)/strftime-test $(BUILD_BASE)/strftime-asan-test \
-            $(BUILD_BASE)/sh-scan-test $(BUILD_BASE)/libc-algorithms-test
+            $(BUILD_BASE)/sh-scan-test $(BUILD_BASE)/libc-algorithms-test \
+            $(BUILD_BASE)/tz-test $(BUILD_BASE)/tz-asan-test $(TZ_ZONES)/.stamp
 	$(Q)$<
 	$(Q)$(BUILD_BASE)/cap-table-test
 	$(Q)$(BUILD_BASE)/bootstrap-manifest-test
@@ -260,9 +317,10 @@ host-tests: $(BUILD_BASE)/path-normalize-test $(BUILD_BASE)/cap-table-test \
 	$(Q)$(BUILD_BASE)/sv39-lookup-test
 	$(Q)$(BUILD_BASE)/strftime-test
 	$(Q)$(BUILD_BASE)/strftime-asan-test
-	$(Q)$(BUILD_BASE)/sh-scan-test
-	$(Q)if command -v dash >/dev/null; then \
-	    $(PYTHON) $(TEST_DIR)/gen-sh-quote-cases.py --check; fi
+	$(Q)$(BUILD_BASE)/sh-scan-test $(Q)if command -v dash >/dev/null; then \
+	    $(PYTHON) $(TEST_DIR)/gen-sh-quote-cases.py --check; fi \
+	    $(Q)RTMUX_TZDIR=$(abspath $(TZ_ZONES))/ $(BUILD_BASE)/tz-test \
+	    $(Q)RTMUX_TZDIR=$(abspath $(TZ_ZONES))/ $(BUILD_BASE)/tz-asan-test
 	$(Q)out=$$($(BUILD_BASE)/libc-algorithms-test) || { printf '%s\n' "$$out"; exit 1; }
 	$(Q)$(PYTHON) $(TEST_DIR)/test-capability-namespace-doc.py
 	$(Q)$(PYTHON) $(TEST_DIR)/test-management-ipc-lock.py

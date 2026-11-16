@@ -9,18 +9,30 @@
  * gmtime, localtime, mktime, timegm, tzset and the POSIX TZ rule parser.
  *
  * The zone lookup, mktime and timegm follow musl's __tz.c, mktime.c and
- * timegm.c. There is no tzdata, so only the POSIX TZ rule form is understood:
+ * timegm.c. TZ is read in two forms. The POSIX rule form needs no files:
  *
  *   std offset [dst [offset] [,rule,rule]]
+ *
+ * Any other value, or one that starts with a colon, names a zone file, read
+ * from /usr/share/zoneinfo (tzfile.c); see "Zone files" below.
  *
  * Bounds: a zone name is 3 to TZNAME_MAX bytes, alphabetic or <quoted> with
  * alphanumerics, '+' and '-'; an offset is [+-]hh[:mm[:ss]] with hh at most 24
  * and mm, ss at most 59; a rule is Jn (1-365), n (0-365) or Mm.w.d (1-12, 1-5,
  * 0-6), with an optional /time of [+-]hhh[:mm[:ss]], hhh at most 167. A DST
  * name without rules uses M3.2.0,M11.1.0. A TZ longer than TZ_STR_MAX bytes,
- * one that does not match the grammar in full, and one in the ":characters"
- * form all select UTC, as does an unset or empty TZ; tzname[0] and tzname[1]
- * are then "UTC".
+ * one that is neither a valid rule string nor the name of a readable zone file,
+ * and an unset or empty TZ all select UTC; tzname[0] and tzname[1] are then
+ * "UTC".
+ *
+ * Zone files: a TZif version 2+ file gives the local time type of each instant
+ * up to its last transition, and its POSIX footer rule gives every later one,
+ * through the same rule code as a TZ rule string. A name is relative to the
+ * zone directory and may not contain "." or ".." components. A file is read
+ * once, outside tz_lock, and kept for the life of the process, so tm_zone
+ * pointers stay valid; at most TZ_FILES_MAX distinct files are kept, and a TZ
+ * naming another selects UTC. A file that is missing when TZ is first seen is
+ * not looked for again until TZ changes.
  *
  * Thread safety: the parsed zone is shared state under tz_lock, a priority-
  * inheritance mutex, and every conversion reads TZ again, so a setenv takes
@@ -34,10 +46,6 @@
  * seen, a TZ with a new name selects UTC. tzname, timezone and daylight are
  * plain objects written under tz_lock; a reader racing a TZ change may see a
  * mix of the old and new zone.
- *
- * Conformance limit: there is no tzdata, so a geographic TZ such as
- * "America/New_York" (or ":America/New_York"), which POSIX.1-2024 asks an
- * implementation to support, selects UTC.
  *
  * Cost: a conversion computes the transitions of three rule years (so a rule
  * whose time crosses a year boundary is honoured) and never loops over years.
@@ -78,11 +86,19 @@
 #include <time.h>
 
 #include "time-conv.h"
+#include "tzfile.h"
 
-#define TZ_STR_MAX 128
+#define TZ_STR_MAX TZFILE_FOOTER_MAX /* a footer is a TZ string */
 
 /* Distinct zone names kept for the life of the process. */
 #define TZ_NAMES_MAX 32
+
+/* Distinct zone files kept for the life of the process, each about 3 KiB. */
+#define TZ_FILES_MAX 64
+
+#ifndef TZNAME_MAX
+#define TZNAME_MAX 255
+#endif
 
 /* Seconds of the mean Gregorian year, for a first guess at the year of t. */
 #define SECS_PER_MEAN_YEAR 31556952LL
@@ -96,14 +112,29 @@ struct tz_rule {
     long time;
 };
 
+struct tz_loaded;
+
 /* A parsed TZ. Offsets are seconds west of UTC, as in `timezone`. The names are
- * interned; dst_name equals std_name without DST.
+ * interned; dst_name equals std_name without DST. For a zone file, `loaded` is
+ * its data and the rest summarizes the footer, or the last types of the table;
+ * for a rule string it is NULL.
  */
 struct tz_zone {
     const char *std_name, *dst_name;
     long std_off, dst_off;
     int daylight;
     struct tz_rule start, end;
+    const struct tz_loaded *loaded;
+};
+
+/* A zone file kept for the life of the process, and its parsed footer. */
+struct tz_loaded {
+    char name[TZ_STR_MAX + 1];
+    const struct tzfile *file;
+    int has_footer;
+    struct tz_zone footer; /* the footer rule; names point at footer_std/dst */
+    char footer_std[TZNAME_MAX + 1], footer_dst[TZNAME_MAX + 1];
+    struct tz_zone zone; /* the summary tz_snapshot hands out */
 };
 
 char *tzname[2] = {(char *) "UTC", (char *) "UTC"};
@@ -117,8 +148,12 @@ static const struct tz_zone utc_zone = {.std_name = utc_name,
 /* Priority inheritance (PRIONONE clear, as for the malloc lock), so a preempted
  * low-priority holder cannot stall a high-priority conversion.
  */
+#ifdef RTMUX_SYNC_INITIALIZER
 static pthread_mutex_t tz_lock = {RTMUX_SYNC_NONRECURSIVE,
                                   RTMUX_SYNC_INITIALIZER};
+#else
+static pthread_mutex_t tz_lock = PTHREAD_MUTEX_INITIALIZER; /* host tests */
+#endif
 /* TZ as last parsed; the initial "" matches the initial UTC `zone`. */
 static char tz_cached[TZ_STR_MAX + 1];
 static struct tz_zone zone = {.std_name = utc_name, .dst_name = utc_name};
@@ -128,6 +163,12 @@ static struct tz_zone zone = {.std_name = utc_name, .dst_name = utc_name};
  */
 static char tz_names[TZ_NAMES_MAX][TZNAME_MAX + 1];
 static int tz_name_count;
+
+/* Zone files kept so far, newest last; an entry is complete before it is
+ * published, under tz_lock, and is never freed or changed.
+ */
+static struct tz_loaded *tz_files[TZ_FILES_MAX];
+static int tz_file_count;
 
 /* Parse up to `maxdig` digits, at least one, into *out. */
 static int get_num(const char **p, int maxdig, int *out)
@@ -294,14 +335,116 @@ static size_t tz_len(const char *s)
     return n;
 }
 
+/* The kept zone file named `name`, or NULL. Caller holds tz_lock. */
+static const struct tz_loaded *find_loaded(const char *name)
+{
+    for (int i = 0; i < tz_file_count; i++) {
+        if (!strcmp(tz_files[i]->name, name))
+            return tz_files[i];
+    }
+    return NULL;
+}
+
+/* Set the summary of *ld, and the footer's names, once its file and footer are
+ * in. The summary's names and offsets are the footer's or, without a footer,
+ * those of the last standard and DST types of the table.
+ */
+static void relink(struct tz_loaded *ld)
+{
+    struct tz_zone *z = &ld->zone;
+
+    *z = (struct tz_zone){.loaded = ld};
+    if (ld->has_footer) {
+        ld->footer.std_name = ld->footer_std;
+        ld->footer.dst_name =
+            ld->footer.daylight ? ld->footer_dst : ld->footer_std;
+        z->std_name = ld->footer.std_name;
+        z->dst_name = ld->footer.dst_name;
+        z->std_off = ld->footer.std_off;
+        z->dst_off = ld->footer.dst_off;
+        z->daylight = ld->footer.daylight;
+    } else {
+        struct tzfile_type std, dst;
+
+        __tzfile_last_types(ld->file, &std, &dst, &z->daylight);
+        z->std_name = std.name;
+        z->dst_name = dst.name;
+        z->std_off = -std.gmtoff;
+        z->dst_off = -dst.gmtoff;
+    }
+}
+
+/* Read the zone file `name` and parse its footer into a new *ld; NULL if it is
+ * missing, invalid, has an invalid footer, or memory is short.
+ */
+static struct tz_loaded *load_zone(const char *name)
+{
+    struct tz_loaded *ld = calloc(1, sizeof *ld);
+    const char *footer;
+
+    if (!ld)
+        return NULL;
+    ld->file = __tzfile_load(name);
+    if (!ld->file)
+        goto fail;
+    strcpy(ld->name, name);
+    footer = __tzfile_footer(ld->file);
+    if (*footer) {
+        if (parse_tz(footer, &ld->footer, ld->footer_std, ld->footer_dst))
+            goto fail;
+        ld->has_footer = 1;
+    }
+    relink(ld);
+    return ld;
+fail:
+    free((void *) ld->file);
+    free(ld);
+    return NULL;
+}
+
+/* The zone file TZ names (without a leading colon), kept on first use; NULL if
+ * there is none or no room for another. The scan under the lock is bounded by
+ * TZ_FILES_MAX; the read and parse run outside it. Threads that first see a
+ * name together each read it, and the extra copies are freed.
+ */
+static const struct tz_loaded *get_loaded(const char *name)
+{
+    struct tz_loaded *fresh;
+    const struct tz_loaded *ld;
+
+    if (!__tzfile_name_ok(name))
+        return NULL;
+    pthread_mutex_lock(&tz_lock);
+    ld = find_loaded(name);
+    pthread_mutex_unlock(&tz_lock);
+    if (ld || !(fresh = load_zone(name)))
+        return ld;
+
+    pthread_mutex_lock(&tz_lock);
+    ld = find_loaded(name);
+    if (!ld && tz_file_count < TZ_FILES_MAX) {
+        tz_files[tz_file_count++] = fresh;
+        ld = fresh;
+        fresh = NULL;
+    }
+    pthread_mutex_unlock(&tz_lock);
+    if (fresh) { /* lost a race, or no room */
+        free((void *) fresh->file);
+        free(fresh);
+    }
+    return ld;
+}
+
 /* Copy the zone that TZ names into *out. TZ is parsed, outside tz_lock, only
  * when it differs from the last one; the lock covers a bounded compare, the
- * interning and the copy.
+ * interning and the copy. A zone file is read the first time TZ names it, which
+ * tzset() does ahead of time for a program that must not do file I/O later.
  */
 static void tz_snapshot(struct tz_zone *out)
 {
     const char *s = getenv("TZ");
     char std[TZNAME_MAX + 1], dst[TZNAME_MAX + 1];
+    const struct tz_loaded *ld = NULL;
     struct tz_zone z;
     size_t len;
     int ok;
@@ -324,6 +467,10 @@ static void tz_snapshot(struct tz_zone *out)
     pthread_mutex_unlock(&tz_lock);
 
     ok = *s && *s != ':' && !parse_tz(s, &z, std, dst);
+    if (!ok && *s) {
+        /* Not a rule string: a zone file, with or without the colon. */
+        ld = get_loaded(s + (*s == ':'));
+    }
 
     pthread_mutex_lock(&tz_lock);
     if (ok) {
@@ -336,9 +483,10 @@ static void tz_snapshot(struct tz_zone *out)
     if (ok) {
         z.std_name = intern(std);
         z.dst_name = z.daylight ? intern(dst) : z.std_name;
+        z.loaded = NULL;
     }
     if (!ok)
-        z = utc_zone;
+        z = ld ? ld->zone : utc_zone;
     memcpy(tz_cached, s, len + 1);
     zone = z;
     tzname[0] = (char *) z.std_name;
@@ -454,23 +602,47 @@ static long zone_gmtoff(const struct tz_zone *z, int dst)
     return dst ? -z->dst_off : -z->std_off;
 }
 
-/* Fill *tm with UTC time t shown in zone z, standard or DST; NULL with
- * EOVERFLOW if the year does not fit.
+/* The local time type of rule zone z (a TZ rule string, or a footer) at UTC t.
+ */
+static void rule_info(const struct tz_zone *z,
+                      long long t,
+                      struct tzfile_type *i)
+{
+    i->dst = zone_is_dst(z, t, 0);
+    i->gmtoff = zone_gmtoff(z, i->dst);
+    i->name = i->dst ? z->dst_name : z->std_name;
+}
+
+/* The local time type of zone z at UTC time t. */
+static void zone_info(const struct tz_zone *z,
+                      long long t,
+                      struct tzfile_type *i)
+{
+    const struct tz_loaded *ld = z->loaded;
+
+    if (!ld) {
+        rule_info(z, t, i);
+    } else if (ld->has_footer && __tzfile_after_table(ld->file, t)) {
+        rule_info(&ld->footer, t, i);
+    } else {
+        __tzfile_type_at(ld->file, t, i);
+    }
+}
+
+/* Fill *tm with UTC time t shown with local time type *i; NULL with EOVERFLOW
+ * if the year does not fit.
  */
 static struct tm *fill_tm(long long t,
-                          const struct tz_zone *z,
-                          int dst,
+                          const struct tzfile_type *i,
                           struct tm *tm)
 {
-    long gmtoff = zone_gmtoff(z, dst);
-
-    if (__secs_to_tm(t + gmtoff, tm) < 0) {
+    if (__secs_to_tm(t + i->gmtoff, tm) < 0) {
         errno = EOVERFLOW;
         return NULL;
     }
-    tm->tm_isdst = dst;
-    tm->tm_gmtoff = gmtoff;
-    tm->tm_zone = dst ? z->dst_name : z->std_name;
+    tm->tm_isdst = i->dst;
+    tm->tm_gmtoff = i->gmtoff;
+    tm->tm_zone = i->name;
     return tm;
 }
 
@@ -478,7 +650,9 @@ static struct tm result;
 
 struct tm *gmtime_r(const time_t *tp, struct tm *tm)
 {
-    return fill_tm(*tp, &utc_zone, 0, tm);
+    static const struct tzfile_type utc = {0, 0, utc_name};
+
+    return fill_tm(*tp, &utc, tm);
 }
 
 struct tm *gmtime(const time_t *tp)
@@ -489,7 +663,7 @@ struct tm *gmtime(const time_t *tp)
 struct tm *localtime_r(const time_t *tp, struct tm *tm)
 {
     struct tz_zone z;
-    int dst;
+    struct tzfile_type info;
 
     /* The zone lookup computes the year of t, so reject a year that does not
      * fit before it.
@@ -499,8 +673,8 @@ struct tm *localtime_r(const time_t *tp, struct tm *tm)
         return NULL;
     }
     tz_snapshot(&z);
-    dst = zone_is_dst(&z, *tp, 0);
-    return fill_tm(*tp, &z, dst, tm);
+    zone_info(&z, *tp, &info);
+    return fill_tm(*tp, &info, tm);
 }
 
 struct tm *localtime(const time_t *tp)
@@ -508,23 +682,149 @@ struct tm *localtime(const time_t *tp)
     return localtime_r(tp, &result);
 }
 
+/* Largest offset a zone file may use, and the spacing of the instants sampled
+ * for the offsets in force near a wall time. A zone does not change offset
+ * twice within a spacing, and every offset in force within a day and a half of
+ * the wall time is seen.
+ */
+#define OFF_REACH UTOFF_MAX
+#define OFF_STEP 10800
+#define OFF_SAMPLES (2 * OFF_REACH / OFF_STEP + 2)
+
+/* Most table transitions within the window that are looked at; a zone file with
+ * more than this in 52 hours has the extra ones ignored here.
+ */
+#define OFF_TABLE 16
+
+/* Whether offset a, with mismatch ma (0 when consistent with the table), is a
+ * better reading of a wall time than b: a consistent one over one that is not,
+ * of two consistent ones the larger (the earlier instant), of two that are not
+ * the nearer to fitting and then the smaller.
+ */
+static int offset_better(const struct tzfile_type *a,
+                         long ma,
+                         const struct tzfile_type *b,
+                         long mb)
+{
+    if (!ma != !mb)
+        return !ma;
+    if (!ma)
+        return a->gmtoff > b->gmtoff;
+    return ma < mb || (ma == mb && a->gmtoff < b->gmtoff);
+}
+
+/* Append the local time type (gmtoff, dst, name) to cand[0..n) unless it is
+ * there already; the new count.
+ */
+static int add_cand(struct tzfile_type *cand,
+                    int n,
+                    const struct tzfile_type *t)
+{
+    for (int k = 0; k < n; k++) {
+        if (cand[k].gmtoff == t->gmtoff && cand[k].dst == t->dst)
+            return n;
+    }
+    cand[n] = *t;
+    return n + 1;
+}
+
+/* UTC seconds of local wall time `local` (counted as if UTC) in zone file z.
+ * The instant is `local` minus the offset in force at it, and that offset is
+ * one of those in force within OFF_REACH of `local`. Those are taken in time
+ * order, and the first that is consistent (the offset at the instant is itself)
+ * wins: in a fold, the earlier reading, which is the DST one for DST. In a gap
+ * none is consistent and the one nearest to it is taken, the earliest on a tie,
+ * which is the offset before the transition, as for rule zones. A tm_isdst of 0
+ * or 1 prefers a consistent offset of that kind, then any of it, including the
+ * zone's standard or DST offset when none of that kind is in force nearby.
+ */
+static long long file_local_to_utc(const struct tz_zone *z,
+                                   long long local,
+                                   int isdst)
+{
+    struct tzfile_type cand[OFF_SAMPLES + OFF_TABLE + 2], at;
+    struct tzfile_type tab[OFF_TABLE];
+    long mismatch[OFF_SAMPLES + OFF_TABLE + 2];
+    int n = 0, pick = -1;
+
+    for (long long t = local - OFF_REACH;; t += OFF_STEP) {
+        struct tzfile_type i;
+
+        if (t > local + OFF_REACH)
+            t = local + OFF_REACH;
+        zone_info(z, t, &i);
+        n = add_cand(cand, n, &i);
+        if (t == local + OFF_REACH)
+            break;
+    }
+
+    /* The samples can miss a type that is in force for a short while; the table
+     * names every one of them.
+     */
+    for (size_t j = 0,
+                nt = __tzfile_types_in(z->loaded->file, local - OFF_REACH,
+                                       local + OFF_REACH, tab, OFF_TABLE);
+         j < nt; j++)
+        n = add_cand(cand, n, &tab[j]);
+
+    /* An explicit tm_isdst selects an offset of that kind even where the zone
+     * has none in force nearby, as for a rule zone: offer the zone's own.
+     */
+    if (isdst >= 0) {
+        struct tzfile_type own = {-z->std_off, 0, z->std_name};
+
+        n = add_cand(cand, n, &own);
+        if (z->daylight) {
+            own = (struct tzfile_type){-z->dst_off, 1, z->dst_name};
+            n = add_cand(cand, n, &own);
+        }
+    }
+    for (int k = 0; k < n; k++) {
+        zone_info(z, local - cand[k].gmtoff, &at);
+        mismatch[k] = at.gmtoff > cand[k].gmtoff ? at.gmtoff - cand[k].gmtoff
+                                                 : cand[k].gmtoff - at.gmtoff;
+    }
+
+    /* Among the offsets that fit (consistent ones first), the largest, which is
+     * the earlier instant; among those that do not, the nearest to fitting and,
+     * on a tie, the smallest, which is the offset before a step forward.
+     * tm_isdst of 0 or 1 limits the choice to offsets of that kind if any.
+     */
+    for (int pass = isdst >= 0 ? 0 : 1; pass < 2 && pick < 0; pass++) {
+        for (int k = 0; k < n; k++) {
+            if (pass == 0 && (cand[k].dst > 0) != (isdst > 0))
+                continue;
+            if (pick < 0 || offset_better(&cand[k], mismatch[k], &cand[pick],
+                                          mismatch[pick]))
+                pick = k;
+        }
+    }
+    return local - cand[pick].gmtoff;
+}
+
 time_t mktime(struct tm *tm)
 {
     struct tm new;
     struct tz_zone z;
+    struct tzfile_type info;
     long long t = __tm_to_secs(tm);
-    int dst;
 
     /* One snapshot serves both lookups, even if TZ changes meanwhile. */
     tz_snapshot(&z);
-    /* An explicit tm_isdst selects that offset, even against the zone. */
-    if (tm->tm_isdst >= 0)
-        dst = tm->tm_isdst > 0;
-    else
-        dst = zone_is_dst(&z, t, 1);
-    t -= zone_gmtoff(&z, dst);
-    dst = zone_is_dst(&z, t, 0);
-    if (!fill_tm(t, &z, dst, &new))
+    if (z.loaded) {
+        t = file_local_to_utc(&z, t, tm->tm_isdst);
+    } else {
+        int dst;
+
+        /* An explicit tm_isdst selects that offset, even against the zone. */
+        if (tm->tm_isdst >= 0)
+            dst = tm->tm_isdst > 0;
+        else
+            dst = zone_is_dst(&z, t, 1);
+        t -= zone_gmtoff(&z, dst);
+    }
+    zone_info(&z, t, &info);
+    if (!fill_tm(t, &info, &new))
         return (time_t) -1;
     *tm = new;
     return (time_t) t;
@@ -532,10 +832,11 @@ time_t mktime(struct tm *tm)
 
 time_t timegm(struct tm *tm)
 {
+    static const struct tzfile_type utc = {0, 0, utc_name};
     struct tm new;
     long long t = __tm_to_secs(tm);
 
-    if (!fill_tm(t, &utc_zone, 0, &new))
+    if (!fill_tm(t, &utc, &new))
         return (time_t) -1;
     *tm = new;
     return (time_t) t;
