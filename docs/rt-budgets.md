@@ -694,14 +694,35 @@ count (the walk has to stay within SKIP_PARTS / 16 calls; a rescan per call
 would not). It also checks that a call without a cursor fails with E2BIG past
 the budget and still works within it.
 
-Not bounded by this: the pre-claim validation loops of `msg_readv` and
-`msg_writev` (kernel/ipc/message.c), which check the caller's own iovec entry
-by entry before the transfer. They hold no claim and no progress, they have no
-cap other than the XFER_IOV_LIMIT test xfermsg applies afterwards, and a
-restart from entry 0 after a preemption could starve behind a periodic
-higher-priority thread, so a plain KSYS_PREEMPT checkpoint does not fit. They
-stay `input_dependent` in the preemption inventory (review Q83), with the
-reason stating this; the transfer that follows them is already checkpointed.
+The pre-claim iov check of `msg_readv` and `msg_writev`
+(kernel/ipc/message.c) was the one loop this did not cover: it read the
+caller's own iovec entry by entry with plain loads, with no cap and no
+checkpoint. It is now `xfer_iov_check` (kernel/ipc/message.c). It examines at
+most XFER_IOV_CHECK_STEP (512) entries per kernel entry, through
+`xfer_memchk`, so an unmapped page of the array fails with EFAULT instead of
+faulting the kernel, and then restarts the call with KCALL_RESTART. The
+prefix already checked is kept on the thread (`iovchk_*`), keyed by the array
+and its length, so the restart resumes instead of rereading from entry 0 and a
+periodic higher-priority thread cannot starve it. The trap handler drops the
+saved prefix at the next kernel call that is not `msg_readv` or `msg_writev`,
+so a thread cannot edit entries it has already passed. The check holds no
+claim, so a restart has nothing to undo. An array longer than XFER_IOV_LIMIT
+fails with EFAULT before any entry is read. The loop is gone, so the
+inventory has no entry for it.
+
+Not bounded by this: the copy that follows the check. For a caller whose
+address space is the current one, `xfermsg` copies the whole vector in one
+`xferiov` pass, so a 65536-entry call still takes tens of ms on QEMU (the
+`readv-ns` and `writev-ns` figures of the iov-steps check). Bounding it needs
+a checkpoint inside the `xferiov` pass.
+
+ipc-roundtrip's iov-steps check covers the check on 65536 one-byte entries:
+the bytes arrive intact through `msg_readv` and `msg_writev`, a bad entry past
+the first step and an array whose tail page is unmapped fail with EFAULT, and
+a call over exactly one step whose last entry is bad (the longest kernel entry
+the check makes) has a p99 under 250 us. On one loaded boot that p99 was
+39 us (max 75 us) and the same failure at the end of the whole array took
+3.3 ms p99, which is 128 steps.
 
 Measured by ipc-roundtrip's readiov-large check (`scripts/qemu-regress.sh
 --mode ipc-roundtrip --timeout 600`). The rdtime span around each call bounds

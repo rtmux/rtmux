@@ -18,11 +18,13 @@
 #define RTMUX_DEVC_COMMON_SERIAL_SERVICE_H
 
 #include <errno.h>
+#include <limits.h>
 #include <stdint.h>
 #include <string.h>
 #include <time.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/poll.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/iomsg.h>
@@ -163,6 +165,7 @@ static void serial_termios_init(void)
     ser_termios.c_iflag = ICRNL | BRKINT;
     ser_termios.c_oflag = OPOST | ONLCR;
     ser_termios.c_cflag = CS8 | CREAD | HUPCL;
+    ser_termios.c_ispeed = ser_termios.c_ospeed = B38400;
     ser_termios.c_lflag = ECHO | ECHOE | ECHOK | ICANON | ISIG;
     ser_termios.c_cc[VEOF] = 0x04;
     ser_termios.c_cc[VEOL] = 0;
@@ -523,6 +526,14 @@ static int ser_devctl(ioserv_context_t *ctp, io_devctl_t *msg, void *ocb)
             (size_t) ctp->size < sizeof(*msg) + sizeof(struct termios))
             return EINVAL;
         memcpy(&ser_termios, data, sizeof(struct termios));
+
+        /* A zero output speed hangs the line up (tcsetattr, POSIX 11.2.5):
+         * every poller wakes to see POLLHUP, a hangup-only one included, and
+         * the line reports it until a speed is set again.
+         */
+        for (int i = 0; ser_termios.c_ospeed == B0 && i < IOSERV_NOTIFY_COUNT;
+             i++)
+            ioserv_notify_trigger(ser_notify_lists, INT_MAX, i);
         break;
     case DEVCTL_TTY_GET_PGRP:
         *(pid_t *) data = ser_pgrp;
@@ -620,6 +631,8 @@ static unsigned ser_ready(unsigned want)
 {
     unsigned sat = _NOTIFY_COND_OUTPUT;
 
+    if (ser_termios.c_ospeed == B0)
+        return 0; /* hung up: POLLHUP, never writable (POSIX 2.10.6) */
     if ((want & _NOTIFY_COND_INPUT) && cooked_rxbuf_peek() >= 0)
         sat |= _NOTIFY_COND_INPUT;
     return sat & want;
@@ -647,7 +660,7 @@ static int ser_notify(ioserv_context_t *ctp, io_notify_t *msg, void *ocb)
     (void) ocb;
     return ioserv_notify(ctp, msg, ser_notify_lists,
                          ser_ready(msg->i.flags & (unsigned) SER_NOTIFY_CONDS),
-                         0, NULL);
+                         ser_termios.c_ospeed == B0 ? POLLHUP : 0, NULL);
 }
 
 static int rx_notification_handler(message_context_t *ctp,

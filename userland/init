@@ -703,6 +703,8 @@ run_lkl_regress() {
         lkl-netd-revoke) run_lkl_selftest lkl-netd-revoke 'lkl_start_net_crash /net/ping && /bin/lkl-measure net-revoke 1 && /bin/lkl-gate' ;;
         lkl-netd-restart) run_lkl_selftest lkl-netd-restart '/bin/lkl-supervisor /net/ipifc 1 /net/ping /sbin/lkl-netd --serve-net-crash-on-ping' ;;
         lkl-netd-stale) run_lkl_selftest lkl-netd-stale 'lkl_start_net_crash /net/dns && /bin/lkl-stale-handle-test' ;;
+        lkl-netd-poll) run_lkl_selftest lkl-netd-poll 'lkl_start_net && /bin/lkl-netd-poll-test' ;;
+        lkl-netd-poll-spent) export LKL_NETD_NOTIFY_RETRIES=0; run_lkl_selftest lkl-netd-poll-spent 'lkl_start_net && /bin/lkl-netd-poll-test' ;;
         lkl-multi) run_lkl_selftest lkl-multi 'lkl_start_pipe && lkl_start_net && lkl_start_fsd && /bin/ls /fs/root && /bin/cat /fs/root/hello.txt && /bin/verify-lkl-net --helpers && /bin/cat /net/stats && /bin/lkl-multi-test && /bin/cat /stats' ;;
         lkl-multi-crash) run_lkl_selftest lkl-multi-crash 'lkl_start_pipe && lkl_start_net_crash /net/ping && lkl_start_fsd && /bin/cat /fs/root/hello.txt && /bin/lkl-measure net-revoke 1 && /bin/cat /fs/root/hello.txt && /bin/lkl-gate /net /net/ping /net/stats /net/tcp/clone /net/udp/clone /net/dns' ;;
         lkl-multi-stress) run_lkl_selftest lkl-multi-stress 'lkl_start_pipe && lkl_start_net && lkl_start_fsd && /bin/lkl-multi-test 10 && /bin/timer-jitter 20 60' ;;

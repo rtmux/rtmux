@@ -199,6 +199,9 @@ void init_objects()
     legal_cpu_bitmask =
         num_processors >= 64 ? ~(uint64_t) 0 : (1ULL << num_processors) - 1;
 
+    /* Only the boot CPU is running; an AP joins in cpu_idle(). */
+    online_cpu_mask = 1ULL << boot_cpunum;
+
     /* Create idle threads — one per logical CPU. Every per-CPU array
      * (actives[], ksys_stack[], cpupageptr[], ...) is indexed by logical CPU;
      * hart_ids[cpu] gives the hart ID SBI needs.

@@ -7,7 +7,9 @@
 
 #include "externs.h"
 #include <fcntl.h>
+#include <limits.h>
 #include <stdalign.h>
+#include <sys/poll.h>
 #include <termios.h>
 #include <devctl/common.h>
 #include <devctl/tty.h>
@@ -428,7 +430,9 @@ static int text_devctl(ioserv_context_t *ctp, io_devctl_t *msg, void *ocb)
         break;
 
     case DEVCTL_TTY_GET_ATTR:
+        text_lock(&text_mutex);
         memcpy(data, &text_termios, sizeof(struct termios));
+        pthread_mutex_unlock(&text_mutex);
         nbytes = sizeof(struct termios);
         break;
 
@@ -437,7 +441,17 @@ static int text_devctl(ioserv_context_t *ctp, io_devctl_t *msg, void *ocb)
     case DEVCTL_TTY_SET_ATTR_FLUSH:
         if (msg->i.nbytes < (int32_t) sizeof(struct termios))
             return EINVAL;
+        text_lock(&text_mutex);
         memcpy(&text_termios, data, sizeof(struct termios));
+
+        /* A zero output speed hangs the line up: every poller wakes to see
+         * POLLHUP, a hangup-only one included, and the console reports it until
+         * a speed is set again.
+         */
+        for (int i = 0; text_termios.c_ospeed == B0 && i < IOSERV_NOTIFY_COUNT;
+             i++)
+            ioserv_notify_trigger(text_notify_lists, INT_MAX, i);
+        pthread_mutex_unlock(&text_mutex);
         break;
 
     case DEVCTL_TTY_GET_PGRP:
@@ -559,9 +573,12 @@ static int text_notify(ioserv_context_t *ctp, io_notify_t *msg, void *ocb)
         text_ahead_head == text_ahead_tail)
         (void) text_next(1);
     text_lock(&text_mutex);
-    if (text_ahead_head != text_ahead_tail)
+    if (text_termios.c_ospeed == B0) /* hung up: POLLHUP, never writable */
+        trig = 0;
+    else if (text_ahead_head != text_ahead_tail)
         trig |= _NOTIFY_COND_INPUT;
-    ret = ioserv_notify(ctp, msg, text_notify_lists, trig, 0, NULL);
+    ret = ioserv_notify(ctp, msg, text_notify_lists, trig,
+                        text_termios.c_ospeed == B0 ? POLLHUP : 0, NULL);
     if (ret == EAGAIN)
         pthread_cond_signal(&text_watch_cond);
     pthread_mutex_unlock(&text_mutex);
@@ -659,6 +676,7 @@ void devtext_init(void)
     text_termios.c_iflag = ICRNL | BRKINT;
     text_termios.c_oflag = OPOST | ONLCR;
     text_termios.c_cflag = CS8 | CREAD | HUPCL;
+    text_termios.c_ispeed = text_termios.c_ospeed = B38400;
     text_termios.c_lflag = ECHO | ECHOE | ECHOK | ICANON | ISIG;
     text_termios.c_cc[VEOF] = 0x04; /* ^D */
     text_termios.c_cc[VEOL] = 0;

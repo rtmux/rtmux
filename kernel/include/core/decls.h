@@ -337,6 +337,7 @@ extern uint32_t smp_slot[];
 extern uint64_t smp_start_tick[];
 #ifdef CONFIG_DEBUG_INJECT
 bool smp_inject(unsigned cpu, const char *opt);
+void smp_inject_ap_crash(unsigned cpu);
 #endif
 void plic_init(void);
 void plic_inithart(void);

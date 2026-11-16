@@ -145,6 +145,8 @@ void startup_entry(void)
      */
     write_syspage_memory();
 
+    boot_layout_check();
+
     /* Switch from PA to high VA. After this call, PC, sp, and ra are all in the
      * upper canonical half (KERNEL_VIRT_BASE + PA). Identity mapping is still
      * active, so _syspage_ptr (a PA) remains valid.

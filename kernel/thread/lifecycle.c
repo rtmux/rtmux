@@ -61,6 +61,7 @@ static void thread_recycle_reset(thread_t *thp)
     thp->robust_spare = NULL;
     thp->robust_nheld = 0;
     thp->restart = NULL;
+    thp->iovchk_iov = NULL;
     memset(&thp->args.wa, 0, sizeof(thp->args.wa));
     thp->runmask = 0;
     thp->default_runmask = 0;
@@ -596,16 +597,16 @@ static void thread_destroy_wait_inactive(thread_t *thp, process_t *prp)
         unsigned depth = 0;
 
         for (hi = 0; hi < num_processors; hi++) {
-            unsigned hart = hi;
+            unsigned cpu = hi;
             thread_t *cur;
 
-            if (hart == self)
+            if (cpu == self || !cpu_online(cpu))
                 continue;
-            cur = __atomic_load_n(&pcpu_array[hart].pc_curthread,
+            cur = __atomic_load_n(&pcpu_array[cpu].pc_curthread,
                                   __ATOMIC_ACQUIRE);
             if (cur == thp) {
-                active_hart = (int) hart;
-                depth = __atomic_load_n(&in_kcall[hart], __ATOMIC_ACQUIRE);
+                active_hart = (int) cpu;
+                depth = __atomic_load_n(&in_kcall[cpu], __ATOMIC_ACQUIRE);
                 break;
             }
         }
@@ -654,13 +655,14 @@ static void thread_soul_free(process_t *prp, thread_t *thp)
  */
 int thread_active_hart(thread_t *thp)
 {
-    for (unsigned hi = 0; hi < num_processors; hi++) {
-        unsigned hart = hi;
+    for (unsigned cpu = 0; cpu < num_processors; cpu++) {
         thread_t *cur;
 
-        cur = __atomic_load_n(&pcpu_array[hart].pc_curthread, __ATOMIC_ACQUIRE);
+        if (!cpu_online(cpu))
+            continue;
+        cur = __atomic_load_n(&pcpu_array[cpu].pc_curthread, __ATOMIC_ACQUIRE);
         if (cur == thp)
-            return (int) hart;
+            return (int) cpu;
     }
     return -1;
 }
@@ -1382,8 +1384,11 @@ int rdecl thread_create(thread_t *act,
  */
 void fpu_drop_claims(thread_t *thp)
 {
-    for (unsigned c = 0; c < CONFIG_PROCESSORS_MAX; c++) {
+    for (unsigned c = 0; c < num_processors; c++) {
         struct thread_entry *me = thp;
+
+        if (!cpu_online(c))
+            continue;
 
         __atomic_compare_exchange_n(&pcpu_array[c].pc_active_fpu, &me, NULL, 0,
                                     __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);

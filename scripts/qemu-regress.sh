@@ -44,6 +44,7 @@ http_pid=
 udp_pid=
 dns_pid=
 payload_pid=
+poll_pid=
 LAST_LOG=
 IOMMU_METADATA_DTB=
 IOMMU_METADATA_DTS=
@@ -58,7 +59,7 @@ FDT_CPU_BASE_OPTS=
 cleanup()
 {
     kill "${http_pid:-}" "${udp_pid:-}" "${dns_pid:-}" "${payload_pid:-}" \
-        2>/dev/null || true
+        "${poll_pid:-}" 2>/dev/null || true
     rm -f "${IOMMU_METADATA_DTB:-}" "${IOMMU_METADATA_DTS:-}" \
         "${IOMMU_METADATA_ERR:-}" "${FDT_CPU_DTB:-}" "${FDT_CPU_DTS:-}" \
         "${FDT_RESV_DTB:-}" "${FDT_RESV_DTS:-}"
@@ -543,7 +544,10 @@ Options:
                     host-authored ext4 with hardlinks/sparse/big dir),
                     lkl-netd-crash, lkl-netd-direct-denied, lkl-netd-http,
                     lkl-netd-http-split, lkl-netd-http-isolated, lkl-netd-revoke,
-                    lkl-netd-stale,
+                    lkl-netd-stale, lkl-netd-poll (poll() on lkl-netd data
+                    sockets, against a host peer on 127.0.0.1:8004-8008),
+                    lkl-netd-poll-spent (the same with no notify retries
+                    left, so every arm takes the last-attempt path),
                     lkl-multi (boots lkl-fsd and lkl-netd together and
                     exercises both domains concurrently), or lkl-multi-crash
                     (crashes lkl-netd mid-workload and checks lkl-fsd survives),
@@ -1039,12 +1043,26 @@ check_smp_bringup()
 {
     local log="$1"
 
+    # Nothing may send an IPI to a CPU that was dropped at bring-up: send_ipi
+    # refuses one and reports it, so the line must not appear.
+    if grep -aq 'send_ipi: cpu [0-9]* was dropped at bring-up' "$log"; then
+        echo "  FAIL     ${MODE}: an IPI was sent to a dropped CPU"
+        grep -a 'send_ipi: cpu' "$log"
+        return 1
+    fi
+
     case "$MODE" in
     smp-hart-start-fail)
         require_log_patterns "$log" "injected start failure" \
             'cpu_start_others: hart [0-9]+ \(cpu 3\) failed' \
             'smp: hart [0-9]+ \(cpu 3\) did not start, dropped' \
             'smp: 3 harts online[[:space:]]*$' || return 1
+        ;;
+    smp-ap-crash-early)
+        require_log_patterns "$log" "crash before join" \
+            'cpu_start_others: hart [0-9]+ \(cpu 3\) failed' \
+            'injected crash on cpu 2 before it joined' \
+            'crash rendezvous: 3 arrived, 3 expected' || return 1
         ;;
     smp-hart-start-late)
         require_log_patterns "$log" "late hart" \
@@ -1124,9 +1142,10 @@ setup_fdt_cpu_status_or_skip()
 }
 
 # patch_fdt_resv_dts IN OUT: add a /memreserve/ entry and a /reserved-memory
-# node holding a no-map child with two reg pairs, a plain child and a reusable
-# child. Properties must precede subnodes, so the node goes in before the
-# root's first child.
+# node holding a no-map child with two reg pairs, a plain child, a reusable
+# child and 32 more plain children, and pad the root with 64 KiB of cells.
+# Properties must precede subnodes, so the node goes in before the root's
+# first child.
 patch_fdt_resv_dts()
 {
     awk '
@@ -1134,6 +1153,13 @@ patch_fdt_resv_dts()
             print; print "/memreserve/ 0x8c400000 0x10000;"; hdr = 1; next
         }
         /^\t[^\t].*\{$/ && !root {
+            # A large property on the root: the FDT grows by 64 KiB, so the
+            # startup path parses a bigger tree and the printed stack
+            # watermark covers it.
+            printf "\trtmux-fdt-pad = <"
+            for (i = 0; i < 16384; i++)
+                printf "0x0%s", (i < 16383 ? " " : "")
+            print ">;"
             print "\treserved-memory {"
             print "\t\t#address-cells = <0x02>;"
             print "\t\t#size-cells = <0x02>;"
@@ -1149,6 +1175,12 @@ patch_fdt_resv_dts()
             print "\t\t\treg = <0x00 0x8c300000 0x00 0x10000>;"
             print "\t\t\treusable;"
             print "\t\t};"
+            for (i = 0; i < 32; i++) {
+                a = 2354053120 + i * 131072
+                printf "\t\trtmux-resv-extra%d@%x {\n", i, a
+                printf "\t\t\treg = <0x00 0x%x 0x00 0x10000>;\n", a
+                print "\t\t};"
+            }
             print "\t};"
             print; root = 1; next
         }
@@ -1176,6 +1208,8 @@ setup_fdt_resv_or_skip()
 # before it prints "unmapped").
 check_fdt_resv()
 {
+    local line top ws used size
+
     require_log_patterns "$1" "reserved-memory fixture" \
         'fdt: reserved mmode_resv0@8c000000 \[8c000000\.\.8c010000\) no-map' \
         'fdt: reserved mmode_resv0@8c000000 \[8c100000\.\.8c110000\) no-map' \
@@ -1184,7 +1218,20 @@ check_fdt_resv()
         'fdt: reserved /memreserve/ \[8c400000\.\.8c410000\)[[:space:]]*$' \
         'unmapped no-map \[8c000000\.\.8c010000\)' \
         'unmapped no-map \[8c100000\.\.8c110000\)' \
-        '^  PASS  fdt-reserved-memory outside[[:space:]]*$'
+        'fdt: reserved rtmux-resv-extra31@8c8e0000 ' \
+        'boot: stack \[[0-9a-f]+\.\.[0-9a-f]+\) used [0-9]+ of [0-9]+ bytes, workspace \[[0-9a-f]+\.\.[0-9a-f]+\) disjoint' \
+        '^  PASS  fdt-reserved-memory outside[[:space:]]*$' || return 1
+    # The workspace must start at or above the stack top, and the stack must
+    # not have used more than its size.
+    line="$(grep -a 'boot: stack ' "$1" | head -n 1)"
+    top="$(sed -E 's/.*stack \[[0-9a-f]+\.\.([0-9a-f]+)\).*/\1/' <<<"$line")"
+    ws="$(sed -E 's/.*workspace \[([0-9a-f]+)\.\..*/\1/' <<<"$line")"
+    used="$(sed -E 's/.*used ([0-9]+) of ([0-9]+) bytes.*/\1/' <<<"$line")"
+    size="$(sed -E 's/.*used ([0-9]+) of ([0-9]+) bytes.*/\2/' <<<"$line")"
+    if [ $((16#$ws)) -lt $((16#$top)) ] || [ "$used" -gt "$size" ]; then
+        echo "  FAIL     ${MODE}: boot stack and workspace overlap: $line"
+        return 1
+    fi
 }
 
 # check_fdt_cpu_status LOG PLACEMENT: OpenSBI picks the boot hart by lottery, so
@@ -1249,6 +1296,17 @@ mode_needs_net_helpers()
         lkl-multi|tracelogger-lkl-netd|tracelogger-lkl-netd-default)
             return 0
             ;;
+    esac
+    return 1
+}
+
+# lkl-netd-poll polls sockets against a peer whose behaviour the test picks by
+# port, so it needs the poll peer below rather than the HTTP, UDP and DNS
+# helpers.
+mode_needs_poll_helper()
+{
+    case "$MODE" in
+        lkl-netd-poll|lkl-netd-poll-spent) return 0 ;;
     esac
     return 1
 }
@@ -1623,6 +1681,20 @@ case "$MODE" in
         CPUS=4
         export CPUS
         ;;
+    smp-ap-crash-early)
+
+        # K32: the last of 4 harts fails to start and cpu 2 crashes after it
+        # committed to joining but before it is online, with cpu 1 online. The
+        # crash dump must complete, and its rendezvous must have waited for
+        # the exact set: cpu 0, cpu 1 and the crashing cpu 2.
+        BEGIN_MARKER='Boot command line:'
+        PASS_MARKER='=== END CRASH DUMP ==='
+        FAIL_MARKER='*** /usr unavailable'
+        MODE_ARG="rtmux.inject=hart-start-fail rtmux.inject=ap-crash-early"
+        NEEDS_DEBUG_INJECT=1
+        CPUS=4
+        export CPUS
+        ;;
     smp-sparse-harts|smp-too-many-harts)
 
         # K3: 10 harts against PROCESSORS_MAX=8. sparse-harts disables cpu@1..8
@@ -1737,7 +1809,7 @@ case "$MODE" in
         NEEDS_LKL_SERVERS=1
         [ "$TIMEOUT_SET" -eq 0 ] && TIMEOUT=60
         ;;
-    lkl-fsd-crash|lkl-fsd-tree|lkl-fsd-tree-split|lkl-fsd-tree-isolated|lkl-fsd-tricky|lkl-fsd-restart|lkl-netd-crash|lkl-netd-direct-denied|lkl-netd-http|lkl-netd-http-split|lkl-netd-http-isolated|lkl-netd-revoke|lkl-netd-restart|lkl-netd-stale|lkl-multi|lkl-multi-crash|lkl-multi-stress)
+    lkl-fsd-crash|lkl-fsd-tree|lkl-fsd-tree-split|lkl-fsd-tree-isolated|lkl-fsd-tricky|lkl-fsd-restart|lkl-netd-crash|lkl-netd-direct-denied|lkl-netd-http|lkl-netd-http-split|lkl-netd-http-isolated|lkl-netd-revoke|lkl-netd-restart|lkl-netd-stale|lkl-netd-poll|lkl-netd-poll-spent|lkl-multi|lkl-multi-crash|lkl-multi-stress)
         BEGIN_MARKER="RTMux ${MODE}: BEGIN"
         PASS_MARKER="RTMux ${MODE}: PASS"
         FAIL_MARKER="RTMux ${MODE}: FAIL"
@@ -1852,6 +1924,11 @@ if [ "$MODE" = "lkl-fsd-crash" ] || [ "$MODE" = "lkl-netd-crash" ] ||
    [ "$MODE" = "lkl-netd-restart" ] || [ "$MODE" = "lkl-netd-stale" ] ||
    [ "$MODE" = "lkl-fsd-restart" ]; then
     BAD_RE='FATAL|CRASH|Kernel panic|panic:|lkl-host: panic|FREED-ACTIVE|__kernel_restore bad ptr|/usr unavailable|Undefined symbol|No such file or directory|Bad file descriptor'
+fi
+
+# smp-ap-crash-early crashes on purpose and checks the dump itself.
+if [ "$MODE" = "smp-ap-crash-early" ]; then
+    BAD_RE='FATAL|Kernel panic|panic:|FREED-ACTIVE|__kernel_restore bad ptr|/usr unavailable|Undefined symbol'
 fi
 
 # spawn-storm --procs measures teardown cost, which only an instrumented kernel
@@ -2727,7 +2804,7 @@ run_one()
     fi
 
     case "$MODE" in
-    smp-hart-start-fail|smp-hart-start-late|smp-sparse-harts|smp-too-many-harts)
+    smp-hart-start-fail|smp-hart-start-late|smp-ap-crash-early|smp-sparse-harts|smp-too-many-harts)
         check_smp_bringup "$log" || return 1
         ;;
     esac
@@ -2983,6 +3060,69 @@ PY
     if ! kill -0 "$payload_pid" 2>/dev/null; then
         echo "qemu-regress: failed to start payload helper on 127.0.0.1:8003" >&2
         cat /tmp/rtmux-lkl-payload.log >&2
+        exit 1
+    fi
+fi
+
+# The poll peer of lkl-netd-poll: a TCP server per behaviour (see
+# tests/userland/rt-latency/lkl-netd-poll-test.c). 8004 is idle, 8005 sends
+# "hello" a second after accept, 8006 resets after a second, 8007 closes after
+# a second, 8008 sends "hello" after two seconds.
+if mode_needs_poll_helper; then
+    python3 - <<'PY' >/tmp/rtmux-lkl-poll.log 2>&1 &
+import socket
+import struct
+import threading
+import time
+
+def peer(conn, delay, action):
+    try:
+        time.sleep(delay)
+        if action == "send":
+            conn.sendall(b"hello")
+        elif action == "reset":
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                            struct.pack("ii", 1, 0))
+            conn.close()
+            return
+        elif action == "fin":
+            conn.close()
+            return
+        conn.settimeout(60)
+        while conn.recv(4096):
+            pass
+    except OSError:
+        pass
+    finally:
+        conn.close()
+
+def listener(port):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("127.0.0.1", port))
+    s.listen(64)
+    return s
+
+def serve(s, delay, action):
+    while True:
+        conn, _ = s.accept()
+        threading.Thread(target=peer, args=(conn, delay, action),
+                         daemon=True).start()
+
+# Bind every port here, so that one already taken ends the helper at once.
+for port, delay, action in ((8004, 0, "idle"), (8005, 1, "send"),
+                            (8006, 1, "reset"), (8007, 1, "fin"),
+                            (8008, 2, "send")):
+    threading.Thread(target=serve, args=(listener(port), delay, action),
+                     daemon=True).start()
+while True:
+    time.sleep(3600)
+PY
+    poll_pid=$!
+    sleep 1
+    if ! kill -0 "$poll_pid" 2>/dev/null; then
+        echo "qemu-regress: failed to start poll helper on 127.0.0.1:8004-8008" >&2
+        cat /tmp/rtmux-lkl-poll.log >&2
         exit 1
     fi
 fi

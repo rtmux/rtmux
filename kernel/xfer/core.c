@@ -10,9 +10,6 @@
 #include <core/globals.h>
 
 #define XFER_IOV_NUM 32 /* Number of iov's to copy at a time */
-#define XFER_IOV_LIMIT \
-    ((4 * 1024 * 1024) / 8) /* Maximum number of iov allowed */
-
 #define XFER_PREEMPT(act)    \
     if (NEED_PREEMPT(act)) { \
         xfer_preempt(act);   \

@@ -1124,6 +1124,9 @@ void kext_process_shutdown(void *data)
                     unsigned i = (unsigned) _hi;
                     process_t *prp0;
 
+                    if (!cpu_online(i))
+                        continue;
+
                     /* On RISC-V 64-bit, pointer loads are atomic. */
                     prp0 = *((process_t *volatile *) &pcpu_array[i].pc_as_prp);
                     if (prp != prp0)

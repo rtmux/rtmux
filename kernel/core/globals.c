@@ -236,6 +236,8 @@ void nonpreempt_report(void)
      */
     if (!warmed) {
         warmed = 1;
+
+        /* Zeroes every slot of the statistics arrays; it visits no CPU. */
         for (cpu = 0; cpu < CONFIG_PROCESSORS_MAX; cpu++) {
             unsigned i;
 

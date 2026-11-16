@@ -116,6 +116,13 @@ int ioserv_notify(ioserv_context_t *ctp,
     ext = flags & (unsigned) _NOTIFY_COND_EXTEN;
     flags &= ~(unsigned) _NOTIFY_COND_EXTEN;
 
+    /* No condition: hangup and error alone, which the service reports whatever
+     * is asked for. Arm, poll and disarm it on the list of its own, so that the
+     * wait ends when the peer goes and a data or room event does not wake it.
+     */
+    if (!((flags | flags >> 28) & ((1u << IOSERV_NOTIFY_COUNT) - 1u)))
+        flags |= (unsigned) _NOTIFY_COND_OBAND;
+
     if (action != _NOTIFY_ACTION_TRANARM) {
         trig &= flags;
     } else {
@@ -135,7 +142,11 @@ int ioserv_notify(ioserv_context_t *ctp,
         if (!(flags & 1u))
             continue;
         pp = notify_find(ctp, &nop[i]);
-        if (trig == 0 && action != _NOTIFY_ACTION_POLL &&
+
+        /* A hangup already known is the reply: the client is not left waiting,
+         * so nothing is armed for it.
+         */
+        if (trig == 0 && hup == 0 && action != _NOTIFY_ACTION_POLL &&
             SIGEV_GET_TYPE(&msg->i.event) != SIGEV_NONE) {
             if (!(event = *pp)) {
                 if (!(event = malloc(sizeof *event)))

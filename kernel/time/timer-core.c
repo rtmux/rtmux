@@ -319,8 +319,8 @@ static void timer_fire_deferred_flush(void)
         unsigned i;
 
         MEM_BARRIER_RW();
-        for (i = 0; i < CONFIG_PROCESSORS_MAX; i++) {
-            if (timer_fire_deferred_n[i]) {
+        for (i = 0; i < num_processors; i++) {
+            if (cpu_online(i) && timer_fire_deferred_n[i]) {
                 pending = true;
                 break;
             }

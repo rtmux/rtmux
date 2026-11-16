@@ -184,10 +184,14 @@ thread_t *idle_pick_thread(unsigned cpu)
      * no nested holds).
      */
     for (int outer = 0; outer < (int) num_processors; outer++) {
-        unsigned src_hart = (unsigned) outer;
-        if (src_hart == cpu)
+        unsigned src_cpu = (unsigned) outer;
+
+        /* Not cpu_online(): see the balance loop in kernel/sched/dispatch.c, a
+         * dropped CPU's queue is drained from here.
+         */
+        if (src_cpu == cpu)
             continue;
-        dpp = pcpu_array[src_hart].pc_dispatch;
+        dpp = pcpu_array[src_cpu].pc_dispatch;
         if (!dpp)
             continue;
         SCHED_LOCK(dpp);
@@ -239,6 +243,7 @@ void idle(void)
     unsigned cpu;
 
     cpu = get_cpunum();
+    __atomic_or_fetch(&online_cpu_mask, 1ULL << cpu, __ATOMIC_RELEASE);
     __atomic_store_n(&pcpu_array[cpu].pc_alive, true, __ATOMIC_RELEASE);
 
     start_kernel_threads(NULL);

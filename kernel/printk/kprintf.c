@@ -96,7 +96,18 @@ static char crash_buf[CONFIG_PROCESSORS_MAX][CRASH_BUF_SIZE]
     __attribute__((aligned(4096)));
 static unsigned crash_buf_used[CONFIG_PROCESSORS_MAX];
 static unsigned char crash_mode_active[CONFIG_PROCESSORS_MAX];
-static atomic_uint crash_arrived;
+/* The CPUs that have joined the rendezvous. */
+static _Atomic uint64_t crash_arrived_mask;
+
+/* The CPUs that were online when the first CPU began crash handling, and so the
+ * ones that get IPI_CRASH; 0 until then.
+ */
+static _Atomic uint64_t crash_online_at_entry;
+
+/* The CPUs that have entered crash handling; the rendezvous waits for these
+ * too. A mask, so the wait loop reads one word instead of every CPU's flag.
+ */
+static _Atomic uint64_t crash_entered_mask;
 static atomic_uint crash_printer_picked;
 
 static inline void kprintf_lock(void)
@@ -870,6 +881,16 @@ int ksnprintf(char *buffer, size_t len, const char *fmt, ...)
 }
 
 
+/* crash_mark_entered — set this CPU's crash mode flag and record it in
+ * crash_entered_mask, before it signals a sibling or joins the rendezvous.
+ */
+static void crash_mark_entered(unsigned cpu)
+{
+    __atomic_store_n(&crash_mode_active[cpu], 1, __ATOMIC_RELEASE);
+    atomic_fetch_or_explicit(&crash_entered_mask, 1ULL << cpu,
+                             memory_order_release);
+}
+
 /* crash_enter_self — set THIS CPU's crash-mode flag and broadcast IPI_CRASH to
  * every sibling. Internal helper used by both crash_recursive_check
  * (no-recursive path) and kprintf_crash_mode_on (entry from crash_halt).
@@ -886,7 +907,17 @@ static void crash_enter_self(void)
     if (crash_mode_active[me])
         return;
 
-    crash_mode_active[me] = 1;
+    crash_mark_entered(me);
+
+    /* The first CPU in fixes the set of CPUs the rendezvous is for; a later one
+     * signals that same set.
+     */
+    uint64_t set = 0, mine = cpu_online_snapshot() | (1ULL << me);
+
+    if (atomic_compare_exchange_strong_explicit(&crash_online_at_entry, &set,
+                                                mine, memory_order_acq_rel,
+                                                memory_order_acquire))
+        set = mine;
 
     /* Broadcast quiesce IPI to every sibling. Each peer's IPI handler calls
      * crash_quiesce_self(), which appends a brief snapshot to its own per-CPU
@@ -894,7 +925,7 @@ static void crash_enter_self(void)
      * buffer in CPU-id order.
      */
     for (unsigned cpu = 0; cpu < num_processors; cpu++) {
-        if (cpu != me)
+        if (cpu != me && cpu_in_mask(set, cpu))
             send_ipi(cpu, IPI_CRASH);
     }
 }
@@ -970,7 +1001,7 @@ void crash_quiesce_self(void)
         crash_rendezvous();
         /* NOTREACHED */
     }
-    crash_mode_active[cpu] = 1;
+    crash_mark_entered(cpu);
 
     /* Brief identity snapshot. sepc CSR still holds the PC at IPI entry — we
      * haven't touched it. The active thread, if any, was the dispatched thread
@@ -995,12 +1026,46 @@ void crash_quiesce_self(void)
     /* NOTREACHED */
 }
 
+/* The CPUs the rendezvous waits for: those online when the first CPU began
+ * crash handling (the ones sent IPI_CRASH) plus every CPU that has entered
+ * crash handling. The two sets differ: a CPU that crashes before it joins was
+ * never online, and one that joins after the first crash is never signalled and
+ * not waited for. Each CPU records itself in crash_entered_mask before it
+ * signals a sibling or joins, so a waiter sees every CPU that can arrive.
+ */
+static uint64_t crash_participants(void)
+{
+    return atomic_load_explicit(&crash_online_at_entry, memory_order_acquire) |
+           atomic_load_explicit(&crash_entered_mask, memory_order_acquire);
+}
+
+/* How many CPUs a crash mask names (the footer prints counts; the wait loop
+ * compares masks).
+ */
+static unsigned crash_mask_count(uint64_t mask)
+{
+    unsigned n = 0;
+
+    for (unsigned cpu = 0; cpu < num_processors; cpu++)
+        n += cpu_in_mask(mask, cpu) ? 1u : 0u;
+    return n;
+}
+
+/* Write a decimal number to the console. */
+static void crash_put_uint(unsigned v)
+{
+    char dec[16];
+    int dlen = (int) kvsnprintf_unsigned(dec, sizeof dec, v);
+
+    con_write(dec, (size_t) dlen);
+}
+
 /* crash_rendezvous — join the SMP crash rendezvous, then halt.
  *
  * Called once this CPU has finished accumulating its diagnostic into its
  * per-CPU crash_buf. Protocol:
  *
- *   1. atomic_inc(crash_arrived) — announce arrival.
+ *   1. set this CPU's bit in crash_arrived_mask — announce arrival.
  *   2. Spin briefly so siblings still finishing their dumps catch up
  *      (bounded loop, not a wall-clock timer — no dependency on the
  *      timer subsystem which itself may be broken at crash time).
@@ -1015,30 +1080,39 @@ void crash_quiesce_self(void)
  *   5. cpu_halt — never returns.
  *
  * Failure-tolerance:
- *   - Lone crasher: arrival count never reaches num_processors, but
- *     the bounded spin still expires; this CPU then becomes the
- *     printer of its own buffer.  Diagnostic still prints.
- *   - All N crashed: arrival count hits num_processors; the spin
- *     exits early; first CPU to win the printer cmpxchg dumps for
- *     everyone.
+ *   - A CPU that never arrives: the arrival count never reaches
+ *     crash_participants(), but the bounded spin still expires; this CPU
+ *     then becomes the printer of the buffers that are filled.
+ *     Diagnostic still prints.
+ *   - Every participant arrives: the spin exits early; first CPU to win
+ *     the printer cmpxchg dumps for everyone.
  *   - One CPU is wedged and never reaches the rendezvous: its buffer
  *     is empty (used == 0) and the printer skips it.  The other CPUs'
  *     dumps still print.
  */
 void crash_rendezvous(void)
 {
-    atomic_fetch_add_explicit(&crash_arrived, 1, memory_order_acq_rel);
+    uint64_t set, arrived;
+
+    /* Every caller has already marked this CPU entered (crash_enter_self,
+     * crash_quiesce_self or kprintf_crash_mode_on), so the participant set
+     * below includes it.
+     */
+    atomic_fetch_or_explicit(&crash_arrived_mask, 1ULL << get_cpunum(),
+                             memory_order_acq_rel);
 
     /* Bounded spin — long enough that any sibling crashing in the same window
      * will reach this rendezvous, short enough not to stall a lone crasher
      * noticeably. ~50M iterations ≈ tens of milliseconds at GHz clocks.
      */
-    for (volatile unsigned long i = 0;
-         i < 50000000UL &&
-         atomic_load_explicit(&crash_arrived, memory_order_acquire) <
-             num_processors;
+    arrived = atomic_load_explicit(&crash_arrived_mask, memory_order_acquire);
+    set = crash_participants();
+    for (volatile unsigned long i = 0; i < 50000000UL && (arrived & set) != set;
          i++) {
         __asm__ volatile("" ::: "memory");
+        arrived =
+            atomic_load_explicit(&crash_arrived_mask, memory_order_acquire);
+        set = crash_participants();
     }
 
     if (atomic_exchange_explicit(&crash_printer_picked, 1,
@@ -1057,19 +1131,20 @@ void crash_rendezvous(void)
                 continue;
 
             /* "--- cpu N (M bytes) ---\r\n" composed inline */
-            char dec[16];
-            int dlen;
-
             con_write("\r\n--- cpu ", 10);
-            dlen = (int) kvsnprintf_unsigned(dec, sizeof dec, cpu);
-            con_write(dec, (size_t) dlen);
+            crash_put_uint(cpu);
             con_write(" (", 2);
-            dlen = (int) kvsnprintf_unsigned(dec, sizeof dec, u);
-            con_write(dec, (size_t) dlen);
+            crash_put_uint(u);
             con_write(" bytes) ---\r\n", 13);
 
             con_write(crash_buf[cpu], u);
         }
+        /* How many CPUs this wait was for, and how many had arrived */
+        con_write("\r\ncrash rendezvous: ", 20);
+        crash_put_uint(crash_mask_count(arrived & set));
+        con_write(" arrived, ", 10);
+        crash_put_uint(crash_mask_count(set));
+        con_write(" expected", 9);
         con_write("\r\n=== END CRASH DUMP ===\r\n", 27);
     }
     cpu_halt();

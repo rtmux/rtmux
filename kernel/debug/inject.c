@@ -127,14 +127,14 @@ void kext_debug_inject(void *data)
         hart = (unsigned) kap->arg0;
         ms = kap->op == INJECT_OP_HANG_HART ? UINT32_MAX : (unsigned) kap->arg1;
 
-        for (unsigned c = 0; c < CONFIG_PROCESSORS_MAX; c++)
-            live += pcpu_array[c].pc_alive ? 1u : 0u;
+        for (unsigned c = 0; c < num_processors; c++)
+            live += cpu_online(c) ? 1u : 0u;
 
         /* Refuse the caller's own hart, a hart that is not alive, and the last
          * live hart: any of them would turn a test into an unrecoverable stop
          * rather than a stall to be diagnosed.
          */
-        if (hart == self || !pcpu_array[hart].pc_alive || live < 2) {
+        if (hart == self || !cpu_online(hart) || live < 2) {
             ret = EINVAL;
             break;
         }

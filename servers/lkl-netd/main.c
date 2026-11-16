@@ -102,14 +102,25 @@ static int netd_path_id = -1;
 
 /* Readiness notifications (_IO_NOTIFY) for the data sockets, one set of lists
  * per slot. The watcher thread polls the LKL sockets that have a poller armed
- * and wakes it once the socket is ready. fd is the LKL socket the arms were
- * made against, or -1. Both are guarded by netd_watch_lock: the slot tables are
- * owned by the dispatch threads, so the watcher never reads them.
+ * and wakes it once the socket is ready. A poll with no events arms the OBAND
+ * list, which a hangup or error wakes alone. fd is the LKL socket the arms were
+ * made against, or -1, and gen counts the changes of the slot's socket: LKL
+ * hands a closed socket's number to the next one, so the number cannot tell the
+ * watcher that what it polled is still what is armed. set is what the watcher's
+ * poll holds for the socket now, as NETD_WATCH_* bits. All are guarded by
+ * netd_watch_lock: the slot tables are owned by the dispatch threads, so the
+ * watcher never reads them.
  */
 struct netd_watch {
     int fd;
+    unsigned gen;
+    unsigned set;
     ioserv_notify_t lists[IOSERV_NOTIFY_COUNT];
 };
+
+#define NETD_WATCH_IN 0x1
+#define NETD_WATCH_OUT 0x2
+#define NETD_WATCH_HUP 0x4 /* hangup or error alone */
 
 /* fd is set to -1 in serve_net before any request is served. */
 static struct netd_watch tcp_watch[NETD_SLOTS];
@@ -117,11 +128,34 @@ static struct netd_watch udp_watch[NETD_SLOTS];
 static pthread_mutex_t netd_watch_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t netd_watch_cond = PTHREAD_COND_INITIALIZER;
 
-/* An LKL eventfd in the watcher's poll set: a new arm writes it, so the watcher
- * takes the socket into its set at once. -1 when LKL has no eventfd; the
- * watcher then looks for new arms every NETD_WATCH_MS.
+/* An LKL eventfd in the watcher's poll set: an arm that adds to what the
+ * watcher polls (a socket, or a condition of one) writes it, so the watcher
+ * takes it into its set at once. -1 when LKL has no eventfd; the watcher then
+ * looks for new arms every NETD_WATCH_MS.
  */
 static int netd_watch_kick = -1;
+
+/* Armed notifications, and the kicks they needed, as /net/stats shows them. */
+static unsigned long long netd_poll_arms;
+static unsigned long long netd_poll_kicks;
+
+static unsigned long long netd_poll_count(const unsigned long long *counter)
+{
+    unsigned long long n;
+
+    pthread_mutex_lock(&netd_watch_lock);
+    n = *counter;
+    pthread_mutex_unlock(&netd_watch_lock);
+    return n;
+}
+
+/* How often a notify checks a slot again that changed under it; the last check
+ * is made under the lock, so it cannot be overtaken. The environment variable
+ * LKL_NETD_NOTIFY_RETRIES sets it, to 0 to run every arm that way (the
+ * lkl-netd-poll-spent mode).
+ */
+#define NETD_NOTIFY_RETRIES 4
+static unsigned netd_notify_retries = NETD_NOTIFY_RETRIES;
 #define NETD_WATCH_MS 20
 #define NETD_WATCH_IDLE_MS 1000
 
@@ -233,10 +267,12 @@ static void slot_store(int *slots, pid_t *owners, int slot, int fd, pid_t owner)
     slots[slot] = fd;
     if (owners)
         owners[slot] = owner;
-    if (w->fd >= 0 && w->fd != fd) {
+    w->gen++;
+    w->set = 0; /* what the watcher polls is the old socket */
+    if (w->fd >= 0) {
         w->fd = -1;
-        ioserv_notify_trigger(w->lists, INT_MAX, IOSERV_NOTIFY_INPUT);
-        ioserv_notify_trigger(w->lists, INT_MAX, IOSERV_NOTIFY_OUTPUT);
+        for (int i = 0; i < IOSERV_NOTIFY_COUNT; i++)
+            ioserv_notify_trigger(w->lists, INT_MAX, i);
     }
     pthread_mutex_unlock(&netd_watch_lock);
 }
@@ -769,6 +805,16 @@ static int netd_open(ioserv_context_t *ctp,
         struct rtmux_lkl_host_stats stats;
         char ioserv_stats[256];
 
+        /* The longest this text can be, with every counter at 20 digits: 256
+         * bytes of fixed text, 14 counters, the command line, and the ioserv
+         * block (106 fixed bytes and 6 counters), 769 bytes in all, against the
+         * 1024 of ocb->text.
+         */
+        _Static_assert(
+            256 + 14 * 20 + sizeof(RTMUX_LKL_NETD_CMDLINE) - 1 + 106 + 6 * 20 <=
+                sizeof(((struct netd_ocb *) 0)->text),
+            "/net/stats must fit the ocb text buffer");
+
         if ((msg->connect.ioflag & _IO_FLAG_WR) != 0) {
             free(ocb);
             rtmux_lkl_admission_unlock(ctp, msg, NULL);
@@ -780,14 +826,16 @@ static int netd_open(ioserv_context_t *ctp,
         ocb->len = rtmux_lkl_text_format(
             ocb->text, sizeof(ocb->text),
             "server lkl-netd\nnetwork ipv4\nlkl_mem %s\n"
+            "poll_arms %llu\npoll_kicks %llu\n"
             "page_current %llu\npage_high %llu\npage_total %llu\n"
             "dma_current %llu\ndma_high %llu\ndma_total %llu\n"
             "net_bounce_rx_bytes %llu\nnet_bounce_tx_bytes %llu\n%s"
             "lkl_block_read_bytes %llu\nlkl_block_write_bytes %llu\n"
             "lkl_threads %llu\nlkl_thread_stack_bytes %llu\n",
-            RTMUX_LKL_NETD_CMDLINE, stats.page_current, stats.page_high,
-            stats.page_total, stats.dma_current, stats.dma_high,
-            stats.dma_total, stats.net_bounce_rx_bytes,
+            RTMUX_LKL_NETD_CMDLINE, netd_poll_count(&netd_poll_arms),
+            netd_poll_count(&netd_poll_kicks), stats.page_current,
+            stats.page_high, stats.page_total, stats.dma_current,
+            stats.dma_high, stats.dma_total, stats.net_bounce_rx_bytes,
             stats.net_bounce_tx_bytes, ioserv_stats, stats.lkl_block_read_bytes,
             stats.lkl_block_write_bytes, stats.thread_count,
             stats.thread_stack_bytes);
@@ -1048,6 +1096,24 @@ static int socket_ready(int fd, unsigned *sat, unsigned *hup)
     return EOK;
 }
 
+/* The NETD_WATCH_* bits a request's conditions need the watcher to poll for: a
+ * request with none waits for hangup or error alone.
+ */
+static unsigned netd_watch_bits(unsigned flags)
+{
+    unsigned bits = 0;
+
+    /* A condition comes in either form, the nibble or the POLL* code, as
+     * ioserv_notify accepts them.
+     */
+    flags = (flags & ~(unsigned) _NOTIFY_COND_EXTEN) | flags >> 28;
+    if (flags & (1u << IOSERV_NOTIFY_INPUT))
+        bits |= NETD_WATCH_IN;
+    if (flags & (1u << IOSERV_NOTIFY_OUTPUT))
+        bits |= NETD_WATCH_OUT;
+    return bits ? bits : NETD_WATCH_HUP;
+}
+
 /* _IO_NOTIFY for poll() and select(). A data socket's readiness is the LKL
  * socket's: input once a read would not wait (data, end of stream or an error),
  * output once a write would not. A slot without a socket fails reads and writes
@@ -1060,43 +1126,71 @@ static int netd_notify(ioserv_context_t *ctp,
                        struct netd_ocb *ocb)
 {
     struct netd_watch *w;
-    unsigned sat, hup;
+    unsigned sat, hup, gen;
+    unsigned flags = msg->i.flags; /* ioserv_notify overwrites the request */
+    unsigned kick = 0;
     int *slots;
     int fd, ret;
 
     if (ocb->kind != NETD_TCP_DATA && ocb->kind != NETD_UDP_DATA)
         return ioserv_notify_ready(ctp, msg, 0);
     slots = ocb->kind == NETD_TCP_DATA ? tcp_fd : udp_fd;
-
-    /* No admission lock here (see servers/lkl/server.c): the slot is read and
-     * the arm made under netd_watch_lock, which every slot write takes. The
-     * socket is checked between the two, outside the lock; if the slot changed
-     * meanwhile, the reply says ready, so the client looks again.
-     */
-    pthread_mutex_lock(&netd_watch_lock);
-    ret = slot_check(slots, ocb->kind == NETD_TCP_DATA ? tcp_owner : udp_owner,
-                     ocb->slot, ctp->info.pid);
-    fd = ret == EOK ? slots[ocb->slot] : -1;
-    pthread_mutex_unlock(&netd_watch_lock);
-    if (ret != EOK)
-        return ret;
-    if (fd < 0)
-        return ioserv_notify_ready(ctp, msg, POLLERR);
-    if ((ret = socket_ready(fd, &sat, &hup)) != EOK)
-        return ret;
-
     w = watch_for(slots, ocb->slot);
-    pthread_mutex_lock(&netd_watch_lock);
-    if (slots[ocb->slot] != fd) {
-        ret = ioserv_notify_ready(ctp, msg, 0);
-    } else {
-        w->fd = fd;
-        ret = ioserv_notify(ctp, msg, w->lists, sat, hup, NULL);
-        if (ret == EAGAIN)
-            pthread_cond_signal(&netd_watch_cond);
+
+    /* No admission lock here (see IOSERV_OPS_NOTIFY_UNLOCKED): the slot is read
+     * and the arm made under netd_watch_lock, which every slot write takes. The
+     * socket is checked between the two, outside the lock, so the slot's
+     * generation says whether it is still the socket that was checked: LKL
+     * gives a closed socket's number to the next one, so the number cannot. A
+     * slot that changed is checked again; it cannot be answered as ready, as a
+     * poll pass would take that for the socket's own readiness. Once the
+     * retries are spent the socket is checked once more under the lock, where
+     * the slot cannot change, so the answer is never a guess.
+     */
+    for (unsigned tries = 0;; tries++) {
+        pthread_mutex_lock(&netd_watch_lock);
+        ret = slot_check(slots,
+                         ocb->kind == NETD_TCP_DATA ? tcp_owner : udp_owner,
+                         ocb->slot, ctp->info.pid);
+        fd = ret == EOK ? slots[ocb->slot] : -1;
+        gen = w->gen;
+        if (ret == EOK && fd >= 0 && tries >= netd_notify_retries) {
+            /* Retries spent: the slot cannot change while the lock is held, so
+             * the socket is checked once more here, a non-blocking poll, and
+             * its answer is true: not-ready is never guessed.
+             */
+            if ((ret = socket_ready(fd, &sat, &hup)) != EOK) {
+                pthread_mutex_unlock(&netd_watch_lock);
+                return ret;
+            }
+            break;
+        }
+        pthread_mutex_unlock(&netd_watch_lock);
+        if (ret != EOK)
+            return ret;
+        if (fd < 0)
+            return ioserv_notify_ready(ctp, msg, POLLERR);
+        if ((ret = socket_ready(fd, &sat, &hup)) != EOK)
+            return ret;
+
+        pthread_mutex_lock(&netd_watch_lock);
+        if (w->gen == gen)
+            break;
+        pthread_mutex_unlock(&netd_watch_lock);
+    }
+    w->fd = fd;
+    ret = ioserv_notify(ctp, msg, w->lists, sat, hup, NULL);
+    if (ret == EAGAIN) {
+        /* Only an arm that adds to what the watcher polls needs a kick; the
+         * rest is in its set already, and is woken from there.
+         */
+        kick = netd_watch_bits(flags) & ~w->set;
+        netd_poll_arms++;
+        netd_poll_kicks += kick != 0;
+        pthread_cond_signal(&netd_watch_cond);
     }
     pthread_mutex_unlock(&netd_watch_lock);
-    if (ret == EAGAIN && netd_watch_kick >= 0) {
+    if (kick && netd_watch_kick >= 0) {
         uint64_t one = 1;
 
         (void) lkl_sys_write((unsigned int) netd_watch_kick, (char *) &one,
@@ -1121,31 +1215,43 @@ static int netd_close_dup(ioserv_context_t *ctp,
     return EOK;
 }
 
-/* Add w to the watcher's poll set when a poller is armed on it. Called with
- * netd_watch_lock held.
+/* Add w to the watcher's poll set when a poller is armed on it, and note what
+ * the set holds for it and which socket that is. Called with netd_watch_lock
+ * held.
  */
 static void watch_collect(struct netd_watch *w,
                           struct lkl_pollfd *pfd,
                           struct netd_watch **who,
+                          unsigned *gens,
                           int *n)
 {
     short events = 0;
 
+    w->set = 0;
     if (w->fd < 0)
         return;
-    if (ioserv_notify_armed(w->lists, IOSERV_NOTIFY_INPUT, 1))
+    if (ioserv_notify_armed(w->lists, IOSERV_NOTIFY_INPUT, 1)) {
         events |= LKL_POLLIN;
-    if (ioserv_notify_armed(w->lists, IOSERV_NOTIFY_OUTPUT, 1))
+        w->set |= NETD_WATCH_IN;
+    }
+    if (ioserv_notify_armed(w->lists, IOSERV_NOTIFY_OUTPUT, 1)) {
         events |= LKL_POLLOUT;
-    if (!events)
+        w->set |= NETD_WATCH_OUT;
+    }
+    if (ioserv_notify_armed(w->lists, IOSERV_NOTIFY_OBAND, 1))
+        w->set |= NETD_WATCH_HUP; /* poll reports it whatever events say */
+    if (!w->set)
         return;
     pfd[*n] = (struct lkl_pollfd){.fd = w->fd, .events = events};
+    gens[*n] = w->gen;
     who[(*n)++] = w;
 }
 
 /* Poll the armed sockets and wake their pollers; sleep while nothing is armed.
- * A socket closed while it is polled only wakes its pollers early: the fd is
- * checked against the watch again under the lock before anyone is woken.
+ * A socket closed while it is polled only wakes its pollers early: the socket
+ * and its generation are checked against the watch again under the lock before
+ * anyone is woken, so a number LKL gave to a new socket is not taken for the
+ * one that was polled.
  */
 static void *netd_watcher(void *arg)
 {
@@ -1154,6 +1260,7 @@ static void *netd_watcher(void *arg)
         /* The sockets, then the kick eventfd last. */
         struct lkl_pollfd pfd[2 * NETD_SLOTS + 1];
         struct netd_watch *who[2 * NETD_SLOTS];
+        unsigned gens[2 * NETD_SLOTS];
         int kick = netd_watch_kick >= 0;
         int n = 0;
         long ret;
@@ -1161,8 +1268,8 @@ static void *netd_watcher(void *arg)
         pthread_mutex_lock(&netd_watch_lock);
         for (;;) {
             for (int i = 0; i < NETD_SLOTS; i++) {
-                watch_collect(&tcp_watch[i], pfd, who, &n);
-                watch_collect(&udp_watch[i], pfd, who, &n);
+                watch_collect(&tcp_watch[i], pfd, who, gens, &n);
+                watch_collect(&udp_watch[i], pfd, who, gens, &n);
             }
             if (n)
                 break;
@@ -1181,26 +1288,27 @@ static void *netd_watcher(void *arg)
             (void) lkl_sys_read((unsigned int) netd_watch_kick, (char *) &drain,
                                 sizeof drain);
         }
-        if (ret == 0)
-            continue;
-        if (ret < 0) {
-            struct timespec ts = {.tv_nsec = NETD_WATCH_MS * 1000000L};
-
-            nanosleep(&ts, NULL);
-            continue;
-        }
         pthread_mutex_lock(&netd_watch_lock);
         for (int i = 0; i < n; i++) {
-            unsigned sat = socket_conds(pfd[i].revents);
+            unsigned sat = ret > 0 ? socket_conds(pfd[i].revents) : 0;
+            int gone = who[i]->fd != pfd[i].fd || who[i]->gen != gens[i];
 
-            if (!sat || who[i]->fd != pfd[i].fd)
+            who[i]->set = 0; /* the next pass collects it again */
+            if (gone || !sat)
                 continue;
             if (sat & _NOTIFY_COND_INPUT)
                 ioserv_notify_trigger(who[i]->lists, 1, IOSERV_NOTIFY_INPUT);
             if (sat & _NOTIFY_COND_OUTPUT)
                 ioserv_notify_trigger(who[i]->lists, 1, IOSERV_NOTIFY_OUTPUT);
+            if (pfd[i].revents & (LKL_POLLHUP | LKL_POLLERR | LKL_POLLNVAL))
+                ioserv_notify_trigger(who[i]->lists, 1, IOSERV_NOTIFY_OBAND);
         }
         pthread_mutex_unlock(&netd_watch_lock);
+        if (ret < 0) {
+            struct timespec ts = {.tv_nsec = NETD_WATCH_MS * 1000000L};
+
+            nanosleep(&ts, NULL);
+        }
     }
     return NULL;
 }
@@ -1278,6 +1386,7 @@ static const ioserv_connect_ops_t netd_connect_funcs = {
 
 static const ioserv_ops_t netd_io_funcs = {
     .nfuncs = IOSERV_IO_NFUNCS,
+    .flags = IOSERV_OPS_NOTIFY_UNLOCKED,
     .read = netd_read,
     .write = netd_write,
     .close_ocb = netd_close,
@@ -1429,6 +1538,7 @@ static int delegate_netd_child(const char *child_arg)
 
 int main(int argc, char **argv)
 {
+    const char *retries;
     struct lkl_netdev_args args;
     struct lkl_netdev *nd;
     int id;
@@ -1454,6 +1564,14 @@ int main(int argc, char **argv)
         return delegate_netd_child("--crash-after-start");
     if (argc == 2 && !strcmp(argv[1], "--delegate-boot-only"))
         return delegate_netd_child("--boot-only");
+
+    if ((retries = getenv("LKL_NETD_NOTIFY_RETRIES")) != NULL) {
+        char *end;
+        unsigned long n = strtoul(retries, &end, 10);
+
+        if (end != retries && *end == '\0' && n <= 1000)
+            netd_notify_retries = (unsigned) n; /* anything else: the default */
+    }
 
     if (argc > 1 && !strcmp(argv[1], "--delegated-virtio")) {
         delegated_child = true;

@@ -2085,7 +2085,7 @@ if ! awk '
     /static void thread_destroy_wait_inactive\(thread_t \*thp, process_t \*prp\)/ {
         in_wait = 1
     }
-    in_wait && /__atomic_load_n\(&pcpu_array\[hart\]\.pc_curthread,/ {
+    in_wait && /__atomic_load_n\(&pcpu_array\[cpu\]\.pc_curthread,/ {
         saw_cur = NR
         in_cur = 1
     }
@@ -2097,7 +2097,7 @@ if ! awk '
         saw_cur_acquire = NR
         in_cur = 0
     }
-    in_wait && /__atomic_load_n\(&in_kcall\[hart\],/ {
+    in_wait && /__atomic_load_n\(&in_kcall\[cpu\],/ {
         saw_depth = NR
         in_depth = 1
     }
@@ -2345,11 +2345,7 @@ if ! awk '
 fi
 
 if ! awk '
-    /static inline int rcu_cpu_alive\(unsigned cpu\)/ { in_alive = 1 }
-    in_alive && /__atomic_load_n\(&pcpu_array\[cpu\]\.pc_alive, __ATOMIC_ACQUIRE\)/ {
-        saw_atomic = NR
-    }
-    in_alive && /^}/ { in_alive = 0 }
+    /cpu_online\(cpu\)/ { saw_atomic = NR } # acquire load of online_cpu_mask
     /pcpu_array\[[^]]+\]\.pc_alive/ {
         line = $0
         gsub(/__atomic_load_n\(&pcpu_array\[cpu\]\.pc_alive, __ATOMIC_ACQUIRE\)/,
@@ -2359,7 +2355,7 @@ if ! awk '
     }
     END { exit !(saw_atomic && !saw_plain) }
 ' kernel/sync/rcu.c; then
-    echo "RCU-sched: pc_alive peer checks must use acquire atomic loads" >&2
+    echo "RCU-sched: peer liveness checks must use cpu_online(), not a plain pc_alive read" >&2
     exit 1
 fi
 

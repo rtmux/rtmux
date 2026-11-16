@@ -49,6 +49,8 @@ lkl-netd-http
 lkl-netd-http-isolated
 lkl-netd-http-split
 lkl-netd-iommu-fail-closed
+lkl-netd-poll
+lkl-netd-poll-spent
 lkl-netd-restart
 lkl-netd-revoke
 lkl-netd-stale
@@ -74,6 +76,7 @@ shutdown-sync
 shutdown-sync-ignore
 shutdown-sync-negative
 shutdown-sync-wedge
+smp-ap-crash-early
 smp-hart-start-fail
 smp-hart-start-late
 smp-invariants

@@ -153,6 +153,99 @@ int kdecl ksys_msg_current(thread_t *act, struct kcall_args_msg_current *kap)
     return EOK;
 }
 
+/* Check the caller's own iov array against its boundary, at most
+ * XFER_IOV_CHECK_STEP entries per kernel entry. parts is at least 1.
+ *
+ * msg_readv and msg_writev check their iov first of all, before they look up or
+ * claim the client, so there is nothing to undo when the call restarts and
+ * every return path of the call has consumed or dropped the saved prefix. The
+ * checked prefix is kept on the thread (iovchk_*), keyed by the array and its
+ * length, so a restart resumes where this entry stopped instead of rereading
+ * from entry 0. Each entry that has more to check ends with KCALL_RESTART,
+ * which returns through kernel_exit and lets a higher-priority thread run, so
+ * no kernel entry spends more than one step on the check. The trap handler
+ * drops the saved prefix at the next kernel call that is not msg_readv or
+ * msg_writev, so this thread cannot edit the entries it has already passed
+ * between the restart and the resume. Another thread sharing the array can, so
+ * the transfer paths still check the entries they use. Entries are read through
+ * xfer_memchk, which recovers from a fault.
+ *
+ * Returns 0 (all entries are inside the boundary), EFAULT (one is not, a page
+ * of the array is unmapped, the array itself is not in the caller's space, or
+ * it is longer than XFER_IOV_LIMIT), or XFER_IOV_CHECK_RESTART (the call was
+ * restarted: return ENOERROR).
+ */
+static int xfer_iov_check(thread_t *act, const iov_t *iov, int parts)
+{
+    uint32_t done = 0, n;
+    int bad;
+    const iov_t *saved = act->iovchk_iov;
+    uintptr_t base = (uintptr_t) iov, last;
+
+    act->iovchk_iov = NULL;
+    if (parts > XFER_IOV_LIMIT)
+        return EFAULT;
+
+    /* The array itself must lie in the caller's space: a fault-recovering read
+     * still succeeds on a mapped kernel address.
+     */
+    last = base + (size_t) parts * sizeof(iov_t) - 1;
+    if (!base || base > last ||
+        !WITHIN_BOUNDARY(base, last, act->process->boundary_addr))
+        return EFAULT;
+    if (saved == iov && act->iovchk_parts == parts)
+        done = act->iovchk_done;
+
+    n = (uint32_t) parts - done;
+    if (n > XFER_IOV_CHECK_STEP)
+        n = XFER_IOV_CHECK_STEP;
+    SET_XFER_HANDLER(&xfer_src_handlers);
+    bad = xfer_memchk(act->process->boundary_addr, iov + done, n);
+    SET_XFER_HANDLER(0);
+    if (bad)
+        return EFAULT;
+    done += n;
+    if (done == (uint32_t) parts)
+        return 0;
+
+    act->iovchk_iov = iov;
+    act->iovchk_parts = parts;
+    act->iovchk_done = done;
+    KCALL_RESTART(act);
+    return XFER_IOV_CHECK_RESTART;
+}
+
+/* Check the caller's own iov (the destination of msg_readv, the source of
+ * msg_writev) against the process boundary, before the client is claimed.
+ *
+ * It runs first, ahead of lookup_rcvid(), so that a saved xfer_iov_check()
+ * prefix is always consumed or dropped by the call it belongs to, and so that
+ * every later path, the remote one included, sees a vector that is in range and
+ * no longer than XFER_IOV_LIMIT. A negative count is one flat buffer, which has
+ * no entries to read; an entry is read only by xfer_iov_check(), which recovers
+ * from a fault and does at most one step of the work per kernel entry.
+ *
+ * Returns 0, an errno, or XFER_IOV_CHECK_RESTART when the call was restarted.
+ */
+static int msg_iov_check(thread_t *act, const iov_t *iov, int parts)
+{
+    if (parts < 0) {
+        uintptr_t base = (uintptr_t) iov, last;
+
+        act->iovchk_iov = NULL;
+        last = base + PARTS_TO_LEN(parts) - 1;
+        if (base > last ||
+            !WITHIN_BOUNDARY(base, last, act->process->boundary_addr))
+            return EFAULT;
+        return 0;
+    }
+    if (parts == 0) {
+        act->iovchk_iov = NULL;
+        return 0;
+    }
+    return xfer_iov_check(act, iov, parts);
+}
+
 /* Read a (partially received) message from a client into the server's iov
  * (msg_readv kcall).
  *
@@ -169,7 +262,7 @@ int kdecl ksys_msg_readv(thread_t *act, struct kcall_args_msg_readv *kap)
 {
     connect_t *cop;
     thread_t *thp;
-    int xferstat;
+    int xferstat, status;
     unsigned slen;
     int do_force_ready = 0;
     unsigned thp_status = 0;
@@ -180,6 +273,12 @@ int kdecl ksys_msg_readv(thread_t *act, struct kcall_args_msg_readv *kap)
      * as the long-msg path, so a concurrent replyv cannot overwrite the source
      * buffer mid-read.
      */
+
+    status = msg_iov_check(act, kap->rmsg, kap->rparts);
+    if (status == XFER_IOV_CHECK_RESTART)
+        return ENOERROR;
+    if (status)
+        return status;
 
     if ((cop = lookup_rcvid((kcall_args_t *) (void *) kap, kap->rcvid, &thp)) ==
         NULL) {
@@ -216,53 +315,6 @@ int kdecl ksys_msg_readv(thread_t *act, struct kcall_args_msg_readv *kap)
 
     act->args.ms.rmsg = kap->rmsg;
     act->args.ms.rparts = kap->rparts;
-
-    /* Validate iov_t boundary */
-    if (kap->rparts < 0) {
-        /* Single part */
-        uintptr_t base, last;
-        size_t len;
-
-        base = (uintptr_t) kap->rmsg;
-        len = PARTS_TO_LEN(kap->rparts);
-        last = base + len - 1;
-        if ((base > last) ||
-            !WITHIN_BOUNDARY(base, last, act->process->boundary_addr)) {
-            return EFAULT;
-        }
-    } else if (kap->rparts == 1) {
-        /* One iov_t */
-        uintptr_t base, last;
-        size_t len;
-
-        base = (uintptr_t) GETIOVBASE(kap->rmsg);
-        len = GETIOVLEN(kap->rmsg);
-        last = base + len - 1;
-        if (((base > last) ||
-             !WITHIN_BOUNDARY(base, last, act->process->boundary_addr)) &&
-            (len != 0)) {
-            return EFAULT;
-        }
-    } else {
-        /* Multi-iov_t. Walk IOVs for boundary check. */
-        uintptr_t base, last;
-        size_t len;
-        int rparts = kap->rparts;
-        iov_t *iov = kap->rmsg;
-
-        while (rparts) {
-            base = (uintptr_t) GETIOVBASE(iov);
-            len = GETIOVLEN(iov);
-            last = base + len - 1;
-            if (((base > last) ||
-                 !WITHIN_BOUNDARY(base, last, act->process->boundary_addr)) &&
-                (len != 0)) {
-                return EFAULT;
-            }
-            iov++;
-            --rparts;
-        }
-    }
 
     /* State-recheck + MSG_DELIVERY claim under channel_slock. Synchronizes with
      * ksys_msg_replyv (which takes the same slock for its own claim). If state
@@ -377,7 +429,7 @@ int kdecl ksys_msg_writev(thread_t *act, struct kcall_args_msg_writev *kap)
 {
     connect_t *cop;
     thread_t *thp;
-    int xferstat;
+    int xferstat, status;
     int do_force_ready = 0;
     unsigned thp_status = 0;
 
@@ -385,6 +437,12 @@ int kdecl ksys_msg_writev(thread_t *act, struct kcall_args_msg_writev *kap)
      * state-recheck + MSG_DELIVERY claim + claim-release, xfer outside the
      * slock, force_ready outside (sched_slock-internal, SCHED < CHANNEL rank).
      */
+
+    status = msg_iov_check(act, kap->smsg, kap->sparts);
+    if (status == XFER_IOV_CHECK_RESTART)
+        return ENOERROR;
+    if (status)
+        return status;
 
     if ((cop = lookup_rcvid((kcall_args_t *) (void *) kap, kap->rcvid, &thp)) ==
         NULL) {
@@ -416,52 +474,6 @@ int kdecl ksys_msg_writev(thread_t *act, struct kcall_args_msg_writev *kap)
         if (!cop || (cop->flags & COF_VCONNECT) == 0 ||
             cop->un.lcl.cop != cop1) {
             return ESRCH;
-        }
-    }
-    /* Validate iov_t boundary */
-    if (kap->sparts < 0) {
-        /* Single part */
-        uintptr_t base, last;
-        size_t len;
-
-        base = (uintptr_t) kap->smsg;
-        len = PARTS_TO_LEN(kap->sparts);
-        last = base + len - 1;
-        if ((base > last) ||
-            !WITHIN_BOUNDARY(base, last, act->process->boundary_addr)) {
-            return EFAULT;
-        }
-    } else if (kap->sparts == 1) {
-        /* One iov_t */
-        uintptr_t base, last;
-        size_t len;
-
-        base = (uintptr_t) GETIOVBASE(kap->smsg);
-        len = GETIOVLEN(kap->smsg);
-        last = base + len - 1;
-        if (((base > last) ||
-             !WITHIN_BOUNDARY(base, last, act->process->boundary_addr)) &&
-            (len != 0)) {
-            return EFAULT;
-        }
-    } else {
-        /* Multi-iov_t. Walk IOVs for boundary check. */
-        uintptr_t base, last;
-        size_t len;
-        int rparts = kap->sparts;
-        iov_t *iov = kap->smsg;
-
-        while (rparts) {
-            base = (uintptr_t) GETIOVBASE(iov);
-            len = GETIOVLEN(iov);
-            last = base + len - 1;
-            if (((base > last) ||
-                 !WITHIN_BOUNDARY(base, last, act->process->boundary_addr)) &&
-                (len != 0)) {
-                return EFAULT;
-            }
-            iov++;
-            --rparts;
         }
     }
 
