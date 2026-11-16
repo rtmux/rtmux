@@ -129,7 +129,7 @@ add_qemu_opts \
     -machine "virt,graphics=off${EMU_QEMU_MACHINE_OPTS:-}" \
     -bios "$BIOS" \
     -kernel "${EMU_KERNEL:-$BUILD_DIR/arch/riscv/rtmux-kernel}" \
-    -m 256M \
+    -m "${EMU_MEM_MB:-256}M" \
     -smp "$CPUS"
 
 # Parse options. Args we recognise are consumed; the rest pass through to the

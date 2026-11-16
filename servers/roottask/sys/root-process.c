@@ -70,6 +70,43 @@ void root_process_init(pid_t pid, pid_t parent_pid)
     pthread_mutex_unlock(&slot_lock);
 }
 
+/* The process group of p: its own pid while it has joined none. */
+pid_t root_process_pgrp(const root_process_t *p)
+{
+    return p->pgrp ? p->pgrp : p->pid;
+}
+
+/* The session id of p: its session's leader, or the system session's. */
+pid_t root_session_leader(const root_process_t *p)
+{
+    return p->session ? p->session->leader : ROOTTASK_PID;
+}
+
+/* The system session. It is static, so that creating it cannot fail and no
+ * process is ever without a session object. One link is roottask's own; the
+ * other is never dropped, so that an unbalanced release cannot free a static
+ * object. Roottask never exits, so it is never freed.
+ */
+static session_t boot_session;
+
+/* Make pid the leader of the system session and of its own group, with no
+ * controlling terminal; its children inherit both. Boot does this for roottask,
+ * so that the session exists before any process is created; the leader's
+ * SLEADER flag is not set, because roottask never calls setsid or setpgid.
+ */
+void root_process_boot_session(pid_t pid)
+{
+    root_process_t *tmp = root_proc(pid);
+
+    boot_session.links = 2; /* roottask's, and one that is never dropped */
+    boot_session.leader = pid;
+    boot_session.pgrp = boot_session.fd = -1;
+    pthread_mutex_lock(&slot_lock);
+    tmp->session = &boot_session;
+    tmp->pgrp = pid;
+    pthread_mutex_unlock(&slot_lock);
+}
+
 /* Release the root_process[] slot for a pid.
  *
  * Idempotent: only clears the slot if it still claims this pid, so a double

@@ -1290,6 +1290,27 @@ int main(int argc, char *argv[])
         }
         return errno == ENXIO ? EXIT_SUCCESS : 4;
     }
+    if ((argc == 2 || argc == 3) && !strcmp(argv[1], "--session-probe")) {
+        /* Report this process's view of its session and group, after joining
+         * the group argv[2] if given and otherwise leading its own (setpgid),
+         * on one line; then stay alive until stdin reaches EOF, so that the
+         * parent can probe it.
+         */
+        char line[128], c;
+        pid_t sid = getsid(0), pg0 = getpgrp();
+        int rc, err, n;
+
+        errno = 0;
+        rc = setpgid(0, argc == 3 ? (pid_t) atoi(argv[2]) : 0);
+        err = rc == 0 ? 0 : errno;
+        n = snprintf(line, sizeof line, "sid=%d pg0=%d rc=%d err=%d pg1=%d\n",
+                     (int) sid, (int) pg0, rc, err, (int) getpgrp());
+        if (n < 0 || write(STDOUT_FILENO, line, (size_t) n) != n)
+            return 2;
+        while (read(STDIN_FILENO, &c, 1) == 1)
+            ;
+        return EXIT_SUCCESS;
+    }
     if (argc == 2 && !strcmp(argv[1], "--getsid-hold")) {
         /* Say it is running, then stay alive until stdin reaches EOF. */
         char c;

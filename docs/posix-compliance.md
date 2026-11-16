@@ -278,7 +278,7 @@ The Option group column attributes each interface to the POSIX option that requi
 | `setegid` | - | - | implemented | include/unistd.h | lib/libc/posix/setids.c | tests/userland/vfs.c | - |
 | `seteuid` | - | - | implemented | include/unistd.h | lib/libc/posix/setids.c | tests/userland/capgate.c<br>tests/userland/vfs.c | - |
 | `setgid` | - | - | implemented | include/unistd.h | lib/libc/posix/setids.c | tests/userland/main.c<br>tests/userland/signals-test.c<br>tests/userland/vfs.c | - |
-| `setpgid` | - | - | implemented | include/unistd.h | lib/libc/posix/setpgid.c | tests/userland/signals-test.c<br>tests/userland/vfs.c | - |
+| `setpgid` | - | - | implemented | include/unistd.h | lib/libc/posix/setpgid.c | tests/userland/main.c<br>tests/userland/signals-test.c<br>tests/userland/vfs.c | - |
 | `setregid` | - | - | implemented | include/unistd.h | lib/libc/posix/setids.c | tests/userland/vfs.c | - |
 | `setreuid` | - | - | implemented | include/unistd.h | lib/libc/posix/setids.c | tests/userland/main.c<br>tests/userland/vfs.c | - |
 | `setsid` | - | - | implemented | include/unistd.h | lib/libc/rtmux/posix-id.c | tests/userland/signals-test.c<br>tests/userland/vfs.c | marshals _PROC_SESSION_SETSID to roottask and returns the caller's pid as the new session id; a process-group leader fails with EPERM (regression-tested) |

@@ -36,7 +36,10 @@ typedef struct root_proc_info {
     uint8_t terming_priority;
     uint8_t process_priority;
     uint8_t pad0[2];
-    /* Session summary (sess_leader == 0 if process has no session). */
+
+    /* Session summary. sess_leader is always the session id: that of the system
+     * session, roottask, for a process with no session.
+     */
     pid_t sess_leader;
     pid_t sess_pgrp;
     int32_t sess_fd;

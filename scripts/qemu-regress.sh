@@ -593,7 +593,8 @@ Options:
                     cost (pshut) and longest interrupts-off window (irqoff)
                     logged before the storm ends (cumulative since boot: the
                     storm's 800 exits are all but one of the pshut samples);
-                    forces CONFIG_INSTRUMENTATION=y; at most 256 residents
+                    forces CONFIG_INSTRUMENTATION=y; at most 256 residents;
+                    above 100 the guest gets 2 MiB more RAM per resident
   --gdb-on-timeout  On a timeout, dump every hart through a live gdb stub
                     (scripts/gdb/dump-state.gdb) into build/lkl-logs/MODE-N.dump
                     before killing QEMU; implies --keep-logs
@@ -2319,6 +2320,20 @@ dump_hang_state()
     fi
 }
 
+# check_spawn_storm_loader LOG: a resident whose loader could not map its data
+# was starved of a roottask resource (K26): the run fails, whatever the tests
+# reported.
+check_spawn_storm_loader()
+{
+    local log="$1"
+
+    if grep -q 'mmap of data failed' "$log"; then
+        echo "  FAIL     spawn-storm: a process failed to map its data (ENOMEM in roottask)"
+        grep -m 3 'mmap of data failed' "$log"
+        return 1
+    fi
+}
+
 # report_spawn_storm_cost LOG: print the last pshut line and each hart's last
 # irqoff line logged before the guest's "storm done" marker, so they cover the
 # storm at PROCS resident processes and not the residents' own exits after it.
@@ -2532,6 +2547,13 @@ run_one()
     fi
     if [ -n "$PROCS" ]; then
         cmd+=("rtmux.spawn_procs=${PROCS}")
+        # Each resident /bin/cat takes about 1.6 MiB of physical memory, so the
+        # default 256 MiB guest holds about 140 of them (K26): above 100, add
+        # 2 MiB per resident to the default.
+        if [ "$PROCS" -gt 100 ] &&
+           [ "${EMU_MEM_MB:-0}" -lt $((256 + 2 * PROCS)) ]; then
+            export EMU_MEM_MB=$((256 + 2 * PROCS))
+        fi
     fi
     if [ "${#EXTRA_ARGS[@]}" -gt 0 ]; then
         cmd+=("${EXTRA_ARGS[@]}")
@@ -2787,8 +2809,11 @@ run_one()
         check_roottask_wait_reports "$log" || return 1
     fi
 
-    if [ "$MODE" = "spawn-storm" ] && [ -n "$PROCS" ]; then
-        report_spawn_storm_cost "$log" || return 1
+    if [ "$MODE" = "spawn-storm" ]; then
+        check_spawn_storm_loader "$log" || return 1
+        if [ -n "$PROCS" ]; then
+            report_spawn_storm_cost "$log" || return 1
+        fi
     fi
 
     if [ "$MODE" = "logger-restart" ]; then

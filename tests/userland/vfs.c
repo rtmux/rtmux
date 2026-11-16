@@ -4727,14 +4727,27 @@ static void test_namespace_open_entry_generation_race(void)
     mismatch_without_generation_bump = 0;
     for (int i = 0; i < ITERS; i++) {
         unsigned long long gen_before;
+        unsigned long long gen_mid;
         unsigned long long gen_after;
         int fd;
         int saw_access;
+        int have_gen;
 
+        /* Bracket the access with two samples of the generation. A removal
+         * that falls between the access and a single sample after it would
+         * bump before the sample and read as a miss with no bump, while one
+         * sample before it lets an attach in the same gap hide a removal that
+         * never bumped. Only when the two agree did the access see the entry
+         * at that generation, so any later removal must move it on.
+         */
+        gen_before = gen_mid = gen_after = 0;
+        have_gen =
+            read_namespace_counter("namespace_version", &gen_before) != -1;
         saw_access = access(path, F_OK) == 0;
-        gen_before = gen_after = 0;
         if (saw_access)
-            (void) read_namespace_counter("namespace_version", &gen_before);
+            have_gen = have_gen &&
+                       read_namespace_counter("namespace_version", &gen_mid) !=
+                           -1;
         errno = 0;
         fd = name_open(name, 0);
         if (fd != -1) {
@@ -4746,9 +4759,10 @@ static void test_namespace_open_entry_generation_race(void)
             absent++;
             if (saw_access) {
                 access_open_mismatch++;
-                if (read_namespace_counter("namespace_version", &gen_after) ==
+                if (!have_gen ||
+                    read_namespace_counter("namespace_version", &gen_after) ==
                         -1 ||
-                    gen_after == gen_before)
+                    (gen_mid == gen_before && gen_after == gen_mid))
                     mismatch_without_generation_bump++;
             }
         } else {
@@ -7835,6 +7849,170 @@ static void test_getsid_cases(void)
     }
 }
 
+static bool spawn_read_report(int fd, char *buf, size_t sz);
+
+/* A --session-probe child: its report, and the pipe that holds it alive. */
+struct session_probe {
+    pid_t pid;
+    int hold;
+    int sid, pg0, rc, err, pg1;
+};
+
+/* The integer after key in line, or `none` when key is absent. */
+static int probe_field(const char *line, const char *key, int none)
+{
+    const char *p = strstr(line, key);
+
+    return p ? atoi(p + strlen(key)) : none;
+}
+
+/* Spawn a --session-probe child (in a session of its own when `setsid`, joining
+ * group `join` when it is positive), and read its one-line report. False if it
+ * did not start or reported nothing readable.
+ */
+static bool session_probe_spawn(bool setsid,
+                                pid_t join,
+                                struct session_probe *sp)
+{
+    char joinarg[16];
+    char *argv[] = {"syscall_testing", "--session-probe", NULL, NULL};
+    posix_spawn_file_actions_t fa;
+    posix_spawnattr_t attr;
+    int in[2], out[2];
+    char line[128] = "";
+    int rc;
+
+    memset(sp, 0, sizeof *sp);
+    sp->pid = (pid_t) -1;
+    sp->hold = -1;
+    if (join > 0) {
+        snprintf(joinarg, sizeof joinarg, "%d", (int) join);
+        argv[2] = joinarg;
+    }
+    if (pipe(in) != 0)
+        return false;
+    if (pipe(out) != 0) {
+        (void) close(in[0]);
+        (void) close(in[1]);
+        return false;
+    }
+    (void) fcntl(in[1], F_SETFD, FD_CLOEXEC);
+    (void) fcntl(out[0], F_SETFD, FD_CLOEXEC);
+    (void) posix_spawn_file_actions_init(&fa);
+    (void) posix_spawn_file_actions_adddup2(&fa, in[0], 0);
+    (void) posix_spawn_file_actions_adddup2(&fa, out[1], 1);
+    (void) posix_spawn_file_actions_addclose(&fa, in[0]);
+    (void) posix_spawn_file_actions_addclose(&fa, out[1]);
+    (void) posix_spawnattr_init(&attr);
+    if (setsid)
+        (void) posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSID);
+    rc = posix_spawn(&sp->pid, "/bin/syscall_testing", &fa, &attr, argv, NULL);
+    (void) posix_spawnattr_destroy(&attr);
+    (void) posix_spawn_file_actions_destroy(&fa);
+    (void) close(in[0]);
+    (void) close(out[1]);
+    if (rc == EOK && !spawn_read_report(out[0], line, sizeof line))
+        line[0] = '\0';
+    (void) close(out[0]);
+    if (rc == EOK && strstr(line, "pg1=")) {
+        sp->sid = probe_field(line, "sid=", -1);
+        sp->pg0 = probe_field(line, "pg0=", -1);
+        sp->rc = probe_field(line, "rc=", -2);
+        sp->err = probe_field(line, "err=", -1);
+        sp->pg1 = probe_field(line, "pg1=", -1);
+        sp->hold = in[1];
+        return true;
+    }
+    (void) close(in[1]);
+    if (rc == EOK)
+        (void) wait_child_exit(sp->pid, &(int){0}, 500);
+    sp->pid = (pid_t) -1;
+    return false;
+}
+
+static void session_probe_release(struct session_probe *sp)
+{
+    if (sp->pid != (pid_t) -1)
+        (void) getsid_hold_release(sp->pid, sp->hold);
+}
+
+/* One rule for "no session": the caller, two children that never called setsid
+ * (one joins the other's group), one that did, and a child that tries to join
+ * that one's group, must agree between getsid, setpgid and kill. A process that
+ * never called setsid belongs to its starter's session, so it reports the
+ * caller's session, may lead a group or join one in that session, and is
+ * signalled by group like any other; a session leader reports itself, is
+ * refused setpgid (EPERM), and is another session for getsid (EPERM) and for
+ * joining its group (EPERM). (tcgetsid is not implemented, so it is not in the
+ * table.)
+ */
+static void test_session_rule(void)
+{
+    struct session_probe a, b, c, l;
+    pid_t self = getsid(0);
+    bool ok_a = session_probe_spawn(false, 0, &a);
+    bool ok_l = session_probe_spawn(true, 0, &l);
+    bool ok_b = ok_a && session_probe_spawn(false, a.pid, &b);
+    bool ok_c = ok_l && session_probe_spawn(false, l.pid, &c);
+    char detail[160];
+
+    check(ok_a && ok_l && ok_b && ok_c, "session rule spawn probes",
+          "the session table needs four live children");
+    if (!(ok_a && ok_l && ok_b && ok_c))
+        goto out;
+
+    snprintf(detail, sizeof detail, "a sid %d b sid %d self %d", a.sid, b.sid,
+             (int) self);
+    check(a.sid == self && b.sid == self && a.sid == b.sid,
+          "never-setsid children report the caller's session", detail);
+    snprintf(detail, sizeof detail, "rc %d err %d pg %d pid %d", a.rc, a.err,
+             a.pg1, (int) a.pid);
+    check(a.rc == 0 && a.pg1 == a.pid,
+          "setpgid(0, 0) in a never-setsid child leads its own group", detail);
+    snprintf(detail, sizeof detail, "rc %d err %d pg %d want %d", b.rc, b.err,
+             b.pg1, (int) a.pid);
+    check(b.rc == 0 && b.pg1 == a.pid,
+          "setpgid into another group unlocks the caller once (join succeeds)",
+          detail);
+    snprintf(detail, sizeof detail, "rc %d err %d pg %d", c.rc, c.err, c.pg1);
+    check(c.rc == -1 && c.err == EPERM && c.pg1 == c.pg0,
+          "setpgid into a group of another session is EPERM", detail);
+    snprintf(detail, sizeof detail, "sid %d pid %d rc %d err %d", l.sid,
+             (int) l.pid, l.rc, l.err);
+    check(l.sid == l.pid && l.rc == -1 && l.err == EPERM && l.pg1 == l.pid,
+          "a session leader reports itself and setpgid refuses it", detail);
+
+    {
+        pid_t got_a, got_b, got_l;
+        int e_l, k_a, k_l;
+
+        got_a = getsid(a.pid);
+        got_b = getsid(b.pid);
+        errno = 0;
+        got_l = getsid(l.pid);
+        e_l = errno;
+        snprintf(detail, sizeof detail, "a %d b %d l %d errno %d self %d",
+                 (int) got_a, (int) got_b, (int) got_l, e_l, (int) self);
+        check(got_a == self && got_b == self && got_l == -1 && e_l == EPERM,
+              "getsid from the caller: same session, other session EPERM",
+              detail);
+        k_a = kill(-a.pid, 0);
+        k_l = kill(-l.pid, 0);
+        snprintf(detail, sizeof detail, "kill(-a) %d kill(-l) %d", k_a, k_l);
+        check(k_a == 0 && k_l == 0,
+              "kill by group reaches both sessions' groups", detail);
+    }
+out:
+    if (ok_c)
+        session_probe_release(&c);
+    if (ok_b)
+        session_probe_release(&b);
+    if (ok_a)
+        session_probe_release(&a);
+    if (ok_l)
+        session_probe_release(&l);
+}
+
 static int name_fd_matches(int fd, const name_attach_t *attach)
 {
     struct _server_info info;
@@ -10155,6 +10333,24 @@ void test_spawn_concurrent(void)
     }
 }
 
+/* Print roottask's heap use and the free physical memory with "residents" idle
+ * processes alive, so a run shows how close the storm came to exhausting either
+ * (K26).
+ */
+static void spawn_storm_report_memory(unsigned residents)
+{
+    char snap[4096];
+    int fd = open("/sys/kstats", O_RDONLY);
+
+    if (fd < 0)
+        return;
+    if (kstats_read(fd, snap, sizeof snap) > 0)
+        printf("spawn_storm: residents=%u roottask.heap_used=%ld pa.free_bytes=%ld\n",
+               residents, kstats_get(snap, "roottask.heap_used"),
+               kstats_get(snap, "pa.free_bytes"));
+    (void) close(fd);
+}
+
 /* Run the spawn storm with residents idle processes alive across it: each is
  * /bin/cat (the small toolbox binary) blocked reading a pipe until EOF. The
  * kernel's pshut and irqoff lines (CONFIG_INSTRUMENTATION) printed before the
@@ -10181,8 +10377,12 @@ void test_spawn_storm(unsigned residents)
         (void) close(p[1]);
         return;
     }
+    spawn_storm_report_memory(0);
     for (; spawned < residents; spawned++) {
         posix_spawn_file_actions_t fa;
+
+        if (spawned && spawned % 50 == 0)
+            spawn_storm_report_memory(spawned);
         int rc = posix_spawn_file_actions_init(&fa);
 
         if (!rc) {
@@ -10201,6 +10401,7 @@ void test_spawn_storm(unsigned residents)
         }
     }
     printf("spawn_storm: residents=%u\n", spawned);
+    spawn_storm_report_memory(spawned);
     if (spawned == residents) {
         test_spawn_concurrent();
         sleep(2); /* let one more pshut/irqoff report land before the marker */
@@ -10278,6 +10479,11 @@ void test_vfs(void)
     test_posix_isatty();
     test_posix__exit();
     test_posix_crypt();
+    /* Before the suite's own setsid: its children are then still in the session
+     * the suite was started in, which for a boot-time starter is the system
+     * session.
+     */
+    test_session_rule();
     test_posix_session_jobcontrol();
     test_posix_fsync();
     test_posix_sync();
