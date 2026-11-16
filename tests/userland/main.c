@@ -1046,6 +1046,12 @@ int main(int argc, char *argv[])
             test_skip("mutex_waiting_republish", "fault injection unavailable");
         return finish(1);
     }
+    if (argc == 2 && !strcmp(argv[1], "--condvar-interrupt-stale")) {
+        printf("[condvar_interrupt_stale]\n");
+        if (condvar_interrupt_stale() == TC_EXIT_SKIP)
+            test_skip("condvar_interrupt_stale", "fault injection unavailable");
+        return finish(1);
+    }
     if (argc == 3 && !strcmp(argv[1], "--serial-unblock-child"))
         return serial_unblock_child(!strcmp(argv[2], "announce"));
     if (argc == 2 && !strcmp(argv[1], "--console-poll")) {

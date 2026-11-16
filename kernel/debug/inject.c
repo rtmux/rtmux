@@ -102,22 +102,21 @@ int inject_should_fail_turnstile(process_t *prp)
 static atomic_int armed_stall_pid = -1;
 static atomic_uint armed_stall_ms;
 
-/* Called from the contended lock path with the chain lock dropped, after the
- * waiter published itself and before it queues.
- */
-void inject_mutex_lock_stall(process_t *prp)
+/* Claim a one-shot stall armed for pid and spin for the armed time. */
+static void inject_stall_once(atomic_int *armed_pid,
+                              atomic_uint *armed_ms,
+                              const process_t *prp)
 {
-    int pid = atomic_load_explicit(&armed_stall_pid, memory_order_acquire);
+    int pid = atomic_load_explicit(armed_pid, memory_order_acquire);
     uint64_t ms;
     uint64_t end;
 
     if (pid < 0 || !prp || prp->pid != pid)
         return;
     /* Read the duration the arm published before claiming it. */
-    ms = atomic_load_explicit(&armed_stall_ms, memory_order_relaxed);
-    if (!atomic_compare_exchange_strong_explicit(&armed_stall_pid, &pid, -1,
-                                                 memory_order_acq_rel,
-                                                 memory_order_relaxed))
+    ms = atomic_load_explicit(armed_ms, memory_order_relaxed);
+    if (!atomic_compare_exchange_strong_explicit(
+            armed_pid, &pid, -1, memory_order_acq_rel, memory_order_relaxed))
         return;
     end = r_time() + ms * (qtimeptr->cycles_per_sec / 1000);
     atomic_store_explicit(&consumed, 1, memory_order_release);
@@ -125,6 +124,26 @@ void inject_mutex_lock_stall(process_t *prp)
     while (r_time() < end)
         ;
     inject_spin_end();
+}
+
+/* Called from the contended lock path with the chain lock dropped, after the
+ * waiter published itself and before it queues.
+ */
+void inject_mutex_lock_stall(process_t *prp)
+{
+    inject_stall_once(&armed_stall_pid, &armed_stall_ms, prp);
+}
+
+/* Like armed_stall_pid, for force_ready's wait-chain window. */
+static atomic_int armed_fr_pid = -1;
+static atomic_uint armed_fr_ms;
+
+/* Called from sync_chain_force_ready after it read the waiter's key, before it
+ * takes the chain lock.
+ */
+void inject_force_ready_stall(thread_t *thp)
+{
+    inject_stall_once(&armed_fr_pid, &armed_fr_ms, thp->process);
 }
 
 /* Called from object_alloc before it touches the free list. Ordinary allocation
@@ -218,6 +237,17 @@ void kext_debug_inject(void *data)
         atomic_store_explicit(&armed_stall_ms, (unsigned) kap->arg1,
                               memory_order_relaxed);
         atomic_store_explicit(&armed_stall_pid, (int) kap->arg0,
+                              memory_order_release);
+        break;
+    case INJECT_OP_STALL_FORCE_READY:
+        if (kap->arg1 == 0 || kap->arg1 > INJECT_SPIN_MAX_MS) {
+            ret = EINVAL;
+            break;
+        }
+        atomic_store_explicit(&consumed, 0, memory_order_relaxed);
+        atomic_store_explicit(&armed_fr_ms, (unsigned) kap->arg1,
+                              memory_order_relaxed);
+        atomic_store_explicit(&armed_fr_pid, (int) kap->arg0,
                               memory_order_release);
         break;
     case INJECT_OP_ALLOC_STATUS:

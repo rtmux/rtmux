@@ -243,7 +243,7 @@ ksync_t *rdecl sync_create(process_t *bill_prp, sync_t *sync, unsigned flags);
 int rdecl sync_destroy(process_t *prp, sync_t *sync);
 ksync_t *rdecl sync_lookup(sync_t *sync, unsigned create);
 void rdecl sync_wakeup(ksync_t *syp, int all);
-int rdecl sync_chain_force_ready(thread_t *thp);
+bool rdecl sync_chain_force_ready(thread_t *thp);
 
 notification_t *rdecl notification_add(process_t *prp,
                                        pril_head_t *queue,

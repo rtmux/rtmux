@@ -347,6 +347,7 @@ void cpu_force_fpu_save(thread_t *thp);
 int inject_should_fail_alloc(process_t *prp,
                              soul_t *soulp); /* debug/inject.c */
 void inject_mutex_lock_stall(process_t *prp);
+void inject_force_ready_stall(thread_t *thp);
 void ipc_blk_trace(const char *file, int line, thread_t *thp);
 #define IPC_BLK(thp) ipc_blk_trace(__FILE__, __LINE__, (thp))
 void thr_trace(const char *file, int line, thread_t *thp, void *ra);
@@ -362,6 +363,10 @@ int inject_should_fail_turnstile(process_t *prp); /* debug/inject.c */
 static inline void inject_mutex_lock_stall(process_t *prp)
 {
     (void) prp;
+}
+static inline void inject_force_ready_stall(thread_t *thp)
+{
+    (void) thp;
 }
 #define IPC_BLK(thp) ((void) 0)
 #define THR_EV(thp) ((void) 0)

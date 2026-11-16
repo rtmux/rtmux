@@ -1130,41 +1130,67 @@ static thread_t *sync_dequeue_head(struct sync_chain *c, sync_key_t key)
 }
 
 /* Remove a thread from the chain-keyed sync wait queue during force_ready()
- * paths (timeout, signal/cancel, destroy). force_ready() only understands
- * ksync_t wait lists; chain waiters identify their queue by args.mu.wait_key.
+ * paths (timeout, signal/cancel, destroy). Chain waiters identify their queue
+ * by args.mu.wait_key; there is no other sync wait queue.
+ *
+ * force_ready reads thp->state without any lock, so thp may have been woken,
+ * run and blocked somewhere else by the time this takes the chain lock. Every
+ * field read here before the lock is then stale: args.mu.wait_key aliases the
+ * message arguments and prev.thread a channel queue link. Only under the chain
+ * lock does a sync state mean that the thread is queued: a waker unlinks it
+ * (clearing prev) under that lock before it readies it, and a waiter stamps its
+ * state under the same lock it queued with.
+ *
+ * Returns true when thp was queued and is now unlinked, so the caller readies
+ * it. False means it is not queued: a waker unlinked it and is about to ready
+ * it (the caller must wait for that, or the thread may be destroyed or move on
+ * before the waker's ready), or it waits somewhere else, or not at all, so the
+ * caller starts over from its state.
+ *
+ * A thread woken and queued again on the same key passes the test and is
+ * unblocked: that unblock reaches its new wait, as if it had arrived just after
+ * the thread blocked again, a valid order for an interrupt or a cancel.
+ * Wait_key is only written under its own chain lock, so the read here is
+ * consistent. The chain address is computed from the key read before the lock,
+ * so the state read under the lock is ordered after that read: a thread seen
+ * with message arguments in the union has already left the sync states.
+ *
+ * The queued test is O(1): under the chain lock a sync state with the matching
+ * key and a back link that points at thp mean thp is linked here. Walking the
+ * chain to prove it would add O(chain) to the interrupt-disabled window of
+ * every timeout and interrupt unblock of a condvar or semaphore waiter.
  */
-int rdecl sync_chain_force_ready(thread_t *thp)
+bool rdecl sync_chain_force_ready(thread_t *thp)
 {
     sync_key_t key = thp->args.mu.wait_key;
     struct sync_chain *c;
+    turnstile_t *ts;
+    thread_t *owner;
 
     if (!key)
-        return 0;
+        return false;
 
     c = sync_chain_of(key);
     kspinlock_lock(&c->lock);
-    if (thp->args.mu.wait_key == key && thp->prev.thread) {
-        turnstile_t *ts;
-        thread_t *owner;
-
-        kspinlock_lock(&sync_pi_slock);
-        ts = thp->blocked_on_turnstile;
-        kspinlock_unlock(&sync_pi_slock);
-        owner = sync_turnstile_owner_pin(ts);
-        sync_dequeue(c, thp);
-        if (thp->state == STATE_MUTEX && !sync_has_waiter(c, key)) {
-            if (ts) {
-                sync_turnstile_free_idle_locked(c, ts);
-            }
-        }
+    if (!prio_on_sync_chain(thp) || thp->args.mu.wait_key != key ||
+        !thp->prev.thread || *thp->prev.thread != thp) {
         kspinlock_unlock(&c->lock);
-        sync_pi_recompute_owner(owner);
-        if (owner)
-            tthread_unpin(owner);
-        return 1;
+        return false;
+    }
+    kspinlock_lock(&sync_pi_slock);
+    ts = thp->blocked_on_turnstile;
+    kspinlock_unlock(&sync_pi_slock);
+    owner = sync_turnstile_owner_pin(ts);
+    sync_dequeue(c, thp);
+    if (thp->state == STATE_MUTEX && !sync_has_waiter(c, key)) {
+        if (ts)
+            sync_turnstile_free_idle_locked(c, ts);
     }
     kspinlock_unlock(&c->lock);
-    return 1;
+    sync_pi_recompute_owner(owner);
+    if (owner)
+        tthread_unpin(owner);
+    return true;
 }
 
 /* User sync_t probing and validation. */
