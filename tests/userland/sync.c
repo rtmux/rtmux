@@ -3451,6 +3451,8 @@ static void test_robust_held_limit(void)
         (void) pthread_mutex_destroy(&m[i]);
 }
 
+static void test_cancel_before_block(void);
+
 void test_sync(void)
 {
     test_create_mutex();
@@ -3517,4 +3519,226 @@ void test_sync(void)
     test_create_destroy_recreate();
     test_malloc_fifo_mixed_prio();
     test_fp_isolation();
+    test_cancel_before_block();
+}
+
+/* A cancel that arrives while the target runs, before it blocks, must not be
+ * lost: the target is held in user code (not at a cancellation point) while the
+ * cancel is issued, and then enters a blocking call. It has to terminate there.
+ * The kernel used to read a thread's pending-cancel flag only when its TLS sat
+ * in kernel memory, which is never so for a user thread, so such a cancel left
+ * the thread blocked for good.
+ */
+enum { CBB_RECEIVE, CBB_NANOSLEEP, CBB_KINDS };
+
+struct cbb_ctx {
+    int kind;
+    int chid;
+    atomic_int ready;
+    atomic_int go;
+    atomic_int finished;
+};
+
+static void cbb_finish(void *raw)
+{
+    atomic_store(&((struct cbb_ctx *) raw)->finished, 1);
+}
+
+static void *cbb_thread(void *raw)
+{
+    struct cbb_ctx *c = raw;
+    char buf[8];
+
+    pthread_cleanup_push(cbb_finish, c);
+    atomic_store(&c->ready, 1);
+    while (!atomic_load(&c->go))
+        (void) sched_yield();
+    if (c->kind == CBB_RECEIVE)
+        (void) msg_receive(c->chid, buf, sizeof buf, NULL);
+    else
+        (void) nanosleep(&(struct timespec){.tv_sec = 30}, NULL);
+    pthread_cleanup_pop(0);
+    return NULL;
+}
+
+/* Wait up to three seconds for the thread to run its cleanup handler. */
+static int cbb_wait_finished(struct cbb_ctx *cp)
+{
+    for (int i = 0; i < 300 && !atomic_load(&cp->finished); i++)
+        sleep_ms(10);
+    return atomic_load(&cp->finished);
+}
+
+static void test_cancel_before_block(void)
+{
+    static const char *const name[CBB_KINDS] = {"msg_receive", "nanosleep"};
+
+    static struct cbb_ctx cbb_ctxs[CBB_KINDS]; /* a stuck thread keeps its context */
+
+    for (int kind = 0; kind < CBB_KINDS; kind++) {
+        struct cbb_ctx *cp = &cbb_ctxs[kind];
+        pthread_t th;
+        void *ret = NULL;
+
+        *cp = (struct cbb_ctx){.kind = kind, .chid = -1};
+        char what[64];
+
+        if (kind == CBB_RECEIVE && (cp->chid = channel_create(0)) == -1) {
+            test_fail("cancel before block fixture", strerror(errno));
+            continue;
+        }
+        if (pthread_create(&th, NULL, cbb_thread, cp) != 0) {
+            test_fail("cancel before block fixture", "pthread_create");
+            if (cp->chid != -1)
+                (void) channel_destroy(cp->chid);
+            continue;
+        }
+        for (int i = 0; i < 3000 && !atomic_load(&cp->ready); i++)
+            sleep_ms(1);
+        if (!atomic_load(&cp->ready)) {
+            test_fail("cancel before block fixture", "thread did not start");
+            if (cp->chid != -1)
+                (void) channel_destroy(cp->chid);
+            continue;
+        }
+        if (pthread_cancel(th) != 0)
+            test_fail("cancel before block fixture", "pthread_cancel");
+        atomic_store(&cp->go, 1);
+        int done = cbb_wait_finished(cp);
+
+        snprintf(what, sizeof what, "cancel before %s block terminates", name[kind]);
+        check(done, what, "a cancel pending when the thread blocked was lost");
+        if (!done) {
+            /* It is blocked now, so this cancel lands. Do not join a thread
+             * that may still not exit: the suite must not hang on a failure.
+             */
+            (void) pthread_cancel(th);
+            if (!cbb_wait_finished(cp))
+                continue;
+        }
+        (void) pthread_join(th, &ret);
+        check(ret == PTHREAD_CANCELED, "cancelled thread reports PTHREAD_CANCELED",
+              "the join value must be PTHREAD_CANCELED");
+        if (cp->chid != -1)
+            (void) channel_destroy(cp->chid);
+    }
+}
+
+/* condvar_reacquire_alloc_failure: a condition wait on a PI mutex returns with
+ * the mutex held, or fails before it gives the mutex up, even when the kernel's
+ * turnstile allocation fails. Needs the debug fault-injection call (/bin/inject,
+ * installed only on a CONFIG_DEBUG_INJECT kernel); without it the case is
+ * skipped.
+ *
+ * 1. With the next allocation failing, the wait must report EAGAIN and leave
+ *    the caller holding the mutex: the reservation is made before the release.
+ * 2. A helper takes the mutex while the main thread waits, arms the failure,
+ *    and keeps the mutex until after the wait's deadline. The reacquire then
+ *    has to queue behind the helper, and so it must not allocate: the wait
+ *    returns only once the helper has let go, and returns holding the mutex.
+ */
+#define CVR_DEADLINE_MS 1500L
+#define CVR_HOLD_MS 150L /* how long past the deadline the helper keeps the mutex */
+#define CVR_PID_NONE "2147483647"
+
+static pthread_mutex_t cvr_mutex;
+static pthread_cond_t cvr_cond;
+static struct timespec cvr_deadline;
+static char cvr_pidarg[16];
+static atomic_int cvr_armed;
+static atomic_int cvr_released;
+
+static void cvr_ts_add_ms(struct timespec *ts, long ms)
+{
+    ts->tv_nsec += ms * 1000000L;
+    ts->tv_sec += ts->tv_nsec / 1000000000L;
+    ts->tv_nsec %= 1000000000L;
+}
+
+static void cvr_deadline_set(long ms)
+{
+    clock_gettime(CLOCK_MONOTONIC, &cvr_deadline);
+    cvr_ts_add_ms(&cvr_deadline, ms);
+}
+
+static void *cvr_helper(void *arg)
+{
+    struct timespec until = cvr_deadline;
+
+    (void) arg;
+    /* The main thread is in its wait once the mutex can be taken. */
+    while (pthread_mutex_trylock(&cvr_mutex) != 0)
+        (void) nanosleep(&(struct timespec){.tv_nsec = 1000000L}, NULL);
+    if (inject_run("fail-turnstile", cvr_pidarg, NULL) == 0)
+        atomic_store(&cvr_armed, 1);
+    cvr_ts_add_ms(&until, CVR_HOLD_MS);
+    (void) clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &until, NULL);
+    atomic_store(&cvr_released, 1);
+    pthread_mutex_unlock(&cvr_mutex);
+    return NULL;
+}
+
+int condvar_reacquire_alloc_failure(void)
+{
+    pthread_mutexattr_t ma;
+    pthread_condattr_t ca;
+    pthread_t th;
+    int rc;
+
+    if (inject_run("alloc-status", NULL, NULL) != 0)
+        return TC_EXIT_SKIP;
+    snprintf(cvr_pidarg, sizeof cvr_pidarg, "%d", (int) getpid());
+    pthread_mutexattr_init(&ma);
+    pthread_mutexattr_setprotocol(&ma, PTHREAD_PRIO_INHERIT);
+    pthread_mutex_init(&cvr_mutex, &ma);
+    pthread_condattr_init(&ca);
+    pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
+    pthread_cond_init(&cvr_cond, &ca);
+
+    /* 1. The reservation fails: EAGAIN, mutex still held. */
+    pthread_mutex_lock(&cvr_mutex);
+    if (inject_run("fail-turnstile", cvr_pidarg, NULL) != 0) {
+        test_fail("condvar_reacquire_alloc_failure fixture", "inject refused");
+        pthread_mutex_unlock(&cvr_mutex);
+        return 0;
+    }
+    cvr_deadline_set(20);
+    rc = pthread_cond_timedwait(&cvr_cond, &cvr_mutex, &cvr_deadline);
+    check(rc == EAGAIN, "cond_timedwait PI turnstile ENOMEM fails with EAGAIN",
+          "expected EAGAIN");
+    rc = pthread_mutex_trylock(&cvr_mutex);
+    if (rc == EOK)
+        (void) pthread_mutex_unlock(&cvr_mutex); /* the wait lost the mutex */
+    check(rc == EBUSY, "cond_timedwait EAGAIN keeps the mutex",
+          "mutex not held on return");
+    if (rc == EBUSY)
+        (void) pthread_mutex_unlock(&cvr_mutex);
+
+    /* 2. The reacquire queues behind a holder while allocation fails. */
+    (void) inject_run("fail-turnstile", CVR_PID_NONE, NULL);
+    atomic_store(&cvr_armed, 0);
+    atomic_store(&cvr_released, 0);
+    pthread_mutex_lock(&cvr_mutex);
+    cvr_deadline_set(CVR_DEADLINE_MS);
+    if (pthread_create(&th, NULL, cvr_helper, NULL) != 0) {
+        test_fail("condvar_reacquire_alloc_failure fixture", "pthread_create");
+        pthread_mutex_unlock(&cvr_mutex);
+        return 0;
+    }
+    rc = pthread_cond_timedwait(&cvr_cond, &cvr_mutex, &cvr_deadline);
+    check(atomic_load(&cvr_armed), "cond_timedwait reacquire fixture armed",
+          "failure not armed before the deadline");
+    check(rc == ETIMEDOUT, "cond_timedwait reacquire under ENOMEM times out",
+          "expected ETIMEDOUT");
+    check(atomic_load(&cvr_released),
+          "cond_timedwait returns only once it owns the mutex",
+          "returned while the helper still held it");
+    check(pthread_mutex_unlock(&cvr_mutex) == EOK,
+          "cond_timedwait reacquire under ENOMEM holds the mutex",
+          "unlock failed: mutex not held");
+    (void) pthread_join(th, NULL);
+    (void) inject_run("fail-turnstile", CVR_PID_NONE, NULL);
+    pthread_cond_destroy(&cvr_cond);
+    pthread_mutex_destroy(&cvr_mutex);
+    return 0;
 }

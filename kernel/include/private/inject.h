@@ -51,6 +51,12 @@
  */
 #define INJECT_OP_SCHED_SET_DISPLACED 8
 
+/* FAIL_NEXT_TURNSTILE(pid): the next allocation of a PI turnstile on behalf of
+ * that process fails once, whether it is a condvar wait's reservation or a
+ * contended lock's own. ALLOC_STATUS reports whether it was consumed.
+ */
+#define INJECT_OP_FAIL_NEXT_TURNSTILE 9
+
 #define INJECT_SPIN_MAX_MS 10000
 
 /* Injected interrupts-off spins, for intrevent_flush()'s debug spin watchdog: a

@@ -147,8 +147,9 @@ static const struct toolbox_applet applets[] = {
     {"id", applet_id, "id [USER]"},
     {"inject", applet_inject,
      "inject spin-irqoff HART MS | spin-console HART MS | hang-hart HART | "
-     "fail-alloc POOL PID | alloc-status | fail-sched-set PID COUNT | "
-     "sched-set-status | sched-set-displaced MIN"},
+     "fail-alloc POOL PID | fail-turnstile PID | alloc-status | "
+     "fail-sched-set PID COUNT | sched-set-status | "
+     "sched-set-displaced MIN"},
     {"kill", applet_kill, "kill [-SIG] PID ..."},
     {"login", applet_login, "login [USER]"},
     {"less", applet_less, "less [FILE ...]"},
@@ -3142,6 +3143,9 @@ static int applet_inject(int argc, char **argv)
             printf("sched-set-displaced=%d\n", rc);
         return rc >= 0 && (unsigned long) rc >= strtoul(argv[2], NULL, 0) ? 0
                                                                           : 3;
+    } else if (argc == 3 && !strcmp(argv[1], "fail-turnstile")) {
+        rc = inject_call(INJECT_OP_FAIL_NEXT_TURNSTILE,
+                         strtoul(argv[2], NULL, 0), 0);
     } else if (argc == 2 && !strcmp(argv[1], "alloc-status")) {
         rc = inject_call(INJECT_OP_ALLOC_STATUS, 0, 0);
         if (rc >= 0)
@@ -3150,8 +3154,8 @@ static int applet_inject(int argc, char **argv)
     } else {
         fprintf(stderr,
                 "usage: inject spin-irqoff HART MS | spin-console HART MS | "
-                "hang-hart HART | fail-alloc POOL PID | alloc-status | "
-                "fail-sched-set PID COUNT | sched-set-status | "
+                "hang-hart HART | fail-alloc POOL PID | fail-turnstile PID | "
+                "alloc-status | fail-sched-set PID COUNT | sched-set-status | "
                 "sched-set-displaced MIN\n");
         return 2;
     }

@@ -915,6 +915,10 @@ static void robust_owner_died(thread_t *thp);
 void rdecl sync_thread_cleanup(thread_t *thp)
 {
     robust_owner_died(thp);
+    if (thp->ts_spare) {
+        _sfree(thp->ts_spare, sizeof(*thp->ts_spare));
+        thp->ts_spare = NULL;
+    }
     for (unsigned i = 0; i < SYNC_NCHAINS; i++) {
         struct sync_chain *c = &sync_chains[i];
 
@@ -1397,6 +1401,45 @@ struct robust_hold {
     sync_t *uva;    /* the holder's virtual address of it */
 };
 
+/* A new zeroed turnstile, or NULL when out of memory (or injected). */
+static turnstile_t *sync_ts_alloc(thread_t *act)
+{
+#ifdef CONFIG_DEBUG_INJECT
+    if (inject_should_fail_turnstile(act->process))
+        return NULL;
+#endif
+    return _scalloc(sizeof(turnstile_t));
+}
+
+/* The thread's idle turnstile, or a new one: a contended PI lock needs one, and
+ * a condvar wait reserves it (see ts_spare in objects.h) so the reacquire on
+ * wake cannot fail on an allocation. Zeroed either way. NULL when out of
+ * memory.
+ */
+static turnstile_t *sync_ts_take(thread_t *act)
+{
+    turnstile_t *ts = act->ts_spare;
+
+    if (ts) {
+        act->ts_spare = NULL;
+        return ts;
+    }
+    return sync_ts_alloc(act);
+}
+
+/* Give back a turnstile that was never queued anywhere: keep it as the spare,
+ * or free it.
+ */
+static void sync_ts_put(thread_t *act, turnstile_t *ts)
+{
+    if (!ts)
+        return;
+    if (!act->ts_spare)
+        act->ts_spare = ts;
+    else
+        _sfree(ts, sizeof(*ts));
+}
+
 /* Get a record for a robust lock of sync: the caller's spare, or a new one.
  * Returns EOK with *recp set, or an errno.
  */
@@ -1821,8 +1864,7 @@ retry_contended:
     rc = mutex_try_acquire(act, sync);
     if (rc != MUTEX_BUSY) {
         kspinlock_unlock(&c->lock);
-        if (allocated_ts)
-            _sfree(allocated_ts, sizeof(*allocated_ts));
+        sync_ts_put(act, allocated_ts);
         mutex_lock_done(act, sync, recp, rc);
         return;
     }
@@ -1838,7 +1880,7 @@ retry_contended:
         if (!ts) {
             if (!allocated_ts) {
                 kspinlock_unlock(&c->lock);
-                allocated_ts = _scalloc(sizeof(*allocated_ts));
+                allocated_ts = sync_ts_take(act);
                 if (!allocated_ts) {
                     kcall_err(act, EAGAIN);
                     return;
@@ -1882,8 +1924,7 @@ retry_contended:
             if (owner)
                 tthread_unpin(owner);
             kcall_err(act, rc);
-            if (free_ts)
-                _sfree(free_ts, sizeof(*free_ts));
+            sync_ts_put(act, free_ts);
             return;
         }
 
@@ -1896,8 +1937,7 @@ retry_contended:
             sync_turnstile_set_owner_thread_locked(ts, NULL, 0, 0);
             sync_turnstile_free_idle_locked(c, ts);
             kspinlock_unlock(&c->lock);
-            if (free_ts)
-                _sfree(free_ts, sizeof(*free_ts));
+            sync_ts_put(act, free_ts);
             mutex_lock_done(act, sync, recp, rc);
             return;
         }
@@ -1960,8 +2000,7 @@ retry_contended:
         sync_pi_recompute_owner(old_owner);
         if (old_owner)
             tthread_unpin(old_owner);
-        if (free_ts)
-            _sfree(free_ts, sizeof(*free_ts));
+        sync_ts_put(act, free_ts);
         mutex_lock_done(act, sync, recp, MUTEX_TAKEN);
         return;
     }
@@ -1983,6 +2022,10 @@ retry_contended:
      */
     extern void unready_release(thread_t *, int, kspinlock_t *);
     unready_release(act, STATE_MUTEX, &c->lock);
+
+    /* act may own the mutex and run on another hart by now, so its spare slot
+     * is off limits: free the idle turnstile outright.
+     */
     if (free_ts)
         _sfree(free_ts, sizeof(*free_ts));
     if (free_rec)
@@ -2196,6 +2239,27 @@ void sync_mutex_lock(thread_t *act, sync_t *sync, int flags)
 
 /* CONDITION VARIABLE */
 
+/* The reacquire on a condvar wake runs where nothing can be reported but the
+ * lock's own result, so every allocation it may need is made before the mutex
+ * is released, while an EAGAIN can still reach the caller with the mutex held:
+ * an idle turnstile for a PI mutex, a holder record for a robust one. False
+ * when out of memory.
+ */
+static bool condvar_reserve_reacquire(thread_t *act, sync_t *mutex)
+{
+    if (mutex_pi_enabled(mutex) && !act->ts_spare) {
+        act->ts_spare = sync_ts_alloc(act);
+        if (!act->ts_spare)
+            return false;
+    }
+    if (mutex_robust(mutex) && !act->robust_spare) {
+        act->robust_spare = _scalloc(sizeof(*act->robust_spare));
+        if (!act->robust_spare)
+            return false;
+    }
+    return true;
+}
+
 /* Wait on a condition variable, releasing the bound mutex atomically (kcall
  * slot SYNC_CONDVAR_WAIT).
  *
@@ -2257,6 +2321,15 @@ int kdecl ksys_sync_condvar_wait(thread_t *act,
     struct sync_chain *cv_c = sync_chain_of(cv_key);
     struct sync_chain *mutex_c = sync_chain_of(mutex_key);
 
+    if (!condvar_reserve_reacquire(act, mutex)) {
+        /* Not blocking: drop a timed wait's armed timeout, or the thread's next
+         * condition wait would start with it.
+         */
+        act->timeout_flags = 0;
+        kcall_err(act, EAGAIN);
+        return ENOERROR;
+    }
+
     /* A robust bound mutex is released here the way ksys_sync_mutex_unlock
      * releases one: only by its recorded holder, and an inconsistent one
      * becomes unrecoverable. The wait still goes through its release and
@@ -2269,6 +2342,7 @@ int kdecl ksys_sync_condvar_wait(thread_t *act,
         rc = robust_release_begin(act, mutex, mutex_key, &mutex_rec,
                                   &mutex_unrecoverable);
         if (rc != EOK) {
+            act->timeout_flags = 0; /* not blocking: drop an armed timeout */
             kcall_err(act, rc);
             return ENOERROR;
         }

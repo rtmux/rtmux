@@ -139,7 +139,14 @@ if test "$rtmux_run" = "debug-inject"; then
             ok=3
         fi
     fi
+    # A condition wait on a PI mutex must not lose the mutex to a failing
+    # turnstile allocation.
     if test "$ok" = 3; then
+        if /bin/syscall_testing --condvar-reacquire-alloc-failure; then
+            ok=4
+        fi
+    fi
+    if test "$ok" = 4; then
         echo "RTMux debug-inject: PASS"
     else
         echo "RTMux debug-inject: FAIL"

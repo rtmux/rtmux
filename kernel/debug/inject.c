@@ -78,6 +78,24 @@ void inject_note_sched_return(thread_t *act, bool displaced)
         atomic_fetch_add_explicit(&sched_displaced, 1, memory_order_release);
 }
 
+/* The pid whose next turnstile allocation fails, or -1: consumed like
+ * armed_soul so exactly one allocation takes the failure.
+ */
+static atomic_int armed_ts_pid = -1;
+
+int inject_should_fail_turnstile(process_t *prp)
+{
+    int pid = atomic_load_explicit(&armed_ts_pid, memory_order_acquire);
+
+    if (pid < 0 || !prp || prp->pid != pid ||
+        !atomic_compare_exchange_strong_explicit(&armed_ts_pid, &pid, -1,
+                                                 memory_order_acq_rel,
+                                                 memory_order_relaxed))
+        return 0;
+    atomic_store_explicit(&consumed, 1, memory_order_release);
+    return 1;
+}
+
 /* Called from object_alloc before it touches the free list. Ordinary allocation
  * only: the reserved path (object_alloc_reserved) must never fail this way.
  */
@@ -153,6 +171,11 @@ void kext_debug_inject(void *data)
         atomic_store_explicit(&armed_pid, (int) kap->arg1,
                               memory_order_relaxed);
         atomic_store_explicit(&armed_soul, (unsigned) kap->arg0,
+                              memory_order_release);
+        break;
+    case INJECT_OP_FAIL_NEXT_TURNSTILE:
+        atomic_store_explicit(&consumed, 0, memory_order_relaxed);
+        atomic_store_explicit(&armed_ts_pid, (int) kap->arg0,
                               memory_order_release);
         break;
     case INJECT_OP_ALLOC_STATUS:

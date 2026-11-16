@@ -59,6 +59,7 @@ static void thread_recycle_reset(thread_t *thp)
     thp->owned_turnstiles = NULL;
     thp->robust_held = NULL;
     thp->robust_spare = NULL;
+    thp->ts_spare = NULL;
     thp->robust_nheld = 0;
     thp->restart = NULL;
     thp->iovchk_iov = NULL;
@@ -1125,6 +1126,7 @@ int rdecl thread_create(thread_t *act,
     thp->owned_turnstiles = NULL;
     thp->robust_held = NULL;
     thp->robust_spare = NULL;
+    thp->ts_spare = NULL;
     thp->robust_nheld = 0;
     thp->held_ceiling_n = 0;
     thp->held_ceiling_floor = 0;

@@ -381,7 +381,6 @@ int kdecl ksys_timer_timeout(thread_t *act,
                              struct kcall_args_timer_timeout *kap)
 {
     ktimer_t *tip;
-    unsigned tls_flags;
     int id = (int) kap->id; /* kap->id may be corrupted by SETKSTATUS */
     uint64_t ntime;
     struct sigevent ev;
@@ -402,9 +401,6 @@ int kdecl ksys_timer_timeout(thread_t *act,
         user_slice_init(act, kap->otime, sizeof(*kap->otime),
                         sizeof(*kap->otime), USER_SLICE_WR, &otime_slice))
         return EFAULT;
-
-    tls_flags = TLS_FLAGS_SAFE(act);
-
 
     /* Return prev flags and load new flags. */
     SETKSTATUS(act, act->timeout_flags);
@@ -459,7 +455,7 @@ int kdecl ksys_timer_timeout(thread_t *act,
 
     /* Must remember address to save time left if a signal hits us. */
     if (act->timeout_flags & (1 << STATE_NANOSLEEP)) {
-        if (PENDCAN(tls_flags)) {
+        if (PENDCAN(tls_flags_load(act))) {
             SETKIP_FUNC(act, act->process->canstub);
             return ENOERROR;
         }

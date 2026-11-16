@@ -540,7 +540,7 @@ static int sendv_body(thread_t *act,
 
     _TRACE_COMM_EMIT_SMSG(act, cop, (act->tid << 16) | cop->scoid);
 
-    if (PENDCAN(TLS_FLAGS_SAFE(act)) && (type != __KSYS_MSG_SENDVNC)) {
+    if ((type != __KSYS_MSG_SENDVNC) && PENDCAN(tls_flags_load(act))) {
         SETKIP_FUNC(act, act->process->canstub);
         return ENOERROR;
     }
@@ -1593,7 +1593,6 @@ int kdecl ksys_msg_receivev(thread_t *act, struct kcall_args_msg_receivev *kap)
     int tid;
     int notification_only = KTYPE(act) == __KSYS_MSG_RECEIVENOTIFICATIONV;
     unsigned chid;
-    unsigned tls_flags;
     vector_t *chvec;
 
     /* Channel-queue exclusion stays under chp->lock; sender-thread claim under
@@ -2081,7 +2080,6 @@ restart_recv:
      * RTMUX_ITF_WAIT_PENDING before pril_rem'ing the receiver, so they never
      * see act in a half-blocked state.
      */
-    tls_flags = TLS_FLAGS_SAFE(act);
     _TRACE_COMM_IPC_RET(act);
 
     if ((thp = act->client) != 0) {
@@ -2094,7 +2092,7 @@ restart_recv:
         return ETIMEDOUT;
     }
 
-    if (PENDCAN(tls_flags)) {
+    if (PENDCAN(tls_flags_load(act))) {
         SETKIP_FUNC(act, act->process->canstub);
         return ENOERROR;
     }

@@ -381,7 +381,6 @@ int kdecl ksys_thread_join(thread_t *act, struct kcall_args_thread_join *kap)
 {
     thread_t *thp;
     process_t *prp = act->process;
-    unsigned tls_flags;
     unsigned claim_spins = 0;
     void *status = NULL;
     int target_dead;
@@ -461,14 +460,12 @@ retry:
         atomic_or(&thp->flags, RTMUX_FLG_THR_DETACHED);
         thp->status = 0;
     } else {
-        tls_flags = TLS_FLAGS_SAFE(act);
-
         if (IMTO(act, STATE_JOIN)) {
             kspinlock_unlock(&prp->vec_slock);
             return ETIMEDOUT;
         }
 
-        if (PENDCAN(tls_flags)) {
+        if (PENDCAN(tls_flags_load(act))) {
             kspinlock_unlock(&prp->vec_slock);
             SETKIP_FUNC(act, act->process->canstub);
             return ENOERROR;

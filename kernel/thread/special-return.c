@@ -237,13 +237,18 @@ void specialret_attr specialret(thread_t *thp)
             atomic_clr((volatile unsigned *) &thp->flags,
                        RTMUX_FLG_THR_ACQUIRE_MUTEX);
 
-            /* Timeout overrides the lock result, except the robust-mutex
-             * results: EOWNERDEAD must reach the caller, which now holds an
-             * inconsistent mutex it has to repair, and ENOTRECOVERABLE says it
-             * holds no mutex at all. KSTATUS holds -errno.
+            /* A timeout overrides a successful lock only. A lock that failed
+             * keeps its own error: the caller holds no mutex, and ETIMEDOUT
+             * would tell it otherwise. EOWNERDEAD must reach the caller, which
+             * now holds an inconsistent mutex it has to repair, and
+             * ENOTRECOVERABLE says it holds no mutex at all. KSTATUS holds
+             * -errno. With the allocations reserved by the wait, the lock can
+             * still fail without the mutex held on EDEADLK (a priority
+             * inheritance cycle through the new owner) and ENOTRECOVERABLE; the
+             * caller sees that error and holds no mutex. That is a known gap
+             * against POSIX, which allows no such result.
              */
-            if (status == -ETIMEDOUT && (int) KSTATUS(thp) != -EOWNERDEAD &&
-                (int) KSTATUS(thp) != -ENOTRECOVERABLE) {
+            if (status == -ETIMEDOUT && (int) KSTATUS(thp) == 0) {
                 SETKSTATUS(thp, status);
             }
 
