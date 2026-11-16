@@ -252,3 +252,141 @@ void kext_debug_inject(void *data)
      */
     SETKSTATUS(act, inject_op_is_status(kap->op) ? EOK : ret);
 }
+
+/* Trace of the writes to thread_t.blocked_on in the IPC paths, for a client
+ * found in STATE_REPLY with a NULL blocked_on while still linked on a channel's
+ * reply queue. Each IPC_BLK() site records who touched the thread last, so the
+ * hang dump can name the writer. Lock-free and lossy by design: a slot being
+ * rewritten when the dump reads it is just noise.
+ */
+struct ipc_blk_ev {
+    uint64_t t;
+    const char *file;
+    thread_t *thp;
+    void *blocked_on;
+    int line;
+    unsigned char cpu;
+    unsigned char state;
+    unsigned short itf;
+};
+
+#define IPC_BLK_RING 2048
+struct ipc_blk_ev ipc_blk_ring[IPC_BLK_RING];
+atomic_uint ipc_blk_idx;
+
+void ipc_blk_trace(const char *file, int line, thread_t *thp)
+{
+    unsigned i =
+        atomic_fetch_add_explicit(&ipc_blk_idx, 1, memory_order_relaxed);
+    struct ipc_blk_ev *e = &ipc_blk_ring[i % IPC_BLK_RING];
+
+    e->t = r_time();
+    e->file = file;
+    e->line = line;
+    e->thp = thp;
+    e->blocked_on = thp->blocked_on;
+    e->cpu = (unsigned char) get_cpunum();
+    e->state = (unsigned char) thp->state;
+    e->itf = (unsigned short) thp->internal_flags;
+}
+
+/* The last arms and clears of the per-hart xfer fault handler. A handler still
+ * armed when a thread leaves the kernel makes the next fault on that hart, from
+ * any thread and any code, longjmp into a frame that no longer exists.
+ */
+#define XH_RING 16
+struct xh_ev {
+    uint64_t t;
+    const char *file;
+    const void *handler;
+    int line;
+};
+static struct xh_ev xh_ring[CONFIG_PROCESSORS_MAX][XH_RING];
+static unsigned xh_idx[CONFIG_PROCESSORS_MAX];
+
+void xfer_handler_trace(const char *file, int line, const void *handler)
+{
+    unsigned cpu = get_cpunum();
+    struct xh_ev *e = &xh_ring[cpu][xh_idx[cpu]++ % XH_RING];
+
+    e->t = r_time();
+    e->file = file;
+    e->line = line;
+    e->handler = handler;
+}
+
+void xfer_handler_check_exit(void)
+{
+    unsigned cpu = get_cpunum();
+    thread_t *act = get_active_thread(cpu);
+
+    if (!get_pcpu()->pc_xfer_handlers)
+        return;
+    kprintf(
+        "xfer handler %p still armed on cpu %u at kcall exit, thread "
+        "pid %d tid %u syscall %d; last sets, newest first:\n",
+        (void *) get_pcpu()->pc_xfer_handlers, cpu,
+        (act && act->process) ? act->process->pid : -1, act ? act->tid : 0U,
+        act ? (int) act->syscall : -1);
+    for (unsigned k = 0; k < XH_RING; k++) {
+        struct xh_ev *e = &xh_ring[cpu][(xh_idx[cpu] - 1 - k) % XH_RING];
+
+        if (e->file)
+            kprintf("  t=%lu %s:%d handler %p\n", (unsigned long) e->t, e->file,
+                    e->line, e->handler);
+    }
+    crash();
+}
+
+/* Lifecycle trace of thread_t objects: readies, dequeues, running, destroys and
+ * frees, with the call site and its caller. A thread found zeroed on a ready
+ * queue was freed while queued or readied after it was dead; the events for its
+ * address say which. Lock-free and lossy, like the blocked_on trace.
+ */
+struct thr_ev {
+    uint64_t t;
+    const char *file;
+    thread_t *thp;
+    void *ra;
+    int line;
+    unsigned char cpu;
+    unsigned char state;
+    unsigned short itf;
+};
+
+#define THR_RING 4096
+static struct thr_ev thr_ring[THR_RING];
+static atomic_uint thr_idx;
+
+void thr_trace(const char *file, int line, thread_t *thp, void *ra)
+{
+    unsigned i = atomic_fetch_add_explicit(&thr_idx, 1, memory_order_relaxed);
+    struct thr_ev *e = &thr_ring[i % THR_RING];
+
+    e->t = r_time();
+    e->file = file;
+    e->line = line;
+    e->thp = thp;
+    e->ra = ra;
+    e->cpu = (unsigned char) get_cpunum();
+    e->state = (unsigned char) thp->state;
+    e->itf = (unsigned short) thp->internal_flags;
+}
+
+void thr_trace_dump(const thread_t *thp)
+{
+    unsigned end = atomic_load_explicit(&thr_idx, memory_order_relaxed);
+    unsigned shown = 0;
+
+    kprintf("thread %p events, newest first:\n", (const void *) thp);
+    for (unsigned k = 1; k <= THR_RING && k <= end && shown < 32; k++) {
+        struct thr_ev *e = &thr_ring[(end - k) % THR_RING];
+
+        if (e->thp != thp)
+            continue;
+        kprintf("  t=%lu cpu%u %s:%d state %u itf %#x ra %p\n",
+                (unsigned long) e->t, (unsigned) e->cpu, e->file, e->line,
+                (unsigned) e->state, (unsigned) e->itf, e->ra);
+        shown++;
+    }
+}

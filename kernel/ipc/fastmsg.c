@@ -1099,6 +1099,7 @@ static int sendv_body(thread_t *act,
 
         /* Block the active thread and ready the receiver thread */
         sender->blocked_on = cop;
+        IPC_BLK(sender);
 
         /* Link the now reply blocked sending thread in the reply queue Queue
          * mutation under chp->lock. No ->destroying recheck here (unlike the
@@ -1186,6 +1187,7 @@ static int sendv_body(thread_t *act,
         snap_time(&sender->timestamp_last_block, 0);
         _TRACE_TH_EMIT_STATE(sender, SEND);
         sender->blocked_on = cop;
+        IPC_BLK(sender);
         /* Queue mutation under chp->lock */
         kspinlock_lock(&chp->lock);
         if (chp->destroying || cop->channel != chp) {
@@ -1193,6 +1195,7 @@ static int sendv_body(thread_t *act,
             ITF_CLR(sender, RTMUX_ITF_WAIT_PENDING);
             atomic_clr(&sender->flags, RTMUX_FLG_THR_BUFF_MSG);
             sender->blocked_on = NULL;
+            IPC_BLK(sender);
             sender->state = STATE_STOPPED;
             return ESRCH;
         }
@@ -1274,6 +1277,7 @@ static int sendv_body(thread_t *act,
          * blocked_on after they exit the spin sees this assignment.
          */
         sender->blocked_on = cop;
+        IPC_BLK(sender);
     }
 
     *heldp = NULL; /* the reply-side drop releases it */
@@ -2174,6 +2178,7 @@ restart_recv:
      * blocked_on).
      */
     act->blocked_on = chp;
+    IPC_BLK(act);
     act->args.ri.rmsg = kap->rmsg;
     act->args.ri.rparts = kap->rparts;
     act->args.ri.info = kap->info;
@@ -2522,6 +2527,7 @@ static int msg_replyv_body(thread_t *act,
             } else {
                 xferstat = 0;
                 thp->blocked_on = thp;
+                IPC_BLK(thp);
                 atomic_or(&thp->flags,
                           (RTMUX_FLG_THR_BUFF_MSG | RTMUX_FLG_THR_SHORT_MSG));
             }
@@ -2576,8 +2582,10 @@ static int msg_replyv_body(thread_t *act,
      * short-reply copy above already set blocked_on to thp itself, which the
      * client's special return needs.)
      */
-    if (thp->blocked_on == cop)
+    if (thp->blocked_on == cop) {
         thp->blocked_on = NULL;
+        IPC_BLK(thp);
+    }
 #if CONFIG_PROCESSORS_MAX > 1 && defined(CONFIG_SMP_MSGOPT)
     /* The reply completes the exchange, so it supersedes an abort a channel
      * destroy deferred to us; drop that flag with the claim, in the same lock
@@ -2615,8 +2623,10 @@ xfer_err:
     LINKPRIL_REM(thp);
     reply_pending_loan_locked(act, chp, changedp);
     /* Complete the exchange under the lock; see ksys_msg_replyv. */
-    if (thp->blocked_on == cop)
+    if (thp->blocked_on == cop) {
         thp->blocked_on = NULL;
+        IPC_BLK(thp);
+    }
 #if CONFIG_PROCESSORS_MAX > 1 && defined(CONFIG_SMP_MSGOPT)
     ITF_CLR(thp, RTMUX_ITF_MSG_DELIVERY | RTMUX_ITF_MSG_FORCE_RDY);
 #endif
@@ -2784,8 +2794,10 @@ static int msg_error_body(thread_t *act,
     LINKPRIL_REM(thp);
     reply_pending_loan_locked(act, chp, changedp);
     /* Complete the exchange under the lock; see ksys_msg_replyv. */
-    if (thp->blocked_on == cop)
+    if (thp->blocked_on == cop) {
         thp->blocked_on = NULL;
+        IPC_BLK(thp);
+    }
 #if CONFIG_PROCESSORS_MAX > 1 && defined(CONFIG_SMP_MSGOPT)
     ITF_CLR(thp, RTMUX_ITF_MSG_DELIVERY);
 #endif

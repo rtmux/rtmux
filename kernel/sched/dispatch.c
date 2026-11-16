@@ -170,6 +170,7 @@ static int dispatch_unlink_ready(kdispatch_t *dpp, thread_t *thp)
     }
 
     LINK3_REM(*queue, &thp->link3_link, thread_t);
+    THR_EV(thp);
     if (!DISPATCH_THP(dpp, thp->priority))
         DISPATCH_CLR(dpp, thp);
     return 1;
@@ -408,6 +409,7 @@ static thread_t *rdecl select_thread_default(int cpu, int prio)
     }
 
     LINK3_REM(DISPATCH_LST(dpp, (thp)->priority), &(thp)->link3_link, thread_t);
+    THR_EV(thp);
 
     /* If that list is now empty, clear the readybit.   */
     if (!DISPATCH_THP(dpp, (thp)->priority)) {
@@ -432,7 +434,9 @@ static void rdecl mark_running_default(thread_t *new)
 
     old = get_active_thread(get_cpunum());
     was_intr = new->state == STATE_INTR;
+    THR_EV(new);
     if (!new->process) {
+        thr_trace_dump(new);
         kprintf(
             "FATAL: mark_running cpu=%u new=%p tid=%d process=NULL type=%u "
             "state=%u\n",
@@ -1466,6 +1470,7 @@ int rdecl force_ready(thread_t *thp, unsigned err)
             }
             LINKPRIL_REM(thp);
             thp->blocked_on = NULL; /* == cop, checked above under the lock */
+            IPC_BLK(thp);
             kspinlock_unlock(&fr_chp->lock);
             unlinked = true;
         }
@@ -1538,8 +1543,10 @@ int rdecl force_ready(thread_t *thp, unsigned err)
          * outlive cop. The REPLY fall-through into STATE_RECEIVE uses fr_chp,
          * not blocked_on, so clearing it here is safe.
          */
-        if (thp->blocked_on == cop)
+        if (thp->blocked_on == cop) {
             thp->blocked_on = NULL;
+            IPC_BLK(thp);
+        }
         if (connect_links_drop(cop)) {
             connect_detach(cop, thp->priority);
         }
@@ -1689,8 +1696,10 @@ int rdecl force_ready(thread_t *thp, unsigned err)
          * keep the drain-before-null ordering to preserve this invariant.
          */
         if (!cop || !cop->channel) {
-            if (thp->blocked_on == cop)
+            if (thp->blocked_on == cop) {
                 thp->blocked_on = NULL;
+                IPC_BLK(thp);
+            }
             if (cop && connect_links_drop(cop))
                 connect_detach(cop, thp->priority);
             break;
@@ -1726,6 +1735,7 @@ int rdecl force_ready(thread_t *thp, unsigned err)
          * free cop (see the STATE_REPLY case above).
          */
         thp->blocked_on = NULL; /* == cop, checked above under the lock */
+        IPC_BLK(thp);
         kspinlock_unlock(&cop->channel->lock);
 
         if (connect_links_drop(cop)) {
@@ -1782,6 +1792,7 @@ int rdecl force_ready(thread_t *thp, unsigned err)
              * rem+add if non-null; clearing here makes it skip the stale rem.
              */
             thp->blocked_on = NULL;
+            IPC_BLK(thp);
 
             /* Identify the owner of the mutex, could be null if orphaned */
             thp2 = NULL;
@@ -1840,6 +1851,7 @@ int rdecl force_ready(thread_t *thp, unsigned err)
             if (bound) {
                 pril_rem(&bound->waiting, thp);
                 thp->blocked_on = NULL;
+                IPC_BLK(thp);
             }
             kspinlock_unlock(&sync_slock);
         }
@@ -1975,6 +1987,7 @@ void rdecl block(void)
         break;
     default:
         thp->blocked_on = NULL;
+        IPC_BLK(thp);
     }
 
     /* Mark execution and schedule a replenishment if needed */
@@ -2062,6 +2075,7 @@ static void rdecl block_release(kspinlock_t *to_release)
         break;
     default:
         thp->blocked_on = NULL;
+        IPC_BLK(thp);
     }
 
     if (thp != act) {
@@ -2139,6 +2153,8 @@ static void rdecl ready_default(thread_t *thp)
 
     chk_dispatch(1);
     chk_thread(thp);
+    THR_EV(thp);
+    sync_chains_assert_readied(thp);
 
     if (thp->timeout_flags)
         timeout_stop(thp);

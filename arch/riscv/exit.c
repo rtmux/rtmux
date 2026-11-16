@@ -213,6 +213,7 @@ void __attribute__((noreturn)) kernel_exit(void)
     unsigned aflags;
     unsigned loop_count = 0;
 
+    xfer_handler_check_exit();
     for (;;) {
         unsigned cpu = get_cpunum();
         thp = get_active_thread(cpu);

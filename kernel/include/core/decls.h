@@ -347,6 +347,14 @@ void cpu_force_fpu_save(thread_t *thp);
 int inject_should_fail_alloc(process_t *prp,
                              soul_t *soulp); /* debug/inject.c */
 void inject_mutex_lock_stall(process_t *prp);
+void ipc_blk_trace(const char *file, int line, thread_t *thp);
+#define IPC_BLK(thp) ipc_blk_trace(__FILE__, __LINE__, (thp))
+void thr_trace(const char *file, int line, thread_t *thp, void *ra);
+void thr_trace_dump(const thread_t *thp);
+void sync_chains_assert_not_queued(const thread_t *thp, const char *what);
+void sync_chains_assert_readied(const thread_t *thp);
+#define THR_EV(thp) \
+    thr_trace(__FILE__, __LINE__, (thp), __builtin_return_address(0))
 bool inject_should_fail_sched_set(thread_t *act, bool lowered);
 void inject_note_sched_return(thread_t *act, bool displaced);
 int inject_should_fail_turnstile(process_t *prp); /* debug/inject.c */
@@ -355,6 +363,11 @@ static inline void inject_mutex_lock_stall(process_t *prp)
 {
     (void) prp;
 }
+#define IPC_BLK(thp) ((void) 0)
+#define THR_EV(thp) ((void) 0)
+#define thr_trace_dump(thp) ((void) 0)
+#define sync_chains_assert_not_queued(thp, what) ((void) 0)
+#define sync_chains_assert_readied(thp) ((void) 0)
 static inline bool inject_should_fail_sched_set(thread_t *act, bool lowered)
 {
     (void) act;

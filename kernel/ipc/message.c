@@ -383,6 +383,7 @@ int kdecl ksys_msg_readv(thread_t *act, struct kcall_args_msg_readv *kap)
 #if CONFIG_PROCESSORS_MAX > 1 && defined(CONFIG_SMP_MSGOPT)
         ITF_CLR(act, RTMUX_ITF_MSG_DELIVERY);
         act->blocked_on = 0;
+        IPC_BLK(act);
 #endif
     }
 
@@ -514,6 +515,7 @@ int kdecl ksys_msg_writev(thread_t *act, struct kcall_args_msg_writev *kap)
 #if CONFIG_PROCESSORS_MAX > 1 && defined(CONFIG_SMP_MSGOPT)
     ITF_CLR(act, RTMUX_ITF_MSG_DELIVERY);
     act->blocked_on = 0;
+    IPC_BLK(act);
 #endif
 
     /* Claim release + MSG_FORCE_RDY drain under channel_slock. */

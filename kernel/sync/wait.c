@@ -937,6 +937,52 @@ void rdecl sync_thread_cleanup(thread_t *thp)
     }
 }
 
+#ifdef CONFIG_DEBUG_INJECT
+/* Debug builds: crash if thp is still linked on any sync wait chain. A thread
+ * that leaves STATE_MUTEX, STATE_CONDVAR or STATE_SEM, or is freed, while still
+ * on a chain leaves the chain head or a neighbour pointing into memory the next
+ * user of its next/prev links reuses: later wakers then ready threads that wait
+ * on nothing. what names the caller's check.
+ */
+void sync_chains_assert_not_queued(const thread_t *thp, const char *what)
+{
+    for (unsigned i = 0; i < SYNC_NCHAINS; i++) {
+        struct sync_chain *c = &sync_chains[i];
+        unsigned steps = 0;
+
+        /* No chain lock: callers may hold one, and thp is not being enqueued
+         * while it is readied or freed, so a racing walk cannot invent a hit.
+         */
+        for (thread_t *cur = c->head; cur && steps < 4096;
+             cur = cur->next.thread, steps++) {
+            /* A waiter's wake unlinks it and clears prev; a link left behind
+             * keeps it, which tells a real leak from a racing walk.
+             */
+            if (cur != thp || !thp->prev.thread)
+                continue;
+            kprintf(
+                "sync chain %u still holds thread %p (%s): tid %d state %u "
+                "wait_key %#lx prev %p next %p ra %p\n",
+                i, (const void *) thp, what, thp->tid, (unsigned) thp->state,
+                (unsigned long) thp->args.mu.wait_key,
+                (void *) thp->prev.thread, (void *) thp->next.thread,
+                __builtin_return_address(0));
+            thr_trace_dump(thp);
+            crash();
+        }
+    }
+}
+
+/* A thread readied out of a sync wait state must already be off its chain. */
+void sync_chains_assert_readied(const thread_t *thp)
+{
+    if (thp->state == STATE_MUTEX || thp->state == STATE_CONDVAR ||
+        thp->state == STATE_SEM)
+        sync_chains_assert_not_queued(thp, "readied");
+}
+
+#endif
+
 /* Wait queue primitives (LINK2 on thread_t next.thread/prev.thread). */
 
 /* Caller holds chain lock. */
@@ -947,6 +993,7 @@ static void sync_enqueue(struct sync_chain *c, sync_key_t key, thread_t *thp)
 
     thp->args.mu.wait_key = key;
     thp->blocked_on = NULL;
+    IPC_BLK(thp);
 
     /* The physical chain list may contain unrelated sync keys. Preserve FIFO
      * order across equal priorities for this key, but insert before the first

@@ -329,6 +329,7 @@ void rdecl sync_wakeup(ksync_t *syp, int all)
          * NULL-check blocked_on before deref — see dispatch.c.
          */
         thp->blocked_on = NULL;
+        IPC_BLK(thp);
 
         /* This screws up the ETIMEDOUT return code from sync_condvar_wait.
          * Instead, we EOK the status when the thread goes onto the waiting
