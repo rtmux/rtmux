@@ -76,8 +76,9 @@ static inline unsigned long rtmux_sync_depth_mask(long count)
 #define RTMUX_SYNC_SPIN 0xfffffffa      /*   -6  spin (count is internal) */
 #define RTMUX_SYNC_DEAD \
     0xffffff00 /* -256  robust mutex whose owner died holding it */
-#define RTMUX_SYNC_NOTRECOVERABLE \
-    0xffffff01 /* -255  robust mutex unlocked without being made consistent */
+#define RTMUX_SYNC_NOTRECOVERABLE                                            \
+    0xffffff01 /* -255  robust mutex unlocked without being made consistent, \
+                *       or any mutex whose owner died holding it */
 
 #define PTHREAD_DETACHSTATE_MASK 0x01
 #define PTHREAD_CREATE_JOINABLE 0x00

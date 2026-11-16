@@ -164,6 +164,7 @@ int rdecl thread_set_as_prp(thread_t *thp, process_t *prp);
 void rdecl thread_clear_as_prp_if(thread_t *thp, process_t *prp);
 unsigned rdecl thread_as_release_borrowers(process_t *prp);
 void rdecl sync_thread_cleanup(thread_t *thp);
+void rdecl thread_sync_teardown(thread_t *thp);
 uint32_t rdecl keygen(const unsigned char *buf, size_t n, uint64_t secret);
 uint64_t keydata_draw(uintptr_t salt);
 void keydata_stir(void);

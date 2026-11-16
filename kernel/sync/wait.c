@@ -911,6 +911,7 @@ static int sync_pi_propagate(thread_t *waiter, turnstile_t *start_ts)
 }
 
 static void robust_owner_died(thread_t *thp);
+static void mutex_owner_died_waiters(thread_t *thp, struct sync_chain *c);
 
 void rdecl sync_thread_cleanup(thread_t *thp)
 {
@@ -923,6 +924,7 @@ void rdecl sync_thread_cleanup(thread_t *thp)
         struct sync_chain *c = &sync_chains[i];
 
         kspinlock_lock(&c->lock);
+        mutex_owner_died_waiters(thp, c);
         for (turnstile_t *ts = c->turnstiles; ts; ts = ts->next) {
             kspinlock_lock(&sync_pi_slock);
             int owned = ts->owner == thp;
@@ -1188,17 +1190,17 @@ static int mutex_try_acquire(thread_t *act, sync_t *sync)
         return MUTEX_BUSY; /* race lost, fall through to slow path */
     }
 
-    /* The DEAD and NOTRECOVERABLE words exist only on robust mutexes (see
-     * ROBUST MUTEXES below); on any other mutex they read as an owner.
+    /* NOTRECOVERABLE ends any mutex whose owner is gone for good (see ROBUST
+     * MUTEXES and OWNER DEATH below). DEAD, the word that lets the next locker
+     * take the mutex, exists only on robust mutexes; on any other it reads as
+     * an owner.
      */
-    if (mutex_robust(sync)) {
-        if (owner == RTMUX_SYNC_DEAD)
-            return _mux_smp_cmpxchg_ul(&sync->owner, owner, want) == owner
-                       ? MUTEX_TAKEN_DEAD
-                       : MUTEX_BUSY;
-        if (owner == RTMUX_SYNC_NOTRECOVERABLE)
-            return MUTEX_UNRECOVERED;
-    }
+    if (owner == RTMUX_SYNC_NOTRECOVERABLE)
+        return MUTEX_UNRECOVERED;
+    if (owner == RTMUX_SYNC_DEAD && mutex_robust(sync))
+        return _mux_smp_cmpxchg_ul(&sync->owner, owner, want) == owner
+                   ? MUTEX_TAKEN_DEAD
+                   : MUTEX_BUSY;
     /* Owner non-zero: check for non-mutex types */
     if (owner == RTMUX_SYNC_DESTROYED)
         return MUTEX_DESTROYED;
@@ -1390,8 +1392,8 @@ static void mutex_prio_ceiling_unboost(thread_t *act, sync_t *sync)
  * waits) or, with no waiter, the dead owner's (rec->uva). The walk and the
  * stores run under as_slock, which every page-table change takes, so the page
  * cannot be unmapped and reused under the store. If neither mapping holds, the
- * mutex is left as it is, as for a non-robust mutex. Most robust mutexes one
- * thread may hold at once; one more lock is EAGAIN.
+ * mutex is left as it is (the word keeps naming the dead owner). Most robust
+ * mutexes one thread may hold at once; one more lock is EAGAIN.
  */
 #define ROBUST_HELD_MAX 64u
 
@@ -1559,25 +1561,49 @@ static int robust_release_begin(thread_t *act,
     return EOK;
 }
 
-/* Caller holds c->lock, and is a robust mutex's releaser while it is
- * inconsistent: store RTMUX_SYNC_NOTRECOVERABLE, clear the state bit and depth,
- * and fail every waiter with ENOTRECOVERABLE. New lockers see the word and fail
- * at once, so the queue only drains. The caller's record is already off its
- * list, and it tidies the turnstile.
- */
-static void mutex_unrecoverable_locked(sync_t *sync,
-                                       struct sync_chain *c,
-                                       sync_key_t key)
+/* A mutex made unrecoverable has no depth and no state bit left. */
+static void mutex_clear_count(sync_t *sync)
 {
     unsigned long count = (unsigned long) sync->count;
-    thread_t *thp;
 
     sync->count = (long) (count & ~(rtmux_sync_depth_mask((long) count) |
                                     RTMUX_SYNC_INCONSISTENT));
+}
+
+/* Store RTMUX_SYNC_NOTRECOVERABLE in the lock word and clear the state bit and
+ * depth. New lockers see the word and fail at once.
+ */
+static void mutex_store_unrecoverable(sync_t *sync)
+{
+    mutex_clear_count(sync);
     *(volatile unsigned long *) &sync->owner = RTMUX_SYNC_NOTRECOVERABLE;
+}
+
+/* Caller holds c->lock: fail every waiter of key with ENOTRECOVERABLE. Once the
+ * lock word is NOTRECOVERABLE the queue only drains.
+ */
+static void mutex_fail_waiters_locked(struct sync_chain *c, sync_key_t key)
+{
+    thread_t *thp;
+
     while ((thp = sync_dequeue_head(c, key))) {
         kcall_err(thp, ENOTRECOVERABLE);
         ready(thp);
+    }
+}
+
+/* Caller holds c->lock; the word of key is already NOTRECOVERABLE. Fail its
+ * waiters and drop its idle turnstile.
+ */
+static void mutex_fail_all_locked(struct sync_chain *c, sync_key_t key)
+{
+    turnstile_t *ts;
+
+    mutex_fail_waiters_locked(c, key);
+    ts = sync_turnstile_find_locked(c, key);
+    if (ts) {
+        sync_turnstile_set_owner_thread_locked(ts, NULL, 0, 0);
+        sync_turnstile_free_idle_locked(c, ts);
     }
 }
 
@@ -1588,16 +1614,11 @@ static void mutex_make_unrecoverable(thread_t *act,
     struct sync_chain *c = sync_chain_of(key);
     unsigned long count = (unsigned long) sync->count;
     thread_t *old_owner;
-    turnstile_t *ts;
 
     kspinlock_lock(&c->lock);
     old_owner = sync_turnstile_owner_pin(sync_turnstile_find_locked(c, key));
-    mutex_unrecoverable_locked(sync, c, key);
-    ts = sync_turnstile_find_locked(c, key);
-    if (ts) {
-        sync_turnstile_set_owner_thread_locked(ts, NULL, 0, 0);
-        sync_turnstile_free_idle_locked(c, ts);
-    }
+    mutex_store_unrecoverable(sync);
+    mutex_fail_all_locked(c, key);
     kspinlock_unlock(&c->lock);
     sync_pi_recompute_owner(old_owner);
     if (old_owner)
@@ -1789,6 +1810,147 @@ static void robust_owner_died(thread_t *thp)
     }
 }
 
+/* OWNER DEATH
+ *
+ * The kernel keeps no record of who holds a mutex that is not robust, so its
+ * owner's death passes unseen: the lock word goes on naming a thread that will
+ * never unlock it, and every waiter would sleep for ever. Two checks close
+ * that, both run under the mutex's chain lock against a thread already stamped
+ * STATE_DEAD, which is set before sync_thread_cleanup runs:
+ *
+ * - a thread that dies scans the waiters for mutexes whose lock word names it
+ *   (mutex_owner_died_waiters);
+ * - a locker about to queue first checks that the word's owner is alive
+ *   (mutex_owner_gone).
+ *
+ * Whichever comes second sees the other's effect, so a waiter is never missed.
+ * The mutex is then left RTMUX_SYNC_NOTRECOVERABLE and its waiters, and every
+ * later locker, fail with ENOTRECOVERABLE. A process-shared mutex is reached
+ * the same way as a robust one, through the waiter's own mapping. A robust
+ * mutex is left to its own hand-off (ROBUST MUTEXES), whose failure the scan
+ * above still covers.
+ *
+ * An owner that dies after clearing its id in the user-space release but before
+ * the kernel hand-off leaves only the waiting bit: its waiters are not found.
+ * Closing that window takes a kernel record of the hold, which a non-robust
+ * mutex deliberately does not have.
+ *
+ * The owner id in the lock word is truncated (RTMUX_SYNC_OWNER_PID_MASK), so a
+ * dead owner's id that a live thread has since taken over reads as alive, and
+ * later lockers wait as they would for that thread: that is the limit of an
+ * owner id this narrow, and no worse than before this check.
+ */
+
+/* The special lock words (INITIALIZER, DESTROYED, the sem/cond/spin tags, DEAD,
+ * NOTRECOVERABLE) all have 0xffffff in bits 8..31: they name no owner and carry
+ * no waiting bit.
+ */
+static bool mutex_word_special(unsigned long word)
+{
+    return (word >> 8) == (RTMUX_SYNC_DEAD >> 8);
+}
+
+/* Whether the owner named by sync's lock word is gone: dead, or no longer
+ * findable. Caller holds the chain lock. On true, *owner is the owner id the
+ * word named, without the waiting bit.
+ */
+static bool mutex_owner_gone(sync_t *sync, unsigned long *owner)
+{
+    unsigned long word = *(volatile unsigned long *) &sync->owner;
+    thread_t *thp;
+    bool gone;
+
+    /* The special words (FREE, DESTROYED, ...) name no owner. */
+    if (mutex_word_special(word) || (word & RTMUX_SYNC_OWNER_MASK) == 0)
+        return false;
+    thp = sync_lookup_owner_pin(word);
+    gone = !thp || __atomic_load_n(&thp->state, __ATOMIC_ACQUIRE) == STATE_DEAD;
+    if (thp)
+        tthread_unpin(thp);
+    *owner = word & RTMUX_SYNC_OWNER_MASK;
+    return gone;
+}
+
+/* Make sync unrecoverable if its lock word still names owner, which is gone.
+ * The word is changed by compare-and-swap, because the user-space release is
+ * not serialized by the chain lock: the owner we looked up can have released
+ * the mutex, and another thread taken it, since the lookup. Waiting is the only
+ * bit a locker may add meanwhile.
+ *
+ * Returns whether the mutex was made unrecoverable.
+ */
+static bool mutex_fail_dead_owner(sync_t *sync, unsigned long owner)
+{
+    unsigned long word = *(volatile unsigned long *) &sync->owner;
+
+    while ((word & RTMUX_SYNC_OWNER_MASK) == owner) {
+        unsigned long seen =
+            _mux_smp_cmpxchg_ul(&sync->owner, word, RTMUX_SYNC_NOTRECOVERABLE);
+
+        if (seen == word) {
+            mutex_clear_count(sync);
+            return true;
+        }
+        word = seen;
+    }
+    return false;
+}
+
+/* mutex_try_acquire() for a caller that holds c->lock and is about to queue: a
+ * mutex that is busy because its owner is gone is made unrecoverable instead. A
+ * robust mutex is left to its owner's death hand-off.
+ */
+static int mutex_try_acquire_locked(thread_t *act,
+                                    sync_t *sync,
+                                    struct sync_chain *c,
+                                    sync_key_t key)
+{
+    for (;;) {
+        unsigned long owner;
+        int rc = mutex_try_acquire(act, sync);
+
+        if (rc != MUTEX_BUSY || mutex_robust(sync) ||
+            !mutex_owner_gone(sync, &owner))
+            return rc;
+        if (mutex_fail_dead_owner(sync, owner)) {
+            mutex_fail_all_locked(c, key);
+            return MUTEX_UNRECOVERED;
+        }
+        /* The word changed under us: look at it again. */
+    }
+}
+
+/* Caller holds c->lock. thp, being destroyed, may hold mutexes that waiters on
+ * this chain are blocked on: fail those mutexes. Each waiter reaches the lock
+ * word through its own mapping. A mutex already failed is no longer named by
+ * the dead owner, so a repeat attempt on the same word is a cheap no-op.
+ */
+static void mutex_owner_died_waiters(thread_t *thp, struct sync_chain *c)
+{
+    unsigned long dead_word = SYNC_OWNER(thp);
+    bool failed;
+
+    do {
+        failed = false;
+        for (thread_t *w = c->head; w; w = w->next.thread) {
+            sync_key_t key = w->args.mu.wait_key;
+            sync_t *ks;
+
+            if (w->state != STATE_MUTEX)
+                continue;
+            kspinlock_lock(&as_slock);
+            ks = robust_word_locked(w->process, w->args.mu.mutex, key);
+            failed = ks && mutex_fail_dead_owner(ks, dead_word);
+            kspinlock_unlock(&as_slock);
+            if (failed) {
+                /* w is readied here: leave the walk and start over. */
+                mutex_fail_all_locked(c, key);
+                break;
+            }
+        }
+    } while (failed);
+}
+
 /* Finish a lock attempt that ended with a result other than MUTEX_BUSY.
  *
  * A failure is reported as its errno. A mutex taken from a dead owner is marked
@@ -1861,7 +2023,7 @@ retry_contended:
     /* Double-check: the holder may have released between the fast-path read and
      * the chain-lock acquire. Try once more under the lock.
      */
-    rc = mutex_try_acquire(act, sync);
+    rc = mutex_try_acquire_locked(act, sync, c, key);
     if (rc != MUTEX_BUSY) {
         kspinlock_unlock(&c->lock);
         sync_ts_put(act, allocated_ts);
@@ -1914,8 +2076,13 @@ retry_contended:
             if (!sync_has_waiter(c, key)) {
                 unsigned long owner_word =
                     *(volatile unsigned long *) &sync->owner;
-                *(volatile unsigned long *) &sync->owner =
-                    owner_word & ~RTMUX_SYNC_WAITING;
+
+                /* A special word (the owner died meanwhile) has no waiting bit
+                 * to clear.
+                 */
+                if (!mutex_word_special(owner_word))
+                    *(volatile unsigned long *) &sync->owner =
+                        owner_word & ~RTMUX_SYNC_WAITING;
                 sync_turnstile_set_owner_thread_locked(ts, NULL, 0, 0);
                 sync_turnstile_free_idle_locked(c, ts);
             }
@@ -1928,7 +2095,7 @@ retry_contended:
             return;
         }
 
-        rc = mutex_try_acquire(act, sync);
+        rc = mutex_try_acquire_locked(act, sync, c, key);
         if (rc != MUTEX_BUSY) {
             if (waiter_bound) {
                 sync_turnstile_unbind_waiter_locked(c, act);
@@ -1945,12 +2112,11 @@ retry_contended:
                                     *(volatile unsigned long *) &sync->owner);
     }
 
-    /* Enqueue self, transition state under the chain lock. A robust waiter also
-     * leaves its own address of the mutex: a handoff, by unlock or by the
-     * owner's death, files the record under it.
+    /* Enqueue self, transition state under the chain lock, leaving our own
+     * address of the mutex: a handoff to a robust waiter files its record under
+     * it, and the owner's death reaches the lock word through it.
      */
-    if (*recp)
-        act->args.mu.mutex = sync;
+    act->args.mu.mutex = sync;
     sync_enqueue(c, key, act);
     if (pi_enabled)
         sync_turnstile_update_max_locked(c, ts);
@@ -2392,8 +2558,10 @@ int kdecl ksys_sync_condvar_wait(thread_t *act,
      * and after act is on the cv queue, so that no signal can slip between the
      * release and the wait; the drain leaves no waiter to hand it to.
      */
-    if (mutex_unrecoverable)
-        mutex_unrecoverable_locked(mutex, mutex_c, mutex_key);
+    if (mutex_unrecoverable) {
+        mutex_store_unrecoverable(mutex);
+        mutex_fail_waiters_locked(mutex_c, mutex_key);
+    }
     thread_t *mutex_next =
         mutex_rec ? robust_pick_owner(mutex_c, mutex_key, mutex_rec)
                   : sync_dequeue_head(mutex_c, mutex_key);

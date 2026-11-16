@@ -248,9 +248,8 @@ void specialret_attr specialret(thread_t *thp)
              * caller sees that error and holds no mutex. That is a known gap
              * against POSIX, which allows no such result.
              */
-            if (status == -ETIMEDOUT && (int) KSTATUS(thp) == 0) {
+            if (status == -ETIMEDOUT && (int) KSTATUS(thp) == EOK)
                 SETKSTATUS(thp, status);
-            }
 
             break;
         }

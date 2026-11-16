@@ -2735,6 +2735,20 @@ static void test_malloc_fifo_mixed_prio(void)
  * unlock without the repair leaves it ENOTRECOVERABLE.
  */
 
+static int plain_mutex_init(pthread_mutex_t *m, int pshared)
+{
+    pthread_mutexattr_t attr;
+    int rc;
+
+    if (pthread_mutexattr_init(&attr) != EOK)
+        return -1;
+    rc = pthread_mutexattr_setpshared(&attr, pshared);
+    if (rc == EOK)
+        rc = pthread_mutex_init(m, &attr);
+    (void) pthread_mutexattr_destroy(&attr);
+    return rc;
+}
+
 static int robust_mutex_init(pthread_mutex_t *m, int protocol, int pshared)
 {
     pthread_mutexattr_t attr;
@@ -2902,6 +2916,7 @@ struct robust_waiter_args {
     atomic_int *result;   /* lock result, -1 until it returns */
     atomic_int *observed; /* priority seen while holding, if wait_waiting */
     int wait_waiting;     /* hold until another waiter queues behind */
+    int lent_prio;        /* the priority the waiter queued behind lends it */
     int repair;           /* call pthread_mutex_consistent on EOWNERDEAD */
 };
 
@@ -2924,10 +2939,20 @@ static void *robust_waiter(void *raw)
         for (int i = 0; i < 5000 && !(arg->mutex->owner & RTMUX_SYNC_WAITING);
              i++)
             (void) nanosleep(&ms, NULL);
-        if ((arg->mutex->owner & RTMUX_SYNC_WAITING) &&
-            __sched_get(0, (int) pthread_self(), &sp) != -1)
-            atomic_store_explicit(arg->observed, sp.sched_curpriority,
-                                  memory_order_release);
+        /* A waiter sets WAITING before it lends its priority, so the bit does
+         * not yet mean the loan is in place: give it time to land.
+         */
+        if (arg->mutex->owner & RTMUX_SYNC_WAITING) {
+            for (int i = 0; i < 2000; i++) {
+                if (__sched_get(0, (int) pthread_self(), &sp) == -1)
+                    break;
+                atomic_store_explicit(arg->observed, sp.sched_curpriority,
+                                      memory_order_release);
+                if (sp.sched_curpriority >= arg->lent_prio)
+                    break;
+                (void) nanosleep(&ms, NULL);
+            }
+        }
     }
     if (rc == EOWNERDEAD && arg->repair)
         (void) pthread_mutex_consistent(arg->mutex);
@@ -2951,6 +2976,7 @@ static void test_robust_waiter_handoff_pi(void)
                                       .result = &heir_rc,
                                       .observed = &heir_prio,
                                       .wait_waiting = 1,
+                                      .lent_prio = 30,
                                       .repair = 1};
     struct robust_waiter_args carg = {
         .mutex = &m, .prio = 30, .result = &contender_rc, .observed = &unused};
@@ -3175,7 +3201,7 @@ static int robust_spawn_owner(const char *mode,
 }
 
 /* A shared region holding a fresh process-shared robust mutex, or NULL. */
-static struct pshared_region *robust_shm_create(const char *what)
+static struct pshared_region *robust_shm_create(const char *what, int robust)
 {
     struct pshared_region *r;
     flock_t space;
@@ -3194,8 +3220,10 @@ static struct pshared_region *robust_shm_create(const char *what)
             ? MAP_FAILED
             : mmap(NULL, sizeof *r, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     (void) close(fd);
-    if (r == MAP_FAILED || robust_mutex_init(&r->mtx, PTHREAD_PRIO_NONE,
-                                             PTHREAD_PROCESS_SHARED) != EOK) {
+    if (r == MAP_FAILED ||
+        (robust ? robust_mutex_init(&r->mtx, PTHREAD_PRIO_NONE,
+                                    PTHREAD_PROCESS_SHARED)
+                : plain_mutex_init(&r->mtx, PTHREAD_PROCESS_SHARED)) != EOK) {
         test_fail(what, "shared mutex setup");
         if (r != MAP_FAILED)
             (void) munmap(r, sizeof *r);
@@ -3221,7 +3249,7 @@ static void test_robust_owner_process_death(void)
     int status = 0;
     int rc;
 
-    r = robust_shm_create("robust process death prerequisite");
+    r = robust_shm_create("robust process death prerequisite", 1);
     if (!r)
         return;
 
@@ -3290,7 +3318,7 @@ static void test_robust_handoff_owner_death(void)
     int dead = 0;
     char detail[96] = "";
 
-    r = robust_shm_create("robust hand-off death prerequisite");
+    r = robust_shm_create("robust hand-off death prerequisite", 1);
     if (!r)
         return;
     for (int i = 0; i < ROBUST_KILL_ROUNDS; i++) {
@@ -3422,6 +3450,180 @@ static void test_robust_condvar_inconsistent(void)
     (void) pthread_cond_destroy(&cv);
 }
 
+/* A non-robust mutex whose owner dies is not revived, but it must not hang
+ * its waiters: everyone blocked on it, and everyone who locks it later, gets
+ * ENOTRECOVERABLE. The waiters must return within 3 s.
+ */
+#define DEADLOCK_WAITERS 3
+#define DEADLOCK_WAIT_MS 3000
+
+struct dead_owner_waiter_args {
+    pthread_mutex_t *mutex;
+    atomic_int *queued;
+    atomic_int *result; /* lock result, -1 until it returns */
+};
+
+static void *dead_owner_waiter(void *raw)
+{
+    struct dead_owner_waiter_args *arg = raw;
+    struct timespec abstime;
+    int rc;
+
+    /* A hang shows as ETIMEDOUT after DEADLOCK_WAIT_MS, not as a stuck test. */
+    (void) clock_gettime(CLOCK_REALTIME, &abstime);
+    abstime.tv_sec += DEADLOCK_WAIT_MS / 1000 + 1;
+    atomic_fetch_add_explicit(arg->queued, 1, memory_order_acq_rel);
+    rc = pthread_mutex_timedlock(arg->mutex, &abstime);
+    atomic_store_explicit(arg->result, rc, memory_order_release);
+    if (rc == EOK)
+        (void) pthread_mutex_unlock(arg->mutex);
+    return NULL;
+}
+
+/* Wait up to DEADLOCK_WAIT_MS for every result in res[0..n) to be set. */
+static int dead_owner_results_in(atomic_int *res, int n)
+{
+    struct timespec ms = {.tv_sec = 0, .tv_nsec = 1000000};
+
+    for (int t = 0; t < DEADLOCK_WAIT_MS; t++) {
+        int done = 1;
+
+        for (int i = 0; i < n; i++)
+            done &= atomic_load_explicit(&res[i], memory_order_acquire) != -1;
+        if (done)
+            return 1;
+        (void) nanosleep(&ms, NULL);
+    }
+    return 0;
+}
+
+static void test_nonrobust_owner_thread_death(void)
+{
+    pthread_mutex_t m;
+    pthread_t owner, w[DEADLOCK_WAITERS];
+    atomic_int locked, die, queued, res[DEADLOCK_WAITERS];
+    struct robust_owner_args oarg = {
+        .mutex = &m, .locked = &locked, .die = &die};
+    struct dead_owner_waiter_args warg[DEADLOCK_WAITERS];
+    struct timespec ms = {.tv_sec = 0, .tv_nsec = 1000000};
+    struct timespec late;
+    char detail[96];
+    int created = 0;
+    int ok;
+
+    if (plain_mutex_init(&m, PTHREAD_PROCESS_PRIVATE) != EOK) {
+        test_fail("non-robust owner death prerequisite", "init failed");
+        return;
+    }
+    atomic_init(&locked, 0);
+    atomic_init(&die, 0);
+    atomic_init(&queued, 0);
+    if (!robust_start_owner(&owner, &oarg)) {
+        test_fail("non-robust owner death prerequisite", "owner did not lock");
+        return;
+    }
+    for (int i = 0; i < DEADLOCK_WAITERS; i++) {
+        atomic_init(&res[i], -1);
+        warg[i] = (struct dead_owner_waiter_args){
+            .mutex = &m, .queued = &queued, .result = &res[i]};
+        if (pthread_create(&w[i], NULL, dead_owner_waiter, &warg[i]) != EOK)
+            break;
+        created++;
+    }
+    /* Let them reach the lock; one that is slower finds the owner already
+     * dead, which must fail the same way.
+     */
+    for (int i = 0; i < 2000 && atomic_load(&queued) < created; i++)
+        (void) nanosleep(&ms, NULL);
+    for (int i = 0; i < 2000 && !(m.owner & RTMUX_SYNC_WAITING); i++)
+        (void) nanosleep(&ms, NULL);
+    for (int i = 0; i < 20; i++)
+        (void) nanosleep(&ms, NULL);
+    atomic_store_explicit(&die, 1, memory_order_release);
+    (void) thread_join(owner, NULL);
+
+    if (created != DEADLOCK_WAITERS)
+        test_fail("non-robust owner death prerequisite",
+                  "waiter create failed");
+    ok = dead_owner_results_in(res, created);
+    detail[0] = '\0';
+    for (int i = 0; i < created; i++) {
+        size_t n = strlen(detail);
+
+        snprintf(detail + n, sizeof(detail) - n, "%d ", atomic_load(&res[i]));
+        ok &= atomic_load(&res[i]) == ENOTRECOVERABLE;
+    }
+    check(ok,
+          "non-robust waiters return ENOTRECOVERABLE when the owner "
+          "thread dies",
+          detail);
+    (void) clock_gettime(CLOCK_REALTIME, &late);
+    late.tv_sec += 1;
+    check(pthread_mutex_timedlock(&m, &late) == ENOTRECOVERABLE &&
+              pthread_mutex_trylock(&m) == ENOTRECOVERABLE,
+          "non-robust lock after the owner thread died",
+          "expected ENOTRECOVERABLE from lock and trylock");
+    /* Every waiter returns, by timeout at the latest, before this frame ends. */
+    for (int i = 0; i < created; i++)
+        (void) thread_join(w[i], NULL);
+}
+
+static void test_nonrobust_owner_process_death(void)
+{
+    struct pshared_region *r;
+    struct robust_killer_args karg;
+    pthread_t killer;
+    struct timespec late;
+    pid_t pid;
+    int status = 0;
+    int rc;
+
+    r = robust_shm_create("non-robust process death prerequisite", 0);
+    if (!r)
+        return;
+    if (!robust_spawn_owner("--robust-hold", r, &pid)) {
+        test_fail("non-robust process death prerequisite",
+                  "owner did not lock");
+    } else {
+        karg.mutex = &r->mtx;
+        karg.pid = pid;
+        if (pthread_create(&killer, NULL, robust_killer, &karg) != EOK) {
+            (void) kill(pid, SIGKILL);
+            test_fail("non-robust process death prerequisite", "killer thread");
+        } else {
+            struct timespec abstime;
+
+            (void) clock_gettime(CLOCK_REALTIME, &abstime);
+            abstime.tv_sec += DEADLOCK_WAIT_MS / 1000;
+            rc = pthread_mutex_timedlock(&r->mtx, &abstime);
+            (void) thread_join(killer, NULL);
+            check(rc == ENOTRECOVERABLE,
+                  "non-robust waiter returns ENOTRECOVERABLE when the owner "
+                  "process is killed",
+                  rc == ETIMEDOUT ? "still blocked after 3 s"
+                                  : "expected ENOTRECOVERABLE");
+        }
+        (void) waitpid(pid, &status, 0);
+    }
+    /* A locker that arrives after the owner process exited; the mutex is
+     * unusable after the first death, so start over with a fresh one.
+     */
+    (void) pthread_mutex_destroy(&r->mtx);
+    if (plain_mutex_init(&r->mtx, PTHREAD_PROCESS_SHARED) == EOK &&
+        robust_spawn_owner("--robust-exit", r, &pid)) {
+        (void) waitpid(pid, &status, 0);
+        (void) clock_gettime(CLOCK_REALTIME, &late);
+        late.tv_sec += 1;
+        check(pthread_mutex_timedlock(&r->mtx, &late) == ENOTRECOVERABLE,
+              "non-robust lock after the owner process exited",
+              "expected ENOTRECOVERABLE");
+    } else {
+        test_fail("non-robust process death prerequisite",
+                  "owner did not lock");
+    }
+    robust_shm_destroy(r);
+}
+
 /* A thread may hold 64 robust mutexes at once (the kernel keeps a record of
  * each); the 65th lock fails with EAGAIN and everything unlocks cleanly.
  */
@@ -3495,6 +3697,8 @@ void test_sync(void)
     test_robust_held_limit();
     test_robust_owner_process_death();
     test_robust_handoff_owner_death();
+    test_nonrobust_owner_thread_death();
+    test_nonrobust_owner_process_death();
 
     test_sem_post_wait();
     test_sem_post_twice_wait_twice();
