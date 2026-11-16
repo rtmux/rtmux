@@ -1096,6 +1096,8 @@ int main(int argc, char *argv[])
         return loader_execvp_child(argv[2]);
     if (argc == 3 && !strcmp(argv[1], "--env-expect"))
         return env_expect_child(argv[2]);
+    if (argc == 2 && !strcmp(argv[1], "--orphan-exit-mid"))
+        return orphan_exit_mid();
     if (argc == 3 && !strcmp(argv[1], "--spawn-echo-child"))
         return spawn_echo_child(argv[2]);
     if (argc >= 2 && !strcmp(argv[1], "--spawn-bigargs-child"))

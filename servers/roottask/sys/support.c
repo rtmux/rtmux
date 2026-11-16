@@ -240,8 +240,25 @@ void root_proc_unlock(pid_t pid)
     release_lock(&root_proc(pid)->lock);
 }
 
+/* The parent the kernel names for a child now, or the pid recorded at spawn
+ * when the kernel no longer lists the child. Parameters:
+ *   child_pid : the child whose parent to look up
+ */
+static pid_t kernel_parent(pid_t child_pid)
+{
+    root_proc_info_t qi;
+
+    if (process_query_info(child_pid, &qi) == EOK && qi.parent_pid != 0)
+        return qi.parent_pid;
+    return root_proc(child_pid)->parent_pid;
+}
+
 /* Lock a child's parent process, waiting out any parent death transition.
- * Parameters:
+ *
+ * The parent is the kernel's current one: when a parent is destroyed, or the
+ * child detaches, the kernel hands the child to another parent, but
+ * root_process_t.parent_pid keeps the parent at spawn. That pid is only the
+ * fallback for a child the kernel no longer lists. Parameters:
  *   child_pid      : the child whose parent to lock
  *   parent_pid_out : out — the parent's pid (may be NULL)
  * Return value: the locked parent process_t.
@@ -256,10 +273,14 @@ process_t *root_proc_lock_parent(pid_t child_pid, pid_t *parent_pid_out)
     /* Parent could be in a death transition */
     count = 0;
     for (;;) {
-        ppid = root_proc(child_pid)->parent_pid;
+        ppid = kernel_parent(child_pid);
         parent = root_proc_lock(ppid);
-        if (parent)
-            break;
+        if (parent) {
+            /* The child may have been handed on while the lock was taken. */
+            if (kernel_parent(child_pid) == ppid)
+                break;
+            root_proc_unlock(ppid);
+        }
         if (count > 100) {
             /* Sleep for one tick to give the transition more time to complete
              */

@@ -109,6 +109,8 @@ void *test_unmapped_user_addr(void);
 
 void test_trace_negative(void);
 void test_spawn_concurrent(void);
+void test_orphan_exit(void);
+int orphan_exit_mid(void);
 void test_spawn_storm(unsigned residents);
 void test_user_ptr_negative(void);
 int capgate_child_connect(const char *chid_arg);

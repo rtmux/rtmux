@@ -19,10 +19,10 @@ int proc_thread_pool_reserve_done(void);
 process_t *root_proc_lookup(pid_t pid);
 process_t *root_proc_lock(pid_t pid);
 
-/* Lock the parent of "child_pid" (looked up via root_proc()->parent_pid). The
- * parent's pid is written through "parent_pid_out" if non-NULL — callers need
- * it for the matching root_proc_unlock(parent_pid) and avoid the now-illegal
- * deref of parent->pid.
+/* Lock the parent of "child_pid" (the kernel's current parent). The parent's
+ * pid is written through "parent_pid_out" if non-NULL — callers need it for the
+ * matching root_proc_unlock(parent_pid) and avoid the now-illegal deref of
+ * parent->pid.
  */
 process_t *root_proc_lock_parent(pid_t child_pid, pid_t *parent_pid_out);
 void root_proc_unlock(pid_t pid);

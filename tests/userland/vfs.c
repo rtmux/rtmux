@@ -10351,6 +10351,133 @@ static void spawn_storm_report_memory(unsigned residents)
     (void) close(fd);
 }
 
+/* The middle process of the orphan test: leave a grandchild blocked on stdin,
+ * report its pid on stdout, and exit before it. Stdin is the gate the test
+ * closes, stdout the report pipe.
+ */
+int orphan_exit_mid(void)
+{
+    posix_spawn_file_actions_t fa;
+    char *argv[] = {"cat", NULL};
+    char *envp[] = {NULL};
+    char buf[32];
+    pid_t g;
+    int n, rc;
+
+    /* The grandchild keeps neither the report pipe nor stdout. */
+    rc = posix_spawn_file_actions_init(&fa);
+    if (rc)
+        return EXIT_FAILURE;
+    rc = posix_spawn_file_actions_addclose(&fa, SPAWN_REPORT_FD);
+    if (!rc)
+        rc = posix_spawn_file_actions_addopen(&fa, STDOUT_FILENO, "/dev/null",
+                                              O_WRONLY, 0);
+    if (!rc)
+        rc = posix_spawn(&g, "/bin/cat", &fa, NULL, argv, envp);
+    (void) posix_spawn_file_actions_destroy(&fa);
+    if (rc)
+        return EXIT_FAILURE;
+    n = snprintf(buf, sizeof buf, "%d\n", (int) g);
+    return write(SPAWN_REPORT_FD, buf, (size_t) n) == n ? EXIT_SUCCESS
+                                                      : EXIT_FAILURE;
+}
+
+/* True if procfs lists pid. */
+static bool proc_listed(pid_t pid)
+{
+    char path[32];
+    int fd;
+
+    snprintf(path, sizeof path, "/proc/%d", (int) pid);
+    if ((fd = open(path, O_RDONLY)) < 0)
+        return false;
+    (void) close(fd);
+    return true;
+}
+
+/* A child that outlives its parent must still finish exiting. Roottask kept
+ * the parent pid recorded at spawn, so once that parent was gone the orphan's
+ * exit retried for ever to lock it, holding a pool thread and never leaving the
+ * process table.
+ */
+void test_orphan_exit(void)
+{
+    char *argv[] = {"syscall_testing", "--orphan-exit-mid", NULL};
+    posix_spawn_file_actions_t fa;
+    int gate[2] = {-1, -1}, rep[2] = {-1, -1}, status = 0, rc, gone = 0;
+    char line[32];
+    pid_t mid = -1, g = -1;
+    bool reaped = false;
+
+    /* Only the middle process and its grandchild may hold the gate's read end,
+     * and only the test its write end, or EOF would never come.
+     */
+    rc = pipe(gate) != 0 || pipe(rep) != 0;
+    for (int i = 0; !rc && i < 2; i++)
+        rc = fcntl(gate[i], F_SETFD, FD_CLOEXEC) != 0 ||
+             fcntl(rep[i], F_SETFD, FD_CLOEXEC) != 0;
+    if (rc) {
+        test_fail("orphan_exit fixture", strerror(errno));
+        goto out;
+    }
+    rc = posix_spawn_file_actions_init(&fa);
+    if (!rc) {
+        rc = posix_spawn_file_actions_adddup2(&fa, gate[0], STDIN_FILENO);
+        if (!rc)
+            rc = posix_spawn_file_actions_adddup2(&fa, rep[1], SPAWN_REPORT_FD);
+        if (!rc)
+            rc = posix_spawn(&mid, "/bin/syscall_testing", &fa, NULL, argv, NULL);
+        (void) posix_spawn_file_actions_destroy(&fa);
+    }
+    (void) close(gate[0]);
+    gate[0] = -1;
+    (void) close(rep[1]);
+    rep[1] = -1;
+    if (rc) {
+        test_fail("orphan_exit spawn", strerror(rc));
+        goto out;
+    }
+    if (!spawn_read_report(rep[0], line, sizeof line) ||
+        (g = (pid_t) strtol(line, NULL, 10)) <= 0) {
+        test_fail("orphan_exit fixture", "middle process did not report");
+        goto out;
+    }
+    reaped = waitpid(mid, &status, 0) == mid;
+    if (!reaped || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        test_fail("orphan_exit fixture", "middle process did not exit cleanly");
+        goto out;
+    }
+    if (!proc_listed(g)) {
+        test_fail("orphan_exit fixture", "the orphan is not in /proc");
+        goto out;
+    }
+    (void) close(gate[1]); /* EOF: the orphan reads it and exits */
+    gate[1] = -1;
+    /* kill() already says ESRCH once a process is exiting: ask procfs, which
+     * lists the orphan until roottask has destroyed it.
+     */
+    for (int i = 0; i < 100 && !gone; i++) {
+        gone = !proc_listed(g);
+        if (!gone)
+            sleep_ms(50);
+    }
+    check(gone, "orphan_exit a child whose parent is gone finishes exiting",
+          "the orphan stayed in the process table");
+    if (!gone)
+        (void) kill(g, SIGKILL);
+out:
+    if (mid > 0 && !reaped) {
+        (void) kill(mid, SIGKILL);
+        (void) waitpid(mid, &status, 0);
+    }
+    for (int i = 0; i < 2; i++) {
+        if (gate[i] >= 0)
+            (void) close(gate[i]);
+        if (rep[i] >= 0)
+            (void) close(rep[i]);
+    }
+}
+
 /* Run the spawn storm with residents idle processes alive across it: each is
  * /bin/cat (the small toolbox binary) blocked reading a pipe until EOF. The
  * kernel's pshut and irqoff lines (CONFIG_INSTRUMENTATION) printed before the
@@ -10449,6 +10576,7 @@ void test_vfs(void)
     test_sys_kstats();
     test_sys_log_read();
     test_spawn_concurrent();
+    test_orphan_exit();
     test_malloc_growth();
     test_posix_errno_corners();
     test_posix_access_and_path_corners();

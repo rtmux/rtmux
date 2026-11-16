@@ -62,10 +62,10 @@ typedef union path_object path_object_t;
  */
 typedef struct root_process_entry {
     pid_t pid;                            /* full pid; 0 = slot free */
-    pid_t parent_pid;                     /* mirror of parent->pid; needed
-                                           * by root_proc_lock_parent without
-                                           * dereferencing the kernel-half
-                                           * process_t.parent pointer
+    pid_t parent_pid;                     /* parent at spawn; stale once
+                                           * the kernel reparents the child,
+                                           * so only a fallback for
+                                           * root_proc_lock_parent
                                            */
     struct proc_mux_lock *lock;           /* roottask-side process mux —
                                            * lazily allocated by acquire_lock
