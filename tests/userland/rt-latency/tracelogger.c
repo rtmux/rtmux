@@ -121,7 +121,7 @@ int main(int argc, char **argv)
 {
     uint64_t paddr = 0;
     unsigned alloc_cmd[4];
-    volatile tracebuf_t *ring;
+    volatile tracebuf_t *ring = MAP_FAILED;
     size_t maplen = (size_t) NBUF * _TRACEBUFSIZE;
     unsigned long total_events = 0;
     unsigned long min_events = 32;
@@ -131,6 +131,8 @@ int main(int argc, char **argv)
     int windowed = 0;
     int kcall_only = 0;
     int in_measure = 0;
+    int rc;
+    int ret = 1;
     struct raw_event pre[PRE_EVENTS];
     unsigned pre_head = 0;
     unsigned pre_count = 0;
@@ -177,7 +179,7 @@ int main(int argc, char **argv)
     }
     if (paddr == 0) {
         puts("tracelogger: FAIL ALLOCBUFFER returned no physical address");
-        return 1;
+        goto out;
     }
 
     /* 3. Map the ring's physical pages into our address space. */
@@ -186,15 +188,21 @@ int main(int argc, char **argv)
     if (ring == MAP_FAILED) {
         printf("tracelogger: FAIL mmap ring @%#lx: %s\n", (unsigned long) paddr,
                strerror(errno));
-        return 1;
+        goto out;
     }
 
+    /* Disable leftover classes for kcall mode. The default path below enables
+     * all classes again, so it does not depend on this reset.
+     */
+    rc = trace_cmd(RTMUX_TRACE_DELALLCLASSES);
+
     /* 3. Enable the trace classes and start recording. */
-    if ((kcall_only ? trace_add_class(RTMUX_TRACE_KCALLEXIT)
+    if (rc == -1 ||
+        (kcall_only ? trace_add_class(RTMUX_TRACE_KCALLEXIT)
                     : trace_cmd(RTMUX_TRACE_ADDALLCLASSES)) == -1 ||
         trace_cmd(RTMUX_TRACE_START) == -1) {
         printf("tracelogger: FAIL start tracing: %s\n", strerror(errno));
-        return 1;
+        goto out;
     }
 
     /* 4. Drain by polling: force the current buffer out, nap to let the boot
@@ -270,8 +278,16 @@ int main(int argc, char **argv)
         }
     }
 
+    ret = 0;
+out:
     (void) trace_cmd(RTMUX_TRACE_STOP);
+    /* Disable all trace classes before handing the tracer to another probe. */
+    (void) trace_cmd(RTMUX_TRACE_DELALLCLASSES);
+    if (ring != MAP_FAILED)
+        (void) munmap((void *) ring, maplen);
     (void) trace_cmd(RTMUX_TRACE_DEALLOCBUFFER);
+    if (ret != 0)
+        return ret;
 
     if (total_events == 0) {
         puts("tracelogger: FAIL no events captured");

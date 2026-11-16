@@ -140,14 +140,15 @@ static const struct rtc_probe_ops ist_ops = {rtc_irq_prepare, rtc_ist_wait};
 int main(int argc, char **argv)
 {
     unsigned long phys = 0;
-    int irq = -1, vector, iid;
+    int irq = -1, vector, iid = -1;
+    int have_ring = 0, ret = 1;
     uint64_t paddr = 0, seed = 0, ist_p50_ns, ist_max_ns;
     uint64_t lat[LAT_ITERS];
     unsigned nok = 0;
     struct rtc_irq_ctx ic;
     volatile unsigned char *rtc;
     unsigned alloc_cmd[4];
-    volatile tracebuf_t *ring;
+    volatile tracebuf_t *ring = MAP_FAILED;
     size_t maplen = (size_t) NBUF * _TRACEBUFSIZE;
     uint32_t seen_seq[NBUF] = {0};
     unsigned seen_events[NBUF] = {0};
@@ -197,15 +198,20 @@ int main(int argc, char **argv)
     alloc_cmd[0] = RTMUX_TRACE_ALLOCBUFFER;
     alloc_cmd[1] = NBUF;
     *(uint64_t **) &alloc_cmd[2] = &paddr;
-    if (trace_event(alloc_cmd) == -1 || paddr == 0) {
+    if (trace_event(alloc_cmd) == -1) {
         printf("irq-latency: FAIL ALLOCBUFFER: %s\n", strerror(errno));
-        return 1;
+        goto out;
+    }
+    have_ring = 1;
+    if (paddr == 0) {
+        puts("irq-latency: FAIL ALLOCBUFFER returned no physical address");
+        goto out;
     }
     ring = mmap(NULL, maplen, PROT_READ | PROT_WRITE | PROT_NOCACHE,
                 MAP_PHYS | MAP_SHARED, NOFD, (off_t) paddr);
     if (ring == MAP_FAILED) {
         printf("irq-latency: FAIL mmap ring: %s\n", strerror(errno));
-        return 1;
+        goto out;
     }
     /* Trace only the interrupt class. Every class (ADDALLCLASSES) would flood
      * the ring with IPC/scheduler events across all harts and overwrite the
@@ -213,10 +219,15 @@ int main(int argc, char **argv)
      */
     {
         unsigned addint[2] = {RTMUX_TRACE_ADDCLASS, RTMUX_TRACE_INT};
+        int rc;
 
-        if (trace_event(addint) == -1 || trace_cmd(RTMUX_TRACE_START) == -1) {
+        /* Disable all trace classes left enabled by earlier probes. */
+        rc = trace_cmd(RTMUX_TRACE_DELALLCLASSES);
+
+        if (rc == -1 || trace_event(addint) == -1 ||
+            trace_cmd(RTMUX_TRACE_START) == -1) {
             printf("irq-latency: FAIL start tracing: %s\n", strerror(errno));
-            return 1;
+            goto out;
         }
     }
 
@@ -227,7 +238,7 @@ int main(int argc, char **argv)
     iid = interrupt_attach_thread(vector, 0);
     if (iid == -1) {
         printf("irq-latency: FAIL attach_thread: %s\n", strerror(errno));
-        return 1;
+        goto out;
     }
     ic.vector = vector;
     ic.id = iid;
@@ -241,18 +252,11 @@ int main(int argc, char **argv)
         if (rtc_probe_attempt(&probe, &ist_ops, &ic, 0, "irq-latency", "ist",
                               &a) != 0) {
             printf("irq-latency: FAIL wait failed\n");
-            rtc_reset(&probe);
-            (void) interrupt_detach(iid);
-            (void) trace_cmd(RTMUX_TRACE_STOP);
-            (void) trace_cmd(RTMUX_TRACE_DEALLOCBUFFER);
-            return 1;
+            goto out;
         }
         if (a.outcome == RTC_OUTCOME_OK)
             lat[nok++] = a.wake_ns - a.alarm_ns;
     }
-
-    (void) interrupt_detach(iid);
-    rtc_reset(&probe);
 
     /* Flush and drain: the printed records feed rt-trace-irq.py, which pairs
      * IRQ_CLAIM with IST_DISPATCH by process and emits the .irq.csv span.
@@ -260,8 +264,22 @@ int main(int argc, char **argv)
     (void) trace_cmd(RTMUX_TRACE_FLUSHBUFFER);
     (void) nanosleep(&nap, NULL);
     total = drain_ring(ring, seen_seq, seen_events, &dispatches);
-    (void) trace_cmd(RTMUX_TRACE_STOP);
-    (void) trace_cmd(RTMUX_TRACE_DEALLOCBUFFER);
+    ret = 0;
+out:
+    rtc_reset(&probe);
+    if (iid != -1)
+        (void) interrupt_detach(iid);
+    if (have_ring) {
+        (void) trace_cmd(RTMUX_TRACE_STOP);
+        /* Disable all trace classes before the next trace consumer starts. */
+        (void) trace_cmd(RTMUX_TRACE_DELALLCLASSES);
+        if (ring != MAP_FAILED)
+            (void) munmap((void *) ring, maplen);
+        (void) trace_cmd(RTMUX_TRACE_DEALLOCBUFFER);
+    }
+    (void) munmap((void *) rtc, 0x1000);
+    if (ret != 0)
+        return ret;
 
     printf("irq-latency: outcomes ok=%u early=%u timeout=%u attempts=%u\n", nok,
            probe.counts[RTC_OUTCOME_EARLY], probe.counts[RTC_OUTCOME_TIMEOUT],
