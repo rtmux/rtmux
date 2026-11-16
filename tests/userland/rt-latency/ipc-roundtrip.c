@@ -825,6 +825,243 @@ fail:
     return -1;
 }
 
+/* msg_readv and msg_writev over an iov array of IOV_PARTS one-byte entries. A
+ * sender thread sends IOV_PARTS bytes and waits for a reply buffer of as many.
+ * The receiver reads the message through the array, checks the bytes, writes
+ * the complement back through the array, and the sender checks that. The
+ * kernel checks such an array in steps of IOV_STEP entries per kernel entry
+ * and resumes after each, so the result must be the same as for one entry. An
+ * entry past the first step that lies outside the process, and an array whose
+ * tail page is unmapped, must fail with EFAULT: the first rather than being
+ * followed, the second rather than faulting the kernel.
+ *
+ * The longest kernel entry of the check is one full step, so a call over
+ * exactly IOV_STEP entries whose last one is bad runs one step and fails; its
+ * p99 over IOV_STEP_CALLS calls must stay under IOV_STEP_NS_MAX. The same
+ * failure at the end of the whole array (every step) is timed for the record,
+ * as are the whole calls: after the check the kernel copies the array's bytes
+ * in one pass, which this check does not bound.
+ */
+#define IOV_PARTS 65536
+#define IOV_STEP 512
+#define IOV_STEP_CALLS 64
+#define IOV_PASSES 8
+#define IOV_STEP_NS_MAX 250000ULL
+#define IOV_BAD_AT 700
+#define IOV_TAIL_PARTS 64
+#define IOV_KERNEL_VA ((void *) 0xffffffc000000000UL)
+
+struct iov_ctx {
+    int chid;
+    unsigned char *out, *in;
+    int rc;
+};
+
+static void *iov_sender(void *arg)
+{
+    struct iov_ctx *ctx = arg;
+    iov_t siov, riov;
+    int coid;
+
+    ctx->rc = -1;
+    coid = connect_attach((uint32_t) 0, 0, ctx->chid, RTMUX_SIDE_CHANNEL, 0);
+    if (coid == -1) {
+        fprintf(stderr, "ipc-roundtrip: iov connect_attach: %s\n",
+                strerror(errno));
+        return NULL;
+    }
+    SETIOV(&siov, ctx->out, IOV_PARTS);
+    SETIOV(&riov, ctx->in, IOV_PARTS);
+    if (msg_sendv(coid, &siov, 1, &riov, 1) == -1)
+        fprintf(stderr, "ipc-roundtrip: iov msg_sendv: %s\n", strerror(errno));
+    else
+        ctx->rc = 0;
+    (void) __connect_detach((uint64_t) coid);
+    return NULL;
+}
+
+static int iov_call(int rcvid, int write, iov_t *iov, int parts)
+{
+    return write ? msg_writev(rcvid, iov, parts, 0)
+                 : msg_readv(rcvid, iov, parts, 0);
+}
+
+/* One call that must fail with EFAULT, whichever of readv and writev it is. */
+static int iov_expect_efault(int rcvid,
+                             int write,
+                             iov_t *iov,
+                             int parts,
+                             const char *what)
+{
+    int n = iov_call(rcvid, write, iov, parts);
+
+    if (n == -1 && errno == EFAULT)
+        return 0;
+    fprintf(stderr, "ipc-roundtrip: iov %s %s: %d %s, want EFAULT\n", what,
+            write ? "writev" : "readv", n, n == -1 ? strerror(errno) : "");
+    return -1;
+}
+
+/* An array whose first IOV_TAIL_PARTS / 2 entries are readable and whose rest
+ * lie on an unmapped page, a one-entry array on an unmapped page, an array in
+ * kernel space or wrapping past the top of it, and a long
+ * array with one bad entry past the first step.
+ */
+static int iov_fault_checks(int rcvid, iov_t *iov, unsigned char *buf)
+{
+    const size_t pg = __PAGESIZE;
+    const size_t head = (IOV_TAIL_PARTS / 2) * sizeof(iov_t);
+    char *map = mmap(NULL, 2 * pg, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANON, NOFD, 0);
+    iov_t *tail, saved;
+    int rc = 0;
+
+    if (map == MAP_FAILED) {
+        fprintf(stderr, "ipc-roundtrip: iov mmap: %s\n", strerror(errno));
+        return -1;
+    }
+    (void) munmap(map + pg, pg);
+    tail = (iov_t *) (void *) (map + pg - head);
+    for (int i = 0; i < IOV_TAIL_PARTS / 2; i++)
+        SETIOV(&tail[i], buf + i, 1);
+    for (int w = 0; w < 2; w++)
+        rc |= iov_expect_efault(rcvid, w, tail, IOV_TAIL_PARTS,
+                                "unmapped tail");
+    for (int w = 0; w < 2; w++)
+        rc |= iov_expect_efault(rcvid, w, (iov_t *) (void *) (map + pg), 1,
+                                "unmapped single entry");
+    (void) munmap(map, pg);
+    for (int w = 0; w < 2; w++) {
+        rc |= iov_expect_efault(rcvid, w, IOV_KERNEL_VA, IOV_TAIL_PARTS,
+                                "kernel array");
+        rc |= iov_expect_efault(rcvid, w, (iov_t *) (void *) ~(uintptr_t) 0xff,
+                                IOV_TAIL_PARTS, "wrapping array");
+    }
+
+    saved = iov[IOV_BAD_AT];
+    SETIOV(&iov[IOV_BAD_AT], IOV_KERNEL_VA, 8);
+    for (int w = 0; w < 2; w++)
+        rc |= iov_expect_efault(rcvid, w, iov, IOV_PARTS, "kernel entry");
+    iov[IOV_BAD_AT] = saved;
+    return rc;
+}
+
+/* Time calls over the first parts entries of iov with the last one outside the
+ * process, so that the check runs to its end and fails; the p99 goes to *p99,
+ * the slowest to *max.
+ */
+static int iov_check_time(int rcvid,
+                          int write,
+                          iov_t *iov,
+                          int parts,
+                          uint64_t cps,
+                          uint64_t *p99,
+                          uint64_t *max)
+{
+    static uint64_t ns[IOV_STEP_CALLS];
+    iov_t saved = iov[parts - 1];
+    int rc = 0;
+
+    SETIOV(&iov[parts - 1], IOV_KERNEL_VA, 8);
+    for (int i = 0; i < IOV_STEP_CALLS && !rc; i++) {
+        uint64_t t0 = read_time();
+
+        rc = iov_expect_efault(rcvid, write, iov, parts, "last entry");
+        ns[i] = ticks_to_ns(read_time() - t0, cps);
+    }
+    iov[parts - 1] = saved;
+    qsort(ns, IOV_STEP_CALLS, sizeof ns[0], cmp_u64);
+    *p99 = ns[p99_index(IOV_STEP_CALLS)];
+    *max = ns[IOV_STEP_CALLS - 1];
+    return rc;
+}
+
+/* Time IOV_PASSES whole calls over iov; the slowest goes to *max_ns. */
+static int iov_timed(int rcvid,
+                     int write,
+                     iov_t *iov,
+                     uint64_t cps,
+                     uint64_t *max_ns)
+{
+    *max_ns = 0;
+    for (int pass = 0; pass < IOV_PASSES; pass++) {
+        uint64_t t0 = read_time(), ns;
+        int n = iov_call(rcvid, write, iov, IOV_PARTS);
+
+        ns = ticks_to_ns(read_time() - t0, cps);
+        if (n != IOV_PARTS) {
+            fprintf(stderr, "ipc-roundtrip: iov %s: %d %s\n",
+                    write ? "writev" : "readv", n,
+                    n == -1 ? strerror(errno) : "");
+            return -1;
+        }
+        if (ns > *max_ns)
+            *max_ns = ns;
+    }
+    return 0;
+}
+
+static int check_iov_steps(int chid)
+{
+    static unsigned char out[IOV_PARTS], in[IOV_PARTS], rd[IOV_PARTS],
+        wr[IOV_PARTS];
+    static iov_t rdiov[IOV_PARTS], wriov[IOV_PARTS];
+    static struct iov_ctx ctx;
+    uint64_t cps = cycles_per_sec(), rd_ns = 0, wr_ns = 0;
+    uint64_t step_p99 = 0, step_max = 0, all_p99 = 0, all_max = 0;
+    pthread_t tid;
+    int rcvid, ok;
+
+    ctx = (struct iov_ctx){.chid = chid, .out = out, .in = in, .rc = -1};
+    for (int i = 0; i < IOV_PARTS; i++) {
+        out[i] = (unsigned char) (i * 7 + 1);
+        wr[i] = (unsigned char) ~out[i];
+        SETIOV(&rdiov[i], rd + i, 1);
+        SETIOV(&wriov[i], wr + i, 1);
+    }
+    if (pthread_create(&tid, NULL, iov_sender, &ctx) != EOK) {
+        fprintf(stderr, "ipc-roundtrip: iov pthread_create failed\n");
+        return -1;
+    }
+    /* static buffers: on a receive timeout the sender is left running. */
+    if ((rcvid = receive_timed(chid)) == -1)
+        return -1;
+    ok = iov_fault_checks(rcvid, rdiov, rd) == 0;
+    for (int w = 0; w < 2; w++) {
+        iov_t *iov = w ? wriov : rdiov;
+        uint64_t p99 = 0, max = 0;
+
+        ok = ok && iov_check_time(rcvid, w, iov, IOV_STEP, cps, &p99, &max) == 0;
+        if (p99 > step_p99)
+            step_p99 = p99;
+        if (max > step_max)
+            step_max = max;
+        ok = ok && iov_check_time(rcvid, w, iov, IOV_PARTS, cps, &p99, &max) == 0;
+        if (p99 > all_p99)
+            all_p99 = p99;
+        if (max > all_max)
+            all_max = max;
+    }
+    ok = ok && step_p99 < IOV_STEP_NS_MAX &&
+         iov_timed(rcvid, 0, rdiov, cps, &rd_ns) == 0 &&
+         memcmp(rd, out, IOV_PARTS) == 0 &&
+         iov_timed(rcvid, 1, wriov, cps, &wr_ns) == 0;
+    if (msg_reply(rcvid, 0, NULL, 0) == -1) {
+        fprintf(stderr, "ipc-roundtrip: iov msg_reply: %s\n", strerror(errno));
+        ok = 0;
+    }
+    (void) pthread_join(tid, NULL);
+    ok = ok && ctx.rc == 0 && memcmp(in, wr, IOV_PARTS) == 0;
+    printf("ipc-roundtrip: iov-steps %s parts=%d step-p99-ns=%llu "
+           "step-max-ns=%llu check-p99-ns=%llu check-max-ns=%llu "
+           "readv-ns=%llu writev-ns=%llu\n",
+           ok ? "PASS" : "FAIL", IOV_PARTS, (unsigned long long) step_p99,
+           (unsigned long long) step_max, (unsigned long long) all_p99,
+           (unsigned long long) all_max, (unsigned long long) rd_ns,
+           (unsigned long long) wr_ns);
+    return ok ? 0 : -1;
+}
+
 /* Client: connect to the parent's channel, retrying briefly in case the send
  * races the parent reaching its receive. The channel already exists (the parent
  * creates it before spawning us), so this normally succeeds on the first try.
@@ -1023,7 +1260,8 @@ int main(int argc, char **argv)
         fprintf(stderr, "ipc-roundtrip: channel_create: %s\n", strerror(errno));
         return EXIT_FAILURE;
     }
-    if (check_readiov_straddle(chid) != 0 || check_readiov_large(chid) != 0)
+    if (check_readiov_straddle(chid) != 0 || check_readiov_large(chid) != 0 ||
+        check_iov_steps(chid) != 0)
         return EXIT_FAILURE;
 
     snprintf(pid_arg, sizeof pid_arg, "%d", getpid());

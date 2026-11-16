@@ -510,6 +510,15 @@ static __inline__ void __attribute__((__unused__)) atomic_boundary()
 #define XFER_SRC_FAULT 0x01
 #define XFER_DST_FAULT 0x02
 
+/* Maximum number of iov entries in one message vector */
+#define XFER_IOV_LIMIT ((4 * 1024 * 1024) / 8)
+
+/* Entries xfer_iov_check() examines in one kernel entry */
+#define XFER_IOV_CHECK_STEP 512
+
+/* xfer_iov_check() asked for the kernel call to be restarted */
+#define XFER_IOV_CHECK_RESTART (-1)
+
 #define XFER_SRC_CHECK 0x01
 #define XFER_DST_CHECK 0x02
 

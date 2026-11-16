@@ -569,6 +569,14 @@ typedef struct thread_entry { /* Also used for vthread_entry */
     unsigned robust_nheld; /* length of robust_held (under sync_pi_slock) */
     thread_t *restart;
 
+    /* Resume point of the msg_readv / msg_writev iov check (xfer_iov_check):
+     * the array being checked, its part count, and how many entries are done.
+     * Valid only until the thread makes any other kernel call.
+     */
+    const iov_t *iovchk_iov;
+    int32_t iovchk_parts;
+    uint32_t iovchk_done;
+
     /* The following is used to hold arguments when a thread blocks to make them
      * easy to access in another threads context. Only a very small number of
      * arguments need to be saved.
