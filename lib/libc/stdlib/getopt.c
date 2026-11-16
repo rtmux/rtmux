@@ -17,8 +17,13 @@
  * optstring "a" the argument "--foo" reports '-' as an unknown option.
  *
  * getopt_long adds long options: "--name", "--name=value", "--name value" for a
- * required argument, and any unambiguous prefix of a name. It does not permute
- * argv: options after the first operand are not seen. getopt_long_only also
+ * required argument, and any unambiguous prefix of a name. Like GNU getopt, it
+ * permutes argv, so options after an operand are seen: the operands it steps
+ * over are moved behind the options, in their order, and optind ends at the
+ * first operand. Permutation is off when POSIXLY_CORRECT is in the environment
+ * or optstring starts with '+' (parsing then stops at the first operand, as in
+ * getopt), and does not apply with a leading '-', where each operand is
+ * returned as it comes. getopt itself never permutes. getopt_long_only also
  * takes long names after a single '-', falling back to option letters when no
  * name matches.
  *
@@ -34,6 +39,7 @@
 
 #include <getopt.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -49,6 +55,13 @@ char *optarg;
 static size_t pos;
 static const char *group;
 
+/* While getopt_long permutes: the operands it has stepped over are
+ * argv[first_non..last_non), and argv[last_non..optind) are the options read
+ * since. Both are empty, and equal to optind, between parses.
+ */
+static int first_non;
+static int last_non;
+
 static void clear_group(void)
 {
     pos = 0;
@@ -60,6 +73,40 @@ static void next_arg(void)
 {
     optind++;
     clear_group();
+}
+
+static void reverse(char **v, int lo, int hi)
+{
+    while (lo < --hi) {
+        char *t = v[lo];
+
+        v[lo++] = v[hi];
+        v[hi] = t;
+    }
+}
+
+/* Move the skipped operands behind the options read since, keeping the order of
+ * each: argv[first_non..optind) becomes options, then operands.
+ */
+static void settle(char *const argv[])
+{
+    if (first_non == last_non || last_non == optind)
+        return;
+    reverse((char **) argv, first_non, last_non);
+    reverse((char **) argv, last_non, optind);
+    reverse((char **) argv, first_non, optind);
+    first_non += optind - last_non;
+    last_non = optind;
+}
+
+/* End of options: leave optind at the first operand skipped, if any. */
+static int finish(char *const argv[])
+{
+    settle(argv);
+    if (first_non != last_non)
+        optind = first_non;
+    first_non = last_non = optind;
+    return -1;
 }
 
 /* The optstring entry for option letter c, or NULL; ':' is never an option. */
@@ -168,7 +215,7 @@ static int parse(int argc,
                  int *longindex,
                  int long_only)
 {
-    int operands_as_1 = 0;
+    int operands_as_1, plus, posix = -1;
     const char *arg;
 
     if (optind == 0 || optreset) {
@@ -176,29 +223,48 @@ static int parse(int argc,
         if (optind == 0)
             optind = 1;
         clear_group();
+        first_non = last_non = optind;
     }
-    if (*optstring == '+' || *optstring == '-')
-        operands_as_1 = *optstring++ == '-';
+    /* A caller that moved optind behind the operands drops the block. */
+    if (first_non > last_non || last_non > optind)
+        first_non = last_non = optind;
+    plus = *optstring == '+';
+    operands_as_1 = *optstring == '-';
+    if (plus || operands_as_1)
+        optstring++;
 
     /* A leading ':' (after any '+' or '-') reports a missing argument as ':'
      * and silences the messages.
      */
     int quiet = *optstring == ':';
 
+again:
     if (optind < 1 || optind >= argc || !(arg = argv[optind]))
-        return -1;
+        return finish(argv);
     if (arg != group)
         pos = 0; /* between arguments, or the caller moved optind elsewhere */
     if (pos == 0) {
         if (arg[0] != '-' || arg[1] == '\0') {
-            if (!operands_as_1)
-                return -1;
-            optarg = argv[optind++];
-            return 1;
+            if (operands_as_1) {
+                optarg = argv[optind++];
+                return 1;
+            }
+            if (!longopts || plus)
+                return finish(argv);
+            if (posix < 0)
+                posix = getenv("POSIXLY_CORRECT") != NULL;
+            if (posix)
+                return finish(argv);
+            /* Step over the operand; the options after it come first. */
+            settle(argv);
+            if (first_non == last_non)
+                first_non = optind;
+            last_non = ++optind;
+            goto again;
         }
         if (arg[1] == '-' && arg[2] == '\0') {
             optind++;
-            return -1;
+            return finish(argv);
         }
         if (longopts && (arg[1] == '-' || long_only)) {
             /* For getopt_long_only, a single letter that is a short option

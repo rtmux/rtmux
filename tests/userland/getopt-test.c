@@ -13,6 +13,7 @@
 
 #include <getopt.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -157,6 +158,87 @@ static void test_getopt_table(void)
     opterr = save_opterr;
 }
 
+/* Permutation: a whole parse, rendered as the options returned, "|", then argv
+ * from the stopping optind on (the operands, in their order). The table's
+ * optind column does not show argv, which permutation rewrites.
+ */
+struct permute_case {
+    const char *name;
+    enum which which;
+    const char *optstring;
+    int posixly; /* set POSIXLY_CORRECT for the parse */
+    const char *args[MAXARGS];
+    const char *want;
+};
+
+static const struct permute_case permute_cases[] = {
+    {"getopt_long -a x -b yields a then b, x left", LONG, "ab", 0, {"-a", "x", "-b"}, "ab|x"},
+    {"getopt_long under POSIXLY_CORRECT stops at x", LONG, "ab", 1, {"-a", "x", "-b"}, "a|x -b"},
+    {"getopt_long leading + stops at x", LONG, "+ab", 0, {"-a", "x", "-b"}, "a|x -b"},
+    {"getopt_long operands keep their order", LONG, "ab", 0, {"x", "-a", "y", "-b", "z"},
+     "ab|x y z"},
+    {"getopt_long operands before options only", LONG, "ab", 0, {"x", "y", "-a"}, "a|x y"},
+    {"getopt_long -- ends options, operands follow", LONG, "ab", 0, {"x", "-a", "--", "-b", "y"},
+     "a|x -b y"},
+    {"getopt_long moves an operand behind a long option's argument", LONG, "", 0,
+     {"x", "--xray", "1", "y", "--xenon"}, "xn|x y"},
+    {"getopt_long no operands", LONG, "ab", 0, {"-a", "-b"}, "ab|"},
+    {"getopt_long operands only", LONG, "ab", 0, {"x", "y"}, "|x y"},
+    {"getopt_long a lone - is an operand", LONG, "ab", 0, {"-", "-a"}, "a|-"},
+    {"getopt_long leading - returns operands as they come", LONG, "-ab", 0, {"x", "-a", "y"},
+     "1a1|"},
+    {"getopt_long_only permutes too", LONG_ONLY, "a", 0, {"x", "-all", "y", "-a"}, "Aa|x y"},
+    {"getopt never permutes", SHORT, "ab", 0, {"x", "-a"}, "|x -a"},
+};
+
+static void test_getopt_permute(void)
+{
+    int save_opterr = opterr;
+
+    opterr = 0;
+    for (size_t i = 0; i < sizeof permute_cases / sizeof permute_cases[0]; i++) {
+        const struct permute_case *t = &permute_cases[i];
+        char *argv[MAXARGS + 1];
+        char out[128];
+        int argc = 0, c;
+        size_t len = 0;
+
+        argv[argc++] = "prog";
+        for (const char *const *a = t->args; *a && argc < MAXARGS; a++)
+            argv[argc++] = (char *) *a;
+        argv[argc] = NULL;
+        if (t->posixly)
+            setenv("POSIXLY_CORRECT", "1", 1);
+        optind = 0;
+        for (int guard = 0; guard < 32; guard++) {
+            if (t->which == SHORT)
+                c = getopt(argc, argv, t->optstring);
+            else if (t->which == LONG)
+                c = getopt_long(argc, argv, t->optstring, longopts, NULL);
+            else
+                c = getopt_long_only(argc, argv, t->optstring, longopts, NULL);
+            if (c == -1)
+                break;
+            len += (size_t) snprintf(out + len, sizeof out - len, "%c", c > 1 ? c : '0' + c);
+        }
+        len += (size_t) snprintf(out + len, sizeof out - len, "|");
+        for (int k = optind; k < argc; k++)
+            len += (size_t) snprintf(out + len, sizeof out - len, "%s%s", k > optind ? " " : "",
+                                     argv[k]);
+        unsetenv("POSIXLY_CORRECT");
+        if (strcmp(out, t->want) == 0) {
+            test_ok(t->name);
+        } else {
+            char detail[200];
+
+            snprintf(detail, sizeof detail, "got \"%s\", want \"%s\"", out, t->want);
+            test_fail(t->name, detail);
+        }
+    }
+    opterr = save_opterr;
+    optind = 1;
+}
+
 static char *first[] = {"prog", "-abc", NULL};
 static char *second[] = {"prog", "-xy", NULL};
 
@@ -217,5 +299,6 @@ static void test_getopt_restart(void)
 void test_getopt(void)
 {
     test_getopt_table();
+    test_getopt_permute();
     test_getopt_restart();
 }

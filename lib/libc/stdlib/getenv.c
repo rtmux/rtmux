@@ -15,27 +15,36 @@
  * vector, records for each entry the size of the buffer when libc allocated the
  * string (setenv) and 0 when it did not (putenv, or inherited).
  *
- * Nothing libc allocated for the environment is freed, except the side array. A
- * vector that is outgrown is retired, not freed: a reader still walking it sees
- * a stale but intact snapshot, and the retired vectors of a geometric series
- * add up to less than the live one. Each change after the program reassigns
- * environ also retires libc's vector, since the program may assign it back
- * later, so a program that keeps reassigning environ and changing it leaks one
- * vector per round.
+ * Nothing libc allocated for the environment is freed, except the side array
+ * and what is described next. A vector that is outgrown is retired, not freed:
+ * a reader still walking it sees a stale but intact snapshot, and the retired
+ * vectors of a geometric series add up to less than the live one. When the
+ * program has reassigned environ, though, libc's next change copies the
+ * program's vector and frees libc's old one, together with every string libc
+ * allocated that nothing holds: not the program's vector (by its start or by a
+ * pointer into it) and not an argument of the call, so a loop that assigns
+ * environ and changes it stays flat. A string the program's vector holds by its
+ * start stays libc's, to reuse or free later. The scan is bounded
+ * (ENV_RELEASE_WORK); past it the rest stay allocated. A program must not
+ * assign environ back to a libc vector it saved before that change, and, as
+ * POSIX allows, a pointer from getenv does not survive a later setenv, unsetenv
+ * or putenv.
  *
  * Lifetime of a string returned by getenv. A string libc allocated (setenv)
- * stays allocated for the life of the process. Overwriting the variable with a
- * value that fits rewrites that buffer in place, so the old pointer then reads
- * the new value; a longer value goes into a new buffer and the old one is left
- * as it was. unsetenv leaves removed strings allocated too. The cost is that
- * replacing a variable with a longer value, or setting it again after unsetenv,
- * leaks the old string. A string libc did not allocate (one passed to putenv,
- * or in a vector the loader or the program supplied) lives exactly as long as
- * its owner keeps it.
+ * stays allocated until the program reassigns environ and libc then releases it
+ * (see above), and otherwise for the life of the process. Overwriting the
+ * variable with a value that fits rewrites that buffer in place, so the old
+ * pointer then reads the new value; a longer value goes into a new buffer and
+ * the old one is left as it was. unsetenv leaves removed strings allocated too.
+ * The cost is that replacing a variable with a longer value, or setting it
+ * again after unsetenv, leaks the old string. A string libc did not allocate
+ * (one passed to putenv, or in a vector the loader or the program supplied)
+ * lives exactly as long as its owner keeps it.
  *
  * A program may assign environ directly. libc notices that environ is no longer
  * its own vector and, on the next change, copies the new vector instead of
- * growing the old one, treating every string in it as not owned.
+ * growing the old one. A string in it counts as not owned, except one that libc
+ * allocated and the vector holds by its start in exactly one entry (see above).
  *
  * Changes run under the environment lock (env-lock.h), which spawn and exec
  * also take while they copy environ. getenv does not take it: as POSIX allows,
@@ -48,6 +57,7 @@
 
 #include <errno.h>
 #include <pthread.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -127,12 +137,71 @@ static long env_find(const char *name, size_t len)
     return -1;
 }
 
+/* The most pointer comparisons env_release makes under the lock; past that the
+ * remaining strings are left allocated, as before, and only the vector is
+ * freed.
+ */
+#define ENV_RELEASE_WORK (1UL << 20)
+
+/* Whether p (which may be NULL) points into the n bytes at base. */
+static int env_within(const char *p, const char *base, size_t n)
+{
+    return p && (uintptr_t) p >= (uintptr_t) base &&
+           (uintptr_t) p - (uintptr_t) base < n;
+}
+
+/* Free libc's old vector, which the program has replaced, and the strings libc
+ * allocated in it that nothing holds: neither live[0..n) (the program's vector,
+ * copied into the new vector with side array owned) nor keep (an argument of
+ * the call in progress), as a whole string or as a pointer into it. A string
+ * that live holds by its start passes on its buffer size to owned, so a later
+ * change can reuse or free it.
+ */
+static void env_release(char *const *live,
+                        size_t n,
+                        size_t *owned,
+                        const void *keep,
+                        const void *keep2)
+{
+    size_t work = ENV_RELEASE_WORK;
+
+    for (size_t i = 0; i < env.slots && env.vec[i]; i++) {
+        const char *str = env.vec[i];
+        size_t size = env.owned[i], hits = 0;
+        long start = -1;
+
+        if (!size)
+            continue;
+        if (work < n + 1)
+            break; /* the rest stay allocated */
+        work -= n + 1;
+        for (size_t k = 0; k < n && hits < 2; k++) {
+            if (env_within(live[k], str, size)) {
+                hits++;
+                if (live[k] == str)
+                    start = (long) k;
+            }
+        }
+
+        /* One entry, at the start: the buffer is that entry's alone. Any other
+         * alias would see a reuse in place.
+         */
+        if (hits == 1 && start >= 0)
+            owned[start] = size;
+        if (!hits && !env_within(keep, str, size) &&
+            !env_within(keep2, str, size))
+            free(env.vec[i]);
+    }
+    free(env.vec);
+}
+
 /* Make environ libc's own vector, with room for extra more entries.
  *
  * Returns the entry count, or -1 with errno ENOMEM and nothing changed. An
- * outgrown vector of libc's is retired, not freed (see the top).
+ * outgrown vector of libc's is retired, not freed (see the top). keep and keep2
+ * are pointers the caller still needs, which a replacement must not free.
  */
-static long env_reserve(size_t extra)
+static long env_reserve(size_t extra, const void *keep, const void *keep2)
 {
     size_t n = env_count();
     int mine = environ && environ == env.vec;
@@ -159,6 +228,8 @@ static long env_reserve(size_t extra)
     vec[n] = NULL;
     if (mine)
         memcpy(owned, env.owned, n * sizeof *owned);
+    else if (env.vec)
+        env_release(vec, n, owned, keep, keep2);
     free(env.owned); /* only libc reads the side array, so it can go */
     env.vec = vec;
     env.owned = owned;
@@ -174,7 +245,7 @@ static long env_reserve(size_t extra)
  */
 static int env_store(long i, char *s, size_t owned)
 {
-    long n = env_reserve(i < 0 ? 1 : 0);
+    long n = env_reserve(i < 0 ? 1 : 0, s, NULL);
 
     if (n < 0)
         return -1;
@@ -218,14 +289,23 @@ int setenv(const char *name, const char *value, int overwrite)
     i = env_find(name, nlen);
     if (i >= 0 && !overwrite)
         goto out;
-    if (i >= 0 && environ == env.vec && env.owned[i] >= size) {
+
+    /* A variable in a vector the program supplied: take over libc's copy of it
+     * first, so that a buffer libc allocated there can be reused in place.
+     */
+    if (i >= 0 && environ != env.vec && env_reserve(0, name, value) < 0) {
+        rc = -1;
+        goto out;
+    }
+    if (i >= 0 && env.owned[i] >= size) {
         /* memmove: value may point into this very string. */
         memmove(environ[i] + nlen + 1, value, vlen + 1);
         goto out;
     }
 
-    /* Allocate the string before touching the vector, so a failure on either
-     * leaves the environment as it was.
+    /* Allocate the string before changing the entries, so a failure on either
+     * leaves every variable as it was (the adoption above copies each entry of
+     * the program's vector, so only libc's own storage is replaced).
      */
     if (!(s = malloc(size))) {
         errno = ENOMEM;
@@ -277,7 +357,7 @@ int unsetenv(const char *name)
      */
     if (env_find(name, len) < 0)
         goto out;
-    if (env_reserve(0) < 0) {
+    if (env_reserve(0, name, NULL) < 0) {
         rc = -1;
         goto out;
     }

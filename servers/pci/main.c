@@ -7,6 +7,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <getopt.h>
+
 #include "globals.h"
 
 #define PCI_MODE (S_IFCHR | 0600)
@@ -412,6 +414,9 @@ static void pci_ioserv_loop(ioserv_context_t *ctp)
     }
 }
 
+/* getopt_long wants a table even when there are no long options. */
+static const struct option no_long_options[] = {{NULL, 0, NULL, 0}};
+
 int main(int argc, char **argv)
 {
     int c;
@@ -442,12 +447,12 @@ int main(int argc, char **argv)
 
     /* process args */
 
-    while (optind < argc) {
-        if ((c = getopt(argc, argv, "b:c:DmMn:pP:vx")) == -1) {
-            optind++;
-            continue;
-        }
-
+    /* getopt_long permutes, so options may follow an operand; "--" ends them,
+     * and whatever follows it is an operand. A POSIXLY_CORRECT environment
+     * turns permutation off: the first operand then ends the options.
+     */
+    while ((c = getopt_long(argc, argv, "b:c:DmMn:pP:vx", no_long_options,
+                            NULL)) != -1) {
         switch (c) {
         case 'b':
             scan_buses = atoi(optarg);
@@ -513,15 +518,23 @@ int main(int argc, char **argv)
             break;
 
         default:
-            /* Stop here: carrying on would read the rest of a bad argument such
-             * as "--verbose" as a group of option letters.
-             */
-            pci_slogf(_SLOGC_PCI, _SLOG_ERROR,
-                      "%s unknown option or missing argument -%c", progname,
-                      optopt);
+            /* A long name leaves optopt 0: report argv[optind - 1]. */
+            if (optopt)
+                pci_slogf(_SLOGC_PCI, _SLOG_ERROR,
+                          "%s unknown option or missing argument -%c", progname,
+                          optopt);
+            else
+                pci_slogf(_SLOGC_PCI, _SLOG_ERROR,
+                          "%s unknown option or missing argument %s", progname,
+                          argv[optind - 1]);
             exit(EXIT_FAILURE);
         }
     }
+
+    /* The server takes no operands. */
+    for (; optind < argc; optind++)
+        pci_slogf(_SLOGC_PCI, _SLOG_WARNING, "%s ignoring operand %s", progname,
+                  argv[optind]);
 
     /* Attach the ECAM driver directly (no DLL loading) */
     {

@@ -122,6 +122,15 @@ static void test_env_putenv(void)
     check(ok, "unsetenv of a putenv string leaves it intact", "caller string changed");
 }
 
+static size_t env_len(void)
+{
+    size_t n = 0;
+
+    while (environ && environ[n])
+        n++;
+    return n;
+}
+
 static void test_env_reassign(void)
 {
     char *mine[] = {"Z=9", "D=1", "E=2", "D=3", NULL};
@@ -153,6 +162,53 @@ static void test_env_reassign(void)
          !strcmp(fixed[0], "K=1") && !strcmp(fixed[1], "L=2") && fixed[2] == NULL;
     check(ok, "unsetenv copies a supplied vector instead of editing it",
           "the program's vector was written");
+}
+
+/* A program that keeps assigning environ and then changing it: libc frees the
+ * vector it replaces, and the strings it allocated that the new vector does not
+ * hold, so the heap stays flat. A string the program's vector does hold (a copy
+ * of environ) survives the replacement.
+ */
+static void test_env_reassign_loop(void)
+{
+    static char *base[] = {"T=1", "U=2", NULL};
+    char *copy[16];
+    char val[16];
+    int ok = 1;
+#ifdef LIBC_HOST_TEST
+    struct host_alloc_stats first, last;
+#endif
+
+    for (int i = 0; i < MANY && ok; i++) {
+        environ = base;
+        snprintf(val, sizeof val, "r%04d", i); /* same length each round */
+        ok = setenv("A", val, 1) == 0 && setenv("T", val, 1) == 0 && !strcmp(getenv("A"), val) &&
+             !strcmp(getenv("T"), val) && !strcmp(getenv("U"), "2") && !strcmp(base[0], "T=1");
+#ifdef LIBC_HOST_TEST
+        if (i == 1)
+            host_alloc_snapshot(&first);
+#endif
+    }
+    check(ok, "1000 environ reassignments with setenv keep every value", "a value was wrong");
+#ifdef LIBC_HOST_TEST
+    host_alloc_snapshot(&last);
+    check(last.live == first.live, "1000 environ reassignments leave the heap flat",
+          "the vectors or strings leaked");
+#endif
+
+    /* The program copies environ, assigns the copy, and libc replaces it. */
+    ok = setenv("KEEP", "kept", 1) == 0 && env_len() < sizeof copy / sizeof *copy;
+    if (!ok)
+        return;
+    memcpy(copy, environ, (env_len() + 1) * sizeof *copy);
+    environ = copy;
+    ok = setenv("OTHER", "o", 1) == 0 && !strcmp(getenv("KEEP"), "kept") &&
+         !strcmp(getenv("OTHER"), "o");
+    check(ok, "a string held by the program's own vector survives", "KEEP was freed or lost");
+
+    environ = NULL;
+    ok = setenv("N", "1", 1) == 0 && !strcmp(getenv("N"), "1") && !getenv("KEEP");
+    check(ok, "environ = NULL then setenv starts afresh", "old variables remained");
 }
 
 /* 1000 distinct names: the vector grows geometrically, so environ changes
@@ -269,13 +325,40 @@ int env_expect_child(const char *assignment)
 }
 #endif
 
+/* The process environment as strings and a vector the program owns. environ may
+ * be libc's own vector, which libc frees when the program assigns environ and
+ * then changes it, so the tests restore this copy and not the saved pointer.
+ */
+static char *saved_vec[64];
+static char saved_str[4096];
+
+static char **save_environ(void)
+{
+    size_t used = 0, n = 0;
+
+    if (!environ)
+        return NULL;
+    for (; environ[n]; n++) {
+        size_t len = strlen(environ[n]) + 1;
+
+        if (n + 1 >= sizeof saved_vec / sizeof saved_vec[0] ||
+            used + len > sizeof saved_str)
+            break;
+        saved_vec[n] = memcpy(saved_str + used, environ[n], len);
+        used += len;
+    }
+    saved_vec[n] = NULL;
+    return saved_vec;
+}
+
 void test_env(void)
 {
-    char **saved = environ;
+    char **saved = save_environ();
 
     test_env_basic();
     test_env_putenv();
     test_env_reassign();
+    test_env_reassign_loop();
     test_env_growth();
 #ifdef LIBC_HOST_TEST
     test_env_alloc_failure();
