@@ -16,7 +16,7 @@ The Option group column attributes each interface to the POSIX option that requi
 | Interface | Option group | Min profile | Status | Exported from | Implementation | Tests | Notes |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `_exit` | - | - | implemented | include/unistd.h | lib/libc/posix/_exit.c | tests/userland/main.c<br>tests/userland/notifications.c<br>tests/userland/sync.c<br>tests/userland/vfs.c | - |
-| `access` | - | - | implemented | include/unistd.h | lib/libc/posix/access.c | tests/userland/posix-options.c<br>tests/userland/rt-latency/lkl-supervisor.c<br>tests/userland/rt-latency/logger-restart.c<br>tests/userland/vfs.c | - |
+| `access` | - | - | implemented | include/unistd.h | lib/libc/posix/access.c | tests/userland/posix-options.c<br>tests/userland/rt-latency/lkl-supervisor.c<br>tests/userland/rt-latency/logger-restart.c<br>tests/userland/time-test.c<br>tests/userland/vfs.c | - |
 | `asctime_r` | _POSIX_THREAD_SAFE_FUNCTIONS | realtime, lkl | implemented | include/time.h | lib/libc/posix/localtime.c | tests/userland/posix-options.c<br>tests/userland/vfs.c | - |
 | `brk` | - | - | not-supported | - | - | scripts/check-porting-contract.sh | omitted by design; alternative: `malloc`, or `mmap` for a large region; expected: undefined reference at link time |
 | `cfgetispeed` | - | - | implemented | include/termios.h | lib/libc/posix/termios-speed.c | tests/userland/vfs.c | - |

@@ -14,6 +14,18 @@
  * that, so servers/roottask/sys/heap.c overrides both with a static arena. A
  * request of LARGE_MIN bytes or more gets its own mapping and is returned to
  * the system on free. malloc is not async-signal-safe.
+ *
+ * Statistics: five counters (see struct __rtmux_mallocstats in
+ * <sys/mallocstats.h>). Small blocks are counted inside the critical sections
+ * the allocator already has, with a plain load and store each (the lock makes
+ * the writers one at a time), so counting adds no atomic read-modify-write. A
+ * mapped block never takes the lock: it has counters of its own, updated
+ * atomically, and the two sets are added when read. So are the failure count
+ * and the peak, which is raised by compare and exchange only when exceeded. A
+ * block's size is its usable payload, the bucket size less the header or the
+ * mapping less LARGE_HDR, which is all free can know. __crt_mallocstats reads
+ * the counters one at a time without the lock, so a snapshot taken while other
+ * threads allocate need not be consistent; with none it is exact.
  */
 
 #include <stddef.h>
@@ -88,8 +100,12 @@ static union overhead *nextf[NBUCKETS];
  * is left clear, which selects priority inheritance. It must not use
  * CONFIG_ULOCK_DEBUG tracking, whose acquire hook allocates and would recurse.
  */
+#ifdef MALLOC_HOST_TEST
+static pthread_mutex_t alloc_mutex = PTHREAD_MUTEX_INITIALIZER;
+#else
 static pthread_mutex_t alloc_mutex = {RTMUX_SYNC_NONRECURSIVE,
                                       RTMUX_SYNC_INITIALIZER};
+#endif
 
 static inline void alloc_lock(void)
 {
@@ -99,6 +115,110 @@ static inline void alloc_lock(void)
 static inline void alloc_unlock(void)
 {
     (void) pthread_mutex_unlock(&alloc_mutex);
+}
+
+/* Statistics. MALLOC_NO_STATS builds the allocator without them, for the host
+ * benchmark that measures what they cost. The small-block counters (st_*) have
+ * one writer at a time, the holder of alloc_mutex. A mapped block is outside
+ * that lock, so it has counters of its own (stm_*) updated atomically and never
+ * waits for the lock; the sums are what is reported.
+ */
+static _Atomic unsigned long long st_allocs, st_frees, st_in_use;
+
+/* Each group is on a cache line of its own: mapped blocks write stm without the
+ * lock and must not take the line from a holder updating st_*, and stx.peak and
+ * stx.failed are written rarely and must not share one with either.
+ */
+static struct {
+    _Alignas(64) _Atomic unsigned long long allocs, frees, in_use;
+} stm;
+static struct {
+    _Alignas(64) _Atomic unsigned long long peak, failed;
+} stx;
+
+#ifndef MALLOC_NO_STATS
+/* A plain load and store of an atomic: only for writers holding alloc_mutex. */
+static inline void st_add(_Atomic unsigned long long *c, unsigned long long n)
+{
+    atomic_store_explicit(c, atomic_load_explicit(c, memory_order_relaxed) + n,
+                          memory_order_relaxed);
+}
+
+/* Raise the peak to `now` if it is higher. The compare is almost always false
+ * once the program has warmed up, so the hot path costs one load.
+ */
+static inline void st_peak_raise(unsigned long long now)
+{
+    unsigned long long peak =
+        atomic_load_explicit(&stx.peak, memory_order_relaxed);
+
+    while (now > peak && !atomic_compare_exchange_weak_explicit(
+                             &stx.peak, &peak, now, memory_order_relaxed,
+                             memory_order_relaxed))
+        ;
+}
+
+/* The caller holds alloc_mutex. */
+static inline void stat_alloc(size_t usable)
+{
+    unsigned long long use =
+        atomic_load_explicit(&st_in_use, memory_order_relaxed) + usable;
+
+    st_add(&st_allocs, 1);
+    atomic_store_explicit(&st_in_use, use, memory_order_relaxed);
+    st_peak_raise(use +
+                  atomic_load_explicit(&stm.in_use, memory_order_relaxed));
+}
+
+/* The caller holds alloc_mutex. */
+static inline void stat_free(size_t usable)
+{
+    st_add(&st_frees, 1);
+    st_add(&st_in_use, -(unsigned long long) usable);
+}
+
+static inline void stat_fail(void)
+{
+    atomic_fetch_add_explicit(&stx.failed, 1, memory_order_relaxed);
+}
+
+/* A mapped block: counted without the lock. A free is counted before the unmap,
+ * an allocation after the map, so the counters never show a block as live while
+ * another takes its place.
+ */
+static void stat_alloc_mapped(size_t usable)
+{
+    unsigned long long use =
+        atomic_fetch_add_explicit(&stm.in_use, usable, memory_order_relaxed) +
+        usable;
+
+    atomic_fetch_add_explicit(&stm.allocs, 1, memory_order_relaxed);
+    st_peak_raise(use + atomic_load_explicit(&st_in_use, memory_order_relaxed));
+}
+
+static void stat_free_mapped(size_t usable)
+{
+    atomic_fetch_add_explicit(&stm.frees, 1, memory_order_relaxed);
+    atomic_fetch_sub_explicit(&stm.in_use, usable, memory_order_relaxed);
+}
+#else
+#define stat_alloc(usable) ((void) (usable))
+#define stat_free(usable) ((void) (usable))
+#define stat_fail() ((void) 0)
+#define stat_alloc_mapped(usable) ((void) (usable))
+#define stat_free_mapped(usable) ((void) (usable))
+#endif
+
+void __crt_mallocstats(struct __rtmux_mallocstats *st)
+{
+    st->allocs = atomic_load_explicit(&st_allocs, memory_order_relaxed) +
+                 atomic_load_explicit(&stm.allocs, memory_order_relaxed);
+    st->frees = atomic_load_explicit(&st_frees, memory_order_relaxed) +
+                atomic_load_explicit(&stm.frees, memory_order_relaxed);
+    st->bytes_in_use = atomic_load_explicit(&st_in_use, memory_order_relaxed) +
+                       atomic_load_explicit(&stm.in_use, memory_order_relaxed);
+    st->bytes_peak = atomic_load_explicit(&stx.peak, memory_order_relaxed);
+    st->failed = atomic_load_explicit(&stx.failed, memory_order_relaxed);
 }
 
 static void *cp2op(void *cp)
@@ -127,6 +247,7 @@ static void *large_alloc(size_t nbytes)
     op = (union overhead *) (void *) (base + LARGE_HDR - sizeof(*op));
     op->ov_magic = LMAGIC;
     op->ov_index = 0;
+    stat_alloc_mapped(total - LARGE_HDR);
     return base + LARGE_HDR;
 }
 
@@ -137,22 +258,28 @@ void *__crt_malloc(size_t nbytes)
     size_t amt;
     void *ret;
 
-    if (nbytes >= LARGE_MIN)
-        return large_alloc(nbytes);
+    if (nbytes >= LARGE_MIN) {
+        if (!(ret = large_alloc(nbytes)))
+            stat_fail();
+        return ret;
+    }
 
     amt = FIRST_BUCKET_SIZE;
     bucket = 0;
     while (nbytes > amt - sizeof(*op)) {
         amt <<= 1;
         bucket++;
-        if (amt == 0 || bucket >= NBUCKETS)
+        if (amt == 0 || bucket >= NBUCKETS) {
+            stat_fail();
             return NULL;
+        }
     }
 
     alloc_lock();
     while (!(op = nextf[bucket])) {
         if (!refill(bucket)) {
             alloc_unlock();
+            stat_fail();
             return NULL;
         }
     }
@@ -160,6 +287,7 @@ void *__crt_malloc(size_t nbytes)
     op->ov_magic = MAGIC;
     op->ov_index = (uint16_t) bucket;
     ret = (char *) (op + 1);
+    stat_alloc(amt - sizeof(*op));
     alloc_unlock();
     return ret;
 }
@@ -168,8 +296,10 @@ void *__crt_calloc(size_t num, size_t size)
 {
     void *ret;
 
-    if (size != 0 && (num * size) / size != num)
+    if (size != 0 && (num * size) / size != num) {
+        stat_fail();
         return NULL; /* overflow */
+    }
 
     if ((ret = __crt_malloc(num * size)))
         memset(ret, 0, num * size);
@@ -185,12 +315,16 @@ void *__crt_aligned_alloc_offset(size_t align, size_t size, size_t offset)
     if (align < FIRST_BUCKET_SIZE)
         align = FIRST_BUCKET_SIZE;
     /* lib_align_up() below assumes a power-of-two alignment. */
-    if (align & (align - 1))
+    if (align & (align - 1)) {
+        stat_fail();
         return NULL;
+    }
     offset &= align - 1;
     if (size > SIZE_MAX - align || size + align > SIZE_MAX - offset ||
-        size + align + offset > SIZE_MAX - sizeof(union overhead))
+        size + align + offset > SIZE_MAX - sizeof(union overhead)) {
+        stat_fail();
         return NULL;
+    }
     mem = __crt_malloc(size + align + offset + sizeof(union overhead));
     if (!mem)
         return NULL;
@@ -204,6 +338,7 @@ void *__crt_aligned_alloc_offset(size_t align, size_t size, size_t offset)
     size_t idx = x - (uintptr_t) mem + sizeof(union overhead);
     if (idx > UINT16_MAX) {
         __crt_free(mem);
+        stat_fail();
         return NULL;
     }
     ov1.ov_magic = AMAGIC;
@@ -294,8 +429,10 @@ void __crt_free(void *cp)
     op = (op1.ov_magic == AMAGIC) ? (void *) ((char *) cp - op1.ov_index) : opx;
     if (op->ov_magic == LMAGIC) {
         char *base = (char *) op - (LARGE_HDR - sizeof(*op));
+        size_t total = *(size_t *) (void *) base;
 
-        __crt_lesscore(base, *(size_t *) (void *) base);
+        stat_free_mapped(total - LARGE_HDR);
+        __crt_lesscore(base, total);
         return;
     }
     if (op->ov_magic != MAGIC)
@@ -304,6 +441,7 @@ void __crt_free(void *cp)
     alloc_lock();
     op->ov_next = nextf[size];
     nextf[size] = op;
+    stat_free(((size_t) FIRST_BUCKET_SIZE << size) - sizeof(*op));
     alloc_unlock();
 }
 

@@ -52,6 +52,7 @@ void test_strftime(void);
 void test_qsort(void);
 void test_getopt(void);
 void test_env(void);
+void test_malloc_stats(void);
 int env_expect_child(const char *assignment);
 void test_signals(void);
 void test_vfs(void);

@@ -201,6 +201,13 @@ if [[ ! -s "$NVME_IMG" ]]; then
     chmod +x "$P8_ROOT/sbin/sysinit/level1.sh"
     echo "RTMux /usr starter tree." > "$P8_ROOT/share/README"
 
+    # Zone files for geographic TZ names (libc reads /usr/share/zoneinfo). An
+    # existing image keeps what it has; delete it to pick the zone files up.
+    ./scripts/gen-zoneinfo.sh "$P8_ROOT/share/zoneinfo" || {
+        rm -rf "$P8_ROOT"
+        exit 1
+    }
+
     # Ship the syscall conformance suite on /usr for the block-filesystem regress
     # mode (EMU_ROMFS_TESTS), which boots it from the disk to prove the suite does
     # not depend on initramfs.cpio for its binary.
