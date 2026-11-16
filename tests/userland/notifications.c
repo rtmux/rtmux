@@ -256,7 +256,7 @@ static long disc_wait(const char *key, long want)
 }
 
 /* Run /bin/inject to completion: its exit status, or -1 if it did not run. */
-static int disc_inject(const char *a1, const char *a2, const char *a3)
+int inject_run(const char *a1, const char *a2, const char *a3)
 {
     char *argv[] = {"inject", (char *) a1, (char *) a2, (char *) a3, NULL};
     pid_t pid;
@@ -314,7 +314,7 @@ static const char *disc_round(int chid, const char *pidarg, char *detail,
         disc_kill(pid);
         return "attach did not reserve a notice per connection";
     }
-    if (disc_inject("fail-alloc", "notification", pidarg) != 0) {
+    if (inject_run("fail-alloc", "notification", pidarg) != 0) {
         disc_kill(pid);
         return "inject refused to arm";
     }
@@ -365,7 +365,7 @@ int disconnect_under_alloc_failure(void)
     const char *why = NULL;
     int chid, round;
 
-    if (disc_inject("alloc-status", NULL, NULL) != 0)
+    if (inject_run("alloc-status", NULL, NULL) != 0)
         return TC_EXIT_SKIP;
     disc_fd = open("/sys/kstats", O_RDONLY);
     chid = channel_create(RTMUX_FLG_CHF_DISCONNECT);
@@ -391,7 +391,7 @@ int disconnect_under_alloc_failure(void)
     }
 
     /* Leave no failure armed against this process. */
-    (void) disc_inject("fail-alloc", "notification", DISC_PID_NONE);
+    (void) inject_run("fail-alloc", "notification", DISC_PID_NONE);
     (void) channel_destroy(chid);
     (void) close(disc_fd);
     return 0;

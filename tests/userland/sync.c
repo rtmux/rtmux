@@ -1404,10 +1404,7 @@ struct condloan_args {
     atomic_int wait_rc;  /* result of the condition wait, or -1 until done */
 };
 
-static int condloan_create(pthread_t *tid,
-                           int prio,
-                           void *(*fn)(void *),
-                           void *arg)
+int condloan_create(pthread_t *tid, int prio, void *(*fn)(void *), void *arg)
 {
     pthread_attr_t attr;
     struct sched_param sp = {.sched_priority = prio};
@@ -2537,25 +2534,30 @@ struct fp_job {
     int pin; /* cpu to pin to, or -1 */
 };
 
-static int fp_pin(int cpu)
+int test_pin_mask(unsigned mask)
 {
-    unsigned size = 1U;
-    size_t bytes =
-        sizeof(struct _thread_runmask) + 2U * size * sizeof(unsigned);
+    size_t bytes = sizeof(struct _thread_runmask) + 2U * sizeof(unsigned);
     struct _thread_runmask *m = calloc(1U, bytes);
-    unsigned *runmask, mask = 0;
+    unsigned *runmask;
     int rc;
 
     if (!m)
         return -1;
-    RMSK_SET((unsigned) cpu, &mask);
-    m->size = size;
+    m->size = 1U;
     runmask = (unsigned *) (m + 1);
-    runmask[0] = mask;
-    runmask[size] = mask;
+    runmask[0] = mask; /* run mask */
+    runmask[1] = mask; /* inherit mask: threads created from here follow */
     rc = thread_ctl(RTMUX_TCTL_RUNMASK_GET_AND_SET_INHERIT, m);
     free(m);
     return rc;
+}
+
+static int fp_pin(int cpu)
+{
+    unsigned mask = 0;
+
+    RMSK_SET((unsigned) cpu, &mask);
+    return test_pin_mask(mask);
 }
 
 static void *fp_worker(void *arg)

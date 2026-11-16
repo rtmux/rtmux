@@ -243,7 +243,8 @@ creator's base (`thread_inherit_prio`). PI loans are never inherited.
 | send or notification queued with no receiver | `pend_loan` raised to its priority on each thread whose `last_chid` is the channel, whatever that thread's current priority |
 | `MsgReply` / `MsgError` that leaves the thread with no client | the request loan ends; if the call completed an exchange on the channel the thread serves, `pend_loan` = the send-queue head read as the client was unlinked |
 | reply to an older client while serving a newer one | unchanged: the newer client's loan stays |
-| the client leaves REPLY by timeout, signal, cancellation or death | `force_ready` clears the server's `client` link but does not touch its priority, because it runs where another thread cannot be rescheduled; the loan ends at the server's next `MsgReply` or `MsgError` (which then fails with `ESRCH`) or `MsgReceive` |
+| the client leaves REPLY by timeout, signal, cancellation or death | `force_ready` clears the server's `client` link and ends the request loan of that client under the same compare-and-swaps the REPLY walk uses (`thread_end_msg_loan`), then recomputes the server's priority (`thread_prio_settle`); another hart's server is rescheduled by an IPI. The chain is not followed from `force_ready`, which runs under caller locks and in interrupt context: a second server or mutex owner the first one waits on keeps the lent priority until it finishes (an over-boost). A client that leaves between the server's receive taking it and installing its loan is caught by the receive (`thread_drop_gone_client_loan`). The server's later `MsgReply` or `MsgError` fails with `ESRCH` |
+| `MsgCurrent(0)` | the request loan ends at once; a notification loan stays until the next receive |
 | server thread dies | its client's `args.ms.server` is cleared before `tthread_rcu` drains; nothing is lent any more |
 
 Until one of those ends it, a stale loan can only hold a server above its base

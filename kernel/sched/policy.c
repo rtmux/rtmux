@@ -187,6 +187,7 @@ int kdecl ksys_sched_set(thread_t *act, struct kcall_args_sched_set *kap)
     int status;
     int prp_pinned = 0;
     int thp_pinned = 0;
+    unsigned old_prio = act->priority;
 
     if (kap->pid == 0 || kap->pid == act->process->pid) {
         prp = act->process;
@@ -292,6 +293,12 @@ int kdecl ksys_sched_set(thread_t *act, struct kcall_args_sched_set *kap)
     }
 
     status = EOK;
+
+    /* After the change is applied, so the caller may already be switched out.
+     */
+    if (inject_should_fail_sched_set(act,
+                                     thp == act && act->priority < old_prio))
+        status = EINVAL;
 out:
     if (thp_pinned)
         tthread_unpin(thp);

@@ -63,18 +63,25 @@ static int self_prio(int *base)
     return prio_of(pthread_self(), base);
 }
 
-/* Poll t until its effective priority equals want; returns the last value. */
-static int wait_prio(pthread_t t, int want)
+/* Poll t for up to tries ms until its effective priority equals want; returns
+ * the last value.
+ */
+static int wait_prio_n(pthread_t t, int want, int tries)
 {
     int cur = -1;
 
-    for (int i = 0; i < POLL_MS; i++) {
+    for (int i = 0; i < tries; i++) {
         cur = prio_of(t, NULL);
         if (cur == want)
             break;
         sleep_ms(1);
     }
     return cur;
+}
+
+static int wait_prio(pthread_t t, int want)
+{
+    return wait_prio_n(t, want, POLL_MS);
 }
 
 /* Wait at most POLL_MS for flag; returns whether it was set. */
@@ -603,10 +610,10 @@ static void test_reply_depth_bound(void)
     (void) pthread_mutex_destroy(&m);
 }
 
-/* Case 6: a client that leaves REPLY by timeout. Its loan stays on the server
- * until the server's next reply or receive (docs/pi-pc-design.md: a client
- * leaving REPLY clears the link, but force_ready cannot reschedule the
- * server); that reply fails with ESRCH and returns the server to its base.
+/* Case 6: a client that leaves REPLY by timeout. Its loan ends with its
+ * departure: the unblock path drops the server's REPLY loan, so the server is
+ * back at its base within a tick, not at its next reply or receive; that reply
+ * then fails with ESRCH.
  */
 #define C6_BASE 5
 
@@ -632,21 +639,239 @@ static void test_loan_after_client_timeout(void)
         return;
     (void) wait_flag(&k.received);
     (void) wait_flag(&c.done);
-    during = prio_of(ts, NULL);
+    /* Within a tick of the timeout; a few more for another hart's IPI. */
+    during = wait_prio_n(ts, C6_BASE, 5);
     set_flag(&k.go);
     (void) pthread_join(ts, NULL);
     (void) pthread_join(tc, NULL);
     snprintf(detail, sizeof detail,
              "received at %d (want 40); client rc %d errno %d (want ETIMEDOUT); "
-             "server %d until it replied (rc %d), then %d base %d (want %d)",
-             k.prio_recv, c.rc, c.err, during, k.reply_rc, k.prio_after,
-             k.base_after, C6_BASE);
+             "server %d within 5 ms of the timeout (want %d), reply rc %d, then "
+             "%d base %d",
+             k.prio_recv, c.rc, c.err, during, C6_BASE, k.reply_rc,
+             k.prio_after, k.base_after);
     check(k.prio_recv == 40 && c.rc == -1 && c.err == ETIMEDOUT &&
-              k.reply_rc == -1 && k.prio_after == C6_BASE &&
-              k.base_after == C6_BASE,
-          "prio loan: a timed-out client's loan ends at the server's next reply",
-          detail);
+              during == C6_BASE && k.reply_rc == -1 &&
+              k.prio_after == C6_BASE && k.base_after == C6_BASE,
+          "prio loan: a timed-out client's loan ends with the timeout", detail);
     chan_close(k.chid, coid);
+}
+
+/* Case 7: a server that names no current client with msg_current(0) has no
+ * request to serve, so the loan its client lent ends at once.
+ */
+static void *case7_server(void *raw)
+{
+    struct server *k = raw;
+    char buf[1], z = 0;
+
+    (void) set_fifo(k->base);
+    set_flag(&k->ready);
+    k->rcvid = msg_receive(k->chid, buf, sizeof buf, NULL);
+    k->prio_recv = self_prio(NULL);
+    set_flag(&k->received);
+    (void) msg_current(0);
+    k->prio_unlocked = self_prio(NULL);
+    set_flag(&k->go);
+    k->reply_rc = k->rcvid == -1 ? -1 : msg_reply(k->rcvid, 0, &z, 1);
+    k->prio_after = self_prio(&k->base_after);
+    return NULL;
+}
+
+#define C7_BASE 5
+
+static void test_loan_ends_at_msg_current_zero(void)
+{
+    static struct server k;
+    struct client c = {.prio = 40, .reply_timeout_ms = POLL_MS};
+    pthread_t ts, tc;
+    int coid = -1;
+    char detail[160];
+
+    memset(&k, 0, sizeof k);
+    if (chan_open(&k.chid, &coid) != 0) {
+        test_fail("prio loan: msg_current(0) setup", strerror(errno));
+        return;
+    }
+    k.base = C7_BASE;
+    c.coid = coid;
+    if (!spawn(&ts, case7_server, &k, "prio loan: msg_current(0) server"))
+        return;
+    (void) wait_flag(&k.ready);
+    if (!spawn(&tc, client_main, &c, "prio loan: msg_current(0) client"))
+        return;
+    (void) wait_flag(&k.go);
+    (void) pthread_join(ts, NULL);
+    (void) pthread_join(tc, NULL);
+    snprintf(detail, sizeof detail,
+             "received at %d (want 40), %d after msg_current(0) (want %d), "
+             "reply rc %d",
+             k.prio_recv, k.prio_unlocked, C7_BASE, k.reply_rc);
+    check(k.prio_recv == 40 && k.prio_unlocked == C7_BASE,
+          "prio loan: msg_current(0) ends the client's loan", detail);
+    chan_close(k.chid, coid);
+}
+
+/* Case 8: a client that leaves REPLY by timeout while its server is itself
+ * REPLY-blocked on a second server. The first server, not running, falls back
+ * to its base. (The second server keeps what it was lent until it replies: the
+ * chain is not followed from the timeout path.)
+ */
+#define C8_BASE_A 10
+#define C8_BASE_B 5
+
+struct c8 {
+    struct server a, b;
+    int coid_b;
+    atomic_int a_sent;
+};
+
+static void *c8_server_a(void *raw)
+{
+    struct c8 *k = raw;
+    char buf[1], req = 0, rep = 0, z = 0;
+
+    (void) set_fifo(k->a.base);
+    set_flag(&k->a.ready);
+    k->a.rcvid = msg_receive(k->a.chid, buf, sizeof buf, NULL);
+    k->a.prio_recv = self_prio(NULL);
+    set_flag(&k->a.received);
+    set_flag(&k->a_sent);
+    k->a.reply_rc = msg_send(k->coid_b, &req, 1, &rep, 1);
+    if (k->a.rcvid != -1)
+        (void) msg_reply(k->a.rcvid, 0, &z, 1);
+    return NULL;
+}
+
+static void test_loan_ends_for_blocked_server(void)
+{
+    static struct c8 k;
+    struct client c = {.prio = 40, .reply_timeout_ms = 300};
+    pthread_t ta, tb, tc;
+    int coid_a = -1, coid_b = -1, during = -1;
+    char detail[192];
+
+    memset(&k, 0, sizeof k);
+    if (chan_open(&k.a.chid, &coid_a) != 0 ||
+        chan_open(&k.b.chid, &coid_b) != 0) {
+        test_fail("prio loan: chained timeout setup", strerror(errno));
+        return;
+    }
+    k.a.base = C8_BASE_A;
+    k.b.base = C8_BASE_B;
+    k.coid_b = coid_b;
+    c.coid = coid_a;
+    if (!spawn(&tb, server_main, &k.b, "prio loan: chained timeout server B"))
+        return;
+    (void) wait_flag(&k.b.ready);
+    if (!spawn(&ta, c8_server_a, &k, "prio loan: chained timeout server A"))
+        return;
+    (void) wait_flag(&k.a.ready);
+    if (!spawn(&tc, client_main, &c, "prio loan: chained timeout client"))
+        return;
+    (void) wait_flag(&k.b.received);
+    (void) wait_flag(&c.done);
+    during = wait_prio_n(ta, C8_BASE_A, 5);
+    set_flag(&k.b.go);
+    (void) pthread_join(tb, NULL);
+    (void) pthread_join(ta, NULL);
+    (void) pthread_join(tc, NULL);
+    snprintf(detail, sizeof detail,
+             "server B at %d while the client waited (want 40); server A %d within "
+             "5 ms of the timeout (want %d); client rc %d errno %d",
+             k.b.prio_recv, during, C8_BASE_A, c.rc, c.err);
+    check(k.b.prio_recv == 40 && c.rc == -1 && c.err == ETIMEDOUT &&
+              during == C8_BASE_A,
+          "prio loan: a timed-out client's loan ends on a blocked server", detail);
+    chan_close(k.a.chid, coid_a);
+    chan_close(k.b.chid, coid_b);
+}
+
+/* K19: a kcall that lowers the caller below a ready thread and then fails. The
+ * switch happens inside the kcall, before the trap handler writes the result,
+ * so the status has to be in the saved context by then. A debug-inject kernel
+ * fails the next K19_ROUNDS lowering SchedSet calls of this process after they
+ * have applied the change; the caller and a competitor are pinned to one hart,
+ * so the competitor really runs before the caller returns.
+ */
+#define K19_ROUNDS 1000
+#define K19_HIGH 40
+#define K19_MID 30
+#define K19_LOW 10
+
+static atomic_int k19_ran;
+
+static void *k19_competitor(void *raw)
+{
+    (void) raw;
+    atomic_store_explicit(&k19_ran, 1, memory_order_release);
+    return NULL;
+}
+
+/* Returns 0 when it ran (the verdict goes through check), or TC_EXIT_SKIP when
+ * fault injection is not available.
+ */
+int sched_set_error_after_lowering(void)
+{
+    struct sched_param saved, low = {.sched_priority = K19_LOW};
+    char pidarg[16], count[16], detail[160];
+    int policy, bad = 0, not_switched = 0, setup = 0;
+    unsigned mask = 0;
+
+    if (inject_run("sched-set-status", NULL, NULL) != 0)
+        return TC_EXIT_SKIP;
+    policy = __sched_get(0, 0, &saved);
+    RMSK_SET(0, &mask);
+    if (policy == -1 || test_pin_mask(mask) == -1 || set_fifo(K19_HIGH) == -1) {
+        test_fail("sched_set_error_after_lowering setup", strerror(errno));
+        return 0;
+    }
+    snprintf(pidarg, sizeof pidarg, "%d", (int) getpid());
+    snprintf(count, sizeof count, "%d", K19_ROUNDS);
+    if (inject_run("fail-sched-set", pidarg, count) != 0) {
+        test_fail("sched_set_error_after_lowering setup", "inject refused to arm");
+        goto out;
+    }
+
+    for (int i = 0; i < K19_ROUNDS; i++) {
+        pthread_t t;
+        int rc, err, ran;
+
+        atomic_store_explicit(&k19_ran, 0, memory_order_relaxed);
+        if (!condloan_create(&t, K19_MID, k19_competitor, NULL)) {
+            setup++;
+            break;
+        }
+        rc = __sched_set(0, 0, RTMUX_SCHED_SETPRIO, &low);
+        err = errno;
+        ran = atomic_load_explicit(&k19_ran, memory_order_acquire);
+        (void) set_fifo(K19_HIGH);
+        (void) pthread_join(t, NULL);
+        if (!ran)
+            not_switched++;
+        if (rc != -1 || err != EINVAL)
+            bad++;
+    }
+
+    /* The competitor running proves a switch, not that it came before the
+     * status write: the trap handler counts each error return that found its
+     * caller already switched out.
+     */
+    if (inject_run("sched-set-displaced", count, NULL) != 0)
+        not_switched++;
+    snprintf(detail, sizeof detail,
+             "%d of %d calls lost the error status (%d never switched out, "
+             "%d not started)",
+             bad, K19_ROUNDS, not_switched, setup);
+    check(bad == 0 && not_switched == 0 && setup == 0,
+          "sched_set_error_after_lowering status survives a switch", detail);
+
+out:
+    /* Leave no failure armed against this process. */
+    (void) inject_run("fail-sched-set", pidarg, "0");
+    (void) test_pin_mask(~0U);
+    (void) __sched_set(0, 0, policy, &saved);
+    return 0;
 }
 
 void test_prio_loan(void)
@@ -664,5 +889,7 @@ void test_prio_loan(void)
     test_reply_cycle_deadlock();
     test_reply_depth_bound();
     test_loan_after_client_timeout();
+    test_loan_ends_at_msg_current_zero();
+    test_loan_ends_for_blocked_server();
     (void) __sched_set(0, 0, policy, &saved);
 }

@@ -165,6 +165,52 @@ static inline bool thread_relend_msg(thread_t *thp,
                                        __ATOMIC_RELEASE, __ATOMIC_RELAXED);
 }
 
+/* End the request loan of the generation seen in `seen`, unless a newer loan
+ * replaced it: a new generation with no priority. A REPLY propagation changing
+ * only the priority meanwhile does not stop it.
+ *
+ * Returns whether it ended the loan. The caller then applies the new effective
+ * priority (thread_prio_update, thread_prio_settle).
+ */
+static inline bool thread_end_msg_loan(thread_t *thp, uint64_t seen)
+{
+    uint64_t want = seen & ~MSG_LOAN_PRIO_MASK; /* flag and generation */
+
+    if (!(seen & MSG_LOAN_REQUEST))
+        return false;
+    for (;;) {
+        uint64_t next = (want & ~(MSG_LOAN_GEN_ONE - 1)) + MSG_LOAN_GEN_ONE;
+
+        if (__atomic_compare_exchange_n(&thp->msg_loan, &seen, next, false,
+                                        __ATOMIC_RELEASE, __ATOMIC_RELAXED))
+            return true;
+
+        /* `seen` is now the current word: retry only if just the priority
+         * changed.
+         */
+        if ((seen & ~MSG_LOAN_PRIO_MASK) != want)
+            return false;
+    }
+}
+
+/* After lending thp's priority to act as its server: a timeout or signal may
+ * have sent thp away before the loan existed, with none then to end, so drop
+ * the loan of a client that is gone. A departure after this check finds the
+ * loan and ends it (force_ready).
+ */
+static inline void thread_drop_gone_client_loan(thread_t *act,
+                                                const thread_t *thp)
+{
+    /* The loan store above and the client load below must not reorder, and
+     * force_ready's client store and loan load likewise: with both fences at
+     * least one side sees the other's store, so a loan installed after the
+     * client left is ended by one of them.
+     */
+    cpu_smp_mb();
+    if (__atomic_load_n(&act->client, __ATOMIC_ACQUIRE) != thp)
+        thread_lend_msg(act, 0, false);
+}
+
 /* Whether thp's message loan came from a client (it ends when the server has no
  * client left) rather than a notification (it ends at the next receive).
  */

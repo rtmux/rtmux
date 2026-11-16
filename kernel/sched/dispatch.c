@@ -1465,8 +1465,42 @@ int rdecl force_ready(thread_t *thp, unsigned err)
             thread_t *srv = thp->args.ms.server;
             thread_t *expect = thp;
 
-            __atomic_compare_exchange_n(&srv->client, &expect, NULL, 0,
-                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
+            bool is_thr = TYPE_MASK(srv->type) == TYPE_THREAD;
+
+            /* Read the loan before the client link, as the REPLY walk does: a
+             * receive sets the new client before it bumps the generation.
+             */
+            uint64_t seen = is_thr ? thread_msg_loan_word(srv) : 0;
+
+            if (__atomic_compare_exchange_n(&srv->client, &expect, NULL, 0,
+                                            __ATOMIC_ACQ_REL,
+                                            __ATOMIC_RELAXED)) {
+                bool ended = thread_end_msg_loan(srv, seen);
+
+                /* The receive that made thp the client may install its loan
+                 * after `seen` was read, even when the old loan just ended
+                 * here. A request loan with no client is that one, so end it
+                 * too. The fence pairs with the one in
+                 * thread_drop_gone_client_loan.
+                 */
+                if (is_thr) {
+                    uint64_t now;
+
+                    cpu_smp_mb();
+                    now = thread_msg_loan_word(srv);
+                    if (__atomic_load_n(&srv->client, __ATOMIC_ACQUIRE) == NULL)
+                        ended |= thread_end_msg_loan(srv, now);
+                }
+
+                /* Return the server to the priority it is owed now. The chain
+                 * is not followed: force_ready runs from timer and event
+                 * delivery under caller locks, so a second server this one
+                 * waits on keeps the lent priority until it replies (an
+                 * over-boost, never a deficit).
+                 */
+                if (ended)
+                    thread_prio_settle(srv);
+            }
             thp->args.ms.server = NULL;
         }
         if (thp->restart) {

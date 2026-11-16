@@ -36,6 +36,21 @@
 /* ALLOC_STATUS: ret is 1 if the armed failure was consumed, else 0. */
 #define INJECT_OP_ALLOC_STATUS 4
 
+/* FAIL_NEXT_SCHED_SET(pid, count): the next count SchedSet kcalls by that
+ * process that lower the caller's own priority fail with EINVAL, after they
+ * have applied the change. A kcall that reschedules its caller and then fails
+ * is otherwise unreachable, and the test of the error status reaching a thread
+ * that was switched out needs one.
+ */
+#define INJECT_OP_FAIL_NEXT_SCHED_SET 6
+/* SCHED_SET_STATUS: ret is how many armed failures have been delivered. */
+#define INJECT_OP_SCHED_SET_STATUS 7
+
+/* SCHED_SET_DISPLACED: ret is how many injected failures found their caller
+ * already switched out when the error status was written.
+ */
+#define INJECT_OP_SCHED_SET_DISPLACED 8
+
 #define INJECT_SPIN_MAX_MS 10000
 
 /* Injected interrupts-off spins, for intrevent_flush()'s debug spin watchdog: a

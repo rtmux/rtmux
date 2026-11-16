@@ -29,7 +29,7 @@ int kdecl ksys_msg_current(thread_t *act, struct kcall_args_msg_current *kap)
     thread_t *thp;
     int do_pi = 0;
     kdispatch_t *new_dpp = NULL;
-
+    thread_t *prior_client = act->client;
 
     /* Disown act's prior client, if any. Single-pointer atomic writes; the
      * prior client briefly observes server=0 with act->client cleared —
@@ -37,12 +37,20 @@ int kdecl ksys_msg_current(thread_t *act, struct kcall_args_msg_current *kap)
      * per-thread_t lock would close this window; not yet instantiated
      * (LOCK_CLASS_THREAD placeholder).
      */
-    if (act->client != 0) {
-        act->client->args.ms.server = 0;
+    if (prior_client) {
+        prior_client->args.ms.server = 0;
         act->client = 0;
     }
 
     if (kap->rcvid == 0) {
+        /* No client left to lend priority. A notification loan stays until the
+         * next receive.
+         */
+        if (prior_client && thread_msg_loan_is_request(act)) {
+            CRITICAL_CLEAR(act);
+            thread_lend_msg(act, 0, false);
+            thread_prio_update(act);
+        }
         return EOK;
     }
 
@@ -132,6 +140,7 @@ int kdecl ksys_msg_current(thread_t *act, struct kcall_args_msg_current *kap)
         CRITICAL_INHERIT(act, thp);
         thread_lend_msg(act, __atomic_load_n(&thp->priority, __ATOMIC_ACQUIRE),
                         true);
+        thread_drop_gone_client_loan(act, thp);
         (void) thread_prio_update_dpp(act, new_dpp, 1);
     } else {
         /* A fixed-priority channel lends nothing. Drop the loan an earlier

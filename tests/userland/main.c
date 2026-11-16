@@ -1027,6 +1027,12 @@ int main(int argc, char *argv[])
             test_skip("disconnect_under_alloc_failure", "fault injection unavailable");
         return finish(1);
     }
+    if (argc == 2 && !strcmp(argv[1], "--sched-set-error")) {
+        printf("[sched_set_error_after_lowering]\n");
+        if (sched_set_error_after_lowering() == TC_EXIT_SKIP)
+            test_skip("sched_set_error_after_lowering", "fault injection unavailable");
+        return finish(1);
+    }
     if (argc == 3 && !strcmp(argv[1], "--serial-unblock-child"))
         return serial_unblock_child(!strcmp(argv[2], "announce"));
     if (argc == 2 && !strcmp(argv[1], "--console-poll")) {

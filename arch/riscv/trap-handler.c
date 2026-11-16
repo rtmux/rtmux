@@ -1085,16 +1085,23 @@ void strap_handler_c(CPU_REGISTERS *regs)
              */
         }
 
-        if (act->state != STATE_RUNNING ||
-            get_active_thread(get_cpunum()) != act) {
+        /* Publish the status before the "still running?" check: a kcall that
+         * rescheduled act may have switched it out, and the status must reach
+         * it whenever it runs next.
+         */
+        SETKSTATUS(act, -(long) ret);
+
+        bool displaced = act->state != STATE_RUNNING ||
+                         get_active_thread(get_cpunum()) != act;
+
+        inject_note_sched_return(act, displaced);
+        if (displaced) {
             kernel_exit();
             /* NOTREACHED — same as above. */
         }
 
-        /* Error return — write negated errno to act->reg (same as regs for
-         * U-mode, different for S-mode). For U-mode: regs == &act->reg, so
-         * writing regs works. For S-mode: we already copied to act->reg above,
-         * but the caller's stack frame also needs the return value.
+        /* S-mode: regs is the caller's stack frame, a different copy from
+         * act->reg, so it needs the return value too.
          */
         in_kcall_dec();
         regs->gpr[RISCV_REG_A0] = (uint64_t) (-(long) ret);
