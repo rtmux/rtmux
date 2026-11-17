@@ -167,7 +167,14 @@ if test "$rtmux_run" = "debug-inject"; then
             ok=7
         fi
     fi
+    # A MAP that meets a superpage half way must report its progress, so the
+    # pages it already mapped are unmapped, and must leave no page behind.
     if test "$ok" = 7; then
+        if /bin/syscall_testing --pte-partial-map; then
+            ok=8
+        fi
+    fi
+    if test "$ok" = 8; then
         echo "RTMux debug-inject: PASS"
     else
         echo "RTMux debug-inject: FAIL"

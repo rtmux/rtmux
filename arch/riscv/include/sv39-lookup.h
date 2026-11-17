@@ -12,9 +12,8 @@
  * walk stopped at. Kept header-only so the host unit test runs the same walk
  * and arithmetic the kernel does.
  *
- * The walker is defined only when the includer has PA_TO_VA(pa), which turns a
- * table's physical address into a pointer the walker can read. Other callers go
- * through cpu_pte_lookup.
+ * The walkers read a table through PA_TO_VA(pa), the kernel's direct map from
+ * cpu-paging.h; a host test defines its own before including this header.
  */
 
 #ifndef _RISCV_SV39_LOOKUP_H
@@ -68,7 +67,6 @@ static inline uint64_t sv39_leaf_paddr(pte_t pte,
     return PTE2PA(pte) | off;
 }
 
-#ifdef PA_TO_VA
 /* sv39_lookup_leaf — read-only walk of pgdir for va.
  *
  * Returns a pointer to the valid leaf PTE that maps va, or NULL if va is not
@@ -151,7 +149,70 @@ static inline pte_t *sv39_walk_slot(pagetable_t pgdir,
     }
     return &pgdir[PX(0, va)];
 }
-#endif
+
+/* What sv39_manip_pages does to each page of its range. */
+enum sv39_manip_op {
+    SV39_MANIP_MAP,      /* store a leaf: frame and bits, one frame per page */
+    SV39_MANIP_UNMAP,    /* clear a valid leaf */
+    SV39_MANIP_PROT,     /* swap a valid leaf's flag bits, keep the rest */
+    SV39_MANIP_PREALLOC, /* only make the tables a MAP would need */
+};
+
+/* sv39_manip_pages — apply op to the 4 KiB pages of [*startp, end) in pgdir.
+ *
+ * The one loop behind cpu_pte_manipulate, header-only so the host test runs the
+ * kernel's own error mapping. MAP and PREALLOC create tables through alloc and
+ * report what sv39_walk_slot did: ENOMEM, or EEXIST over a superpage. UNMAP and
+ * PROT never create a table: a missing one holds nothing to change, so it is
+ * skipped, but EEXIST over a superpage is reported, since neither can act on
+ * part of one. PROT keeps the PPN and the attribute bits above it (Svpbmt,
+ * Svnapot) and replaces bits 0..9 with bits.
+ *
+ * Progress is kept in the caller's variables after every page: *startp is the
+ * first page not done and, for MAP, *paddrp the frame it gets, so on an error
+ * they name what was done and a caller can undo [first, *startp) or resume.
+ * *changedp is set to 1 once a PTE has been written.
+ */
+static inline int sv39_manip_pages(pagetable_t pgdir,
+                                   enum sv39_manip_op op,
+                                   uintptr_t *startp,
+                                   uintptr_t end,
+                                   uint64_t *paddrp,
+                                   uint64_t bits,
+                                   sv39_alloc_fn alloc,
+                                   int *changedp)
+{
+    int create = op == SV39_MANIP_MAP || op == SV39_MANIP_PREALLOC;
+
+    for (uintptr_t va = *startp; va < end; va += PGSIZE, *startp = va) {
+        int err = create ? ENOMEM : ENOENT;
+        pte_t *pte = sv39_walk_slot(pgdir, va, create ? alloc : NULL, &err);
+
+        if (!pte) {
+            if (create || err == EEXIST)
+                return err;
+            continue; /* no table, so no leaf to unmap or re-protect */
+        }
+        switch (op) {
+        case SV39_MANIP_MAP:
+            *pte = PA2PTE(*paddrp) | bits;
+            *paddrp += PGSIZE;
+            *changedp = 1;
+            break;
+        case SV39_MANIP_UNMAP:
+        case SV39_MANIP_PROT:
+            if (!(*pte & PTE_V))
+                break;
+            *pte = op == SV39_MANIP_UNMAP ? 0
+                                          : (*pte & ~PTE_FLAG_BITS) | bits;
+            *changedp = 1;
+            break;
+        case SV39_MANIP_PREALLOC:
+            break;
+        }
+    }
+    return 0;
+}
 
 /* Kernel entry point for sv39_lookup_leaf (arch/riscv/cpu-pte.c). */
 pte_t *cpu_pte_lookup(pagetable_t pgdir,

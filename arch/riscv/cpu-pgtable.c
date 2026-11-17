@@ -24,7 +24,6 @@
 
 #include <core/globals.h>
 #include <paging.h>
-#define PA_TO_VA(pa) PHYS_TO_PTR(pa)
 #include <sv39-lookup.h>
 
 /* cpu_pgdir_create — allocate a user root page table with kernel mappings.
@@ -159,11 +158,11 @@ extern void pa_free_paddr(paddr_t p, paddr_t s, paddr_t resv_size);
 extern void cpu_tlb_flush_complete(void);
 
 /* Free the table a non-leaf PTE points to, with the allocator that made it:
- * sv39_walk (cpu-pte.c) takes intermediate tables from pa_alloc and marks the
- * PTE with PTE_SW_PA; walk() above takes them from _scalloc_page. Freeing a pa
- * page into the kernel heap kept it from pa for good, a few pages per exited
- * process (and quietly refilled the heap that the pgdir's alignment slack
- * drained).
+ * sv39_new_table (cpu-pte.c) takes intermediate tables from pa_alloc and
+ * marks the PTE with PTE_SW_PA; walk() above takes them from _scalloc_page.
+ * Freeing a pa page into the kernel heap kept it from pa for good, a few pages
+ * per exited process (and quietly refilled the heap that the pgdir's alignment
+ * slack drained).
  */
 static void pgtable_page_free(pte_t entry)
 {

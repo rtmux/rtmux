@@ -8,6 +8,8 @@
 /* Debug-only fault injection; built only with CONFIG_DEBUG_INJECT. */
 
 #include <core/globals.h>
+#include "as.h"
+#include <sv39-lookup.h>
 #include <private/inject.h>
 #include <private/kstats.h>
 
@@ -32,7 +34,8 @@ static _Atomic(thread_t *) sched_failed_thr; /* the caller just failed */
 static inline bool inject_op_is_status(unsigned op)
 {
     return op == INJECT_OP_ALLOC_STATUS || op == INJECT_OP_SCHED_SET_STATUS ||
-           op == INJECT_OP_SCHED_SET_DISPLACED;
+           op == INJECT_OP_SCHED_SET_DISPLACED || op == INJECT_OP_PTE_PROBE ||
+           op == INJECT_OP_MANIP_PARTIAL;
 }
 
 atomic_ullong inject_spin_state;
@@ -169,6 +172,129 @@ int inject_should_fail_alloc(process_t *prp, soul_t *soulp)
     return 1;
 }
 
+/* Pages done by the most recent failed MAP, as cpu_pte_manipulate reported it.
+ */
+static atomic_uint manip_partial;
+
+void inject_note_manip_failure(unsigned pages)
+{
+    atomic_store_explicit(&manip_partial, pages, memory_order_release);
+}
+
+/* pid's address space, or NULL. Opens the RCU read section, which the caller
+ * closes either way.
+ */
+static address_t *inject_pid_memory(uint64_t pid)
+{
+    process_t *prp = lookup_pid_rcu((pid_t) pid);
+
+    return prp ? prp->memory : NULL;
+}
+
+/* The armed FAIL_PTE_MAP: the process, and how many pages it may map. */
+static atomic_int armed_map_pid = -1;
+static atomic_uint armed_map_pages;
+static _Atomic uintptr_t armed_map_va; /* 0: any start */
+
+/* Called from cpu_pte_manipulate for a MAP of [start, *endp] in adp (*endp is
+ * the last byte, as in struct mm_pte_manipulate): if a failure is armed for adp
+ * and the range is longer than the armed pages, cut *endp there and take the
+ * arm (once), and the caller reports ENOMEM.
+ */
+bool inject_pte_map_stop(const void *adp, uintptr_t start, uintptr_t *endp)
+{
+    int armed = atomic_load_explicit(&armed_map_pid, memory_order_acquire);
+    process_t *prp;
+    bool match;
+    unsigned pages;
+    uintptr_t va;
+
+    if (!adp || armed < 0)
+        return false;
+
+    /* The pid, not the address space, stays armed: a pid carries a generation,
+     * so an arm that outlives its process matches nothing. The process can go
+     * away under us, so read it inside the RCU section lookup_pid_rcu opens.
+     */
+    prp = lookup_pid_rcu(armed);
+    match = prp && prp->memory == adp;
+    rcu_sched_read_unlock();
+    if (!match)
+        return false;
+    pages = atomic_load_explicit(&armed_map_pages, memory_order_relaxed);
+    va = atomic_load_explicit(&armed_map_va, memory_order_relaxed);
+    if (va && va != start)
+        return false;
+    /* *endp is the last byte of the range, not one past it. */
+    if (*endp < start || (*endp - start + 1) / __PAGESIZE <= pages)
+        return false;
+
+    /* Only the caller that swaps this arm away takes it; a newer arm for
+     * another address space stays.
+     */
+    if (!atomic_compare_exchange_strong_explicit(&armed_map_pid, &armed, -1,
+                                                 memory_order_acq_rel,
+                                                 memory_order_relaxed))
+        return false;
+    atomic_store_explicit(&consumed, 1, memory_order_release);
+    *endp = start + pages * __PAGESIZE;
+    return true;
+}
+
+/* inject_pte — PTE_SUPERPAGE, PTE_CLEAR_SUPERPAGE and PTE_PROBE on the page
+ * table of process pid.
+ *
+ * Returns an errno (EOK on success), or for PTE_PROBE 0 or 1 through *probedp.
+ * The table is read and written under as_slock, the lock ksys_manipulate holds
+ * for every other change to it.
+ */
+static int inject_pte(unsigned op, uint64_t pid, uint64_t va, int *probedp)
+{
+    address_t *adp;
+    pagetable_t pgdir;
+    int ret = EOK;
+    bool flush = false;
+
+    if (pid > INT32_MAX || va >= MAXVA ||
+        (op != INJECT_OP_PTE_PROBE && (va & (sv39_leaf_size(1) - 1))))
+        return EINVAL;
+    adp = inject_pid_memory(pid);
+    if (!adp) {
+        rcu_sched_read_unlock();
+        return ESRCH;
+    }
+    pgdir = adp->cpu.pgdir;
+    kspinlock_lock(&as_slock);
+    if (op == INJECT_OP_PTE_PROBE) {
+        *probedp = sv39_lookup_leaf(pgdir, (uintptr_t) va, NULL, NULL) != NULL;
+    } else {
+        pte_t top = pgdir[PX(2, va)];
+
+        if (!(top & PTE_V) || sv39_is_leaf(top)) {
+            ret = EINVAL;
+        } else {
+            pte_t *slot = &((pagetable_t) PA_TO_VA(PTE2PA(top)))[PX(1, va)];
+
+            if (op == INJECT_OP_PTE_SUPERPAGE && !(*slot & PTE_V)) {
+                *slot = PA2PTE(0) | PTE_V | PTE_R | PTE_U | PTE_A;
+                atomic_store_explicit(&manip_partial, 0, memory_order_relaxed);
+                flush = true;
+            } else if (op == INJECT_OP_PTE_CLEAR_SUPERPAGE && (*slot & PTE_V) &&
+                       sv39_is_leaf(*slot)) {
+                *slot = 0;
+                flush = true;
+            } else {
+                ret = EBUSY;
+            }
+        }
+    }
+    kspinlock_unlock(&as_slock);
+    rcu_sched_read_unlock();
+    if (flush)
+        cpu_tlb_flush_complete();
+    return ret;
+}
+
 /* kext_debug_inject — the DEBUG_INJECT private call. */
 void kext_debug_inject(void *data)
 {
@@ -270,6 +396,45 @@ void kext_debug_inject(void *data)
         break;
     case INJECT_OP_SCHED_SET_DISPLACED:
         ret = atomic_load_explicit(&sched_displaced, memory_order_acquire);
+        break;
+    case INJECT_OP_PTE_SUPERPAGE:
+    case INJECT_OP_PTE_CLEAR_SUPERPAGE:
+        ret = inject_pte(kap->op, kap->arg0, kap->arg1, NULL);
+        break;
+    case INJECT_OP_PTE_PROBE: {
+        int mapped = 0;
+
+        ret = inject_pte(kap->op, kap->arg0, kap->arg1, &mapped);
+        ret = ret == EOK ? mapped : -ret; /* a status: errors read negative */
+        break;
+    }
+    case INJECT_OP_FAIL_PTE_MAP: {
+        address_t *adp;
+
+        if (kap->arg0 > INT32_MAX) {
+            ret = EINVAL;
+            break;
+        }
+        adp = inject_pid_memory(kap->arg0);
+        if (!adp) {
+            ret = ESRCH;
+        } else {
+            atomic_store_explicit(&consumed, 0, memory_order_relaxed);
+            atomic_store_explicit(&manip_partial, 0, memory_order_relaxed);
+            atomic_store_explicit(&armed_map_pages,
+                                  (unsigned) (kap->arg1 & (__PAGESIZE - 1)),
+                                  memory_order_relaxed);
+            atomic_store_explicit(&armed_map_va,
+                                  (uintptr_t) (kap->arg1 & ~(__PAGESIZE - 1)),
+                                  memory_order_relaxed);
+            atomic_store_explicit(&armed_map_pid, (int) kap->arg0,
+                                  memory_order_release);
+        }
+        rcu_sched_read_unlock();
+        break;
+    }
+    case INJECT_OP_MANIP_PARTIAL:
+        ret = (int) atomic_load_explicit(&manip_partial, memory_order_acquire);
         break;
     default:
         ret = EINVAL;

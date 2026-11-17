@@ -79,6 +79,7 @@ int condvar_reacquire_alloc_failure(void);
 int mutex_waiting_republish(void);
 int condvar_interrupt_stale(void);
 int ns_open_deferral(void);
+int pte_partial_map(void);
 int disconnect_child(const char *pid_arg, const char *chid_arg);
 void test_posix_options(void);
 void test_sysconf(void);

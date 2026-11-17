@@ -73,6 +73,37 @@
  */
 #define INJECT_OP_STALL_FORCE_READY 11
 
+/* PTE_SUPERPAGE(pid, va): make the 2 MiB slot at va, which must be empty and
+ * under a table that exists, a 2 MiB leaf in that process's page table, so a
+ * MAP over it meets a superpage. PTE_CLEAR_SUPERPAGE(pid, va) takes it out
+ * again. Planting also clears MANIP_PARTIAL. The leaf is read-only and maps
+ * physical page 0; the test must not touch it. The target must be a live
+ * process that is not exiting (a test names itself): an address space is freed
+ * without waiting for a reader.
+ */
+#define INJECT_OP_PTE_SUPERPAGE 12
+#define INJECT_OP_PTE_CLEAR_SUPERPAGE 13
+
+/* PTE_PROBE(pid, va): ret is 1 if that process's page table has a valid leaf
+ * mapping va, else 0, or minus an errno if the process or address is bad.
+ */
+#define INJECT_OP_PTE_PROBE 14
+
+/* MANIP_PARTIAL: ret is how many pages the most recent MAP that failed in
+ * cpu_pte_manipulate had done when it failed, as the kernel reported it to
+ * roottask (0 if none failed since a PTE_SUPERPAGE).
+ */
+#define INJECT_OP_MANIP_PARTIAL 15
+
+/* FAIL_PTE_MAP(pid, pages | va): the next MAP of more than pages pages in that
+ * process's address space stops after pages pages with ENOMEM, as if the page
+ * table allocator ran dry there. The page-aligned va ORed into the low pages
+ * bits (pages is under 4096) limits it to the MAP that starts at va; 0 means
+ * any. ALLOC_STATUS reports whether it was taken. Planting a superpage or
+ * arming this clears MANIP_PARTIAL.
+ */
+#define INJECT_OP_FAIL_PTE_MAP 16
+
 #define INJECT_SPIN_MAX_MS 10000
 
 /* Injected interrupts-off spins, for intrevent_flush()'s debug spin watchdog: a

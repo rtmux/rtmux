@@ -9,6 +9,7 @@
 #include <sys/types.h>
 #include <posix-types.h>
 #include <arch/cpu-def.h>
+#include <arch/cpu-paging.h> /* PA_TO_VA, KERNEL_VIRT_BASE */
 #include <arch/pcpu.h> /* struct pcpu — uses struct tags only */
 
 #define xfer_setjmp(_env) _setjmp(_env)
@@ -73,8 +74,8 @@
 /* Convert physical address to pointer value and vice-versa when in a physical
  * memory model. Identity mapping for standalone kernel test.
  */
-#define PHYS_TO_PTR(phys) ((void *) ((uintptr_t) (phys) + KERNEL_VIRT_BASE))
-#define PTR_TO_PHYS(ptr) ((uintptr_t) (ptr) - KERNEL_VIRT_BASE)
+#define PHYS_TO_PTR(phys) PA_TO_VA(phys)
+#define PTR_TO_PHYS(ptr) ((uintptr_t) VA_TO_PA(ptr))
 
 /* Memory probes — simple volatile access for physical mode. In the future,
  * these should handle faults properly. HAVE_KERSTACK_STORAGE /

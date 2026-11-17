@@ -37,7 +37,7 @@ PROGS = $(BUILD_BASE)/mkasmoff $(BUILD_BASE)/mkromfs $(BUILD_BASE)/treeromfs \
         $(BUILD_BASE)/ldso-parse-test $(BUILD_BASE)/ldso-path-test \
         $(BUILD_BASE)/cpio-parser-test $(BUILD_BASE)/spawn-fd-policy-test \
         $(BUILD_BASE)/serial-reply-test $(BUILD_BASE)/outcomes-test \
-        $(BUILD_BASE)/sv39-lookup-test \
+        $(BUILD_BASE)/sv39-lookup-test $(BUILD_BASE)/sv39-manip-test \
         $(BUILD_BASE)/strftime-test $(BUILD_BASE)/sh-scan-test $(BUILD_BASE)/tz-test \
         $(BUILD_BASE)/malloc-stats-test $(BUILD_BASE)/pci-args-test \
         $(BUILD_BASE)/libc-algorithms-test
@@ -292,6 +292,15 @@ $(BUILD_BASE)/sv39-lookup-test: $(TEST_DIR)/test-sv39-lookup.c \
 	$(Q)$(HOST_CC) -I../../arch/riscv/include $(HOST_CFLAGS) -o $@ \
 	    $(TEST_DIR)/test-sv39-lookup.c
 
+# The loop behind cpu_pte_manipulate: error mapping and the progress it leaves.
+$(BUILD_BASE)/sv39-manip-test: $(TEST_DIR)/test-sv39-manip.c \
+                              ../../arch/riscv/include/sv39-lookup.h \
+                              ../../arch/riscv/include/cpu-paging.h
+	@mkdir -p $(@D)
+	$(msg) HOSTCC $(notdir $@)
+	$(Q)$(HOST_CC) -I../../arch/riscv/include $(HOST_CFLAGS) -o $@ \
+	    $(TEST_DIR)/test-sv39-manip.c
+
 $(BUILD_BASE)/ldso-hash-test: $(TEST_DIR)/test-ldso-hash.c ../../lib/ldso/hash.c \
                               ../../lib/ldso/hash.h
 	@mkdir -p $(@D)
@@ -334,7 +343,7 @@ host-tests: $(BUILD_BASE)/path-normalize-test $(BUILD_BASE)/cap-table-test \
             $(BUILD_BASE)/ldso-parse-test $(BUILD_BASE)/ldso-path-test \
             $(BUILD_BASE)/cpio-parser-test $(BUILD_BASE)/spawn-fd-policy-test \
             $(BUILD_BASE)/serial-reply-test $(BUILD_BASE)/outcomes-test \
-            $(BUILD_BASE)/sv39-lookup-test \
+            $(BUILD_BASE)/sv39-lookup-test $(BUILD_BASE)/sv39-manip-test \
             $(BUILD_BASE)/strftime-test $(BUILD_BASE)/strftime-asan-test \
             $(BUILD_BASE)/sh-scan-test $(BUILD_BASE)/libc-algorithms-test \
             $(BUILD_BASE)/tz-test $(BUILD_BASE)/tz-asan-test $(TZ_ZONES)/.stamp \
@@ -352,6 +361,7 @@ host-tests: $(BUILD_BASE)/path-normalize-test $(BUILD_BASE)/cap-table-test \
 	$(Q)$(BUILD_BASE)/serial-reply-test
 	$(Q)$(BUILD_BASE)/outcomes-test >/dev/null
 	$(Q)$(BUILD_BASE)/sv39-lookup-test
+	$(Q)$(BUILD_BASE)/sv39-manip-test
 	$(Q)$(BUILD_BASE)/strftime-test
 	$(Q)$(BUILD_BASE)/strftime-asan-test
 	$(Q)$(BUILD_BASE)/sh-scan-test

@@ -1058,6 +1058,12 @@ int main(int argc, char *argv[])
             test_skip("ns_open_deferral", "fault injection unavailable");
         return finish(1);
     }
+    if (argc == 2 && !strcmp(argv[1], "--pte-partial-map")) {
+        printf("[pte_partial_map]\n");
+        if (pte_partial_map() == TC_EXIT_SKIP)
+            test_skip("pte_partial_map", "fault injection unavailable");
+        return finish(1);
+    }
     if (argc == 3 && !strcmp(argv[1], "--serial-unblock-child"))
         return serial_unblock_child(!strcmp(argv[2], "announce"));
     if (argc == 2 && !strcmp(argv[1], "--console-poll")) {

@@ -378,6 +378,8 @@ void sync_chains_assert_readied(const thread_t *thp);
 bool inject_should_fail_sched_set(thread_t *act, bool lowered);
 void inject_note_sched_return(thread_t *act, bool displaced);
 int inject_should_fail_turnstile(process_t *prp); /* debug/inject.c */
+void inject_note_manip_failure(unsigned pages);
+bool inject_pte_map_stop(const void *adp, uintptr_t start, uintptr_t *endp);
 #else
 static inline void inject_mutex_lock_stall(process_t *prp)
 {
@@ -402,6 +404,19 @@ static inline void inject_note_sched_return(thread_t *act, bool displaced)
 {
     (void) act;
     (void) displaced;
+}
+static inline void inject_note_manip_failure(unsigned pages)
+{
+    (void) pages;
+}
+static inline bool inject_pte_map_stop(const void *adp,
+                                       uintptr_t start,
+                                       uintptr_t *endp)
+{
+    (void) adp;
+    (void) start;
+    (void) endp;
+    return false;
 }
 #endif
 void fpu_drop_claims(thread_t *thp);
