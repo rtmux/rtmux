@@ -37,7 +37,7 @@ struct fault_info;
     MMF(int, fault, (struct fault_info *), extra)                             \
     MMF(int, map_xfer,                                                        \
         (process_t * actprp, process_t * prp, iov_t * *piov, int *pparts,     \
-         int *poff, iov_t *niov, int *pnparts, unsigned flags),               \
+         size_t *poff, iov_t *niov, int *pnparts, unsigned flags),            \
         extra)                                                                \
     MMF(int, mcreate, (process_t * prp), extra)                               \
     MMF(void, mdestroy, (process_t * prp), extra)                             \

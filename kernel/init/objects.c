@@ -121,6 +121,7 @@ void init_objects()
     kspinlock_init(&roottask_stack_slock, LOCK_CLASS_MEMPART,
                    "roottask_stack_slock");
     kspinlock_init(&pa_slock, LOCK_CLASS_PA, "pa_slock");
+    prio_defer_init();
 
     /* alloc_slock is initialized at the top of heap_init() — must be ready
      * before the very first _scalloc, which happens earlier in boot than
@@ -329,7 +330,7 @@ extern int mm_map_xfer(process_t *actprp,
                        process_t *prp,
                        iov_t **piov,
                        int *pparts,
-                       int *poff,
+                       size_t *poff,
                        iov_t *niov,
                        int *pnparts,
                        unsigned flags);

@@ -64,6 +64,14 @@ __attribute__((weak)) void __crt_lesscore(void *p, size_t n)
     (void) munmap(p, n);
 }
 
+/* Smallest request that is mapped directly rather than cut from a size class.
+ * Weak so roottask, whose arena is fixed and whose backing store takes mapped
+ * blocks back and merges them, can lower it: a size-class block is never
+ * merged, so a one-off 64 KiB request would otherwise keep a 128 KiB class
+ * block that nothing else can use (K43).
+ */
+__attribute__((weak, visibility("hidden"))) size_t __crt_large_min = LARGE_MIN;
+
 /* Overhead per allocated block */
 
 union overhead {
@@ -258,7 +266,7 @@ void *__crt_malloc(size_t nbytes)
     size_t amt;
     void *ret;
 
-    if (nbytes >= LARGE_MIN) {
+    if (nbytes >= __crt_large_min) {
         if (!(ret = large_alloc(nbytes)))
             stat_fail();
         return ret;
@@ -369,6 +377,39 @@ static void donate(char *p, size_t len)
     }
 }
 
+/* Backing memory ran out: cut a cached free block of a larger class down to
+ * this one. The pieces are never merged back (the allocator has no coalescing),
+ * so this only hands memory a class no longer needs to a class that has none.
+ * It leaves one block of each class from bucket up to the donor's, and puts the
+ * first into nextf[bucket]. Caller holds the lock.
+ *
+ * Returns 0 if no larger class has a free block.
+ */
+static int steal(int bucket)
+{
+    for (int b = bucket + 1; b < NBUCKETS; b++) {
+        union overhead *op = nextf[b];
+        char *p;
+
+        if (!op)
+            continue;
+        nextf[b] = op->ov_next;
+        p = (char *) op;
+        for (int c = b - 1; c >= bucket; c--) {
+            union overhead *half =
+                (union overhead *) (void *) (p +
+                                             ((size_t) FIRST_BUCKET_SIZE << c));
+
+            half->ov_next = nextf[c];
+            nextf[c] = half;
+        }
+        op->ov_next = nextf[bucket];
+        nextf[bucket] = op;
+        return 1;
+    }
+    return 0;
+}
+
 /* Make nextf[bucket] non-empty. Called and returns with the lock held, but
  * drops it while asking for backing memory.
  *
@@ -392,13 +433,14 @@ static int refill(int bucket)
             chunk = __crt_morecore(want);
         }
         alloc_lock();
-        if (!chunk)
-            return 0;
         if (nextf[bucket] || (size_t) (pagepool_end - pagepool_start) >= amt) {
             /* Another thread refilled while the lock was dropped. */
-            donate(chunk, want);
+            if (chunk)
+                donate(chunk, want);
             return 1;
         }
+        if (!chunk)
+            return steal(bucket);
         donate(pagepool_start, (size_t) (pagepool_end - pagepool_start));
         pagepool_start = chunk;
         pagepool_end = chunk + want;
@@ -496,9 +538,9 @@ void *__crt_realloc(void *cp, size_t nbytes, int *bad)
         size_t cap = *(size_t *) (void *) base - LARGE_HDR;
 
         /* Keep the mapping while the new size still belongs in a mapped block;
-         * shrinking below LARGE_MIN moves to the bucketed heap.
+         * shrinking below __crt_large_min moves to the bucketed heap.
          */
-        if (nbytes >= LARGE_MIN && nbytes <= cap)
+        if (nbytes >= __crt_large_min && nbytes <= cap)
             return cp;
         if (!(res = __crt_malloc(nbytes)))
             return NULL;

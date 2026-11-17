@@ -737,13 +737,51 @@ reads the whole destination vector to find how much arrived (`xferlen_upto`
 stops once the entries add up to the message). `rcvmsg`, unused, and its
 unbounded boundary scans are gone.
 
-Not bounded by this: the other callers of `xfermsg` (send, receive and reply
-over the fast path) are not stepped; the short-message branch of msg_readv still
-walks a destination vector of empty entries to its end (`xfer_cpy_diov`,
-`xferlen_upto`); and a wake from a timer or an interrupt does not preempt a
+The other callers of `xfermsg` are stepped the same way. Send, receive and
+reply (kernel/ipc/fastmsg.c) call `xfermsg_bounded` through `fastmsg_xfer`,
+and a copy that uses its step up gives up the claim on the peer under the
+channel lock (`fastmsg_step_yield`), honors a wake deferred meanwhile and
+returns through the call to be restarted; the trap handler keeps the cursor for
+msg_sendv, msg_receivev and msg_replyv as it does for msg_readv and
+msg_writev. A message of more than XFER_STEP_PARTS_MAX (4096) entries on
+either side is copied in one piece, as each restart would scan both vectors
+again, and so is a message that carries capabilities (a native header
+installed ahead of the copy, which a restart would install twice). The loops
+that total and check a send, receive or reply vector before the copy are not
+stepped either. The head of a message the receive peeks at goes through
+`xfermsg` and used to clear the restart links the cursor needs, so the peek now
+gives them back. The short message branch of msg_readv copies into a
+destination of many entries a step at a time (`xfer_cpy_diov_step`), so a
+vector of empty entries is not walked to its end; a destination of one entry
+or none keeps the one shot copy. `xfer_preempt` closes every level of the
+rcvid lookup window (`lookup_rcvid_release_all`) and not only the outermost's
+one, which left the RCU sections open across the restart of a call that had
+looked up twice. The offsets and the cursor are `size_t`, as is the offset
+`vm_ops->map_xfer` takes; the byte count of a message stays 32 bit, as the ABI
+reports it. msg_sendv checks that its send and reply arrays lie inside the
+caller's boundary and are no longer than XFER_IOV_LIMIT entries, as
+msg_receivev always has, and fails with EFAULT before reading them.
+
+Not bounded by this: a wake from a timer or an interrupt does not preempt a
 running user thread before the next scheduler tick on this tree (see the
 interrupt-wake gap below), so no test can time the gap between two restarts of
-one call from user space.
+one call from user space; and the loops that total and check the send, receive
+and reply vectors of msg_sendv, msg_receivev and msg_replyv before the copy are
+still not stepped (an array of up to XFER_IOV_LIMIT entries, now at least
+inside the caller's space, is read in one kernel entry).
+
+ipc-roundtrip's iov-send, iov-receive-reply and iov-path-big checks cover the
+three paths. Over 32 entries of 16 bytes each way a send is one step: the time
+from the sender's entry into msg_sendv to the receiver's return from its
+receive may exceed the same message in one entry by no more than 250 us at the
+p99 (the delivery includes waking the receiver, which a loaded host slows
+whatever the kernel does, so the step is judged by its addition), and a receive
+from a queued sender and a reply are each under 250 us at the p99. Over 2048
+entries each way both orders of receiver and sender move the bytes through many
+restarts. iov-short reads a short message into 64 entries, all empty but the
+last, in one step (p99 under 250 us), and into 65536 entries, which move the
+same bytes. sendv-array sends with arrays in kernel space, wrapping past the
+top of memory and longer than XFER_IOV_LIMIT, which must fail with EFAULT.
 
 ipc-roundtrip's iov-steps check covers the check on 65536 one-byte entries:
 the bytes arrive intact through `msg_readv` and `msg_writev`, a bad entry past

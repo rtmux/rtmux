@@ -239,11 +239,11 @@ static int fastmsg_copy_source_prefix(thread_t *sender,
     return EOK;
 }
 
-static int fastmsg_native_cap_install_long(thread_t *sender,
-                                           thread_t *receiver,
-                                           bool reply,
-                                           fastmsg_native_cap_tx_t *tx,
-                                           int *patched)
+static int fastmsg_native_cap_install_long_peek(thread_t *sender,
+                                                thread_t *receiver,
+                                                bool reply,
+                                                fastmsg_native_cap_tx_t *tx,
+                                                int *patched)
 {
     struct _io_msg msg;
     struct _io_native_hdr hdr;
@@ -330,6 +330,44 @@ static int fastmsg_native_cap_install_long(thread_t *sender,
     return EOK;
 }
 
+/* fastmsg_native_cap_install_long_peek reads the head of the message through
+ * xfermsg, which ends by clearing the restart links and the byte count of the
+ * transfer it borrowed them from. A stepped copy that has yielded keeps its
+ * cursor on exactly those, so the peek must give them back, or each restart
+ * would begin the copy again and never get past its first step.
+ */
+static int fastmsg_native_cap_install_long(thread_t *sender,
+                                           thread_t *receiver,
+                                           bool reply,
+                                           fastmsg_native_cap_tx_t *tx,
+                                           int *patched)
+{
+    thread_t *rrestart = receiver->restart, *srestart = sender->restart;
+    thread_t *sdthp = sender->args.ms.dthp;
+    uint32_t msglen = sender->args.ms.msglen;
+    int ret;
+
+    /* Only a copy that yielded leaves links to give back. */
+    if (!rrestart && !srestart)
+        return fastmsg_native_cap_install_long_peek(sender, receiver, reply, tx,
+                                                    patched);
+
+    /* The peek starts at the head of the message: a copy that yielded left
+     * links that would make xfermsg resume it, so they are cleared for the peek
+     * and given back.
+     */
+    receiver->restart = sender->restart = NULL;
+    sender->args.ms.dthp = NULL;
+    sender->args.ms.msglen = 0;
+    ret = fastmsg_native_cap_install_long_peek(sender, receiver, reply, tx,
+                                               patched);
+    receiver->restart = rrestart;
+    sender->restart = srestart;
+    sender->args.ms.dthp = sdthp;
+    sender->args.ms.msglen = msglen;
+    return ret;
+}
+
 #define STUFF_RCVINFO(thp, cop, info) fastmsg_fill_rcvinfo(thp, cop, info)
 
 /* send_queue mixes thread senders with queued notifications, and only a thread
@@ -402,6 +440,65 @@ static thread_t *receive_candidate(channel_t *chp, int notification_only)
 #define END_SMP_XFER(act, thp)
 #define END_SMP_XFER_SELF(act)
 #endif
+
+/* The copy of a message between a thread and its peer, for send, receive and
+ * reply. One that carries capabilities (cap_patched: a native header was
+ * installed ahead of the copy, and a restart would install it twice) runs in
+ * one piece, as before; any other does at most a step of work per kernel entry
+ * (xfermsg_bounded) and returns XFER_RESTART when it used the step up.
+ */
+static inline int fastmsg_xfer(thread_t *dthp, thread_t *sthp, bool cap_patched)
+{
+    if (!cap_patched && sthp->args.ms.sparts <= XFER_STEP_PARTS_MAX &&
+        dthp->args.ms.rparts <= XFER_STEP_PARTS_MAX)
+        return xfermsg_bounded(dthp, sthp, 0, 0);
+    if (!cap_patched)
+        return xfermsg(dthp, sthp, 0, 0);
+    return xfermsg(dthp, sthp, sizeof(struct _io_native_hdr),
+                   sizeof(struct _io_native_hdr));
+}
+
+/* A stepped copy used its step up and arranged for the call to run again
+ * (xfer_yield did the KCALL_RESTART): give up the claim on the peer, and on
+ * ourselves, under the channel lock, so that another thread can use the peer in
+ * the meantime, and honor a wake that was deferred while the claim was held.
+ * The caller returns ENOERROR. The cursor and the restart links stay for the
+ * restarted call to resume from.
+ */
+static void fastmsg_step_yield(channel_t *chp, thread_t *act, thread_t *thp)
+{
+    unsigned status = 0;
+    bool wake = false;
+
+    kspinlock_lock(&chp->lock);
+    END_SMP_XFER(act, thp);
+    if (thp->internal_flags & RTMUX_ITF_MSG_FORCE_RDY) {
+        ITF_CLR(thp, RTMUX_ITF_MSG_FORCE_RDY);
+        status = (unsigned) KSTATUS(thp);
+        wake = true;
+    }
+    kspinlock_unlock(&chp->lock);
+    if (wake)
+        force_ready(thp, status);
+}
+
+/* Whether an iov array of parts entries, which the kernel reads itself, lies
+ * inside the process's boundary and is no longer than a transfer takes. An
+ * array with no entry to read passes.
+ */
+static bool fastmsg_iov_array_ok(const iov_t *iov,
+                                 int parts,
+                                 const process_t *prp)
+{
+    uintptr_t base = (uintptr_t) iov, last;
+
+    if (parts <= 0)
+        return true;
+    if (parts > XFER_IOV_LIMIT)
+        return false;
+    last = base + (size_t) parts * sizeof(iov_t) - 1;
+    return base <= last && WITHIN_BOUNDARY(base, last, prp->boundary_addr);
+}
 
 /* Handle CPU vm_ops->as implementations that need the kernel locked */
 #define SWITCH_AS(as_prp, asp, act) vm_ops->as(as_prp, asp)
@@ -591,6 +688,15 @@ static int sendv_body(thread_t *act,
     atomic_clr(&sender->flags, RTMUX_FLG_THR_BUFF_MSG);
     /* Make sure the SPECRET_PENDING bit isn't set when we don't need it. */
     ITF_CLR(sender, RTMUX_ITF_SPECRET_PENDING);
+
+    /* The loops below read both arrays themselves: they must lie inside the
+     * sender's boundary, as the receive side requires of its own. (For remote
+     * IPC rmsg is not an array.)
+     */
+    if (!fastmsg_iov_array_ok(kap->smsg, kap->sparts, act->process) ||
+        (!(cop->flags & COF_NETCON) &&
+         !fastmsg_iov_array_ok(kap->rmsg, kap->rparts, act->process)))
+        return EFAULT;
 
     /* Validate incoming IOVs - override for remote IPC - rparts/rmsg have
      * special meaning
@@ -842,9 +948,11 @@ static int sendv_body(thread_t *act,
             }
             START_SMP_XFER(act, thp);
             /* Yes. Transfer the data. */
-            xferstat = xfermsg(thp, act,
-                               cap_patched ? sizeof(struct _io_native_hdr) : 0,
-                               cap_patched ? sizeof(struct _io_native_hdr) : 0);
+            xferstat = fastmsg_xfer(thp, act, cap_patched);
+            if (xferstat == XFER_RESTART) {
+                fastmsg_step_yield(chp, act, thp);
+                return ENOERROR;
+            }
             sender->args.ms.msglen = act->args.ms.msglen;
             if (cap_patched)
                 sender->args.ms.msglen +=
@@ -1881,9 +1989,11 @@ restart_recv:
             capstat = fastmsg_native_cap_install_long(thp, act, false, &captx,
                                                       &cap_patched);
             if (capstat == EOK) {
-                xferstat = xfermsg(
-                    act, thp, cap_patched ? sizeof(struct _io_native_hdr) : 0,
-                    cap_patched ? sizeof(struct _io_native_hdr) : 0);
+                xferstat = fastmsg_xfer(act, thp, cap_patched);
+                if (xferstat == XFER_RESTART) {
+                    fastmsg_step_yield(chp, act, thp);
+                    return ENOERROR;
+                }
             } else if (capstat & (XFER_SRC_FAULT | XFER_DST_FAULT)) {
                 xferstat = capstat;
                 capstat = EOK;
@@ -2052,7 +2162,7 @@ restart_recv:
             else
                 CRITICAL_CLEAR(act);
             thread_lend_msg(act, thp->priority, true); /* act->client = thp */
-            thread_drop_gone_client_loan(act, thp);
+            (void) thread_end_orphan_loan(act);
             (void) thread_prio_update_dpp(act, thp->dpp, 1);
         } else {
             CRITICAL_CLEAR(act);
@@ -2484,9 +2594,11 @@ static int msg_replyv_body(thread_t *act,
             }
             START_SMP_XFER(act, thp);
             /* Yes. Transfer the data. */
-            xferstat = xfermsg(thp, act,
-                               cap_patched ? sizeof(struct _io_native_hdr) : 0,
-                               cap_patched ? sizeof(struct _io_native_hdr) : 0);
+            xferstat = fastmsg_xfer(thp, act, cap_patched);
+            if (xferstat == XFER_RESTART) {
+                fastmsg_step_yield(chp, act, thp);
+                return ENOERROR;
+            }
             /* Keep thp's claim until the success tail unlinks it. */
             END_SMP_XFER_SELF(act);
 

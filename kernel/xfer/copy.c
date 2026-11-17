@@ -304,3 +304,64 @@ int xfer_cpy_diov(thread_t *thpd,
     SET_XFER_HANDLER(0);
     return 0;
 }
+
+/* xfer_cpy_diov for a vector of many entries, a step of entries at a time: copy
+ * slen bytes of a kernel buffer into the vector at dst, from entry *idx on,
+ * with *copied bytes already placed. A vector of entries that are empty is
+ * walked by the step too, so no length of it holds the kernel for longer than
+ * XFER_STEP_ENTRIES entries. Each entry is read once, under the fault handlers.
+ *
+ * Returns 0 with *copied the bytes placed (less than slen when the vector is
+ * short), XFER_YIELD with *idx and *copied at the position to resume from, or a
+ * fault.
+ */
+int xfer_cpy_diov_step(thread_t *thpd,
+                       iov_t *dst,
+                       int dparts,
+                       const uint8_t *saddr,
+                       size_t slen,
+                       unsigned *idx,
+                       size_t *copied)
+{
+    jmp_buf env;
+    unsigned i = *idx, ents = 0;
+    size_t done = *copied;
+    int status;
+
+    SET_XFER_ENV(&env);
+    if ((status = xfer_setjmp(*GET_XFER_ENV()))) {
+        SET_XFER_HANDLER(0);
+        return status;
+    }
+    while (done < slen && i < (unsigned) dparts) {
+        char *daddr;
+        size_t dlen;
+
+        SET_XFER_HANDLER(&xfer_dst_handlers);
+        daddr = (char *) GETIOVBASE(&dst[i]);
+        dlen = GETIOVLEN(&dst[i]);
+        i++;
+        if (dlen) {
+            size_t n = min_size(dlen, slen - done);
+
+            if (!WR_PROBE_PTR(thpd, daddr, n)) {
+                SET_XFER_HANDLER(0);
+                return XFER_DST_FAULT;
+            }
+            SET_XFER_HANDLER(&xfer_src_handlers);
+            xfer_memcpy(daddr, saddr + done, n);
+            done += n;
+        }
+        if (++ents >= XFER_STEP_ENTRIES && done < slen &&
+            i < (unsigned) dparts) {
+            *idx = i;
+            *copied = done;
+            SET_XFER_HANDLER(0);
+            return XFER_YIELD;
+        }
+    }
+    *idx = i;
+    *copied = done;
+    SET_XFER_HANDLER(0);
+    return 0;
+}

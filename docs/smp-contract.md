@@ -27,7 +27,8 @@ instance-ordering rule.
 | 11 | `LOCK_CLASS_THREAD` | thread scalar state | Per-thread fields outside queue ownership. |
 | 12 | `LOCK_CLASS_MEMPART` | kernel heap | May call into physical allocator. |
 | 13 | `LOCK_CLASS_PA` | physical allocator | Leaf after memory partition. |
-| 14 | `LOCK_CLASS_DEBUG` | debugger/crash interlocks | Avoid acquiring normal subsystem locks while held. |
+| 14 | `LOCK_CLASS_PRIO_DEFER` | per-hart deferred priority settle list | Leaf: `force_ready` takes it under any caller lock; nothing is acquired while it is held. |
+| 15 | `LOCK_CLASS_DEBUG` | debugger/crash interlocks | Avoid acquiring normal subsystem locks while held. |
 
 `CONFIG_LOCK_DEBUG` records nested acquisitions and rejects rank cycles.  It is
 part of the realtime test surface, not optional documentation.  It only catches
@@ -280,13 +281,28 @@ server's receive as two separate stores, so a `force_ready` of the client may se
 the pair half-cleared; it clears the server's link with a compare-exchange against
 the client and does not treat the half-cleared state as corruption.
 
-It then ends the server's request loan of that client (`thread_end_msg_loan`).
-A receive installs the loan after it publishes the client, so the two sides
+It then ends the server's request loan of that client: `thread_client_departed`
+is the one primitive (link compare-exchange, loan end) used by `force_ready`,
+`ksys_msg_current` and the receive.  A receive installs the loan after it publishes the client, so the two sides
 meet through a store-buffering handshake: the receiver stores the loan, fences
-and re-reads the client (`thread_drop_gone_client_loan`), and `force_ready`
+and re-reads the client (`thread_end_orphan_loan`), and `force_ready`
 stores the cleared client, fences and re-reads the loan word.  With both fences
 at least one of them sees the other's store, so a loan installed after its
-client left is always ended by one of them.
+client left is always ended by one of them.  A loan-generation bump by the
+departing client cannot replace the fence: a notification lend or a REPLY
+propagation bumps the generation too, so a loan install failing on it could not
+tell a departed client from a busy server.
+
+The priority settle and the chain walk do not run here.  `force_ready` only
+queues the server on its hart's list (`thread_prio_defer_settle`, under the leaf
+lock `LOCK_CLASS_PRIO_DEFER`); `kernel_exit` settles that list before the hart
+resumes or idles, in thread context, and follows the chain a blocked server waits
+in.  The loan-end store precedes the list lock's release and the settle pops
+under the same lock, so it reads the store; a departure that finds the server
+already queued adds nothing because the settle has not popped it.
+`thread_destroy` takes a queued server off the list after the RCU drain and
+before the pin wait, so no entry outlives its thread and a settle in progress
+holds a pin the destroy waits out.
 
 ### Unblock notification of a reply-blocked client
 

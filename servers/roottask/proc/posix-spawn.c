@@ -148,8 +148,11 @@ static int fact_list_get(posix_spawn_file_actions_t *factp,
         return r;
     CRASHCHECK(num_fact > 0);
     num_fact = -num_fact;
-    if (!(*list = calloc((size_t) num_fact + 1, sizeof(**list))))
+    if (!(*list = calloc((size_t) num_fact + 1, sizeof(**list)))) {
+        roottask_heap_note_nomem("spawn action list",
+                                 ((size_t) num_fact + 1) * sizeof(**list));
         return ENOMEM;
+    }
     if ((r = rtmux_spawn_file_getactions(factp, &num_fact, *list)) != EOK) {
         free(*list);
         *list = NULL;
@@ -355,6 +358,7 @@ static int parse_pspawn_msg(pid_t ppid,
     if (spawn_msg_len > (size_t) INT_MAX)
         return E2BIG;
     if (!(new_msg = calloc(1, spawn_msg_len))) {
+        roottask_heap_note_nomem("spawn message", spawn_msg_len);
         return ENOMEM;
     }
 
@@ -469,8 +473,10 @@ int proc_pspawn(ioserv_context_t *ctp, void *vmsg)
         if (len > PSPAWN_MSG_MAX)
             return E2BIG;
         tail = (int) len - head;
-        if (!(whole = malloc((size_t) len)))
+        if (!(whole = malloc((size_t) len))) {
+            roottask_heap_note_nomem("spawn request", (size_t) len);
             return ENOMEM;
+        }
 
         /* The checked header comes from the receive buffer; only the tail is
          * read from the sender.

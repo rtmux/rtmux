@@ -2,19 +2,22 @@ menu "Roottask"
 
 config ROOTTASK_HEAP_SIZE
     int "Roottask malloc heap size (bytes)"
-    default 1048576
+    default 2097152
     range 131072 16777216
     help
       Size of the fixed arena that backs roottask's malloc. Roottask is the
       mmap server, so unlike every other process it cannot grow its heap
       by mapping memory. Must be a multiple of 4096.
 
-      The allocator keeps freed blocks in their size class, so the arena
-      must hold the peak of every class at once; /sys/kstats reports how
-      much is used (roottask.heap_used). Concurrent spawns under the
-      leak-gate suite peak near 768 KiB, which 512 KiB could not hold.
+      The allocator keeps a freed block under 32 KiB in its size class and
+      never merges it, so the arena must hold the peak of every class at
+      once; /sys/kstats reports how much is used (roottask.heap_used) and
+      how large a block is still free (roottask.heap_largest). Concurrent
+      spawns under the leak-gate suite peak near 768 KiB, and one run of
+      the spawn tests with 64 KiB arguments adds about as much again; an
+      allocation that finds no room fails with ENOMEM and is logged.
 
-      Default: 1048576 (1 MiB).
+      Default: 2097152 (2 MiB).
 
 config ROOTTASK_SYSLOG_SIZE
     int "Roottask log buffer size (bytes)"

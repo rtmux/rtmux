@@ -152,7 +152,9 @@ static const struct toolbox_applet applets[] = {
      "sched-set-displaced MIN | stall-lock PID MS | "
      "stall-force-ready PID MS | pte-superpage PID VA | "
      "pte-clear-superpage PID VA | pte-probe PID VA | "
-     "fail-pte-map PID PAGES | manip-partial MIN"},
+     "fail-pte-map PID PAGES | manip-partial MIN | "
+     "prio-settle-thread MIN | prio-settle-departure MAX | "
+     "prio-settle-reset"},
     {"kill", applet_kill, "kill [-SIG] PID ..."},
     {"login", applet_login, "login [USER]"},
     {"less", applet_less, "less [FILE ...]"},
@@ -3161,6 +3163,26 @@ static int applet_inject(int argc, char **argv)
     } else if (argc == 4 && !strcmp(argv[1], "stall-force-ready")) {
         rc = inject_call(INJECT_OP_STALL_FORCE_READY, strtoul(argv[2], NULL, 0),
                          strtoul(argv[3], NULL, 0));
+    } else if (argc == 3 && !strcmp(argv[1], "prio-settle-thread")) {
+        /* Exit 0 when at least MIN deferred priority settles ran in thread
+         * context since the last reset.
+         */
+        rc = inject_call(INJECT_OP_PRIO_SETTLE_STATS, 0, 0);
+        if (rc >= 0)
+            printf("prio-settle-thread=%d\n", rc);
+        return rc >= 0 && (unsigned long) rc >= strtoul(argv[2], NULL, 0) ? 0
+                                                                          : 3;
+    } else if (argc == 3 && !strcmp(argv[1], "prio-settle-departure")) {
+        /* Exit 0 when at most MAX priority recomputations ran inside a client
+         * departure (timer and event context) since the last reset.
+         */
+        rc = inject_call(INJECT_OP_PRIO_SETTLE_STATS, 1, 0);
+        if (rc >= 0)
+            printf("prio-settle-departure=%d\n", rc);
+        return rc >= 0 && (unsigned long) rc <= strtoul(argv[2], NULL, 0) ? 0
+                                                                          : 3;
+    } else if (argc == 2 && !strcmp(argv[1], "prio-settle-reset")) {
+        rc = inject_call(INJECT_OP_PRIO_SETTLE_STATS, 2, 0);
     } else if (argc == 4 && !strcmp(argv[1], "pte-superpage")) {
         rc = inject_call(INJECT_OP_PTE_SUPERPAGE, strtoul(argv[2], NULL, 0),
                          strtoul(argv[3], NULL, 0));
@@ -3202,7 +3224,9 @@ static int applet_inject(int argc, char **argv)
                 "stall-force-ready PID MS | pte-superpage PID VA | "
                 "pte-clear-superpage PID VA | pte-probe PID VA | "
                 "fail-pte-map PID PAGES | manip-partial MIN | "
-                "stall-lock-early PID MS | stall-lock-propagated PID MS\n");
+                "stall-lock-early PID MS | stall-lock-propagated PID MS | "
+                "prio-settle-thread MIN | prio-settle-departure MAX | "
+                "prio-settle-reset\n");
         return 2;
     }
     return rc == 0 ? 0 : 1;

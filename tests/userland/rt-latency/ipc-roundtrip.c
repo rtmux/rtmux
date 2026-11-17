@@ -1283,6 +1283,319 @@ static int check_iov_bytes(int chid)
     return ok ? 0 : -1;
 }
 
+/* The other copying paths: a short message read into a vector of many entries
+ * (msg_readv, whose destination of empty entries was walked to its end), and
+ * the copy of send, receive and reply, which are stepped like msg_readv and
+ * msg_writev. Each of them over IOV_COPY_PARTS entries on each side is one step
+ * of work, so its p99 must stay under IOV_STEP_NS_MAX; the long calls must move
+ * the bytes whatever the number of restarts. A msg_sendv whose arrays are not
+ * inside the caller's space must fail with EFAULT, as msg_receivev's do.
+ */
+#define PATH_SHORT 32
+#define PATH_ENTRY \
+    16 /* so that PATH_PARTS entries make a long message (over 256 bytes) */
+#define PATH_PARTS 32 /* each side: one step of work, timed */
+#define PATH_BIG 2048 /* each side: many steps, which must move the bytes */
+#define PATH_BIG_ROUNDS 4
+#define PATH_NAP_NS 2000000L
+#define PATH_TOO_MANY 600000 /* more entries than a transfer takes */
+
+static void path_nap(long ns)
+{
+    struct timespec ts = {.tv_sec = 0, .tv_nsec = ns};
+
+    (void) nanosleep(&ts, NULL);
+}
+
+struct path_ctx {
+    int chid, parts, entry, rounds;
+    iov_t sarr[PATH_BIG], rarr[PATH_BIG];
+    unsigned char out[PATH_BIG * PATH_ENTRY], in[PATH_BIG * PATH_ENTRY];
+    volatile uint64_t t_send; /* when the sender entered msg_sendv */
+    int rc;
+};
+
+static void *path_sender(void *arg)
+{
+    struct path_ctx *c = arg;
+    int coid = connect_attach((uint32_t) 0, 0, c->chid, RTMUX_SIDE_CHANNEL, 0);
+
+    c->rc = -1;
+    if (coid == -1)
+        return NULL;
+    for (int i = 0; i < c->rounds; i++) {
+        int r;
+
+        path_nap(PATH_NAP_NS); /* the receiver is, or is not yet, receiving */
+        (void) __timer_timeout(CLOCK_MONOTONIC,
+                               RTMUX_TIMEOUT_SEND | RTMUX_TIMEOUT_REPLY, NULL,
+                               &(const uint64_t){STRADDLE_TIMEOUT_NS}, NULL);
+        c->t_send = read_time();
+        r = msg_sendv(coid, c->sarr, c->parts, c->rarr, c->parts);
+        if (r == -1 ||
+            memcmp(c->in, c->out, (size_t) (c->parts * c->entry)) != 0) {
+            fprintf(stderr,
+                    "ipc-roundtrip: path send round %d parts %d: %d %s\n", i,
+                    c->parts, r, r == -1 ? strerror(errno) : "reply differs");
+            goto out;
+        }
+        memset(c->in, 0, sizeof c->in);
+    }
+    c->rc = 0;
+out:
+    (void) __connect_detach((uint64_t) coid);
+    return NULL;
+}
+
+static int path_p99(uint64_t *ns, uint64_t *max)
+{
+    qsort(ns, IOV_STEP_CALLS, sizeof ns[0], cmp_u64);
+    *max = ns[IOV_STEP_CALLS - 1];
+    return ns[p99_index(IOV_STEP_CALLS)] >= IOV_STEP_NS_MAX;
+}
+
+static uint64_t path_base_ns; /* p99 delivery of one 512 byte entry */
+
+/* A send, receive and reply of parts entries each way, with the receiver
+ * waiting (receiver_first), or with the sender queued first, so that the
+ * receive copies from the queue. The send's own cost is the time from the
+ * sender's entry into msg_sendv to the receiver's return from its receive (the
+ * copy, then the wake); in the second case the receive and the reply are timed
+ * in the server. Over PATH_PARTS entries each is one step, and its p99 must
+ * stay under IOV_STEP_NS_MAX; over PATH_BIG entries it is many, and the bytes
+ * must arrive.
+ */
+static int path_round(int chid, int receiver_first, int parts, int entry)
+{
+    static struct path_ctx c;
+    static unsigned char sin[PATH_BIG * PATH_ENTRY];
+    static iov_t siov[PATH_BIG], riov[PATH_BIG];
+    static uint64_t snd[IOV_STEP_CALLS], rcv[IOV_STEP_CALLS],
+        rep[IOV_STEP_CALLS];
+    int timed = parts <= PATH_PARTS;
+    int rounds = timed ? IOV_STEP_CALLS : PATH_BIG_ROUNDS;
+    uint64_t cps = cycles_per_sec(), smax = 0, rmax = 0, pmax = 0;
+    struct _msg_info info;
+    pthread_t tid;
+    int ok = 1;
+
+    memset(&c, 0, sizeof c);
+    c.chid = chid;
+    c.parts = parts;
+    c.entry = entry;
+    c.rounds = rounds;
+    for (int i = 0; i < parts * entry; i++)
+        c.out[i] = (unsigned char) (i * 3 + 1);
+    /* the sender expects its own bytes back, so the server replies with them */
+    for (int i = 0; i < parts; i++) {
+        SETIOV(&c.sarr[i], c.out + i * entry, entry);
+        SETIOV(&c.rarr[i], c.in + i * entry, entry);
+        SETIOV(&siov[i], c.out + i * entry, entry);
+        SETIOV(&riov[i], sin + i * entry, entry);
+    }
+    if (pthread_create(&tid, NULL, path_sender, &c) != EOK)
+        return -1;
+    for (int i = 0; i < rounds && ok; i++) {
+        uint64_t t0, t1, t2;
+        int rcvid;
+
+        if (!receiver_first)
+            path_nap(PATH_NAP_NS + PATH_NAP_NS / 2); /* the sender queues */
+        (void) __timer_timeout(CLOCK_MONOTONIC, RTMUX_TIMEOUT_RECEIVE, NULL,
+                               &(const uint64_t){STRADDLE_TIMEOUT_NS}, NULL);
+        t0 = read_time();
+        rcvid = msg_receivev(chid, riov, parts, &info);
+        t1 = read_time();
+        if (rcvid == -1 || memcmp(sin, c.out, (size_t) (parts * entry)) != 0) {
+            ok = 0;
+            break;
+        }
+        t2 = read_time();
+        if (msg_replyv(rcvid, 0, siov, parts) == -1) {
+            fprintf(stderr, "ipc-roundtrip: path reply round %d: %s\n", i,
+                    strerror(errno));
+            ok = 0;
+        }
+        snd[i % IOV_STEP_CALLS] = ticks_to_ns(t1 - c.t_send, cps);
+        rcv[i % IOV_STEP_CALLS] = ticks_to_ns(t1 - t0, cps);
+        rep[i % IOV_STEP_CALLS] = ticks_to_ns(read_time() - t2, cps);
+        memset(sin, 0, sizeof sin);
+    }
+    (void) pthread_join(tid, NULL);
+    ok = ok && c.rc == 0;
+    if (timed && receiver_first) {
+        /* The delivery includes waking the receiver, which a busy host makes
+         * slow whatever the kernel does: a step is judged by what it adds to
+         * the same message in one entry.
+         */
+        uint64_t p99;
+
+        qsort(snd, IOV_STEP_CALLS, sizeof snd[0], cmp_u64);
+        p99 = snd[p99_index(IOV_STEP_CALLS)];
+        smax = snd[IOV_STEP_CALLS - 1];
+        if (parts == 1) {
+            path_base_ns = p99;
+        } else {
+            ok = ok && p99 < path_base_ns + IOV_STEP_NS_MAX;
+        }
+        printf(
+            "ipc-roundtrip: iov-send %s parts=%d p99-ns=%llu max-ns=%llu "
+            "one-entry-p99-ns=%llu\n",
+            ok ? "PASS" : "FAIL", parts, (unsigned long long) p99,
+            (unsigned long long) smax, (unsigned long long) path_base_ns);
+    } else if (timed) {
+        ok = ok && path_p99(rcv, &rmax) == 0 && path_p99(rep, &pmax) == 0;
+        printf(
+            "ipc-roundtrip: iov-receive-reply %s receive-p99-ns=%llu "
+            "receive-max-ns=%llu reply-p99-ns=%llu reply-max-ns=%llu\n",
+            ok ? "PASS" : "FAIL",
+            (unsigned long long) rcv[p99_index(IOV_STEP_CALLS)],
+            (unsigned long long) rmax,
+            (unsigned long long) rep[p99_index(IOV_STEP_CALLS)],
+            (unsigned long long) pmax);
+    } else {
+        printf("ipc-roundtrip: iov-path-big %s %s parts=%d\n",
+               ok ? "PASS" : "FAIL",
+               receiver_first ? "receiver-first" : "sender-first", parts);
+    }
+    return ok ? 0 : -1;
+}
+
+/* A thread that sends PATH_SHORT bytes, a short message, and waits for the
+ * reply.
+ */
+static void *iov_short_sender(void *arg)
+{
+    struct iov_ctx *ctx = arg;
+    iov_t siov, riov;
+    int coid, r;
+    char rep[1];
+
+    ctx->rc = -1;
+    coid = connect_attach((uint32_t) 0, 0, ctx->chid, RTMUX_SIDE_CHANNEL, 0);
+    if (coid == -1)
+        return NULL;
+    SETIOV(&siov, ctx->out, PATH_SHORT);
+    SETIOV(&riov, rep, sizeof rep);
+    r = msg_sendv(coid, &siov, 1, &riov, 1);
+    if (r != -1)
+        ctx->rc = 0;
+    (void) __connect_detach((uint64_t) coid);
+    return NULL;
+}
+
+/* A short message, read into IOV_COPY_PARTS entries of which only the last is
+ * not empty (one step, timed), and into IOV_PARTS of them (many restarts, which
+ * must move the same bytes, and which an all-empty vector must end with none).
+ */
+static int check_iov_short(int chid)
+{
+    static unsigned char out[PATH_SHORT], rd[PATH_SHORT];
+    static iov_t ev[IOV_COPY_PARTS], big[IOV_PARTS];
+    static struct iov_ctx ctx;
+    uint64_t cps = cycles_per_sec(), p99 = 0, max = 0;
+    pthread_t tid;
+    int rcvid, ok, n;
+
+    ctx = (struct iov_ctx){.chid = chid, .out = out, .in = rd, .rc = -1};
+    for (int i = 0; i < PATH_SHORT; i++)
+        out[i] = (unsigned char) (i * 5 + 1);
+    for (int i = 0; i < IOV_COPY_PARTS - 1; i++)
+        SETIOV(&ev[i], rd, 0);
+    SETIOV(&ev[IOV_COPY_PARTS - 1], rd, PATH_SHORT);
+    for (int i = 0; i < IOV_PARTS - 1; i++)
+        SETIOV(&big[i], rd, 0);
+    SETIOV(&big[IOV_PARTS - 1], rd, PATH_SHORT);
+    if (pthread_create(&tid, NULL, iov_short_sender, &ctx) != EOK)
+        return -1;
+    if ((rcvid = receive_timed(chid)) == -1)
+        return -1;
+    ok = iov_copy_time(rcvid, 0, ev, IOV_COPY_PARTS, PATH_SHORT, cps, &p99,
+                       &max) == 0 &&
+         memcmp(rd, out, PATH_SHORT) == 0;
+    memset(rd, 0, sizeof rd);
+    n = msg_readv(rcvid, big, IOV_PARTS, 0);
+    ok = ok && n == PATH_SHORT && memcmp(rd, out, PATH_SHORT) == 0;
+    for (int i = 0; i < IOV_PARTS; i++)
+        SETIOV(&big[i], rd, 0);
+    n = msg_readv(rcvid, big, IOV_PARTS, 0);
+    ok = ok && n == 0;
+    if (msg_reply(rcvid, 0, NULL, 0) == -1)
+        ok = 0;
+    (void) pthread_join(tid, NULL);
+    ok = ok && ctx.rc == 0 && p99 < IOV_STEP_NS_MAX;
+    printf("ipc-roundtrip: iov-short %s step-p99-ns=%llu step-max-ns=%llu\n",
+           ok ? "PASS" : "FAIL", (unsigned long long) p99,
+           (unsigned long long) max);
+    return ok ? 0 : -1;
+}
+
+/* msg_sendv with an array the caller does not own: in kernel space, wrapping
+ * past the top of it, or longer than a transfer takes. Bounded by a send
+ * timeout, so a kernel that reads the array and queues the send does not hang
+ * the run: it fails with ETIMEDOUT, not EFAULT.
+ */
+static int check_sendv_array(int chid)
+{
+    static iov_t good[2];
+    static unsigned char b[8];
+    const uint64_t timeout = STRADDLE_TIMEOUT_NS;
+    iov_t *bad[] = {(iov_t *) IOV_KERNEL_VA,
+                    (iov_t *) (uintptr_t) (UINTPTR_MAX - sizeof(iov_t))};
+    int coid = connect_attach((uint32_t) 0, 0, chid, RTMUX_SIDE_CHANNEL, 0);
+    int ok = coid != -1;
+
+    SETIOV(&good[0], b, sizeof b);
+    SETIOV(&good[1], b, sizeof b);
+    for (size_t i = 0; ok && i < sizeof bad / sizeof bad[0]; i++) {
+        for (int side = 0; side < 2; side++) {
+            int r;
+
+            (void) __timer_timeout(CLOCK_MONOTONIC, RTMUX_TIMEOUT_SEND, NULL,
+                                   &timeout, NULL);
+            errno = 0;
+            r = side ? msg_sendv(coid, good, 2, bad[i], 2)
+                     : msg_sendv(coid, bad[i], 2, good, 2);
+            if (r != -1 || errno != EFAULT) {
+                fprintf(
+                    stderr,
+                    "ipc-roundtrip: sendv %s array %zu: %d %s, want EFAULT\n",
+                    side ? "reply" : "send", i, r,
+                    r == -1 ? strerror(errno) : "");
+                ok = 0;
+            }
+        }
+    }
+    errno = 0;
+    (void) __timer_timeout(CLOCK_MONOTONIC, RTMUX_TIMEOUT_SEND, NULL, &timeout,
+                           NULL);
+    if (ok && (msg_sendv(coid, good, PATH_TOO_MANY, good, 1) != -1 ||
+               errno != EFAULT)) {
+        fprintf(stderr,
+                "ipc-roundtrip: sendv %d entries: errno %d, want "
+                "EFAULT\n",
+                PATH_TOO_MANY, errno);
+        ok = 0;
+    }
+    if (coid != -1)
+        (void) __connect_detach((uint64_t) coid);
+    printf("ipc-roundtrip: sendv-array %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : -1;
+}
+
+static int check_iov_paths(int chid)
+{
+    int rc = check_sendv_array(chid);
+
+    rc |= check_iov_short(chid);
+    rc |= path_round(chid, 1, 1, PATH_PARTS * PATH_ENTRY);
+    rc |= path_round(chid, 1, PATH_PARTS, PATH_ENTRY);
+    rc |= path_round(chid, 0, PATH_PARTS, PATH_ENTRY);
+    rc |= path_round(chid, 1, PATH_BIG, PATH_ENTRY);
+    rc |= path_round(chid, 0, PATH_BIG, PATH_ENTRY);
+    return rc;
+}
+
 /* Client: connect to the parent's channel, retrying briefly in case the send
  * races the parent reaching its receive. The channel already exists (the parent
  * creates it before spawning us), so this normally succeeds on the first try.
@@ -1482,7 +1795,8 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
     if (check_readiov_straddle(chid) != 0 || check_readiov_large(chid) != 0 ||
-        check_iov_steps(chid) != 0 || check_iov_bytes(chid) != 0)
+        check_iov_steps(chid) != 0 || check_iov_bytes(chid) != 0 ||
+        check_iov_paths(chid) != 0)
         return EXIT_FAILURE;
 
     snprintf(pid_arg, sizeof pid_arg, "%d", getpid());

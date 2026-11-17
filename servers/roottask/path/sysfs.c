@@ -143,10 +143,14 @@ static size_t synth_kstats(char *buf, size_t cap)
             len += (size_t) n;
     }
     if (len < cap) {
+        struct roottask_heap_stats hs;
+
+        roottask_heap_stats(&hs);
         n = snprintf(buf + len, cap - len,
-                     "pa.free_bytes=%llu\nroottask.heap_used=%zu\n",
-                     (unsigned long long) pa_free_size(),
-                     roottask_heap_in_use());
+                     "pa.free_bytes=%llu\nroottask.heap_used=%zu\n"
+                     "roottask.heap_size=%zu\nroottask.heap_largest=%zu\n",
+                     (unsigned long long) pa_free_size(), hs.used, hs.arena,
+                     hs.largest);
         if (n > 0 && (size_t) n < cap - len)
             len += (size_t) n;
     }

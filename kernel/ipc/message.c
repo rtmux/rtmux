@@ -11,6 +11,8 @@
 /* #define   MSG_XFER_CHUNK_SIZE     1024 */
 
 
+static int msg_current_take(thread_t *act, struct kcall_args_msg_current *kap);
+
 /* Establish the calling thread as the server for a given rcvid (msg_current
  * kcall).
  *
@@ -21,38 +23,56 @@
  *   act : the calling (active) thread
  *   kap : kcall args; kap->rcvid identifies the client thread
  * Return value: EOK on success; ESRCH if the rcvid no longer names a
- *               reply-blocked client.
+ *               reply-blocked client. Either way the loan of the prior client
+ *               has ended.
  */
 int kdecl ksys_msg_current(thread_t *act, struct kcall_args_msg_current *kap)
+{
+    thread_t *prior_client = act->client;
+    bool ended = false;
+    int r;
+
+    /* Disown act's prior client, if any, and end the loan it lent, whatever
+     * this call then does: a call that fails must not leave act running at the
+     * priority of a client it no longer serves. The prior client briefly
+     * observes server=0 with act->client cleared; eventually consistent for its
+     * own ksys_msg_current.
+     */
+    if (prior_client) {
+        prior_client->args.ms.server = 0;
+        ended = thread_client_departed(act, prior_client);
+        if (ended)
+            CRITICAL_CLEAR(act);
+    }
+
+    r = kap->rcvid == 0 ? EOK : msg_current_take(act, kap);
+
+    /* A new client's loan, once taken, replaced the ended one and was applied
+     * by msg_current_take; with none, or on an error return, apply the end.
+     * Applying can switch act out, and the trap path writes a returned status
+     * only while act still runs, so publish the status first.
+     */
+    if (ended && (kap->rcvid == 0 || r != EOK)) {
+        if (r != EOK && r != ENOERROR) {
+            kcall_err(act, r);
+            r = ENOERROR;
+        }
+        thread_prio_update(act);
+    }
+    return r;
+}
+
+/* Make the client named by kap->rcvid act's current one and lend its priority.
+ *
+ * Returns EOK on success, ESRCH if the rcvid no longer names a reply-blocked
+ * client, or ENOERROR when lookup_rcvid already set the error.
+ */
+static int msg_current_take(thread_t *act, struct kcall_args_msg_current *kap)
 {
     connect_t *cop;
     thread_t *thp;
     int do_pi = 0;
     kdispatch_t *new_dpp = NULL;
-    thread_t *prior_client = act->client;
-
-    /* Disown act's prior client, if any. Single-pointer atomic writes; the
-     * prior client briefly observes server=0 with act->client cleared —
-     * eventually-consistent for the prior client's own ksys_msg_current. A
-     * per-thread_t lock would close this window; not yet instantiated
-     * (LOCK_CLASS_THREAD placeholder).
-     */
-    if (prior_client) {
-        prior_client->args.ms.server = 0;
-        act->client = 0;
-    }
-
-    if (kap->rcvid == 0) {
-        /* No client left to lend priority. A notification loan stays until the
-         * next receive.
-         */
-        if (prior_client && thread_msg_loan_is_request(act)) {
-            CRITICAL_CLEAR(act);
-            thread_lend_msg(act, 0, false);
-            thread_prio_update(act);
-        }
-        return EOK;
-    }
 
     /* lookup_rcvid runs unlocked: the chancons/threads vec_lookups share the
      * helper-level vec_slock race surface common to every IPC kcall.
@@ -140,7 +160,7 @@ int kdecl ksys_msg_current(thread_t *act, struct kcall_args_msg_current *kap)
         CRITICAL_INHERIT(act, thp);
         thread_lend_msg(act, __atomic_load_n(&thp->priority, __ATOMIC_ACQUIRE),
                         true);
-        thread_drop_gone_client_loan(act, thp);
+        (void) thread_end_orphan_loan(act);
         (void) thread_prio_update_dpp(act, new_dpp, 1);
     } else {
         /* A fixed-priority channel lends nothing. Drop the loan an earlier
@@ -370,7 +390,42 @@ static int msg_readv_body(thread_t *act, struct kcall_args_msg_readv *kap)
         unsigned dlen;
 
         slen = thp->args.msbuff.msglen;
-        if (kap->offset < slen) {
+        if (kap->offset < slen && act->args.ms.rparts > 1) {
+            /* A destination of many entries is walked a step at a time, so a
+             * vector of empty ones does not hold the kernel to its end; the
+             * cursor is the entry reached and the bytes placed, for the same
+             * client, vector and offset.
+             */
+            unsigned idx = 0;
+            size_t copied = 0;
+
+            slen -= kap->offset;
+            if (act->xcur.armed && act->xcur.sthp == thp &&
+                act->xcur.rmsg == act->args.ms.rmsg &&
+                act->xcur.rparts == (int32_t) act->args.ms.rparts &&
+                act->xcur.soff0 == kap->offset && act->xcur.msglen == slen) {
+                idx = act->xcur.didx;
+                copied = act->xcur.soff;
+            }
+            xferstat = xfer_cpy_diov_step(
+                act, act->args.ms.rmsg, act->args.ms.rparts,
+                thp->args.msbuff.buff + kap->offset, slen, &idx, &copied);
+            if (xferstat == XFER_YIELD) {
+                act->xcur.armed = true;
+                act->xcur.sthp = thp;
+                act->xcur.rmsg = act->args.ms.rmsg;
+                act->xcur.rparts = (int32_t) act->args.ms.rparts;
+                act->xcur.soff0 = kap->offset;
+                act->xcur.msglen = (uint32_t) slen;
+                act->xcur.didx = idx;
+                act->xcur.soff = copied;
+                KCALL_RESTART(act);
+                xferstat = XFER_RESTART;
+            } else {
+                act->xcur.armed = false;
+                slen = (unsigned) copied;
+            }
+        } else if (kap->offset < slen) {
             slen -= kap->offset;
             xferstat = xfer_cpy_diov(act, act->args.ms.rmsg,
                                      thp->args.msbuff.buff + kap->offset,

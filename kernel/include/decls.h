@@ -81,6 +81,7 @@ void *nano_query(unsigned type,
                  void *objbuf,
                  size_t objsize);
 int rdecl force_ready(thread_t *thp, unsigned err);
+void prio_defer_init(void);
 void specialret_attr specialret(thread_t *thp);
 void rdecl deliver_fault(thread_t *thp, siginfo_t *info);
 uint64_t rlimit_cpu_to_ns(uint64_t secs);
@@ -238,6 +239,7 @@ connect_t *rdecl lookup_rcvid(kcall_args_t *kap, int rcvid, thread_t **thpp);
  * unconditionally). Call after the last dereference of cop / thp.
  */
 void rdecl lookup_rcvid_release(void);
+void rdecl lookup_rcvid_release_all(void);
 limits_t *rdecl lookup_limits(uid_t uid);
 ksync_t *rdecl sync_create(process_t *bill_prp, sync_t *sync, unsigned flags);
 int rdecl sync_destroy(process_t *prp, sync_t *sync);
