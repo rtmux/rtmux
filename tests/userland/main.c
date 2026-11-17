@@ -1052,6 +1052,18 @@ int main(int argc, char *argv[])
             test_skip("mutex_waiting_republish", "fault injection unavailable");
         return finish(1);
     }
+    if (argc == 2 && !strcmp(argv[1], "--mutex-handoff-loan")) {
+        printf("[mutex_handoff_loan]\n");
+        if (mutex_handoff_loan() == TC_EXIT_SKIP)
+            test_skip("mutex_handoff_loan", "fault injection unavailable");
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--mutex-waiting-withdrawn")) {
+        printf("[mutex_waiting_withdrawn]\n");
+        if (mutex_waiting_withdrawn() == TC_EXIT_SKIP)
+            test_skip("mutex_waiting_withdrawn", "fault injection unavailable");
+        return finish(1);
+    }
     if (argc == 2 && !strcmp(argv[1], "--condvar-interrupt-stale")) {
         printf("[condvar_interrupt_stale]\n");
         if (condvar_interrupt_stale() == TC_EXIT_SKIP)

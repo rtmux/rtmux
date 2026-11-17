@@ -121,27 +121,44 @@ int inject_should_fail_turnstile(process_t *prp)
     return 1;
 }
 
-/* The pid whose next contended PI mutex lock stalls, or -1, and for how long.
- * Consumed like armed_ts_pid.
+/* One-shot stalls, one per site: the pid whose next pass through the site
+ * stalls, or -1, and for how long. Consumed like armed_ts_pid. The sites are
+ * the windows of a contended PI mutex lock (published but not queued, before
+ * WAITING is published, after the priority walk) and force_ready's wait-chain
+ * window.
  */
-static atomic_int armed_stall_pid = -1;
-static atomic_uint armed_stall_ms;
+enum stall_site {
+    STALL_LOCK,
+    STALL_LOCK_EARLY,
+    STALL_LOCK_PROPAGATED,
+    STALL_FORCE_READY,
+    STALL_SITES
+};
 
-/* Claim a one-shot stall armed for pid and spin for the armed time. */
-static void inject_stall_once(atomic_int *armed_pid,
-                              atomic_uint *armed_ms,
-                              const process_t *prp)
+static struct {
+    atomic_int pid;
+    atomic_uint ms;
+} stall_site[STALL_SITES] = {
+    [STALL_LOCK] = {.pid = -1},
+    [STALL_LOCK_EARLY] = {.pid = -1},
+    [STALL_LOCK_PROPAGATED] = {.pid = -1},
+    [STALL_FORCE_READY] = {.pid = -1},
+};
+
+/* Claim a one-shot stall armed for the site's pid and spin for its time. */
+static void inject_stall_once(enum stall_site site, const process_t *prp)
 {
-    int pid = atomic_load_explicit(armed_pid, memory_order_acquire);
+    int pid = atomic_load_explicit(&stall_site[site].pid, memory_order_acquire);
     uint64_t ms;
     uint64_t end;
 
     if (pid < 0 || !prp || prp->pid != pid)
         return;
     /* Read the duration the arm published before claiming it. */
-    ms = atomic_load_explicit(armed_ms, memory_order_relaxed);
-    if (!atomic_compare_exchange_strong_explicit(
-            armed_pid, &pid, -1, memory_order_acq_rel, memory_order_relaxed))
+    ms = atomic_load_explicit(&stall_site[site].ms, memory_order_relaxed);
+    if (!atomic_compare_exchange_strong_explicit(&stall_site[site].pid, &pid,
+                                                 -1, memory_order_acq_rel,
+                                                 memory_order_relaxed))
         return;
     end = r_time() + ms * (qtimeptr->cycles_per_sec / 1000);
     atomic_store_explicit(&consumed, 1, memory_order_release);
@@ -151,24 +168,45 @@ static void inject_stall_once(atomic_int *armed_pid,
     inject_spin_end();
 }
 
+/* Arm a stall at site for pid and ms milliseconds; an errno. */
+static int inject_stall_arm(enum stall_site site, uint64_t pid, uint64_t ms)
+{
+    if (ms == 0 || ms > INJECT_SPIN_MAX_MS)
+        return EINVAL;
+    atomic_store_explicit(&consumed, 0, memory_order_relaxed);
+    atomic_store_explicit(&stall_site[site].ms, (unsigned) ms,
+                          memory_order_relaxed);
+    atomic_store_explicit(&stall_site[site].pid, (int) pid,
+                          memory_order_release);
+    return EOK;
+}
+
 /* Called from the contended lock path with the chain lock dropped, after the
  * waiter published itself and before it queues.
  */
 void inject_mutex_lock_stall(process_t *prp)
 {
-    inject_stall_once(&armed_stall_pid, &armed_stall_ms, prp);
+    inject_stall_once(STALL_LOCK, prp);
 }
 
-/* Like armed_stall_pid, for force_ready's wait-chain window. */
-static atomic_int armed_fr_pid = -1;
-static atomic_uint armed_fr_ms;
+/* Called with the chain lock held, before WAITING is published. */
+void inject_mutex_lock_early(process_t *prp)
+{
+    inject_stall_once(STALL_LOCK_EARLY, prp);
+}
+
+/* Called with the chain lock dropped, after the priority walk. */
+void inject_mutex_lock_propagated(process_t *prp)
+{
+    inject_stall_once(STALL_LOCK_PROPAGATED, prp);
+}
 
 /* Called from sync_chain_force_ready after it read the waiter's key, before it
  * takes the chain lock.
  */
 void inject_force_ready_stall(thread_t *thp)
 {
-    inject_stall_once(&armed_fr_pid, &armed_fr_ms, thp->process);
+    inject_stall_once(STALL_FORCE_READY, thp->process);
 }
 
 /* Called from object_alloc before it touches the free list. Ordinary allocation
@@ -377,26 +415,16 @@ void kext_debug_inject(void *data)
                               memory_order_release);
         break;
     case INJECT_OP_STALL_MUTEX_LOCK:
-        if (kap->arg1 == 0 || kap->arg1 > INJECT_SPIN_MAX_MS) {
-            ret = EINVAL;
-            break;
-        }
-        atomic_store_explicit(&consumed, 0, memory_order_relaxed);
-        atomic_store_explicit(&armed_stall_ms, (unsigned) kap->arg1,
-                              memory_order_relaxed);
-        atomic_store_explicit(&armed_stall_pid, (int) kap->arg0,
-                              memory_order_release);
+        ret = inject_stall_arm(STALL_LOCK, kap->arg0, kap->arg1);
+        break;
+    case INJECT_OP_STALL_MUTEX_EARLY:
+        ret = inject_stall_arm(STALL_LOCK_EARLY, kap->arg0, kap->arg1);
+        break;
+    case INJECT_OP_STALL_MUTEX_PROPAGATED:
+        ret = inject_stall_arm(STALL_LOCK_PROPAGATED, kap->arg0, kap->arg1);
         break;
     case INJECT_OP_STALL_FORCE_READY:
-        if (kap->arg1 == 0 || kap->arg1 > INJECT_SPIN_MAX_MS) {
-            ret = EINVAL;
-            break;
-        }
-        atomic_store_explicit(&consumed, 0, memory_order_relaxed);
-        atomic_store_explicit(&armed_fr_ms, (unsigned) kap->arg1,
-                              memory_order_relaxed);
-        atomic_store_explicit(&armed_fr_pid, (int) kap->arg0,
-                              memory_order_release);
+        ret = inject_stall_arm(STALL_FORCE_READY, kap->arg0, kap->arg1);
         break;
     case INJECT_OP_ALLOC_STATUS:
         ret = atomic_load_explicit(&consumed, memory_order_acquire);

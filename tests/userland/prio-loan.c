@@ -891,6 +891,136 @@ out:
     return 0;
 }
 
+/* mutex_handoff_loan: a PI waiter that has lent its priority to the owner but
+ * is not yet queued must still count when the owner hands the mutex on. H holds
+ * the mutex and W queues behind it; B then locks at a higher priority, lends it
+ * to H, and is held by the debug injection call before it takes the chain lock
+ * again. H unlocks meanwhile and W takes the mutex. B then queues, and W must
+ * run at B's priority: the loan went to H, which no longer owns the mutex.
+ * Needs /bin/inject and four harts; otherwise the case is skipped.
+ */
+#define MHL_STALL_MS 4000L
+#define MHL_PRIO_H 20
+#define MHL_PRIO_W 30
+#define MHL_PRIO_B 50
+
+static pthread_mutex_t mhl_mutex;
+static atomic_int mhl_h_has;
+static atomic_int mhl_h_release;
+static atomic_int mhl_w_has;
+static atomic_int mhl_w_release;
+static atomic_int mhl_b_has;
+
+static void *mhl_owner(void *raw)
+{
+    bool is_h = raw != NULL;
+
+    (void) test_pin_mask(is_h ? 2U : 8U);
+    (void) set_fifo(is_h ? MHL_PRIO_H : MHL_PRIO_W);
+    pthread_mutex_lock(&mhl_mutex);
+    set_flag(is_h ? &mhl_h_has : &mhl_w_has);
+    while (!atomic_load_explicit(is_h ? &mhl_h_release : &mhl_w_release,
+                                 memory_order_acquire))
+        sleep_ms(1);
+    pthread_mutex_unlock(&mhl_mutex);
+    return NULL;
+}
+
+static void *mhl_late(void *raw)
+{
+    (void) raw;
+    (void) test_pin_mask(4U);
+    (void) set_fifo(MHL_PRIO_B);
+    pthread_mutex_lock(&mhl_mutex);
+    set_flag(&mhl_b_has);
+    pthread_mutex_unlock(&mhl_mutex);
+    return NULL;
+}
+
+int mutex_handoff_loan(void)
+{
+    struct sched_param saved;
+    pthread_t h, w, b;
+    char pid[16], ms[16], detail[96];
+    int policy = __sched_get(0, 0, &saved);
+    int cur;
+    bool have_h, have_w = false, have_b = false;
+
+    if (sysconf(_SC_NPROCESSORS_ONLN) < 4 ||
+        inject_run("alloc-status", NULL, NULL) != 0)
+        return TC_EXIT_SKIP;
+    snprintf(pid, sizeof pid, "%d", (int) getpid());
+    snprintf(ms, sizeof ms, "%ld", MHL_STALL_MS);
+    atomic_store(&mhl_h_has, 0);
+    atomic_store(&mhl_h_release, 0);
+    atomic_store(&mhl_w_has, 0);
+    atomic_store(&mhl_w_release, 0);
+    atomic_store(&mhl_b_has, 0);
+    if (policy == -1 || set_fifo(OBSERVER_PRIO) == -1 ||
+        test_pin_mask(1U) == -1 || pi_mutex_init(&mhl_mutex) != 0) {
+        test_fail("mutex_handoff_loan fixture", "setup");
+        return 0;
+    }
+    have_h = spawn(&h, mhl_owner, &h, "mutex_handoff_loan owner");
+    if (!have_h || !wait_flag(&mhl_h_has)) {
+        test_fail("mutex_handoff_loan fixture", "owner did not lock");
+        goto out;
+    }
+    have_w = spawn(&w, mhl_owner, NULL, "mutex_handoff_loan waiter");
+    if (!have_w || wait_prio(h, MHL_PRIO_W) != MHL_PRIO_W) {
+        test_fail("mutex_handoff_loan fixture", "waiter did not queue");
+        goto out;
+    }
+    sleep_ms(200); /* W has left its own walk and queued: it must not eat the stall */
+    if (inject_run("stall-lock-propagated", pid, ms) != 0) {
+        test_fail("mutex_handoff_loan fixture", "inject refused");
+        goto out;
+    }
+    have_b = spawn(&b, mhl_late, NULL, "mutex_handoff_loan late waiter");
+
+    /* B's walk has reached H: it is in, or just about to enter, its stall. */
+    if (!have_b || wait_prio(h, MHL_PRIO_B) != MHL_PRIO_B) {
+        test_fail("mutex_handoff_loan fixture", "late waiter did not lend");
+        goto out;
+    }
+
+    /* B has lent H its priority and is held, not yet queued: hand the mutex to
+     * W at once, so that the stall has not run out first (B queued would win
+     * the handoff, being the highest, and the case would prove nothing).
+     */
+    set_flag(&mhl_h_release);
+    if (!wait_flag(&mhl_w_has)) {
+        test_fail("mutex_handoff_loan fixture", "waiter did not take it");
+        goto out;
+    }
+    if (atomic_load(&mhl_b_has)) {
+        test_fail("mutex_handoff_loan fixture",
+                  "the stall ran out before the handoff");
+        goto out;
+    }
+    check(inject_run("alloc-status", "consumed", NULL) == 0,
+          "the injected stall held the late waiter in its window",
+          "the stall was not taken");
+    cur = wait_prio_n(w, MHL_PRIO_B, (int) MHL_STALL_MS + POLL_MS);
+    snprintf(detail, sizeof detail, "owner runs at %d, want %d", cur,
+             MHL_PRIO_B);
+    check(cur == MHL_PRIO_B,
+          "PI waiter not yet queued still lends to the next owner", detail);
+
+out:
+    set_flag(&mhl_h_release);
+    set_flag(&mhl_w_release);
+    if (have_h)
+        (void) pthread_join(h, NULL);
+    if (have_w)
+        (void) pthread_join(w, NULL);
+    if (have_b)
+        (void) pthread_join(b, NULL);
+    (void) test_pin_mask(~0U);
+    (void) __sched_set(0, 0, policy, &saved);
+    return 0;
+}
+
 int sched_set_error_after_lowering(void)
 {
     return sched_set_error_run(false);

@@ -366,6 +366,8 @@ void cpu_force_fpu_save(thread_t *thp);
 int inject_should_fail_alloc(process_t *prp,
                              soul_t *soulp); /* debug/inject.c */
 void inject_mutex_lock_stall(process_t *prp);
+void inject_mutex_lock_early(process_t *prp);
+void inject_mutex_lock_propagated(process_t *prp);
 void inject_force_ready_stall(thread_t *thp);
 void ipc_blk_trace(const char *file, int line, thread_t *thp);
 #define IPC_BLK(thp) ipc_blk_trace(__FILE__, __LINE__, (thp))
@@ -382,6 +384,14 @@ void inject_note_manip_failure(unsigned pages);
 bool inject_pte_map_stop(const void *adp, uintptr_t start, uintptr_t *endp);
 #else
 static inline void inject_mutex_lock_stall(process_t *prp)
+{
+    (void) prp;
+}
+static inline void inject_mutex_lock_early(process_t *prp)
+{
+    (void) prp;
+}
+static inline void inject_mutex_lock_propagated(process_t *prp)
 {
     (void) prp;
 }

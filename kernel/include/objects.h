@@ -558,6 +558,7 @@ typedef struct thread_entry { /* Also used for vthread_entry */
     turnstile_t *blocked_on_turnstile; /* PI/PC wait-chain object, not
                                         * blocked_on channel state
                                         */
+    thread_t *ts_bound_next; /* link in blocked_on_turnstile's bound list */
     turnstile_t
         *owned_turnstiles; /* turnstiles currently boosting this owner */
     /* Robust mutexes this thread holds (under sync_pi_slock), and one spare

@@ -3962,6 +3962,7 @@ int condvar_reacquire_alloc_failure(void)
 static pthread_mutex_t mwr_mutex;
 static atomic_int mwr_w_release;
 static atomic_int mwr_b_done;
+static atomic_int mwr_b_started;
 
 static void *mwr_w(void *arg)
 {
@@ -3977,6 +3978,7 @@ static void *mwr_b(void *arg)
 {
     (void) arg;
     (void) test_pin_mask(2U); /* its stall must not hold up the others */
+    atomic_store(&mwr_b_started, 1);
     pthread_mutex_lock(&mwr_mutex);
     pthread_mutex_unlock(&mwr_mutex);
     atomic_store(&mwr_b_done, 1);
@@ -4003,6 +4005,7 @@ int mutex_waiting_republish(void)
     }
     pthread_mutexattr_destroy(&ma);
     atomic_store(&mwr_b_done, 0);
+    atomic_store(&mwr_b_started, 0);
     atomic_store(&mwr_w_release, 0);
     (void) test_pin_mask(1U);
 
@@ -4023,6 +4026,8 @@ int mutex_waiting_republish(void)
         test_fail("mutex_waiting_republish fixture", "pthread_create");
         goto out;
     }
+    for (int i = 0; i < 1000 && !atomic_load(&mwr_b_started); i++)
+        sleep_ms(5);
     sleep_ms(100); /* B is inside its stall: published, not yet queued */
     pthread_mutex_unlock(&mwr_mutex); /* hands the mutex to W alone */
     sleep_ms(MWR_STALL_MS + 400); /* B has left its stall and queued */
@@ -4030,6 +4035,9 @@ int mutex_waiting_republish(void)
 
     for (long i = 0; i < MWR_WAIT_MS / 10 && !atomic_load(&mwr_b_done); i++)
         sleep_ms(10);
+    check(inject_run("alloc-status", "consumed", NULL) == 0,
+          "the injected stall held the late waiter in its window",
+          "the stall was not taken");
     check(atomic_load(&mwr_b_done),
           "PI mutex waiter published but not yet queued is not stranded",
           "the late waiter slept on a mutex released in user space");
@@ -4039,6 +4047,92 @@ int mutex_waiting_republish(void)
         pthread_mutex_destroy(&mwr_mutex);
     }
 out:
+    (void) test_pin_mask(~0U);
+    return 0;
+}
+
+/* mutex_waiting_withdrawn: a contended PI lock that cannot get a turnstile
+ * fails with EAGAIN, and must take back the WAITING bit it published. The
+ * fixture stalls the locker, with the chain lock held, after it saw the mutex
+ * busy and before it publishes, releases the mutex in user space meanwhile, and
+ * fails the locker's turnstile allocation. The locker then publishes WAITING
+ * onto a free word; if it leaves it there, every trylock reports the free mutex
+ * busy. Needs /bin/inject and two harts; otherwise the case is skipped.
+ */
+#define MWW_STALL_MS 3000L
+
+static pthread_mutex_t mww_mutex;
+static atomic_int mww_rc;
+static atomic_int mww_started;
+
+static void *mww_locker(void *arg)
+{
+    int rc;
+
+    (void) arg;
+    (void) test_pin_mask(2U);
+    atomic_store(&mww_started, 1);
+    rc = pthread_mutex_lock(&mww_mutex);
+    if (rc == 0)
+        pthread_mutex_unlock(&mww_mutex);
+    atomic_store(&mww_rc, rc);
+    return NULL;
+}
+
+int mutex_waiting_withdrawn(void)
+{
+    pthread_mutexattr_t ma;
+    pthread_t t;
+    char ms[16];
+    char pid[16];
+    int rc;
+
+    if (sysconf(_SC_NPROCESSORS_ONLN) < 2 ||
+        inject_run("alloc-status", NULL, NULL) != 0)
+        return TC_EXIT_SKIP;
+    snprintf(pid, sizeof pid, "%d", (int) getpid());
+    snprintf(ms, sizeof ms, "%ld", MWW_STALL_MS);
+    pthread_mutexattr_init(&ma);
+    pthread_mutexattr_setprotocol(&ma, PTHREAD_PRIO_INHERIT);
+    rc = pthread_mutex_init(&mww_mutex, &ma);
+    pthread_mutexattr_destroy(&ma);
+    if (rc != 0) {
+        test_fail("mutex_waiting_withdrawn fixture", "pthread_mutex_init");
+        return 0;
+    }
+    atomic_store(&mww_rc, -1);
+    atomic_store(&mww_started, 0);
+    (void) test_pin_mask(1U);
+
+    if (pthread_mutex_lock(&mww_mutex) != 0 ||
+        inject_run("fail-turnstile", pid, NULL) != 0 ||
+        inject_run("stall-lock-early", pid, ms) != 0) {
+        test_fail("mutex_waiting_withdrawn fixture", "lock or inject refused");
+        goto out;
+    }
+    if (pthread_create(&t, NULL, mww_locker, NULL) != 0) {
+        test_fail("mutex_waiting_withdrawn fixture", "pthread_create");
+        goto out;
+    }
+    for (int i = 0; i < 1000 && !atomic_load(&mww_started); i++)
+        sleep_ms(5);
+    sleep_ms(200); /* the locker is inside its stall, before it publishes */
+    pthread_mutex_unlock(&mww_mutex); /* in user space: no bit to see yet */
+    (void) pthread_join(t, NULL);
+    check(inject_run("alloc-status", "consumed", NULL) == 0,
+          "the injected stall held the locker before it published",
+          "the stall was not taken");
+    check(atomic_load(&mww_rc) == EAGAIN,
+          "contended PI lock without a turnstile fails with EAGAIN",
+          "the lock did not fail as injected");
+    rc = pthread_mutex_trylock(&mww_mutex);
+    check(rc == 0, "failed contended PI lock leaves no WAITING on a free mutex",
+          "trylock reports the free mutex busy");
+    if (rc == 0)
+        pthread_mutex_unlock(&mww_mutex);
+    pthread_mutex_destroy(&mww_mutex);
+out:
+    (void) inject_run("fail-turnstile", "2147483647", NULL);
     (void) test_pin_mask(~0U);
     return 0;
 }

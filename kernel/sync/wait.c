@@ -141,6 +141,7 @@ struct turnstile_entry {
     unsigned contenders;
     unsigned refs;
     unsigned max_waiter_prio;
+    thread_t *bound; /* waiters bound but not yet queued, chain lock */
 };
 
 /* Physical address of a user VA in the current process (arch/riscv/cpu-pte.c).
@@ -823,14 +824,6 @@ static thread_t *sync_turnstile_owner_pin(turnstile_t *ts)
     return owner;
 }
 
-static void sync_turnstile_bind_waiter(turnstile_t *ts, thread_t *thp)
-{
-    kspinlock_lock(&sync_pi_slock);
-    thp->blocked_on_turnstile = ts;
-    kspinlock_unlock(&sync_pi_slock);
-    ts->contenders++;
-}
-
 static void sync_turnstile_update_max_locked(struct sync_chain *c,
                                              turnstile_t *ts)
 {
@@ -840,10 +833,46 @@ static void sync_turnstile_update_max_locked(struct sync_chain *c,
         if (cur->args.mu.wait_key == ts->key && max_prio < cur->priority)
             max_prio = cur->priority;
     }
+    for (thread_t *cur = ts->bound; cur; cur = cur->ts_bound_next) {
+        if (max_prio < cur->priority)
+            max_prio = cur->priority;
+    }
 
     kspinlock_lock(&sync_pi_slock);
     ts->max_waiter_prio = max_prio;
     kspinlock_unlock(&sync_pi_slock);
+}
+
+/* Caller holds the chain lock. A PI lock binds to the turnstile, lends its
+ * priority with the chain lock dropped, and only then queues. Until it queues
+ * it is on the bound list, which the turnstile maximum counts: a recompute in
+ * that window (a handoff, another waiter leaving) must not take the loan back
+ * from the owner.
+ */
+static void sync_turnstile_bind_waiter(turnstile_t *ts, thread_t *thp)
+{
+    ts->contenders++;
+    thp->ts_bound_next = ts->bound;
+    ts->bound = thp;
+    kspinlock_lock(&sync_pi_slock);
+    thp->blocked_on_turnstile = ts;
+    if (ts->max_waiter_prio < thp->priority)
+        ts->max_waiter_prio = thp->priority;
+    kspinlock_unlock(&sync_pi_slock);
+}
+
+/* Caller holds the chain lock. Take thp off ts's bound list; a queued waiter is
+ * not on it, so a miss is normal.
+ */
+static void sync_turnstile_bound_remove_locked(turnstile_t *ts, thread_t *thp)
+{
+    for (thread_t **pp = &ts->bound; *pp; pp = &(*pp)->ts_bound_next) {
+        if (*pp == thp) {
+            *pp = thp->ts_bound_next;
+            thp->ts_bound_next = NULL;
+            return;
+        }
+    }
 }
 
 static void sync_turnstile_unbind_waiter_locked(struct sync_chain *c,
@@ -860,6 +889,7 @@ static void sync_turnstile_unbind_waiter_locked(struct sync_chain *c,
         if (ts->contenders == 0)
             crash();
         ts->contenders--;
+        sync_turnstile_bound_remove_locked(ts, thp);
         sync_turnstile_update_max_locked(c, ts);
     }
 }
@@ -1108,6 +1138,31 @@ static int sync_has_waiter(struct sync_chain *c, sync_key_t key)
     for (thread_t *cur = c->head; cur; cur = cur->next.thread) {
         if (cur->args.mu.wait_key == key)
             return 1;
+    }
+    return 0;
+}
+
+/* Caller holds chain lock. The WAITING bit the lock word of the mutex at key is
+ * owed: RTMUX_SYNC_WAITING when a thread other than `except` waits for it, else
+ * 0. A waiter counts from the moment it binds to the turnstile, not only once
+ * it is queued: a PI lock drops the chain lock between the two, and a word
+ * rewritten in that window from the queued waiters alone would strand it. ts is
+ * the mutex's turnstile (NULL for a non-PI mutex); `except` is a queued waiter
+ * about to be dequeued, which still counts in ts->contenders.
+ */
+static unsigned long mutex_waiting_bit_locked(struct sync_chain *c,
+                                              sync_key_t key,
+                                              const turnstile_t *ts,
+                                              const thread_t *except)
+{
+    /* A PI waiter is counted from its bind to its dequeue, so the turnstile
+     * alone answers for the queued ones too.
+     */
+    if (ts)
+        return ts->contenders > (except ? 1U : 0U) ? RTMUX_SYNC_WAITING : 0;
+    for (thread_t *cur = c->head; cur; cur = cur->next.thread) {
+        if (cur != except && cur->args.mu.wait_key == key)
+            return RTMUX_SYNC_WAITING;
     }
     return 0;
 }
@@ -1780,19 +1835,16 @@ static struct robust_hold *robust_hand_on(thread_t *dead,
     sync_t *ks = NULL;
 
     kspinlock_lock(&c->lock);
+    ts = sync_turnstile_find_locked(c, key);
 
     /* The first waiter that is not itself dying takes the mutex. The record
      * goes on its list before the lock word changes, so that its own death
      * cannot find the word without the record.
      */
     for (thread_t *cand = c->head; cand && !head; cand = cand->next.thread) {
-        bool more = false;
-
         if (cand->args.mu.wait_key != key ||
             !robust_attach(cand, rec, cand->args.mu.mutex))
             continue;
-        for (thread_t *thp = c->head; thp && !more; thp = thp->next.thread)
-            more = thp != cand && thp->args.mu.wait_key == key;
 
         kspinlock_lock(&as_slock);
         ks = robust_word_if_dead(cand->process, cand->args.mu.mutex, key,
@@ -1801,7 +1853,7 @@ static struct robust_hold *robust_hand_on(thread_t *dead,
             ceiling = mutex_prio_ceiling(ks);
             mutex_mark_inconsistent(ks);
             *(volatile unsigned long *) &ks->owner =
-                SYNC_OWNER(cand) | (more ? RTMUX_SYNC_WAITING : 0);
+                SYNC_OWNER(cand) | mutex_waiting_bit_locked(c, key, ts, cand);
             head = cand;
         }
         kspinlock_unlock(&as_slock);
@@ -1823,7 +1875,6 @@ static struct robust_hold *robust_hand_on(thread_t *dead,
         kspinlock_unlock(&as_slock);
     }
 
-    ts = sync_turnstile_find_locked(c, key);
     if (!ks || !head) {
         /* Mutex handed on to no one: a PI turnstile left without contenders is
          * freed (sync_thread_cleanup clears the dead owner otherwise).
@@ -1921,6 +1972,28 @@ static void robust_owner_died(thread_t *thp)
 static bool mutex_word_special(unsigned long word)
 {
     return (word >> 8) == (RTMUX_SYNC_DEAD >> 8);
+}
+
+/* Caller holds the chain lock. Take back the WAITING bit a contended lock
+ * published when no waiter is left to need it: none queued, none bound to the
+ * turnstile. Cleared in place, since a load and store of the whole word could
+ * write back an owner that unlocked, or locked, in user space in between. A
+ * special word (the owner died meanwhile) has no waiting bit and must not lose
+ * or gain one.
+ *
+ * Returns whether no waiter remains.
+ */
+static bool mutex_waiting_withdraw_locked(struct sync_chain *c,
+                                          sync_key_t key,
+                                          const turnstile_t *ts,
+                                          sync_t *sync)
+{
+    if (mutex_waiting_bit_locked(c, key, ts, NULL))
+        return false;
+    if (!mutex_word_special(*(volatile unsigned long *) &sync->owner))
+        atomic_clr_64((volatile unsigned long *) &sync->owner,
+                      RTMUX_SYNC_WAITING);
+    return true;
 }
 
 /* Whether the owner named by sync's lock word is gone: dead, or no longer
@@ -2064,7 +2137,6 @@ static void mutex_lock_body(thread_t *act,
     turnstile_t *allocated_ts = NULL;
     turnstile_t *free_ts = NULL;
     struct robust_hold *free_rec = NULL;
-    int waiter_bound = 0;
     int pi_enabled;
     int rc;
 
@@ -2107,6 +2179,7 @@ retry_contended:
     /* Mark the lock word as having waiters. This is observed by mutex_unlock to
      * know it must wake someone.
      */
+    inject_mutex_lock_early(act->process);
     atomic_or_64((volatile unsigned long *) &sync->owner, RTMUX_SYNC_WAITING);
     pi_enabled = mutex_pi_enabled(sync);
     turnstile_t *ts = NULL;
@@ -2117,6 +2190,14 @@ retry_contended:
                 kspinlock_unlock(&c->lock);
                 allocated_ts = sync_ts_take(act);
                 if (!allocated_ts) {
+                    /* The bit published above is ours to take back: the holder
+                     * may have released in user space since, leaving a free
+                     * word that every trylock would read as busy.
+                     */
+                    kspinlock_lock(&c->lock);
+                    (void) mutex_waiting_withdraw_locked(
+                        c, key, sync_turnstile_find_locked(c, key), sync);
+                    kspinlock_unlock(&c->lock);
                     kcall_err(act, EAGAIN);
                     return;
                 }
@@ -2130,34 +2211,21 @@ retry_contended:
             allocated_ts = NULL;
         }
     }
-    if (pi_enabled)
-        sync_turnstile_record_owner(ts,
-                                    *(volatile unsigned long *) &sync->owner);
     if (pi_enabled) {
+        unsigned long lent_to = *(volatile unsigned long *) &sync->owner;
+
+        sync_turnstile_record_owner(ts, lent_to);
         sync_turnstile_bind_waiter(ts, act);
-        waiter_bound = 1;
         kspinlock_unlock(&c->lock);
         inject_mutex_lock_stall(act->process);
         rc = sync_pi_propagate(act, ts);
+        inject_mutex_lock_propagated(act->process);
         kspinlock_lock(&c->lock);
         if (rc != EOK) {
             thread_t *owner = sync_turnstile_owner_pin(ts);
 
-            if (waiter_bound) {
-                sync_turnstile_unbind_waiter_locked(c, act);
-                waiter_bound = 0;
-            }
-            if (!sync_has_waiter(c, key)) {
-                /* Clear the bit in place: a load and store of the whole word
-                 * could write back an owner that unlocked, or locked, in user
-                 * space in between. A waiter still propagating republishes the
-                 * bit itself once it is queued. A special word (the owner died
-                 * meanwhile) has no waiting bit to clear.
-                 */
-                if (!mutex_word_special(
-                        *(volatile unsigned long *) &sync->owner))
-                    atomic_clr_64((volatile unsigned long *) &sync->owner,
-                                  RTMUX_SYNC_WAITING);
+            sync_turnstile_unbind_waiter_locked(c, act);
+            if (mutex_waiting_withdraw_locked(c, key, ts, sync)) {
                 sync_turnstile_set_owner_thread_locked(ts, NULL, 0, 0);
                 sync_turnstile_free_idle_locked(c, ts);
             }
@@ -2172,10 +2240,7 @@ retry_contended:
 
         rc = mutex_try_acquire_locked(act, sync, c, key);
         if (rc != MUTEX_BUSY) {
-            if (waiter_bound) {
-                sync_turnstile_unbind_waiter_locked(c, act);
-                waiter_bound = 0;
-            }
+            sync_turnstile_unbind_waiter_locked(c, act);
             sync_turnstile_set_owner_thread_locked(ts, NULL, 0, 0);
             sync_turnstile_free_idle_locked(c, ts);
             kspinlock_unlock(&c->lock);
@@ -2183,8 +2248,24 @@ retry_contended:
             mutex_lock_done(act, sync, recp, rc);
             return;
         }
-        sync_turnstile_record_owner(ts,
-                                    *(volatile unsigned long *) &sync->owner);
+
+        /* The owner may have changed in the window: a release in user space
+         * with nobody queued frees the mutex, and another thread can take it
+         * before this one relocks. The walk above lent to the old owner, so
+         * take the new owner's loan from the turnstile maximum, which counts
+         * this waiter while it is bound.
+         */
+        unsigned long now = *(volatile unsigned long *) &sync->owner;
+
+        sync_turnstile_record_owner(ts, now);
+        if ((now & ~RTMUX_SYNC_WAITING) != (lent_to & ~RTMUX_SYNC_WAITING)) {
+            thread_t *owner = sync_turnstile_owner_pin(ts);
+
+            sync_pi_recompute_owner_held(owner, c);
+            if (owner)
+                tthread_unpin(owner);
+        }
+        sync_turnstile_bound_remove_locked(ts, act);
     }
 
     /* Enqueue self, transition state under the chain lock, leaving our own
@@ -2197,12 +2278,13 @@ retry_contended:
         sync_turnstile_update_max_locked(c, ts);
 
     /* A PI lock dropped the chain lock to propagate priority after the first
-     * publish above. Another waiter's failed propagation (no queued waiter
-     * left, so it cleared WAITING) or an unlock handoff (it rewrote the word
-     * from the queued waiters only) can erase the bit meanwhile; republish it
-     * now that this waiter is queued. A non-PI lock never dropped the lock. A
-     * special word (the owner died meanwhile; the death scan runs under this
-     * chain lock) has no waiting bit and must not gain one.
+     * publish above. A handoff or a failed propagation in that window counts
+     * this waiter as bound (mutex_waiting_bit_locked) and keeps the bit, but an
+     * unlock that found nobody queued stores a free word, and a user-space
+     * locker can take it, without the bit, before this waiter relocks;
+     * republish it now that this waiter is queued. A non-PI lock never dropped
+     * the lock. A special word (the owner died meanwhile; the death scan runs
+     * under this chain lock) has no waiting bit and must not gain one.
      */
     if (pi_enabled &&
         !mutex_word_special(*(volatile unsigned long *) &sync->owner))
@@ -2240,11 +2322,10 @@ retry_contended:
         thread_t *old_owner = pi_enabled ? sync_turnstile_owner_pin(ts) : NULL;
 
         sync_dequeue(c, act);
-        unsigned long no = want;
-        if (sync_has_waiter(c, key))
-            no |= RTMUX_SYNC_WAITING;
-        *(volatile unsigned long *) &sync->owner = no;
-        if (pi_enabled && sync_has_waiter(c, key))
+        unsigned long waiting = mutex_waiting_bit_locked(c, key, ts, NULL);
+
+        *(volatile unsigned long *) &sync->owner = want | waiting;
+        if (pi_enabled && waiting)
             sync_turnstile_set_owner_thread_locked(ts, act, want, 0);
         else if (pi_enabled) {
             sync_turnstile_set_owner_thread_locked(ts, NULL, 0, 0);
@@ -2427,9 +2508,8 @@ int kdecl ksys_sync_mutex_unlock(thread_t *act,
     thread_t *next =
         rec ? robust_pick_owner(c, key, rec) : sync_dequeue_head(c, key);
     if (next) {
-        unsigned long new_owner = SYNC_OWNER(next);
-        if (sync_has_waiter(c, key))
-            new_owner |= RTMUX_SYNC_WAITING;
+        unsigned long new_owner =
+            SYNC_OWNER(next) | mutex_waiting_bit_locked(c, key, ts, NULL);
         *(volatile unsigned long *) &sync->owner = new_owner;
         if (pi_enabled && ts)
             sync_turnstile_set_owner_thread_locked(ts, next, new_owner, 0);
@@ -2654,9 +2734,9 @@ int kdecl ksys_sync_condvar_wait(thread_t *act,
         mutex_rec ? robust_pick_owner(mutex_c, mutex_key, mutex_rec)
                   : sync_dequeue_head(mutex_c, mutex_key);
     if (mutex_next) {
-        unsigned long new_owner = SYNC_OWNER(mutex_next);
-        if (sync_has_waiter(mutex_c, mutex_key))
-            new_owner |= RTMUX_SYNC_WAITING;
+        unsigned long new_owner =
+            SYNC_OWNER(mutex_next) |
+            mutex_waiting_bit_locked(mutex_c, mutex_key, mutex_ts, NULL);
         *(volatile unsigned long *) &mutex->owner = new_owner;
         if (bound_mutex_pi && mutex_ts)
             sync_turnstile_set_owner_thread_locked(mutex_ts, mutex_next,

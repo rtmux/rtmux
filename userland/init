@@ -175,7 +175,20 @@ if test "$rtmux_run" = "debug-inject"; then
             ok=8
         fi
     fi
+    # A waiter that must lend its priority but is not yet queued still counts
+    # when the owner hands the mutex on, and a contended lock that cannot get a
+    # turnstile takes back the WAITING bit it published.
     if test "$ok" = 8; then
+        if /bin/syscall_testing --mutex-handoff-loan; then
+            ok=9
+        fi
+    fi
+    if test "$ok" = 9; then
+        if /bin/syscall_testing --mutex-waiting-withdrawn; then
+            ok=10
+        fi
+    fi
+    if test "$ok" = 10; then
         echo "RTMux debug-inject: PASS"
     else
         echo "RTMux debug-inject: FAIL"

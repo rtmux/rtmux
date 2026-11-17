@@ -78,6 +78,8 @@ int sched_set_error_after_lowering(void);
 int sched_set_error_while_migrating(void);
 int condvar_reacquire_alloc_failure(void);
 int mutex_waiting_republish(void);
+int mutex_handoff_loan(void);
+int mutex_waiting_withdrawn(void);
 int condvar_interrupt_stale(void);
 int ns_open_deferral(void);
 int pte_partial_map(void);

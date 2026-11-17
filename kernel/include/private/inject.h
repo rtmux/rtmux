@@ -107,6 +107,20 @@
  */
 #define INJECT_OP_FAIL_PTE_MAP 16
 
+/* STALL_MUTEX_EARLY(pid, ms): like STALL_MUTEX_LOCK, but the stall comes
+ * earlier, with the chain lock held, after the contended lock saw the mutex
+ * busy and before it publishes WAITING. A holder that releases in user space
+ * meanwhile leaves a free word for the waiter to publish onto.
+ */
+#define INJECT_OP_STALL_MUTEX_EARLY 17
+
+/* STALL_MUTEX_PROPAGATED(pid, ms): like STALL_MUTEX_LOCK, but the stall comes
+ * after the waiter has lent its priority to the owner and before it takes the
+ * chain lock again, the window in which an unlock hands the mutex to another
+ * waiter that was not lent it.
+ */
+#define INJECT_OP_STALL_MUTEX_PROPAGATED 18
+
 #define INJECT_SPIN_MAX_MS 10000
 
 /* Injected interrupts-off spins, for intrevent_flush()'s debug spin watchdog: a

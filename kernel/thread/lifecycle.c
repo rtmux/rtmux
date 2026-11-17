@@ -56,6 +56,7 @@ static void thread_recycle_reset(thread_t *thp)
     thp->client = NULL;
     thp->blocked_on = NULL;
     thp->blocked_on_turnstile = NULL;
+    thp->ts_bound_next = NULL;
     thp->owned_turnstiles = NULL;
     thp->robust_held = NULL;
     thp->robust_spare = NULL;
@@ -1126,6 +1127,7 @@ int rdecl thread_create(thread_t *act,
     thp->syscall = -1;
     thp->client = 0;
     thp->blocked_on_turnstile = NULL;
+    thp->ts_bound_next = NULL;
     thp->owned_turnstiles = NULL;
     thp->robust_held = NULL;
     thp->robust_spare = NULL;
