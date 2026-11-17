@@ -408,7 +408,8 @@ void rdecl send_ipi(unsigned cpu, int cmd)
      * cpu_online(), so count the attempt (qemu-regress reports the warning) and
      * send nothing.
      */
-    if (!((__atomic_load_n(&legal_cpu_bitmask, __ATOMIC_RELAXED) >> cpu) & 1)) {
+    if (!cpu_in_mask(__atomic_load_n(&legal_cpu_bitmask, __ATOMIC_RELAXED),
+                     cpu)) {
         if (__atomic_fetch_add(&pcpu_array[cpu].pc_ipi_refused, 1,
                                __ATOMIC_RELAXED) == 0)
             LOGF_W("send_ipi: cpu %u was dropped at bring-up\n", cpu);

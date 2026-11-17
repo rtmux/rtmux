@@ -2106,7 +2106,8 @@ static void mutex_owner_died_waiters(thread_t *thp, struct sync_chain *c)
  * A failure is reported as its errno. A mutex taken from a dead owner is marked
  * inconsistent and reports EOWNERDEAD; the libc wrapper then counts the new
  * hold as usual. A robust mutex gets the caller's record unless this was a
- * recursive acquire, which already has one. Last, the ceiling boost.
+ * recursive acquire, which already has one. Last, the ceiling boost, which a
+ * recursive acquire also already has (the final unlock pops it once).
  */
 static void mutex_lock_done(thread_t *act,
                             sync_t *sync,
@@ -2125,7 +2126,8 @@ static void mutex_lock_done(thread_t *act,
         if (robust_attach(act, *recp, sync))
             *recp = NULL; /* else the caller frees it */
     }
-    mutex_prio_ceiling_boost(act, sync);
+    if (rc != MUTEX_RECURSED)
+        mutex_prio_ceiling_boost(act, sync);
 }
 
 /* The body of ksys_sync_mutex_lock, after the probe. A robust mutex comes with

@@ -115,6 +115,8 @@ struct netd_watch {
     int fd;
     unsigned gen;
     unsigned set;
+    unsigned
+        pins; /* notifies checking the socket now: a store to the slot waits */
     ioserv_notify_t lists[IOSERV_NOTIFY_COUNT];
 };
 
@@ -127,6 +129,9 @@ static struct netd_watch tcp_watch[NETD_SLOTS];
 static struct netd_watch udp_watch[NETD_SLOTS];
 static pthread_mutex_t netd_watch_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t netd_watch_cond = PTHREAD_COND_INITIALIZER;
+
+/* Signalled when a slot's last pin is dropped, for the store that waits. */
+static pthread_cond_t netd_pin_cond = PTHREAD_COND_INITIALIZER;
 
 /* An LKL eventfd in the watcher's poll set: an arm that adds to what the
  * watcher polls (a socket, or a condition of one) writes it, so the watcher
@@ -150,12 +155,38 @@ static unsigned long long netd_poll_count(const unsigned long long *counter)
 }
 
 /* How often a notify checks a slot again that changed under it; the last check
- * is made under the lock, so it cannot be overtaken. The environment variable
- * LKL_NETD_NOTIFY_RETRIES sets it, to 0 to run every arm that way (the
- * lkl-netd-poll-spent mode).
+ * is made with the slot pinned, so it cannot be overtaken. The --notify-retries
+ * flag sets it, to 0 to run every arm that way (the lkl-netd-poll-spent mode).
  */
 #define NETD_NOTIFY_RETRIES 4
 static unsigned netd_notify_retries = NETD_NOTIFY_RETRIES;
+
+/* The counters of /net/stats before and after the ioserv block, one line each:
+ * the name shown and its value. The text, its arguments and its longest size
+ * all come from these lists; stats is the host statistics snapshot.
+ */
+#define NETD_STATS_BEFORE(X)                          \
+    X(poll_arms, netd_poll_count(&netd_poll_arms))    \
+    X(poll_kicks, netd_poll_count(&netd_poll_kicks))  \
+    X(page_current, stats.page_current)               \
+    X(page_high, stats.page_high)                     \
+    X(page_total, stats.page_total)                   \
+    X(dma_current, stats.dma_current)                 \
+    X(dma_high, stats.dma_high)                       \
+    X(dma_total, stats.dma_total)                     \
+    X(net_bounce_rx_bytes, stats.net_bounce_rx_bytes) \
+    X(net_bounce_tx_bytes, stats.net_bounce_tx_bytes)
+#define NETD_STATS_AFTER(X)                               \
+    X(lkl_block_read_bytes, stats.lkl_block_read_bytes)   \
+    X(lkl_block_write_bytes, stats.lkl_block_write_bytes) \
+    X(lkl_threads, stats.thread_count)                    \
+    X(lkl_thread_stack_bytes, stats.thread_stack_bytes)
+#define NETD_STATS_LINE(name, value) #name " %llu\n"
+#define NETD_STATS_ARG(name, value) , (unsigned long long) (value)
+#define NETD_STATS_ONE(name, value) +1
+#define NETD_STATS_FMT                                               \
+    "server lkl-netd\nnetwork ipv4\nlkl_mem %s\n" NETD_STATS_BEFORE( \
+        NETD_STATS_LINE) "%s" NETD_STATS_AFTER(NETD_STATS_LINE)
 #define NETD_WATCH_MS 20
 #define NETD_WATCH_IDLE_MS 1000
 
@@ -264,6 +295,8 @@ static void slot_store(int *slots, pid_t *owners, int slot, int fd, pid_t owner)
     struct netd_watch *w = watch_for(slots, slot);
 
     pthread_mutex_lock(&netd_watch_lock);
+    while (w->pins) /* a notify is checking the socket this slot holds */
+        pthread_cond_wait(&netd_pin_cond, &netd_watch_lock);
     slots[slot] = fd;
     if (owners)
         owners[slot] = owner;
@@ -803,17 +836,20 @@ static int netd_open(ioserv_context_t *ctp,
                                          "default 10.0.2.2\n");
     } else if (!strcmp(msg->connect.path, "stats")) {
         struct rtmux_lkl_host_stats stats;
-        char ioserv_stats[256];
+        char ioserv_stats[IOSERV_REPLY_COUNTERS_MAX + 1];
 
-        /* The longest this text can be, with every counter at 20 digits: 256
-         * bytes of fixed text, 14 counters, the command line, and the ioserv
-         * block (106 fixed bytes and 6 counters), 769 bytes in all, against the
-         * 1024 of ocb->text.
+        /* The text is the format below with its two %s filled and its counters
+         * at 20 digits (a %llu is 4 characters of the format), so the bound
+         * comes from the format itself.
          */
-        _Static_assert(
-            256 + 14 * 20 + sizeof(RTMUX_LKL_NETD_CMDLINE) - 1 + 106 + 6 * 20 <=
-                sizeof(((struct netd_ocb *) 0)->text),
-            "/net/stats must fit the ocb text buffer");
+        _Static_assert(sizeof(NETD_STATS_FMT) - 1 - 2 * 2 +
+                               sizeof(RTMUX_LKL_NETD_CMDLINE) - 1 +
+                               IOSERV_REPLY_COUNTERS_MAX +
+                               (0 NETD_STATS_BEFORE(NETD_STATS_ONE)
+                                    NETD_STATS_AFTER(NETD_STATS_ONE)) *
+                                   16 <
+                           sizeof(((struct netd_ocb *) 0)->text),
+                       "/net/stats must fit the ocb text buffer");
 
         if ((msg->connect.ioflag & _IO_FLAG_WR) != 0) {
             free(ocb);
@@ -824,21 +860,9 @@ static int netd_open(ioserv_context_t *ctp,
         (void) ioserv_reply_counters_format(ioserv_stats, sizeof(ioserv_stats));
         ocb->kind = NETD_TEXT;
         ocb->len = rtmux_lkl_text_format(
-            ocb->text, sizeof(ocb->text),
-            "server lkl-netd\nnetwork ipv4\nlkl_mem %s\n"
-            "poll_arms %llu\npoll_kicks %llu\n"
-            "page_current %llu\npage_high %llu\npage_total %llu\n"
-            "dma_current %llu\ndma_high %llu\ndma_total %llu\n"
-            "net_bounce_rx_bytes %llu\nnet_bounce_tx_bytes %llu\n%s"
-            "lkl_block_read_bytes %llu\nlkl_block_write_bytes %llu\n"
-            "lkl_threads %llu\nlkl_thread_stack_bytes %llu\n",
-            RTMUX_LKL_NETD_CMDLINE, netd_poll_count(&netd_poll_arms),
-            netd_poll_count(&netd_poll_kicks), stats.page_current,
-            stats.page_high, stats.page_total, stats.dma_current,
-            stats.dma_high, stats.dma_total, stats.net_bounce_rx_bytes,
-            stats.net_bounce_tx_bytes, ioserv_stats, stats.lkl_block_read_bytes,
-            stats.lkl_block_write_bytes, stats.thread_count,
-            stats.thread_stack_bytes);
+            ocb->text, sizeof(ocb->text), NETD_STATS_FMT,
+            RTMUX_LKL_NETD_CMDLINE NETD_STATS_BEFORE(NETD_STATS_ARG),
+            ioserv_stats NETD_STATS_AFTER(NETD_STATS_ARG));
     } else if (!strcmp(msg->connect.path, "dns")) {
         ocb->kind = NETD_DNS;
         ocb->len = rtmux_lkl_text_format(
@@ -1144,8 +1168,9 @@ static int netd_notify(ioserv_context_t *ctp,
      * gives a closed socket's number to the next one, so the number cannot. A
      * slot that changed is checked again; it cannot be answered as ready, as a
      * poll pass would take that for the socket's own readiness. Once the
-     * retries are spent the socket is checked once more under the lock, where
-     * the slot cannot change, so the answer is never a guess.
+     * retries are spent the slot is pinned and the socket is checked once more
+     * with the lock dropped, while a store to the slot waits, so the answer is
+     * never a guess.
      */
     for (unsigned tries = 0;; tries++) {
         pthread_mutex_lock(&netd_watch_lock);
@@ -1155,11 +1180,19 @@ static int netd_notify(ioserv_context_t *ctp,
         fd = ret == EOK ? slots[ocb->slot] : -1;
         gen = w->gen;
         if (ret == EOK && fd >= 0 && tries >= netd_notify_retries) {
-            /* Retries spent: the slot cannot change while the lock is held, so
-             * the socket is checked once more here, a non-blocking poll, and
-             * its answer is true: not-ready is never guessed.
+            /* Retries spent: the slot is pinned, so a store to it waits, and
+             * the socket is checked once more with the lock dropped, which
+             * keeps the watcher and the other slots from waiting on LKL. The
+             * slot cannot change meanwhile, so the answer is true: not-ready is
+             * never guessed.
              */
-            if ((ret = socket_ready(fd, &sat, &hup)) != EOK) {
+            w->pins++;
+            pthread_mutex_unlock(&netd_watch_lock);
+            ret = socket_ready(fd, &sat, &hup);
+            pthread_mutex_lock(&netd_watch_lock);
+            if (--w->pins == 0)
+                pthread_cond_broadcast(&netd_pin_cond);
+            if (ret != EOK) {
                 pthread_mutex_unlock(&netd_watch_lock);
                 return ret;
             }
@@ -1512,16 +1545,49 @@ static int wait_child(pid_t pid)
     return EXIT_FAILURE;
 }
 
+/* A leading --notify-retries=N: how often a notify checks a slot again that
+ * changed under it (see NETD_NOTIFY_RETRIES), 0 to run every arm on the last
+ * attempt (the lkl-netd-poll-spent mode). It is taken off argv, and the
+ * delegating parent passes it on to the child it serves from.
+ *
+ * Returns false for a value that is not a number up to 1000.
+ */
+#define NETD_RETRIES_FLAG "--notify-retries="
+static char netd_retries_flag[sizeof(NETD_RETRIES_FLAG) + 4];
+
+static bool take_retries_flag(int *argc, char ***argv)
+{
+    while (*argc > 1 && !strncmp((*argv)[1], NETD_RETRIES_FLAG,
+                                 sizeof(NETD_RETRIES_FLAG) - 1)) {
+        const char *value = (*argv)[1] + sizeof(NETD_RETRIES_FLAG) - 1;
+        char *end;
+        unsigned long n = strtoul(value, &end, 10);
+
+        if (end == value || *end != '\0' || n > 1000)
+            return false;
+        netd_notify_retries = (unsigned) n;
+        snprintf(netd_retries_flag, sizeof netd_retries_flag, "%s%lu",
+                 NETD_RETRIES_FLAG, n);
+        (*argv)[1] = (*argv)[0];
+        ++*argv;
+        --*argc;
+    }
+    return true;
+}
+
 static int delegate_netd_child(const char *child_arg)
 {
-    char *child_argv[] = {
-        "lkl-netd",
-        "--delegated-virtio",
-        (char *) child_arg,
-        NULL,
-    };
+    char *child_argv[5];
+    int nargs = 0;
     pid_t pid;
     int rc;
+
+    child_argv[nargs++] = "lkl-netd";
+    if (netd_retries_flag[0])
+        child_argv[nargs++] = netd_retries_flag;
+    child_argv[nargs++] = "--delegated-virtio";
+    child_argv[nargs++] = (char *) child_arg;
+    child_argv[nargs] = NULL;
 
     rc = posix_spawn(&pid, "/sbin/lkl-netd", NULL, NULL, child_argv, environ);
     if (rc != EOK) {
@@ -1538,7 +1604,6 @@ static int delegate_netd_child(const char *child_arg)
 
 int main(int argc, char **argv)
 {
-    const char *retries;
     struct lkl_netdev_args args;
     struct lkl_netdev *nd;
     int id;
@@ -1548,6 +1613,11 @@ int main(int argc, char **argv)
     bool serve_files = false;
     bool delegated_child = false;
     int argi = 1;
+
+    if (!take_retries_flag(&argc, &argv)) {
+        fprintf(stderr, "lkl-netd: " NETD_RETRIES_FLAG "N takes 0 to 1000\n");
+        return EXIT_FAILURE;
+    }
 
     /* Public entry points: each re-execs a --delegated-virtio child that owns
      * the MMIO handoff, then serves. --serve-net{,-crash-on-ping} take the
@@ -1565,14 +1635,6 @@ int main(int argc, char **argv)
     if (argc == 2 && !strcmp(argv[1], "--delegate-boot-only"))
         return delegate_netd_child("--boot-only");
 
-    if ((retries = getenv("LKL_NETD_NOTIFY_RETRIES")) != NULL) {
-        char *end;
-        unsigned long n = strtoul(retries, &end, 10);
-
-        if (end != retries && *end == '\0' && n <= 1000)
-            netd_notify_retries = (unsigned) n; /* anything else: the default */
-    }
-
     if (argc > 1 && !strcmp(argv[1], "--delegated-virtio")) {
         delegated_child = true;
         argi = 2;
@@ -1589,11 +1651,11 @@ int main(int argc, char **argv)
     else if (argc == argi + 1 && !strcmp(argv[argi], "--boot-only"))
         boot_only = true;
     else if (argc > argi) {
-        fprintf(stderr,
-                "usage: lkl-netd "
-                "[--serve-net|--serve-net-crash-on-ping|--boot-only|"
-                "--crash-after-start|--delegate-crash-after-start|"
-                "--delegate-boot-only]\n");
+        fprintf(stderr, "usage: lkl-netd [" NETD_RETRIES_FLAG
+                        "N] "
+                        "[--serve-net|--serve-net-crash-on-ping|--boot-only|"
+                        "--crash-after-start|--delegate-crash-after-start|"
+                        "--delegate-boot-only]\n");
         return EXIT_FAILURE;
     }
     if (delegated_child)

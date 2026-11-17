@@ -701,8 +701,7 @@ int xfermsg_bounded(thread_t *dthp, thread_t *sthp, size_t doff, size_t soff)
     if (status != XFER_RESTART) {
         thread_t *act = get_active_thread(get_cpunum());
 
-        if (act->xcur.armed)
-            act->xcur.armed = false;
+        act->xcur.armed = false;
     }
     return status;
 }

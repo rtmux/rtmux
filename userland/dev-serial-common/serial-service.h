@@ -29,6 +29,7 @@
 #include <sys/types.h>
 #include <sys/iomsg.h>
 #include <sys/ioserv.h>
+#include <sys/ioserv-tty.h>
 #include <sys/dispatch.h>
 #include <sys/rtmux-core.h>
 #include <sys/procmsg.h>
@@ -381,6 +382,10 @@ static int ser_read(ioserv_context_t *ctp, io_read_t *msg, void *ocb)
         return EOK;
     }
 
+    if (ioserv_tty_hung_up(&ser_termios)) { /* end of file */
+        _IO_SET_READ_NBYTES(ctp, 0);
+        return EOK;
+    }
     if ((c = ser_jobctl_gate(ctp->info.pid, 0)) != 0)
         return c;
 
@@ -429,6 +434,8 @@ static int ser_write(ioserv_context_t *ctp, io_write_t *msg, void *ocb)
         return ENOSYS;
     }
 
+    if ((err = ioserv_tty_write_err(&ser_termios)) != 0)
+        return err;
     if ((err = ser_jobctl_gate(ctp->info.pid, 1)) != 0)
         return err;
 
@@ -526,14 +533,15 @@ static int ser_devctl(ioserv_context_t *ctp, io_devctl_t *msg, void *ocb)
             (size_t) ctp->size < sizeof(*msg) + sizeof(struct termios))
             return EINVAL;
         memcpy(&ser_termios, data, sizeof(struct termios));
+        ioserv_tty_hangup_wake(ser_notify_lists, &ser_termios);
 
-        /* A zero output speed hangs the line up (tcsetattr, POSIX 11.2.5):
-         * every poller wakes to see POLLHUP, a hangup-only one included, and
-         * the line reports it until a speed is set again.
-         */
-        for (int i = 0; ser_termios.c_ospeed == B0 && i < IOSERV_NOTIFY_COUNT;
-             i++)
-            ioserv_notify_trigger(ser_notify_lists, INT_MAX, i);
+        /* A reader parked on a line that is now hung up gets end of file. */
+        if (ioserv_tty_hung_up(&ser_termios) && ser_pending_live()) {
+            int rcvid = pending_rcvid;
+
+            ser_cancel_pending(0);
+            (void) msg_reply(rcvid, 0, NULL, 0);
+        }
         break;
     case DEVCTL_TTY_GET_PGRP:
         *(pid_t *) data = ser_pgrp;
@@ -635,8 +643,8 @@ static unsigned ser_ready(unsigned want)
 {
     unsigned sat = _NOTIFY_COND_OUTPUT;
 
-    if (ser_termios.c_ospeed == B0)
-        return 0; /* hung up: POLLHUP, never writable (POSIX 2.10.6) */
+    if (ioserv_tty_hung_up(&ser_termios))
+        return 0; /* POLLHUP, never writable (POSIX 2.10.6) */
     if ((want & _NOTIFY_COND_INPUT) && cooked_rxbuf_peek() >= 0)
         sat |= _NOTIFY_COND_INPUT;
     return sat & want;
@@ -664,7 +672,7 @@ static int ser_notify(ioserv_context_t *ctp, io_notify_t *msg, void *ocb)
     (void) ocb;
     return ioserv_notify(ctp, msg, ser_notify_lists,
                          ser_ready(msg->i.flags & (unsigned) SER_NOTIFY_CONDS),
-                         ser_termios.c_ospeed == B0 ? POLLHUP : 0, NULL);
+                         ioserv_tty_hup(&ser_termios), NULL);
 }
 
 static int rx_notification_handler(message_context_t *ctp,

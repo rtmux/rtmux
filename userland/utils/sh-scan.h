@@ -55,4 +55,10 @@ void sh_unit_next(struct sh_scan *sc, struct sh_unit *u);
  */
 const char *sh_scan_find(const char *s, const char *set);
 
+/* The end of the case command that opens at p, which points at its `case`: just
+ * past its esac, however many case commands are nested in its arms, or NULL
+ * when it is not closed.
+ */
+const char *sh_scan_case_end(const char *p);
+
 #endif /* SH_SCAN_H */

@@ -2194,6 +2194,141 @@ out:
     (void) dispatch_destroy(dpp);
 }
 
+/* A service in this process that answers _IO_NOTIFY with the real
+ * ioserv_notify, to check what it arms: a hangup already known is the reply, so
+ * nothing is armed for it, whether the request is a condition arm or a
+ * transition arm; with no hangup the same requests are armed.
+ */
+#define HUP_ARM_PATH "/hup-arm-test"
+
+static ioserv_notify_t hup_arm_lists[IOSERV_NOTIFY_COUNT];
+static atomic_uint hup_arm_hup;   /* the hangup codes the service reports */
+static atomic_int hup_arm_armed;  /* lists armed after the last request */
+static int hup_arm_ocb;
+
+static int hup_arm_open(ioserv_context_t *ctp,
+                        io_open_t *msg,
+                        void *handle,
+                        void *extra)
+{
+    (void) msg;
+    (void) handle;
+    (void) extra;
+    return ioserv_open_bind(ctp, &hup_arm_ocb, NULL) == -1 ? errno : EOK;
+}
+
+static int hup_arm_notify(ioserv_context_t *ctp, io_notify_t *msg, void *ocb)
+{
+    int ret, armed = 0;
+
+    (void) ocb;
+    ret = ioserv_notify(ctp, msg, hup_arm_lists, 0, atomic_load(&hup_arm_hup),
+                        NULL);
+    for (int i = 0; i < IOSERV_NOTIFY_COUNT; i++)
+        armed += ioserv_notify_armed(hup_arm_lists, i, INT_MAX) != 0;
+    atomic_store(&hup_arm_armed, armed);
+    return ret;
+}
+
+static const ioserv_connect_ops_t hup_arm_connect_ops = {
+    .nfuncs = IOSERV_CONNECT_NFUNCS,
+    .open = hup_arm_open,
+};
+
+static const ioserv_ops_t hup_arm_io_ops = {
+    .nfuncs = IOSERV_IO_NFUNCS,
+    .notify = hup_arm_notify,
+};
+
+/* Send fd an _IO_NOTIFY of the given action that asks for input and carries a
+ * pulse event. Returns 0 or the errno of the send.
+ */
+static int hup_arm_send(int fd, int action, unsigned *hup)
+{
+    io_notify_t msg = {0};
+
+    msg.i.type = _IO_NOTIFY;
+    msg.i.combine_len = sizeof msg.i;
+    msg.i.action = (uint16_t) action;
+    msg.i.flags = (unsigned) _NOTIFY_COND_INPUT;
+    SIGEV_NOTIFICATION_INIT(&msg.i.event, fd, -1, 0, 0);
+    if (msg_sendnc(fd, &msg.i, sizeof msg.i, &msg.o, sizeof msg.o) == -1)
+        return errno;
+    *hup = msg.o.flags_exten;
+    return 0;
+}
+
+static void test_notify_hangup_arm(void)
+{
+    static const struct {
+        int action;
+        const char *name;
+    } kinds[] = {
+        {_NOTIFY_ACTION_CONDARM, "condition arm"},
+        {_NOTIFY_ACTION_TRANARM, "transition arm"},
+    };
+    dispatch_t *dpp;
+    pthread_t server;
+    char what[96];
+    int id, fd;
+
+    if (!(dpp = dispatch_create())) {
+        test_fail("hangup arm service dispatch", strerror(errno));
+        return;
+    }
+    id = ioserv_attach(dpp, NULL, HUP_ARM_PATH, _FTYPE_ANY,
+                       IOSERV_FLAG_DIR | IOSERV_FLAG_SELF,
+                       &hup_arm_connect_ops, &hup_arm_io_ops, NULL);
+    if (id == -1) {
+        test_skip("hangup arm service", "cannot attach a test path");
+        (void) dispatch_destroy(dpp);
+        return;
+    }
+    if (pthread_create(&server, NULL, poll_fault_server, dpp) != 0) {
+        test_fail("hangup arm service thread", "pthread_create failed");
+        (void) ioserv_detach(dpp, id, 0);
+        (void) dispatch_destroy(dpp);
+        return;
+    }
+    fd = open(HUP_ARM_PATH "/node", O_RDONLY);
+    if (fd < 0) {
+        test_fail("hangup arm service open", strerror(errno));
+        goto out;
+    }
+    /* Both kinds, with a hangup and without. Only one transition arm may be
+     * held on the input, and a condition arm leaves a node there, so the
+     * transition arm comes first when something is armed.
+     */
+    for (int hung = 1; hung >= 0; hung--) {
+        for (size_t n = 0; n < sizeof kinds / sizeof *kinds; n++) {
+            size_t k = hung ? n : sizeof kinds / sizeof *kinds - 1 - n;
+            unsigned hup = 0;
+            int err, armed;
+
+            atomic_store(&hup_arm_hup, hung ? (unsigned) POLLHUP : 0u);
+            atomic_store(&hup_arm_armed, -1);
+            err = hup_arm_send(fd, kinds[k].action, &hup);
+            armed = atomic_load(&hup_arm_armed);
+            snprintf(what, sizeof what, "hangup %s %s",
+                     hung ? "known: no arm for a" : "unknown: an arm for a",
+                     kinds[k].name);
+            if (hung)
+                check((err == 0 && (hup & POLLHUP) && armed == 0), what,
+                      "a hangup already known must be the reply, with nothing "
+                      "armed");
+            else
+                check((err == EAGAIN || err == 0) && armed == 1, what,
+                      "without a hangup the request must be armed");
+        }
+    }
+    (void) close(fd);
+out:
+    (void) ioserv_detach(dpp, id, 0);
+    (void) pthread_cancel(server);
+    (void) pthread_join(server, NULL);
+    (void) dispatch_destroy(dpp);
+}
+
 /* Make a pipe read end readable ~50 ms from now, while a blocked poll waits. */
 static void *poll_wake_writer(void *raw)
 {
@@ -2591,7 +2726,7 @@ static void *tty_hangup_setter(void *arg)
  * line, ends at once when the line is hung up (B0) and keeps reporting it until
  * a speed is set again.
  */
-static void tty_hangup_check(const char *name, int fd)
+static void tty_hangup_check(const char *name, const char *path, int fd)
 {
     char what[96];
     struct termios saved;
@@ -2599,7 +2734,10 @@ static void tty_hangup_check(const char *name, int fd)
     struct timespec t0, t1;
     pthread_t th;
     long ms;
+    char ch;
     int rc;
+    bool hup_ok, out_ok, write_ok, read_ok;
+    int nfd;
 
     if (tcgetattr(fd, &saved) != 0) {
         test_fail(name, "hangup tcgetattr failed");
@@ -2615,23 +2753,42 @@ static void tty_hangup_check(const char *name, int fd)
         test_fail(name, "hangup thread failed");
         return;
     }
+    nfd = open(path, O_RDWR | O_NONBLOCK);
     clock_gettime(CLOCK_MONOTONIC, &t0);
     rc = poll(&pfd, 1, 10000);
     clock_gettime(CLOCK_MONOTONIC, &t1);
     (void) pthread_join(th, NULL);
     ms = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
-    snprintf(what, sizeof what, "%s hangup-only poll returns at once on hangup", name);
-    check(rc == 1 && (pfd.revents & POLLHUP) && ms < 5000, what,
-          "a hangup-only poll must return POLLHUP when the line is hung up");
+    hup_ok = rc == 1 && (pfd.revents & POLLHUP) && ms < 5000;
+
+    /* The terminal may be where the results are printed, and a hung-up line
+     * refuses writes: everything is measured first and reported after the
+     * speed is set again.
+     */
     pfd = (struct pollfd){.fd = fd, .events = POLLOUT};
-    snprintf(what, sizeof what, "%s hung-up line reports POLLHUP, not POLLOUT", name);
-    check(poll(&pfd, 1, 0) == 1 && (pfd.revents & POLLHUP) &&
-              !(pfd.revents & POLLOUT),
-          what, "a hung-up line must report POLLHUP at once and not be writable");
-    pfd.events = 0;
+    out_ok = poll(&pfd, 1, 0) == 1 && (pfd.revents & POLLHUP) &&
+             !(pfd.revents & POLLOUT);
+    errno = 0;
+    write_ok = write(fd, "x", 1) == -1 && errno == EIO;
+    /* A descriptor opened non blocking, so that a line that wrongly waits
+     * fails this check rather than hanging the test.
+     */
+    read_ok = nfd >= 0 && read(nfd, &ch, 1) == 0;
 
     (void) tcsetattr(fd, TCSANOW, &saved);
-    pfd.revents = 0;
+    if (nfd >= 0)
+        (void) close(nfd);
+    snprintf(what, sizeof what, "%s hangup-only poll returns at once on hangup", name);
+    check(hup_ok, what,
+          "a hangup-only poll must return POLLHUP when the line is hung up");
+    snprintf(what, sizeof what, "%s hung-up line reports POLLHUP, not POLLOUT", name);
+    check(out_ok, what,
+          "a hung-up line must report POLLHUP at once and not be writable");
+    snprintf(what, sizeof what, "%s write on a hung-up line fails with EIO", name);
+    check(write_ok, what, "a write to a hung-up line must fail with EIO");
+    snprintf(what, sizeof what, "%s read on a hung-up line is at end of file", name);
+    check(read_ok, what, "a read from a hung-up line must return end of file");
+    pfd = (struct pollfd){.fd = fd, .events = 0};
     snprintf(what, sizeof what, "%s hangup ends when a speed is set", name);
     check(poll(&pfd, 1, 50) == 0, what,
           "setting a speed again must end the hangup");
@@ -2675,7 +2832,7 @@ void test_serial_poll(void)
     pfd = (struct pollfd){.fd = fd, .events = POLLOUT};
     check(poll(&pfd, 1, 0) == 1 && (pfd.revents & POLLOUT),
           "serial_poll writable", "a terminal must poll POLLOUT");
-    tty_hangup_check("serial_poll", fd);
+    tty_hangup_check("serial_poll", SERIAL_POLL_DEV, fd);
 
     /* Close while polled: the armed notification goes with the open, and the
      * poller ends at its timeout instead of hanging or waking spuriously.
@@ -2781,6 +2938,54 @@ out:
  * out, output always ready, a poller and a select waking on a typed character,
  * and a typed character being reported at once until it is read.
  */
+/* A reader that waits on the console when the line is hung up and the speed is
+ * set again at once, before the reader looks again, still gets end of file:
+ * the hangup is not lost because it was over by the time the reader woke.
+ */
+struct hangup_reader {
+    int fd;
+    atomic_int done;
+    ssize_t rc;
+};
+
+static void *hangup_reader_main(void *raw)
+{
+    struct hangup_reader *r = raw;
+    char ch;
+
+    r->rc = read(r->fd, &ch, 1);
+    atomic_store(&r->done, 1);
+    return NULL;
+}
+
+static void console_hangup_wakes_reader(int fd)
+{
+    struct hangup_reader r = {.fd = fd};
+    struct termios saved, hung;
+    pthread_t th;
+    bool woke;
+
+    if (tcgetattr(fd, &saved) != 0 ||
+        pthread_create(&th, NULL, hangup_reader_main, &r) != 0) {
+        test_fail("console_poll hangup wakes a reader", "setup failed");
+        return;
+    }
+    sleep_ms(150); /* the reader is waiting */
+    hung = saved;
+    cfsetospeed(&hung, B0);
+    (void) tcsetattr(fd, TCSANOW, &hung);
+    (void) tcsetattr(fd, TCSANOW, &saved);
+    for (int i = 0; i < 200 && !atomic_load(&r.done); i++)
+        sleep_ms(10);
+    woke = atomic_load(&r.done) && r.rc == 0;
+    if (!atomic_load(&r.done))
+        console_inject('g'); /* let the reader go */
+    (void) pthread_join(th, NULL);
+    check(woke, "console_poll hangup wakes a reader",
+          "a reader that waits must get end of file when the line is hung up, "
+          "also when the speed is set again before it looks");
+}
+
 void test_console_poll(void)
 {
     struct serial_poller a = {0}, b = {0};
@@ -2804,7 +3009,9 @@ void test_console_poll(void)
     pfd = (struct pollfd){.fd = fd, .events = POLLOUT};
     check(poll(&pfd, 1, 0) == 1 && pfd.revents == POLLOUT,
           "console_poll writable", "the console must poll POLLOUT only");
-    tty_hangup_check("console_poll", fd);
+    tty_hangup_check("console_poll", "/dev/text", fd);
+    test_notify_hangup_arm();
+    console_hangup_wakes_reader(fd);
 
     a.fd = b.fd = fd;
     a.timeout_ms = b.timeout_ms = 20000;

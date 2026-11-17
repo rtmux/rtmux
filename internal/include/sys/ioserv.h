@@ -87,6 +87,29 @@ void ioserv_reply_counters_record(int error, uint64_t queue_depth);
 void ioserv_reply_counters_snapshot(ioserv_reply_counters_t *out);
 int ioserv_reply_counters_format(char *buf, size_t size);
 
+/* The counters ioserv_reply_counters_format prints, one line each: the name
+ * shown and the field of ioserv_reply_counters_t. The text, the arguments that
+ * print it and its longest size all come from this list.
+ */
+#define IOSERV_REPLY_COUNTERS(X) \
+    X(ioserv_sends, sends)       \
+    X(ioserv_receives, receives) \
+    X(ioserv_denied_sends, denied_sends) \
+    X(ioserv_timeouts, timeouts) \
+    X(ioserv_queue_full, queue_full) \
+    X(ioserv_max_depth, max_depth)
+#define IOSERV_COUNTER_LINE(name, field) #name " %llu\n"
+#define IOSERV_COUNTER_ONE(name, field) +1
+#define IOSERV_COUNTER_ARG(name, field) , (unsigned long long) c.field
+#define IOSERV_REPLY_COUNTERS_FMT IOSERV_REPLY_COUNTERS(IOSERV_COUNTER_LINE)
+
+/* The most characters the text takes, with every counter at 20 digits (a %llu
+ * is 4 characters of the format), and not counting the NUL.
+ */
+#define IOSERV_REPLY_COUNTERS_MAX                  \
+    (sizeof(IOSERV_REPLY_COUNTERS_FMT) - 1 +       \
+     (0 IOSERV_REPLY_COUNTERS(IOSERV_COUNTER_ONE)) * 16)
+
 /* Readiness notification lists for an _IO_NOTIFY handler (poll and select).
  * A service keeps an array of IOSERV_NOTIFY_COUNT lists per object, one per
  * condition, and serializes every call on it with its own lock. Each list holds

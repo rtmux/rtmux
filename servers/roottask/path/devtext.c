@@ -11,6 +11,7 @@
 #include <stdalign.h>
 #include <sys/poll.h>
 #include <termios.h>
+#include <sys/ioserv-tty.h>
 #include <devctl/common.h>
 #include <devctl/tty.h>
 #include <sys/procmsg.h>
@@ -64,9 +65,29 @@ static struct termios text_termios;
 static pid_t text_pgrp;
 static pid_t text_sid; /* leader of the session this is the terminal of, or 0 */
 
+/* A copy of the terminal state, taken under text_mutex: tcsetattr writes the
+ * termios on any thread, so a read of it is made under the same lock. *hangups,
+ * when not NULL, gets the number of times the line was hung up: a reader that
+ * waits sees one that came and went while it slept.
+ */
+static unsigned text_hangups;
+
+static struct termios text_attr(unsigned *hangups)
+{
+    struct termios t;
+
+    text_lock(&text_mutex);
+    t = text_termios;
+    if (hangups)
+        *hangups = text_hangups;
+    pthread_mutex_unlock(&text_mutex);
+    return t;
+}
+
 /* Job control gate for a read (is_write = 0) or a write (is_write = 1) by the
  * caller. Only the caller's controlling terminal is policed, and only for a
- * background process; a write is policed only under TOSTOP.
+ * background process; a write is policed only under TOSTOP, which lflag (the
+ * c_lflag the caller read under the lock) says.
  *
  * A background read gets EIO when its group is orphaned or it blocks/ignores
  * SIGTTIN; otherwise the group is sent SIGTTIN and the read fails with EINTR. A
@@ -75,12 +96,12 @@ static pid_t text_sid; /* leader of the session this is the terminal of, or 0 */
  *
  * Returns EOK to proceed, else the errno to reply.
  */
-static int text_jobctl_gate(ioserv_context_t *ctp, int is_write)
+static int text_jobctl_gate(ioserv_context_t *ctp, int is_write, tcflag_t lflag)
 {
     struct _proc_jobctl_reply q;
     unsigned hold = is_write ? _JOBCTL_HOLD_TTOU : _JOBCTL_HOLD_TTIN;
 
-    if (is_write && !(text_termios.c_lflag & TOSTOP))
+    if (is_write && !(lflag & TOSTOP))
         return EOK;
     if (proc_jobctl_query(ROOTTASK_PID, ctp->info.pid, &q) != EOK ||
         !(q.flags & _JOBCTL_CTTY) || (q.flags & _JOBCTL_FG))
@@ -247,6 +268,8 @@ static void *text_watcher(void *arg)
 static int text_read(ioserv_context_t *ctp, io_read_t *msg, void *ocb)
 {
     unsigned ioflag = (unsigned) (uintptr_t) ocb;
+    struct termios t;
+    unsigned hangups, seen;
     int c;
 
     if (!(ioflag & _IO_FLAG_RD)) {
@@ -277,14 +300,23 @@ static int text_read(ioserv_context_t *ctp, io_read_t *msg, void *ocb)
         return EOK;
     }
 
-    if ((c = text_jobctl_gate(ctp, 0)) != EOK) {
+    if ((c = text_jobctl_gate(ctp, 0, 0)) != EOK) {
         return c;
     }
 
+    (void) text_attr(&hangups);
     for (;;) {
         struct _msg_info info;
         uint64_t to;
 
+        /* A line that is hung up, or was since the read began, is at end of
+         * file, for a reader that waits too.
+         */
+        t = text_attr(&seen);
+        if (ioserv_tty_hung_up(&t) || seen != hangups) {
+            _IO_SET_READ_NBYTES(ctp, 0);
+            return EOK;
+        }
         c = text_next(0);
         if (c >= 0) {
             break;
@@ -307,11 +339,12 @@ static int text_read(ioserv_context_t *ctp, io_read_t *msg, void *ocb)
     }
 
     /* ICRNL: convert CR to NL (standard termios input processing) */
-    if ((text_termios.c_iflag & ICRNL) && c == '\r')
+    t = text_attr(NULL);
+    if ((t.c_iflag & ICRNL) && c == '\r')
         c = '\n';
 
     /* ECHO: terminal driver responsibility per POSIX */
-    if (text_termios.c_lflag & ECHO) {
+    if (t.c_lflag & ECHO) {
         char ch = (char) c;
 
         if (ch == '\r' || ch == '\n')
@@ -336,6 +369,7 @@ static int text_read(ioserv_context_t *ctp, io_read_t *msg, void *ocb)
 static int text_write(ioserv_context_t *ctp, io_write_t *msg, void *ocb)
 {
     unsigned ioflag = (unsigned) (uintptr_t) ocb;
+    struct termios t;
     int err;
 
     if (!(ioflag & _IO_FLAG_WR)) {
@@ -350,7 +384,10 @@ static int text_write(ioserv_context_t *ctp, io_write_t *msg, void *ocb)
         return ENOSYS;
     }
 
-    if ((err = text_jobctl_gate(ctp, 1)) != EOK) {
+    t = text_attr(NULL);
+    if ((err = ioserv_tty_write_err(&t)) != 0)
+        return err;
+    if ((err = text_jobctl_gate(ctp, 1, t.c_lflag)) != EOK) {
         return err;
     }
 
@@ -443,14 +480,9 @@ static int text_devctl(ioserv_context_t *ctp, io_devctl_t *msg, void *ocb)
             return EINVAL;
         text_lock(&text_mutex);
         memcpy(&text_termios, data, sizeof(struct termios));
-
-        /* A zero output speed hangs the line up: every poller wakes to see
-         * POLLHUP, a hangup-only one included, and the console reports it until
-         * a speed is set again.
-         */
-        for (int i = 0; text_termios.c_ospeed == B0 && i < IOSERV_NOTIFY_COUNT;
-             i++)
-            ioserv_notify_trigger(text_notify_lists, INT_MAX, i);
+        ioserv_tty_hangup_wake(text_notify_lists, &text_termios);
+        if (ioserv_tty_hung_up(&text_termios))
+            text_hangups++;
         pthread_mutex_unlock(&text_mutex);
         break;
 
@@ -528,13 +560,13 @@ static int text_devctl(ioserv_context_t *ctp, io_devctl_t *msg, void *ocb)
             return EINVAL;
         switch (data->flow) {
         case TCIOFF: {
-            char ch = (char) text_termios.c_cc[VSTOP];
+            char ch = (char) text_attr(NULL).c_cc[VSTOP];
 
             text_console_write(&ch, 1);
             break;
         }
         case TCION: {
-            char ch = (char) text_termios.c_cc[VSTART];
+            char ch = (char) text_attr(NULL).c_cc[VSTART];
 
             text_console_write(&ch, 1);
             break;
@@ -578,12 +610,12 @@ static int text_notify(ioserv_context_t *ctp, io_notify_t *msg, void *ocb)
         text_ahead_head == text_ahead_tail)
         (void) text_next(1);
     text_lock(&text_mutex);
-    if (text_termios.c_ospeed == B0) /* hung up: POLLHUP, never writable */
+    if (ioserv_tty_hung_up(&text_termios)) /* POLLHUP, never writable */
         trig = 0;
     else if (text_ahead_head != text_ahead_tail)
         trig |= _NOTIFY_COND_INPUT;
     ret = ioserv_notify(ctp, msg, text_notify_lists, trig,
-                        text_termios.c_ospeed == B0 ? POLLHUP : 0, NULL);
+                        ioserv_tty_hup(&text_termios), NULL);
     if (ret == EAGAIN)
         pthread_cond_signal(&text_watch_cond);
     pthread_mutex_unlock(&text_mutex);

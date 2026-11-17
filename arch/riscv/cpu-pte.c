@@ -141,7 +141,10 @@ static pte_t sv39_new_table(void)
  * Handles PTE_OP_MAP, PTE_OP_UNMAP, PTE_OP_PROT and PTE_OP_PREALLOC operations.
  * For MAP: creates PTEs mapping [start, end) to paddr with given prot. For
  * UNMAP: clears PTEs in [start, end). For PROT: changes protection bits on
- * existing PTEs. See sv39_manip_pages for the errors each can return.
+ * existing PTEs. end is the last byte of the range (as pte_map passes it) or
+ * one past it (as the kernel's own callers pass it): every page that starts
+ * below end is processed, so a page-aligned end names no page. See
+ * sv39_manip_pages for the errors each can return.
  *
  * Intermediate page table pages are allocated via pa_alloc() and accessed
  * through PA_TO_VA() — never assumes PA == VA.

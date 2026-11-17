@@ -140,15 +140,7 @@ int ioserv_reply_counters_format(char *buf, size_t size)
     ioserv_reply_counters_snapshot(&c);
     n = snprintf(
         buf, size,
-        "ioserv_sends %llu\n"
-        "ioserv_receives %llu\n"
-        "ioserv_denied_sends %llu\n"
-        "ioserv_timeouts %llu\n"
-        "ioserv_queue_full %llu\n"
-        "ioserv_max_depth %llu\n",
-        (unsigned long long) c.sends, (unsigned long long) c.receives,
-        (unsigned long long) c.denied_sends, (unsigned long long) c.timeouts,
-        (unsigned long long) c.queue_full, (unsigned long long) c.max_depth);
+        IOSERV_REPLY_COUNTERS_FMT IOSERV_REPLY_COUNTERS(IOSERV_COUNTER_ARG));
     if (n < 0 || (size_t) n >= size)
         return ENOSPC;
     return EOK;

@@ -512,13 +512,7 @@ static void mon_dump_ghost_running(void)
             /* Which hart (if any) actually has this thp as pc_curthread? -1 if
              * none — that's a real ghost.
              */
-            int owner = -1;
-            for (unsigned cpu = 0; cpu < num_processors; cpu++) {
-                if (cpu_online(cpu) && pcpu_array[cpu].pc_curthread == thp) {
-                    owner = (int) cpu;
-                    break;
-                }
-            }
+            int owner = thread_active_hart(thp);
 
             if (!header_printed) {
                 mon_puts("\n  -- RUNNING threads --");

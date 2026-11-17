@@ -158,7 +158,8 @@ enum sv39_manip_op {
     SV39_MANIP_PREALLOC, /* only make the tables a MAP would need */
 };
 
-/* sv39_manip_pages — apply op to the 4 KiB pages of [*startp, end) in pgdir.
+/* sv39_manip_pages — apply op to the 4 KiB pages in pgdir that start between
+ * *startp and end, end excluded when it is page aligned.
  *
  * The one loop behind cpu_pte_manipulate, header-only so the host test runs the
  * kernel's own error mapping. MAP and PREALLOC create tables through alloc and

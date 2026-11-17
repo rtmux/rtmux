@@ -55,6 +55,8 @@ int(pthread_mutex_trylock)(pthread_mutex_t *mutex)
     /* Is it recursive and locked by me? */
     if ((mutex->count & RTMUX_SYNC_NONRECURSIVE) == 0) {
         if ((owner & ~RTMUX_SYNC_WAITING) == id) {
+            if ((mutex->count & RTMUX_SYNC_COUNTMASK) == RTMUX_SYNC_COUNTMASK)
+                return EAGAIN; /* Unix 98 recursive-count saturation */
             ++mutex->count;
             __ulock_debug_acquire(mutex, __pc);
             return EOK;

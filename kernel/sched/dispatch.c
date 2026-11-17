@@ -236,7 +236,7 @@ static int rdecl select_cpu(thread_t *thp)
             }
             if (!smp_dispatch_enabled && i != get_cpunum())
                 continue;
-            if (!(legal & (1ULL << i)))
+            if (!cpu_in_mask(legal, i))
                 continue; /* offline: its hart never started */
             if ((thp->runmask & (1u << i)) == 0) {
                 act = get_active_thread(i);

@@ -223,6 +223,20 @@ static void test_pthread_mutex_types(void)
                   pthread_mutex_unlock(&m) == EOK,
               "RECURSIVE mutex allows owner re-lock",
               "a recursive mutex must let the owner re-lock and count down");
+        /* The depth saturates: lock and trylock both report EAGAIN at the
+         * limit rather than carry into the flag bits.
+         */
+        if (pthread_mutex_lock(&m) == EOK) {
+            unsigned long saved = m.count;
+
+            m.count |= RTMUX_SYNC_COUNTMASK;
+            check(pthread_mutex_lock(&m) == EAGAIN &&
+                      pthread_mutex_trylock(&m) == EAGAIN,
+                  "RECURSIVE mutex depth saturates with EAGAIN",
+                  "lock and trylock must fail EAGAIN at the depth limit");
+            m.count = saved;
+            (void) pthread_mutex_unlock(&m);
+        }
         (void) pthread_mutex_destroy(&m);
     }
     (void) pthread_mutexattr_destroy(&attr);

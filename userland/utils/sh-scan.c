@@ -30,6 +30,7 @@ struct group {
     int subject;  /* after `case`: 1 for its word, 2 when `in` is next */
     int ncase;    /* case commands open */
     unsigned pat; /* bit per case, the innermost lowest: a pattern is next */
+    bool done;    /* the esac of the outermost case was read */
 };
 
 static bool word_is(const struct group *g, const char *kw)
@@ -59,6 +60,7 @@ static void group_word(struct group *g)
         g->ncase--;
         g->pat >>= 1;
         g->cmd = true;
+        g->done = g->ncase == 0;
     } else if (at_cmd && word_is(g, "case")) {
         g->subject = 1;
     } else if (at_cmd) {
@@ -68,6 +70,72 @@ static void group_word(struct group *g)
     }
     g->wlen = 0;
     g->plain = true;
+}
+
+/* Feed the unquoted character at, which is not part of a longer unit, to the
+ * state of a group of command text. depth counts the parentheses open, and
+ * sc->p may move on past what the character makes part of it.
+ *
+ * Returns true when the character is the ) that balances the last one.
+ */
+static bool group_char(struct group *g,
+                       struct sh_scan *sc,
+                       const char *at,
+                       int *depth)
+{
+    bool pat;
+
+    switch (*at) {
+    case ' ':
+    case '\t':
+    case '\n':
+        group_word(g);
+        g->cmd = g->cmd || *at == '\n';
+        break;
+    case '#':
+        if (g->wlen != 0)
+            goto word;
+        sc->p = strchr(at, '\n');
+        if (!sc->p)
+            sc->p = at + strlen(at);
+        break;
+    case ';':
+        group_word(g);
+        g->cmd = true;
+        if (at[1] == ';' && g->ncase > 0) {
+            g->pat |= 1;
+            sc->p = at + 2;
+        }
+        break;
+    case '&':
+    case '|':
+        group_word(g);
+        g->cmd = true;
+        break;
+    case '(':
+        group_word(g);
+        pat = g->ncase > 0 && (g->pat & 1);
+        if (!pat)
+            ++*depth;
+        g->cmd = true;
+        break;
+    case ')':
+        group_word(g);
+        pat = g->ncase > 0 && (g->pat & 1);
+        g->cmd = true;
+        if (pat)
+            g->pat &= ~1u;
+        else if (--*depth == 0)
+            return true;
+        break;
+    default:
+    word:
+        if (g->wlen < sizeof g->word)
+            g->word[g->wlen] = *at;
+        g->wlen++;
+        break;
+    }
+    return false;
 }
 
 /* The end of the text after an opening delimiter, scanned as unquoted command
@@ -86,7 +154,6 @@ static const char *scan_group(const char *p, char close, int nest, bool *closed)
         return p + strlen(p);
     for (;;) {
         const char *at = sc.p;
-        bool pat;
 
         unit_next(&sc, &u, nest + 1);
         if (u.kind == SH_U_END)
@@ -103,57 +170,9 @@ static const char *scan_group(const char *p, char close, int nest, bool *closed)
             }
             continue;
         }
-        switch (*at) {
-        case ' ':
-        case '\t':
-        case '\n':
-            group_word(&g);
-            g.cmd = g.cmd || *at == '\n';
-            break;
-        case '#':
-            if (g.wlen != 0)
-                goto word;
-            sc.p = strchr(at, '\n');
-            if (!sc.p)
-                sc.p = at + strlen(at);
-            break;
-        case ';':
-            group_word(&g);
-            g.cmd = true;
-            if (at[1] == ';' && g.ncase > 0) {
-                g.pat |= 1;
-                sc.p = at + 2;
-            }
-            break;
-        case '&':
-        case '|':
-            group_word(&g);
-            g.cmd = true;
-            break;
-        case '(':
-            group_word(&g);
-            pat = g.ncase > 0 && (g.pat & 1);
-            if (!pat)
-                depth++;
-            g.cmd = true;
-            break;
-        case ')':
-            group_word(&g);
-            pat = g.ncase > 0 && (g.pat & 1);
-            g.cmd = true;
-            if (pat) {
-                g.pat &= ~1u;
-            } else if (--depth == 0) {
-                *closed = true;
-                return at;
-            }
-            break;
-        default:
-        word:
-            if (g.wlen < sizeof g.word)
-                g.word[g.wlen] = *at;
-            g.wlen++;
-            break;
+        if (group_char(&g, &sc, at, &depth)) {
+            *closed = true;
+            return at;
         }
     }
 }
@@ -256,6 +275,37 @@ const char *sh_scan_find(const char *s, const char *set)
         if (u.kind == SH_U_END)
             return NULL;
         if (u.kind == SH_U_LIT && sc.quote == 0 && strchr(set, *at))
+            return at;
+    }
+}
+
+const char *sh_scan_case_end(const char *p)
+{
+    struct sh_scan sc = {p, 0};
+    struct sh_unit u;
+    struct group g = {.cmd = true, .plain = true};
+    int depth = 1;
+
+    for (;;) {
+        const char *at = sc.p;
+
+        unit_next(&sc, &u, 1);
+        if (u.kind == SH_U_END) {
+            group_word(&g); /* an esac that ends the text */
+            return g.done ? at : NULL;
+        }
+        if (u.kind != SH_U_LIT || sc.quote != 0) {
+            g.plain = false;
+            g.wlen += g.wlen == 0; /* a word, though not a plain one */
+            continue;
+        }
+
+        /* The character that ends the esac word is where the command ends; a )
+         * that balances nothing here ends it with no esac.
+         */
+        if (group_char(&g, &sc, at, &depth) && !g.done)
+            return NULL;
+        if (g.done)
             return at;
     }
 }

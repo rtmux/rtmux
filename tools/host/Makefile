@@ -256,6 +256,20 @@ $(BUILD_BASE)/sh-scan-test: $(TEST_DIR)/test-sh-scan.c $(SH_DIR)/sh-scan.c $(SH_
 	$(Q)$(HOST_CC) -I$(SH_DIR) -I$(TEST_DIR) $(HOST_CFLAGS) -o $@ \
 	    $(TEST_DIR)/test-sh-scan.c $(SH_DIR)/sh-scan.c
 
+# The shell itself as a host program, built with the hook that lets a test send
+# it a signal at the one moment a read could lose it (tests/host/sh-host-shim.c).
+# Subshells run this same binary. The format-truncation warning is about the
+# line editor's path buffers, which the target compiler does not report.
+$(BUILD_BASE)/sh-host: $(TEST_DIR)/sh-host-shim.c $(SH_DIR)/sh.c $(SH_DIR)/sh-scan.c \
+                       $(SH_DIR)/sh-scan.h ../../userland/include/toolbox.h
+	@mkdir -p $(@D)
+	$(msg) HOSTCC $(notdir $@)
+	$(Q)$(HOST_CC) -std=gnu11 -D_GNU_SOURCE -DEOK=0 \
+	    -DSH_TEST_AWAIT_WINDOW=sh_test_await_window \
+	    '-DSH_SELF_PATH="$(abspath $@)"' -I../../userland/include -I$(SH_DIR) \
+	    $(HOST_CFLAGS) -Wno-format-truncation -o $@ \
+	    $(TEST_DIR)/sh-host-shim.c $(SH_DIR)/sh.c $(SH_DIR)/sh-scan.c
+
 cap-table-test: $(BUILD_BASE)/cap-table-test
 	$(Q)$<
 
@@ -369,7 +383,8 @@ host-tests: $(BUILD_BASE)/path-normalize-test $(BUILD_BASE)/cap-table-test \
             $(BUILD_BASE)/sh-scan-test $(BUILD_BASE)/libc-algorithms-test \
             $(BUILD_BASE)/tz-test $(BUILD_BASE)/tz-asan-test $(TZ_ZONES)/.stamp \
             $(BUILD_BASE)/malloc-stats-test $(BUILD_BASE)/pci-args-test \
-            $(BUILD_BASE)/pgrp-table-test $(BUILD_BASE)/heap-arena-test
+            $(BUILD_BASE)/pgrp-table-test $(BUILD_BASE)/heap-arena-test \
+            $(BUILD_BASE)/sh-host
 	$(Q)$<
 	$(Q)$(BUILD_BASE)/cap-table-test
 	$(Q)$(BUILD_BASE)/bootstrap-manifest-test
@@ -390,6 +405,10 @@ host-tests: $(BUILD_BASE)/path-normalize-test $(BUILD_BASE)/cap-table-test \
 	$(Q)$(BUILD_BASE)/sh-scan-test
 	$(Q)if command -v dash >/dev/null; then \
 	    $(PYTHON) $(TEST_DIR)/gen-sh-quote-cases.py --check; fi
+	$(Q)$(PYTHON) $(TEST_DIR)/test-sh-host.py $(abspath $(BUILD_BASE)/sh-host) \
+	    $(abspath ../../tests/userland/sh-posix/gaps.sh)
+	$(Q)if command -v dash >/dev/null; then \
+	    SH=dash dash ../../tests/userland/sh-posix/gaps.sh >/dev/null; fi
 	$(Q)RTMUX_TZDIR=$(abspath $(TZ_ZONES))/ $(BUILD_BASE)/tz-test
 	$(Q)RTMUX_TZDIR=$(abspath $(TZ_ZONES))/ $(BUILD_BASE)/tz-asan-test
 	$(Q)$(BUILD_BASE)/malloc-stats-test

@@ -272,7 +272,7 @@ static void fill_text_export(struct lklfs_ocb *ocb,
         break;
     case LKLFS_TEXT_STATS: {
         struct rtmux_lkl_host_stats stats;
-        char ioserv_stats[256];
+        char ioserv_stats[IOSERV_REPLY_COUNTERS_MAX + 1];
 
         rtmux_lkl_host_stats(&stats);
         (void) ioserv_reply_counters_format(ioserv_stats, sizeof(ioserv_stats));

@@ -259,12 +259,44 @@ static void check_groups(void)
     }
 }
 
+/* Where a case command that starts a text ends: just past its esac, with the
+ * case commands of its arms inside it, or NULL when it never closes.
+ */
+static void check_case_end(void)
+{
+    static const struct {
+        const char *text;
+        const char *rest; /* what follows the esac, or NULL: not closed */
+    } cases[] = {
+        {"case a in a) echo x;; esac; echo y", "; echo y"},
+        {"case a in a) echo x;; esac", ""},
+        {"case a in a) case b in b) echo x;; esac;; esac", ""},
+        {"case a in a) case b in b) echo x;; esac;; z) y;; esac; z", "; z"},
+        {"case a in a) case b in b) echo x;; esac; echo t;; esac >f", " >f"},
+        {"case a in a) echo \"esac\";; esac", ""},
+        {"case a in a) echo esac;; esac", ""},
+        {"case a in a) echo $(case b in b) :;; esac);; esac;", ";"},
+        {"case a in a) echo x;;", NULL},
+        {"case a in a) case b in b) echo x;; esac;;", NULL},
+        {"case a in a) echo x;; esac)", ")"},
+    };
+
+    for (size_t i = 0; i < sizeof cases / sizeof *cases; i++) {
+        const char *end = sh_scan_case_end(cases[i].text);
+
+        if (!cases[i].rest ? end != NULL : (!end || strcmp(end, cases[i].rest)))
+            fail("case end", cases[i].text, cases[i].rest ? cases[i].rest : "NULL",
+                 end ? end : "NULL");
+    }
+}
+
 int main(void)
 {
     int host = 0;
 
     check_nesting();
     check_groups();
+    check_case_end();
 
     for (size_t i = 0; i < sizeof(sh_quote_cases) / sizeof(*sh_quote_cases);
          i++) {

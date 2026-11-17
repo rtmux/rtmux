@@ -46,7 +46,6 @@
  * the PPN and the attribute bits, which a change of protection keeps.
  */
 #define PTE_FLAG_BITS 0x3FFUL
-#define PTE_FLAGS(pte) ((pte) & PTE_FLAG_BITS)
 
 /* The kernel's direct map of physical memory: a table's or a page's physical
  * address as a pointer. The one definition for the kernel, roottask and the
