@@ -150,7 +150,7 @@ ksync_t *rdecl sync_lookup(sync_t *sync, unsigned create)
     path_object_t *obp;
     ksync_t **owner;
 
-    if (!sync || ((uintptr_t) sync & (sizeof(unsigned) - 1)) ||
+    if (!sync || ((uintptr_t) sync & (_Alignof(sync_t) - 1)) ||
         !WITHIN_BOUNDARY((uintptr_t) sync, (uintptr_t) (sync + 1),
                          act->process->boundary_addr)) {
         kcall_err(act, EFAULT);

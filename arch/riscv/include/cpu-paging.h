@@ -27,7 +27,7 @@
 #define PTE_D (1UL << 7) /* dirty */
 
 /* Software bit (RSW, ignored by hardware) on a non-leaf PTE: the table it
- * points to came from pa_alloc (sv39_walk), not the kernel heap, so
+ * points to came from pa_alloc (sv39_new_table), not the kernel heap, so
  * cpu_pgdir_free returns it with pa_free_paddr.
  */
 #define PTE_SW_PA (1UL << 8)
@@ -42,7 +42,21 @@
 
 #define PTE2PA(pte) (((((uint64_t) (pte)) >> 10) & PTE_PPN_MASK) << 12)
 
-#define PTE_FLAGS(pte) ((pte) & 0x3FF)
+/* Bits 0..9: V, R, W, X, U, G, A, D and the two RSW bits. Everything above is
+ * the PPN and the attribute bits, which a change of protection keeps.
+ */
+#define PTE_FLAG_BITS 0x3FFUL
+#define PTE_FLAGS(pte) ((pte) & PTE_FLAG_BITS)
+
+/* The kernel's direct map of physical memory: a table's or a page's physical
+ * address as a pointer. The one definition for the kernel, roottask and the
+ * walkers in sv39-lookup.h; a host test that has no direct map defines
+ * PA_TO_VA itself first.
+ */
+#ifndef PA_TO_VA
+#define PA_TO_VA(pa) ((void *) ((uintptr_t) (pa) + KERNEL_VIRT_BASE))
+#define VA_TO_PA(va) ((uint64_t) ((uintptr_t) (va) - KERNEL_VIRT_BASE))
+#endif
 
 /* extract the three 9-bit page table indices from a virtual address. */
 #define PXMASK 0x1FF /* 9 bits */

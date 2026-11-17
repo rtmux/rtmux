@@ -194,6 +194,13 @@ int proc_wait_check(pid_t prp_pid,
         return 0;
     }
 
+    /* A child collected here is gone from its group before its waiter is told,
+     * so that what the waiter does next (join that group, ask for it) sees it
+     * as ended. One that is only looked at (WNOWAIT) stays a member, a zombie.
+     */
+    if (match == WEXITED && !(wap->options & WNOWAIT))
+        proc_pgrp_reap(prp_pid);
+
     /* Unblock the waiting thread... */
 
     if (msg_info(wap->rcvid, &info) != -1) {

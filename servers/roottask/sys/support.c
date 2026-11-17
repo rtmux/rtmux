@@ -232,6 +232,20 @@ process_t *root_proc_lock(pid_t pid)
     return prp;
 }
 
+/* Make mutex priority-inheriting, for the locks a real-time client can wait on.
+ * Boot, before the mutex is first used.
+ */
+void root_mutex_init_pi(pthread_mutex_t *mutex)
+{
+    pthread_mutexattr_t attr;
+
+    if (pthread_mutexattr_init(&attr) != EOK ||
+        pthread_mutexattr_setprotocol(&attr, PTHREAD_PRIO_INHERIT) != EOK ||
+        pthread_mutex_init(mutex, &attr) != EOK)
+        crash();
+    pthread_mutexattr_destroy(&attr);
+}
+
 /* Release the lock taken by root_proc_lock for the given pid. Parameters:
  *   pid : the process id to unlock
  */

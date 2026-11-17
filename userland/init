@@ -133,9 +133,10 @@ if test "$rtmux_run" = "debug-inject"; then
         fi
     fi
     # A failing kcall must keep its error status when its caller was switched
-    # out inside the call.
+    # out inside the call, also when the caller may run on every hart.
     if test "$ok" = 2; then
-        if /bin/syscall_testing --sched-set-error; then
+        if /bin/syscall_testing --sched-set-error &&
+            /bin/syscall_testing --sched-set-error-migrate; then
             ok=3
         fi
     fi
@@ -167,7 +168,41 @@ if test "$rtmux_run" = "debug-inject"; then
             ok=7
         fi
     fi
+    # A MAP that meets a superpage half way must report its progress, so the
+    # pages it already mapped are unmapped, and must leave no page behind.
     if test "$ok" = 7; then
+        if /bin/syscall_testing --pte-partial-map; then
+            ok=8
+        fi
+    fi
+    # A waiter that must lend its priority but is not yet queued still counts
+    # when the owner hands the mutex on, and a contended lock that cannot get a
+    # turnstile takes back the WAITING bit it published.
+    if test "$ok" = 8; then
+        if /bin/syscall_testing --mutex-handoff-loan; then
+            ok=9
+        fi
+    fi
+    if test "$ok" = 9; then
+        if /bin/syscall_testing --mutex-waiting-withdrawn; then
+            ok=10
+        fi
+    fi
+    # setpgid and tcsetsid(-1) racing a reap and a rebind, each held open at the
+    # point where it has checked and not yet changed. The case spawns children
+    # that wait on pipes, and binds a terminal the init session does not own.
+    if test "$ok" = 10; then
+        /bin/pipe &
+        /sbin/logger
+        /sbin/virtio-mmio
+        /sbin/virtio-mmio --register-boot
+        /bin/dev-serial-8250 &
+        if waitfor /dev/pipe 10 && waitfor /dev/ser1 5 &&
+            /bin/syscall_testing --pgrp-races; then
+            ok=11
+        fi
+    fi
+    if test "$ok" = 11; then
         echo "RTMux debug-inject: PASS"
     else
         echo "RTMux debug-inject: FAIL"

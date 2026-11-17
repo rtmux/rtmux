@@ -40,14 +40,17 @@
  * process that lower the caller's own priority fail with EINVAL, after they
  * have applied the change. A kcall that reschedules its caller and then fails
  * is otherwise unreachable, and the test of the error status reaching a thread
- * that was switched out needs one.
+ * that was switched out needs one. Each failure first waits a short window with
+ * the other harts kicked, so a caller exposed to them inside the call is
+ * resumed there rather than racing the status store by luck.
  */
 #define INJECT_OP_FAIL_NEXT_SCHED_SET 6
 /* SCHED_SET_STATUS: ret is how many armed failures have been delivered. */
 #define INJECT_OP_SCHED_SET_STATUS 7
 
 /* SCHED_SET_DISPLACED: ret is how many injected failures found their caller
- * already switched out when the error status was written.
+ * switched out, or its switch still owed to kernel_exit, when the error status
+ * was written.
  */
 #define INJECT_OP_SCHED_SET_DISPLACED 8
 
@@ -72,6 +75,51 @@
  * stall was taken.
  */
 #define INJECT_OP_STALL_FORCE_READY 11
+
+/* PTE_SUPERPAGE(pid, va): make the 2 MiB slot at va, which must be empty and
+ * under a table that exists, a 2 MiB leaf in that process's page table, so a
+ * MAP over it meets a superpage. PTE_CLEAR_SUPERPAGE(pid, va) takes it out
+ * again. Planting also clears MANIP_PARTIAL. The leaf is read-only and maps
+ * physical page 0; the test must not touch it. The target must be a live
+ * process that is not exiting (a test names itself): an address space is freed
+ * without waiting for a reader.
+ */
+#define INJECT_OP_PTE_SUPERPAGE 12
+#define INJECT_OP_PTE_CLEAR_SUPERPAGE 13
+
+/* PTE_PROBE(pid, va): ret is 1 if that process's page table has a valid leaf
+ * mapping va, else 0, or minus an errno if the process or address is bad.
+ */
+#define INJECT_OP_PTE_PROBE 14
+
+/* MANIP_PARTIAL: ret is how many pages the most recent MAP that failed in
+ * cpu_pte_manipulate had done when it failed, as the kernel reported it to
+ * roottask (0 if none failed since a PTE_SUPERPAGE).
+ */
+#define INJECT_OP_MANIP_PARTIAL 15
+
+/* FAIL_PTE_MAP(pid, pages | va): the next MAP of more than pages pages in that
+ * process's address space stops after pages pages with ENOMEM, as if the page
+ * table allocator ran dry there. The page-aligned va ORed into the low pages
+ * bits (pages is under 4096) limits it to the MAP that starts at va; 0 means
+ * any. ALLOC_STATUS reports whether it was taken. Planting a superpage or
+ * arming this clears MANIP_PARTIAL.
+ */
+#define INJECT_OP_FAIL_PTE_MAP 16
+
+/* STALL_MUTEX_EARLY(pid, ms): like STALL_MUTEX_LOCK, but the stall comes
+ * earlier, with the chain lock held, after the contended lock saw the mutex
+ * busy and before it publishes WAITING. A holder that releases in user space
+ * meanwhile leaves a free word for the waiter to publish onto.
+ */
+#define INJECT_OP_STALL_MUTEX_EARLY 17
+
+/* STALL_MUTEX_PROPAGATED(pid, ms): like STALL_MUTEX_LOCK, but the stall comes
+ * after the waiter has lent its priority to the owner and before it takes the
+ * chain lock again, the window in which an unlock hands the mutex to another
+ * waiter that was not lent it.
+ */
+#define INJECT_OP_STALL_MUTEX_PROPAGATED 18
 
 #define INJECT_SPIN_MAX_MS 10000
 

@@ -136,102 +136,84 @@ static pte_t sv39_new_table(void)
     return PA2PTE(paddr) | PTE_V | PTE_SW_PA;
 }
 
-/* sv39_walk — the L0 PTE slot for va, creating tables when alloc is set.
- *
- * Returns NULL on failure with *errp set; see sv39_walk_slot, which also stops
- * at a superpage leaf.
- */
-static pte_t *sv39_walk(pagetable_t pgdir, uintptr_t va, int alloc, int *errp)
-{
-    return sv39_walk_slot(pgdir, va, alloc ? sv39_new_table : NULL, errp);
-}
-
 /* cpu_pte_manipulate — create, modify, or remove Sv39 page table entries.
  *
- * Handles PTE_OP_MAP, PTE_OP_UNMAP, and PTE_OP_PROT operations. For MAP:
- * creates PTEs mapping [start, end) to paddr with given prot. For UNMAP: clears
- * PTEs in [start, end). For PROT: changes protection bits on existing PTEs.
+ * Handles PTE_OP_MAP, PTE_OP_UNMAP, PTE_OP_PROT and PTE_OP_PREALLOC operations.
+ * For MAP: creates PTEs mapping [start, end) to paddr with given prot. For
+ * UNMAP: clears PTEs in [start, end). For PROT: changes protection bits on
+ * existing PTEs. See sv39_manip_pages for the errors each can return.
  *
  * Intermediate page table pages are allocated via pa_alloc() and accessed
  * through PA_TO_VA() — never assumes PA == VA.
+ *
+ * Progress is kept in data after every page: data->start is the first page not
+ * done and, for MAP, data->paddr the frame that page gets. A call that fails
+ * leaves them naming exactly how far it got, which is what lets the caller roll
+ * a failed MAP back over [first, start).
  */
 int cpu_pte_manipulate(struct mm_pte_manipulate *data)
 {
     address_t *adp = data->adp;
-    pagetable_t pgdir;
-    uintptr_t curr;
+    pagetable_t pgdir = adp ? adp->cpu.pgdir : pgtbl_list->pgdir;
     unsigned op = data->op;
-    uint64_t bits;
+    uint64_t bits = (op & PTE_OP_BAD) ? 0 : prot_to_pte_bits(data->prot);
+    uint64_t paddr = 0; /* only a MAP supplies one */
+    uintptr_t start = data->start;
+    uintptr_t end = data->end;
+    enum sv39_manip_op mop;
+    int changed = 0;
+    bool cut = false;
+    int r;
 
-    if (adp) {
-        pgdir = adp->cpu.pgdir;
-    } else {
-        pgdir = pgtbl_list->pgdir;
+    if (op & (PTE_OP_MAP | PTE_OP_BAD)) {
+        mop = SV39_MANIP_MAP;
+        paddr = data->paddr;
     }
+    else if (op & PTE_OP_UNMAP)
+        mop = SV39_MANIP_UNMAP;
+    else if (op & PTE_OP_PROT)
+        mop = SV39_MANIP_PROT;
+    else if (op & PTE_OP_PREALLOC)
+        mop = SV39_MANIP_PREALLOC;
+    else
+        return EOK;
 
-    if (op & PTE_OP_BAD) {
-        bits = 0;
-    } else {
-        bits = prot_to_pte_bits(data->prot);
-    }
+    if (mop == SV39_MANIP_MAP && (bits & PTE_U) && start < KERNEL_VIRT_BASE) {
+        extern char _text_start[], _end[];
+        uintptr_t uend = end < KERNEL_VIRT_BASE ? end : KERNEL_VIRT_BASE;
+        uint64_t len = uend > start ? uend - start : 0;
 
-    for (curr = data->start; curr < data->end; curr += __PAGESIZE) {
-        if (op & (PTE_OP_MAP | PTE_OP_BAD)) {
-            int err = ENOMEM;
-            pte_t *pte = sv39_walk(pgdir, curr, 1, &err);
-            if (!pte)
-                return err;
-
-            if (curr < KERNEL_VIRT_BASE && (bits & PTE_U)) {
-                extern char _text_start[], _end[];
-
-                /* Guard against mapping the kernel image into a user VA. Bound
-                 * the window with the actual linker image extent [_text_start,
-                 * _end): a fixed 16 MiB window above the image crashed on a
-                 * legitimate user allocation whose page landed in free RAM a
-                 * few MiB up (a memory-pressure false positive), and deriving
-                 * the base by masking a function address down to 1 MiB only
-                 * holds while this code stays in the first megabyte of the
-                 * image. section 18.
-                 */
-                if (data->paddr >= CPU_V2P((uintptr_t) _text_start) &&
-                    data->paddr < CPU_V2P((uintptr_t) _end)) {
-                    kprintf(
-                        "BUG: cpu_pte_manipulate mapping kernel paddr %lx "
-                        "into user va %lx (op=%x prot=%x)\n",
-                        (unsigned long) data->paddr, (unsigned long) curr, op,
-                        data->prot);
-                    crash();
-                }
-            }
-
-            *pte = PA2PTE(data->paddr) | bits;
-            data->paddr += __PAGESIZE;
-            data->tlb_flush_pending = 1;
-
-        } else if (op & (PTE_OP_UNMAP | PTE_OP_PROT)) {
-            int err = ENOENT;
-            pte_t *pte = sv39_walk(pgdir, curr, 0, &err);
-
-            /* A superpage covers curr: it can be neither unmapped nor
-             * re-protected one 4 KiB page at a time, so say so rather than
-             * report success. A missing table (ENOENT) has nothing to change.
-             */
-            if (!pte && err == EEXIST)
-                return err;
-            if (pte && (*pte & PTE_V)) {
-                *pte = (op & PTE_OP_UNMAP) ? 0 : (*pte & PTE_PADDR_BITS) | bits;
-                data->tlb_flush_pending = 1;
-            }
-
-        } else if (op & PTE_OP_PREALLOC) {
-            int err = ENOMEM;
-            if (!sv39_walk(pgdir, curr, 1, &err))
-                return err;
+        /* Guard against mapping the kernel image into a user VA. Bound the
+         * window with the actual linker image extent [_text_start, _end): a
+         * fixed 16 MiB window above the image crashed on a legitimate user
+         * allocation whose page landed in free RAM a few MiB up (a
+         * memory-pressure false positive), and deriving the base by masking a
+         * function address down to 1 MiB only holds while this code stays in
+         * the first megabyte of the image. section 18.
+         */
+        if (len && paddr < CPU_V2P((uintptr_t) _end) &&
+            paddr + len > CPU_V2P((uintptr_t) _text_start)) {
+            kprintf(
+                "BUG: cpu_pte_manipulate mapping kernel paddr %lx "
+                "into user va %lx (op=%x prot=%x)\n",
+                (unsigned long) paddr, (unsigned long) start, op, data->prot);
+            crash();
         }
     }
 
-    return EOK;
+    /* Debug builds can make a MAP run dry part of the way (ENOMEM). */
+    if (mop == SV39_MANIP_MAP)
+        cut = inject_pte_map_stop(adp, start, &end);
+    r = sv39_manip_pages(pgdir, mop, &start, end, &paddr, bits, sv39_new_table,
+                         &changed);
+    if (cut && r == EOK)
+        r = ENOMEM;
+    data->start = start;
+    if (mop == SV39_MANIP_MAP)
+        data->paddr = paddr;
+    if (changed)
+        data->tlb_flush_pending = 1;
+    return r;
 }
 
 /* cpu_pte_merge — merge adjacent 4 KiB PTEs into a 2 MiB megapage.
@@ -267,8 +249,10 @@ int cpu_pte_split(uintptr_t vaddr, struct mm_pte_manipulate *data)
  *
  * Used to expose roottask text/data and the syspage to U-mode pool threads.
  * Walks the current satp's page table without ever allocating intermediate
- * tables (passes alloc=0 to sv39_walk); pages outside any existing mapping are
- * silently skipped. Does sfence_vma() once at the end.
+ * tables; pages outside any existing mapping are silently skipped. A leaf that
+ * is a superpage is marked whole, and the walk resumes after it, since PTE_U
+ * cannot be set on part of one; a range that cuts one crashes. Does
+ * sfence_vma() once at the end.
  *
  * Parameters:
  *   start : first virtual address of the range
@@ -283,12 +267,30 @@ void cpu_pte_mark_user(uintptr_t start, uintptr_t end)
     uint64_t satp = r_satp();
     pagetable_t pgdir =
         (pagetable_t) PA_TO_VA((satp & 0xFFFFFFFFFFFUL) << PGSHIFT);
+    uintptr_t first = start & ~(uintptr_t) (__PAGESIZE - 1);
+    uintptr_t va = first;
 
-    for (uintptr_t va = start & ~(uintptr_t) (__PAGESIZE - 1); va < end;
-         va += __PAGESIZE) {
-        pte_t *pte = sv39_walk(pgdir, va, 0, NULL);
-        if (pte && (*pte & PTE_V))
-            *pte |= PTE_U;
+    while (va < end) {
+        int level;
+        pte_t *pte = sv39_lookup_leaf(pgdir, va, &level, NULL);
+
+        if (!pte) {
+            va += __PAGESIZE;
+            continue;
+        }
+        /* PTE_U on a superpage covers all of it, in every address space that
+         * shares the table: a range that cuts one is a caller bug, not
+         * something to widen silently.
+         */
+        uintptr_t mask = sv39_leaf_size(level) - 1;
+
+        if (level && ((va & ~mask) < first || (va | mask) >= end)) {
+            kprintf("BUG: cpu_pte_mark_user [%lx, %lx) cuts a level %d leaf\n",
+                    (unsigned long) start, (unsigned long) end, level);
+            crash();
+        }
+        *pte |= PTE_U;
+        va = (va | mask) + 1;
     }
     sfence_vma();
 }

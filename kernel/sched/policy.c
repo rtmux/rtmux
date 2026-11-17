@@ -288,14 +288,24 @@ int kdecl ksys_sched_set(thread_t *act, struct kcall_args_sched_set *kap)
         if (status != EOK) {
             goto out;
         }
-    } else if ((status = sched_thread(thp, kap->policy, &param)) != EOK) {
-        goto out;
+    } else {
+        /* See RTMUX_ITF_DEFER_DISPLACE: a change to the caller's own priority
+         * must not switch it out inside this kcall.
+         */
+        bool self = thp == act;
+
+        if (self)
+            ITF_SET(act, RTMUX_ITF_DEFER_DISPLACE);
+        status = sched_thread(thp, kap->policy, &param);
+        if (self)
+            ITF_CLR(act, RTMUX_ITF_DEFER_DISPLACE);
+        if (status != EOK)
+            goto out;
     }
 
     status = EOK;
 
-    /* After the change is applied, so the caller may already be switched out.
-     */
+    /* After the change; the caller's own switch waits for kernel_exit. */
     if (inject_should_fail_sched_set(act,
                                      thp == act && act->priority < old_prio))
         status = EINVAL;

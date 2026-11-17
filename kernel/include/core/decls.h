@@ -366,6 +366,8 @@ void cpu_force_fpu_save(thread_t *thp);
 int inject_should_fail_alloc(process_t *prp,
                              soul_t *soulp); /* debug/inject.c */
 void inject_mutex_lock_stall(process_t *prp);
+void inject_mutex_lock_early(process_t *prp);
+void inject_mutex_lock_propagated(process_t *prp);
 void inject_force_ready_stall(thread_t *thp);
 void ipc_blk_trace(const char *file, int line, thread_t *thp);
 #define IPC_BLK(thp) ipc_blk_trace(__FILE__, __LINE__, (thp))
@@ -376,10 +378,20 @@ void sync_chains_assert_readied(const thread_t *thp);
 #define THR_EV(thp) \
     thr_trace(__FILE__, __LINE__, (thp), __builtin_return_address(0))
 bool inject_should_fail_sched_set(thread_t *act, bool lowered);
-void inject_note_sched_return(thread_t *act, bool displaced);
+void inject_note_sched_return(thread_t *act, bool switched);
 int inject_should_fail_turnstile(process_t *prp); /* debug/inject.c */
+void inject_note_manip_failure(unsigned pages);
+bool inject_pte_map_stop(const void *adp, uintptr_t start, uintptr_t *endp);
 #else
 static inline void inject_mutex_lock_stall(process_t *prp)
+{
+    (void) prp;
+}
+static inline void inject_mutex_lock_early(process_t *prp)
+{
+    (void) prp;
+}
+static inline void inject_mutex_lock_propagated(process_t *prp)
 {
     (void) prp;
 }
@@ -398,10 +410,23 @@ static inline bool inject_should_fail_sched_set(thread_t *act, bool lowered)
     (void) lowered;
     return false;
 }
-static inline void inject_note_sched_return(thread_t *act, bool displaced)
+static inline void inject_note_sched_return(thread_t *act, bool switched)
 {
     (void) act;
-    (void) displaced;
+    (void) switched;
+}
+static inline void inject_note_manip_failure(unsigned pages)
+{
+    (void) pages;
+}
+static inline bool inject_pte_map_stop(const void *adp,
+                                       uintptr_t start,
+                                       uintptr_t *endp)
+{
+    (void) adp;
+    (void) start;
+    (void) endp;
+    return false;
 }
 #endif
 void fpu_drop_claims(thread_t *thp);

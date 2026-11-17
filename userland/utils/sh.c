@@ -5124,7 +5124,11 @@ static int run_for(struct sh *sh, struct sh_script *sc, int at, int done_i)
     }
     sh->loop_depth++;
     for (int i = 0; i < vals.n && !sh->exit_requested; i++) {
-        setenv(var, vals.v[i], 1);
+        if (setenv(var, vals.v[i], 1) != 0) {
+            fprintf(stderr, "sh: %s: %s\n", var, strerror(errno));
+            rc = 1;
+            break;
+        }
         rc = run_script_range(sh, sc, at + 1, done_i);
         if (loop_consume(sh))
             break;

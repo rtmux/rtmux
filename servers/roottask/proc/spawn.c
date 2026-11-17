@@ -522,14 +522,23 @@ int proc_spawn(ioserv_context_t *ctp, void *vmsg)
         }
         {
             int rcvid = lcp->ctx.rcvid;
+            pid_t exec_pid = lcp->ctx.ppid;
 
             root_trace(
                 "SPAWN_EXEC: calling process_exec lcp=%p rcvid=%d "
                 "ctp->rcvid=%d "
                 "ppid=%d\n",
                 lcp, rcvid, ctp->rcvid, lcp->ctx.ppid);
+
+            /* Once the image is replaced the parent can no longer setpgid the
+             * process. Marked before the swap, so that no setpgid sees the new
+             * image unmarked, and undone if the swap fails. The slot outlives
+             * the swap, so the mark does too.
+             */
+            root_proc(exec_pid)->execed = 1;
             if (process_exec(lcp, &lcp->ctx.rcvid, ctp->rcvid, lcp->ctx.ppid) ==
                 -1) {
+                root_proc(exec_pid)->execed = 0;
                 msg_error(ctp->rcvid, errno);
                 return IOSERV_NOREPLY;
             }

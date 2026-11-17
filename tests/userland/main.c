@@ -1034,6 +1034,12 @@ int main(int argc, char *argv[])
             test_skip("sched_set_error_after_lowering", "fault injection unavailable");
         return finish(1);
     }
+    if (argc == 2 && !strcmp(argv[1], "--sched-set-error-migrate")) {
+        printf("[sched_set_error_while_migrating]\n");
+        if (sched_set_error_while_migrating() == TC_EXIT_SKIP)
+            test_skip("sched_set_error_while_migrating", "needs fault injection and two harts");
+        return finish(1);
+    }
     if (argc == 2 && !strcmp(argv[1], "--condvar-reacquire-alloc-failure")) {
         printf("[condvar_reacquire_alloc_failure]\n");
         if (condvar_reacquire_alloc_failure() == TC_EXIT_SKIP)
@@ -1044,6 +1050,18 @@ int main(int argc, char *argv[])
         printf("[mutex_waiting_republish]\n");
         if (mutex_waiting_republish() == TC_EXIT_SKIP)
             test_skip("mutex_waiting_republish", "fault injection unavailable");
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--mutex-handoff-loan")) {
+        printf("[mutex_handoff_loan]\n");
+        if (mutex_handoff_loan() == TC_EXIT_SKIP)
+            test_skip("mutex_handoff_loan", "fault injection unavailable");
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--mutex-waiting-withdrawn")) {
+        printf("[mutex_waiting_withdrawn]\n");
+        if (mutex_waiting_withdrawn() == TC_EXIT_SKIP)
+            test_skip("mutex_waiting_withdrawn", "fault injection unavailable");
         return finish(1);
     }
     if (argc == 2 && !strcmp(argv[1], "--condvar-interrupt-stale")) {
@@ -1058,6 +1076,24 @@ int main(int argc, char *argv[])
             test_skip("ns_open_deferral", "fault injection unavailable");
         return finish(1);
     }
+    if (argc == 2 && !strcmp(argv[1], "--pte-partial-map")) {
+        printf("[pte_partial_map]\n");
+        if (pte_partial_map() == TC_EXIT_SKIP)
+            test_skip("pte_partial_map", "fault injection unavailable");
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--pgrp-races")) {
+        printf("[pgrp_races]\n");
+        if (pgrp_races() == TC_EXIT_SKIP)
+            test_skip("pgrp_races", "debug window unavailable");
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--pgrp-exec-hold"))
+        return pgrp_exec_hold();
+    if (argc == 2 && !strcmp(argv[1], "--pgrp-tty-bind"))
+        return pgrp_tty_child(0);
+    if (argc == 2 && !strcmp(argv[1], "--pgrp-tty-race"))
+        return pgrp_tty_child(1);
     if (argc == 3 && !strcmp(argv[1], "--serial-unblock-child"))
         return serial_unblock_child(!strcmp(argv[2], "announce"));
     if (argc == 2 && !strcmp(argv[1], "--console-poll")) {

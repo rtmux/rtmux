@@ -787,12 +787,18 @@ static void test_loan_ends_for_blocked_server(void)
     chan_close(k.b.chid, coid_b);
 }
 
-/* K19: a kcall that lowers the caller below a ready thread and then fails. The
- * switch happens inside the kcall, before the trap handler writes the result,
- * so the status has to be in the saved context by then. A debug-inject kernel
+/* K19 and K30: a kcall that lowers the caller below a ready thread and then
+ * fails. The status is stored after the body returns, so the caller must not be
+ * switched out, or exposed to another hart, before then. A debug-inject kernel
  * fails the next K19_ROUNDS lowering SchedSet calls of this process after they
- * have applied the change; the caller and a competitor are pinned to one hart,
- * so the competitor really runs before the caller returns.
+ * have applied the change, and holds each in the call for a short window with
+ * the other harts kicked.
+ *
+ * Pinned (K19): the caller and a competitor share one hart, so the competitor
+ * really runs before the caller returns. Migrating (K30): the competitor is
+ * confined to the caller's hart, but the caller may run on every hart; a
+ * kernel that put the caller on that hart's ready queue inside the call would
+ * let an idle hart resume it with the status unwritten.
  */
 #define K19_ROUNDS 1000
 #define K19_HIGH 40
@@ -809,27 +815,36 @@ static void *k19_competitor(void *raw)
 }
 
 /* Returns 0 when it ran (the verdict goes through check), or TC_EXIT_SKIP when
- * fault injection is not available.
+ * fault injection or the harts it needs are not available.
  */
-int sched_set_error_after_lowering(void)
+static int sched_set_error_run(bool migrate)
 {
     struct sched_param saved, low = {.sched_priority = K19_LOW};
     char pidarg[16], count[16], detail[160];
+    const char *name = migrate ? "sched_set_error_while_migrating"
+                               : "sched_set_error_after_lowering";
     int policy, bad = 0, not_switched = 0, setup = 0;
-    unsigned mask = 0;
+    long harts = sysconf(_SC_NPROCESSORS_ONLN);
+    unsigned mask = 0, all = 0;
 
     if (inject_run("sched-set-status", NULL, NULL) != 0)
         return TC_EXIT_SKIP;
+    if (migrate) {
+        if (harts < 2 || harts > 31)
+            return TC_EXIT_SKIP;
+        all = (1U << harts) - 1U;
+    }
     policy = __sched_get(0, 0, &saved);
     RMSK_SET(0, &mask);
-    if (policy == -1 || test_pin_mask(mask) == -1 || set_fifo(K19_HIGH) == -1) {
-        test_fail("sched_set_error_after_lowering setup", strerror(errno));
+    if (policy == -1 || test_pin_mask(mask) == -1 || set_fifo(K19_HIGH) == -1 ||
+        (migrate && thread_ctl(RTMUX_TCTL_RUNMASK_GET_AND_SET, &all) == -1)) {
+        test_fail(name, strerror(errno));
         return 0;
     }
     snprintf(pidarg, sizeof pidarg, "%d", (int) getpid());
     snprintf(count, sizeof count, "%d", K19_ROUNDS);
     if (inject_run("fail-sched-set", pidarg, count) != 0) {
-        test_fail("sched_set_error_after_lowering setup", "inject refused to arm");
+        test_fail(name, "inject refused to arm");
         goto out;
     }
 
@@ -847,7 +862,10 @@ int sched_set_error_after_lowering(void)
         ran = atomic_load_explicit(&k19_ran, memory_order_acquire);
         (void) set_fifo(K19_HIGH);
         (void) pthread_join(t, NULL);
-        if (!ran)
+        /* The migrating competitor may run on a hart the caller never sees
+         * in time; only the pinned run requires that it did.
+         */
+        if (!ran && !migrate)
             not_switched++;
         if (rc != -1 || err != EINVAL)
             bad++;
@@ -855,16 +873,15 @@ int sched_set_error_after_lowering(void)
 
     /* The competitor running proves a switch, not that it came before the
      * status write: the trap handler counts each error return that found its
-     * caller already switched out.
+     * caller switched out or its switch still owed.
      */
-    if (inject_run("sched-set-displaced", count, NULL) != 0)
+    if (!migrate && inject_run("sched-set-displaced", count, NULL) != 0)
         not_switched++;
     snprintf(detail, sizeof detail,
              "%d of %d calls lost the error status (%d never switched out, "
              "%d not started)",
              bad, K19_ROUNDS, not_switched, setup);
-    check(bad == 0 && not_switched == 0 && setup == 0,
-          "sched_set_error_after_lowering status survives a switch", detail);
+    check(bad == 0 && not_switched == 0 && setup == 0, name, detail);
 
 out:
     /* Leave no failure armed against this process. */
@@ -872,6 +889,146 @@ out:
     (void) test_pin_mask(~0U);
     (void) __sched_set(0, 0, policy, &saved);
     return 0;
+}
+
+/* mutex_handoff_loan: a PI waiter that has lent its priority to the owner but
+ * is not yet queued must still count when the owner hands the mutex on. H holds
+ * the mutex and W queues behind it; B then locks at a higher priority, lends it
+ * to H, and is held by the debug injection call before it takes the chain lock
+ * again. H unlocks meanwhile and W takes the mutex. B then queues, and W must
+ * run at B's priority: the loan went to H, which no longer owns the mutex.
+ * Needs /bin/inject and four harts; otherwise the case is skipped.
+ */
+#define MHL_STALL_MS 4000L
+#define MHL_PRIO_H 20
+#define MHL_PRIO_W 30
+#define MHL_PRIO_B 50
+
+static pthread_mutex_t mhl_mutex;
+static atomic_int mhl_h_has;
+static atomic_int mhl_h_release;
+static atomic_int mhl_w_has;
+static atomic_int mhl_w_release;
+static atomic_int mhl_b_has;
+
+static void *mhl_owner(void *raw)
+{
+    bool is_h = raw != NULL;
+
+    (void) test_pin_mask(is_h ? 2U : 8U);
+    (void) set_fifo(is_h ? MHL_PRIO_H : MHL_PRIO_W);
+    pthread_mutex_lock(&mhl_mutex);
+    set_flag(is_h ? &mhl_h_has : &mhl_w_has);
+    while (!atomic_load_explicit(is_h ? &mhl_h_release : &mhl_w_release,
+                                 memory_order_acquire))
+        sleep_ms(1);
+    pthread_mutex_unlock(&mhl_mutex);
+    return NULL;
+}
+
+static void *mhl_late(void *raw)
+{
+    (void) raw;
+    (void) test_pin_mask(4U);
+    (void) set_fifo(MHL_PRIO_B);
+    pthread_mutex_lock(&mhl_mutex);
+    set_flag(&mhl_b_has);
+    pthread_mutex_unlock(&mhl_mutex);
+    return NULL;
+}
+
+int mutex_handoff_loan(void)
+{
+    struct sched_param saved;
+    pthread_t h, w, b;
+    char pid[16], ms[16], detail[96];
+    int policy = __sched_get(0, 0, &saved);
+    int cur;
+    bool have_h, have_w = false, have_b = false;
+
+    if (sysconf(_SC_NPROCESSORS_ONLN) < 4 ||
+        inject_run("alloc-status", NULL, NULL) != 0)
+        return TC_EXIT_SKIP;
+    snprintf(pid, sizeof pid, "%d", (int) getpid());
+    snprintf(ms, sizeof ms, "%ld", MHL_STALL_MS);
+    atomic_store(&mhl_h_has, 0);
+    atomic_store(&mhl_h_release, 0);
+    atomic_store(&mhl_w_has, 0);
+    atomic_store(&mhl_w_release, 0);
+    atomic_store(&mhl_b_has, 0);
+    if (policy == -1 || set_fifo(OBSERVER_PRIO) == -1 ||
+        test_pin_mask(1U) == -1 || pi_mutex_init(&mhl_mutex) != 0) {
+        test_fail("mutex_handoff_loan fixture", "setup");
+        return 0;
+    }
+    have_h = spawn(&h, mhl_owner, &h, "mutex_handoff_loan owner");
+    if (!have_h || !wait_flag(&mhl_h_has)) {
+        test_fail("mutex_handoff_loan fixture", "owner did not lock");
+        goto out;
+    }
+    have_w = spawn(&w, mhl_owner, NULL, "mutex_handoff_loan waiter");
+    if (!have_w || wait_prio(h, MHL_PRIO_W) != MHL_PRIO_W) {
+        test_fail("mutex_handoff_loan fixture", "waiter did not queue");
+        goto out;
+    }
+    sleep_ms(200); /* W has left its own walk and queued: it must not eat the stall */
+    if (inject_run("stall-lock-propagated", pid, ms) != 0) {
+        test_fail("mutex_handoff_loan fixture", "inject refused");
+        goto out;
+    }
+    have_b = spawn(&b, mhl_late, NULL, "mutex_handoff_loan late waiter");
+
+    /* B's walk has reached H: it is in, or just about to enter, its stall. */
+    if (!have_b || wait_prio(h, MHL_PRIO_B) != MHL_PRIO_B) {
+        test_fail("mutex_handoff_loan fixture", "late waiter did not lend");
+        goto out;
+    }
+
+    /* B has lent H its priority and is held, not yet queued: hand the mutex to
+     * W at once, so that the stall has not run out first (B queued would win
+     * the handoff, being the highest, and the case would prove nothing).
+     */
+    set_flag(&mhl_h_release);
+    if (!wait_flag(&mhl_w_has)) {
+        test_fail("mutex_handoff_loan fixture", "waiter did not take it");
+        goto out;
+    }
+    if (atomic_load(&mhl_b_has)) {
+        test_fail("mutex_handoff_loan fixture",
+                  "the stall ran out before the handoff");
+        goto out;
+    }
+    check(inject_run("alloc-status", "consumed", NULL) == 0,
+          "the injected stall held the late waiter in its window",
+          "the stall was not taken");
+    cur = wait_prio_n(w, MHL_PRIO_B, (int) MHL_STALL_MS + POLL_MS);
+    snprintf(detail, sizeof detail, "owner runs at %d, want %d", cur,
+             MHL_PRIO_B);
+    check(cur == MHL_PRIO_B,
+          "PI waiter not yet queued still lends to the next owner", detail);
+
+out:
+    set_flag(&mhl_h_release);
+    set_flag(&mhl_w_release);
+    if (have_h)
+        (void) pthread_join(h, NULL);
+    if (have_w)
+        (void) pthread_join(w, NULL);
+    if (have_b)
+        (void) pthread_join(b, NULL);
+    (void) test_pin_mask(~0U);
+    (void) __sched_set(0, 0, policy, &saved);
+    return 0;
+}
+
+int sched_set_error_after_lowering(void)
+{
+    return sched_set_error_run(false);
+}
+
+int sched_set_error_while_migrating(void)
+{
+    return sched_set_error_run(true);
 }
 
 void test_prio_loan(void)

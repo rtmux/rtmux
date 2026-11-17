@@ -572,6 +572,14 @@ static __inline__ void __attribute__((__unused__)) atomic_boundary()
  */
 #define RTMUX_ITF_EXIT_READIED 0x200U
 
+/* SchedSet on the caller itself sets DEFER_DISPLACE so adjust_priority only
+ * records the change, sets YIELD_TAIL and posts RTMUX_ATF_SMP_RESCHED;
+ * resched() at kernel_exit switches after the trap handler stores the status.
+ * Both bits are owned by the thread itself.
+ */
+#define RTMUX_ITF_DEFER_DISPLACE 0x400U
+#define RTMUX_ITF_YIELD_TAIL 0x800U
+
 /* internal_flags is a single 32-bit word whose bits are written from MULTIPLE
  * CPUs concurrently. A thread sets/clears its OWN WAIT_PENDING /
  * RCVNOTIFICATION / SPECRET_PENDING bits (e.g. ksys_msg_receivev clearing

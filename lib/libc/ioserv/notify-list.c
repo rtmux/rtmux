@@ -101,7 +101,7 @@ int ioserv_notify(ioserv_context_t *ctp,
                   const int *notifycnts)
 {
     ioserv_notify_event_t *event;
-    unsigned flags, ext;
+    unsigned flags, ext, passed = 0;
     int i, action;
 
     /* Fold the extended POLL* codes into the condition nibble, so a service
@@ -142,6 +142,7 @@ int ioserv_notify(ioserv_context_t *ctp,
         if (!(flags & 1u))
             continue;
         pp = notify_find(ctp, &nop[i]);
+        passed |= 1u << i;
 
         /* A hangup already known is the reply: the client is not left waiting,
          * so nothing is armed for it.
@@ -149,8 +150,20 @@ int ioserv_notify(ioserv_context_t *ctp,
         if (trig == 0 && hup == 0 && action != _NOTIFY_ACTION_POLL &&
             SIGEV_GET_TYPE(&msg->i.event) != SIGEV_NONE) {
             if (!(event = *pp)) {
-                if (!(event = malloc(sizeof *event)))
+                if (!(event = malloc(sizeof *event))) {
+                    /* All or nothing: a failed arm leaves no list of this call
+                     * armed for the client, which is told to retry.
+                     */
+                    for (int j = 0; j < i; j++) {
+                        if (!(passed & (1u << j)))
+                            continue;
+                        if (*(pp = notify_find(ctp, &nop[j]))) {
+                            notify_drop(pp);
+                            notify_recount(&nop[j]);
+                        }
+                    }
                     return ENOMEM;
+                }
                 event->rcvid = ctp->rcvid;
                 event->scoid = ctp->info.scoid;
                 event->coid = ctp->info.coid;

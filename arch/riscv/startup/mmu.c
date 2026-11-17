@@ -20,6 +20,7 @@ paddr_t page_directory;
 uint64_t boot_satp_val;
 
 #define MEGAPAGE_SIZE (2UL * 1024UL * 1024UL)
+#define GIGAPAGE_SIZE (1UL << PXSHIFT(2))
 #define ALIGN_UP_2M(x) (((x) + MEGAPAGE_SIZE - 1) & ~(MEGAPAGE_SIZE - 1))
 #define ALIGN_UP_4K(x) (((x) + 0xFFFUL) & ~0xFFFUL)
 
@@ -96,29 +97,33 @@ static inline int pte_is_leaf(pte_t entry)
 }
 
 /**
- * \brief Split a megapage (2MB leaf at L1) into 512 individual 4KB PTEs.
+ * \brief Split a superpage leaf (2MB at L1, 1GB at L2) into 512 smaller leaves.
  *
- * Allocates a new L0 page table, fills it with 512 entries that reproduce the
- * same mapping as the original megapage, then replaces the L1 leaf with a
- * pointer to the new L0 table.
+ * Allocates a new page table one level down, fills it with 512 entries that
+ * reproduce the same mapping as the original leaf (4KB pages under a megapage,
+ * megapages under a gigapage), then replaces the leaf with a pointer to the new
+ * table. \a level is the level the leaf sits at.
  */
-static void split_megapage(pte_t *l1_table, unsigned l1_idx, pte_t entry)
+static void split_leaf(pte_t *table, unsigned idx, pte_t entry, int level)
 {
-    paddr_t mega_pa = PTE2PA(entry);
-    uint64_t flags =
-        entry & (PTE_R | PTE_W | PTE_X | PTE_U | PTE_V | PTE_A | PTE_D | PTE_G);
+    paddr_t base_pa = PTE2PA(entry);
+    uint64_t step = 1UL << PXSHIFT(level - 1);
+    /* Every bit but the PPN carries over: permissions, and the memory type and
+     * software bits above and below the PPN.
+     */
+    uint64_t flags = entry & ~(PTE_PPN_MASK << 10);
 
     paddr_t new_pt = calloc_ram(__PAGESIZE, __PAGESIZE);
-    pte_t *l0_table = MAKE_1TO1_PTR(new_pt);
+    pte_t *lower = MAKE_1TO1_PTR(new_pt);
 
     for (unsigned i = 0; i < 512; i++) {
-        l0_table[i] = PA2PTE(mega_pa + i * PGSIZE) | flags;
+        lower[i] = PA2PTE(base_pa + i * step) | flags;
     }
 
-    /* Replace the megapage leaf with a pointer to the L0 table */
-    l1_table[l1_idx] = PA2PTE(new_pt) | PTE_V;
+    /* Replace the leaf with a pointer to the new table */
+    table[idx] = PA2PTE(new_pt) | PTE_V;
 
-    /* Flush stale TLB entries for the old megapage */
+    /* Flush stale TLB entries for the old superpage */
     sfence_vma();
 }
 
@@ -152,11 +157,12 @@ static void map_page(paddr_t root,
         pte_t entry = pgtable[idx];
 
         if (entry & PTE_V) {
-            if (level == 1 && !megapage && pte_is_leaf(entry)) {
-                /* Existing 2MB megapage leaf, but we need 4KB granularity.
-                 * Split it into 512 individual page entries.
+            if (pte_is_leaf(entry)) {
+                /* An existing superpage leaf stands where a table must be:
+                 * descending would read its PPN as one. Split it into 512
+                 * leaves of the next size down, until the one we want fits.
                  */
-                split_megapage(pgtable, idx, entry);
+                split_leaf(pgtable, idx, entry, level);
                 entry = pgtable[idx];
             }
             /* Descend to next level */
@@ -189,26 +195,35 @@ static inline size_t range_step(uintptr_t va, uintptr_t next, size_t len)
 /* unmap_range — drop [va, va + len) from the boot page table, before the MMU
  * is on.
  *
- * A megapage wholly inside the range is cleared at level 1; one the range only
- * partly covers is split first, so its other pages stay mapped. Unmapped
- * stretches are skipped. va and len must be page-aligned.
+ * A gigapage or megapage wholly inside the range is cleared at its own level;
+ * one the range only partly covers is split first, so the rest of it stays
+ * mapped. Unmapped stretches are skipped. va and len must be page-aligned.
  */
 static void unmap_range(uintptr_t va, size_t len)
 {
     while (len) {
-        pte_t *l1 = MAKE_1TO1_PTR(page_directory);
-        pte_t entry = l1[PX(2, va)];
+        pte_t *l2 = MAKE_1TO1_PTR(page_directory);
+        pte_t entry = l2[PX(2, va)];
+        pte_t *l1;
         uintptr_t next;
         unsigned idx;
 
         if (!(entry & PTE_V)) {
-            next = (va | ((1UL << PXSHIFT(2)) - 1)) + 1;
+            next = (va | (GIGAPAGE_SIZE - 1)) + 1;
             len = range_step(va, next, len);
             va = next;
             continue;
         }
-        if (pte_is_leaf(entry))
-            crash("unmap_range: gigapage at %lx\n", (unsigned long) va);
+        if (pte_is_leaf(entry)) {
+            if ((va & (GIGAPAGE_SIZE - 1)) == 0 && len >= GIGAPAGE_SIZE) {
+                l2[PX(2, va)] = 0;
+                len -= GIGAPAGE_SIZE;
+                va += GIGAPAGE_SIZE;
+                continue;
+            }
+            split_leaf(l2, PX(2, va), entry, 2);
+            entry = l2[PX(2, va)];
+        }
         l1 = MAKE_1TO1_PTR(PTE2PA(entry));
         idx = PX(1, va);
         entry = l1[idx];
@@ -225,7 +240,7 @@ static void unmap_range(uintptr_t va, size_t len)
                 va += MEGAPAGE_SIZE;
                 continue;
             }
-            split_megapage(l1, idx, entry);
+            split_leaf(l1, idx, entry, 1);
             entry = l1[idx];
         }
         ((pte_t *) MAKE_1TO1_PTR(PTE2PA(entry)))[PX(0, va)] = 0;
@@ -326,8 +341,8 @@ static void unmap_fdt_nomap(void)
 /**
  * \brief Invalidate the PTE for a single 4KB page, creating a guard page.
  *
- * If the page is part of a 2MB megapage, splits it first. After this call, any
- * access to \a va will trigger a page fault.
+ * If the page is part of a 2MB megapage or a 1GB gigapage, splits it first.
+ * After this call, any access to \a va will trigger a page fault.
  */
 void kernel_guard_page(uintptr_t va)
 {
@@ -341,8 +356,8 @@ void kernel_guard_page(uintptr_t va)
         if (!(entry & PTE_V))
             return; /* not mapped at all — already a guard */
 
-        if (level == 1 && pte_is_leaf(entry)) {
-            split_megapage(pgtable, idx, entry);
+        if (pte_is_leaf(entry)) {
+            split_leaf(pgtable, idx, entry, level);
             entry = pgtable[idx];
         }
         pgtable = MAKE_1TO1_PTR(PTE2PA(entry));

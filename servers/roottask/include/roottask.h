@@ -18,6 +18,7 @@ int proc_thread_pool_reserve_done(void);
 /* support.c */
 process_t *root_proc_lookup(pid_t pid);
 process_t *root_proc_lock(pid_t pid);
+void root_mutex_init_pi(pthread_mutex_t *mutex);
 
 /* Lock the parent of "child_pid" (the kernel's current parent). The parent's
  * pid is written through "parent_pid_out" if non-NULL — callers need it for the

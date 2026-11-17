@@ -8,6 +8,8 @@
 /* Debug-only fault injection; built only with CONFIG_DEBUG_INJECT. */
 
 #include <core/globals.h>
+#include "as.h"
+#include <sv39-lookup.h>
 #include <private/inject.h>
 #include <private/kstats.h>
 
@@ -32,10 +34,31 @@ static _Atomic(thread_t *) sched_failed_thr; /* the caller just failed */
 static inline bool inject_op_is_status(unsigned op)
 {
     return op == INJECT_OP_ALLOC_STATUS || op == INJECT_OP_SCHED_SET_STATUS ||
-           op == INJECT_OP_SCHED_SET_DISPLACED;
+           op == INJECT_OP_SCHED_SET_DISPLACED || op == INJECT_OP_PTE_PROBE ||
+           op == INJECT_OP_MANIP_PARTIAL;
 }
 
 atomic_ullong inject_spin_state;
+
+/* How long an injected SchedSet failure holds the caller in the kcall, after
+ * the change is applied, with the other harts kicked (microseconds).
+ */
+#define SCHED_WINDOW_US 500
+
+/* Leave the other harts a window to take a caller that the change exposed. */
+static void inject_sched_window(void)
+{
+    unsigned me = get_cpunum();
+    uint64_t live = cpu_online_snapshot();
+    uint64_t end =
+        r_time() + SCHED_WINDOW_US * (qtimeptr->cycles_per_sec / 1000000);
+
+    for (unsigned h = 0; h < num_processors; h++)
+        if (h != me && cpu_in_mask(live, h))
+            SENDIPI(h, IPI_RESCHED);
+    while (r_time() < end)
+        ;
+}
 
 /* Called from ksys_sched_set once the change is applied; `lowered` says the
  * caller's priority went down. Only a lowering call fails, so the caller can
@@ -58,23 +81,25 @@ bool inject_should_fail_sched_set(thread_t *act, bool lowered)
         memory_order_relaxed));
     atomic_store_explicit(&sched_failed_thr, act, memory_order_release);
     atomic_fetch_add_explicit(&sched_consumed, 1, memory_order_release);
+    inject_sched_window();
     return true;
 }
 
 /* Called from the trap handler on every error return. If that error is the
  * SchedSet failure just injected for act, consume the mark, and count it when
- * the caller was already switched out, so a test can tell a status that
- * survived a switch from one that never met one. Consuming the mark on an
- * undisplaced return keeps it from matching a later, unrelated error.
+ * the caller was already switched out or its switch was still owed to
+ * kernel_exit, so a test can tell a status that met a switch from one that
+ * never did. Consuming the mark on any other return keeps it from matching a
+ * later, unrelated error.
  */
-void inject_note_sched_return(thread_t *act, bool displaced)
+void inject_note_sched_return(thread_t *act, bool switched)
 {
     thread_t *expect = act;
 
     if (atomic_compare_exchange_strong_explicit(&sched_failed_thr, &expect,
                                                 NULL, memory_order_acq_rel,
                                                 memory_order_relaxed) &&
-        displaced)
+        switched)
         atomic_fetch_add_explicit(&sched_displaced, 1, memory_order_release);
 }
 
@@ -96,27 +121,44 @@ int inject_should_fail_turnstile(process_t *prp)
     return 1;
 }
 
-/* The pid whose next contended PI mutex lock stalls, or -1, and for how long.
- * Consumed like armed_ts_pid.
+/* One-shot stalls, one per site: the pid whose next pass through the site
+ * stalls, or -1, and for how long. Consumed like armed_ts_pid. The sites are
+ * the windows of a contended PI mutex lock (published but not queued, before
+ * WAITING is published, after the priority walk) and force_ready's wait-chain
+ * window.
  */
-static atomic_int armed_stall_pid = -1;
-static atomic_uint armed_stall_ms;
+enum stall_site {
+    STALL_LOCK,
+    STALL_LOCK_EARLY,
+    STALL_LOCK_PROPAGATED,
+    STALL_FORCE_READY,
+    STALL_SITES
+};
 
-/* Claim a one-shot stall armed for pid and spin for the armed time. */
-static void inject_stall_once(atomic_int *armed_pid,
-                              atomic_uint *armed_ms,
-                              const process_t *prp)
+static struct {
+    atomic_int pid;
+    atomic_uint ms;
+} stall_site[STALL_SITES] = {
+    [STALL_LOCK] = {.pid = -1},
+    [STALL_LOCK_EARLY] = {.pid = -1},
+    [STALL_LOCK_PROPAGATED] = {.pid = -1},
+    [STALL_FORCE_READY] = {.pid = -1},
+};
+
+/* Claim a one-shot stall armed for the site's pid and spin for its time. */
+static void inject_stall_once(enum stall_site site, const process_t *prp)
 {
-    int pid = atomic_load_explicit(armed_pid, memory_order_acquire);
+    int pid = atomic_load_explicit(&stall_site[site].pid, memory_order_acquire);
     uint64_t ms;
     uint64_t end;
 
     if (pid < 0 || !prp || prp->pid != pid)
         return;
     /* Read the duration the arm published before claiming it. */
-    ms = atomic_load_explicit(armed_ms, memory_order_relaxed);
-    if (!atomic_compare_exchange_strong_explicit(
-            armed_pid, &pid, -1, memory_order_acq_rel, memory_order_relaxed))
+    ms = atomic_load_explicit(&stall_site[site].ms, memory_order_relaxed);
+    if (!atomic_compare_exchange_strong_explicit(&stall_site[site].pid, &pid,
+                                                 -1, memory_order_acq_rel,
+                                                 memory_order_relaxed))
         return;
     end = r_time() + ms * (qtimeptr->cycles_per_sec / 1000);
     atomic_store_explicit(&consumed, 1, memory_order_release);
@@ -126,24 +168,45 @@ static void inject_stall_once(atomic_int *armed_pid,
     inject_spin_end();
 }
 
+/* Arm a stall at site for pid and ms milliseconds; an errno. */
+static int inject_stall_arm(enum stall_site site, uint64_t pid, uint64_t ms)
+{
+    if (ms == 0 || ms > INJECT_SPIN_MAX_MS)
+        return EINVAL;
+    atomic_store_explicit(&consumed, 0, memory_order_relaxed);
+    atomic_store_explicit(&stall_site[site].ms, (unsigned) ms,
+                          memory_order_relaxed);
+    atomic_store_explicit(&stall_site[site].pid, (int) pid,
+                          memory_order_release);
+    return EOK;
+}
+
 /* Called from the contended lock path with the chain lock dropped, after the
  * waiter published itself and before it queues.
  */
 void inject_mutex_lock_stall(process_t *prp)
 {
-    inject_stall_once(&armed_stall_pid, &armed_stall_ms, prp);
+    inject_stall_once(STALL_LOCK, prp);
 }
 
-/* Like armed_stall_pid, for force_ready's wait-chain window. */
-static atomic_int armed_fr_pid = -1;
-static atomic_uint armed_fr_ms;
+/* Called with the chain lock held, before WAITING is published. */
+void inject_mutex_lock_early(process_t *prp)
+{
+    inject_stall_once(STALL_LOCK_EARLY, prp);
+}
+
+/* Called with the chain lock dropped, after the priority walk. */
+void inject_mutex_lock_propagated(process_t *prp)
+{
+    inject_stall_once(STALL_LOCK_PROPAGATED, prp);
+}
 
 /* Called from sync_chain_force_ready after it read the waiter's key, before it
  * takes the chain lock.
  */
 void inject_force_ready_stall(thread_t *thp)
 {
-    inject_stall_once(&armed_fr_pid, &armed_fr_ms, thp->process);
+    inject_stall_once(STALL_FORCE_READY, thp->process);
 }
 
 /* Called from object_alloc before it touches the free list. Ordinary allocation
@@ -167,6 +230,129 @@ int inject_should_fail_alloc(process_t *prp, soul_t *soulp)
         return 0;
     atomic_store_explicit(&consumed, 1, memory_order_release);
     return 1;
+}
+
+/* Pages done by the most recent failed MAP, as cpu_pte_manipulate reported it.
+ */
+static atomic_uint manip_partial;
+
+void inject_note_manip_failure(unsigned pages)
+{
+    atomic_store_explicit(&manip_partial, pages, memory_order_release);
+}
+
+/* pid's address space, or NULL. Opens the RCU read section, which the caller
+ * closes either way.
+ */
+static address_t *inject_pid_memory(uint64_t pid)
+{
+    process_t *prp = lookup_pid_rcu((pid_t) pid);
+
+    return prp ? prp->memory : NULL;
+}
+
+/* The armed FAIL_PTE_MAP: the process, and how many pages it may map. */
+static atomic_int armed_map_pid = -1;
+static atomic_uint armed_map_pages;
+static _Atomic uintptr_t armed_map_va; /* 0: any start */
+
+/* Called from cpu_pte_manipulate for a MAP of [start, *endp] in adp (*endp is
+ * the last byte, as in struct mm_pte_manipulate): if a failure is armed for adp
+ * and the range is longer than the armed pages, cut *endp there and take the
+ * arm (once), and the caller reports ENOMEM.
+ */
+bool inject_pte_map_stop(const void *adp, uintptr_t start, uintptr_t *endp)
+{
+    int armed = atomic_load_explicit(&armed_map_pid, memory_order_acquire);
+    process_t *prp;
+    bool match;
+    unsigned pages;
+    uintptr_t va;
+
+    if (!adp || armed < 0)
+        return false;
+
+    /* The pid, not the address space, stays armed: a pid carries a generation,
+     * so an arm that outlives its process matches nothing. The process can go
+     * away under us, so read it inside the RCU section lookup_pid_rcu opens.
+     */
+    prp = lookup_pid_rcu(armed);
+    match = prp && prp->memory == adp;
+    rcu_sched_read_unlock();
+    if (!match)
+        return false;
+    pages = atomic_load_explicit(&armed_map_pages, memory_order_relaxed);
+    va = atomic_load_explicit(&armed_map_va, memory_order_relaxed);
+    if (va && va != start)
+        return false;
+    /* *endp is the last byte of the range, not one past it. */
+    if (*endp < start || (*endp - start + 1) / __PAGESIZE <= pages)
+        return false;
+
+    /* Only the caller that swaps this arm away takes it; a newer arm for
+     * another address space stays.
+     */
+    if (!atomic_compare_exchange_strong_explicit(&armed_map_pid, &armed, -1,
+                                                 memory_order_acq_rel,
+                                                 memory_order_relaxed))
+        return false;
+    atomic_store_explicit(&consumed, 1, memory_order_release);
+    *endp = start + pages * __PAGESIZE;
+    return true;
+}
+
+/* inject_pte — PTE_SUPERPAGE, PTE_CLEAR_SUPERPAGE and PTE_PROBE on the page
+ * table of process pid.
+ *
+ * Returns an errno (EOK on success), or for PTE_PROBE 0 or 1 through *probedp.
+ * The table is read and written under as_slock, the lock ksys_manipulate holds
+ * for every other change to it.
+ */
+static int inject_pte(unsigned op, uint64_t pid, uint64_t va, int *probedp)
+{
+    address_t *adp;
+    pagetable_t pgdir;
+    int ret = EOK;
+    bool flush = false;
+
+    if (pid > INT32_MAX || va >= MAXVA ||
+        (op != INJECT_OP_PTE_PROBE && (va & (sv39_leaf_size(1) - 1))))
+        return EINVAL;
+    adp = inject_pid_memory(pid);
+    if (!adp) {
+        rcu_sched_read_unlock();
+        return ESRCH;
+    }
+    pgdir = adp->cpu.pgdir;
+    kspinlock_lock(&as_slock);
+    if (op == INJECT_OP_PTE_PROBE) {
+        *probedp = sv39_lookup_leaf(pgdir, (uintptr_t) va, NULL, NULL) != NULL;
+    } else {
+        pte_t top = pgdir[PX(2, va)];
+
+        if (!(top & PTE_V) || sv39_is_leaf(top)) {
+            ret = EINVAL;
+        } else {
+            pte_t *slot = &((pagetable_t) PA_TO_VA(PTE2PA(top)))[PX(1, va)];
+
+            if (op == INJECT_OP_PTE_SUPERPAGE && !(*slot & PTE_V)) {
+                *slot = PA2PTE(0) | PTE_V | PTE_R | PTE_U | PTE_A;
+                atomic_store_explicit(&manip_partial, 0, memory_order_relaxed);
+                flush = true;
+            } else if (op == INJECT_OP_PTE_CLEAR_SUPERPAGE && (*slot & PTE_V) &&
+                       sv39_is_leaf(*slot)) {
+                *slot = 0;
+                flush = true;
+            } else {
+                ret = EBUSY;
+            }
+        }
+    }
+    kspinlock_unlock(&as_slock);
+    rcu_sched_read_unlock();
+    if (flush)
+        cpu_tlb_flush_complete();
+    return ret;
 }
 
 /* kext_debug_inject — the DEBUG_INJECT private call. */
@@ -229,26 +415,16 @@ void kext_debug_inject(void *data)
                               memory_order_release);
         break;
     case INJECT_OP_STALL_MUTEX_LOCK:
-        if (kap->arg1 == 0 || kap->arg1 > INJECT_SPIN_MAX_MS) {
-            ret = EINVAL;
-            break;
-        }
-        atomic_store_explicit(&consumed, 0, memory_order_relaxed);
-        atomic_store_explicit(&armed_stall_ms, (unsigned) kap->arg1,
-                              memory_order_relaxed);
-        atomic_store_explicit(&armed_stall_pid, (int) kap->arg0,
-                              memory_order_release);
+        ret = inject_stall_arm(STALL_LOCK, kap->arg0, kap->arg1);
+        break;
+    case INJECT_OP_STALL_MUTEX_EARLY:
+        ret = inject_stall_arm(STALL_LOCK_EARLY, kap->arg0, kap->arg1);
+        break;
+    case INJECT_OP_STALL_MUTEX_PROPAGATED:
+        ret = inject_stall_arm(STALL_LOCK_PROPAGATED, kap->arg0, kap->arg1);
         break;
     case INJECT_OP_STALL_FORCE_READY:
-        if (kap->arg1 == 0 || kap->arg1 > INJECT_SPIN_MAX_MS) {
-            ret = EINVAL;
-            break;
-        }
-        atomic_store_explicit(&consumed, 0, memory_order_relaxed);
-        atomic_store_explicit(&armed_fr_ms, (unsigned) kap->arg1,
-                              memory_order_relaxed);
-        atomic_store_explicit(&armed_fr_pid, (int) kap->arg0,
-                              memory_order_release);
+        ret = inject_stall_arm(STALL_FORCE_READY, kap->arg0, kap->arg1);
         break;
     case INJECT_OP_ALLOC_STATUS:
         ret = atomic_load_explicit(&consumed, memory_order_acquire);
@@ -270,6 +446,45 @@ void kext_debug_inject(void *data)
         break;
     case INJECT_OP_SCHED_SET_DISPLACED:
         ret = atomic_load_explicit(&sched_displaced, memory_order_acquire);
+        break;
+    case INJECT_OP_PTE_SUPERPAGE:
+    case INJECT_OP_PTE_CLEAR_SUPERPAGE:
+        ret = inject_pte(kap->op, kap->arg0, kap->arg1, NULL);
+        break;
+    case INJECT_OP_PTE_PROBE: {
+        int mapped = 0;
+
+        ret = inject_pte(kap->op, kap->arg0, kap->arg1, &mapped);
+        ret = ret == EOK ? mapped : -ret; /* a status: errors read negative */
+        break;
+    }
+    case INJECT_OP_FAIL_PTE_MAP: {
+        address_t *adp;
+
+        if (kap->arg0 > INT32_MAX) {
+            ret = EINVAL;
+            break;
+        }
+        adp = inject_pid_memory(kap->arg0);
+        if (!adp) {
+            ret = ESRCH;
+        } else {
+            atomic_store_explicit(&consumed, 0, memory_order_relaxed);
+            atomic_store_explicit(&manip_partial, 0, memory_order_relaxed);
+            atomic_store_explicit(&armed_map_pages,
+                                  (unsigned) (kap->arg1 & (__PAGESIZE - 1)),
+                                  memory_order_relaxed);
+            atomic_store_explicit(&armed_map_va,
+                                  (uintptr_t) (kap->arg1 & ~(__PAGESIZE - 1)),
+                                  memory_order_relaxed);
+            atomic_store_explicit(&armed_map_pid, (int) kap->arg0,
+                                  memory_order_release);
+        }
+        rcu_sched_read_unlock();
+        break;
+    }
+    case INJECT_OP_MANIP_PARTIAL:
+        ret = (int) atomic_load_explicit(&manip_partial, memory_order_acquire);
         break;
     default:
         ret = EINVAL;

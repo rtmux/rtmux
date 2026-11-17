@@ -2546,6 +2546,22 @@ void rdecl unready(thread_t *thp, int newstate)
  */
 
 
+/* A kcall that asked for its own displacement to wait (see
+ * RTMUX_ITF_DEFER_DISPLACE): post it for resched() at kernel_exit, which runs
+ * after the trap handler has stored the kcall's status.
+ *
+ * Returns whether it was deferred.
+ */
+static bool sched_defer_displacement(thread_t *act)
+{
+    if (!(act->internal_flags & RTMUX_ITF_DEFER_DISPLACE))
+        return false;
+    ITF_SET(act, RTMUX_ITF_YIELD_TAIL);
+    atomic_fetch_or_explicit(&act->async_flags, RTMUX_ATF_SMP_RESCHED,
+                             memory_order_release);
+    return true;
+}
+
 static void rdecl yield_default(void)
 {
     thread_t *act = get_active_thread(get_cpunum());
@@ -2581,7 +2597,7 @@ static void rdecl yield_default(void)
 #else
         thp = DISPATCH_THP(dpp, prio);
 #endif
-        if (!thp) {
+        if (!thp || sched_defer_displacement(act)) {
             SCHED_UNLOCK_LOCAL();
             return;
         }
@@ -2617,6 +2633,15 @@ static void rdecl resched_default(void)
     thread_t *thp;
     kdispatch_t *dpp = act->dpp;
     uint8_t prio = act->priority;
+    bool yield_tail;
+
+    /* A deferred displacement (see RTMUX_ITF_DEFER_DISPLACE): act asked to go
+     * behind the threads at its new level, so those are eligible too, and it
+     * queues at the tail like a thread whose slice ended.
+     */
+    yield_tail = (act->internal_flags & RTMUX_ITF_YIELD_TAIL) != 0;
+    if (yield_tail)
+        ITF_CLR(act, RTMUX_ITF_YIELD_TAIL);
 
     /* DO NOT preempt a thread that is mid-sync- transition. The WAIT_PENDING
      * flag is set inside cv_wait / mutex_lock / sem_wait between
@@ -2718,7 +2743,7 @@ static void rdecl resched_default(void)
      * select from to those higher than act's priority in that case.
      */
     prio = (uint8_t) ((act->runmask & (1u << get_cpunum())) ? 0
-                      : (act->policy == SCHED_FIFO)
+                      : (act->policy == SCHED_FIFO && !yield_tail)
                           ? min(act->priority + 1, NUM_PRI - 1)
                           : act->priority);
 
@@ -2740,7 +2765,8 @@ static void rdecl resched_default(void)
          * assumption is we've consummed our sched quantum. Otherwise, we've
          * been preempted and go back to the head of the queue.
          */
-        if (IS_SCHED_RR(act) && RR_GET_TICKS(act) >= RR_MAXTICKS) {
+        if (yield_tail ||
+            (IS_SCHED_RR(act) && RR_GET_TICKS(act) >= RR_MAXTICKS)) {
             RR_RESET_TICK(act);
             LINK3_END(DISPATCH_LST(dpp, act->priority), &act->link3_link,
                       thread_t);
@@ -2927,6 +2953,11 @@ static void rdecl adjust_priority_default(thread_t *thp,
                 act->priority = (uint8_t) prio;
                 break;
             }
+            if (sched_defer_displacement(act)) {
+                act->priority = (uint8_t) prio;
+                _TRACE_TH_EMIT_ANY_STATE(act, act->state);
+                break;
+            }
             /* Did we lower our prio below another thread which can run? */
             thp = select_thread((int) get_cpunum(), (int) prio);
             if (thp && thp->priority >= prio) {
@@ -2964,7 +2995,8 @@ static void rdecl adjust_priority_default(thread_t *thp,
             _TRACE_TH_EMIT_ANY_STATE(act, act->state);
         }
 #else
-        if (prio < act->priority && prio <= DISPATCH_HIGHEST_PRI(dpp)) {
+        if (prio < act->priority && !sched_defer_displacement(act) &&
+            prio <= DISPATCH_HIGHEST_PRI(dpp)) {
             thread_t *oldact = act;
 
             /* Put active into ready queue */

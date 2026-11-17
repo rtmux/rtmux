@@ -150,7 +150,9 @@ static const struct toolbox_applet applets[] = {
      "fail-alloc POOL PID | fail-turnstile PID | alloc-status | "
      "fail-sched-set PID COUNT | sched-set-status | "
      "sched-set-displaced MIN | stall-lock PID MS | "
-     "stall-force-ready PID MS"},
+     "stall-force-ready PID MS | pte-superpage PID VA | "
+     "pte-clear-superpage PID VA | pte-probe PID VA | "
+     "fail-pte-map PID PAGES | manip-partial MIN"},
     {"kill", applet_kill, "kill [-SIG] PID ..."},
     {"login", applet_login, "login [USER]"},
     {"less", applet_less, "less [FILE ...]"},
@@ -3150,21 +3152,57 @@ static int applet_inject(int argc, char **argv)
     } else if (argc == 4 && !strcmp(argv[1], "stall-lock")) {
         rc = inject_call(INJECT_OP_STALL_MUTEX_LOCK, strtoul(argv[2], NULL, 0),
                          strtoul(argv[3], NULL, 0));
+    } else if (argc == 4 && !strcmp(argv[1], "stall-lock-early")) {
+        rc = inject_call(INJECT_OP_STALL_MUTEX_EARLY, strtoul(argv[2], NULL, 0),
+                         strtoul(argv[3], NULL, 0));
+    } else if (argc == 4 && !strcmp(argv[1], "stall-lock-propagated")) {
+        rc = inject_call(INJECT_OP_STALL_MUTEX_PROPAGATED,
+                         strtoul(argv[2], NULL, 0), strtoul(argv[3], NULL, 0));
     } else if (argc == 4 && !strcmp(argv[1], "stall-force-ready")) {
         rc = inject_call(INJECT_OP_STALL_FORCE_READY, strtoul(argv[2], NULL, 0),
                          strtoul(argv[3], NULL, 0));
-    } else if (argc == 2 && !strcmp(argv[1], "alloc-status")) {
+    } else if (argc == 4 && !strcmp(argv[1], "pte-superpage")) {
+        rc = inject_call(INJECT_OP_PTE_SUPERPAGE, strtoul(argv[2], NULL, 0),
+                         strtoul(argv[3], NULL, 0));
+    } else if (argc == 4 && !strcmp(argv[1], "pte-clear-superpage")) {
+        rc = inject_call(INJECT_OP_PTE_CLEAR_SUPERPAGE,
+                         strtoul(argv[2], NULL, 0), strtoul(argv[3], NULL, 0));
+    } else if (argc == 4 && !strcmp(argv[1], "pte-probe")) {
+        /* Exit 0 when PID's page table has no leaf at VA, 3 when it has one. */
+        rc = inject_call(INJECT_OP_PTE_PROBE, strtoul(argv[2], NULL, 0),
+                         strtoul(argv[3], NULL, 0));
+        if (rc >= 0)
+            printf("pte-mapped=%d\n", rc);
+        return rc < 0 ? 1 : (rc ? 3 : 0);
+    } else if (argc == 4 && !strcmp(argv[1], "fail-pte-map")) {
+        rc = inject_call(INJECT_OP_FAIL_PTE_MAP, strtoul(argv[2], NULL, 0),
+                         strtoul(argv[3], NULL, 0));
+    } else if (argc == 3 && !strcmp(argv[1], "manip-partial")) {
+        /* Exit 0 when the last failed MAP had done at least MIN pages. */
+        rc = inject_call(INJECT_OP_MANIP_PARTIAL, 0, 0);
+        if (rc >= 0)
+            printf("manip-partial=%d\n", rc);
+        return rc >= 0 && (unsigned long) rc >= strtoul(argv[2], NULL, 0) ? 0
+                                                                          : 3;
+    } else if ((argc == 2 || argc == 3) && !strcmp(argv[1], "alloc-status")) {
+        /* With "consumed", also exit nonzero until an armed injection fired. */
         rc = inject_call(INJECT_OP_ALLOC_STATUS, 0, 0);
         if (rc >= 0)
             printf("alloc-consumed=%d\n", rc);
+        if (argc == 3)
+            return rc == 1 && !strcmp(argv[2], "consumed") ? 0 : 3;
         return rc < 0 ? 1 : 0;
     } else {
         fprintf(stderr,
                 "usage: inject spin-irqoff HART MS | spin-console HART MS | "
                 "hang-hart HART | fail-alloc POOL PID | fail-turnstile PID | "
-                "alloc-status | fail-sched-set PID COUNT | sched-set-status | "
+                "alloc-status [consumed] | fail-sched-set PID COUNT | "
+                "sched-set-status | "
                 "sched-set-displaced MIN | stall-lock PID MS | "
-                "stall-force-ready PID MS\n");
+                "stall-force-ready PID MS | pte-superpage PID VA | "
+                "pte-clear-superpage PID VA | pte-probe PID VA | "
+                "fail-pte-map PID PAGES | manip-partial MIN | "
+                "stall-lock-early PID MS | stall-lock-propagated PID MS\n");
         return 2;
     }
     return rc == 0 ? 0 : 1;

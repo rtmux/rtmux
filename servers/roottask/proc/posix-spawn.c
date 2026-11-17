@@ -98,7 +98,10 @@ static int fill_struct_inheritance(struct inheritance *inherit,
     if ((r = posix_spawnattr_getflags(attrp, &flags)) != EOK) {
         return r;
     }
-    inherit->flags = (unsigned long) flags;
+    /* The flags come from the client's message: zero extend them, so a set top
+     * bit cannot turn into the high bits above the field.
+     */
+    inherit->flags = (unsigned long) (unsigned short) flags;
     CRASHCHECK(inherit->flags &
                SPAWN_SEARCH_PATH); /* posix spawn message always has a fully
                                       qualified path
