@@ -383,6 +383,9 @@ void sync_chains_assert_readied(const thread_t *thp);
     thr_trace(__FILE__, __LINE__, (thp), __builtin_return_address(0))
 bool inject_should_fail_sched_set(thread_t *act, bool lowered);
 void inject_note_sched_return(thread_t *act, bool switched);
+void inject_in_departure(int on);
+void inject_note_prio_work(void);
+void inject_note_prio_deferred_run(void);
 int inject_should_fail_turnstile(process_t *prp); /* debug/inject.c */
 void inject_note_manip_failure(unsigned pages);
 bool inject_pte_map_stop(const void *adp, uintptr_t start, uintptr_t *endp);
@@ -419,6 +422,12 @@ static inline void inject_note_sched_return(thread_t *act, bool switched)
     (void) act;
     (void) switched;
 }
+static inline void inject_in_departure(int on)
+{
+    (void) on;
+}
+static inline void inject_note_prio_work(void) {}
+static inline void inject_note_prio_deferred_run(void) {}
 static inline void inject_note_manip_failure(unsigned pages)
 {
     (void) pages;

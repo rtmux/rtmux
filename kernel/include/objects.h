@@ -817,6 +817,14 @@ typedef struct thread_entry { /* Also used for vthread_entry */
     uint8_t pend_loan;
     uint8_t pi_loan;
 
+    /* Link in a hart's list of servers whose priority settle a client's
+     * departure deferred (thread_prio_defer_settle), and that hart plus one, or
+     * 0 when not queued. Both are written under prio_defer_slock. Appended at
+     * the tail like the fields above.
+     */
+    thread_t *prio_defer_next;
+    uint8_t prio_defer_cpu;
+
     /* timestamp_last_block value the stall detector has already reported for
      * this thread (stall_scan_roottask_waiters, CONFIG_STALL_DETECTOR). Written
      * only by that scan, which runs on the boot hart alone; 0 = never reported.

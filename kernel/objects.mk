@@ -45,7 +45,7 @@ endif
 KER_OBJECT_SRC = object/alloc object/core object/vector \
                  object/query object/lookup
 
-KER_THREAD_SRC = thread/lifecycle thread/special-return
+KER_THREAD_SRC = thread/lifecycle thread/special-return thread/prio-defer
 
 KER_IPC_CORE_SRC = ipc/connect-core ipc/message-core ipc/notification ipc/event
 

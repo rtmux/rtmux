@@ -1411,44 +1411,17 @@ reread_state:
              * newer client the server has meanwhile taken is not overwritten.
              */
             thread_t *srv = thp->args.ms.server;
-            thread_t *expect = thp;
 
-            bool is_thr = TYPE_MASK(srv->type) == TYPE_THREAD;
-
-            /* Read the loan before the client link, as the REPLY walk does: a
-             * receive sets the new client before it bumps the generation.
+            /* The server stops serving thp and its loan ends here; the priority
+             * it is owed now, and the chain it may be blocked in, are settled
+             * in thread context (thread_prio_defer_settle). This runs from
+             * timer and event delivery under caller locks, where taking the PI
+             * lock and walking the chain are not allowed.
              */
-            uint64_t seen = is_thr ? thread_msg_loan_word(srv) : 0;
-
-            if (__atomic_compare_exchange_n(&srv->client, &expect, NULL, 0,
-                                            __ATOMIC_ACQ_REL,
-                                            __ATOMIC_RELAXED)) {
-                bool ended = thread_end_msg_loan(srv, seen);
-
-                /* The receive that made thp the client may install its loan
-                 * after `seen` was read, even when the old loan just ended
-                 * here. A request loan with no client is that one, so end it
-                 * too. The fence pairs with the one in
-                 * thread_drop_gone_client_loan.
-                 */
-                if (is_thr) {
-                    uint64_t now;
-
-                    cpu_smp_mb();
-                    now = thread_msg_loan_word(srv);
-                    if (__atomic_load_n(&srv->client, __ATOMIC_ACQUIRE) == NULL)
-                        ended |= thread_end_msg_loan(srv, now);
-                }
-
-                /* Return the server to the priority it is owed now. The chain
-                 * is not followed: force_ready runs from timer and event
-                 * delivery under caller locks, so a second server this one
-                 * waits on keeps the lent priority until it replies (an
-                 * over-boost, never a deficit).
-                 */
-                if (ended)
-                    thread_prio_settle(srv);
-            }
+            inject_in_departure(1);
+            if (thread_client_departed(srv, thp))
+                thread_prio_defer_settle(srv);
+            inject_in_departure(0);
             thp->args.ms.server = NULL;
         }
         if (thp->restart) {

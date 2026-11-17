@@ -1960,6 +1960,7 @@ void rdecl thread_destroy(thread_t *thp)
         stats_destroy_t0 = cpu_clock_ticks();
         (void) rcu_sched_synchronize_detail(&stats_busy);
         stats_destroy_t1 = cpu_clock_ticks();
+        thread_prio_defer_cancel(thp);
         stats_pin_waited = tthread_wait_unpinned(thp);
 
         /* Freed-active gate. The RCU drain above covers in-flight kernel
@@ -1994,6 +1995,7 @@ void rdecl thread_destroy(thread_t *thp)
         stats_have = true;
     } else {
         rcu_sched_synchronize();
+        thread_prio_defer_cancel(thp);
         (void) tthread_wait_unpinned(thp);
         thread_destroy_wait_inactive(thp, prp);
         thread_soul_free(prp, thp);

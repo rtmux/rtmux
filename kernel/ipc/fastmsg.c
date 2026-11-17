@@ -2162,7 +2162,7 @@ restart_recv:
             else
                 CRITICAL_CLEAR(act);
             thread_lend_msg(act, thp->priority, true); /* act->client = thp */
-            thread_drop_gone_client_loan(act, thp);
+            (void) thread_end_orphan_loan(act);
             (void) thread_prio_update_dpp(act, thp->dpp, 1);
         } else {
             CRITICAL_CLEAR(act);
