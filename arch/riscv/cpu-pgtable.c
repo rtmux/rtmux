@@ -24,6 +24,7 @@
 
 #include <core/globals.h>
 #include <paging.h>
+#define PA_TO_VA(pa) PHYS_TO_PTR(pa)
 #include <sv39-lookup.h>
 
 /* cpu_pgdir_create — allocate a user root page table with kernel mappings.
@@ -94,30 +95,27 @@ pagetable_t cpu_pgdir_create(void)
     return pgdir;
 }
 
+/* walk_new_table — zeroed intermediate table from the kernel heap, for
+ * sv39_walk_slot. Returns the linking PTE, or 0 when the heap is out.
+ */
+static pte_t walk_new_table(void)
+{
+    void *table = _scalloc_page();
+
+    return table ? PA2PTE(PTR_TO_PHYS(table)) | PTE_V : 0;
+}
+
 /* walk — traverse the page table, optionally creating intermediate levels.
  *
  * Returns a pointer to the L0 PTE for the given VA, or NULL if alloc is false
- * and the mapping doesn't exist.
+ * and the mapping doesn't exist, if a superpage leaf covers the VA, or if an
+ * allocation fails.
  */
 static pte_t *walk(pagetable_t pgdir, uintptr_t va, int alloc)
 {
     if (va >= MAXVA)
         return NULL;
-
-    for (int level = 2; level > 0; level--) {
-        pte_t *pte = &pgdir[PX(level, va)];
-        if (*pte & PTE_V) {
-            pgdir = (pagetable_t) PHYS_TO_PTR(PTE2PA(*pte));
-        } else {
-            if (!alloc)
-                return NULL;
-            pgdir = (pagetable_t) _scalloc_page();
-            if (!pgdir)
-                return NULL;
-            *pte = PA2PTE(PTR_TO_PHYS(pgdir)) | PTE_V;
-        }
-    }
-    return &pgdir[PX(0, va)];
+    return sv39_walk_slot(pgdir, va, alloc ? walk_new_table : NULL, NULL);
 }
 
 /* cpu_map_pages — map VA → PA with given PTE flags in the page table.
@@ -192,7 +190,7 @@ void cpu_pgdir_free(pagetable_t pgdir)
      * latter case, then the L1, then the pgdir itself.
      */
     pte_t l2_entry = pgdir[0];
-    if ((l2_entry & PTE_V) && !(l2_entry & (PTE_R | PTE_W | PTE_X))) {
+    if ((l2_entry & PTE_V) && !sv39_is_leaf(l2_entry)) {
         pagetable_t l1 = (pagetable_t) PHYS_TO_PTR(PTE2PA(l2_entry));
 
         /* A hart may still cache translations walked through these tables.
@@ -203,7 +201,7 @@ void cpu_pgdir_free(pagetable_t pgdir)
         cpu_tlb_flush_complete();
         for (int j = 0; j < 512; j++) {
             pte_t l1_entry = l1[j];
-            if ((l1_entry & PTE_V) && !(l1_entry & (PTE_R | PTE_W | PTE_X))) {
+            if ((l1_entry & PTE_V) && !sv39_is_leaf(l1_entry)) {
                 pgtable_page_free(l1_entry);
             }
         }

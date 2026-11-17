@@ -20,6 +20,7 @@
 #ifndef _RISCV_SV39_LOOKUP_H
 #define _RISCV_SV39_LOOKUP_H
 
+#include <errno.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <cpu-paging.h>
@@ -28,6 +29,14 @@
 static inline uint64_t sv39_leaf_size(int level)
 {
     return (uint64_t) 1 << PXSHIFT(level);
+}
+
+/* sv39_is_leaf — whether e, a valid entry, is a leaf (any of R/W/X) rather
+ * than a pointer to the next table.
+ */
+static inline int sv39_is_leaf(pte_t e)
+{
+    return (e & (PTE_R | PTE_W | PTE_X)) != 0;
 }
 
 /* sv39_leaf_ok — whether e, a valid entry with R/W/X at level, is a leaf the
@@ -82,8 +91,7 @@ static inline pte_t *sv39_lookup_leaf(pagetable_t pgdir,
 
         if (!(e & PTE_V))
             return NULL;
-        /* A leaf has any of R/W/X; an interior entry has none. */
-        if (e & (PTE_R | PTE_W | PTE_X)) {
+        if (sv39_is_leaf(e)) {
             if (!sv39_leaf_ok(e, level))
                 return NULL;
             if (levelp)
@@ -95,6 +103,53 @@ static inline pte_t *sv39_lookup_leaf(pagetable_t pgdir,
         pgdir = (pagetable_t) PA_TO_VA(PTE2PA(e));
     }
     return NULL;
+}
+
+/* sv39_alloc_fn — returns the PTE value that links a new, zeroed table (valid
+ * bit, the table's PPN and any caller flags), or 0 when none can be had.
+ */
+typedef pte_t (*sv39_alloc_fn)(void);
+
+/* sv39_walk_slot — walk pgdir down to the L0 slot for va.
+ *
+ * Returns a pointer to the L0 PTE, which may itself be invalid, or NULL with
+ * *errp (when non-NULL) set. A missing interior table is created through alloc
+ * when it is non-NULL, otherwise the walk ends with ENOENT. A superpage leaf at
+ * L2 or L1 already covers va, and its PPN names mapped memory, not a table, so
+ * the walk stops there instead of descending, with EEXIST whether or not alloc
+ * is set, so a caller that unmaps or re-protects tells a covering superpage
+ * apart from a missing table (ENOENT). ENOMEM when alloc returns 0.
+ */
+static inline pte_t *sv39_walk_slot(pagetable_t pgdir,
+                                    uintptr_t va,
+                                    sv39_alloc_fn alloc,
+                                    int *errp)
+{
+    for (int level = 2; level > 0; level--) {
+        pte_t *pte = &pgdir[PX(level, va)];
+        pte_t e = *pte; /* one load: the checks and the descent agree */
+
+        if (!(e & PTE_V)) {
+            if (!alloc) {
+                if (errp)
+                    *errp = ENOENT;
+                return NULL;
+            }
+            e = alloc();
+            if (!e) {
+                if (errp)
+                    *errp = ENOMEM;
+                return NULL;
+            }
+            *pte = e;
+        } else if (sv39_is_leaf(e)) {
+            if (errp)
+                *errp = EEXIST;
+            return NULL;
+        }
+        pgdir = (pagetable_t) PA_TO_VA(PTE2PA(e));
+    }
+    return &pgdir[PX(0, va)];
 }
 #endif
 

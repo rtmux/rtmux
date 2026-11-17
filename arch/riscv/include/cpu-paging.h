@@ -35,7 +35,12 @@
 /* shift a physical address to the right place for a PTE. */
 #define PA2PTE(pa) ((((uint64_t) pa) >> 12) << 10)
 
-#define PTE2PA(pte) (((pte) >> 10) << 12)
+/* The PPN field is bits 10..53. Bits 54..63 hold attributes (Svpbmt PBMT,
+ * Svnapot N), so they must not reach the address.
+ */
+#define PTE_PPN_MASK ((1UL << 44) - 1)
+
+#define PTE2PA(pte) (((((uint64_t) (pte)) >> 10) & PTE_PPN_MASK) << 12)
 
 #define PTE_FLAGS(pte) ((pte) & 0x3FF)
 

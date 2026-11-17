@@ -24,9 +24,9 @@
  */
 
 #include <core/globals.h>
-#include "as.h"         /* address_t, pagetable_t, pte_t, paddr_t */
-#include <cpu-paging.h> /* PX / PXSHIFT / PTE2PA / PTE_V/R/W/X / PGSIZE */
-#include <unistd.h>     /* iov_t, GETIOVBASE / GETIOVLEN / SETIOV */
+#include "as.h"          /* address_t, pagetable_t, pte_t, paddr_t */
+#include <sv39-lookup.h> /* cpu_pte_lookup, sv39_leaf_paddr, PGSIZE */
+#include <unistd.h>      /* iov_t, GETIOVBASE / GETIOVLEN / SETIOV */
 
 /* vm-hooks.h flags — duplicated here to avoid header churn */
 #ifndef MAPADDR_FLAGS_SYSPRP
@@ -52,41 +52,18 @@
  * remaining in that mapping (4 KiB for L0 leaf, 2 MiB for L1 megapage, 1 GiB
  * for L2 gigapage); (paddr_t)-1 on miss.
  *
- * Mirrors servers/roottask/mem/riscv/as-map-xfer.c's helper, kept inline here
- * so the kernel doesn't depend on roottask text.
+ * The walk is the shared one in sv39-lookup.h, so a W-only leaf or a misaligned
+ * superpage misses here exactly as the hardware would fault on it.
  */
+/*@ requires contig == \null || \valid(contig); */
 static paddr_t sv39_va_to_pa(pagetable_t pgdir, uintptr_t va, size_t *contig)
 {
-    /* PXSHIFT(level) is 12 + 9*level, so every shift below depends on level
-     * staying in 1..2. The bound is written into the loop header, but a prover
-     * will not read it off the header for a shift inside the body.
-     */
-    /*@ loop invariant 0 <= level <= 2;
-        loop assigns level, pgdir;
-        loop variant level;
-     */
-    for (int level = 2; level > 0; level--) {
-        pte_t pte = pgdir[PX(level, va)];
-        if (!(pte & PTE_V))
-            return (paddr_t) -1;
-        if (pte & (PTE_R | PTE_W | PTE_X)) {
-            size_t pgsize = 1UL << PXSHIFT(level);
-            paddr_t pa = PTE2PA(pte) | (va & (pgsize - 1));
-            if (contig)
-                *contig = pgsize - (va & (pgsize - 1));
-            return pa;
-        }
-        pgdir = (pagetable_t) ((uintptr_t) PTE2PA(pte) + KERNEL_VIRT_BASE);
-    }
+    int level;
+    pte_t e;
 
-    pte_t pte = pgdir[PX(0, va)];
-    if (!(pte & PTE_V))
+    if (!cpu_pte_lookup(pgdir, va, &level, &e))
         return (paddr_t) -1;
-
-    paddr_t pa = PTE2PA(pte) | (va & (PGSIZE - 1));
-    if (contig)
-        *contig = PGSIZE - (va & (PGSIZE - 1));
-    return pa;
+    return (paddr_t) sv39_leaf_paddr(e, level, va, contig);
 }
 
 /* fetch_iov — copy one iov_t entry out of prp's address space into "out".
