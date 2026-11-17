@@ -25,6 +25,7 @@
 
 #include <core/globals.h>
 #include "as.h"          /* address_t, pagetable_t, pte_t, paddr_t */
+#include <limits.h>      /* INT_MAX */
 #include <sv39-lookup.h> /* cpu_pte_lookup, sv39_leaf_paddr, PGSIZE */
 #include <unistd.h>      /* iov_t, GETIOVBASE / GETIOVLEN / SETIOV */
 
@@ -143,6 +144,22 @@ static int fetch_iov(pagetable_t pgdir,
     return 0;
 }
 
+/* The whole entry, not only the part that is still to move, must lie inside the
+ * boundary: its base plus an offset can wrap into range while the entry itself
+ * does not. An empty entry moves nothing and is not checked.
+ */
+static bool entry_in_bound(const iov_t *e, unsigned flags, uintptr_t bound)
+{
+    uintptr_t base = (uintptr_t) GETIOVBASE(e), last;
+    size_t len = GETIOVLEN(e);
+
+    if (len == 0)
+        return true;
+    last = base + len - 1;
+    return last >= base && ((flags & MAPADDR_FLAGS_SYSPRP) ||
+                            WITHIN_BOUNDARY(base, last, bound));
+}
+
 /* mm_map_xfer — translate a process's user-VA IOV list into kernel- direct-map
  * IOV entries for cross-as message transfer.
  *
@@ -182,6 +199,14 @@ int mm_map_xfer(process_t *actprp,
     uintptr_t cache_va = (uintptr_t) -1;
     paddr_t cache_pa = 0;
     bool xlate_iov;
+
+    /* A stepped call (msg_readv, msg_writev) maps at most one step of work and
+     * returns XFER_MAP_YIELD with the position updated when a skip or a run of
+     * empty entries uses up its step; any other call is not capped.
+     */
+    bool step = (flags & MAPADDR_FLAGS_STEP) != 0;
+    size_t bcap = step ? XFER_STEP_BYTES : (size_t) INT_MAX;
+    int acap = step ? XFER_STEP_ENTRIES : INT_MAX;
 
     (void) actprp; /* satp is set by the caller; we walk prp's table */
 
@@ -223,22 +248,28 @@ int mm_map_xfer(process_t *actprp,
         if (fetch_iov(pgdir, uiov, xlate_iov, iov_bound, &cache_va, &cache_pa,
                       &cur) < 0)
             return -1;
+        if (iov_advances >= acap) {
+            /* The skip used up its step: hand back the entry it reached, the
+             * entries left from it and the offset still to skip.
+             */
+            *pnparts = 0;
+            *pparts = parts;
+            *poff = (int) off;
+            *piov = *piov + iov_advances;
+            return XFER_MAP_YIELD;
+        }
     }
 
+    if (!entry_in_bound(&cur, flags, bound))
+        return -1;
     uintptr_t addr = (uintptr_t) GETIOVBASE(&cur) + off;
     size_t size = GETIOVLEN(&cur) - off;
-
-    if (size != 0) {
-        uintptr_t last = addr + size - 1;
-        if (addr > last || (!(flags & MAPADDR_FLAGS_SYSPRP) &&
-                            !WITHIN_BOUNDARY(addr, last, bound)))
-            return -1;
-    }
 
     nparts = 0;
     bytes = 0;
 
-    while (nparts < nparts_max) {
+    while (nparts < nparts_max && (size_t) bytes < bcap &&
+           iov_advances < acap) {
         if (size == 0) {
             if (--parts <= 0)
                 break;
@@ -247,19 +278,20 @@ int mm_map_xfer(process_t *actprp,
             if (fetch_iov(pgdir, uiov, xlate_iov, iov_bound, &cache_va,
                           &cache_pa, &cur) < 0)
                 return -1;
+            if (!entry_in_bound(&cur, flags, bound))
+                return -1;
             addr = (uintptr_t) GETIOVBASE(&cur);
             size = GETIOVLEN(&cur);
             if (size == 0)
                 continue;
-            uintptr_t last = addr + size - 1;
-            if (addr > last || (!(flags & MAPADDR_FLAGS_SYSPRP) &&
-                                !WITHIN_BOUNDARY(addr, last, bound)))
-                return -1;
         }
 
         /* Kernel-direct-map addresses need no translation. */
         if (addr >= KERNEL_VIRT_BASE) {
             size_t chunk = size;
+
+            if (chunk > bcap - (size_t) bytes)
+                chunk = bcap - (size_t) bytes;
             SETIOV(&niov[nparts], (void *) addr, chunk);
             nparts++;
             bytes += (int) chunk;
@@ -275,6 +307,9 @@ int mm_map_xfer(process_t *actprp,
 
         size_t chunk = (contig < size) ? contig : size;
 
+        if (chunk > bcap - (size_t) bytes)
+            chunk = bcap - (size_t) bytes;
+
         SETIOV(&niov[nparts], (void *) ((uintptr_t) pa + KERNEL_VIRT_BASE),
                chunk);
         nparts++;
@@ -288,5 +323,10 @@ int mm_map_xfer(process_t *actprp,
     *poff = (int) (GETIOVLEN(&cur) - size);
     *piov = *piov + iov_advances;
 
+    /* Nothing mapped but entries left: the step ran out over a run of empty
+     * entries, so the caller restarts from the updated position.
+     */
+    if (bytes == 0 && parts > 0 && size == 0 && nparts == 0)
+        return XFER_MAP_YIELD;
     return bytes;
 }

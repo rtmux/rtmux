@@ -846,12 +846,17 @@ static const char *ifs_value(void)
     return v ? v : " \t\n";
 }
 
+static bool ifs_blank_char(int c)
+{
+    return c == ' ' || c == '\t' || c == '\n';
+}
+
 /* Whether c is an IFS white space character: a blank, tab or newline in IFS,
  * which runs together and is trimmed from the ends of the fields.
  */
 static bool ifs_is_space(const char *ifs, int c)
 {
-    return (c == ' ' || c == '\t' || c == '\n') && strchr(ifs, c) != NULL;
+    return ifs_blank_char(c) && strchr(ifs, c) != NULL;
 }
 
 /* The character that joins the parameters in "$*": the first of IFS, a blank
@@ -1403,7 +1408,8 @@ static int emit_sub_result(struct sh_token *tok,
             p++; /* quoted in a ${...} word: no split, and no longer a mark */
             quoted_char = true;
         } else if (strchr(ifs, *p) != NULL) {
-            bool space = ifs_is_space(ifs, (unsigned char) *p);
+            /* strchr above already found *p in IFS. */
+            bool space = ifs_blank_char((unsigned char) *p);
 
             if (space) {
                 /* A white space run: the first ends the word if it has content,

@@ -73,13 +73,22 @@ static void xfer_preempt(thread_t *thp)
     if (pcpu_array[get_cpunum()].pc_in_specret) {
         unspecret_kernel();
     } else {
-        CRASHCHECK(TYPE_MASK(thp->type) != TYPE_THREAD);
-        SETKIP(thp, KIP(thp) - KSYS_ENTRY_SIZE);
+        /* KCALL_RESTART, not a bare rewind of the IP: a0 holds the first
+         * argument only until something stores a status in it, and the call
+         * must run again with the arguments it was entered with.
+         */
+        KCALL_RESTART(thp);
     }
 #if CONFIG_PROCESSORS_MAX > 1 && defined(CONFIG_SMP_MSGOPT)
     xfer_restorestate(thp);
 #endif
     SET_XFER_HANDLER(NULL);
+
+    /* kernel_exit does not return to the trap handler that closes the rcvid
+     * lookup window, so close it here: a call that restarts many times would
+     * otherwise open more than the nesting counter can hold.
+     */
+    lookup_rcvid_release();
     kernel_exit();
 }
 
@@ -187,49 +196,200 @@ void xfer_async_restart(thread_t *thp, CPU_REGISTERS *regs)
     get_active_thread(get_cpunum())->restart = 0; \
     return fault
 
-#define BOUNDARY_CHECK(bound, iov, parts, fault)          \
-    if (xfer_memchk(bound, iov, (size_t) (parts)) != 0) { \
-        XFER_FAULTRET(fault);                             \
-    }
+/* xfer_skip() went past every entry of the vector. */
+#define XFER_SKIP_ALL (-1)
 
-#define OFFSET_SKIP(off, iov, iovparts)   \
-    while (off >= GETIOVLEN(iov)) {       \
-        off -= (unsigned) GETIOVLEN(iov); \
-        if (--iovparts == 0) {            \
-            SET_XFER_HANDLER(0);          \
-            return 0;                     \
-        }                                 \
-        ++iov;                            \
-    }
+/* Step *iovp forward over the *offp bytes still to be skipped, an entry at a
+ * time, leaving *offp the offset into the entry it stops at. A bounded transfer
+ * (sp set) stops with XFER_YIELD after XFER_STEP_ENTRIES entries, the position
+ * left in place. Each entry's length is read once, under the fault handlers the
+ * caller armed, so another thread cannot change it between the test and the
+ * subtraction.
+ *
+ * Returns 0, XFER_SKIP_ALL, XFER_YIELD or a fault.
+ */
+static int xfer_skip(iov_t **iovp,
+                     int *partsp,
+                     unsigned *offp,
+                     struct xfer_spent *sp)
+{
+    jmp_buf env, *old_env = GET_XFER_ENV();
+    iov_t *iov = *iovp;
+    int parts = *partsp, ret = 0, status;
+    unsigned off = *offp;
 
-#define OFFSET_SKIP_BR(off, iov, iovparts)    \
-    do {                                      \
-        while (off >= GETIOVLEN(iov)) {       \
-            off -= (unsigned) GETIOVLEN(iov); \
-            if (--iovparts == 0)              \
-                break;                        \
-            ++iov;                            \
-        }                                     \
-        SET_XFER_HANDLER(0);                  \
+    SET_XFER_ENV(&env);
+    if ((status = xfer_setjmp(*GET_XFER_ENV()))) {
+        SET_XFER_ENV(old_env);
+        return status;
+    }
+    for (;;) {
+        size_t len = GETIOVLEN(iov);
+
+        if (off < len)
+            break;
+        off -= (unsigned) len;
+        if (--parts == 0) {
+            ret = XFER_SKIP_ALL;
+            break;
+        }
+        ++iov;
+        if (sp && ++sp->ents >= XFER_STEP_ENTRIES) {
+            ret = XFER_YIELD;
+            break;
+        }
+    }
+    SET_XFER_ENV(old_env);
+    *iovp = iov;
+    *partsp = parts;
+    *offp = off;
+    return ret;
+}
+
+/* Save where a bounded transfer stands and arrange for the kernel call to run
+ * again. It does not exit: xfermsg_run returns XFER_RESTART through the call,
+ * which gives up the peer it claimed under the channel lock and returns to the
+ * trap handler, which closes the rcvid lookup window and leaves the kernel.
+ * Each side is the entry index into its vector and the offset to move forward
+ * from there, so the restart resumes in place instead of skipping msglen bytes
+ * again.
+ */
+static int xfer_yield(thread_t *act,
+                      thread_t *dthp,
+                      thread_t *sthp,
+                      const iov_t *sbase,
+                      const iov_t *src,
+                      unsigned soff,
+                      const iov_t *dbase,
+                      const iov_t *dst,
+                      unsigned doff)
+{
+    act->xcur.msglen = sthp->args.ms.msglen;
+    act->xcur.sidx = (uint32_t) (src - sbase);
+    act->xcur.soff = soff;
+    act->xcur.didx = (uint32_t) (dst - dbase);
+    act->xcur.doff = doff;
+    act->xcur.armed = true;
+    SET_XFER_HANDLER(0);
+    KCALL_RESTART(act);
+    return XFER_RESTART;
+}
+
+/* The restart point of every loop of a transfer: a preemption check for the
+ * callers that restart by msglen, and for a bounded transfer a step of work
+ * done or a preemption request, either of which saves the cursor and restarts.
+ * It names the locals of xfermsg_run.
+ */
+#define XFER_CHECKPOINT(src, soff, dst, doff)                                \
+    do {                                                                     \
+        if (!bounded) {                                                      \
+            XFER_PREEMPT(act);                                               \
+        } else if (spent.ents >= XFER_STEP_ENTRIES ||                        \
+                   spent.bytes >= XFER_STEP_BYTES || NEED_PREEMPT(act)) {    \
+            return xfer_yield(act, dthp, sthp, sbase, src, soff, dbase, dst, \
+                              doff);                                         \
+        }                                                                    \
     } while (0)
 
+/* Skip the bytes still to be skipped at the start of one vector. */
+#define XFER_SKIP_SIDE(iov, parts, off)                                      \
+    do {                                                                     \
+        status = xfer_skip(&(iov), &(parts), &(off), sp);                    \
+        if (status == XFER_SKIP_ALL) {                                       \
+            SET_XFER_HANDLER(0);                                             \
+            return 0;                                                        \
+        }                                                                    \
+        if (status == XFER_YIELD) {                                          \
+            return xfer_yield(act, dthp, sthp, sbase, src, soff, dbase, dst, \
+                              doff);                                         \
+        }                                                                    \
+        if (status) {                                                        \
+            XFER_FAULTRET(status);                                           \
+        }                                                                    \
+    } while (0)
 
-int xfermsg(thread_t *dthp, thread_t *sthp, unsigned doff, unsigned soff)
+/* The boundary a bounded vector's entries must lie inside: that of the process
+ * the vector belongs to, or 0 where entries are not checked (roottask, a kernel
+ * buffer, or a transfer that is not bounded).
+ */
+static uintptr_t xfer_bound(bool bounded, unsigned flags, process_t *prp)
 {
-    iov_t *dst, *src;
+    if (!bounded || (flags & (MAPADDR_FLAGS_SYSPRP | MAPADDR_FLAGS_IOVKERNEL)))
+        return 0;
+    return prp->boundary_addr;
+}
+
+/* A bounded transfer reads the entries of a vector in this address space
+ * itself, so the array must lie inside the boundary too (bound 0: not checked).
+ */
+static bool xfer_array_in_bound(const iov_t *iov,
+                                unsigned parts,
+                                uintptr_t bound)
+{
+    uintptr_t base = (uintptr_t) iov, last;
+
+    if (!bound)
+        return true;
+    last = base + (size_t) parts * sizeof(iov_t) - 1;
+    return base <= last && WITHIN_BOUNDARY(base, last, bound);
+}
+
+static int xfermsg_run(thread_t *dthp,
+                       thread_t *sthp,
+                       unsigned doff,
+                       unsigned soff,
+                       bool bounded)
+{
+    iov_t *dst, *src, *dbase, *sbase;
     int dparts, sparts;
     process_t *prp, *sprp, *dprp;
     unsigned sflags, dflags;
     int status;
     iov_t diov[1], siov[1];
+    thread_t *act = get_active_thread(get_cpunum());
+    struct xfer_spent spent = {0, 0};
+    struct xfer_spent *sp = bounded ? &spent : NULL;
+    bool resume = false, fresh;
+    unsigned sall, dall;
+    uintptr_t sbound, dbound;
 
-    XFER_PREEMPT(get_active_thread(get_cpunum()));
+    /* A bounded transfer restarts only at its own checkpoints, which save the
+     * cursor and leave through the call, so the claim on the peer is given up
+     * under the channel lock; XFER_PREEMPT would exit with it held.
+     */
+    if (!bounded) {
+        XFER_PREEMPT(act);
+    }
 
-    /* If restarted, and threads match, continue where we left off */
-    if (dthp->restart != sthp || sthp->restart != sthp ||
-        sthp->args.ms.dthp != dthp) {
+    /* If restarted, and threads match, continue where we left off. A bounded
+     * transfer continues only from its own cursor, for the same vectors and
+     * offsets: a call that finds some other cursor, or none, starts over.
+     */
+    fresh = dthp->restart != sthp || sthp->restart != sthp ||
+            sthp->args.ms.dthp != dthp;
+    if (bounded && !fresh)
+        fresh = !(act->xcur.armed && act->xcur.sthp == sthp &&
+                  act->xcur.dthp == dthp &&
+                  act->xcur.msglen == sthp->args.ms.msglen &&
+                  act->xcur.smsg == sthp->args.ms.smsg &&
+                  act->xcur.sparts == (int32_t) sthp->args.ms.sparts &&
+                  act->xcur.rmsg == dthp->args.ms.rmsg &&
+                  act->xcur.rparts == (int32_t) dthp->args.ms.rparts &&
+                  act->xcur.soff0 == soff && act->xcur.doff0 == doff);
+    if (fresh) {
         sthp->args.ms.msglen = 0;
         sthp->args.ms.dthp = dthp;
+        if (bounded) {
+            act->xcur.armed = false;
+            act->xcur.sthp = sthp;
+            act->xcur.dthp = dthp;
+            act->xcur.smsg = sthp->args.ms.smsg;
+            act->xcur.sparts = (int32_t) sthp->args.ms.sparts;
+            act->xcur.rmsg = dthp->args.ms.rmsg;
+            act->xcur.rparts = (int32_t) dthp->args.ms.rparts;
+            act->xcur.soff0 = soff;
+            act->xcur.doff0 = doff;
+        }
 
         /* CAREFUL! The above operations have to happen before dthp->restart
          * gets updated here. The compiler can rearrange code, and if it
@@ -239,6 +399,8 @@ int xfermsg(thread_t *dthp, thread_t *sthp, unsigned doff, unsigned soff)
          * hence we use atomic_order().
          */
         atomic_order(sthp->restart = dthp->restart = sthp);
+    } else if (bounded) {
+        resume = true;
     } else {
         soff += sthp->args.ms.msglen;
         doff += sthp->args.ms.msglen;
@@ -290,6 +452,30 @@ int xfermsg(thread_t *dthp, thread_t *sthp, unsigned doff, unsigned soff)
     }
     dprp = dthp->as_prp;
 
+    if (bounded) {
+        sflags |= MAPADDR_FLAGS_STEP;
+        dflags |= MAPADDR_FLAGS_STEP;
+    }
+
+    sbase = src;
+    dbase = dst;
+    sall = (unsigned) sparts;
+    dall = (unsigned) dparts;
+    if (resume) {
+        if (act->xcur.sidx >= sall) {
+            return XFER_SRC_FAULT;
+        }
+        if (act->xcur.didx >= dall) {
+            return XFER_DST_FAULT;
+        }
+        src += act->xcur.sidx;
+        sparts -= (int) act->xcur.sidx;
+        soff = act->xcur.soff;
+        dst += act->xcur.didx;
+        dparts -= (int) act->xcur.didx;
+        doff = act->xcur.doff;
+    }
+
     prp = pcpu_array[get_cpunum()].pc_as_prp;
 
     /* Server/loader threads are in pid 1 (roottask) and use process_bind to set
@@ -308,6 +494,19 @@ int xfermsg(thread_t *dthp, thread_t *sthp, unsigned doff, unsigned soff)
         dprp = dthp->process;
     }
 
+    /* A bounded transfer checks each entry of the vectors it reads in this
+     * address space against that vector's process, at the time it copies. The
+     * other side of a cross-as transfer is checked by map_xfer.
+     */
+    sbound = xfer_bound(bounded, sflags, sprp ? sprp : sthp->process);
+    dbound = xfer_bound(bounded, dflags, dprp ? dprp : dthp->process);
+    if (!xfer_array_in_bound(sbase, sall, sbound)) {
+        return XFER_SRC_FAULT;
+    }
+    if (!xfer_array_in_bound(dbase, dall, dbound)) {
+        return XFER_DST_FAULT;
+    }
+
     /* Find the translation or change address spaces as necessary. */
     /* dst_as src_as as <=> as
      *    1            2       !(1|2)      1 could not happen (for pipe case,
@@ -319,40 +518,59 @@ int xfermsg(thread_t *dthp, thread_t *sthp, unsigned doff, unsigned soff)
         if (sprp == prp) {
             if (dprp != prp) {
                 iov_t iovlist[XFER_IOV_NUM];
+                iov_t *dst0;
+                unsigned doff0;
+                uint32_t msglen0;
                 int parts;
                 int nbytes;
+                struct xfer_walk w;
 
                 /* Check for a src offset and skip over it. */
                 if (soff) {
-                    OFFSET_SKIP(soff, src, sparts);
+                    SET_XFER_HANDLER(&xfer_src_handlers);
+                    XFER_SKIP_SIDE(src, sparts, soff);
                 }
 
                 do {
-                    XFER_PREEMPT(get_active_thread(get_cpunum()));
+                    XFER_CHECKPOINT(src, soff, dst, doff);
                     SET_XFER_HANDLER(&xfer_dst_handlers);
                     parts = sizeof iovlist / sizeof *iovlist;
+                    dst0 = dst;
+                    doff0 = doff;
+                    msglen0 = sthp->args.ms.msglen;
                     nbytes = vm_ops->map_xfer(prp, dprp, (iov_t **) &dst,
                                               &dparts, (int *) &doff, iovlist,
                                               &parts, dflags);
                     if (nbytes <= 0) {
                         if (nbytes == 0) {
                             break;
+                        } else if (nbytes == XFER_MAP_YIELD) {
+                            return xfer_yield(act, dthp, sthp, sbase, src, soff,
+                                              dbase, dst, doff);
                         } else {
                             XFER_FAULTRET(XFER_DST_FAULT);
                         }
                     }
                     dflags |= MAPADDR_FLAGS_NOTFIRST;
+                    spent.ents += (unsigned) parts;
 
                     SET_XFER_HANDLER(&xfer_src_handlers);
-                    if ((status = xferiov(sthp, iovlist, src, parts, sparts, 0,
-                                          soff)) != 0) {
+                    w = (struct xfer_walk){iovlist, src, parts,  sparts, 0,
+                                           soff,    0,   sbound, sp};
+                    if ((status = xferiov(sthp, &w)) != 0) {
+                        if (status == XFER_YIELD) {
+                            return xfer_yield(
+                                act, dthp, sthp, sbase, w.src, w.soff, dbase,
+                                dst0, doff0 + (sthp->args.ms.msglen - msglen0));
+                        }
                         XFER_FAULTRET(status);
                     }
                     if (dparts == 0) {
                         break;
                     }
-                    soff += (unsigned) nbytes;
-                    OFFSET_SKIP_BR(soff, src, sparts);
+                    src = w.src;
+                    sparts = w.sparts;
+                    soff = w.soff;
                 } while (sparts);
                 SET_XFER_HANDLER(0);
                 return 0;
@@ -361,21 +579,27 @@ int xfermsg(thread_t *dthp, thread_t *sthp, unsigned doff, unsigned soff)
             }
         } else if (sprp) { /* end for (sprp == prp) */
             iov_t iovlist[XFER_IOV_NUM];
+            iov_t *src0;
+            unsigned soff0;
+            uint32_t msglen0;
             int parts;
             int nbytes;
-
+            struct xfer_walk w;
 
             /* Check for a dst offset and skip over it. */
             if (doff) {
-                OFFSET_SKIP(doff, dst, dparts);
+                SET_XFER_HANDLER(&xfer_dst_handlers);
+                XFER_SKIP_SIDE(dst, dparts, doff);
             }
 
-
             do {
-                XFER_PREEMPT(get_active_thread(get_cpunum()));
+                XFER_CHECKPOINT(src, soff, dst, doff);
                 SET_XFER_HANDLER(&xfer_src_handlers);
 
                 parts = sizeof iovlist / sizeof *iovlist;
+                src0 = src;
+                soff0 = soff;
+                msglen0 = sthp->args.ms.msglen;
                 nbytes =
                     vm_ops->map_xfer(prp, sprp, (iov_t **) &src, &sparts,
                                      (int *) &soff, iovlist, &parts, sflags);
@@ -383,21 +607,33 @@ int xfermsg(thread_t *dthp, thread_t *sthp, unsigned doff, unsigned soff)
                 if (nbytes <= 0) {
                     if (nbytes == 0) {
                         break;
+                    } else if (nbytes == XFER_MAP_YIELD) {
+                        return xfer_yield(act, dthp, sthp, sbase, src, soff,
+                                          dbase, dst, doff);
                     } else {
                         XFER_FAULTRET(XFER_SRC_FAULT);
                     }
                 }
                 sflags |= MAPADDR_FLAGS_NOTFIRST;
+                spent.ents += (unsigned) parts;
 
-                if ((status = xferiov(sthp, dst, iovlist, dparts, parts, doff,
-                                      0)) != 0) {
+                w = (struct xfer_walk){dst, iovlist, dparts, parts, doff,
+                                       0,   dbound,  0,      sp};
+                if ((status = xferiov(sthp, &w)) != 0) {
+                    if (status == XFER_YIELD) {
+                        return xfer_yield(
+                            act, dthp, sthp, sbase, src0,
+                            soff0 + (sthp->args.ms.msglen - msglen0), dbase,
+                            w.dst, w.doff);
+                    }
                     XFER_FAULTRET(status);
                 }
                 if (sparts == 0) {
                     break;
                 }
-                doff += (unsigned) nbytes;
-                OFFSET_SKIP_BR(doff, dst, dparts);
+                dst = w.dst;
+                dparts = w.dparts;
+                doff = w.doff;
 
             } while (dparts);
             SET_XFER_HANDLER(0);
@@ -405,14 +641,14 @@ int xfermsg(thread_t *dthp, thread_t *sthp, unsigned doff, unsigned soff)
         } else { /* end for (sprp) */
             if (dprp != prp) {
                 vm_ops->as(dprp, &pcpu_array[get_cpunum()].pc_as_prp);
-                XFER_PREEMPT(get_active_thread(get_cpunum()));
+                XFER_CHECKPOINT(src, soff, dst, doff);
             }
         }
     } else {
         if (sprp != prp) {
             if (sprp) {
                 vm_ops->as(sprp, &pcpu_array[get_cpunum()].pc_as_prp);
-                XFER_PREEMPT(get_active_thread(get_cpunum()));
+                XFER_CHECKPOINT(src, soff, dst, doff);
             }
         }
     }
@@ -421,157 +657,45 @@ int xfermsg(thread_t *dthp, thread_t *sthp, unsigned doff, unsigned soff)
     /* Check for a dst offset and skip over it. */
     if (doff) {
         SET_XFER_HANDLER(&xfer_dst_handlers);
-        OFFSET_SKIP(doff, dst, dparts);
+        XFER_SKIP_SIDE(dst, dparts, doff);
     }
 
     SET_XFER_HANDLER(&xfer_src_handlers);
 
     /* Check for a src offset and skip over it. */
     if (soff) {
-        OFFSET_SKIP(soff, src, sparts);
+        XFER_SKIP_SIDE(src, sparts, soff);
     }
 
-    status = xferiov(sthp, dst, src, dparts, sparts, doff, soff);
+    {
+        struct xfer_walk w = {dst,  src,    dparts, sparts, doff,
+                              soff, dbound, sbound, sp};
 
+        status = xferiov(sthp, &w);
+        if (status == XFER_YIELD) {
+            return xfer_yield(act, dthp, sthp, sbase, w.src, w.soff, dbase,
+                              w.dst, w.doff);
+        }
+    }
 
     SET_XFER_HANDLER(0);
     return status;
 }
 
-/* for aysnc msg receive */
-int rcvmsg(thread_t *dthp,
-           process_t *sprp,
-           void *destp,
-           int destparts,
-           void *srcp,
-           int srcparts)
+int xfermsg(thread_t *dthp, thread_t *sthp, unsigned doff, unsigned soff)
 {
-    iov_t *dst, *src;
-    int sparts, dparts;
-    process_t *dprp;
-    unsigned sflags;
-    int status;
-    iov_t diov[1], siov[1];
-    unsigned soff, doff;
+    return xfermsg_run(dthp, sthp, doff, soff, false);
+}
 
-    /* restart check */
-    soff = doff = dthp->args.ms.msglen;
-
-    if (srcparts == 0 || destparts == 0) {
-        return 0;
-    }
-
-    /* Special case for 1 part source messages. */
-    if (srcparts < 0) {
-        SETIOV(siov, srcp, PARTS_TO_LEN(srcparts));
-        src = siov;
-        sparts = 1;
-        sflags = MAPADDR_FLAGS_IOVKERNEL;
-    } else {
-        if (srcparts > XFER_IOV_LIMIT) {
-            return XFER_SRC_FAULT;
-        }
-        src = srcp;
-        sparts = srcparts;
-        sflags = 0;
-    }
-
-    /* Same special case for 1 part dst messages */
-    if (destparts < 0) {
-        SETIOV(diov, destp, PARTS_TO_LEN(destparts));
-        dst = diov;
-        dparts = 1;
-    } else {
-        if (destparts > XFER_IOV_LIMIT) {
-            return XFER_DST_FAULT;
-        }
-        dst = destp;
-        dparts = destparts;
-    }
-
-    dprp = dthp->as_prp;
-
-    /* act is receiver */
-    if (dprp != sprp) {
-        iov_t iovlist[XFER_IOV_NUM];
-        int parts = 0;
-        int nbytes;
-
-        /* check dst iov addresses */
-        SET_XFER_HANDLER(&xfer_dst_handlers);
-        if (dprp->pid != ROOTTASK_PID) {
-            BOUNDARY_CHECK(dprp->boundary_addr, dst, dparts, XFER_DST_FAULT);
-        }
-
-        /* Check for a dst offset and skip over it. */
-        if (doff) {
-            OFFSET_SKIP(doff, dst, dparts);
-        }
-
-        do {
-            XFER_PREEMPT(get_active_thread(get_cpunum()));
-            SET_XFER_HANDLER(&xfer_async_handlers);
-
-            if (sprp->pid != ROOTTASK_PID) {
-                BOUNDARY_CHECK(sprp->boundary_addr, src, sparts,
-                               XFER_DST_FAULT);
-            }
-
-            parts = sizeof iovlist / sizeof *iovlist;
-            nbytes = vm_ops->map_xfer(dprp, sprp, (iov_t **) &src, &sparts,
-                                      (int *) &soff, iovlist, &parts, sflags);
-            if (nbytes <= 0) {
-                if (nbytes == 0) {
-                    break;
-                } else {
-                    XFER_FAULTRET(XFER_SRC_FAULT);
-                }
-            }
-            sflags |= MAPADDR_FLAGS_NOTFIRST;
-
-            if ((status = xferiov(dthp, dst, iovlist, dparts, parts, doff,
-                                  soff)) != 0) {
-                XFER_FAULTRET(status);
-            }
-            if (sparts == 0) {
-                break;
-            }
-            doff += (unsigned) nbytes;
-            OFFSET_SKIP_BR(doff, dst, dparts);
-
-        } while (dparts);
-        SET_XFER_HANDLER(0);
-    } else {
-        /* dprp == sprp */
-
-        /* check dst iov addresses */
-        if (dprp->pid != ROOTTASK_PID) {
-            SET_XFER_HANDLER(&xfer_dst_handlers);
-            BOUNDARY_CHECK(dprp->boundary_addr, dst, dparts, XFER_DST_FAULT);
-        }
-
-        /* Check for a dst offset and skip over it. */
-        if (doff) {
-            SET_XFER_HANDLER(&xfer_dst_handlers);
-            OFFSET_SKIP(doff, dst, dparts);
-        }
-
-        if (sprp->pid != ROOTTASK_PID) {
-            SET_XFER_HANDLER(&xfer_src_handlers);
-            BOUNDARY_CHECK(sprp->boundary_addr, src, sparts, XFER_DST_FAULT);
-        }
-
-        /* Check for a dst offset and skip over it. */
-        if (soff) {
-            SET_XFER_HANDLER(&xfer_src_handlers);
-            OFFSET_SKIP(soff, src, sparts);
-        }
-
-        /* xfer */
-        SET_XFER_HANDLER(&xfer_async_handlers);
-        status = xferiov(dthp, dst, src, dparts, sparts, doff, soff);
-        SET_XFER_HANDLER(0);
-    }
-
-    return EOK;
+/* xfermsg for msg_readv and msg_writev: each kernel entry does at most a step
+ * of work (XFER_STEP_ENTRIES vector entries stepped over, XFER_STEP_BYTES
+ * copied), then saves where it stands and restarts the call. The vector entries
+ * it uses are read once and checked as it copies.
+ */
+int xfermsg_bounded(thread_t *dthp,
+                    thread_t *sthp,
+                    unsigned doff,
+                    unsigned soff)
+{
+    return xfermsg_run(dthp, sthp, doff, soff, true);
 }

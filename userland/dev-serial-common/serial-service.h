@@ -539,6 +539,10 @@ static int ser_devctl(ioserv_context_t *ctp, io_devctl_t *msg, void *ocb)
         *(pid_t *) data = ser_pgrp;
         nbytes = sizeof(pid_t);
         break;
+    case DEVCTL_TTY_GET_SID:
+        *(pid_t *) data = ser_sid;
+        nbytes = sizeof(pid_t);
+        break;
     case DEVCTL_TTY_SET_PGRP: {
         pid_t pgrp;
         int err;
@@ -565,8 +569,8 @@ static int ser_devctl(ioserv_context_t *ctp, io_devctl_t *msg, void *ocb)
             return EPERM;
         if (msg->i.nbytes < (int32_t) sizeof(pid_t) ||
             (size_t) ctp->size < sizeof(*msg) + sizeof(pid_t) ||
-            *(pid_t *) data <= 0)
-            return EINVAL;
+            *(pid_t *) data < 0)
+            return EINVAL; /* 0 unbinds the terminal */
         ser_sid = ser_pgrp = *(pid_t *) data;
         break;
     case DEVCTL_TTY_FLUSH:

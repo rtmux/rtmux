@@ -3156,6 +3156,9 @@ static void test_posix_session_jobcontrol(void)
                   tcgetpgrp(STDIN_FILENO) == pgrp,
               "tc pgrp terminal round trip",
               "terminal foreground process-group get/set must round trip");
+        check(tcgetsid(STDIN_FILENO) == getsid(0),
+              "tcgetsid names the controlling terminal's session",
+              "tcgetsid must return the caller's session leader");
         errno = 0;
         check(tcsetpgrp(STDIN_FILENO, 1000000) == -1 && errno == EPERM,
               "tcsetpgrp rejects foreign pgrp",
@@ -3190,6 +3193,10 @@ static void test_posix_session_jobcontrol(void)
         check(tcsetpgrp(STDIN_FILENO, getpgrp()) == -1 && errno == ENOTTY,
               "tcsetpgrp on a terminal that is not ours",
               "tcsetpgrp must fail ENOTTY on another session's terminal");
+        errno = 0;
+        check(tcgetsid(STDIN_FILENO) == -1 && errno == ENOTTY,
+              "tcgetsid on a terminal that is not ours",
+              "tcgetsid must fail ENOTTY on another session's terminal");
     }
 
     fd = open("/dev/null", O_RDONLY);
@@ -3200,6 +3207,12 @@ static void test_posix_session_jobcontrol(void)
     errno = 0;
     check(tcgetpgrp(fd) == -1 && errno == ENOTTY, "tcgetpgrp on a non-terminal",
           "tcgetpgrp must fail ENOTTY on a non-terminal descriptor");
+    errno = 0;
+    check(tcgetsid(fd) == -1 && errno == ENOTTY, "tcgetsid on a non-terminal",
+          "tcgetsid must fail ENOTTY on a non-terminal descriptor");
+    errno = 0;
+    check(tcgetsid(-1) == -1 && errno == EBADF, "tcgetsid bad fd",
+          "tcgetsid must fail EBADF on a bad descriptor");
     errno = 0;
     check(tcsetpgrp(fd, getpid()) == -1 && errno == ENOTTY,
           "tcsetpgrp on a non-terminal",
@@ -4796,6 +4809,152 @@ static void test_namespace_open_entry_generation_race(void)
         check(mismatch_without_generation_bump == 0,
               "namespace access/open generation", detail);
     }
+}
+
+/* ns_open_deferral: a stat or access that was in flight when an unlink of the
+ * same node arrived still returns its result and leaves no connection state
+ * behind.
+ *
+ * The namespace server parks the unlink behind the first request and restarts
+ * it when that finishes. It used to answer the request first, with no result,
+ * and skip the combined stat and close, so the call "succeeded" with a zeroed
+ * buffer and its binding stayed on the connection id for good: the next request
+ * that was given that id failed with EBUSY, long after the race. That is the
+ * second round, an access that follows a stat. A node named
+ * rtmux-open-stall-MS holds each open of it for MS ms in a CONFIG_DEBUG_INJECT
+ * image, which keeps the first request in flight while the unlink arrives;
+ * elsewhere it is not held and the case is skipped.
+ */
+#define NSD_STALL_MS 600
+#define NSD_NAME "rtmux-open-stall-600"
+#define NSD_PATH "/dev/name/local/" NSD_NAME
+#define NSD_ATTEMPTS 3
+
+static struct {
+    bool use_access;
+    atomic_int started;
+    int rc;
+    int err;
+    struct stat st;
+    long ms;
+} nsd;
+
+static long nsd_ms_since(const struct timespec *t0)
+{
+    struct timespec t1;
+
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    return (t1.tv_sec - t0->tv_sec) * 1000L + (t1.tv_nsec - t0->tv_nsec) / 1000000L;
+}
+
+static void *nsd_thread(void *arg)
+{
+    struct timespec t0;
+
+    (void) arg;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    atomic_store(&nsd.started, 1);
+    errno = 0;
+    nsd.rc = nsd.use_access ? access(NSD_PATH, F_OK) : stat(NSD_PATH, &nsd.st);
+    nsd.err = errno;
+    nsd.ms = nsd_ms_since(&t0);
+    return NULL;
+}
+
+/* One round. Returns 1 when the request was held and the unlink parked behind
+ * it, 0 when the unlink was not held (a late thread; the caller retries), and
+ * -1 after a failure it has reported.
+ */
+static int nsd_round(bool use_access)
+{
+    const char *what = use_access ? "access" : "stat";
+    char name[48], why[112];
+    name_attach_t *attach;
+    pthread_t th;
+    struct timespec t0;
+    long unlink_ms;
+    int unlink_rc, unlink_err;
+
+    (void) unlink(NSD_PATH);
+    attach = name_attach(NULL, NSD_NAME, 0);
+    if (!attach) {
+        test_fail("ns_open_deferral fixture", strerror(errno));
+        return -1;
+    }
+    memset(&nsd, 0, sizeof nsd);
+    nsd.use_access = use_access;
+    if (pthread_create(&th, NULL, nsd_thread, NULL) != 0) {
+        test_fail("ns_open_deferral fixture", "pthread_create");
+        (void) name_detach(attach, 0);
+        return -1;
+    }
+    while (!atomic_load(&nsd.started))
+        (void) __sched_yield();
+    /* The request is held in the server by now; this unlink parks behind it. */
+    (void) nanosleep(&(struct timespec){.tv_nsec = (NSD_STALL_MS / 4) * 1000000L}, NULL);
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    errno = 0;
+    unlink_rc = unlink(NSD_PATH);
+    unlink_err = errno;
+    unlink_ms = nsd_ms_since(&t0);
+    (void) pthread_join(th, NULL);
+    (void) name_detach(attach, 0);
+
+    if (unlink_ms < NSD_STALL_MS / 4)
+        return 0; /* it ran before the request reached the server, or after it */
+
+    snprintf(name, sizeof name, "ns_open_deferral %s result", what);
+    snprintf(why, sizeof why, "rc %d errno %d mode %#o after %ld ms; unlink rc %d errno %d", nsd.rc,
+             nsd.err, (unsigned) nsd.st.st_mode, nsd.ms, unlink_rc, unlink_err);
+    check(nsd.rc == 0 && (use_access || S_ISNAM(nsd.st.st_mode)), name, why);
+    snprintf(name, sizeof name, "ns_open_deferral %s parked unlink", what);
+    check(unlink_rc == 0 || unlink_err == ENOENT, name,
+          "the unlink parked behind the request must complete");
+    return 1;
+}
+
+int ns_open_deferral(void)
+{
+    struct stat st;
+    struct timespec t0;
+    name_attach_t *attach;
+    long ms;
+    int rc;
+
+    /* Is the stall in this image? A held stat of the fixture node takes the
+     * stall; judged on its time alone when it succeeds, so that a stat that
+     * fails fast is a failure and not a skip.
+     */
+    (void) unlink(NSD_PATH);
+    attach = name_attach(NULL, NSD_NAME, 0);
+    if (!attach) {
+        test_fail("ns_open_deferral fixture", strerror(errno));
+        return 0;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    rc = stat(NSD_PATH, &st);
+    ms = nsd_ms_since(&t0);
+    (void) name_detach(attach, 0);
+    if (rc != 0) {
+        test_fail("ns_open_deferral fixture", strerror(errno));
+        return 0;
+    }
+    if (ms < NSD_STALL_MS / 2)
+        return TC_EXIT_SKIP;
+
+    for (int round = 0; round < 2; round++) {
+        int held = 0;
+
+        for (int i = 0; i < NSD_ATTEMPTS && !held; i++)
+            held = nsd_round(round == 1);
+        if (held < 0)
+            return 0;
+        if (!held) {
+            test_fail("ns_open_deferral", "the unlink was never held behind the request");
+            return 0;
+        }
+    }
+    return 0;
 }
 
 static void test_namespace_uncacheable_bypass(void)
@@ -7849,6 +8008,134 @@ static void test_getsid_cases(void)
     }
 }
 
+/* Release a getsid_hold_spawn() child ahead of its siblings, ignoring a child
+ * that never started.
+ */
+static bool hold_release(pid_t pid, int hold)
+{
+    return pid == (pid_t) -1 || getsid_hold_release(pid, hold);
+}
+
+/* getpgid table, setpgid by the parent, and a group that outlives its leader.
+ * A process group is its members: a spawned child starts in its parent's
+ * group, the parent may move it (setpgid from parent to spawned child), and a
+ * group stays joinable, and signalled by kill(-pgid), while any member lives
+ * even after the process it is named for has exited.
+ */
+static void test_pgrp_model(void)
+{
+    pid_t self_pg = getpgrp();
+    pid_t a, b, d, e, l, kid;
+    int ah, bh, dh, eh, lh, kh;
+    char detail[96];
+    int err;
+
+    kid = getsid_hold_spawn(false, &kh);
+    l = getsid_hold_spawn(true, &lh);
+    check(kid != (pid_t) -1 && l != (pid_t) -1, "pgrp model spawn children",
+          "the group table needs two live children");
+    if (kid == (pid_t) -1 || l == (pid_t) -1)
+        goto out_kid;
+
+    /* getpgid: the caller, a child (which starts in the caller's group), a
+     * child in another session (EPERM, as for getsid), and no process.
+     */
+    {
+        const struct {
+            const char *name;
+            pid_t pid;
+            pid_t want;
+            int want_errno;
+        } cases[] = {
+            {"getpgid(0) is getpgrp", 0, self_pg, 0},
+            {"getpgid self by pid", getpid(), self_pg, 0},
+            {"getpgid child starts in the caller's group", kid, self_pg, 0},
+            {"getpgid other session is EPERM", l, -1, EPERM},
+            {"getpgid negative pid is ESRCH", -2, -1, ESRCH},
+            {"getpgid INT_MAX pid is ESRCH", INT_MAX, -1, ESRCH},
+        };
+
+        for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+            pid_t got;
+
+            errno = 0;
+            got = getpgid(cases[i].pid);
+            err = errno;
+            snprintf(detail, sizeof detail, "got %d errno %d, want %d errno %d",
+                     (int) got, err, (int) cases[i].want, cases[i].want_errno);
+            check(got == cases[i].want &&
+                      (got != -1 || err == cases[i].want_errno),
+                  cases[i].name, detail);
+        }
+    }
+
+    /* setpgid from the parent to a spawned child: into a group of its own, and
+     * back into the parent's.
+     */
+    check(setpgid(kid, kid) == 0 && getpgid(kid) == kid,
+          "setpgid parent to spawned child leads a group",
+          "the parent must be able to move a spawned child into its own group");
+    check(kill(-kid, 0) == 0, "the child's new group is signalable",
+          "kill(-pgid, 0) must reach the new group");
+    errno = 0;
+    err = setpgid(kid, l) == -1 ? errno : 0;
+    check(err == EPERM, "setpgid to a group of another session is EPERM",
+          "a group in another session cannot be joined");
+    check(setpgid(kid, self_pg) == 0 && getpgid(kid) == self_pg,
+          "setpgid parent moves a child back to the parent's group",
+          "joining the caller's own group must work");
+    errno = 0;
+    err = setpgid(l, l) == -1 ? errno : 0;
+    check(err == EPERM, "setpgid of another session's leader is EPERM",
+          "a session leader may not change group");
+
+    /* A group that outlives its leader. */
+    a = getsid_hold_spawn(false, &ah);
+    b = getsid_hold_spawn(false, &bh);
+    if (a != (pid_t) -1 && b != (pid_t) -1) {
+        bool a_ok;
+        pid_t grp, a_pid;
+
+        check(setpgid(a, a) == 0 && setpgid(b, a) == 0 && getpgid(b) == a,
+              "two children share a group led by the first",
+              "the second child must join the first's group");
+        a_pid = a;
+        a_ok = hold_release(a, ah);
+        a = (pid_t) -1;
+        check(a_ok, "the group leader exits", "the held child must exit");
+        grp = getpgid(b);
+        check(grp == a_pid && kill(-grp, 0) == 0,
+              "a group is still signalable after its leader is gone",
+              "kill(-pgid, 0) must find the surviving member");
+        d = getsid_hold_spawn(false, &dh);
+        if (d != (pid_t) -1) {
+            snprintf(detail, sizeof detail, "group %d, d in %d", (int) grp,
+                     (int) getpgid(d));
+            check(setpgid(d, grp) == 0 && getpgid(d) == grp,
+                  "a group whose leader exited can still be joined", detail);
+            (void) hold_release(d, dh);
+        }
+        (void) hold_release(b, bh);
+        b = (pid_t) -1;
+        /* No member is left: the group no longer exists. */
+        errno = 0;
+        e = getsid_hold_spawn(false, &eh);
+        err = (e != (pid_t) -1 && setpgid(e, grp) == -1) ? errno : 0;
+        check(err == EPERM && kill(-grp, 0) == -1,
+              "a group with no member left cannot be joined or signalled",
+              "an empty group must not exist");
+        (void) hold_release(e, eh);
+    } else {
+        test_fail("pgrp model spawn group", "two children are needed");
+    }
+    (void) hold_release(a, ah);
+    (void) hold_release(b, bh);
+
+out_kid:
+    (void) hold_release(l, lh);
+    (void) hold_release(kid, kh);
+}
+
 static bool spawn_read_report(int fd, char *buf, size_t sz);
 
 /* A --session-probe child: its report, and the pipe that holds it alive. */
@@ -7943,8 +8230,8 @@ static void session_probe_release(struct session_probe *sp)
  * caller's session, may lead a group or join one in that session, and is
  * signalled by group like any other; a session leader reports itself, is
  * refused setpgid (EPERM), and is another session for getsid (EPERM) and for
- * joining its group (EPERM). (tcgetsid is not implemented, so it is not in the
- * table.)
+ * joining its group (EPERM). (tcgetsid needs a terminal, so test_posix_session_
+ * jobcontrol covers it.)
  */
 static void test_session_rule(void)
 {
@@ -10676,6 +10963,7 @@ void test_vfs(void)
     test_spawn_file_actions_chdir();
     test_spawn_large_arguments();
     test_getsid_cases();
+    test_pgrp_model();
     test_proc_lifecycle_burst_wait();
     test_proc_wait_handle_stale_after_reap();
     test_kill_zero_after_reap();

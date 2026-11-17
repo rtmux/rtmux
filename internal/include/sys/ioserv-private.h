@@ -69,6 +69,7 @@ typedef struct _ioserv_context {
     int status;
     int offset;
     int size;
+    void *post; /* the server's work to do once this request is replied to */
     iov_t iov[1];
 } ioserv_context_t;
 

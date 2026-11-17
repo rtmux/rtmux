@@ -87,8 +87,7 @@ static int signal_one(const struct signal_sender *snd,
     if (process_query_info(target_pid, &qinfo) != EOK || !qinfo.sys_chp ||
         (signo == 0 && (qinfo.flags & dead))) {
         rc = ESRCH;
-    } else if ((scope == KILL_PGRP &&
-                (qinfo.pgrp ? qinfo.pgrp : target_pid) != pgrp) ||
+    } else if ((scope == KILL_PGRP && qinfo.pgrp != pgrp) ||
                (scope == KILL_ALL &&
                 (target_pid == ROOTTASK_PID || target_pid == snd->pid ||
                  root_proc(target_pid)->system))) {
@@ -120,8 +119,7 @@ static int signal_sender_snapshot(pid_t pid, struct signal_sender *snd)
     if (rc != EOK)
         return rc;
     snd->pid = pid;
-    /* A process that never joined a group is its own group (pgrp 0 = unset). */
-    snd->pgrp = qinfo.pgrp ? qinfo.pgrp : pid;
+    snd->pgrp = qinfo.pgrp;
     snd->sid = qinfo.sess_leader;
     return EOK;
 }

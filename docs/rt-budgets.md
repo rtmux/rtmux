@@ -710,11 +710,40 @@ claim, so a restart has nothing to undo. An array longer than XFER_IOV_LIMIT
 fails with EFAULT before any entry is read. The loop is gone, so the
 inventory has no entry for it.
 
-Not bounded by this: the copy that follows the check. For a caller whose
-address space is the current one, `xfermsg` copies the whole vector in one
-`xferiov` pass, so a 65536-entry call still takes tens of ms on QEMU (the
-`readv-ns` and `writev-ns` figures of the iov-steps check). Bounding it needs
-a checkpoint inside the `xferiov` pass.
+The copy that follows the check is bounded the same way. `xfermsg_bounded`
+(kernel/xfer/core.c) does at most XFER_STEP_ENTRIES (128) vector entries
+stepped over or copied and XFER_STEP_BYTES (8 KiB) bytes in one kernel entry,
+then saves a cursor on the thread (`xcur`: the entry index and the offset to
+move forward from it, for each vector) and restarts the call through
+`xfer_preempt`, which closes the rcvid lookup window the trap handler would
+have closed, restores the saved arguments and returns through kernel_exit. The
+restart resumes from the cursor instead of skipping msglen bytes again, so
+neither the offset skip nor the vectors passed are rescanned; a cursor is used
+only for the thread pair and message length that saved it. The offset skip
+(`xfer_skip`, and the skip inside `mm_map_xfer`, which returns XFER_MAP_YIELD
+with the position handed back) and a run of empty entries count against the
+same step. The check's saved state now also records that the vector was
+checked, so a restart inside the copy does not walk it again; msg_readv and
+msg_writev drop it, the cursor and the restart link on every return.
+
+Each vector entry the same-address-space copy uses is read once into a
+snapshot, checked against the process boundary of the vector's owner (not for
+roottask or a kernel buffer) and offset against its length, under a fault env
+armed around the whole walk, so another thread that rewrites an entry after
+the check gets EFAULT and a vector that is unmapped under the call does not
+fault the kernel. This covers the other side too, which the call never checked
+before: the client's send or reply vector. The short-message branch no longer
+reads the whole destination vector to find how much arrived (`xferlen_upto`
+stops once the entries add up to the message). `rcvmsg`, unused, and its
+unbounded boundary scans are gone.
+
+Not bounded by this: the other callers of `xfermsg` (send, receive and reply
+over the fast path) are not stepped; the short-message branch of msg_readv still
+walks a destination vector of empty entries to its end (`xfer_cpy_diov`,
+`xferlen_upto`); and a wake from a timer or an interrupt does not preempt a
+running user thread before the next scheduler tick on this tree (see the
+interrupt-wake gap below), so no test can time the gap between two restarts of
+one call from user space.
 
 ipc-roundtrip's iov-steps check covers the check on 65536 one-byte entries:
 the bytes arrive intact through `msg_readv` and `msg_writev`, a bad entry past
@@ -723,6 +752,23 @@ a call over exactly one step whose last entry is bad (the longest kernel entry
 the check makes) has a p99 under 250 us. On one loaded boot that p99 was
 39 us (max 75 us) and the same failure at the end of the whole array took
 3.3 ms p99, which is 128 steps.
+
+The copy is checked on the same boot: iov-peer rewrites one entry of the
+sender's send vector, then of its reply vector, to a kernel address and
+`msg_readv` and `msg_writev` must fail with EFAULT (an unfixed kernel faults on
+it and crashes); iov-race flips an entry of the sender's vector between good
+and a kernel address from a thread above the receiver while 12 whole calls
+read through it, and each call must be a whole good transfer or EFAULT, with at
+least one EFAULT, which also shows the long call yields to a woken higher
+priority thread between its steps (the unfixed kernel finishes all 12 without
+the flipper running); iov-steps times a call of one step of entries (64 entries
+on each side) and iov-bytes a call of one step of bytes (8 KiB), both for
+readv and writev, and their p99 must stay under 250 us. On boots at a load
+average of 24 the step of entries was 94 to 101 us p99 (max 118 to 129 us) and
+the step of bytes 127 to 178 us p99 (max 144 to 198 us); on one boot at a load
+of 40 the same checks were 185 us and 1.3 ms, which is the host and not the
+kernel, as with the other checks here. A whole 65536 entry call takes 33 to
+57 ms, in steps of at most 128 entries each.
 
 Measured by ipc-roundtrip's readiov-large check (`scripts/qemu-regress.sh
 --mode ipc-roundtrip --timeout 600`). The rdtime span around each call bounds

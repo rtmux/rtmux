@@ -838,12 +838,17 @@ fail:
  * The longest kernel entry of the check is one full step, so a call over
  * exactly IOV_STEP entries whose last one is bad runs one step and fails; its
  * p99 over IOV_STEP_CALLS calls must stay under IOV_STEP_NS_MAX. The same
- * failure at the end of the whole array (every step) is timed for the record,
- * as are the whole calls: after the check the kernel copies the array's bytes
- * in one pass, which this check does not bound.
+ * failure at the end of the whole array (every step) is timed for the record.
+ * The sender's own vectors have one-byte entries too, so a copy of
+ * IOV_COPY_PARTS bytes steps over IOV_STEP entries, one step of copy work. The
+ * copy saves a cursor and restarts the call after each step, so a call that
+ * short makes one kernel entry and its p99 is the longest entry of a long
+ * one; it must stay under IOV_STEP_NS_MAX as well. The whole calls are timed
+ * for the record.
  */
 #define IOV_PARTS 65536
 #define IOV_STEP 512
+#define IOV_COPY_PARTS 64
 #define IOV_STEP_CALLS 64
 #define IOV_PASSES 8
 #define IOV_STEP_NS_MAX 250000ULL
@@ -854,6 +859,7 @@ fail:
 struct iov_ctx {
     int chid;
     unsigned char *out, *in;
+    iov_t *sarr, *rarr; /* the sender's vectors, one byte per entry */
     int rc;
 };
 
@@ -861,7 +867,7 @@ static void *iov_sender(void *arg)
 {
     struct iov_ctx *ctx = arg;
     iov_t siov, riov;
-    int coid;
+    int coid, r;
 
     ctx->rc = -1;
     coid = connect_attach((uint32_t) 0, 0, ctx->chid, RTMUX_SIDE_CHANNEL, 0);
@@ -872,7 +878,11 @@ static void *iov_sender(void *arg)
     }
     SETIOV(&siov, ctx->out, IOV_PARTS);
     SETIOV(&riov, ctx->in, IOV_PARTS);
-    if (msg_sendv(coid, &siov, 1, &riov, 1) == -1)
+    if (ctx->sarr && ctx->rarr)
+        r = msg_sendv(coid, ctx->sarr, IOV_PARTS, ctx->rarr, IOV_PARTS);
+    else
+        r = msg_sendv(coid, &siov, 1, &riov, 1);
+    if (r == -1)
         fprintf(stderr, "ipc-roundtrip: iov msg_sendv: %s\n", strerror(errno));
     else
         ctx->rc = 0;
@@ -1001,23 +1011,170 @@ static int iov_timed(int rcvid,
     return 0;
 }
 
+/* The sender's vectors are shared with its siblings, here the receiver. An
+ * entry rewritten to point into the kernel after the sender blocked is not
+ * covered by the check of the caller's own vector, so the copy has to check
+ * it: the call must fail with EFAULT, not move kernel memory. Both
+ * directions: readv reads the sender's send vector, writev writes its reply
+ * vector.
+ */
+static int iov_peer_checks(int rcvid,
+                           iov_t *rdiov,
+                           iov_t *wriov,
+                           iov_t *sarr,
+                           iov_t *rarr)
+{
+    int rc = 0;
+
+    for (int w = 0; w < 2; w++) {
+        iov_t *peer = w ? rarr : sarr;
+        iov_t saved = peer[IOV_BAD_AT];
+
+        SETIOV(&peer[IOV_BAD_AT], IOV_KERNEL_VA, 8);
+        rc |= iov_expect_efault(rcvid, w, w ? wriov : rdiov, IOV_PARTS,
+                                "peer entry rewritten");
+        peer[IOV_BAD_AT] = saved;
+    }
+    return rc;
+}
+
+/* A sibling that flips an entry of the sender's send vector between a good and
+ * a kernel address while the receiver reads through it. Each call has to be a
+ * whole good transfer or EFAULT, and the kernel has to survive: the entry is
+ * read once per use and checked as it is used. The flipper is a thread above
+ * the receiver that wakes on a timer, so it also shows that the long call can
+ * be preempted between its steps.
+ */
+#define IOV_RACE_CALLS 12
+#define IOV_RACE_PRIORITY (SERVER_PRIORITY + 2)
+
+struct iov_race {
+    iov_t *entry, good;
+    volatile int stop;
+};
+
+static void *iov_flipper(void *arg)
+{
+    struct iov_race *r = arg;
+    struct timespec ts = {.tv_sec = 0, .tv_nsec = 300000};
+
+    (void) raise_to_rt(IOV_RACE_PRIORITY);
+    while (!r->stop) {
+        SETIOV(r->entry, IOV_KERNEL_VA, 8);
+        (void) nanosleep(&ts, NULL);
+        *r->entry = r->good;
+        (void) nanosleep(&ts, NULL);
+    }
+    *r->entry = r->good;
+    return NULL;
+}
+
+static int iov_race_check(int rcvid,
+                          iov_t *rdiov,
+                          unsigned char *rd,
+                          const unsigned char *out,
+                          iov_t *sarr)
+{
+    struct iov_race race = {.entry = &sarr[IOV_PARTS - 2],
+                            .good = sarr[IOV_PARTS - 2]};
+    int efault = 0, good = 0, rc = 0;
+    pthread_t tid;
+
+    if (pthread_create(&tid, NULL, iov_flipper, &race) != EOK)
+        return -1;
+    for (int i = 0; i < IOV_RACE_CALLS && !rc; i++) {
+        int n;
+
+        memset(rd, 0, IOV_PARTS);
+        n = msg_readv(rcvid, rdiov, IOV_PARTS, 0);
+        if (n == -1 && errno == EFAULT) {
+            efault++;
+        } else if (n == IOV_PARTS && memcmp(rd, out, IOV_PARTS) == 0) {
+            good++;
+        } else {
+            fprintf(stderr, "ipc-roundtrip: iov race readv: %d %s\n", n,
+                    n == -1 ? strerror(errno) : "");
+            rc = -1;
+        }
+    }
+    race.stop = 1;
+    (void) pthread_join(tid, NULL);
+
+    /* The flipper wakes on a timer and is above the receiver: it only gets to
+     * poison the entry in the middle of a call if the call lets it run. Calls
+     * that all see the entry good mean it never ran, that is the call does not
+     * stop for a higher-priority thread between its steps.
+     */
+    if (!rc && !efault) {
+        fprintf(stderr, "ipc-roundtrip: iov race: the flipper never ran\n");
+        rc = -1;
+    }
+    printf("ipc-roundtrip: iov-race %s calls=%d efault=%d good=%d\n",
+           rc ? "FAIL" : "PASS", IOV_RACE_CALLS, efault, good);
+    return rc;
+}
+
+/* Time IOV_STEP_CALLS whole calls over parts entries, each of which must move
+ * want bytes; the p99 goes to *p99 and the slowest to *max. With
+ * IOV_COPY_PARTS entries that is one step of copy work, counting the entries
+ * of both vectors. A call this short makes one kernel entry, so its span
+ * is the longest entry the copy of a longer one makes.
+ */
+static int iov_copy_time(int rcvid,
+                         int write,
+                         iov_t *iov,
+                         int parts,
+                         int want,
+                         uint64_t cps,
+                         uint64_t *p99,
+                         uint64_t *max)
+{
+    static uint64_t ns[IOV_STEP_CALLS];
+
+    for (int i = 0; i < IOV_STEP_CALLS; i++) {
+        uint64_t t0 = read_time();
+        int n = iov_call(rcvid, write, iov, parts);
+
+        ns[i] = ticks_to_ns(read_time() - t0, cps);
+        if (n != want) {
+            fprintf(stderr, "ipc-roundtrip: iov copy %s: %d %s\n",
+                    write ? "writev" : "readv", n,
+                    n == -1 ? strerror(errno) : "");
+            return -1;
+        }
+    }
+    qsort(ns, IOV_STEP_CALLS, sizeof ns[0], cmp_u64);
+    *p99 = ns[p99_index(IOV_STEP_CALLS)];
+    *max = ns[IOV_STEP_CALLS - 1];
+    return 0;
+}
+
 static int check_iov_steps(int chid)
 {
     static unsigned char out[IOV_PARTS], in[IOV_PARTS], rd[IOV_PARTS],
         wr[IOV_PARTS];
     static iov_t rdiov[IOV_PARTS], wriov[IOV_PARTS];
+    static iov_t sarr[IOV_PARTS], rarr[IOV_PARTS];
     static struct iov_ctx ctx;
     uint64_t cps = cycles_per_sec(), rd_ns = 0, wr_ns = 0;
     uint64_t step_p99 = 0, step_max = 0, all_p99 = 0, all_max = 0;
+    uint64_t copy_p99 = 0, copy_max = 0;
     pthread_t tid;
     int rcvid, ok;
 
-    ctx = (struct iov_ctx){.chid = chid, .out = out, .in = in, .rc = -1};
+    ctx = (struct iov_ctx){.chid = chid,
+                           .out = out,
+                           .in = in,
+                           .sarr = sarr,
+                           .rarr = rarr,
+                           .rc = -1};
     for (int i = 0; i < IOV_PARTS; i++) {
         out[i] = (unsigned char) (i * 7 + 1);
         wr[i] = (unsigned char) ~out[i];
         SETIOV(&rdiov[i], rd + i, 1);
         SETIOV(&wriov[i], wr + i, 1);
+        SETIOV(&sarr[i], out + i, 1);
+        SETIOV(&rarr[i], in + i, 1);
     }
     if (pthread_create(&tid, NULL, iov_sender, &ctx) != EOK) {
         fprintf(stderr, "ipc-roundtrip: iov pthread_create failed\n");
@@ -1043,6 +1200,19 @@ static int check_iov_steps(int chid)
             all_max = max;
     }
     ok = ok && step_p99 < IOV_STEP_NS_MAX &&
+         iov_peer_checks(rcvid, rdiov, wriov, sarr, rarr) == 0 &&
+         iov_race_check(rcvid, rdiov, rd, out, sarr) == 0;
+    for (int w = 0; w < 2; w++) {
+        uint64_t p99 = 0, max = 0;
+
+        ok = ok && iov_copy_time(rcvid, w, w ? wriov : rdiov, IOV_COPY_PARTS,
+                                 IOV_COPY_PARTS, cps, &p99, &max) == 0;
+        if (p99 > copy_p99)
+            copy_p99 = p99;
+        if (max > copy_max)
+            copy_max = max;
+    }
+    ok = ok && copy_p99 < IOV_STEP_NS_MAX &&
          iov_timed(rcvid, 0, rdiov, cps, &rd_ns) == 0 &&
          memcmp(rd, out, IOV_PARTS) == 0 &&
          iov_timed(rcvid, 1, wriov, cps, &wr_ns) == 0;
@@ -1054,11 +1224,62 @@ static int check_iov_steps(int chid)
     ok = ok && ctx.rc == 0 && memcmp(in, wr, IOV_PARTS) == 0;
     printf("ipc-roundtrip: iov-steps %s parts=%d step-p99-ns=%llu "
            "step-max-ns=%llu check-p99-ns=%llu check-max-ns=%llu "
-           "readv-ns=%llu writev-ns=%llu\n",
+           "copy-p99-ns=%llu copy-max-ns=%llu readv-ns=%llu writev-ns=%llu\n",
            ok ? "PASS" : "FAIL", IOV_PARTS, (unsigned long long) step_p99,
            (unsigned long long) step_max, (unsigned long long) all_p99,
-           (unsigned long long) all_max, (unsigned long long) rd_ns,
+           (unsigned long long) all_max, (unsigned long long) copy_p99,
+           (unsigned long long) copy_max, (unsigned long long) rd_ns,
            (unsigned long long) wr_ns);
+    return ok ? 0 : -1;
+}
+
+/* The byte side of a step: a sender with one IOV_PARTS-byte entry in each
+ * direction, and one-entry calls that move IOV_BYTE_STEP of it, which is the
+ * XFER_STEP_BYTES of copy work the most a kernel entry copies. Their p99 must
+ * stay under IOV_STEP_NS_MAX, and the bytes must arrive.
+ */
+#define IOV_BYTE_STEP (8 * 1024)
+
+static int check_iov_bytes(int chid)
+{
+    static unsigned char out[IOV_PARTS], in[IOV_PARTS], rd[IOV_PARTS],
+        wr[IOV_PARTS];
+    static struct iov_ctx ctx;
+    uint64_t cps = cycles_per_sec(), rp99 = 0, rmax = 0, wp99 = 0, wmax = 0;
+    iov_t rdiov, wriov;
+    pthread_t tid;
+    int rcvid, ok;
+
+    ctx = (struct iov_ctx){.chid = chid, .out = out, .in = in, .rc = -1};
+    for (int i = 0; i < IOV_PARTS; i++) {
+        out[i] = (unsigned char) (i * 7 + 1);
+        wr[i] = (unsigned char) ~out[i];
+    }
+    SETIOV(&rdiov, rd, IOV_BYTE_STEP);
+    SETIOV(&wriov, wr, IOV_BYTE_STEP);
+    if (pthread_create(&tid, NULL, iov_sender, &ctx) != EOK) {
+        fprintf(stderr, "ipc-roundtrip: iov pthread_create failed\n");
+        return -1;
+    }
+    if ((rcvid = receive_timed(chid)) == -1)
+        return -1;
+    ok = iov_copy_time(rcvid, 0, &rdiov, 1, IOV_BYTE_STEP, cps, &rp99, &rmax) ==
+             0 &&
+         memcmp(rd, out, IOV_BYTE_STEP) == 0 &&
+         iov_copy_time(rcvid, 1, &wriov, 1, IOV_BYTE_STEP, cps, &wp99, &wmax) ==
+             0;
+    if (msg_reply(rcvid, 0, NULL, 0) == -1) {
+        fprintf(stderr, "ipc-roundtrip: iov msg_reply: %s\n", strerror(errno));
+        ok = 0;
+    }
+    (void) pthread_join(tid, NULL);
+    ok = ok && ctx.rc == 0 && memcmp(in, wr, IOV_BYTE_STEP) == 0 &&
+         rp99 < IOV_STEP_NS_MAX && wp99 < IOV_STEP_NS_MAX;
+    printf("ipc-roundtrip: iov-bytes %s bytes=%d readv-p99-ns=%llu "
+           "readv-max-ns=%llu writev-p99-ns=%llu writev-max-ns=%llu\n",
+           ok ? "PASS" : "FAIL", IOV_BYTE_STEP, (unsigned long long) rp99,
+           (unsigned long long) rmax, (unsigned long long) wp99,
+           (unsigned long long) wmax);
     return ok ? 0 : -1;
 }
 
@@ -1261,7 +1482,7 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
     if (check_readiov_straddle(chid) != 0 || check_readiov_large(chid) != 0 ||
-        check_iov_steps(chid) != 0)
+        check_iov_steps(chid) != 0 || check_iov_bytes(chid) != 0)
         return EXIT_FAILURE;
 
     snprintf(pid_arg, sizeof pid_arg, "%d", getpid());

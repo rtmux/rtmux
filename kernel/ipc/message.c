@@ -153,6 +153,16 @@ int kdecl ksys_msg_current(thread_t *act, struct kcall_args_msg_current *kap)
     return EOK;
 }
 
+/* Forget what a restarted msg_readv or msg_writev kept for its next entry: the
+ * vector it checked, the cursor of its copy and its restart link.
+ */
+static void msg_resume_drop(thread_t *act)
+{
+    act->iovchk_iov = NULL;
+    act->xcur.armed = false;
+    act->restart = NULL;
+}
+
 /* Check the caller's own iov array against its boundary, at most
  * XFER_IOV_CHECK_STEP entries per kernel entry. parts is at least 1.
  *
@@ -172,7 +182,7 @@ int kdecl ksys_msg_current(thread_t *act, struct kcall_args_msg_current *kap)
  *
  * Returns 0 (all entries are inside the boundary), EFAULT (one is not, a page
  * of the array is unmapped, the array itself is not in the caller's space, or
- * it is longer than XFER_IOV_LIMIT), or XFER_IOV_CHECK_RESTART (the call was
+ * it is longer than XFER_IOV_LIMIT), or XFER_CALL_RESTART (the call was
  * restarted: return ENOERROR).
  */
 static int xfer_iov_check(thread_t *act, const iov_t *iov, int parts)
@@ -196,6 +206,15 @@ static int xfer_iov_check(thread_t *act, const iov_t *iov, int parts)
     if (saved == iov && act->iovchk_parts == parts)
         done = act->iovchk_done;
 
+    /* Checked already by an earlier entry of this call, which restarted in the
+     * copy: the copy reads and checks every entry it uses, so do not walk the
+     * vector again on each restart.
+     */
+    if (done == (uint32_t) parts) {
+        act->iovchk_iov = iov;
+        return 0;
+    }
+
     n = (uint32_t) parts - done;
     if (n > XFER_IOV_CHECK_STEP)
         n = XFER_IOV_CHECK_STEP;
@@ -205,14 +224,13 @@ static int xfer_iov_check(thread_t *act, const iov_t *iov, int parts)
     if (bad)
         return EFAULT;
     done += n;
-    if (done == (uint32_t) parts)
-        return 0;
-
     act->iovchk_iov = iov;
     act->iovchk_parts = parts;
     act->iovchk_done = done;
+    if (done == (uint32_t) parts)
+        return 0;
     KCALL_RESTART(act);
-    return XFER_IOV_CHECK_RESTART;
+    return XFER_CALL_RESTART;
 }
 
 /* Check the caller's own iov (the destination of msg_readv, the source of
@@ -225,7 +243,7 @@ static int xfer_iov_check(thread_t *act, const iov_t *iov, int parts)
  * no entries to read; an entry is read only by xfer_iov_check(), which recovers
  * from a fault and does at most one step of the work per kernel entry.
  *
- * Returns 0, an errno, or XFER_IOV_CHECK_RESTART when the call was restarted.
+ * Returns 0, an errno, or XFER_CALL_RESTART when the call was restarted.
  */
 static int msg_iov_check(thread_t *act, const iov_t *iov, int parts)
 {
@@ -258,7 +276,7 @@ static int msg_iov_check(thread_t *act, const iov_t *iov, int parts)
  * Return value: ENOERROR (transferred length or error reported via
  * KSTATUS/kcall_err).
  */
-int kdecl ksys_msg_readv(thread_t *act, struct kcall_args_msg_readv *kap)
+static int msg_readv_body(thread_t *act, struct kcall_args_msg_readv *kap)
 {
     connect_t *cop;
     thread_t *thp;
@@ -275,8 +293,6 @@ int kdecl ksys_msg_readv(thread_t *act, struct kcall_args_msg_readv *kap)
      */
 
     status = msg_iov_check(act, kap->rmsg, kap->rparts);
-    if (status == XFER_IOV_CHECK_RESTART)
-        return ENOERROR;
     if (status)
         return status;
 
@@ -359,8 +375,8 @@ int kdecl ksys_msg_readv(thread_t *act, struct kcall_args_msg_readv *kap)
             xferstat = xfer_cpy_diov(act, act->args.ms.rmsg,
                                      thp->args.msbuff.buff + kap->offset,
                                      act->args.ms.rparts, slen);
-            dlen =
-                (unsigned) xferlen(act, act->args.ms.rmsg, act->args.ms.rparts);
+            dlen = (unsigned) xferlen_upto(act, act->args.ms.rmsg,
+                                           act->args.ms.rparts, slen);
             if (dlen < slen)
                 slen = dlen;
         } else {
@@ -378,7 +394,7 @@ int kdecl ksys_msg_readv(thread_t *act, struct kcall_args_msg_readv *kap)
         *(volatile void **) &(act->blocked_on) = thp;
         ITF_SET(act, RTMUX_ITF_MSG_DELIVERY);
 #endif
-        xferstat = xfermsg(act, thp, 0, kap->offset);
+        xferstat = xfermsg_bounded(act, thp, 0, kap->offset);
         slen = thp->args.ms.msglen;
 #if CONFIG_PROCESSORS_MAX > 1 && defined(CONFIG_SMP_MSGOPT)
         ITF_CLR(act, RTMUX_ITF_MSG_DELIVERY);
@@ -404,6 +420,13 @@ int kdecl ksys_msg_readv(thread_t *act, struct kcall_args_msg_readv *kap)
     if (do_force_ready)
         force_ready(thp, thp_status);
 
+    /* The copy used up its step and arranged for the call to run again; the
+     * client is given up above, so another thread can reply to it, and is
+     * claimed again by the restarted call.
+     */
+    if (xferstat == XFER_RESTART)
+        return XFER_CALL_RESTART;
+
     if (xferstat) {
         kcall_err(act, (xferstat & XFER_SRC_FAULT) ? EFAULT : EFAULT);
     } else {
@@ -426,7 +449,7 @@ int kdecl ksys_msg_readv(thread_t *act, struct kcall_args_msg_readv *kap)
  * Return value: ENOERROR (transferred length or error reported via
  * KSTATUS/kcall_err).
  */
-int kdecl ksys_msg_writev(thread_t *act, struct kcall_args_msg_writev *kap)
+static int msg_writev_body(thread_t *act, struct kcall_args_msg_writev *kap)
 {
     connect_t *cop;
     thread_t *thp;
@@ -440,8 +463,6 @@ int kdecl ksys_msg_writev(thread_t *act, struct kcall_args_msg_writev *kap)
      */
 
     status = msg_iov_check(act, kap->smsg, kap->sparts);
-    if (status == XFER_IOV_CHECK_RESTART)
-        return ENOERROR;
     if (status)
         return status;
 
@@ -511,7 +532,7 @@ int kdecl ksys_msg_writev(thread_t *act, struct kcall_args_msg_writev *kap)
 #endif
     act->args.ms.smsg = kap->smsg;
     act->args.ms.sparts = kap->sparts;
-    xferstat = xfermsg(thp, act, kap->offset, 0);
+    xferstat = xfermsg_bounded(thp, act, kap->offset, 0);
 #if CONFIG_PROCESSORS_MAX > 1 && defined(CONFIG_SMP_MSGOPT)
     ITF_CLR(act, RTMUX_ITF_MSG_DELIVERY);
     act->blocked_on = 0;
@@ -530,6 +551,13 @@ int kdecl ksys_msg_writev(thread_t *act, struct kcall_args_msg_writev *kap)
     if (do_force_ready)
         force_ready(thp, thp_status);
 
+    /* The copy used up its step and arranged for the call to run again; the
+     * client is given up above, so another thread can reply to it, and is
+     * claimed again by the restarted call.
+     */
+    if (xferstat == XFER_RESTART)
+        return XFER_CALL_RESTART;
+
     if (xferstat) {
         kcall_err(act, (xferstat & XFER_SRC_FAULT) ? EFAULT : EFAULT);
     } else {
@@ -541,6 +569,32 @@ int kdecl ksys_msg_writev(thread_t *act, struct kcall_args_msg_writev *kap)
 }
 
 
+
+/* msg_readv and msg_writev: the iov check first, then the transfer. A call that
+ * returns here is over, so the check's saved state (it holds the vector as
+ * checked, for a restart of the copy) is dropped on every path but a restart,
+ * whether the check's or the copy's, which both return XFER_CALL_RESTART.
+ * ENOERROR is a finished call (its status already stored), not a restart.
+ */
+int kdecl ksys_msg_readv(thread_t *act, struct kcall_args_msg_readv *kap)
+{
+    int rc = msg_readv_body(act, kap);
+
+    if (rc == XFER_CALL_RESTART)
+        return ENOERROR;
+    msg_resume_drop(act);
+    return rc;
+}
+
+int kdecl ksys_msg_writev(thread_t *act, struct kcall_args_msg_writev *kap)
+{
+    int rc = msg_writev_body(act, kap);
+
+    if (rc == XFER_CALL_RESTART)
+        return ENOERROR;
+    msg_resume_drop(act);
+    return rc;
+}
 
 /* Read a message into the server's iov, mapping the client's iov directly
  * (msg_readiov kcall).

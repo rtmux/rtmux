@@ -146,6 +146,7 @@ typedef struct proc_hooks_entry {
 #define MAPADDR_FLAGS_WRITE 0x1
 #define MAPADDR_FLAGS_SYSPRP 0x2
 #define MAPADDR_FLAGS_NOTFIRST 0x4
+#define MAPADDR_FLAGS_STEP 0x10 /* cap the work; XFER_MAP_YIELD at the cap */
 #define MAPADDR_FLAGS_IOVKERNEL 0x8000
 
 #endif

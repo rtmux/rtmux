@@ -997,9 +997,11 @@ void strap_handler_c(CPU_REGISTERS *regs)
         /* A saved msg_readv/msg_writev iov check resumes only into the same
          * call; any other kernel call in between discards it.
          */
-        if (act->iovchk_iov && num != __KSYS_MSG_READV &&
-            num != __KSYS_MSG_WRITEV)
+        if ((act->iovchk_iov || act->xcur.armed) && num != __KSYS_MSG_READV &&
+            num != __KSYS_MSG_WRITEV) {
             act->iovchk_iov = NULL;
+            act->xcur.armed = false;
+        }
 
         /* Reject invalid syscall numbers AFTER advancing the PC so the faulting
          * thread resumes past the ecall instead of re-triggering it in an

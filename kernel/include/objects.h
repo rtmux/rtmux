@@ -822,6 +822,24 @@ typedef struct thread_entry { /* Also used for vthread_entry */
      * Appended at the tail like the fields above.
      */
     uint64_t stall_reported_ts;
+
+    /* Resume cursor of a bounded msg_readv / msg_writev transfer (xfermsg).
+     * Each side is an entry index into its vector and a byte offset to move
+     * forward from that entry (an offset still to be skipped is kept whole), so
+     * a restart neither rescans the entries it passed nor trusts them. Valid
+     * while armed, for the thread pair, vectors, offsets and message length of
+     * the transfer that saved it, and dropped with the iov check state.
+     * Appended at the tail like the fields above it.
+     */
+    struct {
+        thread_t *sthp, *dthp;
+        const void *smsg, *rmsg; /* the vectors the transfer was started on */
+        int32_t sparts, rparts;
+        uint32_t soff0, doff0; /* and the offsets the call asked for */
+        uint32_t msglen;
+        uint32_t sidx, soff, didx, doff;
+        bool armed;
+    } xcur;
 } thread_t;
 
 /* Map a dispatch-list LINK3_NODE pointer back to its enclosing thread_t. The

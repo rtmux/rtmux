@@ -39,6 +39,7 @@ int path_node_fullpath(node_t *node, char *path, int pathmax);
 
 /* path-open.c */
 int path_open(ioserv_context_t *ctp, io_open_t *msg, void *handle, void *extra);
+void path_open_resume(ioserv_context_t *ctp);
 int path_unlink(ioserv_context_t *ctp,
                 io_unlink_t *msg,
                 void *handle,

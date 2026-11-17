@@ -197,6 +197,7 @@
         getopt_long;
         getopt_long_only;
         getpagesize;
+        getpgid;
         getpgrp;
         getpid;
         getppid;
@@ -628,6 +629,7 @@
         tcflush;
         tcgetattr;
         tcgetpgrp;
+        tcgetsid;
         tcsendbreak;
         tcsetattr;
         tcsetpgrp;

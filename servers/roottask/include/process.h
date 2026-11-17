@@ -108,6 +108,15 @@ int proc_jobctl_signal_bg(pid_t server, pid_t pid, int signo);
 int proc_jobctl_setpgrp(pid_t server, pid_t pid, pid_t pgrp);
 int proc_jobctl_tty_busy(pid_t server, pid_t sid);
 
+/* Process groups are tracked by their members (jobctl.c). proc_pgrp_session
+ * finds a live member's session; proc_pgrp_lock serializes every change of a
+ * process's group or session (setpgid, setsid) and is taken before any process
+ * slot lock.
+ */
+int proc_pgrp_session(pid_t pgrp, pid_t *sid);
+void proc_pgrp_lock(void);
+void proc_pgrp_unlock(void);
+
 /* exit.c */
 int proc_exit(ioserv_context_t *ctp, union proc_msg_union *msg);
 int proc_terminate(message_context_t *ctp,

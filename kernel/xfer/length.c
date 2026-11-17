@@ -29,7 +29,11 @@ static const struct fault_handlers xfer_fault_handlers_xferlen = {
     .restart = 0,
 };
 
-int xferlen(thread_t *thp, iov_t *iov, int parts)
+/* The total length of a vector, or once the entries add up to cap, what they
+ * add up to by then: a transfer of at most cap bytes does not read a longer
+ * vector to its end.
+ */
+int xferlen_upto(thread_t *thp, iov_t *iov, int parts, size_t cap)
 {
     size_t len;
     int status;
@@ -55,7 +59,7 @@ int xferlen(thread_t *thp, iov_t *iov, int parts)
     SET_XFER_HANDLER(&xfer_fault_handlers_xferlen);
 
     len = 0;
-    while (parts > 0) {
+    while (parts > 0 && len < cap) {
         len += GETIOVLEN(iov);
         ++iov;
         --parts;
@@ -64,4 +68,9 @@ int xferlen(thread_t *thp, iov_t *iov, int parts)
     SET_XFER_HANDLER(0);
 
     return (int) len;
+}
+
+int xferlen(thread_t *thp, iov_t *iov, int parts)
+{
+    return xferlen_upto(thp, iov, parts, SIZE_MAX);
 }
