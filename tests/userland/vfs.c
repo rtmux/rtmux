@@ -1087,7 +1087,7 @@ static void test_sys_kstats(void)
               kstats_get(snap, "timeout.live") <= kstats_get(snap, "thread.live") &&
               kstats_get(snap, "prio.reply_depth") > 0 &&
               kstats_get(snap, "prio.reply_depth_overflow") >= 0 &&
-              lines == (int) (3 * (sizeof pools / sizeof pools[0]) + 7 + (size_t) harts),
+              lines == (int) (3 * (sizeof pools / sizeof pools[0]) + 9 + (size_t) harts),
           "sys_kstats_format documented keys appear exactly once",
           "a documented key is missing, duplicated, or extra");
 
@@ -10765,6 +10765,8 @@ out:
     }
 }
 
+#define SPAWN_HEAP_ROUNDS 2
+
 /* Run the spawn storm with residents idle processes alive across it: each is
  * /bin/cat (the small toolbox binary) blocked reading a pipe until EOF. The
  * kernel's pshut and irqoff lines (CONFIG_INSTRUMENTATION) printed before the
@@ -10817,7 +10819,17 @@ void test_spawn_storm(unsigned residents)
     printf("spawn_storm: residents=%u\n", spawned);
     spawn_storm_report_memory(spawned);
     if (spawned == residents) {
-        test_spawn_concurrent();
+        /* Spawns with 32 and 64 KiB arguments after each concurrent storm:
+         * the storm leaves roottask's fixed heap holding blocks of many
+         * sizes, and these needed new backing the heap could no longer give
+         * (K43).
+         */
+        for (int round = 0; round < SPAWN_HEAP_ROUNDS; round++) {
+            test_spawn_concurrent();
+            spawn_storm_report_memory(spawned);
+            test_spawn_large_arguments();
+            spawn_storm_report_memory(spawned);
+        }
         sleep(2); /* let one more pshut/irqoff report land before the marker */
         printf("spawn_storm: storm done residents=%u\n", spawned);
     }

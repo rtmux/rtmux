@@ -35,6 +35,7 @@ SYS_OBJECTS = \
 	sys/root-process.o \
 	sys/main.o \
 	sys/heap.o \
+	sys/heap-note.o \
 	sys/message.o \
 	sys/proc-loader.o \
 	sys/proc-read.o \

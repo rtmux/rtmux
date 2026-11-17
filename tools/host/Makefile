@@ -40,7 +40,8 @@ PROGS = $(BUILD_BASE)/mkasmoff $(BUILD_BASE)/mkromfs $(BUILD_BASE)/treeromfs \
         $(BUILD_BASE)/sv39-lookup-test $(BUILD_BASE)/sv39-manip-test \
         $(BUILD_BASE)/strftime-test $(BUILD_BASE)/sh-scan-test $(BUILD_BASE)/tz-test \
         $(BUILD_BASE)/malloc-stats-test $(BUILD_BASE)/pci-args-test \
-        $(BUILD_BASE)/libc-algorithms-test $(BUILD_BASE)/pgrp-table-test
+        $(BUILD_BASE)/libc-algorithms-test $(BUILD_BASE)/pgrp-table-test \
+        $(BUILD_BASE)/heap-arena-test
 
 # Each tool compiles and links its sources in one command, so -MMD cannot give a
 # per-tool dependency file (with several sources it writes one named after each
@@ -206,6 +207,18 @@ $(BUILD_BASE)/malloc-stats-test: $(MALLOC_DEPS)
 	$(Q)$(HOST_CC) $(MALLOC_FLAGS) $(HOST_CFLAGS) -o $@ \
 	    $(TEST_DIR)/test-malloc-stats.c ../../lib/libc/alloc/malloc-core.c
 
+# Roottask's malloc arena (servers/roottask/sys/heap.c) under the real allocator.
+HEAP_DEPS = $(TEST_DIR)/test-heap-arena.c ../../lib/libc/alloc/malloc-core.c \
+            ../../servers/roottask/sys/heap.c \
+            ../../servers/roottask/include/heap-stats.h
+$(BUILD_BASE)/heap-arena-test: $(HEAP_DEPS)
+	@mkdir -p $(@D)
+	$(msg) HOSTCC $(notdir $@)
+	$(Q)$(HOST_CC) $(MALLOC_FLAGS) -I../../servers/roottask/include \
+	    -DCONFIG_ROOTTASK_HEAP_SIZE=4194304 $(HOST_CFLAGS) -o $@ \
+	    $(TEST_DIR)/test-heap-arena.c ../../lib/libc/alloc/malloc-core.c \
+	    ../../servers/roottask/sys/heap.c
+
 $(BUILD_BASE)/malloc-nostats-bench: $(MALLOC_DEPS)
 	@mkdir -p $(@D)
 	$(msg) HOSTCC $(notdir $@)
@@ -356,7 +369,7 @@ host-tests: $(BUILD_BASE)/path-normalize-test $(BUILD_BASE)/cap-table-test \
             $(BUILD_BASE)/sh-scan-test $(BUILD_BASE)/libc-algorithms-test \
             $(BUILD_BASE)/tz-test $(BUILD_BASE)/tz-asan-test $(TZ_ZONES)/.stamp \
             $(BUILD_BASE)/malloc-stats-test $(BUILD_BASE)/pci-args-test \
-            $(BUILD_BASE)/pgrp-table-test
+            $(BUILD_BASE)/pgrp-table-test $(BUILD_BASE)/heap-arena-test
 	$(Q)$<
 	$(Q)$(BUILD_BASE)/cap-table-test
 	$(Q)$(BUILD_BASE)/bootstrap-manifest-test
@@ -380,6 +393,7 @@ host-tests: $(BUILD_BASE)/path-normalize-test $(BUILD_BASE)/cap-table-test \
 	$(Q)RTMUX_TZDIR=$(abspath $(TZ_ZONES))/ $(BUILD_BASE)/tz-test
 	$(Q)RTMUX_TZDIR=$(abspath $(TZ_ZONES))/ $(BUILD_BASE)/tz-asan-test
 	$(Q)$(BUILD_BASE)/malloc-stats-test
+	$(Q)$(BUILD_BASE)/heap-arena-test
 	$(Q)$(BUILD_BASE)/pci-args-test
 	$(Q)out=$$($(BUILD_BASE)/libc-algorithms-test) || { printf '%s\n' "$$out"; exit 1; }
 	$(Q)$(PYTHON) $(TEST_DIR)/test-capability-namespace-doc.py

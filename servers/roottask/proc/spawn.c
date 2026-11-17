@@ -279,6 +279,7 @@ int proc_spawn(ioserv_context_t *ctp, void *vmsg)
                   LC_SPAWN | (((ctp->info.flags & RTMUX_MI_ENDIAN_DIFF))
                                   ? LC_CROSS_ENDIAN
                                   : 0)))) {
+            roottask_heap_note_nomem("loader context", msgsize);
             return ENOMEM;
         }
 
