@@ -1052,6 +1052,12 @@ int main(int argc, char *argv[])
             test_skip("condvar_interrupt_stale", "fault injection unavailable");
         return finish(1);
     }
+    if (argc == 2 && !strcmp(argv[1], "--ns-open-deferral")) {
+        printf("[ns_open_deferral]\n");
+        if (ns_open_deferral() == TC_EXIT_SKIP)
+            test_skip("ns_open_deferral", "fault injection unavailable");
+        return finish(1);
+    }
     if (argc == 3 && !strcmp(argv[1], "--serial-unblock-child"))
         return serial_unblock_child(!strcmp(argv[2], "announce"));
     if (argc == 2 && !strcmp(argv[1], "--console-poll")) {

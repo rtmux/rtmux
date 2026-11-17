@@ -47,11 +47,26 @@ static dispatch_context_t *roottask_dispatch_block(dispatch_context_t *ctp)
 #define ROOT_BLOCK_FN dispatch_block
 #endif
 
+/* Dispatch one message, then restart what the path server parked behind it:
+ * that waits for this thread's reply.
+ */
+static int root_dispatch_handler(dispatch_context_t *ctp)
+{
+    int ret = dispatch_handler(ctp);
+
+    /* dispatch_handler accepts a NULL context (the block function came out
+     * early on a signal or error) and tells the pool to reblock.
+     */
+    if (ctp)
+        path_open_resume((ioserv_context_t *) ctp);
+    return ret;
+}
+
 static thread_pool_attr_t pool_attr = {
     NULL,                   /* Handle */
     ROOT_BLOCK_FN,          /* Block function */
     NULL,                   /* Unblock func */
-    dispatch_handler,       /* Handler function */
+    root_dispatch_handler,  /* Handler function */
     dispatch_context_alloc, /* Context allocation */
     dispatch_context_free,  /* Context free */
     &thread_attr,           /* Thread attribute struct */

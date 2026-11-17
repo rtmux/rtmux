@@ -160,7 +160,14 @@ if test "$rtmux_run" = "debug-inject"; then
             ok=6
         fi
     fi
+    # A request parked behind another on one namespace node must not cost the
+    # request it waited for its combined result or its connection state.
     if test "$ok" = 6; then
+        if /bin/syscall_testing --ns-open-deferral; then
+            ok=7
+        fi
+    fi
+    if test "$ok" = 7; then
         echo "RTMux debug-inject: PASS"
     else
         echo "RTMux debug-inject: FAIL"

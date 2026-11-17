@@ -4811,6 +4811,152 @@ static void test_namespace_open_entry_generation_race(void)
     }
 }
 
+/* ns_open_deferral: a stat or access that was in flight when an unlink of the
+ * same node arrived still returns its result and leaves no connection state
+ * behind.
+ *
+ * The namespace server parks the unlink behind the first request and restarts
+ * it when that finishes. It used to answer the request first, with no result,
+ * and skip the combined stat and close, so the call "succeeded" with a zeroed
+ * buffer and its binding stayed on the connection id for good: the next request
+ * that was given that id failed with EBUSY, long after the race. That is the
+ * second round, an access that follows a stat. A node named
+ * rtmux-open-stall-MS holds each open of it for MS ms in a CONFIG_DEBUG_INJECT
+ * image, which keeps the first request in flight while the unlink arrives;
+ * elsewhere it is not held and the case is skipped.
+ */
+#define NSD_STALL_MS 600
+#define NSD_NAME "rtmux-open-stall-600"
+#define NSD_PATH "/dev/name/local/" NSD_NAME
+#define NSD_ATTEMPTS 3
+
+static struct {
+    bool use_access;
+    atomic_int started;
+    int rc;
+    int err;
+    struct stat st;
+    long ms;
+} nsd;
+
+static long nsd_ms_since(const struct timespec *t0)
+{
+    struct timespec t1;
+
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    return (t1.tv_sec - t0->tv_sec) * 1000L + (t1.tv_nsec - t0->tv_nsec) / 1000000L;
+}
+
+static void *nsd_thread(void *arg)
+{
+    struct timespec t0;
+
+    (void) arg;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    atomic_store(&nsd.started, 1);
+    errno = 0;
+    nsd.rc = nsd.use_access ? access(NSD_PATH, F_OK) : stat(NSD_PATH, &nsd.st);
+    nsd.err = errno;
+    nsd.ms = nsd_ms_since(&t0);
+    return NULL;
+}
+
+/* One round. Returns 1 when the request was held and the unlink parked behind
+ * it, 0 when the unlink was not held (a late thread; the caller retries), and
+ * -1 after a failure it has reported.
+ */
+static int nsd_round(bool use_access)
+{
+    const char *what = use_access ? "access" : "stat";
+    char name[48], why[112];
+    name_attach_t *attach;
+    pthread_t th;
+    struct timespec t0;
+    long unlink_ms;
+    int unlink_rc, unlink_err;
+
+    (void) unlink(NSD_PATH);
+    attach = name_attach(NULL, NSD_NAME, 0);
+    if (!attach) {
+        test_fail("ns_open_deferral fixture", strerror(errno));
+        return -1;
+    }
+    memset(&nsd, 0, sizeof nsd);
+    nsd.use_access = use_access;
+    if (pthread_create(&th, NULL, nsd_thread, NULL) != 0) {
+        test_fail("ns_open_deferral fixture", "pthread_create");
+        (void) name_detach(attach, 0);
+        return -1;
+    }
+    while (!atomic_load(&nsd.started))
+        (void) __sched_yield();
+    /* The request is held in the server by now; this unlink parks behind it. */
+    (void) nanosleep(&(struct timespec){.tv_nsec = (NSD_STALL_MS / 4) * 1000000L}, NULL);
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    errno = 0;
+    unlink_rc = unlink(NSD_PATH);
+    unlink_err = errno;
+    unlink_ms = nsd_ms_since(&t0);
+    (void) pthread_join(th, NULL);
+    (void) name_detach(attach, 0);
+
+    if (unlink_ms < NSD_STALL_MS / 4)
+        return 0; /* it ran before the request reached the server, or after it */
+
+    snprintf(name, sizeof name, "ns_open_deferral %s result", what);
+    snprintf(why, sizeof why, "rc %d errno %d mode %#o after %ld ms; unlink rc %d errno %d", nsd.rc,
+             nsd.err, (unsigned) nsd.st.st_mode, nsd.ms, unlink_rc, unlink_err);
+    check(nsd.rc == 0 && (use_access || S_ISNAM(nsd.st.st_mode)), name, why);
+    snprintf(name, sizeof name, "ns_open_deferral %s parked unlink", what);
+    check(unlink_rc == 0 || unlink_err == ENOENT, name,
+          "the unlink parked behind the request must complete");
+    return 1;
+}
+
+int ns_open_deferral(void)
+{
+    struct stat st;
+    struct timespec t0;
+    name_attach_t *attach;
+    long ms;
+    int rc;
+
+    /* Is the stall in this image? A held stat of the fixture node takes the
+     * stall; judged on its time alone when it succeeds, so that a stat that
+     * fails fast is a failure and not a skip.
+     */
+    (void) unlink(NSD_PATH);
+    attach = name_attach(NULL, NSD_NAME, 0);
+    if (!attach) {
+        test_fail("ns_open_deferral fixture", strerror(errno));
+        return 0;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    rc = stat(NSD_PATH, &st);
+    ms = nsd_ms_since(&t0);
+    (void) name_detach(attach, 0);
+    if (rc != 0) {
+        test_fail("ns_open_deferral fixture", strerror(errno));
+        return 0;
+    }
+    if (ms < NSD_STALL_MS / 2)
+        return TC_EXIT_SKIP;
+
+    for (int round = 0; round < 2; round++) {
+        int held = 0;
+
+        for (int i = 0; i < NSD_ATTEMPTS && !held; i++)
+            held = nsd_round(round == 1);
+        if (held < 0)
+            return 0;
+        if (!held) {
+            test_fail("ns_open_deferral", "the unlink was never held behind the request");
+            return 0;
+        }
+    }
+    return 0;
+}
+
 static void test_namespace_uncacheable_bypass(void)
 {
     const char name[] = "rtmux-uncacheable-dir";
