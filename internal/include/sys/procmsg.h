@@ -590,8 +590,14 @@ enum {
     _PROC_JOBCTL_QUERY,
     _PROC_JOBCTL_SIGFG,
     _PROC_JOBCTL_SIGBG,
-    _PROC_JOBCTL_SETPGRP
+    _PROC_JOBCTL_SETPGRP,
+    _PROC_JOBCTL_DEBUG /* CONFIG_DEBUG_INJECT only: arg window, arg2 ms */
 };
+
+/* _PROC_JOBCTL_DEBUG windows (arg): where roottask holds the next operation. */
+#define PGRP_WINDOW_NONE 0
+#define PGRP_WINDOW_SETPGID 1 /* setpgid, checked and not yet changed */
+#define PGRP_WINDOW_DETACH 2  /* tcsetsid(-1), terminal let go, server not told */
 
 /* _PROC_JOBCTL_STATE events (arg) */
 enum { _JOBCTL_STOPPED, _JOBCTL_CONTINUED, _JOBCTL_TTYMASK };

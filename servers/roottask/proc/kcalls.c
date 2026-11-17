@@ -181,17 +181,6 @@ static process_t *process_create_locked(pid_t parent_pid,
         root_process_t *parent_tmp = root_proc(parent_pid);
         root_process_t *child_tmp = root_proc(new_pid);
         child_tmp->umask = parent_tmp->umask;
-
-        /* POSIX: a child starts in its parent's process group and session. A
-         * parent starts in its own group (root_process_init), so a child of one
-         * that never moved is in group parent_pid. Each member holds one link
-         * on the session; root_process_fini drops it.
-         */
-        child_tmp->pgrp = root_process_pgrp(parent_tmp);
-        if (parent_tmp->session) {
-            child_tmp->session = parent_tmp->session;
-            (void) atomic_add_value(&child_tmp->session->links, 1);
-        }
     }
 
     /* Kernel mm_mcreate has set up adp + cpu pgdir. Fill in the roottask-half
@@ -222,6 +211,10 @@ static process_t *process_create_locked(pid_t parent_pid,
 process_t *process_create(pid_t parent_pid, void *lcp, pid_t *out_pid)
 {
     process_t *prp;
+    pid_t pid = 0;
+
+    if (!out_pid)
+        out_pid = &pid;
 
     /* Held across creation so a failed as_mcreate_pid can shut the new address
      * space down; the lock is not recursive, so callers must not hold it.
@@ -229,6 +222,26 @@ process_t *process_create(pid_t parent_pid, void *lcp, pid_t *out_pid)
     proc_wlock_adp(ROOTTASK_PID);
     prp = process_create_locked(parent_pid, lcp, out_pid);
     proc_unlock_adp(ROOTTASK_PID);
+    if (prp == (void *) -1 || !prp)
+        return prp;
+
+    /* A child starts in its parent's process group and session (a process with
+     * no parent, in a group of its own): see proc_pgrp_inherit. Not under the
+     * address space lock, which a holder of pgrp_mutex or a slot lock can wait
+     * for in turn; the child's first thread is not created yet, so nothing runs
+     * in it before this is done.
+     */
+    if (proc_pgrp_inherit(*out_pid, parent_pid) != EOK) {
+        proc_wlock_adp(ROOTTASK_PID);
+        (void) process_destroy_all(*out_pid);
+        while (process_shutdown(prp, 0) == -1 && errno == EAGAIN)
+            ;
+        (void) process_destroy_call(*out_pid);
+        proc_unlock_adp(ROOTTASK_PID);
+        *out_pid = 0;
+        errno = EAGAIN;
+        return (process_t *) -1;
+    }
     return prp;
 }
 

@@ -1082,6 +1082,18 @@ int main(int argc, char *argv[])
             test_skip("pte_partial_map", "fault injection unavailable");
         return finish(1);
     }
+    if (argc == 2 && !strcmp(argv[1], "--pgrp-races")) {
+        printf("[pgrp_races]\n");
+        if (pgrp_races() == TC_EXIT_SKIP)
+            test_skip("pgrp_races", "debug window unavailable");
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--pgrp-exec-hold"))
+        return pgrp_exec_hold();
+    if (argc == 2 && !strcmp(argv[1], "--pgrp-tty-bind"))
+        return pgrp_tty_child(0);
+    if (argc == 2 && !strcmp(argv[1], "--pgrp-tty-race"))
+        return pgrp_tty_child(1);
     if (argc == 3 && !strcmp(argv[1], "--serial-unblock-child"))
         return serial_unblock_child(!strcmp(argv[2], "announce"));
     if (argc == 2 && !strcmp(argv[1], "--console-poll")) {

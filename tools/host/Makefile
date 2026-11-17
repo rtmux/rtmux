@@ -40,7 +40,7 @@ PROGS = $(BUILD_BASE)/mkasmoff $(BUILD_BASE)/mkromfs $(BUILD_BASE)/treeromfs \
         $(BUILD_BASE)/sv39-lookup-test $(BUILD_BASE)/sv39-manip-test \
         $(BUILD_BASE)/strftime-test $(BUILD_BASE)/sh-scan-test $(BUILD_BASE)/tz-test \
         $(BUILD_BASE)/malloc-stats-test $(BUILD_BASE)/pci-args-test \
-        $(BUILD_BASE)/libc-algorithms-test
+        $(BUILD_BASE)/libc-algorithms-test $(BUILD_BASE)/pgrp-table-test
 
 # Each tool compiles and links its sources in one command, so -MMD cannot give a
 # per-tool dependency file (with several sources it writes one named after each
@@ -64,6 +64,14 @@ $(BUILD_BASE)/spawn-fd-policy-test: $(TEST_DIR)/test-spawn-fd-policy.c \
 	$(msg) HOSTCC $(notdir $@)
 	$(Q)$(HOST_CC) $(HOST_CPPFLAGS) -I../../internal/include -I../../include $(HOST_CFLAGS) -o $@ \
 	    $(TEST_DIR)/test-spawn-fd-policy.c
+
+$(BUILD_BASE)/pgrp-table-test: $(TEST_DIR)/test-pgrp-table.c \
+                               ../../servers/roottask/proc/pgrp-table.c \
+                               ../../servers/roottask/include/pgrp-table.h
+	@mkdir -p $(@D)
+	$(msg) HOSTCC $(notdir $@)
+	$(Q)$(HOST_CC) $(HOST_CPPFLAGS) -I../../servers/roottask/include $(HOST_CFLAGS) -o $@ \
+	    $(TEST_DIR)/test-pgrp-table.c ../../servers/roottask/proc/pgrp-table.c
 
 # Outcome accounting (pass/fail/gap/skip) shared with the guest suite.
 $(BUILD_BASE)/outcomes-test: $(TEST_DIR)/test-outcomes.c
@@ -347,7 +355,8 @@ host-tests: $(BUILD_BASE)/path-normalize-test $(BUILD_BASE)/cap-table-test \
             $(BUILD_BASE)/strftime-test $(BUILD_BASE)/strftime-asan-test \
             $(BUILD_BASE)/sh-scan-test $(BUILD_BASE)/libc-algorithms-test \
             $(BUILD_BASE)/tz-test $(BUILD_BASE)/tz-asan-test $(TZ_ZONES)/.stamp \
-            $(BUILD_BASE)/malloc-stats-test $(BUILD_BASE)/pci-args-test
+            $(BUILD_BASE)/malloc-stats-test $(BUILD_BASE)/pci-args-test \
+            $(BUILD_BASE)/pgrp-table-test
 	$(Q)$<
 	$(Q)$(BUILD_BASE)/cap-table-test
 	$(Q)$(BUILD_BASE)/bootstrap-manifest-test
@@ -358,6 +367,7 @@ host-tests: $(BUILD_BASE)/path-normalize-test $(BUILD_BASE)/cap-table-test \
 	$(Q)$(BUILD_BASE)/ldso-path-test
 	$(Q)$(BUILD_BASE)/cpio-parser-test
 	$(Q)$(BUILD_BASE)/spawn-fd-policy-test
+	$(Q)$(BUILD_BASE)/pgrp-table-test
 	$(Q)$(BUILD_BASE)/serial-reply-test
 	$(Q)$(BUILD_BASE)/outcomes-test >/dev/null
 	$(Q)$(BUILD_BASE)/sv39-lookup-test

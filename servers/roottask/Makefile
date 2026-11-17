@@ -60,6 +60,7 @@ PROC_OBJECTS = \
 	proc/ids.o \
 	proc/session.o \
 	proc/group.o \
+	proc/pgrp-table.o \
 	proc/umask.o \
 	proc/event.o \
 	proc/resource.o \

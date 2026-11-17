@@ -154,6 +154,21 @@ typedef struct root_process_entry {
     struct session_entry *session;
     siginfo_t siginfo;
 
+    /* The process's place in the group table (proc/group.c): whether it is
+     * counted in group pgrp, and which incarnation of that group, so that
+     * leaving never takes a count from a later group of the same id. Changed
+     * under the group table's lock; pgrp_member is set once the process has
+     * entered its first group and cleared when it is reaped.
+     */
+    uint32_t pgrp_gen;
+    unsigned char pgrp_member;
+
+    /* The process has itself replaced its image (exec). The only thing it
+     * affects is setpgid, which POSIX refuses from the parent after that; a
+     * spawned child that has not exec'd stays movable.
+     */
+    unsigned char execed;
+
     /* Job control: which of SIGTTIN/SIGTTOU the process blocks or ignores
      * (_JOBCTL_HOLD_* bits), as its libc reports through _PROC_JOBCTL_STATE. A
      * terminal server reads it to choose between EIO and a stop signal.

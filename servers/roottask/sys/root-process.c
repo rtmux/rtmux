@@ -62,8 +62,13 @@ void root_process_init(pid_t pid, pid_t parent_pid)
 {
     root_process_t *tmp = root_proc(pid);
 
-    /* Wipe stale process state; the proc-mux lock belongs to the slot. */
+    /* Wipe stale process state; the proc-mux lock belongs to the slot. A
+     * previous generation whose fini has not run yet leaves its group first, or
+     * its count would never end.
+     */
     pthread_mutex_lock(&slot_lock);
+    if (tmp->pid)
+        proc_pgrp_reap(tmp->pid);
     root_process_clear(tmp);
     tmp->pid = pid;
     tmp->parent_pid = parent_pid;
@@ -106,8 +111,9 @@ void root_process_boot_session(pid_t pid)
     boot_session.pgrp = boot_session.fd = -1;
     pthread_mutex_lock(&slot_lock);
     tmp->session = &boot_session;
-    tmp->pgrp = pid;
     pthread_mutex_unlock(&slot_lock);
+    if (proc_pgrp_boot(pid) != EOK)
+        crash();
 }
 
 /* Release the root_process[] slot for a pid.
@@ -119,6 +125,7 @@ void root_process_boot_session(pid_t pid)
 void root_process_fini(pid_t pid)
 {
     root_process_t *tmp = root_proc(pid);
+    session_t *sep = NULL;
 
     /* Idempotent: callers (proc_exit) sometimes hit the destroy path twice on a
      * swap-during-exit sequence. Only clear if the slot still claims this pid;
@@ -127,16 +134,12 @@ void root_process_fini(pid_t pid)
     pthread_mutex_lock(&slot_lock);
     if (tmp->pid == pid) {
         free(tmp->debug_name); /* tolerates NULL */
-        if (tmp->session && atomic_sub_value(&tmp->session->links, 1) == 1) {
-            /* The last member is gone: release the controlling terminal
-             * descriptor, if one was bound, and the session itself.
-             */
-            if (tmp->session->fd >= 0)
-                (void) close(tmp->session->fd);
-            free(tmp->session);
-        }
+        proc_pgrp_reap(pid); /* a no-op for a child its waiter already reaped */
+        sep = tmp->session;  /* its link is dropped below, outside the lock */
         memcap_process_fini(tmp);
         root_process_clear(tmp);
     }
     pthread_mutex_unlock(&slot_lock);
+    if (sep)
+        proc_session_unref(sep);
 }
