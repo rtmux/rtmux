@@ -1000,7 +1000,13 @@ void strap_handler_c(CPU_REGISTERS *regs)
         if ((act->iovchk_iov || act->xcur.armed) && num != __KSYS_MSG_READV &&
             num != __KSYS_MSG_WRITEV) {
             act->iovchk_iov = NULL;
-            act->xcur.armed = false;
+
+            /* A copy cursor resumes only into the call that saved it: one of
+             * the calls that copy a message in steps.
+             */
+            if (num != __KSYS_MSG_SENDV && num != __KSYS_MSG_SENDVNC &&
+                num != __KSYS_MSG_RECEIVEV && num != __KSYS_MSG_REPLYV)
+                act->xcur.armed = false;
         }
 
         /* Reject invalid syscall numbers AFTER advancing the PC so the faulting

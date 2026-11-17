@@ -182,7 +182,7 @@ int mm_map_xfer(process_t *actprp,
                 process_t *prp,
                 iov_t **piov,
                 int *pparts,
-                int *poff,
+                size_t *poff,
                 iov_t *niov,
                 int *pnparts,
                 unsigned flags)
@@ -237,7 +237,7 @@ int mm_map_xfer(process_t *actprp,
         return -1;
 
     /* Skip over the initial offset within the IOV list. */
-    off = (size_t) *poff;
+    off = *poff;
     while (off >= GETIOVLEN(&cur)) {
         size_t len = GETIOVLEN(&cur);
         if (--parts == 0)
@@ -254,7 +254,7 @@ int mm_map_xfer(process_t *actprp,
              */
             *pnparts = 0;
             *pparts = parts;
-            *poff = (int) off;
+            *poff = off;
             *piov = *piov + iov_advances;
             return XFER_MAP_YIELD;
         }
@@ -320,7 +320,7 @@ int mm_map_xfer(process_t *actprp,
 
     *pnparts = nparts;
     *pparts = parts;
-    *poff = (int) (GETIOVLEN(&cur) - size);
+    *poff = GETIOVLEN(&cur) - size;
     *piov = *piov + iov_advances;
 
     /* Nothing mapped but entries left: the step ran out over a run of empty

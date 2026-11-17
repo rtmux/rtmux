@@ -329,7 +329,7 @@ extern int mm_map_xfer(process_t *actprp,
                        process_t *prp,
                        iov_t **piov,
                        int *pparts,
-                       int *poff,
+                       size_t *poff,
                        iov_t *niov,
                        int *pnparts,
                        unsigned flags);

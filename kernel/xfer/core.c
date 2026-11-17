@@ -88,7 +88,7 @@ static void xfer_preempt(thread_t *thp)
      * lookup window, so close it here: a call that restarts many times would
      * otherwise open more than the nesting counter can hold.
      */
-    lookup_rcvid_release();
+    lookup_rcvid_release_all();
     kernel_exit();
 }
 
@@ -210,13 +210,13 @@ void xfer_async_restart(thread_t *thp, CPU_REGISTERS *regs)
  */
 static int xfer_skip(iov_t **iovp,
                      int *partsp,
-                     unsigned *offp,
+                     size_t *offp,
                      struct xfer_spent *sp)
 {
     jmp_buf env, *old_env = GET_XFER_ENV();
     iov_t *iov = *iovp;
     int parts = *partsp, ret = 0, status;
-    unsigned off = *offp;
+    size_t off = *offp;
 
     SET_XFER_ENV(&env);
     if ((status = xfer_setjmp(*GET_XFER_ENV()))) {
@@ -259,10 +259,10 @@ static int xfer_yield(thread_t *act,
                       thread_t *sthp,
                       const iov_t *sbase,
                       const iov_t *src,
-                      unsigned soff,
+                      size_t soff,
                       const iov_t *dbase,
                       const iov_t *dst,
-                      unsigned doff)
+                      size_t doff)
 {
     act->xcur.msglen = sthp->args.ms.msglen;
     act->xcur.sidx = (uint32_t) (src - sbase);
@@ -336,8 +336,8 @@ static bool xfer_array_in_bound(const iov_t *iov,
 
 static int xfermsg_run(thread_t *dthp,
                        thread_t *sthp,
-                       unsigned doff,
-                       unsigned soff,
+                       size_t doff,
+                       size_t soff,
                        bool bounded)
 {
     iov_t *dst, *src, *dbase, *sbase;
@@ -519,7 +519,7 @@ static int xfermsg_run(thread_t *dthp,
             if (dprp != prp) {
                 iov_t iovlist[XFER_IOV_NUM];
                 iov_t *dst0;
-                unsigned doff0;
+                size_t doff0;
                 uint32_t msglen0;
                 int parts;
                 int nbytes;
@@ -538,9 +538,9 @@ static int xfermsg_run(thread_t *dthp,
                     dst0 = dst;
                     doff0 = doff;
                     msglen0 = sthp->args.ms.msglen;
-                    nbytes = vm_ops->map_xfer(prp, dprp, (iov_t **) &dst,
-                                              &dparts, (int *) &doff, iovlist,
-                                              &parts, dflags);
+                    nbytes =
+                        vm_ops->map_xfer(prp, dprp, (iov_t **) &dst, &dparts,
+                                         &doff, iovlist, &parts, dflags);
                     if (nbytes <= 0) {
                         if (nbytes == 0) {
                             break;
@@ -580,7 +580,7 @@ static int xfermsg_run(thread_t *dthp,
         } else if (sprp) { /* end for (sprp == prp) */
             iov_t iovlist[XFER_IOV_NUM];
             iov_t *src0;
-            unsigned soff0;
+            size_t soff0;
             uint32_t msglen0;
             int parts;
             int nbytes;
@@ -600,9 +600,8 @@ static int xfermsg_run(thread_t *dthp,
                 src0 = src;
                 soff0 = soff;
                 msglen0 = sthp->args.ms.msglen;
-                nbytes =
-                    vm_ops->map_xfer(prp, sprp, (iov_t **) &src, &sparts,
-                                     (int *) &soff, iovlist, &parts, sflags);
+                nbytes = vm_ops->map_xfer(prp, sprp, (iov_t **) &src, &sparts,
+                                          &soff, iovlist, &parts, sflags);
 
                 if (nbytes <= 0) {
                     if (nbytes == 0) {
@@ -682,7 +681,7 @@ static int xfermsg_run(thread_t *dthp,
     return status;
 }
 
-int xfermsg(thread_t *dthp, thread_t *sthp, unsigned doff, unsigned soff)
+int xfermsg(thread_t *dthp, thread_t *sthp, size_t doff, size_t soff)
 {
     return xfermsg_run(dthp, sthp, doff, soff, false);
 }
@@ -692,10 +691,18 @@ int xfermsg(thread_t *dthp, thread_t *sthp, unsigned doff, unsigned soff)
  * copied), then saves where it stands and restarts the call. The vector entries
  * it uses are read once and checked as it copies.
  */
-int xfermsg_bounded(thread_t *dthp,
-                    thread_t *sthp,
-                    unsigned doff,
-                    unsigned soff)
+int xfermsg_bounded(thread_t *dthp, thread_t *sthp, size_t doff, size_t soff)
 {
-    return xfermsg_run(dthp, sthp, doff, soff, true);
+    int status = xfermsg_run(dthp, sthp, doff, soff, true);
+
+    /* A cursor is for the restart of a call that yielded, not for a later call
+     * that happens to look the same.
+     */
+    if (status != XFER_RESTART) {
+        thread_t *act = get_active_thread(get_cpunum());
+
+        if (act->xcur.armed)
+            act->xcur.armed = false;
+    }
+    return status;
 }

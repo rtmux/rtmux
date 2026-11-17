@@ -370,7 +370,42 @@ static int msg_readv_body(thread_t *act, struct kcall_args_msg_readv *kap)
         unsigned dlen;
 
         slen = thp->args.msbuff.msglen;
-        if (kap->offset < slen) {
+        if (kap->offset < slen && act->args.ms.rparts > 1) {
+            /* A destination of many entries is walked a step at a time, so a
+             * vector of empty ones does not hold the kernel to its end; the
+             * cursor is the entry reached and the bytes placed, for the same
+             * client, vector and offset.
+             */
+            unsigned idx = 0;
+            size_t copied = 0;
+
+            slen -= kap->offset;
+            if (act->xcur.armed && act->xcur.sthp == thp &&
+                act->xcur.rmsg == act->args.ms.rmsg &&
+                act->xcur.rparts == (int32_t) act->args.ms.rparts &&
+                act->xcur.soff0 == kap->offset && act->xcur.msglen == slen) {
+                idx = act->xcur.didx;
+                copied = act->xcur.soff;
+            }
+            xferstat = xfer_cpy_diov_step(
+                act, act->args.ms.rmsg, act->args.ms.rparts,
+                thp->args.msbuff.buff + kap->offset, slen, &idx, &copied);
+            if (xferstat == XFER_YIELD) {
+                act->xcur.armed = true;
+                act->xcur.sthp = thp;
+                act->xcur.rmsg = act->args.ms.rmsg;
+                act->xcur.rparts = (int32_t) act->args.ms.rparts;
+                act->xcur.soff0 = kap->offset;
+                act->xcur.msglen = (uint32_t) slen;
+                act->xcur.didx = idx;
+                act->xcur.soff = copied;
+                KCALL_RESTART(act);
+                xferstat = XFER_RESTART;
+            } else {
+                act->xcur.armed = false;
+                slen = (unsigned) copied;
+            }
+        } else if (kap->offset < slen) {
             slen -= kap->offset;
             xferstat = xfer_cpy_diov(act, act->args.ms.rmsg,
                                      thp->args.msbuff.buff + kap->offset,

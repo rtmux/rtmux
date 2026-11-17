@@ -201,18 +201,15 @@ struct xfer_spent {
 struct xfer_walk {
     iov_t *dst, *src;
     int dparts, sparts;
-    unsigned doff, soff;
+    size_t doff, soff;
     uintptr_t dbound, sbound;
     struct xfer_spent *spent;
 };
 
 int(xferiov)(thread_t *sthp, struct xfer_walk *w);
 
-int(xfermsg)(thread_t *dthp, thread_t *sthp, unsigned doff, unsigned soff);
-int xfermsg_bounded(thread_t *dthp,
-                    thread_t *sthp,
-                    unsigned doff,
-                    unsigned soff);
+int(xfermsg)(thread_t *dthp, thread_t *sthp, size_t doff, size_t soff);
+int xfermsg_bounded(thread_t *dthp, thread_t *sthp, size_t doff, size_t soff);
 int(xfernotification)(thread_t *dthp,
                       iov_t *dst,
                       int parts,
@@ -226,6 +223,13 @@ int xfer_probe(void *loc, unsigned words, int write);
 int xfer_atomic_or_user(volatile unsigned *uaddr, unsigned bits);
 int xfer_fetch_or_user(volatile unsigned *uaddr, unsigned bits, unsigned *oldp);
 unsigned tls_flags_load(thread_t *thp);
+int xfer_cpy_diov_step(thread_t *thpd,
+                       iov_t *dst,
+                       int dparts,
+                       const uint8_t *saddr,
+                       size_t slen,
+                       unsigned *idx,
+                       size_t *copied);
 int(xfer_cpy_diov)(thread_t *thpd,
                    iov_t *dst,
                    uint8_t *saddr,

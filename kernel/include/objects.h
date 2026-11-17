@@ -836,9 +836,10 @@ typedef struct thread_entry { /* Also used for vthread_entry */
         thread_t *sthp, *dthp;
         const void *smsg, *rmsg; /* the vectors the transfer was started on */
         int32_t sparts, rparts;
-        uint32_t soff0, doff0; /* and the offsets the call asked for */
+        size_t soff0, doff0; /* and the offsets the call asked for */
         uint32_t msglen;
-        uint32_t sidx, soff, didx, doff;
+        uint32_t sidx, didx;
+        size_t soff, doff;
         bool armed;
     } xcur;
 } thread_t;

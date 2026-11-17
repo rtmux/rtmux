@@ -45,7 +45,7 @@ static void xfer_cpy(thread_t *thp, char *dst, char *src, size_t nbytes)
  */
 static int xfer_entry(const iov_t *e,
                       uintptr_t bound,
-                      unsigned off,
+                      size_t off,
                       int fault,
                       char **addr,
                       size_t *len)
@@ -90,8 +90,8 @@ static int xferiov_walk(thread_t *sthp, struct xfer_walk *w)
         if (sp)
             n = min_size(n, XFER_STEP_BYTES - sp->bytes);
         xfer_cpy(sthp, dbase + w->doff, sbase + w->soff, n);
-        w->doff += (unsigned) n;
-        w->soff += (unsigned) n;
+        w->doff += n;
+        w->soff += n;
         if (sp)
             sp->bytes += (unsigned) n;
 

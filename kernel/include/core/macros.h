@@ -514,6 +514,12 @@ static __inline__ void __attribute__((__unused__)) atomic_boundary()
 #define XFER_STEP_ENTRIES 128
 #define XFER_STEP_BYTES (8 * 1024)
 
+/* Send, receive and reply rescan both vectors before the copy on every restart,
+ * so a message of more entries than this is copied in one piece, as before: the
+ * rescans would cost more than the steps save.
+ */
+#define XFER_STEP_PARTS_MAX 4096
+
 /* xferiov stopped at its work budget; map_xfer stopped skipping iov entries */
 #define XFER_YIELD 0x04
 #define XFER_MAP_YIELD (-2)

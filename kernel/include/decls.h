@@ -238,6 +238,7 @@ connect_t *rdecl lookup_rcvid(kcall_args_t *kap, int rcvid, thread_t **thpp);
  * unconditionally). Call after the last dereference of cop / thp.
  */
 void rdecl lookup_rcvid_release(void);
+void rdecl lookup_rcvid_release_all(void);
 limits_t *rdecl lookup_limits(uid_t uid);
 ksync_t *rdecl sync_create(process_t *bill_prp, sync_t *sync, unsigned flags);
 int rdecl sync_destroy(process_t *prp, sync_t *sync);
