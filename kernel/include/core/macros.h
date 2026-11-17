@@ -507,8 +507,25 @@ static __inline__ void __attribute__((__unused__)) atomic_boundary()
 /* Entries xfer_iov_check() examines in one kernel entry */
 #define XFER_IOV_CHECK_STEP 512
 
-/* xfer_iov_check() asked for the kernel call to be restarted */
-#define XFER_IOV_CHECK_RESTART (-1)
+/* Work one bounded msg_readv / msg_writev kernel entry may do (xfermsg) before
+ * it saves its cursor and restarts the call: iov entries stepped over, and
+ * bytes copied.
+ */
+#define XFER_STEP_ENTRIES 128
+#define XFER_STEP_BYTES (8 * 1024)
+
+/* xferiov stopped at its work budget; map_xfer stopped skipping iov entries */
+#define XFER_YIELD 0x04
+#define XFER_MAP_YIELD (-2)
+
+/* msg_readv or msg_writev has arranged for the kernel call to run again: the
+ * iov check or the copy used up its step. Returned by the call bodies, and by
+ * xfermsg_bounded() as XFER_RESTART, after the cursor is saved. It must differ
+ * from ENOERROR (-1), which a body returns when the call is over: the wrappers
+ * drop the saved resume state for that and keep it for this.
+ */
+#define XFER_CALL_RESTART (-3)
+#define XFER_RESTART 0x08
 
 #define XFER_SRC_CHECK 0x01
 #define XFER_DST_CHECK 0x02

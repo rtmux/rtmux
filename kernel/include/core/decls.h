@@ -186,15 +186,33 @@ int rdecl interrupt_unmask(unsigned level, interrupt_t *itp);
 int rdecl get_interrupt_level(thread_t *act, unsigned vector);
 
 unsigned(xferiov_pos)(CPU_REGISTERS *regs);
-int(xferiov)(thread_t *sthp,
-             iov_t *dst,
-             iov_t *src,
-             int dparts,
-             int sparts,
-             unsigned doff,
-             unsigned soff);
+/* Work one bounded transfer step has done so far (see XFER_STEP_*). */
+struct xfer_spent {
+    unsigned ents, bytes;
+};
+
+/* A copy position over two iov vectors. dst/src, dparts/sparts and doff/soff
+ * are the current entry, the entries left from it and the bytes already moved
+ * within it; xferiov advances them as it goes. A bound is the process boundary
+ * its vector's entries must lie inside (0: not checked), and spent, when set,
+ * makes the walk return XFER_YIELD, with the position left in place, once it
+ * has done a step of work.
+ */
+struct xfer_walk {
+    iov_t *dst, *src;
+    int dparts, sparts;
+    unsigned doff, soff;
+    uintptr_t dbound, sbound;
+    struct xfer_spent *spent;
+};
+
+int(xferiov)(thread_t *sthp, struct xfer_walk *w);
 
 int(xfermsg)(thread_t *dthp, thread_t *sthp, unsigned doff, unsigned soff);
+int xfermsg_bounded(thread_t *dthp,
+                    thread_t *sthp,
+                    unsigned doff,
+                    unsigned soff);
 int(xfernotification)(thread_t *dthp,
                       iov_t *dst,
                       int parts,
@@ -202,6 +220,7 @@ int(xfernotification)(thread_t *dthp,
                       uintptr_t value,
                       int32_t scoid);
 int(xferlen)(thread_t *thp, iov_t *iov, int parts);
+int xferlen_upto(thread_t *thp, iov_t *iov, int parts, size_t cap);
 int(xfer_memcpy)(void *dst, const void *src, size_t len);
 int xfer_probe(void *loc, unsigned words, int write);
 int xfer_atomic_or_user(volatile unsigned *uaddr, unsigned bits);
@@ -410,13 +429,6 @@ void rdecl cpu_restore_perfregs(void *);
 void rdecl cpu_free_perfregs(thread_t *thp);
 void rdecl cpu_debug_init_perfregs(void);
 /* int  rdecl    cpu_alloc_perfregs(thread_t *thp); */
-
-int(rcvmsg)(thread_t *dthp,
-            process_t *sprp,
-            void *destp,
-            int destparts,
-            void *srcp,
-            int srcparts);
 
 #undef MMF
 #define MMF(r, f, p, e) MMF_PROTO(r, f, p, e)

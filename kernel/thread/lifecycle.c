@@ -63,6 +63,7 @@ static void thread_recycle_reset(thread_t *thp)
     thp->robust_nheld = 0;
     thp->restart = NULL;
     thp->iovchk_iov = NULL;
+    thp->xcur.armed = false;
     memset(&thp->args.wa, 0, sizeof(thp->args.wa));
     thp->runmask = 0;
     thp->default_runmask = 0;
