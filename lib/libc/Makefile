@@ -52,7 +52,7 @@ POSIX1_SRCS = sleep.c write.c read.c close.c fstat.c fdatasync.c fsync.c sync.c 
               getgroups.c sysconf.c umask.c time-posix.c times.c \
               lseek.c dup.c kill.c pause.c \
               pipe.c waitpid.c getcwd.c isatty.c creat.c \
-              tcgetattr.c tcsetattr.c tcgetpgrp.c tcflush.c tcdrain.c \
+              tcgetattr.c tcsetattr.c tcgetpgrp.c tcgetsid.c tcflush.c tcdrain.c \
               tcflow.c tcsendbreak.c termios-speed.c \
               statvfs.c poll.c select.c resource.c fcntl.c signal.c iodir.c _exit.c exec.c raise.c unlink.c \
               gettimeofday.c localtime.c tzfile.c time-conv.c strftime.c setjmp.c uname.c

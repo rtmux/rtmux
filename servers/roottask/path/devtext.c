@@ -459,6 +459,11 @@ static int text_devctl(ioserv_context_t *ctp, io_devctl_t *msg, void *ocb)
         nbytes = sizeof(pid_t);
         break;
 
+    case DEVCTL_TTY_GET_SID:
+        *(pid_t *) data = text_sid;
+        nbytes = sizeof(pid_t);
+        break;
+
     case DEVCTL_TTY_SET_PGRP: {
         int err;
         pid_t pgrp;
@@ -483,8 +488,8 @@ static int text_devctl(ioserv_context_t *ctp, io_devctl_t *msg, void *ocb)
          */
         if (ctp->info.pid != ROOTTASK_PID)
             return EPERM; /* only roottask binds the terminal */
-        if (msg->i.nbytes < (int32_t) sizeof(pid_t) || *(pid_t *) data <= 0)
-            return EINVAL;
+        if (msg->i.nbytes < (int32_t) sizeof(pid_t) || *(pid_t *) data < 0)
+            return EINVAL; /* 0 unbinds the terminal */
         text_sid = text_pgrp = *(pid_t *) data;
         break;
 

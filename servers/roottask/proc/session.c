@@ -11,6 +11,54 @@
 #include <devctl/tty.h>
 #include <sys/procmsg.h>
 
+/* setsid, with pgrp_mutex held: no group or session changes under it. */
+static int session_setsid(ioserv_context_t *ctp)
+{
+    root_proc_info_t qinfo;
+    root_process_t *tmp = root_proc(ctp->info.pid);
+    session_t *sep;
+
+    /* POSIX: EPERM when the caller's pid names a process group, even one whose
+     * only members are others now. Groups are their members
+     * (proc_pgrp_session), so this is not "the caller's own group id equals its
+     * pid". Asked before the caller's slot is locked: the scan locks each slot
+     * in turn.
+     */
+    if (proc_pgrp_session(ctp->info.pid, NULL) == EOK) {
+        return EPERM;
+    }
+
+    if (!root_proc_lock(ctp->info.pid)) {
+        return EL2HLT;
+    }
+    if (process_query_info(ctp->info.pid, &qinfo) != EOK) {
+        return proc_error(ESRCH, ctp->info.pid);
+    }
+    /* Must not already be a session leader */
+    if (qinfo.flags & RTMUX_FLG_PROC_SLEADER) {
+        return proc_error(EPERM, ctp->info.pid);
+    }
+
+    /* Session struct lives in roottask heap end-to-end now. */
+    if (!(sep = malloc(sizeof *sep))) {
+        return proc_error(ENOMEM, ctp->info.pid);
+    }
+    memset(sep, 0, sizeof(*sep));
+    sep->links = 1;
+    sep->leader = ctp->info.pid;
+    sep->pgrp = sep->fd = -1;
+    if (tmp->session && atomic_sub_value(&tmp->session->links, 1) == 1) {
+        /* This should only happen if the session leader died... */
+        free(tmp->session);
+    }
+    (void) ProcessFlagsOp(ctp->info.pid, RTMUX_FLG_PROC_SLEADER, 0);
+    tmp->session = sep;
+    ctp->status = tmp->pgrp = ctp->info.pid;
+
+    root_proc_unlock(ctp->info.pid);
+    return EOK;
+}
+
 /* proc_msg_session — handle a _PROC_SESSION message.
  *
  * Dispatches the session events: TCSETSID (assign / drop a controlling
@@ -57,11 +105,22 @@ int proc_msg_session(ioserv_context_t *ctp, proc_session_t *msg)
         }
 
         if (msg->i.id == -1) {
+            pid_t none = 0;
+
             fd = sep->fd;
             sep->fd = -1;
-            close(fd);
+            root_proc_unlock(ctp->info.pid);
+
+            /* Tell the terminal server it has no session now, so that tcgetsid
+             * on a descriptor that is still open stops naming one. A server
+             * that is gone cannot answer, and has nothing to clear.
+             */
+            if (fd >= 0) {
+                (void) _devctl(fd, DEVCTL_TTY_SET_SID, &none, sizeof none, 0);
+                close(fd);
+            }
             proc_thread_pool_reserve_done();
-            return proc_error(EOK, ctp->info.pid);
+            return EOK;
         }
 
         /* We know the process won't die because we haven't replied so sep stays
@@ -140,121 +199,79 @@ int proc_msg_session(ioserv_context_t *ctp, proc_session_t *msg)
         return EOK;
     }
 
-    case _PROC_SESSION_SETSID:
-        if (!(prp = root_proc_lock(ctp->info.pid))) {
-            return EL2HLT;
-        }
-        {
-            root_proc_info_t qinfo;
-            root_process_t *tmp = root_proc(ctp->info.pid);
+    case _PROC_SESSION_SETSID: {
+        int rc;
 
-            if (process_query_info(ctp->info.pid, &qinfo) != EOK) {
-                return proc_error(ESRCH, ctp->info.pid);
-            }
-            /* Must not already be a session or process group leader */
-            if ((qinfo.flags & RTMUX_FLG_PROC_SLEADER) ||
-                tmp->pgrp == ctp->info.pid) {
-                return proc_error(EPERM, ctp->info.pid);
-            }
-
-            /* Session struct lives in roottask heap end-to-end now. */
-            if (!(sep = malloc(sizeof *sep))) {
-                return proc_error(ENOMEM, ctp->info.pid);
-            }
-            memset(sep, 0, sizeof(*sep));
-            sep->links = 1;
-            sep->leader = ctp->info.pid;
-            sep->pgrp = sep->fd = -1;
-            if (tmp->session &&
-                atomic_sub_value(&tmp->session->links, 1) == 1) {
-                /* This should only happen if the session leader died... */
-                free(tmp->session);
-            }
-            (void) ProcessFlagsOp(ctp->info.pid, RTMUX_FLG_PROC_SLEADER, 0);
-            tmp->session = sep;
-            ctp->status = tmp->pgrp = ctp->info.pid;
-        }
-
-        root_proc_unlock(ctp->info.pid);
-        return EOK;
+        proc_pgrp_lock();
+        rc = session_setsid(ctp);
+        proc_pgrp_unlock();
+        return rc;
+    }
 
     case _PROC_SESSION_SETPGRP: {
-        process_t *prp2;
-        int ret;
-        pid_t leader;
         pid_t sid_pid = (pid_t) msg->i.sid;
         pid_t id_pid = (pid_t) msg->i.id;
         root_proc_info_t qinfo;
+        pid_t leader, gsid;
 
         if (!proc_isaccess(0, &ctp->info)) {
             break;
         }
-        if (!(prp = root_proc_lock(sid_pid)) ||
+        if (!root_proc_lock(sid_pid) ||
             process_query_info(sid_pid, &qinfo) != EOK ||
             !(qinfo.flags & RTMUX_FLG_PROC_SLEADER) ||
             !(sep = root_proc(sid_pid)->session) || sep->fd < 0) {
             return proc_error(EINVAL, sid_pid);
         }
+        leader = root_session_leader(root_proc(sid_pid));
+        root_proc_unlock(sid_pid);
 
-        ret = EOK;
-        prp2 = NULL;
-        leader = sep->leader;
-        if (msg->i.sid == msg->i.id) {
-            sep->pgrp = root_proc(sid_pid)->pgrp;
-            root_proc_unlock(sid_pid);
-        } else {
-            root_proc_unlock(sid_pid);
-            /* Don't access "sep" pointer from above past the unlock */
-            if (!(prp2 = root_proc_lock(id_pid))) {
-                ret = EINVAL;
-            } else {
-                root_process_t *tmp2 = root_proc(id_pid);
-                if (id_pid != tmp2->pgrp || !tmp2->session) {
-                    ret = EINVAL;
-                } else if (tmp2->session->leader != leader) {
-                    ret = EPERM;
-                } else {
-                    tmp2->session->pgrp = tmp2->pgrp;
-                }
-            }
+        /* The group, named by id_pid, is its members: the process it is named
+         * for may be gone. The leader's own group (id equal to sid) is the
+         * leader's group.
+         */
+        if (sid_pid != id_pid) {
+            if (proc_pgrp_session(id_pid, &gsid) != EOK)
+                return EINVAL;
+            if (gsid != leader)
+                return EPERM;
         }
-        if (prp2)
-            root_proc_unlock(id_pid);
-        return ret;
+
+        /* The session outlives the unlock only while its leader does; look it
+         * up again, under the lock, to record the group.
+         */
+        if (!root_proc_lock(sid_pid))
+            return EINVAL;
+        sep = root_proc(sid_pid)->session;
+        if (sep && sep->fd >= 0)
+            sep->pgrp = sid_pid == id_pid
+                            ? root_process_pgrp(root_proc(sid_pid))
+                            : id_pid;
+        root_proc_unlock(sid_pid);
+        return EOK;
     }
 
     case _PROC_SESSION_VALIDATE_PGRP: {
-        process_t *target;
         pid_t pgrp = (pid_t) msg->i.id;
-        pid_t leader;
+        pid_t gsid;
         root_proc_info_t qinfo;
 
         if (pgrp <= 0)
             return EINVAL;
 
-        prp = root_proc_lock(ctp->info.pid);
-        if (!prp)
+        if (!root_proc_lock(ctp->info.pid))
             return EPERM;
         if (process_query_info(ctp->info.pid, &qinfo) != EOK) {
             root_proc_unlock(ctp->info.pid);
             return EPERM;
         }
-        leader = qinfo.sess_leader;
         root_proc_unlock(ctp->info.pid);
 
-        target = root_proc_lock(pgrp);
-        if (!target) {
+        /* A group exists while it has a member, and must be in the caller's
+         * session.
+         */
+        if (proc_pgrp_session(pgrp, &gsid) != EOK || gsid != qinfo.sess_leader)
             return EPERM;
-        }
-        if (root_proc(pgrp)->pgrp != pgrp) {
-            root_proc_unlock(pgrp);
-            return EPERM;
-        }
-        if (root_session_leader(root_proc(pgrp)) != leader) {
-            root_proc_unlock(pgrp);
-            return EPERM;
-        }
-        root_proc_unlock(pgrp);
         return EOK;
     }
 

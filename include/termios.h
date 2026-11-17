@@ -140,6 +140,7 @@ extern int tcdrain(int __fildes);
 extern int tcflow(int __fildes, int __action);
 extern int tcflush(int __fildes, int __queue_selector);
 extern int tcgetattr(int __fildes, struct termios *__termios_p);
+extern pid_t tcgetsid(int __fildes);
 extern int tcsendbreak(int __fildes, int __duration);
 extern int tcsetattr(int __fildes,
                      int __opt_act,

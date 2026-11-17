@@ -73,24 +73,11 @@ pid_t getpgrp(void)
     return msg.o.pgrp > 0 ? msg.o.pgrp : getpid();
 }
 
-pid_t getppid(void)
-{
-    proc_getsetid_t msg = {
-        .i.type = _PROC_GETSETID,
-        .i.subtype = _PROC_ID_GETID,
-    };
-
-    if (msg_sendnc(ROOTTASK_COID, &msg.i, sizeof msg.i, &msg.o, sizeof msg.o) ==
-        -1) {
-        return 1;
-    }
-    return msg.o.ppid;
-}
-
-/* getsid — the session leader's pid for `pid`, or for the caller when 0. proc
- * answers EPERM for a process in another session and ESRCH for no process.
+/* The process group (want_sid 0) or session (want_sid 1) of `pid`, or of the
+ * caller when 0. proc answers EPERM for a process in another session and ESRCH
+ * for no process.
  */
-pid_t getsid(pid_t pid)
+static pid_t getid_of(pid_t pid, int want_sid)
 {
     proc_getsetid_t msg = {
         .i.type = _PROC_GETSETID,
@@ -105,7 +92,32 @@ pid_t getsid(pid_t pid)
     if (msg_sendnc(ROOTTASK_COID, &msg.i, sizeof msg.i, &msg.o, sizeof msg.o) ==
         -1)
         return -1;
-    return msg.o.sid;
+    return want_sid ? msg.o.sid : msg.o.pgrp;
+}
+
+pid_t getpgid(pid_t pid)
+{
+    return getid_of(pid, 0);
+}
+
+pid_t getppid(void)
+{
+    proc_getsetid_t msg = {
+        .i.type = _PROC_GETSETID,
+        .i.subtype = _PROC_ID_GETID,
+    };
+
+    if (msg_sendnc(ROOTTASK_COID, &msg.i, sizeof msg.i, &msg.o, sizeof msg.o) ==
+        -1) {
+        return 1;
+    }
+    return msg.o.ppid;
+}
+
+/* getsid — the session leader's pid for `pid`, or for the caller when 0. */
+pid_t getsid(pid_t pid)
+{
+    return getid_of(pid, 1);
 }
 
 pid_t setsid(void)

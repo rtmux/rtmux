@@ -318,7 +318,7 @@ int process_query_info(pid_t pid, root_proc_info_t *info)
          * extension needed.
          */
         root_process_t *tmp = root_proc(pid);
-        info->pgrp = tmp->pgrp;
+        info->pgrp = root_process_pgrp(tmp);
         if (tmp->siginfo.si_signo != 0)
             info->siginfo = tmp->siginfo;
         info->session = tmp->session;

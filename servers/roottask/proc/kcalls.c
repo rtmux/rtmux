@@ -183,8 +183,8 @@ static process_t *process_create_locked(pid_t parent_pid,
         child_tmp->umask = parent_tmp->umask;
 
         /* POSIX: a child starts in its parent's process group and session. A
-         * parent that never joined a group is its own group (pgrp 0 is unset),
-         * so its children are in group parent_pid. Each member holds one link
+         * parent starts in its own group (root_process_init), so a child of one
+         * that never moved is in group parent_pid. Each member holds one link
          * on the session; root_process_fini drops it.
          */
         child_tmp->pgrp = root_process_pgrp(parent_tmp);

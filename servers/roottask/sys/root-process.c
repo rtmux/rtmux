@@ -67,10 +67,13 @@ void root_process_init(pid_t pid, pid_t parent_pid)
     root_process_clear(tmp);
     tmp->pid = pid;
     tmp->parent_pid = parent_pid;
+    tmp->pgrp = pid;
     pthread_mutex_unlock(&slot_lock);
 }
 
-/* The process group of p: its own pid while it has joined none. */
+/* The process group of p. A slot starts in its own group (root_process_init),
+ * so the pid fallback only covers a slot that was never initialized.
+ */
 pid_t root_process_pgrp(const root_process_t *p)
 {
     return p->pgrp ? p->pgrp : p->pid;

@@ -83,6 +83,13 @@
  */
 #define DEVCTL_TTY_SET_SID __DIOT(DEVCTL_CLASS_TTY, 8, pid_t)
 
+/* Desc: This call is made to get the session leader's pid of the session a
+ * terminal is the controlling terminal of, or 0 when it is nobody's. Args: See
+ * the tcgetsid documentation. Notes: This function is for internal use and
+ * should not be called directly. Instead use the tcgetsid cover function.
+ */
+#define DEVCTL_TTY_GET_SID __DIOF(DEVCTL_CLASS_TTY, 9, pid_t)
+
 /* Desc: This call is made to test to see if a file descriptor is associated
  * with a terminal. Args: See the isatty documentation. Notes: This function is
  * for internal use and should not be called directly. Instead use the isatty

@@ -202,6 +202,7 @@ extern gid_t getegid(void);
 extern uid_t geteuid(void);
 extern gid_t getgid(void);
 extern int getgroups(int __gidsetsize, gid_t __grouplist[]);
+extern pid_t getpgid(pid_t __pid);
 extern pid_t getpgrp(void);
 extern pid_t getpid(void);
 extern pid_t getppid(void);

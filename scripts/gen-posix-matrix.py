@@ -194,9 +194,11 @@ POSIX_NAMES = {
     # maturity varies, see STUB_OVERRIDES for getpgrp/setsid/tcgetpgrp/tcsetpgrp.
     "getpid",
     "setpgid",
+    "getpgid",
     "getpgrp",
     "setsid",
     "tcgetpgrp",
+    "tcgetsid",
     "tcsetpgrp",
     # crypt is an XSI extension (not POSIX.1 base); RTMux implements and uses it
     # for login, so the matrix tracks it.

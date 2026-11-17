@@ -54,7 +54,7 @@ static int jc_snapshot(pid_t pid, struct jc_snap *s)
     }
     s->pid = pid;
     s->ppid = qinfo.parent_pid;
-    s->pgrp = qinfo.pgrp ? qinfo.pgrp : pid;
+    s->pgrp = qinfo.pgrp;
     s->sid = qinfo.sess_leader;
     s->fg = qinfo.sess_pgrp;
     s->fd = qinfo.sess_fd;
@@ -62,6 +62,32 @@ static int jc_snapshot(pid_t pid, struct jc_snap *s)
     s->chp = qinfo.sys_chp;
     root_proc_unlock(pid);
     return EOK;
+}
+
+/* proc_pgrp_session - whether process group pgrp has a live member, and the
+ * session that member is in. A group is its members, not its leader's pid: it
+ * outlives a leader that exited or left it, and a pid it was named for can be
+ * reused. EOK with *sid set (if not NULL), or ESRCH when no live process is in
+ * the group.
+ */
+int proc_pgrp_session(pid_t pgrp, pid_t *sid)
+{
+    for (unsigned i = 0; i < ROOT_PROCESS_MAX; i++) {
+        pid_t pid = root_process[i].pid;
+        struct jc_snap m;
+
+        /* The unlocked read only skips the slots that cannot match; the
+         * snapshot under the lock decides.
+         */
+        if (pid != 0 && root_process_pgrp(&root_process[i]) == pgrp &&
+            jc_snapshot(pid, &m) == EOK && m.pgrp == pgrp &&
+            !(m.flags & JC_DEAD)) {
+            if (sid)
+                *sid = m.sid;
+            return EOK;
+        }
+    }
+    return ESRCH;
 }
 
 /* Pid of the server behind roottask's terminal descriptor fd, or 0. */
@@ -230,8 +256,8 @@ int proc_jobctl_setpgrp(pid_t server, pid_t pid, pid_t pgrp)
 {
     struct _proc_jobctl_reply q;
     struct jc_snap c;
+    pid_t gsid;
     int rc;
-    int found = 0;
 
     if (pgrp <= 0)
         return EINVAL;
@@ -242,15 +268,7 @@ int proc_jobctl_setpgrp(pid_t server, pid_t pid, pid_t pgrp)
     if (!(q.flags & _JOBCTL_CTTY))
         return ENOTTY;
 
-    for (unsigned i = 0; i < ROOT_PROCESS_MAX && !found; i++) {
-        pid_t m = root_process[i].pid;
-        struct jc_snap g;
-
-        if (m != 0 && jc_snapshot(m, &g) == EOK && g.pgrp == pgrp &&
-            g.sid == q.sid && !(g.flags & JC_DEAD))
-            found = 1;
-    }
-    if (!found)
+    if (proc_pgrp_session(pgrp, &gsid) != EOK || gsid != q.sid)
         return EPERM;
 
     if (!(q.flags & _JOBCTL_FG) && !(c.flags & RTMUX_FLG_PROC_LOADING) &&
