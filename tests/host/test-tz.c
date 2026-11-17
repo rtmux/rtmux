@@ -536,14 +536,23 @@ static void test_fixtures(void)
     write_fixture("Fix/NoNl", &f);
     expect_utc("missing footer newlines", "Fix/NoNl");
 
-    /* A file that appears later is found once TZ changes, not before. */
+    /* A file that appears later is found by the next tzset, not by a
+     * conversion, which never looks for a file it did not find.
+     */
     expect_utc("late file, first look", "Fix/Late");
     write_fixture("Fix/Late", &fix_a);
+    CHECK(zone_is(1000000, 0, 0, "UTC"), "a conversion does not retry a failed lookup");
     rtmux_tzset();
-    CHECK(zone_is(1000000, 0, 0, "UTC"), "a failed lookup is cached");
+    CHECK(zone_is(100000, 7200, 1, "BBB"), "tzset finds a file that appeared");
+    CHECK(zone_is(1000000, 10800, 0, "CCC"), "and keeps it");
+
+    /* A file that is still missing stays UTC after a retry. */
+    expect_utc("bad name, first look", "Fix/Nope");
+    rtmux_tzset();
+    CHECK(zone_is(1000000, 0, 0, "UTC"), "a file that is still missing stays UTC");
     use_tz("");
     use_tz("Fix/Late");
-    CHECK(zone_is(100000, 7200, 1, "BBB"), "found after TZ changes");
+    CHECK(zone_is(100000, 7200, 1, "BBB"), "found again after TZ changes");
 }
 
 /* The footer takes over strictly after the last transition: at the transition
@@ -624,35 +633,37 @@ static void test_short_lived_type(void)
           "a type in force for 100 seconds is found");
 }
 
-static void test_file_cap(void)
+/* Zone files are kept as a list, so no count of files fails a lookup: 200
+ * distinct names all work, and tm_zone pointers from the first load stay valid.
+ */
+static void test_many_files(void)
 {
+    enum { MANY = 200 };
     char name[96];
+    struct tm tm;
+    time_t t = 150000;
+    const char *kept;
+    int bad = 0;
 
-    /* At most 64 files are kept; a zone already kept still works after that,
-     * and tm_zone pointers from earlier loads stay valid.
-     */
-    {
-        struct tm tm;
-        time_t t = 150000;
-        const char *kept;
-        int first_utc = -1;
-
-        use_tz("Fix/A");
-        rtmux_localtime_r(&t, &tm);
-        kept = tm.tm_zone;
-        for (int i = 0; i < 80 && first_utc < 0; i++) {
-            snprintf(name, sizeof name, "Fix/N%d", i);
-            write_fixture(name, &fix_a);
-            use_tz(name);
-            if (zone_is(1000000, 0, 0, "UTC"))
-                first_utc = i;
-        }
-        CHECK(first_utc > 40 && first_utc <= 64,
-              "the cap on distinct files: first UTC at %d", first_utc);
-        use_tz("Fix/A");
-        CHECK(zone_is(150000, 7200, 1, "BBB"), "a kept file still works");
-        CHECK(!strcmp(kept, "BBB"), "tm_zone from an earlier load stays valid");
+    use_tz("Fix/A");
+    rtmux_localtime_r(&t, &tm);
+    kept = tm.tm_zone;
+    for (int i = 0; i < MANY; i++) {
+        snprintf(name, sizeof name, "Fix/N%d", i);
+        write_fixture(name, &fix_a);
+        use_tz(name);
+        bad += !zone_is(150000, 7200, 1, "BBB");
     }
+    CHECK(!bad, "%d of %d distinct zone files failed to load", bad, MANY);
+    for (int i = 0; i < MANY; i += 17) {
+        snprintf(name, sizeof name, "Fix/N%d", i);
+        use_tz(name);
+        bad += !zone_is(150000, 7200, 1, "BBB");
+    }
+    CHECK(!bad, "a kept file still works after many others");
+    use_tz("Fix/A");
+    CHECK(zone_is(150000, 7200, 1, "BBB"), "the first file still works");
+    CHECK(!strcmp(kept, "BBB"), "tm_zone from an earlier load stays valid");
 }
 
 static void remove_fixtures(void)
@@ -679,7 +690,7 @@ int main(void)
     test_footer_boundary();
     test_large_offsets();
     test_short_lived_type();
-    test_file_cap();
+    test_many_files();
     remove_fixtures();
     printf("tz-test: %s (%ld checks, %d failures)\n",
            failures ? "FAIL" : "PASS", checks, failures);

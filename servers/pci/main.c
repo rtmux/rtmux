@@ -7,8 +7,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include <getopt.h>
-
+#include "args.h"
 #include "globals.h"
 
 #define PCI_MODE (S_IFCHR | 0600)
@@ -414,12 +413,8 @@ static void pci_ioserv_loop(ioserv_context_t *ctp)
     }
 }
 
-/* getopt_long wants a table even when there are no long options. */
-static const struct option no_long_options[] = {{NULL, 0, NULL, 0}};
-
 int main(int argc, char **argv)
 {
-    int c;
     ioserv_connect_ops_t connect_funcs;
     dispatch_t *dpp;
     ioserv_context_t *ctp;
@@ -446,95 +441,66 @@ int main(int argc, char **argv)
     };
 
     /* process args */
+    {
+        int first;
+        struct pci_args args = {
+            .scan_buses = scan_buses,
+            .class_override = class_override,
+            .enable_crt_msi = enable_crt_msi,
+            .map_irqs = map_irqs,
+            .use_msi = use_msi,
+            .max_msi = max_msi,
+            .program_display_device = program_display_device,
+            .verbose = verbose,
+            .dont_touch = dont_touch,
+        };
+        const char *bad = NULL;
 
-    /* getopt_long permutes, so options may follow an operand; "--" ends them,
-     * and whatever follows it is an operand. A POSIXLY_CORRECT environment
-     * turns permutation off: the first operand then ends the options.
-     */
-    while ((c = getopt_long(argc, argv, "b:c:DmMn:pP:vx", no_long_options,
-                            NULL)) != -1) {
-        switch (c) {
-        case 'b':
-            scan_buses = atoi(optarg);
+        switch (pci_parse_args(argc, argv, &args, &first, &bad)) {
+        case PCI_ARGS_OK:
             break;
-        case 'c':
-            class_override = atoi(optarg);
-            if ((class_override & 3) == 0) {
-                pci_slogf(_SLOGC_PCI, _SLOG_ERROR,
-                          "-c value must be 1, 2 or 3");
-                exit(EXIT_FAILURE);
-            }
-            break;
-
-        case 'D':
-            enable_crt_msi = 1;
-            pci_slogf(_SLOGC_PCI, _SLOG_WARNING, "%s enabling MSI for video",
-                      progname);
-            break;
-
-        case 'm':
-            map_irqs ^= 1; /* Flip the flag */
-            break;
-
-        case 'M':
-            use_msi = 0;
-            pci_slogf(_SLOGC_PCI, _SLOG_WARNING, "%s MSI is turned off",
-                      progname);
-            break;
-
-        case 'n':
-            max_msi = atoi(optarg);
-            switch (max_msi) {
-            case 1:
-            case 2:
-            case 4:
-            case 8:
-            case 16:
-            case 32:
-                pci_slogf(_SLOGC_PCI, _SLOG_INFO, "max msi set to %d", max_msi);
-                break;
-            default:
-                pci_slogf(_SLOGC_PCI, _SLOG_ERROR,
-                          "Incorrect value for max_msi %d", max_msi);
-                return -1;
-            }
-            break;
-
-        case 'p':
-            program_display_device = 1;
-            break;
-
-        case 'P':
+        case PCI_ARGS_BAD_CLASS:
+            pci_slogf(_SLOGC_PCI, _SLOG_ERROR, "-c value must be 1, 2 or 3");
+            exit(EXIT_FAILURE);
+        case PCI_ARGS_BAD_MSI:
+            pci_slogf(_SLOGC_PCI, _SLOG_ERROR, "Incorrect value for max_msi %d",
+                      args.max_msi);
+            return -1;
+        case PCI_ARGS_RAW_MAPPING:
             pci_slogf(_SLOGC_PCI, _SLOG_ERROR,
                       "%s -P raw PCIEX mapping is unsupported", progname);
             return -1;
-
-        case 'v':
-            verbose++;
-            break;
-
-        case 'x':
-            dont_touch = 1;
-            break;
-
         default:
-            /* A long name leaves optopt 0: report argv[optind - 1]. */
-            if (optopt)
-                pci_slogf(_SLOGC_PCI, _SLOG_ERROR,
-                          "%s unknown option or missing argument -%c", progname,
-                          optopt);
-            else
-                pci_slogf(_SLOGC_PCI, _SLOG_ERROR,
-                          "%s unknown option or missing argument %s", progname,
-                          argv[optind - 1]);
+            pci_slogf(_SLOGC_PCI, _SLOG_ERROR,
+                      "%s unknown option or missing argument %s", progname,
+                      bad);
             exit(EXIT_FAILURE);
         }
+        if (args.max_msi_set)
+            pci_slogf(_SLOGC_PCI, _SLOG_INFO, "max msi set to %d",
+                      args.max_msi);
+        scan_buses = args.scan_buses;
+        class_override = args.class_override;
+        enable_crt_msi = args.enable_crt_msi;
+        map_irqs = args.map_irqs;
+        use_msi = args.use_msi;
+        max_msi = args.max_msi;
+        program_display_device = args.program_display_device;
+        verbose = args.verbose;
+        dont_touch = args.dont_touch;
+        if (enable_crt_msi)
+            pci_slogf(_SLOGC_PCI, _SLOG_WARNING, "%s enabling MSI for video",
+                      progname);
+        if (!use_msi)
+            pci_slogf(_SLOGC_PCI, _SLOG_WARNING, "%s MSI is turned off",
+                      progname);
+
+        /* The server takes no operands. */
+        for (; first < argc; first++)
+            pci_slogf(_SLOGC_PCI, _SLOG_WARNING, "%s ignoring operand %s",
+                      progname, argv[first]);
     }
 
-    /* The server takes no operands. */
-    for (; optind < argc; optind++)
-        pci_slogf(_SLOGC_PCI, _SLOG_WARNING, "%s ignoring operand %s", progname,
-                  argv[optind]);
 
     /* Attach the ECAM driver directly (no DLL loading) */
     {

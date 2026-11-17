@@ -41,9 +41,21 @@ void *calloc(size_t nmemb, size_t size)
     return nomem(__crt_calloc(nmemb, size), nmemb != 0 && size != 0);
 }
 
+/* A pointer that malloc did not return is a caller error, not a shortage. It is
+ * recognized by the block header in front of it not being the allocator's, so
+ * the diagnosis is best effort: POSIX leaves such a pointer undefined, and one
+ * that is unmapped, or whose header happens to look valid, is not caught.
+ */
 void *realloc(void *ptr, size_t size)
 {
-    return nomem(__crt_realloc(ptr, size), size != 0);
+    int bad;
+    void *p = __crt_realloc(ptr, size, &bad);
+
+    if (bad)
+        errno = EINVAL;
+    else
+        p = nomem(p, size != 0);
+    return p;
 }
 
 int __rtmux_mallocstats(struct __rtmux_mallocstats *st)

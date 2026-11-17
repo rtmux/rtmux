@@ -39,7 +39,7 @@ PROGS = $(BUILD_BASE)/mkasmoff $(BUILD_BASE)/mkromfs $(BUILD_BASE)/treeromfs \
         $(BUILD_BASE)/serial-reply-test $(BUILD_BASE)/outcomes-test \
         $(BUILD_BASE)/sv39-lookup-test \
         $(BUILD_BASE)/strftime-test $(BUILD_BASE)/sh-scan-test $(BUILD_BASE)/tz-test \
-        $(BUILD_BASE)/malloc-stats-test \
+        $(BUILD_BASE)/malloc-stats-test $(BUILD_BASE)/pci-args-test \
         $(BUILD_BASE)/libc-algorithms-test
 
 # Each tool compiles and links its sources in one command, so -MMD cannot give a
@@ -93,6 +93,16 @@ $(BUILD_BASE)/libc-algorithms-test: $(TEST_DIR)/test-libc-algorithms.c $(LIBC_AL
 	$(msg) HOSTCC $(notdir $@)
 	$(Q)$(HOST_CC) $(LIBC_ALGO_FLAGS) $(HOST_CFLAGS) -o $@ \
 	    $(TEST_DIR)/test-libc-algorithms.c $(LIBC_ALGO_SRCS)
+
+# The PCI server's command line, with the libc getopt_long it runs on the guest.
+$(BUILD_BASE)/pci-args-test: $(TEST_DIR)/test-pci-args.c ../../servers/pci/args.c \
+                             ../../servers/pci/args.h ../../lib/libc/stdlib/getopt.c
+	@mkdir -p $(@D)
+	$(msg) HOSTCC $(notdir $@)
+	$(Q)$(HOST_CC) -I../../servers/pci -idirafter ../../internal/include \
+	    -idirafter ../../lib/libc/internal -D_GNU_SOURCE -DLIBC_HOST_TEST \
+	    -pthread $(HOST_CFLAGS) -o $@ $(TEST_DIR)/test-pci-args.c \
+	    ../../servers/pci/args.c ../../lib/libc/stdlib/getopt.c
 
 # The shared serial service is compiled against the tree's own headers with the
 # IPC calls stubbed (the host libc has no ssp/string.h, so fortify is off).
@@ -194,10 +204,11 @@ $(BUILD_BASE)/malloc-nostats-bench: $(MALLOC_DEPS)
 	$(Q)$(HOST_CC) $(MALLOC_FLAGS) -DMALLOC_NO_STATS $(HOST_CFLAGS) -o $@ \
 	    $(TEST_DIR)/test-malloc-stats.c ../../lib/libc/alloc/malloc-core.c
 
-# Best of 7 runs each of 2e6 malloc/free pairs, with and without the counters.
+# Alternating runs of the two builds, each the best of 7 passes of 2e6 malloc/free
+# pairs, and a verdict against the noise of the samples (scripts/bench-malloc.sh).
 host-bench-malloc: $(BUILD_BASE)/malloc-stats-test $(BUILD_BASE)/malloc-nostats-bench
-	@echo "with counters:"; $(BUILD_BASE)/malloc-stats-test bench
-	@echo "without counters:"; $(BUILD_BASE)/malloc-nostats-bench bench
+	@../../scripts/bench-malloc.sh $(BUILD_BASE)/malloc-stats-test \
+	    $(BUILD_BASE)/malloc-nostats-bench
 .PHONY: host-bench-malloc
 
 $(BUILD_BASE)/strftime-asan-test: $(STRFTIME_DEPS)
@@ -327,7 +338,7 @@ host-tests: $(BUILD_BASE)/path-normalize-test $(BUILD_BASE)/cap-table-test \
             $(BUILD_BASE)/strftime-test $(BUILD_BASE)/strftime-asan-test \
             $(BUILD_BASE)/sh-scan-test $(BUILD_BASE)/libc-algorithms-test \
             $(BUILD_BASE)/tz-test $(BUILD_BASE)/tz-asan-test $(TZ_ZONES)/.stamp \
-            $(BUILD_BASE)/malloc-stats-test
+            $(BUILD_BASE)/malloc-stats-test $(BUILD_BASE)/pci-args-test
 	$(Q)$<
 	$(Q)$(BUILD_BASE)/cap-table-test
 	$(Q)$(BUILD_BASE)/bootstrap-manifest-test
@@ -349,6 +360,7 @@ host-tests: $(BUILD_BASE)/path-normalize-test $(BUILD_BASE)/cap-table-test \
 	$(Q)RTMUX_TZDIR=$(abspath $(TZ_ZONES))/ $(BUILD_BASE)/tz-test
 	$(Q)RTMUX_TZDIR=$(abspath $(TZ_ZONES))/ $(BUILD_BASE)/tz-asan-test
 	$(Q)$(BUILD_BASE)/malloc-stats-test
+	$(Q)$(BUILD_BASE)/pci-args-test
 	$(Q)out=$$($(BUILD_BASE)/libc-algorithms-test) || { printf '%s\n' "$$out"; exit 1; }
 	$(Q)$(PYTHON) $(TEST_DIR)/test-capability-namespace-doc.py
 	$(Q)$(PYTHON) $(TEST_DIR)/test-management-ipc-lock.py
