@@ -40,14 +40,17 @@
  * process that lower the caller's own priority fail with EINVAL, after they
  * have applied the change. A kcall that reschedules its caller and then fails
  * is otherwise unreachable, and the test of the error status reaching a thread
- * that was switched out needs one.
+ * that was switched out needs one. Each failure first waits a short window with
+ * the other harts kicked, so a caller exposed to them inside the call is
+ * resumed there rather than racing the status store by luck.
  */
 #define INJECT_OP_FAIL_NEXT_SCHED_SET 6
 /* SCHED_SET_STATUS: ret is how many armed failures have been delivered. */
 #define INJECT_OP_SCHED_SET_STATUS 7
 
 /* SCHED_SET_DISPLACED: ret is how many injected failures found their caller
- * already switched out when the error status was written.
+ * switched out, or its switch still owed to kernel_exit, when the error status
+ * was written.
  */
 #define INJECT_OP_SCHED_SET_DISPLACED 8
 

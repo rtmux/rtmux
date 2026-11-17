@@ -1034,6 +1034,12 @@ int main(int argc, char *argv[])
             test_skip("sched_set_error_after_lowering", "fault injection unavailable");
         return finish(1);
     }
+    if (argc == 2 && !strcmp(argv[1], "--sched-set-error-migrate")) {
+        printf("[sched_set_error_while_migrating]\n");
+        if (sched_set_error_while_migrating() == TC_EXIT_SKIP)
+            test_skip("sched_set_error_while_migrating", "needs fault injection and two harts");
+        return finish(1);
+    }
     if (argc == 2 && !strcmp(argv[1], "--condvar-reacquire-alloc-failure")) {
         printf("[condvar_reacquire_alloc_failure]\n");
         if (condvar_reacquire_alloc_failure() == TC_EXIT_SKIP)

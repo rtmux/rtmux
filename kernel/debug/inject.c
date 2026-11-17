@@ -40,6 +40,26 @@ static inline bool inject_op_is_status(unsigned op)
 
 atomic_ullong inject_spin_state;
 
+/* How long an injected SchedSet failure holds the caller in the kcall, after
+ * the change is applied, with the other harts kicked (microseconds).
+ */
+#define SCHED_WINDOW_US 500
+
+/* Leave the other harts a window to take a caller that the change exposed. */
+static void inject_sched_window(void)
+{
+    unsigned me = get_cpunum();
+    uint64_t live = cpu_online_snapshot();
+    uint64_t end =
+        r_time() + SCHED_WINDOW_US * (qtimeptr->cycles_per_sec / 1000000);
+
+    for (unsigned h = 0; h < num_processors; h++)
+        if (h != me && cpu_in_mask(live, h))
+            SENDIPI(h, IPI_RESCHED);
+    while (r_time() < end)
+        ;
+}
+
 /* Called from ksys_sched_set once the change is applied; `lowered` says the
  * caller's priority went down. Only a lowering call fails, so the caller can
  * raise itself again with the failure still armed.
@@ -61,23 +81,25 @@ bool inject_should_fail_sched_set(thread_t *act, bool lowered)
         memory_order_relaxed));
     atomic_store_explicit(&sched_failed_thr, act, memory_order_release);
     atomic_fetch_add_explicit(&sched_consumed, 1, memory_order_release);
+    inject_sched_window();
     return true;
 }
 
 /* Called from the trap handler on every error return. If that error is the
  * SchedSet failure just injected for act, consume the mark, and count it when
- * the caller was already switched out, so a test can tell a status that
- * survived a switch from one that never met one. Consuming the mark on an
- * undisplaced return keeps it from matching a later, unrelated error.
+ * the caller was already switched out or its switch was still owed to
+ * kernel_exit, so a test can tell a status that met a switch from one that
+ * never did. Consuming the mark on any other return keeps it from matching a
+ * later, unrelated error.
  */
-void inject_note_sched_return(thread_t *act, bool displaced)
+void inject_note_sched_return(thread_t *act, bool switched)
 {
     thread_t *expect = act;
 
     if (atomic_compare_exchange_strong_explicit(&sched_failed_thr, &expect,
                                                 NULL, memory_order_acq_rel,
                                                 memory_order_relaxed) &&
-        displaced)
+        switched)
         atomic_fetch_add_explicit(&sched_displaced, 1, memory_order_release);
 }
 

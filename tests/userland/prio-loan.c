@@ -787,12 +787,18 @@ static void test_loan_ends_for_blocked_server(void)
     chan_close(k.b.chid, coid_b);
 }
 
-/* K19: a kcall that lowers the caller below a ready thread and then fails. The
- * switch happens inside the kcall, before the trap handler writes the result,
- * so the status has to be in the saved context by then. A debug-inject kernel
+/* K19 and K30: a kcall that lowers the caller below a ready thread and then
+ * fails. The status is stored after the body returns, so the caller must not be
+ * switched out, or exposed to another hart, before then. A debug-inject kernel
  * fails the next K19_ROUNDS lowering SchedSet calls of this process after they
- * have applied the change; the caller and a competitor are pinned to one hart,
- * so the competitor really runs before the caller returns.
+ * have applied the change, and holds each in the call for a short window with
+ * the other harts kicked.
+ *
+ * Pinned (K19): the caller and a competitor share one hart, so the competitor
+ * really runs before the caller returns. Migrating (K30): the competitor is
+ * confined to the caller's hart, but the caller may run on every hart; a
+ * kernel that put the caller on that hart's ready queue inside the call would
+ * let an idle hart resume it with the status unwritten.
  */
 #define K19_ROUNDS 1000
 #define K19_HIGH 40
@@ -809,27 +815,36 @@ static void *k19_competitor(void *raw)
 }
 
 /* Returns 0 when it ran (the verdict goes through check), or TC_EXIT_SKIP when
- * fault injection is not available.
+ * fault injection or the harts it needs are not available.
  */
-int sched_set_error_after_lowering(void)
+static int sched_set_error_run(bool migrate)
 {
     struct sched_param saved, low = {.sched_priority = K19_LOW};
     char pidarg[16], count[16], detail[160];
+    const char *name = migrate ? "sched_set_error_while_migrating"
+                               : "sched_set_error_after_lowering";
     int policy, bad = 0, not_switched = 0, setup = 0;
-    unsigned mask = 0;
+    long harts = sysconf(_SC_NPROCESSORS_ONLN);
+    unsigned mask = 0, all = 0;
 
     if (inject_run("sched-set-status", NULL, NULL) != 0)
         return TC_EXIT_SKIP;
+    if (migrate) {
+        if (harts < 2 || harts > 31)
+            return TC_EXIT_SKIP;
+        all = (1U << harts) - 1U;
+    }
     policy = __sched_get(0, 0, &saved);
     RMSK_SET(0, &mask);
-    if (policy == -1 || test_pin_mask(mask) == -1 || set_fifo(K19_HIGH) == -1) {
-        test_fail("sched_set_error_after_lowering setup", strerror(errno));
+    if (policy == -1 || test_pin_mask(mask) == -1 || set_fifo(K19_HIGH) == -1 ||
+        (migrate && thread_ctl(RTMUX_TCTL_RUNMASK_GET_AND_SET, &all) == -1)) {
+        test_fail(name, strerror(errno));
         return 0;
     }
     snprintf(pidarg, sizeof pidarg, "%d", (int) getpid());
     snprintf(count, sizeof count, "%d", K19_ROUNDS);
     if (inject_run("fail-sched-set", pidarg, count) != 0) {
-        test_fail("sched_set_error_after_lowering setup", "inject refused to arm");
+        test_fail(name, "inject refused to arm");
         goto out;
     }
 
@@ -847,7 +862,10 @@ int sched_set_error_after_lowering(void)
         ran = atomic_load_explicit(&k19_ran, memory_order_acquire);
         (void) set_fifo(K19_HIGH);
         (void) pthread_join(t, NULL);
-        if (!ran)
+        /* The migrating competitor may run on a hart the caller never sees
+         * in time; only the pinned run requires that it did.
+         */
+        if (!ran && !migrate)
             not_switched++;
         if (rc != -1 || err != EINVAL)
             bad++;
@@ -855,16 +873,15 @@ int sched_set_error_after_lowering(void)
 
     /* The competitor running proves a switch, not that it came before the
      * status write: the trap handler counts each error return that found its
-     * caller already switched out.
+     * caller switched out or its switch still owed.
      */
-    if (inject_run("sched-set-displaced", count, NULL) != 0)
+    if (!migrate && inject_run("sched-set-displaced", count, NULL) != 0)
         not_switched++;
     snprintf(detail, sizeof detail,
              "%d of %d calls lost the error status (%d never switched out, "
              "%d not started)",
              bad, K19_ROUNDS, not_switched, setup);
-    check(bad == 0 && not_switched == 0 && setup == 0,
-          "sched_set_error_after_lowering status survives a switch", detail);
+    check(bad == 0 && not_switched == 0 && setup == 0, name, detail);
 
 out:
     /* Leave no failure armed against this process. */
@@ -872,6 +889,16 @@ out:
     (void) test_pin_mask(~0U);
     (void) __sched_set(0, 0, policy, &saved);
     return 0;
+}
+
+int sched_set_error_after_lowering(void)
+{
+    return sched_set_error_run(false);
+}
+
+int sched_set_error_while_migrating(void)
+{
+    return sched_set_error_run(true);
 }
 
 void test_prio_loan(void)

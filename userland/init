@@ -133,9 +133,10 @@ if test "$rtmux_run" = "debug-inject"; then
         fi
     fi
     # A failing kcall must keep its error status when its caller was switched
-    # out inside the call.
+    # out inside the call, also when the caller may run on every hart.
     if test "$ok" = 2; then
-        if /bin/syscall_testing --sched-set-error; then
+        if /bin/syscall_testing --sched-set-error &&
+            /bin/syscall_testing --sched-set-error-migrate; then
             ok=3
         fi
     fi

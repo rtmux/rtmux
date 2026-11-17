@@ -1094,17 +1094,21 @@ void strap_handler_c(CPU_REGISTERS *regs)
              */
         }
 
-        /* Publish the status before the "still running?" check: a kcall that
-         * rescheduled act may have switched it out, and the status must reach
-         * it whenever it runs next.
+        /* Store the status before testing for a switch. SchedSet on itself
+         * defers its switch (RTMUX_ITF_DEFER_DISPLACE), so this store reaches
+         * the caller and kernel_exit switches afterwards (YIELD_TAIL). Other
+         * bodies that switch the caller out publish their status first, and
+         * this store repeats it; thread destroy (kcall 47) relies on it too.
          */
         SETKSTATUS(act, -(long) ret);
 
         bool displaced = act->state != STATE_RUNNING ||
                          get_active_thread(get_cpunum()) != act;
+        bool switch_pending =
+            displaced || (act->internal_flags & RTMUX_ITF_YIELD_TAIL) != 0;
 
-        inject_note_sched_return(act, displaced);
-        if (displaced) {
+        inject_note_sched_return(act, switch_pending);
+        if (switch_pending) {
             kernel_exit();
             /* NOTREACHED — same as above. */
         }
