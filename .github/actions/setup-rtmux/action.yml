@@ -28,10 +28,10 @@ runs:
         mkdir -p ~/apt-cache
         pkgs="build-essential lld python3 git e2fsprogs"
         if [ "${{ inputs.qemu }}" = "true" ]; then
-          pkgs="$pkgs qemu-system-misc opensbi"
+          pkgs="$pkgs qemu-system-misc opensbi gdb-multiarch ipxe-qemu"
         fi
         if [ "${{ inputs.lkl }}" = "true" ]; then
-          pkgs="$pkgs gcc-riscv64-linux-gnu binutils-riscv64-linux-gnu flex bison bc libelf-dev"
+          pkgs="$pkgs gcc-riscv64-linux-gnu binutils-riscv64-linux-gnu libc6-dev-riscv64-cross flex bison bc libelf-dev"
         fi
         if [ "${{ inputs.formal }}" = "true" ]; then
           pkgs="$pkgs cbmc spin z3"
@@ -40,15 +40,41 @@ runs:
         # so bound each attempt and retry.
         apt() {
           for attempt in 1 2 3; do
-            timeout 300 sudo apt-get -o Acquire::Retries=3 \
+            timeout 600 sudo apt-get -o Acquire::Retries=3 \
               -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 "$@" && return 0
             echo "apt-get $1 attempt $attempt failed" >&2
             sleep 5
           done
           return 1
         }
+        # The image's mirror list can name a regional mirror that answers each
+        # index file in 20 to 30 seconds, which pushed whole installs past the
+        # attempt timeout. Use the canonical archive.
+        for f in /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list; do
+          if [ -f "$f" ]; then
+            sudo sed -i \
+              -e 's#mirror+file:/etc/apt/apt-mirrors.txt#http://archive.ubuntu.com/ubuntu/#' \
+              -e 's#https\?://[a-z0-9.-]*ec2\.archive\.ubuntu\.com/ubuntu/\?#http://archive.ubuntu.com/ubuntu/#' "$f"
+          fi
+        done
         apt update
-        apt install -y -o "Dir::Cache::Archives=$HOME/apt-cache" $pkgs ${{ inputs.packages }}
+        # A runner image can come up with no Ubuntu archive configured, so
+        # that update fetches only third-party lists and every package below
+        # is "unable to locate": retrying cannot help. Add the archive and
+        # update again before installing.
+        if ! apt-cache show build-essential >/dev/null 2>&1; then
+          echo "no Ubuntu archive in apt sources, adding it" >&2
+          codename=$(. /etc/os-release && echo "$VERSION_CODENAME")
+          printf '%s\n' \
+            "Types: deb" \
+            "URIs: http://archive.ubuntu.com/ubuntu/" \
+            "Suites: $codename $codename-updates $codename-security" \
+            "Components: main universe" \
+            "Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg" |
+            sudo tee /etc/apt/sources.list.d/rtmux-ubuntu.sources >/dev/null
+          apt update
+        fi
+        apt install -y --no-install-recommends -o "Dir::Cache::Archives=$HOME/apt-cache" $pkgs ${{ inputs.packages }}
 
     # `make defconfig` clones Kconfiglib on first use; keep it out of the
     # critical path (and off the network) on later runs.
