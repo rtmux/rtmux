@@ -16,6 +16,7 @@ runs:
         retention-days: 3
         path: |
           build/**/*.log
+          build/lkl-logs/*.dump
           /tmp/rtmux-*
           ${{ inputs.extra }}
         if-no-files-found: ignore
