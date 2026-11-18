@@ -14,8 +14,10 @@ TIMEOUT_SET=0
 REPEAT=1
 LAPS=
 PROCS=
-KEEP_LOGS=0
-GDB_ON_TIMEOUT=0
+# QEMU_REGRESS_GDB_ON_TIMEOUT=1 is --gdb-on-timeout for a caller (CI) that
+# cannot pass the flag through its make targets.
+GDB_ON_TIMEOUT=${QEMU_REGRESS_GDB_ON_TIMEOUT:-0}
+KEEP_LOGS=$GDB_ON_TIMEOUT
 REQUIRE_SUPPORTED=0
 DISK_SUITE=0
 NVME_SMOKE=0
@@ -2313,6 +2315,13 @@ dump_hang_state()
                     printf '#   %s -> %s\n' "$v" \
                         "$("$a2l" -f -e "$roottask" "$v" 2>/dev/null | paste -sd' ')" >>"$dump"
                 done
+            # The saved pc/ra of each READY or running thread, by the same map.
+            echo "# thread pc/ra at 0xc0000000+:" >>"$dump"
+            grep -aoE '(pc|ra)=0xc[0-9a-f]{7}' "$dump" | sort -u |
+                while IFS== read -r k v; do
+                    printf '#   %s %s -> %s\n' "$k" "$v" \
+                        "$("$a2l" -f -e "$roottask" "$v" 2>/dev/null | paste -sd' ')" >>"$dump"
+                done
         fi
     else
         echo "# result: GDB FAILED or timed out; this dump is INCOMPLETE" >>"$dump"
@@ -2661,6 +2670,7 @@ run_one()
         else
             echo "  FAIL     ${MODE} exited rc=${rc}"
         fi
+        grep -En '^  FAIL  ' "$log" | head -n 40
         tail -n 120 "$log"
         return 1
     fi
@@ -2686,6 +2696,8 @@ run_one()
 
     if grep -Fq "$FAIL_MARKER" "$log"; then
         echo "  FAIL     ${MODE} reported guest failure"
+        # The tail can scroll the failing test out of view; name it first.
+        grep -En '^  FAIL  ' "$log" | head -n 40
         tail -n 160 "$log"
         return 1
     fi

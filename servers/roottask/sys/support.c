@@ -260,11 +260,21 @@ void root_proc_unlock(pid_t pid)
  */
 static pid_t kernel_parent(pid_t child_pid)
 {
+    root_process_t *tmp = root_proc(child_pid);
     root_proc_info_t qi;
 
     if (process_query_info(child_pid, &qi) == EOK && qi.parent_pid != 0)
         return qi.parent_pid;
-    return root_proc(child_pid)->parent_pid;
+
+    /* The kernel frees the index before roottask releases the slot, so a new
+     * generation may already own it: its parent_pid is not this child's. A
+     * slot that no longer carries the child's full pid means the child is gone,
+     * and a gone child has no parent but roottask, which adopts orphans and
+     * never waits.
+     */
+    if (tmp->pid != child_pid)
+        return ROOTTASK_PID;
+    return tmp->parent_pid;
 }
 
 /* Lock a child's parent process, waiting out any parent death transition.

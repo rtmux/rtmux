@@ -187,7 +187,11 @@ int kdecl ksys_sched_set(thread_t *act, struct kcall_args_sched_set *kap)
     int status;
     int prp_pinned = 0;
     int thp_pinned = 0;
-    unsigned old_prio = act->priority;
+    /* The caller's base priority, not its effective one: a loan that ends or
+     * starts on another hart moves act->priority at any time, which would let
+     * an unrelated or raising call read as a lowering one below.
+     */
+    unsigned old_prio = thread_base_prio(act);
 
     if (kap->pid == 0 || kap->pid == act->process->pid) {
         prp = act->process;
@@ -306,8 +310,8 @@ int kdecl ksys_sched_set(thread_t *act, struct kcall_args_sched_set *kap)
     status = EOK;
 
     /* After the change; the caller's own switch waits for kernel_exit. */
-    if (inject_should_fail_sched_set(act,
-                                     thp == act && act->priority < old_prio))
+    if (inject_should_fail_sched_set(
+            act, thp == act && thread_base_prio(act) < old_prio))
         status = EINVAL;
 out:
     if (thp_pinned)

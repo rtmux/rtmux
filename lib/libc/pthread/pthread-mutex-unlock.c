@@ -21,8 +21,7 @@ int(pthread_mutex_unlock)(pthread_mutex_t *mutex)
         unsigned long depth =
             (unsigned long) mutex->count & RTMUX_SYNC_COUNTMASK;
 
-        if ((mutex->count & (RTMUX_SYNC_PRIOCEILING | RTMUX_SYNC_ROBUST)) !=
-            0) {
+        if ((mutex->count & RTMUX_SYNC_KERNEL_PATH) != 0) {
             /* A PRIO_PROTECT ceiling sits in disjoint high bits, so decrement
              * only the low-16 depth. A recursive unlock (depth > 1) stays held
              * entirely in user space; the final unlock drops to depth 0 and

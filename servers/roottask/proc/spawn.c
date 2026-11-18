@@ -534,9 +534,15 @@ int proc_spawn(ioserv_context_t *ctp, void *vmsg)
             /* Once the image is replaced the parent can no longer setpgid the
              * process. Marked before the swap, so that no setpgid sees the new
              * image unmarked, and undone if the swap fails. The slot outlives
-             * the swap, so the mark does too.
+             * the swap, so the mark does too. The exec'ing process is the
+             * loader's parent (kext_process_exec swaps the image into
+             * child->parent), hence ppid. The mark is set under the group
+             * lock so that a setpgid already past its execed check finishes
+             * its move before the swap rather than after it.
              */
+            proc_pgrp_lock();
             root_proc(exec_pid)->execed = 1;
+            proc_pgrp_unlock();
             if (process_exec(lcp, &lcp->ctx.rcvid, ctp->rcvid, lcp->ctx.ppid) ==
                 -1) {
                 root_proc(exec_pid)->execed = 0;

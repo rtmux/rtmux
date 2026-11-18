@@ -278,14 +278,16 @@ int rdecl notification_deliver(channel_t *chp,
 #endif
         kspinlock_unlock(&chp->lock);
 
-        /* By default the receiver runs with message driven priority. */
-        if ((chp->flags & RTMUX_FLG_CHF_FIXED_PRIORITY) == 0) {
-            /* The notification lends prio until thp next receives. thp is on no
-             * queue until ready() below.
-             */
-            thread_lend_msg(thp, prio, false);
-            thread_prio_settle(thp);
-        }
+        /* By default the receiver runs with message driven priority: the
+         * notification lends prio until thp next receives. A fixed-priority
+         * channel lends nothing and drops a loan an earlier receive on another
+         * channel left, as notification_lend does. thp is on no queue until
+         * ready() below.
+         */
+        thread_lend_msg(thp,
+                        (chp->flags & RTMUX_FLG_CHF_FIXED_PRIORITY) ? 0 : prio,
+                        false);
+        thread_prio_settle(thp);
 
         if ((unsigned) priority & _NOTIFICATION_PRIO_VTID) {
             atomic_or(&thp->flags, RTMUX_FLG_THR_RCVINFO);

@@ -18,13 +18,11 @@
 #define RTMUX_DEVC_COMMON_SERIAL_SERVICE_H
 
 #include <errno.h>
-#include <limits.h>
 #include <stdint.h>
 #include <string.h>
 #include <time.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <sys/poll.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/iomsg.h>
@@ -66,8 +64,6 @@ static volatile unsigned cooked_tail;
  * rx_notification_handler: that serialization is the lock that keeps arming and
  * the RX edge from racing. Every condition fires on a single byte.
  */
-#define SER_NOTIFY_CONDS (_NOTIFY_COND_INPUT | _NOTIFY_COND_OUTPUT)
-
 static ioserv_notify_t ser_notify_lists[IOSERV_NOTIFY_COUNT];
 
 /* Ask roottask a job control question about a client (see sys/procmsg.h).
@@ -670,9 +666,11 @@ static void ser_notify_input(void)
 static int ser_notify(ioserv_context_t *ctp, io_notify_t *msg, void *ocb)
 {
     (void) ocb;
-    return ioserv_notify(ctp, msg, ser_notify_lists,
-                         ser_ready(msg->i.flags & (unsigned) SER_NOTIFY_CONDS),
-                         ioserv_tty_hup(&ser_termios), NULL);
+    return ioserv_notify(
+        ctp, msg, ser_notify_lists,
+        ser_ready(msg->i.flags &
+                  (unsigned) (_NOTIFY_COND_INPUT | _NOTIFY_COND_OUTPUT)),
+        ioserv_tty_hup(&ser_termios), NULL);
 }
 
 static int rx_notification_handler(message_context_t *ctp,

@@ -45,6 +45,10 @@ extern kspinlock_t alloc_slock, sync_slock, global_channel_slock, as_slock,
  * core/globals.h's <arch/pcpu.h>.
  */
 extern unsigned num_processors;
+/* Architectural hart ID of each logical CPU, for labels only: every per-CPU
+ * array is indexed by the logical CPU, which may differ on sparse-ID systems.
+ */
+extern unsigned hart_ids[];
 extern unsigned in_kcall[CONFIG_PROCESSORS_MAX];
 extern process_t *kernel_threads_prp;
 extern vector_t process_vector;
@@ -537,11 +541,11 @@ static void mon_dump_ghost_running(void)
                 mon_puts("NONE *GHOST*");
             else if ((unsigned) owner != thp->runcpu) {
                 mon_putc('h');
-                mon_put_dec((unsigned) owner);
+                mon_put_dec(hart_ids[owner]);
                 mon_puts(" *RUNCPU-MISMATCH*");
             } else {
                 mon_putc('h');
-                mon_put_dec((unsigned) owner);
+                mon_put_dec(hart_ids[owner]);
             }
         }
     }
@@ -772,8 +776,8 @@ void __attribute__((noreturn)) monitor_loop(void)
             mon_putc(' ');
         }
 
-        /* Per-CPU sched locks: one char per active hart in hart_ids[] order (L
-         * = held, u = unlocked).
+        /* Per-CPU sched locks: one char per logical CPU in index order (L =
+         * held, u = unlocked, - = offline).
          */
         mon_puts("sched=");
         for (unsigned cpu = 0; cpu < num_processors; cpu++) {
@@ -804,8 +808,11 @@ void __attribute__((noreturn)) monitor_loop(void)
             if (!cpu_online(hart))
                 continue;
             thp = get_active_thread(hart);
+            /* The label names the architectural hart; the index stays logical
+             * for every per-CPU access below.
+             */
             mon_puts(" h");
-            mon_put_dec(hart);
+            mon_put_dec(hart_ids[hart]);
             mon_putc(':');
             if (!thp)
                 mon_puts("NULL");

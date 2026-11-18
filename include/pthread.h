@@ -45,6 +45,9 @@ __BEGIN_DECLS
 #define RTMUX_SYNC_CEIL_MASK 0x00ff0000   /* mutexes: PRIO_PROTECT ceiling */
 #define RTMUX_SYNC_PPDEPTHMASK 0x0000ffff /* mutexes: PRIO_PROTECT depth */
 
+/* Count bits that send a mutex through the kernel on every lock and unlock. */
+#define RTMUX_SYNC_KERNEL_PATH (RTMUX_SYNC_PRIOCEILING | RTMUX_SYNC_ROBUST)
+
 /* The recursion-depth bits of a mutex count: a PRIO_PROTECT mutex keeps its
  * ceiling above the low 16 bits.
  */

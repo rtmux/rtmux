@@ -7,7 +7,9 @@
 # "  ok NAME" or "  FAIL NAME: ..." per case, then "gaps: PASS" or "gaps: FAIL".
 #
 # $SH is the shell the cases run as `sh -c`, and the one a case runs as a child;
-# it defaults to sh. $GAPS_DIR is the directory for scratch files.
+# it defaults to sh. $GAPS_DIR is the directory for scratch files. A non-empty
+# $GAPS_NO_EXEC skips the cases that need a successful exec to start the new
+# image.
 #
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -309,6 +311,73 @@ rmf "$P-ml.sh"
 raw=$(printf '%s\n' 'echo "a' 'b"' 'echo done' | $SH 2>&1)
 out=$(echo "$raw" | tr -d '$>#')
 ck multiline-prompt "a b done" "$(echo $out)"
+
+# --- exec with a command applies its redirections to that command -------------
+if test -z "$GAPS_NO_EXEC"; then
+    out=$($SH -c 'exec echo hi 1>&2' 2>&1 >/dev/null)
+    ck exec-cmd-redirect hi "$out"
+fi
+
+# --- elif ---------------------------------------------------------------------------------
+out=$($SH -c 'if false; then echo a; elif true; then echo b; else echo c; fi')
+ck elif-one-line b "$out"
+out=$($SH -c 'if false; then echo 1; elif false; then echo 2; elif true; then echo 3; else echo 4; fi')
+ck elif-chain 3 "$out"
+out=$($SH -c 'if false; then echo 1; elif false; then echo 2; else echo 4; fi')
+ck elif-else 4 "$out"
+out=$($SH -c 'if true; then echo 1; elif true; then echo 2; fi')
+ck elif-not-reached 1 "$out"
+printf '%s\n' 'if false; then' '  echo a' 'elif false; then' '  if true; then echo no; fi' 'elif true; then' '  echo c' 'else' '  echo d' 'fi' > "$P-el.sh"
+out=$($SH "$P-el.sh")
+ck elif-multiline c "$out"
+rmf "$P-el.sh"
+
+# --- the status of a compound command that ran nothing is 0 ---------------------------------
+out=$($SH -c 'false; if false; then echo a; fi; echo $?')
+ck if-no-branch-status 0 "$out"
+out=$($SH -c 'false; while false; do :; done; echo $?')
+ck while-no-pass-status 0 "$out"
+out=$($SH -c 'false; for i in; do :; done; echo $?')
+ck for-no-items-status 0 "$out"
+out=$($SH -c 'false; case x in y) :;; esac; echo $?')
+ck case-no-match-status 0 "$out"
+$SH -c 'if false; then echo a; fi'
+ck if-no-branch-exit 0 "$?"
+
+# --- the special parameters in braces -------------------------------------------------------
+out=$($SH -c 'set -- a b c; echo ${#} "${#}" ${?}')
+ck brace-special-params "3 3 0" "$out"
+out=$($SH -c 'false; echo ${?}; echo ${$}' | tr -d '0-9')
+ck brace-status-pid "$(printf '\n')" "$out"
+out=$($SH -c 'f() { echo ${#}; }; f x y')
+ck brace-count-in-function 2 "$out"
+
+# --- case patterns lose their quotes, and an arm may span lines -----------------------------
+out=$($SH -c 'x="a b"; case "$x" in "a b") echo dq;; esac')
+ck case-dquote-pattern dq "$out"
+out=$($SH -c "case 'a*' in 'a*') echo lit;; esac")
+ck case-squote-pattern lit "$out"
+out=$($SH -c "case abc in 'a*') echo bad;; *) echo glob;; esac")
+ck case-squote-pattern-no-glob glob "$out"
+out=$($SH -c 'case a in a) echo A;; esac; case b in b) echo B;; esac')
+ck case-twice-one-line "A B" "$(echo $out)"
+out=$($SH -c 'y="a b"; case "a b" in "$y") echo var;; esac')
+ck case-quoted-var-pattern var "$out"
+out=$($SH -c 'case ")" in ")") echo paren;; esac')
+ck case-quoted-paren-pattern paren "$out"
+printf '%s\n' 'case b in' '  a) echo A ;;' '  b|c)' '    echo B1' '    echo "B2 (x)"' '    ;;' '  *) echo other ;;' 'esac' > "$P-ca.sh"
+out=$($SH "$P-ca.sh")
+ck case-multiline-arm "B1 B2 (x)" "$(echo $out)"
+printf '%s\n' 'case z in' '  a)' '    echo "(A)"' '    ;;' '  *)' '    echo star' 'esac' > "$P-ca.sh"
+out=$($SH "$P-ca.sh")
+ck case-multiline-last-arm star "$out"
+printf '%s\n' 'case a in' '  a)' '    case b in' '      b)' '        echo inner' '        ;;' '    esac' '    echo outer' '    ;;' '  *) echo no ;;' 'esac' > "$P-ca.sh"
+out=$($SH "$P-ca.sh")
+ck case-multiline-nested "inner outer" "$(echo $out)"
+printf '%s\n' 'f() {' '  case $1 in' '    a)' '      if [ "$2" = y ]; then' '        echo AY' '      fi' '      ;;' '    *) echo other ;;' '  esac' '}' 'f a y' 'f b' > "$P-ca.sh"
+out=$($SH "$P-ca.sh")
+ck case-multiline-in-function "AY other" "$(echo $out)"
+rmf "$P-ca.sh"
 
 echo "  $n gap cases"
 if test -z "$bad"; then

@@ -17,10 +17,18 @@ HEADER = ROOT / "include/confname.h"
 SOURCE = ROOT / "lib/libc/posix/sysconf.c"
 
 
+def strip_comments(text):
+    """Drop C comments, keeping their newlines, so a commented-out name counts
+    as absent."""
+    return re.sub(r"/\*.*?\*/|//[^\n]*",
+                  lambda m: "\n" * m.group(0).count("\n"), text, flags=re.S)
+
+
 def main():
     header = set()
-    for name, value in re.findall(r"^#define\s+(_SC_\w+)[ \t]+([^\n]*)", HEADER.read_text(), re.M):
-        value = re.sub(r"/\*.*?\*/", "", value).strip()
+    for name, value in re.findall(r"^#define\s+(_SC_\w+)[ \t]+([^\n]*)",
+                                  strip_comments(HEADER.read_text()), re.M):
+        value = value.strip()
         if re.fullmatch(r"_SC_\w+", value):
             continue  # an alias is covered by its target
         if not re.fullmatch(r"(0[xX][0-9a-fA-F]+|\d+)[uUlL]*", value):
@@ -28,7 +36,7 @@ def main():
                   file=sys.stderr)
             return 1
         header.add(name)
-    text = SOURCE.read_text()
+    text = strip_comments(SOURCE.read_text())
     func = re.search(r"sysconf_name_valid\(int name\)\s*\{(.*?)\n\}", text, re.S)
     if not func:
         print("check-sysconf-names: sysconf_name_valid() not found", file=sys.stderr)

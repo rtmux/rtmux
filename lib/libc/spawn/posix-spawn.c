@@ -32,18 +32,21 @@ static void close_temp_fds(int fds[], size_t nfds)
     }
 }
 
-#define ACTION_BIT(t) (1U << (t))
-
-/* The set of action types present, as ACTION_BIT()s, in one pass. */
-static unsigned action_types(const _posix_spawn_file_actions_t *fact)
+/* Whether any action opens a file, and whether any changes directory. */
+static void action_kinds(const _posix_spawn_file_actions_t *fact,
+                         bool *has_open,
+                         bool *has_chdir)
 {
-    unsigned types = 0;
-
+    *has_open = *has_chdir = false;
     for (unsigned i = 0; i < fact->num_entries; i++) {
-        if (fact->action[i].type < 32)
-            types |= ACTION_BIT(fact->action[i].type);
+        uint32_t type = fact->action[i].type;
+
+        if (type == posix_file_action_type_OPEN)
+            *has_open = true;
+        else if (type == posix_file_action_type_CHDIR ||
+                 type == posix_file_action_type_FCHDIR)
+            *has_chdir = true;
     }
-    return types;
 }
 
 /* Working buffers for path resolution. cwd[0] is '\0' until a chdir or fchdir
@@ -428,8 +431,7 @@ int posix_spawn(pid_t *restrict pid,
     _posix_spawn_file_actions_t *materialized_factp = NULL;
     int *temp_fds = NULL;
     size_t ntemp_fds = 0;
-    unsigned types = 0;
-    bool fact_has_open, fact_has_chdir, image_known;
+    bool fact_has_open = false, fact_has_chdir = false, image_known;
     struct spawn_paths *paths = NULL;
     size_t cwdlen = 0;
     bool env_locked = false;
@@ -457,10 +459,7 @@ int posix_spawn(pid_t *restrict pid,
     }
 
     if (_factp)
-        types = action_types(_factp);
-    fact_has_open = types & ACTION_BIT(posix_file_action_type_OPEN);
-    fact_has_chdir = types & (ACTION_BIT(posix_file_action_type_CHDIR) |
-                              ACTION_BIT(posix_file_action_type_FCHDIR));
+        action_kinds(_factp, &fact_has_open, &fact_has_chdir);
     /* only open and chdir actions, and a relative image, resolve paths */
     if (fact_has_open || fact_has_chdir || *path != '/') {
         paths = malloc(sizeof(*paths));

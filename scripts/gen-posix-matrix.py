@@ -688,7 +688,9 @@ DESIGN_NOTES = {
     "pthread_mutexattr_setrobust": "a robust mutex always locks and unlocks "
     "through the kernel, which hands it to the next waiter (or the next "
     "locker) with EOWNERDEAD when the owning thread or process dies; works "
-    "process-shared and with PRIO_INHERIT/PRIO_PROTECT",
+    "process-shared with PTHREAD_PRIO_NONE (pthread_mutex_init refuses a "
+    "process-shared PRIO_INHERIT or PRIO_PROTECT mutex with ENOTSUP) and with "
+    "PRIO_INHERIT/PRIO_PROTECT in a process-private mutex",
     "crypt": "XSI; SHA-512 modular form ($6$salt$hash) only (from FreeBSD)",
     "pthread_attr_setscope": "PTHREAD_SCOPE_SYSTEM only; PTHREAD_SCOPE_PROCESS is "
     "correctly ENOTSUP and an unknown scope is EINVAL (RTMux threads are 1:1 "

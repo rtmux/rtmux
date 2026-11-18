@@ -14,8 +14,10 @@ config ROOTTASK_HEAP_SIZE
       once; /sys/kstats reports how much is used (roottask.heap_used) and
       how large a block is still free (roottask.heap_largest). Concurrent
       spawns under the leak-gate suite peak near 768 KiB, and one run of
-      the spawn tests with 64 KiB arguments adds about as much again; an
-      allocation that finds no room fails with ENOMEM and is logged.
+      the spawn tests with 64 KiB arguments adds about as much again. An
+      allocation that finds no room fails with ENOMEM; the spawn paths
+      (spawn request and message, action list, loader context) also log
+      the failure with the heap figures, other callers only see ENOMEM.
 
       Default: 2097152 (2 MiB).
 

@@ -501,7 +501,6 @@ int main(int argc, char **argv)
                       progname, argv[first]);
     }
 
-
     /* Attach the ECAM driver directly (no DLL loading) */
     {
         pci_driver_t *pdrvr = calloc(1, sizeof(pci_driver_t));

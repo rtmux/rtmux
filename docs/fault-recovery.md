@@ -40,7 +40,10 @@ Every recoverable fault decision has these fields:
   owner died is detected by the next locker that has to wait; a `trylock`
   reports `EBUSY` until then. Limits: an owner that dies between the user-space
   release and the kernel hand-off, and an owner id reused by a live thread, are
-  not detected.
+  not detected. A thread holds at most `ROBUST_HELD_MAX` (64) robust mutexes at
+  once (`robust_rec_get` in `kernel/sync/wait.c`): a lock of one more fails
+  with `EAGAIN`, as does a robust lock when the kernel cannot allocate the
+  holder record.
 
 ## Taxonomy
 
