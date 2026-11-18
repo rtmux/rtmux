@@ -48,6 +48,22 @@ runs:
           return 1
         }
         apt update
+        # A runner image can come up with no Ubuntu archive configured, so
+        # that update fetches only third-party lists and every package below
+        # is "unable to locate": retrying cannot help. Add the archive and
+        # update again before installing.
+        if ! apt-cache show build-essential >/dev/null 2>&1; then
+          echo "no Ubuntu archive in apt sources, adding it" >&2
+          codename=$(. /etc/os-release && echo "$VERSION_CODENAME")
+          printf '%s\n' \
+            "Types: deb" \
+            "URIs: http://archive.ubuntu.com/ubuntu/" \
+            "Suites: $codename $codename-updates $codename-security" \
+            "Components: main universe" \
+            "Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg" |
+            sudo tee /etc/apt/sources.list.d/rtmux-ubuntu.sources >/dev/null
+          apt update
+        fi
         apt install -y -o "Dir::Cache::Archives=$HOME/apt-cache" $pkgs ${{ inputs.packages }}
 
     # `make defconfig` clones Kconfiglib on first use; keep it out of the

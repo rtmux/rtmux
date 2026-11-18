@@ -4858,9 +4858,16 @@ static void test_namespace_open_race(void)
     }
     (void) pthread_detach(tid);
 
+    /* Progress lines: a guest that stalls here leaves the last one in the log,
+     * which says whether the open loop or the wait for the churner stopped.
+     */
+    printf("  namespace open race: churner started, %d opens\n", (int) ITERS);
     clean = stale = bad = 0;
     for (int i = 0; i < ITERS; i++) {
         int fd;
+
+        if (i && i % 32 == 0)
+            printf("  namespace open race: %d opens done\n", i);
 
         errno = 0;
         fd = open("/sys/namespace-stats", O_RDONLY);
@@ -4874,6 +4881,7 @@ static void test_namespace_open_race(void)
         }
     }
 
+    printf("  namespace open race: opens done, stopping churner\n");
     atomic_store_explicit(&args->stop, 1, memory_order_release);
     while (!atomic_load_explicit(&args->done, memory_order_acquire))
         (void) __sched_yield();
@@ -7315,6 +7323,27 @@ static void test_spawn_malformed_messages_fail_closed(void)
                                             sizeof(pspawn_msg.i), NULL, 0));
     check(rc == EMSGSIZE, "spawn rejects short POSIX message",
           "_PROC_POSIX_SPAWN must reject declared regions outside msglen");
+
+    /* The sender picks attr_bytes, so the file actions can start at an odd
+     * address; the receiver must refuse that rather than build a key mask.
+     */
+    {
+        static union {
+            proc_posixspawn_t m;
+            char raw[sizeof(proc_posixspawn_t) + 4096 + 1 + 8];
+        } buf;
+        proc_posixspawn_t *m = &buf.m;
+
+        memset(&buf, 0, sizeof buf);
+        m->i.type = _PROC_POSIX_SPAWN;
+        m->i.subtype = _PROC_SPAWN_START;
+        m->i.attr_bytes = 4096 + 1;
+        m->i.filact_bytes = 8;
+        rc = roottask_errno_status(
+            msg_sendnc_r(ROOTTASK_COID, &buf, sizeof buf, NULL, 0));
+        check(rc == EINVAL, "spawn rejects misaligned file actions",
+              "an odd attr_bytes must fail EINVAL, not reach key_mask_create");
+    }
 }
 
 /* End-to-end: a valid close/dup2 file-actions object must actually spawn. */

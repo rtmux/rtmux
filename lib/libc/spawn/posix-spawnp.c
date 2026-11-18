@@ -98,20 +98,28 @@ int posix_spawnp(pid_t *restrict pid,
             /* "" and "." name the cwd itself; "./" was the old special case */
             if (elen == 1 && env_path[i][0] == '.')
                 elen = 0;
+            /* An entry that cannot fit is too long anyway; refusing it here
+             * also keeps the %.*s precision below from narrowing a length past
+             * INT_MAX to a smaller one and naming a truncated candidate.
+             */
+            if (elen >= sizeof(path) - len) {
+                r = ENAMETOOLONG;
+                continue; /* a later entry may still fit */
+            }
             n = snprintf(path + len, sizeof(path) - len, "%s%.*s%s%s",
                          len > 1 ? "/" : "", (int) elen, env_path[i],
                          elen ? "/" : "", file);
 
             if (n < 0 || (size_t) n >= sizeof(path) - len) {
                 r = ENAMETOOLONG;
-                break;
+                continue; /* a later entry may still fit */
             }
         } else {
             int n = snprintf(path, sizeof(path), "%s/%s", env_path[i], file);
 
             if (n < 0 || (size_t) n >= sizeof(path)) {
                 r = ENAMETOOLONG;
-                break;
+                continue; /* a later entry may still fit */
             }
         }
 
@@ -123,8 +131,8 @@ int posix_spawnp(pid_t *restrict pid,
              */
             if (r != EACCES)
                 break;
-        } else {
-            r = errno;
+        } else if (r != EACCES) {
+            r = errno; /* keep an earlier EACCES over a later ENOENT */
         }
     }
 

@@ -236,10 +236,22 @@ void __attribute__((noreturn)) kernel_exit(void)
         if (!thp) {
             /* A hart about to idle settles its stale servers first. Interrupts
              * stay off: with no active thread a nested trap has no thread to
-             * run on, and an idle hart has no thread to delay.
+             * run on, and an idle hart has no thread to delay. The settle wakes
+             * and requeues through plain kspinlock pairs, whose outermost
+             * unlock would turn SIE back on; hold the nesting depth across it,
+             * as the trap dispatch does, so those unlocks are inner ones and
+             * cpu_idle is entered with SIE still off.
              */
             if (__atomic_load_n(&prio_defer_pending[cpu], __ATOMIC_RELAXED)) {
+                pcpu_array[cpu].pc_kspin_depth++;
+#if defined(CONFIG_INSTRUMENTATION)
+                irqoff_open(LOCK_CLASS_PRIO_DEFER);
+#endif
                 thread_prio_run_deferred();
+#if defined(CONFIG_INSTRUMENTATION)
+                irqoff_close();
+#endif
+                pcpu_array[cpu].pc_kspin_depth--;
                 continue;
             }
 

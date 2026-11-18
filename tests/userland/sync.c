@@ -227,14 +227,14 @@ static void test_pthread_mutex_types(void)
          * limit rather than carry into the flag bits.
          */
         if (pthread_mutex_lock(&m) == EOK) {
-            unsigned long saved = m.count;
+            unsigned long saved = (unsigned long) m.count;
 
             m.count |= RTMUX_SYNC_COUNTMASK;
             check(pthread_mutex_lock(&m) == EAGAIN &&
                       pthread_mutex_trylock(&m) == EAGAIN,
                   "RECURSIVE mutex depth saturates with EAGAIN",
                   "lock and trylock must fail EAGAIN at the depth limit");
-            m.count = saved;
+            m.count = (long) saved;
             (void) pthread_mutex_unlock(&m);
         }
         (void) pthread_mutex_destroy(&m);
@@ -361,6 +361,39 @@ static void test_pthread_mutex_prio_protect_required_pass(void)
                 (void) pthread_mutex_destroy(&lo);
             }
             (void) pthread_mutexattr_destroy(&lattr);
+        }
+        /* The library recurses on a held ceiling mutex in user space, so the
+         * kernel's own recursive acquire is reached only by a raw call. It
+         * counts the depth itself and must not boost again: the one final unlock pops
+         * the ceiling once, so a second boost would leave the thread raised.
+         */
+        {
+            pthread_mutexattr_t rattr;
+            pthread_mutex_t rec;
+
+            if (pthread_mutexattr_init(&rattr) == EOK &&
+                pthread_mutexattr_settype(&rattr, PTHREAD_MUTEX_RECURSIVE) ==
+                    EOK &&
+                pthread_mutexattr_setprotocol(&rattr, PTHREAD_PRIO_PROTECT) ==
+                    EOK &&
+                pthread_mutexattr_setprioceiling(&rattr, 14) == EOK &&
+                pthread_mutex_init(&rec, &rattr) == EOK) {
+                int r1 = pthread_mutex_lock(&rec);
+                int r2 = sync_mutex_lock_r((sync_t *) &rec);
+                int r3 = pthread_mutex_unlock(&rec); /* depth 2 to 1 */
+                int r4 = pthread_mutex_unlock(&rec); /* final: kernel pop */
+
+                __sched_get(0, 0, &sp);
+                check(r1 == EOK && r2 == EOK && r3 == EOK && r4 == EOK &&
+                          sp.sched_curpriority == 5,
+                      "PRIO_PROTECT kernel recursive lock boosts once",
+                      "a recursive acquire must leave no boost behind after "
+                      "the final unlock");
+                (void) pthread_mutex_destroy(&rec);
+            } else {
+                test_fail("PRIO_PROTECT recursive prerequisite", "init failed");
+            }
+            (void) pthread_mutexattr_destroy(&rattr);
         }
         sp.sched_priority = 20;
         if (__sched_set(0, 0, SCHED_FIFO, &sp) == EOK) {

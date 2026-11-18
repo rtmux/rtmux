@@ -1011,6 +1011,14 @@ static inline uint64_t pshut_ticks(void)
     return cpu_clock_ticks();
 }
 
+/* Cycles to ns without forming cyc * 1e9, which wraps past about 1.8e10
+ * cycles: whole seconds first, then the remainder, which is below cps.
+ */
+static uint64_t pshut_ns(uint64_t cyc, uint64_t cps)
+{
+    return cyc / cps * 1000000000ULL + cyc % cps * 1000000000ULL / cps;
+}
+
 /* Print the teardown cost in ns. Called throttled from clock_handler next to
  * nonpreempt_report(), outside any lock.
  */
@@ -1035,10 +1043,10 @@ void process_shutdown_report(void)
         "total_avg_ns=%llu total_max_ns=%llu\n",
         (unsigned long long) n, (unsigned long long) (visit_sum / n),
         (unsigned long long) visit_max,
-        (unsigned long long) (unbind_sum / n * 1000000000ULL / cps),
-        (unsigned long long) (unbind_max * 1000000000ULL / cps),
-        (unsigned long long) (total_sum / n * 1000000000ULL / cps),
-        (unsigned long long) (total_max * 1000000000ULL / cps));
+        (unsigned long long) pshut_ns(unbind_sum / n, cps),
+        (unsigned long long) pshut_ns(unbind_max, cps),
+        (unsigned long long) pshut_ns(total_sum / n, cps),
+        (unsigned long long) pshut_ns(total_max, cps));
 }
 #else
 static inline uint64_t pshut_ticks(void)

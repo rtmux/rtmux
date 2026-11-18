@@ -140,15 +140,6 @@ void *__crt_morecore(size_t n)
     return p;
 }
 
-/* Put [p, p + n) in the table at index i, which keeps it in address order. */
-static void ext_insert(unsigned i, char *p, size_t n)
-{
-    memmove(&free_ext[i + 1], &free_ext[i], (nfree - i) * sizeof free_ext[0]);
-    nfree++;
-    free_ext[i].p = p;
-    free_ext[i].n = n;
-}
-
 /* Take a block back. It joins the extents next to it; one that ends at the bump
  * pointer lowers the pointer instead.
  */
@@ -188,7 +179,12 @@ void __crt_lesscore(void *ptr, size_t n)
         free_ext[i].p = p;
         free_ext[i].n += n;
     } else {
-        ext_insert(i, p, n);
+        /* Insert at i, which keeps the table in address order. */
+        memmove(&free_ext[i + 1], &free_ext[i],
+                (nfree - i) * sizeof free_ext[0]);
+        nfree++;
+        free_ext[i].p = p;
+        free_ext[i].n = n;
     }
     if (i + 1 < nfree && free_ext[i].p + free_ext[i].n == free_ext[i + 1].p) {
         free_ext[i].n += free_ext[i + 1].n;

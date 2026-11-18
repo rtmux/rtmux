@@ -341,8 +341,10 @@ instead of skipping when that support is absent.
 The other userland `MAP_PHYS` allowlist entries are RT latency fixtures that map
 delegated goldfish-rtc MMIO, a kernel trace ring for measurement only, or the
 typed RISC-V IOMMU MMIO plus anonymous command/DDT/page-table pages used by
-`lkl-iommu-probe`.  They are not service publication or LKL device-authority
-paths.
+`lkl-iommu-probe`, or, in `ipc-roundtrip`, read one frame of the test's own
+message back through the physical address `msg_readiov` reported, to check the
+walk named the right memory.  They are not service publication or LKL
+device-authority paths.
 
 Scope of the seal: it bounds an *already-authorized* domain from mapping *new*
 physical regions unless those regions are already in its hwres claims.

@@ -48,17 +48,6 @@ void proc_pgrp_unlock(void)
     pthread_mutex_unlock(&pgrp_mutex);
 }
 
-/* Make the group locks, and the terminal bind lock, priority-inheriting, and
- * empty the table. Boot, before the first process exists.
- */
-static void pgrp_init(void)
-{
-    root_mutex_init_pi(&pgrp_mutex);
-    root_mutex_init_pi(&pgtab_lock);
-    pgrp_table_init(&pgtab);
-    proc_tty_init();
-}
-
 #ifdef CONFIG_DEBUG_INJECT
 /* A window a test armed holds the next operation that reaches it for the armed
  * time, once, so that another operation can be started inside it.
@@ -125,10 +114,16 @@ static int pgrp_first_enter(pid_t pid, pid_t pgid, pid_t sid)
     return rc;
 }
 
-/* Roottask's own group, which its session leads. */
+/* Roottask's own group, which its session leads. Make the group locks, and the
+ * terminal bind lock, priority-inheriting and empty the table first: boot,
+ * before the first process exists.
+ */
 int proc_pgrp_boot(pid_t pid)
 {
-    pgrp_init();
+    root_mutex_init_pi(&pgrp_mutex);
+    root_mutex_init_pi(&pgtab_lock);
+    pgrp_table_init(&pgtab);
+    proc_tty_init();
     return pgrp_first_enter(pid, pid, pid);
 }
 
@@ -172,11 +167,6 @@ void proc_pgrp_reap(pid_t pid)
 {
     root_process_t *p = root_proc(pid);
 
-    /* The unlocked look skips the second call of a reaped child's teardown; the
-     * one under the lock decides.
-     */
-    if (!p->pgrp_member)
-        return;
     pthread_mutex_lock(&pgtab_lock);
     if (p->pid == pid && p->pgrp_member) {
         pgrp_table_leave(&pgtab, p->pgrp, p->pgrp_gen);

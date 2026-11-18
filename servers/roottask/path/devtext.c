@@ -697,18 +697,9 @@ static const ioserv_connect_ops_t text_connect_funcs = {
  */
 void devtext_init(void)
 {
-    {
-        /* Priority inheritance: see the comment at text_mutex. */
-        pthread_mutexattr_t mattr;
-
-        if (pthread_mutexattr_init(&mattr) != EOK ||
-            pthread_mutexattr_setprotocol(&mattr, PTHREAD_PRIO_INHERIT) !=
-                EOK ||
-            pthread_mutex_init(&text_mutex, &mattr) != EOK ||
-            pthread_mutex_init(&text_out_mutex, &mattr) != EOK)
-            crash();
-        pthread_mutexattr_destroy(&mattr);
-    }
+    /* Priority inheritance: see the comment at text_mutex. */
+    root_mutex_init_pi(&text_mutex);
+    root_mutex_init_pi(&text_out_mutex);
     /* Sensible terminal defaults so the shell gets ECHO | ICANON */
     text_termios.c_iflag = ICRNL | BRKINT;
     text_termios.c_oflag = OPOST | ONLCR;

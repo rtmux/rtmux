@@ -92,8 +92,9 @@
  *
  * A dense index in 0..num_processors-1, with the boot hart at 0. Every per-CPU
  * array is indexed by it. The architectural hart ID, which SBI and the PLIC
- * context table need, is hart_ids[cpu]; it may be sparse or large and indexes
- * nothing.
+ * context table need, is hart_ids[cpu]; it may be sparse or large, so no
+ * per-CPU array is indexed by it. Only the PLIC context table, sized to the
+ * largest hart ID, is.
  *
  * Implementation: one load from offset PC_CPU of *tp. tp is invariant per hart
  * in S-mode (set once at bootstrap, never reassigned), so this is always

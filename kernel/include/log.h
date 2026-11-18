@@ -4,8 +4,9 @@
  * Provides LOGF_E/W/I/D/T macros for structured logging at different verbosity
  * levels. Safe to include from kernel, roottask, and libc.
  *
- * E/W/I always print. D prints with -v (kopt.loglevel >= 1). T prints with -vv
- * (kopt.loglevel >= 2).
+ * E/I always print. W prints regardless of level but is rate-limited per call
+ * site, so a warning repeated in a burst may drop lines. D prints with -v
+ * (kopt.loglevel >= 1). T prints with -vv (kopt.loglevel >= 2).
  *
  * kopt.loglevel is set by '-v' options in common-options.c.
  *

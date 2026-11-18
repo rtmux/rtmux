@@ -22,6 +22,7 @@ struct open_entry {
     int rcvid;
     int check_generation;
     int deferred; /* parked behind another op on the node (IOSERV_NOREPLY) */
+    int unlink;   /* an unlink: owns NODE_FLAG_UNLINKING while pending */
     ioserv_context_t *ctp; /* context of the request this entry stands for */
 };
 
@@ -311,9 +312,16 @@ static int complete_open(struct open_entry *oep, int ret)
         }
         nop->flags &= (uint16_t) ~NODE_FLAG_DEFERRED;
     }
+    /* Only the unlink clears its flag, and in the same hold of path_mutex that
+     * removes its entry: a second unlink starting between the two would have
+     * its flag cleared under it, and an open would then pass the check while
+     * that unlink detaches the node.
+     */
+    if (oep->unlink)
+        nop->flags &= (uint16_t) ~NODE_FLAG_UNLINKING;
     proc_object_free(&open_souls, oep);
     path_node_complete(nop);
-    path_node_detach_flags(nop, NODE_FLAG_UNLINKING);
+    path_node_detach(nop);
     return ret;
 }
 
@@ -451,6 +459,7 @@ again:
         oep->rcvid = ctp->rcvid;
         oep->ctp = ctp;
         oep->deferred = 0;
+        oep->unlink = (msg->connect.subtype == _IO_CONNECT_UNLINK);
         oep->check_generation = (msg->connect.subtype != _IO_CONNECT_UNLINK);
         if (msg->connect.subtype == _IO_CONNECT_UNLINK) {
             nop->flags |= NODE_FLAG_UNLINKING;
