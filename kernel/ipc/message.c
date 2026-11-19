@@ -11,8 +11,6 @@
 /* #define   MSG_XFER_CHUNK_SIZE     1024 */
 
 
-static int msg_current_take(thread_t *act, struct kcall_args_msg_current *kap);
-
 /* Establish the calling thread as the server for a given rcvid (msg_current
  * kcall).
  *
@@ -23,56 +21,38 @@ static int msg_current_take(thread_t *act, struct kcall_args_msg_current *kap);
  *   act : the calling (active) thread
  *   kap : kcall args; kap->rcvid identifies the client thread
  * Return value: EOK on success; ESRCH if the rcvid no longer names a
- *               reply-blocked client. Either way the loan of the prior client
- *               has ended.
+ *               reply-blocked client.
  */
 int kdecl ksys_msg_current(thread_t *act, struct kcall_args_msg_current *kap)
-{
-    thread_t *prior_client = act->client;
-    bool ended = false;
-    int r;
-
-    /* Disown act's prior client, if any, and end the loan it lent, whatever
-     * this call then does: a call that fails must not leave act running at the
-     * priority of a client it no longer serves. The prior client briefly
-     * observes server=0 with act->client cleared; eventually consistent for its
-     * own ksys_msg_current.
-     */
-    if (prior_client) {
-        prior_client->args.ms.server = 0;
-        ended = thread_client_departed(act, prior_client);
-        if (ended)
-            CRITICAL_CLEAR(act);
-    }
-
-    r = kap->rcvid == 0 ? EOK : msg_current_take(act, kap);
-
-    /* A new client's loan, once taken, replaced the ended one and was applied
-     * by msg_current_take; with none, or on an error return, apply the end.
-     * Applying can switch act out, and the trap path writes a returned status
-     * only while act still runs, so publish the status first.
-     */
-    if (ended && (kap->rcvid == 0 || r != EOK)) {
-        if (r != EOK && r != ENOERROR) {
-            kcall_err(act, r);
-            r = ENOERROR;
-        }
-        thread_prio_update(act);
-    }
-    return r;
-}
-
-/* Make the client named by kap->rcvid act's current one and lend its priority.
- *
- * Returns EOK on success, ESRCH if the rcvid no longer names a reply-blocked
- * client, or ENOERROR when lookup_rcvid already set the error.
- */
-static int msg_current_take(thread_t *act, struct kcall_args_msg_current *kap)
 {
     connect_t *cop;
     thread_t *thp;
     int do_pi = 0;
     kdispatch_t *new_dpp = NULL;
+    thread_t *prior_client = act->client;
+
+    /* Disown act's prior client, if any. Single-pointer atomic writes; the
+     * prior client briefly observes server=0 with act->client cleared —
+     * eventually-consistent for the prior client's own ksys_msg_current. A
+     * per-thread_t lock would close this window; not yet instantiated
+     * (LOCK_CLASS_THREAD placeholder).
+     */
+    if (prior_client) {
+        prior_client->args.ms.server = 0;
+        act->client = 0;
+    }
+
+    if (kap->rcvid == 0) {
+        /* No client left to lend priority. A notification loan stays until the
+         * next receive.
+         */
+        if (prior_client && thread_msg_loan_is_request(act)) {
+            CRITICAL_CLEAR(act);
+            thread_lend_msg(act, 0, false);
+            thread_prio_update(act);
+        }
+        return EOK;
+    }
 
     /* lookup_rcvid runs unlocked: the chancons/threads vec_lookups share the
      * helper-level vec_slock race surface common to every IPC kcall.
@@ -160,7 +140,7 @@ static int msg_current_take(thread_t *act, struct kcall_args_msg_current *kap)
         CRITICAL_INHERIT(act, thp);
         thread_lend_msg(act, __atomic_load_n(&thp->priority, __ATOMIC_ACQUIRE),
                         true);
-        (void) thread_end_orphan_loan(act);
+        thread_drop_gone_client_loan(act, thp);
         (void) thread_prio_update_dpp(act, new_dpp, 1);
     } else {
         /* A fixed-priority channel lends nothing. Drop the loan an earlier

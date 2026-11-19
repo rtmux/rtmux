@@ -82,11 +82,9 @@ CASES = (
     ("join snapshot", "kernel/thread/lifecycle.c", "thread_destroy",
      "jthp = thp->join;", "jthp = NULL;", "join wake paths must wait"),
     ("reclaim handoff", "kernel/thread/lifecycle.c", "thread_destroy",
-     "    rcu_sched_synchronize();\n        thread_prio_defer_cancel(thp);\n"
-     "        (void) tthread_wait_unpinned(thp);",
+     "    rcu_sched_synchronize();\n        (void) tthread_wait_unpinned(thp);",
      "    if (thread_reclaim_enqueue(thp, prp, last_active))\n            return;\n"
-     "        rcu_sched_synchronize();\n        thread_prio_defer_cancel(thp);\n"
-     "        (void) tthread_wait_unpinned(thp);",
+     "        rcu_sched_synchronize();\n        (void) tthread_wait_unpinned(thp);",
      "thread reap must stay synchronous"),
     ("sync reap", "kernel/thread/lifecycle.c", "thread_destroy",
      "(void) tthread_wait_unpinned(thp);", "/* removed pin wait */",

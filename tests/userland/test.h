@@ -75,7 +75,6 @@ int inject_run(const char *a1, const char *a2, const char *a3);
 int test_pin_mask(unsigned mask);
 int condloan_create(pthread_t *tid, int prio, void *(*fn)(void *), void *arg);
 int sched_set_error_after_lowering(void);
-int loan_settle_context(void);
 int sched_set_error_while_migrating(void);
 int condvar_reacquire_alloc_failure(void);
 int mutex_waiting_republish(void);

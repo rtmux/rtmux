@@ -712,79 +712,10 @@ static void test_loan_ends_at_msg_current_zero(void)
     chan_close(k.chid, coid);
 }
 
-/* Case 9: a server whose msg_current names a rcvid that is no client fails, but
- * it has still given up the client it served before: the loan that client lent
- * ends with the failed call (K29). The server replies to the old rcvid
- * afterwards, which still reaches the client.
- */
-#define C9_BASE 5
-#define C9_BAD_RCVID 0x7ffffff
-
-struct c9 {
-    struct server k;
-    int rc, err;
-};
-
-static void *case9_server(void *raw)
-{
-    struct c9 *c = raw;
-    struct server *k = &c->k;
-    char buf[1], z = 0;
-
-    (void) set_fifo(k->base);
-    set_flag(&k->ready);
-    k->rcvid = msg_receive(k->chid, buf, sizeof buf, NULL);
-    k->prio_recv = self_prio(NULL);
-    set_flag(&k->received);
-    c->rc = msg_current(C9_BAD_RCVID);
-    c->err = errno;
-    k->prio_unlocked = self_prio(NULL);
-    k->reply_rc = k->rcvid == -1 ? -1 : msg_reply(k->rcvid, 0, &z, 1);
-    set_flag(&k->go);
-    return NULL;
-}
-
-static void test_loan_ends_at_failed_msg_current(void)
-{
-    static struct c9 c9;
-    struct client c = {.prio = 40, .reply_timeout_ms = POLL_MS};
-    pthread_t ts, tc;
-    int coid = -1;
-    char detail[192];
-
-    memset(&c9, 0, sizeof c9);
-    if (chan_open(&c9.k.chid, &coid) != 0) {
-        test_fail("prio loan: failed msg_current setup", strerror(errno));
-        return;
-    }
-    c9.k.base = C9_BASE;
-    c.coid = coid;
-    if (!spawn(&ts, case9_server, &c9, "prio loan: failed msg_current server"))
-        return;
-    (void) wait_flag(&c9.k.ready);
-    if (!spawn(&tc, client_main, &c, "prio loan: failed msg_current client"))
-        return;
-    (void) wait_flag(&c9.k.go);
-    (void) pthread_join(ts, NULL);
-    (void) pthread_join(tc, NULL);
-    snprintf(detail, sizeof detail,
-             "received at %d (want 40), %d after the failed msg_current "
-             "(want %d), call rc %d errno %d, reply rc %d, client rc %d",
-             c9.k.prio_recv, c9.k.prio_unlocked, C9_BASE, c9.rc, c9.err,
-             c9.k.reply_rc, c.rc);
-    check(c9.k.prio_recv == 40 && c9.rc == -1 && c9.k.prio_unlocked == C9_BASE &&
-              c9.k.reply_rc == 0 && c.rc == 0,
-          "prio loan: a failed msg_current ends the old client's loan", detail);
-    chan_close(c9.k.chid, coid);
-}
-
 /* Case 8: a client that leaves REPLY by timeout while its server is itself
  * REPLY-blocked on a second server. The first server, not running, falls back
- * to its base, and the second one, which was lent the first one's priority, to
- * what the first one now has: the departed client's settle follows the chain
- * (K29). With a fault-injection kernel it also checks where that work ran:
- * deferred settles in thread context, none inside the departure that runs in
- * timer context.
+ * to its base. (The second server keeps what it was lent until it replies: the
+ * chain is not followed from the timeout path.)
  */
 #define C8_BASE_A 10
 #define C8_BASE_B 5
@@ -812,19 +743,14 @@ static void *c8_server_a(void *raw)
     return NULL;
 }
 
-static void run_loan_ends_for_blocked_server(bool need_inject)
+static void test_loan_ends_for_blocked_server(void)
 {
     static struct c8 k;
     struct client c = {.prio = 40, .reply_timeout_ms = 300};
     pthread_t ta, tb, tc;
-    int coid_a = -1, coid_b = -1, during = -1, during_b = -1;
-    bool inject = inject_run("prio-settle-reset", NULL, NULL) == 0;
-    char detail[256];
+    int coid_a = -1, coid_b = -1, during = -1;
+    char detail[192];
 
-    if (need_inject && !inject) {
-        test_skip("prio loan: settle context", "fault injection unavailable");
-        return;
-    }
     memset(&k, 0, sizeof k);
     if (chan_open(&k.a.chid, &coid_a) != 0 ||
         chan_open(&k.b.chid, &coid_b) != 0) {
@@ -846,43 +772,19 @@ static void run_loan_ends_for_blocked_server(bool need_inject)
     (void) wait_flag(&k.b.received);
     (void) wait_flag(&c.done);
     during = wait_prio_n(ta, C8_BASE_A, 5);
-    during_b = wait_prio_n(tb, C8_BASE_A, 5);
     set_flag(&k.b.go);
     (void) pthread_join(tb, NULL);
     (void) pthread_join(ta, NULL);
     (void) pthread_join(tc, NULL);
     snprintf(detail, sizeof detail,
-             "server B at %d while the client waited (want 40); server A %d "
-             "within 5 ms of the timeout (want %d); server B then %d (want %d); "
-             "client rc %d errno %d",
-             k.b.prio_recv, during, C8_BASE_A, during_b, C8_BASE_A, c.rc,
-             c.err);
+             "server B at %d while the client waited (want 40); server A %d within "
+             "5 ms of the timeout (want %d); client rc %d errno %d",
+             k.b.prio_recv, during, C8_BASE_A, c.rc, c.err);
     check(k.b.prio_recv == 40 && c.rc == -1 && c.err == ETIMEDOUT &&
-              during == C8_BASE_A && during_b == C8_BASE_A,
-          "prio loan: a timed-out client's loan ends along a blocked chain",
-          detail);
-    if (inject) {
-        check(inject_run("prio-settle-thread", "1", NULL) == 0,
-              "prio loan: the settle after a timeout ran in thread context",
-              "no deferred settle ran");
-        check(inject_run("prio-settle-departure", "0", NULL) == 0,
-              "prio loan: no priority work ran in the departure itself",
-              "a priority recomputation ran inside force_ready");
-    }
+              during == C8_BASE_A,
+          "prio loan: a timed-out client's loan ends on a blocked server", detail);
     chan_close(k.a.chid, coid_a);
     chan_close(k.b.chid, coid_b);
-}
-
-static void test_loan_ends_for_blocked_server(void)
-{
-    run_loan_ends_for_blocked_server(false);
-}
-
-int loan_settle_context(void)
-{
-    run_loan_ends_for_blocked_server(true);
-    test_loan_ends_at_failed_msg_current();
-    return 0;
 }
 
 /* K19 and K30: a kcall that lowers the caller below a ready thread and then
@@ -1146,6 +1048,5 @@ void test_prio_loan(void)
     test_loan_after_client_timeout();
     test_loan_ends_at_msg_current_zero();
     test_loan_ends_for_blocked_server();
-    test_loan_ends_at_failed_msg_current();
     (void) __sched_set(0, 0, policy, &saved);
 }

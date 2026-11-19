@@ -35,7 +35,7 @@ static inline bool inject_op_is_status(unsigned op)
 {
     return op == INJECT_OP_ALLOC_STATUS || op == INJECT_OP_SCHED_SET_STATUS ||
            op == INJECT_OP_SCHED_SET_DISPLACED || op == INJECT_OP_PTE_PROBE ||
-           op == INJECT_OP_MANIP_PARTIAL || op == INJECT_OP_PRIO_SETTLE_STATS;
+           op == INJECT_OP_MANIP_PARTIAL;
 }
 
 atomic_ullong inject_spin_state;
@@ -101,35 +101,6 @@ void inject_note_sched_return(thread_t *act, bool switched)
                                                 memory_order_relaxed) &&
         switched)
         atomic_fetch_add_explicit(&sched_displaced, 1, memory_order_release);
-}
-
-/* Where a client's departure settles the server's priority (K29). The settle is
- * deferred to thread context, so none may run inside force_ready's departure
- * (in_departure, per hart); the count of deferred ones that ran lets a test see
- * that the deferral happened at all.
- */
-static atomic_int in_departure_hart[CONFIG_PROCESSORS_MAX];
-static atomic_ullong prio_thread_runs;
-static atomic_ullong prio_departure_work;
-
-void inject_in_departure(int on)
-{
-    atomic_store_explicit(&in_departure_hart[get_cpunum()], on,
-                          memory_order_relaxed);
-}
-
-/* A priority recomputation is about to run (thread_prio_update_dpp, settle). */
-void inject_note_prio_work(void)
-{
-    if (atomic_load_explicit(&in_departure_hart[get_cpunum()],
-                             memory_order_relaxed))
-        atomic_fetch_add_explicit(&prio_departure_work, 1,
-                                  memory_order_relaxed);
-}
-
-void inject_note_prio_deferred_run(void)
-{
-    atomic_fetch_add_explicit(&prio_thread_runs, 1, memory_order_relaxed);
 }
 
 /* The pid whose next turnstile allocation fails, or -1: consumed like
@@ -483,19 +454,6 @@ void kext_debug_inject(void *data)
         break;
     case INJECT_OP_SCHED_SET_DISPLACED:
         ret = atomic_load_explicit(&sched_displaced, memory_order_acquire);
-        break;
-    case INJECT_OP_PRIO_SETTLE_STATS:
-        if (kap->arg0 == 2) {
-            atomic_store_explicit(&prio_thread_runs, 0, memory_order_relaxed);
-            atomic_store_explicit(&prio_departure_work, 0,
-                                  memory_order_relaxed);
-        } else if (kap->arg0 <= 1) {
-            ret = (int) atomic_load_explicit(
-                kap->arg0 ? &prio_departure_work : &prio_thread_runs,
-                memory_order_relaxed);
-        } else {
-            ret = EINVAL;
-        }
         break;
     case INJECT_OP_PTE_SUPERPAGE:
     case INJECT_OP_PTE_CLEAR_SUPERPAGE:

@@ -34,9 +34,8 @@
 /* Called from __kernel_restore (entry.S) when a0 is not a kernel pointer */
 void __kernel_restore_bad_ptr(CPU_REGISTERS *regs)
 {
-    kprintf(
-        "FATAL: __kernel_restore bad ptr! a0=%p (expected kernel address)\n",
-        (void *) regs);
+    kprintf("FATAL: __kernel_restore bad ptr! a0=%p (expected kernel address)\n",
+            (void *) regs);
     kprintf("  ra=%lx sp=%lx\n", (unsigned long) __builtin_return_address(0),
             (unsigned long) __builtin_frame_address(0));
     crash();
@@ -208,21 +207,6 @@ extern void __attribute__((noreturn)) __kernel_restore(CPU_REGISTERS *regs);
  *   7. Decrement in_kcall
  *   8. Restore registers via __kernel_restore (never returns)
  */
-/* Settle the servers a client's departure left stale on this hart (a timeout or
- * signal delivered from timer or event context, where the PI lock and the wait
- * chain are off limits). Returns whether it ran, and the caller starts over.
- * Interrupts are on while it runs and off again after.
- */
-static inline bool kexit_settle_deferred(unsigned cpu)
-{
-    if (!__atomic_load_n(&prio_defer_pending[cpu], __ATOMIC_RELAXED))
-        return false;
-    interrupt_enable();
-    thread_prio_run_deferred();
-    interrupt_disable();
-    return true;
-}
-
 void __attribute__((noreturn)) kernel_exit(void)
 {
     thread_t *thp;
@@ -234,27 +218,6 @@ void __attribute__((noreturn)) kernel_exit(void)
         unsigned cpu = get_cpunum();
         thp = get_active_thread(cpu);
         if (!thp) {
-            /* A hart about to idle settles its stale servers first. Interrupts
-             * stay off: with no active thread a nested trap has no thread to
-             * run on, and an idle hart has no thread to delay. The settle wakes
-             * and requeues through plain kspinlock pairs, whose outermost
-             * unlock would turn SIE back on; hold the nesting depth across it,
-             * as the trap dispatch does, so those unlocks are inner ones and
-             * cpu_idle is entered with SIE still off.
-             */
-            if (__atomic_load_n(&prio_defer_pending[cpu], __ATOMIC_RELAXED)) {
-                pcpu_array[cpu].pc_kspin_depth++;
-#if defined(CONFIG_INSTRUMENTATION)
-                irqoff_open(LOCK_CLASS_PRIO_DEFER);
-#endif
-                thread_prio_run_deferred();
-#if defined(CONFIG_INSTRUMENTATION)
-                irqoff_close();
-#endif
-                pcpu_array[cpu].pc_kspin_depth--;
-                continue;
-            }
-
             /* No runnable thread (block() cleared actives[cpu]). Re-enter
              * cpu_idle, which will pick a thread from the dispatch queue. Reset
              * the stack to the per-CPU kernel stack top to prevent stack growth
@@ -425,13 +388,6 @@ void __attribute__((noreturn)) kernel_exit(void)
         }
 
         interrupt_disable();
-
-        /* The last look, with interrupts off: a departure delivered since the
-         * check at the top is settled before the thread resumes, and none can
-         * be queued from here to the restore.
-         */
-        if (kexit_settle_deferred(cpu))
-            continue;
 
         /* Atomically read and clear async flags */
         aflags = atomic_exchange_explicit(&thp->async_flags, 0,

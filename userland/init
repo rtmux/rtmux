@@ -202,15 +202,7 @@ if test "$rtmux_run" = "debug-inject"; then
             ok=11
         fi
     fi
-    # A client that leaves REPLY by timeout while its server is blocked on a
-    # second server must have the server settled in thread context, along the
-    # chain, and no priority work run in the departure itself.
     if test "$ok" = 11; then
-        if /bin/syscall_testing --prio-loan-context; then
-            ok=12
-        fi
-    fi
-    if test "$ok" = 12; then
         echo "RTMux debug-inject: PASS"
     else
         echo "RTMux debug-inject: FAIL"
