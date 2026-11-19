@@ -35,6 +35,9 @@ permissions:
 # every guest boot more time than the Makefile default.
 env:
   QEMU_BOOT_TIMEOUT: '600'
+  # A guest that hangs leaves a per-hart dump (build/lkl-logs/*.dump), which
+  # the log upload collects.
+  QEMU_REGRESS_GDB_ON_TIMEOUT: '1'
 
 jobs:
   static:
@@ -50,7 +53,7 @@ jobs:
         run: make -j"$(nproc)"
       - name: POSIX / ABI / contract gates
         run: |
-          make -j"$(nproc)" \
+          make -k -j"$(nproc)" \
                check-ci-coverage check-lkl-scripts check-make-target-names \
                check-gap-anchors \
                check-posix-matrix check-posix-matrix-strict-ignore \
