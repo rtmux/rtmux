@@ -182,69 +182,30 @@ if [[ ! -s "$NVME_IMG" ]]; then
         status=none
     rm -f "$TMP_GPT"
 
-    # Step 3: build mkromfs on demand, then lay the romfs starter tree directly
-    # into build/images/nvme-p8.dat. No intermediate file.
+    # Step 3: build mkromfs on demand, then build the /usr romfs
+    # (scripts/mkusr.sh) directly into build/images/nvme-p8.dat.
     case "$BUILD_DIR" in
         /*) mkromfs_target="$BUILD_DIR/tools/host/mkromfs" ;;
         *) mkromfs_target="$TOP_DIR/$BUILD_DIR/tools/host/mkromfs" ;;
     esac
     make --no-print-directory OUT="$BUILD_DIR" "$mkromfs_target" >/dev/null
-    P8_ROOT=$(mktemp -d)
-    mkdir -p "$P8_ROOT/bin"             \
-             "$P8_ROOT/sbin"            \
-             "$P8_ROOT/sbin/sysinit"    \
-             "$P8_ROOT/conf"            \
-             "$P8_ROOT/conf/sysinit"    \
-             "$P8_ROOT/home/rtmuxuser"    \
-             "$P8_ROOT/share"
-    cp userland/utils/sysinit/level1.sh "$P8_ROOT/sbin/sysinit/level1.sh"
-    chmod +x "$P8_ROOT/sbin/sysinit/level1.sh"
-    echo "RTMux /usr starter tree." > "$P8_ROOT/share/README"
+    MKUSR_ARGS=(-s 16)
 
     # Ship the syscall conformance suite on /usr for the block-filesystem regress
     # mode (EMU_ROMFS_TESTS), which boots it from the disk to prove the suite does
     # not depend on initramfs.cpio for its binary.
     if [[ -n "${EMU_ROMFS_TESTS:-}" ]]; then
-        if ! cp "$BUILD_DIR/tests/userland/syscall_testing" \
-                "$P8_ROOT/bin/syscall_testing"; then
+        if [[ ! -f "$BUILD_DIR/tests/userland/syscall_testing" ]]; then
             echo "emu.sh: $BUILD_DIR/tests/userland/syscall_testing missing;" \
                  "run 'make initramfs' first" >&2
-            rm -rf "$P8_ROOT"
             exit 1
         fi
+        MKUSR_ARGS+=(-a "$BUILD_DIR/tests/userland/syscall_testing:bin/syscall_testing")
     fi
     if [[ -f "$LKL_EXT4_IMG" ]]; then
-        cp "$LKL_EXT4_IMG" "$P8_ROOT/share/lkl-ext4.img"
+        MKUSR_ARGS+=(-a "$LKL_EXT4_IMG:share/lkl-ext4.img")
     fi
-    cat > "$P8_ROOT/home/rtmuxuser/.profile" <<'EOF'
-# rtmuxuser default login profile.
-echo
-echo "Welcome to RTMux!"
-echo
-EOF
-
-    # /usr/conf/{passwd,shadow,group} — credentials shipped with the dev image
-    # so toolbox login can authenticate against them. Hashes produced on the
-    # host with `mkpasswd -m sha-512 -S <salt> <pw>`, bit-compatible with RTMux
-    # libc's crypt(3) output.
-    #   root    -> RTMux
-    #   rtmuxuser -> rtmux
-    cat > "$P8_ROOT/conf/passwd" <<'EOF'
-root:x:0:0:root:/root:/bin/sh
-rtmuxuser:x:1000:1000:RTMux default user:/home/rtmuxuser:/bin/sh
-EOF
-    cat > "$P8_ROOT/conf/shadow" <<'EOF'
-root:$6$rtmuxtest1$Y9rQ.8S6PpteL5Hq1H2pCsyW5HcfMZB7bhQUG4wBa7rikBXOvQhY5gAUOBgC4Qs0AzS9nGxW2B8Mk0wxjQs7E.:::::::
-rtmuxuser:$6$rtmuxtest2$v0STB0rbO2isO/Se.Beh5t2V7vxpLykb6moB5vN8hwqYUWVevhXsaAGIVuf4agv69sbgVHi1XnppWNUlnrlff.:::::::
-EOF
-    cat > "$P8_ROOT/conf/group" <<'EOF'
-root:x:0:
-rtmuxuser:x:1000:
-EOF
-    chmod 600 "$P8_ROOT/conf/shadow"
-
-    "$BUILD_DIR/tools/host/mkromfs" -s 16 "$NVME_P8_IMG" "$P8_ROOT" >/dev/null
-    rm -rf "$P8_ROOT"
+    ./scripts/mkusr.sh "${MKUSR_ARGS[@]}" "$mkromfs_target" "$NVME_P8_IMG"
 
     # Step 4: assemble nvme.img = nvme-pre.dat + nvme-p8.dat, padded to the full
     # 192 MiB disk size so QEMU sees a sane GPT.

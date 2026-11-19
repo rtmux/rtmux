@@ -42,6 +42,19 @@ static uint64_t prot_to_pte_bits(unsigned prot)
     return bits;
 }
 
+extern int pa_sysram_contains(paddr_t start, paddr_t len);
+
+/* Memory type bits (non-zero only on T-Head with MAEE, see cpu-paging.h).
+ * PROT_NOCACHE RAM stays cacheable: nothing cleans the D-cache before the
+ * no-cache PTE goes in, and the kernel direct map of the page stays cached.
+ */
+static uint64_t pte_attr(unsigned prot, paddr_t pa)
+{
+    if ((prot & PROT_NOCACHE) && !pa_sysram_contains(pa, __PAGESIZE))
+        return riscv_pte_attr_io;
+    return riscv_pte_attr_mem;
+}
+
 void cpu_tlb_flush_complete(void)
 {
     sfence_vma();
@@ -216,7 +229,8 @@ int cpu_pte_manipulate(struct mm_pte_manipulate *data)
                 }
             }
 
-            *pte = PA2PTE(data->paddr) | bits;
+            *pte = PA2PTE(data->paddr) | bits |
+                   ((op & PTE_OP_BAD) ? 0 : pte_attr(data->prot, data->paddr));
             data->paddr += __PAGESIZE;
             data->tlb_flush_pending = 1;
 
@@ -230,7 +244,8 @@ int cpu_pte_manipulate(struct mm_pte_manipulate *data)
         } else if (op & PTE_OP_PROT) {
             pte_t *pte = sv39_walk(pgdir, curr, 0);
             if (pte && (*pte & PTE_V)) {
-                *pte = (*pte & PTE_PADDR_BITS) | bits;
+                *pte = (*pte & PTE_PADDR_BITS) | bits |
+                       pte_attr(data->prot, PTE2PA(*pte));
                 data->tlb_flush_pending = 1;
             }
 

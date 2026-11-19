@@ -14,6 +14,7 @@
 #include <startup-api.h>
 #include <paging.h>
 #include <cpu-inline.h>
+#include <sbi.h>
 
 paddr_t page_directory;
 uint64_t boot_satp_val;
@@ -83,7 +84,61 @@ static uint64_t map_flags_to_pte(unsigned flags)
             pte_flags |= PTE_U;
     }
 
+    /* Memory type (non-zero only on T-Head with MAEE). Test RISCV_MAP_DEVICE
+     * only for general mappings: the RISCV_MAP_SYSPAGE* / USER_RX sentinels
+     * have every high bit set, DEVICE included, but map RAM.
+     */
+    if (flags != RISCV_MAP_SYSPAGE && flags != RISCV_MAP_SYSPAGE_RO &&
+        flags != RISCV_MAP_USER_RX && (flags & RISCV_MAP_DEVICE))
+        pte_flags |= riscv_pte_attr_io;
+    else
+        pte_flags |= riscv_pte_attr_mem;
+
     return pte_flags;
+}
+
+/* SBI Base extension query (get_mvendorid / get_marchid / get_mimpid); the
+ * value comes back in a1. Returns ~0 if the call fails.
+ */
+static unsigned long sbi_base_value(unsigned long fid)
+{
+    register unsigned long a0 asm("a0") = 0;
+    register unsigned long a1 asm("a1") = 0;
+    register unsigned long a6 asm("a6") = fid;
+    register unsigned long a7 asm("a7") = SBI_EXT_BASE;
+    asm volatile("ecall" : "+r"(a0), "+r"(a1) : "r"(a6), "r"(a7) : "memory");
+    return a0 ? ~0UL : a1;
+}
+
+#define THEAD_MVENDORID 0x5b7UL      /* JEDEC ID; Linux vendorid_list.h */
+#define THEAD_SXSTATUS_MAEE (1UL << 21)
+
+/**
+ * \brief Enable T-Head C9xx PTE memory attributes when the core needs them.
+ *
+ * With MXSTATUS.MAEE set (by M-mode firmware; S-mode can only read it through
+ * the sxstatus mirror, CSR 0x5c0), PTE bits [63:59] choose the memory type and
+ * leaving them zero makes RAM non-cacheable, so the first atomic faults. Same
+ * checks as Linux errata_probe_mae(): T-Head vendor ID, marchid == mimpid == 0,
+ * MAEE set. sxstatus is only read after the vendor check — it is a custom CSR
+ * and traps on other cores.
+ */
+static void detect_thead_mae(void)
+{
+    unsigned long sxstatus;
+
+    if (sbi_base_value(SBI_EXT_BASE_GET_MVENDORID) != THEAD_MVENDORID ||
+        sbi_base_value(SBI_EXT_BASE_GET_MARCHID) != 0 ||
+        sbi_base_value(SBI_EXT_BASE_GET_MIMPID) != 0)
+        return;
+
+    asm volatile("csrr %0, 0x5c0" : "=r"(sxstatus)); /* sxstatus */
+    if (!(sxstatus & THEAD_SXSTATUS_MAEE))
+        return;
+
+    riscv_pte_attr_mem = PTE_THEAD_PMA;
+    riscv_pte_attr_io = PTE_THEAD_IO;
+    kprintf("  T-Head MAEE enabled: leaf PTEs carry C906 memory attributes\n");
 }
 
 /**
@@ -104,8 +159,10 @@ static inline int pte_is_leaf(pte_t entry)
 static void split_megapage(pte_t *l1_table, unsigned l1_idx, pte_t entry)
 {
     paddr_t mega_pa = PTE2PA(entry);
-    uint64_t flags =
-        entry & (PTE_R | PTE_W | PTE_X | PTE_U | PTE_V | PTE_A | PTE_D | PTE_G);
+    /* Everything except the PPN: permission bits and, on T-Head, the memory
+     * type in [63:59].
+     */
+    uint64_t flags = entry & ~PTE_PPN_MASK;
 
     paddr_t new_pt = calloc_ram(__PAGESIZE, __PAGESIZE);
     pte_t *l0_table = MAKE_1TO1_PTR(new_pt);
@@ -335,6 +392,9 @@ void init_mmu(void)
 {
     kprintf("init_mmu\n");
     LOGF_D("  building Sv39 page tables\n");
+
+    /* Before any leaf PTE is built (here or by later riscv_map() callers) */
+    detect_thead_mae();
 
     riscv_init_pgdir();
 
