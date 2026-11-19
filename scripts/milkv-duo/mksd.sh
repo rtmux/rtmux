@@ -49,22 +49,20 @@ die() { echo "mksd: $*" >&2; exit 1; }
 
 [ -f "$vendor_fip" ] || die "$vendor_fip: not a file"
 [ -d "$out_dir" ] || die "$out_dir: not a directory (mount the SD card's FAT partition first)"
-for tool in python3 dtc git make clang ld.lld; do
+for tool in python3 dtc git make clang ld.lld cpio; do
     command -v "$tool" >/dev/null || die "$tool not found"
 done
 
 script_dir=$(cd "$(dirname "$0")" && pwd)
 fip_py="python3 $script_dir/fip.py"
 kernel=$build_dir/arch/riscv/rtmux-kernel.bin
-initrd=$build_dir/initramfs.cpio
-[ -f "$kernel" ] && [ -f "$initrd" ] || die "$kernel or $initrd missing; run make first"
-initrd_size=$(wc -c < "$initrd")
-[ "$initrd_size" -le "$INITRD_MAX" ] ||
-    die "$initrd is $initrd_size bytes, more than the $INITRD_MAX that fit below 0x8a000000"
+initramfs=$build_dir/initramfs
+[ -f "$kernel" ] && [ -d "$initramfs" ] || die "$kernel or $initramfs missing; run make first"
 
 work=$build_dir/milkv-duo
 mkdir -p "$work"
 work=$(cd "$work" && pwd)
+build_dir=$(cd "$build_dir" && pwd)
 
 # 1. The vendor OpenSBI embeds the board DTB; reuse it for upstream OpenSBI.
 #    Upstream drivers bind to the first matching compatible, so put the T-Head
@@ -109,15 +107,30 @@ $fip_py replace-opensbi "$vendor_fip" "$fw" "$work/fip-opensbi.bin" >/dev/null
 $fip_py patch-env "$work/fip-opensbi.bin" sdboot "$sdboot" "$work/fip.bin" >/dev/null
 $fip_py parse "$work/fip.bin" >/dev/null || die "generated fip.bin fails its checksums"
 
-# 4. Copy everything to the card.
+# 4. No NVMe on the board: ship the /usr romfs inside the initramfs, where
+#    romfs reads it like any file, and point mainfs= at it.
+mkromfs=$build_dir/tools/host/mkromfs
+make --no-print-directory -C "$script_dir/../.." OUT="$build_dir" "$mkromfs" >/dev/null
+"$script_dir/../mkusr.sh" -s 1 "$mkromfs" "$work/usr.romfs"
+rm -rf "$work/initramfs"
+cp -Rp "$initramfs" "$work/initramfs"
+cp "$work/usr.romfs" "$work/initramfs/usr.romfs"
+(cd "$work/initramfs" && find . | sort | cpio -H newc -o 2>/dev/null) > "$work/initramfs.cpio"
+initrd_size=$(wc -c < "$work/initramfs.cpio")
+[ "$initrd_size" -le "$INITRD_MAX" ] ||
+    die "initramfs.cpio is $initrd_size bytes, more than the $INITRD_MAX that fit below 0x8a000000"
+
+# 5. Copy everything to the card.
 cp "$work/fip.bin" "$out_dir/fip.bin"
 cp "$kernel" "$out_dir/rtmux-kernel.bin"
-cp "$initrd" "$out_dir/initramfs.cpio"
+cp "$work/initramfs.cpio" "$out_dir/initramfs.cpio"
 if [ -e "$out_dir/uEnv.txt" ] && [ "$force_uenv" = 0 ]; then
     echo "mksd: keeping existing $out_dir/uEnv.txt (--force-uenv to replace)"
+    grep -q 'mainfs=/usr.romfs' "$out_dir/uEnv.txt" ||
+        echo "mksd: warning: $out_dir/uEnv.txt has no mainfs=/usr.romfs; /usr will not mount"
 else
     cat > "$out_dir/uEnv.txt" <<EOF
-rtmux_args=-Dsbi --limit-ram=160M
+rtmux_args=-Dsbi --limit-ram=160M mainfs=/usr.romfs
 uenvcmd=fatload mmc 0 $KERNEL_ADDR rtmux-kernel.bin && fatload mmc 0 $INITRD_ADDR initramfs.cpio && setenv initrd_high 0xffffffffffffffff && setenv bootargs \${rtmux_args} && booti $KERNEL_ADDR $INITRD_ADDR:\${filesize} \${fdtcontroladdr}
 EOF
 fi
