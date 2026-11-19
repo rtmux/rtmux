@@ -219,6 +219,17 @@ static inline bool thread_end_orphan_loan(thread_t *srv)
     return thread_end_msg_loan(srv, now);
 }
 
+/* Probe: the earlier check, after lending thp's priority to act as its server:
+ * drop the loan of a client that is gone.
+ */
+static inline void thread_drop_gone_client_loan(thread_t *act,
+                                                const thread_t *thp)
+{
+    cpu_smp_mb();
+    if (__atomic_load_n(&act->client, __ATOMIC_ACQUIRE) != thp)
+        thread_lend_msg(act, 0, false);
+}
+
 /* The one way a server stops serving `client`: take the client link, then end
  * the loan the client lent. It serves every departure: a timeout, signal or
  * channel destroy of the client (force_ready), the server naming another client
