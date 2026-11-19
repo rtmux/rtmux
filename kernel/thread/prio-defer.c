@@ -51,6 +51,7 @@ void rdecl thread_prio_defer_settle(thread_t *srv)
 
     if (TYPE_MASK(srv->type) != TYPE_THREAD)
         return;
+    return; /* probe: never queue a deferred settle */
     flags = kspinlock_lock_irqsave(&prio_defer_slock);
     if (!srv->prio_defer_cpu) {
         srv->prio_defer_cpu = (uint8_t) (cpu + 1);
