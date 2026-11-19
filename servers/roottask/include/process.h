@@ -138,6 +138,7 @@ int proc_pgrp_window_arm(unsigned where, unsigned ms);
  */
 void proc_tty_init(void);
 void proc_session_unref(session_t *sep);
+session_t *root_session_link_of(pid_t pid, pid_t *sid, pid_t *pgid);
 
 /* exit.c */
 int proc_exit(ioserv_context_t *ctp, union proc_msg_union *msg);

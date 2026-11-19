@@ -39,16 +39,20 @@ int process_bind(pid_t pid)
 }
 
 struct reparent_args {
-    process_t *prp;
+    pid_t pid;
 };
 
 /* process_reparent — reparent a process to pid 1 ("stay resident"). Parameters:
- *   prp : opaque kernel-VA pointer to the process being reparented
+ *   pid : the process, generation included
+ * Return value: EOK, or ESRCH when the process is gone, is being destroyed, or
+ *               is already being reparented by another call.
  */
-void process_reparent(process_t *prp)
+int process_reparent(pid_t pid)
 {
-    struct reparent_args args = {.prp = prp};
-    syscall_priv(__KSYS_PRIV_REPARENT, &args);
+    struct reparent_args args = {.pid = pid};
+    int rc = (int) syscall_priv(__KSYS_PRIV_REPARENT, &args);
+
+    return rc < 0 ? -rc : rc;
 }
 
 struct kext_destroy_args {

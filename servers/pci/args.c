@@ -35,7 +35,10 @@ enum pci_args_status pci_parse_args(int argc,
             break;
         case 'c':
             a->class_override = atoi(optarg);
-            if ((a->class_override & 3) == 0)
+            /* A mask of the two override bits, so only 1, 2 and 3; a value
+             * such as 5 or -1 would otherwise pass on its low bits alone.
+             */
+            if (a->class_override < 1 || a->class_override > 3)
                 return PCI_ARGS_BAD_CLASS;
             break;
         case 'D':

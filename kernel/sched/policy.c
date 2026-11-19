@@ -187,7 +187,12 @@ int kdecl ksys_sched_set(thread_t *act, struct kcall_args_sched_set *kap)
     int status;
     int prp_pinned = 0;
     int thp_pinned = 0;
-    unsigned old_prio = act->priority;
+
+    /* The caller's base priority, not its effective one: a loan that ends or
+     * starts on another hart moves act->priority at any time, which would let
+     * an unrelated or raising call read as a lowering one below.
+     */
+    unsigned old_prio = thread_base_prio(act);
 
     if (kap->pid == 0 || kap->pid == act->process->pid) {
         prp = act->process;
@@ -297,6 +302,17 @@ int kdecl ksys_sched_set(thread_t *act, struct kcall_args_sched_set *kap)
         if (self)
             ITF_SET(act, RTMUX_ITF_DEFER_DISPLACE);
         status = sched_thread(thp, kap->policy, &param);
+
+        /* A SchedSet that changed the parameters does not leave the thread at
+         * the priority of a send that is no longer queued. Only after the
+         * request was accepted, and not for a move within the priority level,
+         * which recomputes nothing.
+         */
+        if (status == EOK && kap->policy != RTMUX_SCHED_ADJTOHEAD &&
+            kap->policy != RTMUX_SCHED_ADJTOTAIL) {
+            thread_pend_loan_resettle(thp);
+            thread_prio_update(thp);
+        }
         if (self)
             ITF_CLR(act, RTMUX_ITF_DEFER_DISPLACE);
         if (status != EOK)
@@ -306,8 +322,8 @@ int kdecl ksys_sched_set(thread_t *act, struct kcall_args_sched_set *kap)
     status = EOK;
 
     /* After the change; the caller's own switch waits for kernel_exit. */
-    if (inject_should_fail_sched_set(act,
-                                     thp == act && act->priority < old_prio))
+    if (inject_should_fail_sched_set(
+            act, thp == act && thread_base_prio(act) < old_prio))
         status = EINVAL;
 out:
     if (thp_pinned)

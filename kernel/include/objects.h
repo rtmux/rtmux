@@ -215,6 +215,11 @@ typedef struct process_entry {
      * proc_mux_lock *lock". It is purely roottask bookkeeping (the kernel never
      * observed it beyond a NULL-on-destroy assertion) and now lives in
      * root_process_t.lock — see servers/roottask/include/root-process.h.
+     * Written under the child locks, always with a release store. A reader that
+     * holds those locks may load it plainly; one that does not (the process
+     * query) loads it with acquire, so a reparent's earlier flag changes are
+     * seen first. The diagnostic readers in trace and debug code load it
+     * plainly and accept a stale answer.
      */
     struct process_entry *parent;
     vector_t threads;
@@ -312,6 +317,12 @@ typedef struct process_entry {
      * the teardown; a concurrent destroy of the same pid sees it and backs off.
      */
     bool destroying;
+
+    /* Set under process_vector_slock by kext_reparent while it moves this
+     * process between child lists; kext_process_destroy answers EAGAIN until it
+     * clears, as it does for querying.
+     */
+    bool reparenting;
     unsigned pending_interrupts;
 
     /* Per-process vector spinlock (LOCK_CLASS_PROCVEC). Initialized by

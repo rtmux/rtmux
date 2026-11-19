@@ -223,18 +223,19 @@ static void test_pthread_mutex_types(void)
                   pthread_mutex_unlock(&m) == EOK,
               "RECURSIVE mutex allows owner re-lock",
               "a recursive mutex must let the owner re-lock and count down");
-        /* The depth saturates: lock and trylock both report EAGAIN at the
-         * limit rather than carry into the flag bits.
+
+        /* The depth saturates: lock and trylock both report EAGAIN at the limit
+         * rather than carry into the flag bits.
          */
         if (pthread_mutex_lock(&m) == EOK) {
-            unsigned long saved = m.count;
+            unsigned long saved = (unsigned long) m.count;
 
             m.count |= RTMUX_SYNC_COUNTMASK;
             check(pthread_mutex_lock(&m) == EAGAIN &&
                       pthread_mutex_trylock(&m) == EAGAIN,
                   "RECURSIVE mutex depth saturates with EAGAIN",
                   "lock and trylock must fail EAGAIN at the depth limit");
-            m.count = saved;
+            m.count = (long) saved;
             (void) pthread_mutex_unlock(&m);
         }
         (void) pthread_mutex_destroy(&m);
@@ -275,7 +276,7 @@ static void test_pthread_mutex_types(void)
     }
 }
 
-static void test_pthread_mutex_prio_protect_required_pass(void)
+static void test_pthread_mutex_prio_protect_required_pass_body(void)
 {
     pthread_mutexattr_t attr;
     pthread_mutex_t mutex;
@@ -316,11 +317,16 @@ static void test_pthread_mutex_prio_protect_required_pass(void)
         int unlock_rc = pthread_mutex_unlock(&mutex);
         int get_released_rc = __sched_get(0, 0, &sp);
         int released_cur = sp.sched_curpriority;
+        char pp_detail[128];
+        snprintf(pp_detail, sizeof pp_detail,
+                 "expected current priority to rise to ceiling while held "
+                 "(lock=%d get=%d held=%d unlock=%d get=%d released=%d)",
+                 lock_rc, get_held_rc, held_cur, unlock_rc, get_released_rc,
+                 released_cur);
         check(lock_rc == EOK && get_held_rc != -1 && held_cur >= 18 &&
                   unlock_rc == EOK && get_released_rc != -1 &&
                   released_cur == 5,
-              "pthread_mutex_lock PRIO_PROTECT boost/deboost",
-              "expected current priority to rise to ceiling while held");
+              "pthread_mutex_lock PRIO_PROTECT boost/deboost", pp_detail);
 
         /* Nested out-of-order release: hold two PP mutexes (ceilings 18 and
          * 10) and release the higher-ceiling one first. The effective boost
@@ -362,6 +368,40 @@ static void test_pthread_mutex_prio_protect_required_pass(void)
             }
             (void) pthread_mutexattr_destroy(&lattr);
         }
+        /* The library recurses on a held ceiling mutex in user space, so the
+         * kernel's own recursive acquire is reached only by a raw call. It
+         * counts the depth itself and must not boost again: the one final
+         * unlock pops the ceiling once, so a second boost would leave the
+         * thread raised.
+         */
+        {
+            pthread_mutexattr_t rattr;
+            pthread_mutex_t rec;
+
+            if (pthread_mutexattr_init(&rattr) == EOK &&
+                pthread_mutexattr_settype(&rattr, PTHREAD_MUTEX_RECURSIVE) ==
+                    EOK &&
+                pthread_mutexattr_setprotocol(&rattr, PTHREAD_PRIO_PROTECT) ==
+                    EOK &&
+                pthread_mutexattr_setprioceiling(&rattr, 14) == EOK &&
+                pthread_mutex_init(&rec, &rattr) == EOK) {
+                int r1 = pthread_mutex_lock(&rec);
+                int r2 = sync_mutex_lock_r((sync_t *) &rec);
+                int r3 = pthread_mutex_unlock(&rec); /* depth 2 to 1 */
+                int r4 = pthread_mutex_unlock(&rec); /* final: kernel pop */
+
+                __sched_get(0, 0, &sp);
+                check(r1 == EOK && r2 == EOK && r3 == EOK && r4 == EOK &&
+                          sp.sched_curpriority == 5,
+                      "PRIO_PROTECT kernel recursive lock boosts once",
+                      "a recursive acquire must leave no boost behind after "
+                      "the final unlock");
+                (void) pthread_mutex_destroy(&rec);
+            } else {
+                test_fail("PRIO_PROTECT recursive prerequisite", "init failed");
+            }
+            (void) pthread_mutexattr_destroy(&rattr);
+        }
         sp.sched_priority = 20;
         if (__sched_set(0, 0, SCHED_FIFO, &sp) == EOK) {
             check(pthread_mutex_lock(&mutex) == EINVAL,
@@ -390,6 +430,27 @@ static void test_pthread_mutex_prio_protect_required_pass(void)
           "pthread_mutex prioceiling on non-ceiling mutex",
           "expected EINVAL without corrupting count");
     (void) pthread_mutex_destroy(&normal);
+}
+
+/* The cases above leave this thread at FIFO 20, above the ceilings they set,
+ * and the suite runs again in a lap in the same process. Setting the ceiling of
+ * an unlocked mutex locks it, so a thread still at 20 fails the first ceiling
+ * operation of the next lap, which needs a priority at or below 17. Start each
+ * run below every ceiling used here.
+ *
+ * The thread is still left at FIFO 20 afterwards, as it always was: a signal
+ * thread test that runs later failed when the original priority was restored,
+ * so it depends on this state.
+ */
+static void test_pthread_mutex_prio_protect_required_pass(void)
+{
+    struct sched_param low = {.sched_priority = 10};
+
+    if (__sched_set(0, 0, SCHED_FIFO, &low) != EOK) {
+        test_fail("PRIO_PROTECT prerequisite", "could not lower the priority");
+        return;
+    }
+    test_pthread_mutex_prio_protect_required_pass_body();
 }
 
 static void test_create_cond_monotonic(void)
@@ -819,8 +880,10 @@ static void *pi_reuse_candidate(void *raw)
     return NULL;
 }
 
-/* Run the two-mutex PI cycle once. Returns 1 when the cycle was detected with
- * no stuck waiter, 0 when it was not, -1 on a setup failure.
+/* Run the two-mutex PI cycle once.
+ *
+ * Returns 1 when the cycle was detected with no stuck waiter, 0 when it was
+ * not, -1 on a setup failure.
  */
 static int pi_cycle_run(int *got1, int *got2)
 {
@@ -1893,6 +1956,7 @@ static void test_reply_timeout_armed_on_claim(void)
                   strerror(errno));
         return;
     }
+
     /* The sender announces itself, then the settle delay lets it queue in SEND
      * (nobody is receiving yet); a late sender only weakens the test.
      */
@@ -1945,11 +2009,11 @@ static void test_posix_named_sem_timedwait(void)
     check(sem_timedwait(sem, &abstime) == -1 && errno == ETIMEDOUT,
           "sem_timedwait(named empty, deadline past)", "expected ETIMEDOUT");
 
-    /* Near-miss sweep: a deadline 1 ns to ~16 ms ahead expires
-     * between the libc conversion and the kernel arm of the reply timeout, or
-     * while the sender is mid-block (Q74: the past-deadline fire was delivered
-     * inline while the sender held its own WAIT_PENDING bit and spun forever).
-     * Every wait must report ETIMEDOUT, promptly. A regression hangs here.
+    /* Near-miss sweep: a deadline 1 ns to ~16 ms ahead expires between the libc
+     * conversion and the kernel arm of the reply timeout, or while the sender
+     * is mid-block (Q74: the past-deadline fire was delivered inline while the
+     * sender held its own WAIT_PENDING bit and spun forever). Every wait must
+     * report ETIMEDOUT, promptly. A regression hangs here.
      */
     {
         enum { SWEEP_ITERS = 6000 };
@@ -1957,9 +2021,10 @@ static void test_posix_named_sem_timedwait(void)
 
         for (i = 0; i < SWEEP_ITERS; i++) {
             struct timespec t0, t1;
-            /* 1 ns .. ~16 ms, log-spaced with a linear ramp inside each
-             * octave, so some deadline lands in the arm window whatever the
-             * guest's kcall latency is.
+
+            /* 1 ns .. ~16 ms, log-spaced with a linear ramp inside each octave,
+             * so some deadline lands in the arm window whatever the guest's
+             * kcall latency is.
              */
             long oct = i % 24;
             long off =
@@ -2472,7 +2537,7 @@ static void test_create_destroy_recreate(void)
 
 /* Aggregator */
 
-/* ---- FP register isolation ----
+/* FP register isolation
  *
  * User f0-f31 and fcsr must belong to one thread at a time. fp_loop loads all
  * 32 registers with a pattern unique to the caller, yields (a real context
@@ -2646,7 +2711,8 @@ static void test_fp_isolation(void)
         pthread_t jt;
 
         /* On a helper thread: pinning is inherited and would otherwise pin the
-         * whole test driver to hart 0 for every test that follows. */
+         * whole test driver to hart 0 for every test that follows.
+         */
         if (pthread_create(&jt, NULL, fp_worker, &j) == 0)
             (void) pthread_join(jt, NULL);
         else
@@ -2660,7 +2726,8 @@ static void test_fp_isolation(void)
     }
 
     /* A new thread reads f0-f31 and fcsr before writing any of them; the
-     * earlier loops left nonzero values behind on hart 0. */
+     * earlier loops left nonzero values behind on hart 0.
+     */
     if (pthread_create(&th, NULL, fp_zero_reader, &seen) == 0) {
         (void) pthread_join(th, NULL);
         check(seen == 0, "fp_first_use_zero a new thread reads all zeros",
@@ -2670,7 +2737,7 @@ static void test_fp_isolation(void)
     }
 }
 
-/* ---- malloc lock under mixed FIFO priorities ----
+/* malloc lock under mixed FIFO priorities
  *
  * Four FIFO threads at different priorities, all pinned to one hart, hammer
  * malloc and free. A spinning allocator lock deadlocks this: the highest
@@ -2723,6 +2790,7 @@ static void test_malloc_fifo_mixed_prio(void)
             break;
         started++;
     }
+
     /* Watchdog: a lock that can deadlock must fail the test, not hang the
      * suite. Low priority is fine here: the workers finish or the wait expires.
      */
@@ -2835,8 +2903,8 @@ struct robust_owner_args {
     atomic_int *die;
 };
 
-/* Lock the mutex, report it, then exit holding it once told to. It sleeps,
- * not yields, so that waiters of a lower priority get to queue meanwhile.
+/* Lock the mutex, report it, then exit holding it once told to. It sleeps, not
+ * yields, so that waiters of a lower priority get to queue meanwhile.
  */
 static void *robust_dying_owner(void *raw)
 {
@@ -2953,6 +3021,7 @@ static void *robust_waiter(void *raw)
         for (int i = 0; i < 5000 && !(arg->mutex->owner & RTMUX_SYNC_WAITING);
              i++)
             (void) nanosleep(&ms, NULL);
+
         /* A waiter sets WAITING before it lends its priority, so the bit does
          * not yet mean the loan is in place: give it time to land.
          */
@@ -3177,9 +3246,9 @@ static void test_robust_condvar_handoff(void)
     (void) pthread_mutex_destroy(&m);
 }
 
-/* A process-shared robust mutex whose owner process dies: a waiter blocked
- * in another process when the owner is killed, and a locker that arrives
- * after the owner exited, both get EOWNERDEAD.
+/* A process-shared robust mutex whose owner process dies: a waiter blocked in
+ * another process when the owner is killed, and a locker that arrives after the
+ * owner exited, both get EOWNERDEAD.
  */
 #define ROBUST_SHM_NAME "/rtmux-robust-mtx"
 
@@ -3313,13 +3382,13 @@ static void test_robust_owner_process_death(void)
     robust_shm_destroy(r);
 }
 
-/* The owner dies at every point of a hand-off: the parent holds a shared
- * robust mutex with a child process blocked on it, then releases it and kills
- * the child, in four orders and with 0..7 yields around the release, so that
- * the kill lands before, during and after the kernel passes the mutex to the
- * child. The parent must then always get the mutex back, never time out. A
- * child that received it before the kill dies as the owner, which gives
- * EOWNERDEAD; one killed while still queued gives EOK.
+/* The owner dies at every point of a hand-off: the parent holds a shared robust
+ * mutex with a child process blocked on it, then releases it and kills the
+ * child, in four orders and with 0..7 yields around the release, so that the
+ * kill lands before, during and after the kernel passes the mutex to the child.
+ * The parent must then always get the mutex back, never time out. A child that
+ * received it before the kill dies as the owner, which gives EOWNERDEAD; one
+ * killed while still queued gives EOK.
  */
 #define ROBUST_KILL_ROUNDS 32
 
@@ -3464,8 +3533,8 @@ static void test_robust_condvar_inconsistent(void)
     (void) pthread_cond_destroy(&cv);
 }
 
-/* A non-robust mutex whose owner dies is not revived, but it must not hang
- * its waiters: everyone blocked on it, and everyone who locks it later, gets
+/* A non-robust mutex whose owner dies is not revived, but it must not hang its
+ * waiters: everyone blocked on it, and everyone who locks it later, gets
  * ENOTRECOVERABLE. The waiters must return within 3 s.
  */
 #define DEADLOCK_WAITERS 3
@@ -3544,8 +3613,9 @@ static void test_nonrobust_owner_thread_death(void)
             break;
         created++;
     }
-    /* Let them reach the lock; one that is slower finds the owner already
-     * dead, which must fail the same way.
+
+    /* Let them reach the lock; one that is slower finds the owner already dead,
+     * which must fail the same way.
      */
     for (int i = 0; i < 2000 && atomic_load(&queued) < created; i++)
         (void) nanosleep(&ms, NULL);
@@ -3577,7 +3647,9 @@ static void test_nonrobust_owner_thread_death(void)
               pthread_mutex_trylock(&m) == ENOTRECOVERABLE,
           "non-robust lock after the owner thread died",
           "expected ENOTRECOVERABLE from lock and trylock");
-    /* Every waiter returns, by timeout at the latest, before this frame ends. */
+
+    /* Every waiter returns, by timeout at the latest, before this frame ends.
+     */
     for (int i = 0; i < created; i++)
         (void) thread_join(w[i], NULL);
 }
@@ -3619,6 +3691,7 @@ static void test_nonrobust_owner_process_death(void)
         }
         (void) waitpid(pid, &status, 0);
     }
+
     /* A locker that arrives after the owner process exited; the mutex is
      * unusable after the first death, so start over with a fresh one.
      */
@@ -3844,9 +3917,9 @@ static void test_cancel_before_block(void)
 
 /* condvar_reacquire_alloc_failure: a condition wait on a PI mutex returns with
  * the mutex held, or fails before it gives the mutex up, even when the kernel's
- * turnstile allocation fails. Needs the debug fault-injection call (/bin/inject,
- * installed only on a CONFIG_DEBUG_INJECT kernel); without it the case is
- * skipped.
+ * turnstile allocation fails. Needs the debug fault-injection call
+ * (/bin/inject, installed only on a CONFIG_DEBUG_INJECT kernel); without it the
+ * case is skipped.
  *
  * 1. With the next allocation failing, the wait must report EAGAIN and leave
  *    the caller holding the mutex: the reservation is made before the release.

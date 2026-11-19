@@ -70,6 +70,16 @@ static uintptr_t obj_key_adj(void *_a, void *_b)
     return a + ((align == 0) ? 0 : align - 1);
 }
 
+/* True when a region of the message starts where key_mask_create can handle it.
+ * The sender chooses attr_bytes, so the file actions can start anywhere.
+ */
+static bool pspawn_region_aligned(const void *p)
+{
+    uintptr_t align = ALIGNOF(p);
+
+    return align == 0 || align == 4;
+}
+
 static int pspawn_add_size(size_t *sum, size_t add)
 {
     if (add > SIZE_MAX - *sum)
@@ -315,6 +325,9 @@ static int parse_pspawn_msg(pid_t ppid,
     if (msg->i.filact_bytes > 0) {
         void *_factp = (void *) ((char *) (msg + 1) + msg->i.attr_bytes);
         void *open_action = (void *) ((char *) _factp + msg->i.filact_bytes);
+
+        if (!pspawn_region_aligned(_factp))
+            return EINVAL;
 
         /* fix any open file_actions pointers so they point to the local
          * messaged structure. All open actions are after the optional factp.

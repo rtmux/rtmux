@@ -48,17 +48,6 @@ void proc_pgrp_unlock(void)
     pthread_mutex_unlock(&pgrp_mutex);
 }
 
-/* Make the group locks, and the terminal bind lock, priority-inheriting, and
- * empty the table. Boot, before the first process exists.
- */
-static void pgrp_init(void)
-{
-    root_mutex_init_pi(&pgrp_mutex);
-    root_mutex_init_pi(&pgtab_lock);
-    pgrp_table_init(&pgtab);
-    proc_tty_init();
-}
-
 #ifdef CONFIG_DEBUG_INJECT
 /* A window a test armed holds the next operation that reaches it for the armed
  * time, once, so that another operation can be started inside it.
@@ -125,10 +114,16 @@ static int pgrp_first_enter(pid_t pid, pid_t pgid, pid_t sid)
     return rc;
 }
 
-/* Roottask's own group, which its session leads. */
+/* Roottask's own group, which its session leads. Make the group locks, and the
+ * terminal bind lock, priority-inheriting and empty the table first: boot,
+ * before the first process exists.
+ */
 int proc_pgrp_boot(pid_t pid)
 {
-    pgrp_init();
+    root_mutex_init_pi(&pgrp_mutex);
+    root_mutex_init_pi(&pgtab_lock);
+    pgrp_table_init(&pgtab);
+    proc_tty_init();
     return pgrp_first_enter(pid, pid, pid);
 }
 
@@ -145,22 +140,30 @@ int proc_pgrp_boot(pid_t pid)
 int proc_pgrp_inherit(pid_t child, pid_t parent)
 {
     root_process_t *c = root_proc(child);
+    session_t *drop = NULL;
     int rc;
 
     proc_pgrp_lock();
     if (parent == 0) {
         rc = pgrp_first_enter(child, child, ROOTTASK_PID);
     } else {
-        root_process_t *pp = root_proc(parent);
+        pid_t sid, pgid;
+        session_t *sep = root_session_link_of(parent, &sid, &pgid);
 
-        rc = pgrp_first_enter(child, root_process_pgrp(pp),
-                              root_session_leader(pp));
-        if (rc == EOK && pp->session) {
-            c->session = pp->session;
-            (void) atomic_add_value(&c->session->links, 1);
-        }
+        rc = pgrp_first_enter(child, pgid, sid);
+        if (rc == EOK)
+            c->session = sep;
+        else
+            drop = sep;
     }
     proc_pgrp_unlock();
+
+    /* The last link of a session unbinds its terminal, which takes the bind
+     * lock and may message the terminal server: both are ordered before
+     * pgrp_mutex, so the drop waits until it is released.
+     */
+    if (drop)
+        proc_session_unref(drop);
     return rc;
 }
 
@@ -172,11 +175,6 @@ void proc_pgrp_reap(pid_t pid)
 {
     root_process_t *p = root_proc(pid);
 
-    /* The unlocked look skips the second call of a reaped child's teardown; the
-     * one under the lock decides.
-     */
-    if (!p->pgrp_member)
-        return;
     pthread_mutex_lock(&pgtab_lock);
     if (p->pid == pid && p->pgrp_member) {
         pgrp_table_leave(&pgtab, p->pgrp, p->pgrp_gen);

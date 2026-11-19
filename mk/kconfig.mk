@@ -54,8 +54,11 @@ savedefconfig: $(KCONFIG_DIR)/menuconfig.py
 	$(msg) SAVE $(DEFCONFIG)
 
 # Every file the schema sources, so that a new symbol in a sub-Kconfig
-# regenerates autoconf.h (genconfig.py fills in its default).
-KCONFIG_SOURCES := $(KCONFIG_SCHEMA) $(wildcard */Kconfig */*/Kconfig */*/*/Kconfig)
+# regenerates autoconf.h (genconfig.py fills in its default). Follow the
+# `source` lines from the schema down, so a file at any depth is tracked.
+kconfig_sources = $(foreach f,$(1),$(f) $(call kconfig_sources,$(wildcard \
+    $(shell sed -n 's/^[[:space:]]*source[[:space:]]*"\([^"]*\)".*/\1/p' $(f)))))
+KCONFIG_SOURCES := $(call kconfig_sources,$(KCONFIG_SCHEMA))
 
 # Regenerate autoconf.h whenever .config or any Kconfig file changes.
 $(AUTOCONF_H): .config $(KCONFIG_SOURCES) $(KCONFIG_DIR)/menuconfig.py

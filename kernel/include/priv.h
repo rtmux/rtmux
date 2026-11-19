@@ -30,7 +30,7 @@ int process_destroy_call(pid_t pid);
 int process_destroy_all(pid_t pid);
 int process_exec(void *lcp, int *prcvid, int rcvid, int ppid);
 int process_shutdown(process_t *prp, int exec);
-void process_reparent(process_t *prp);
+int process_reparent(pid_t pid);
 void signal_kill(channel_t *chp, int signo, pid_t sender_pid);
 void process_threads_destroy(process_t *prp);
 int process_timer_destroy(process_t *prp, int id);

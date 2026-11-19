@@ -122,8 +122,15 @@ void kext_proc_query(void *data)
 
     memset(out, 0, sizeof(*out));
     out->pid = prp->pid;
-    out->parent_pid = prp->parent ? prp->parent->pid : 0;
-    out->flags = prp->flags;
+    {
+        /* Parent before flags, as the reparent publishes them in the other
+         * order: a new parent is never seen with the ZOMBIE it cleared.
+         */
+        process_t *parent = __atomic_load_n(&prp->parent, __ATOMIC_ACQUIRE);
+
+        out->parent_pid = parent ? parent->pid : 0;
+    }
+    out->flags = __atomic_load_n(&prp->flags, __ATOMIC_RELAXED);
     out->num_active_threads = prp->num_active_threads;
     out->num_total_threads = prp->threads.nentries - prp->threads.nfree;
     out->terming_priority = prp->terming_priority;

@@ -1,5 +1,5 @@
 name: Upload failure logs
-description: "Upload QEMU and build logs as an artifact (call with if: failure())."
+description: "Upload QEMU and build logs as an artifact (call with if: failure() || cancelled(), so a job stopped by its timeout keeps its logs)."
 inputs:
   name:
     description: Artifact name.
@@ -16,6 +16,7 @@ runs:
         retention-days: 3
         path: |
           build/**/*.log
+          build/lkl-logs/*.dump
           /tmp/rtmux-*
           ${{ inputs.extra }}
         if-no-files-found: ignore

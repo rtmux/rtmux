@@ -11,8 +11,10 @@
  * A loaded zone is one immutable allocation. The caller keeps it for the life
  * of the process once it has published it (and frees it otherwise), so pointers
  * into a kept zone (zone abbreviations, the footer) stay valid. Only the 64-bit
- * block of the file is used; the leap second tables and the standard/wall and
- * UT/local indicators are validated and ignored.
+ * block of the file is used. A file whose 64-bit block has leap second records
+ * is rejected, not loaded: its transition times are not POSIX time. The
+ * standard/wall and UT/local indicators are skipped: their counts must be 0 or
+ * the number of types, and their values are not read.
  */
 #ifndef LIBC_TZFILE_H
 #define LIBC_TZFILE_H
@@ -77,8 +79,10 @@ size_t __tzfile_types_in(const struct tzfile *f,
                          struct tzfile_type *out,
                          size_t max) __hidden;
 
-/* The standard and DST types of the latest transitions of each kind, or of type
- * 0 for a kind that never occurs; *has_dst says whether any DST type was seen.
+/* The standard and DST types of the latest transitions of each kind. With no
+ * standard transition, *std is type 0; with no DST transition, *dst is a copy of
+ * *std (not type 0), and *has_dst, which says whether any DST type was seen, is
+ * 0.
  */
 void __tzfile_last_types(const struct tzfile *f,
                          struct tzfile_type *std,

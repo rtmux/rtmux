@@ -79,6 +79,10 @@ bool inject_should_fail_sched_set(thread_t *act, bool lowered)
     } while (!atomic_compare_exchange_weak_explicit(
         &sched_left, &left, left - 1, memory_order_acq_rel,
         memory_order_relaxed));
+    /* One pending mark: failures injected from two threads at once overwrite
+     * it, and the displaced count then falls short. The tests that count
+     * displaced switches inject from one thread.
+     */
     atomic_store_explicit(&sched_failed_thr, act, memory_order_release);
     atomic_fetch_add_explicit(&sched_consumed, 1, memory_order_release);
     inject_sched_window();
@@ -200,7 +204,8 @@ static void inject_stall_once(enum stall_site site, const process_t *prp)
 /* Arm a stall at site for pid and ms milliseconds; an errno. */
 static int inject_stall_arm(enum stall_site site, uint64_t pid, uint64_t ms)
 {
-    if (ms == 0 || ms > INJECT_SPIN_MAX_MS)
+    /* A pid past INT32_MAX would truncate to another process's pid below. */
+    if (pid > INT32_MAX || ms == 0 || ms > INJECT_SPIN_MAX_MS)
         return EINVAL;
     atomic_store_explicit(&consumed, 0, memory_order_relaxed);
     atomic_store_explicit(&stall_site[site].ms, (unsigned) ms,
@@ -439,6 +444,13 @@ void kext_debug_inject(void *data)
                               memory_order_release);
         break;
     case INJECT_OP_FAIL_NEXT_TURNSTILE:
+        /* Same truncation as a stall arm; INT32_MAX stays valid, as the pid
+         * tests use to disarm.
+         */
+        if (kap->arg0 > INT32_MAX) {
+            ret = EINVAL;
+            break;
+        }
         atomic_store_explicit(&consumed, 0, memory_order_relaxed);
         atomic_store_explicit(&armed_ts_pid, (int) kap->arg0,
                               memory_order_release);

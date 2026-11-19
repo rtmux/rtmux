@@ -1060,15 +1060,21 @@ static void crash_put_uint(unsigned v)
     con_write(dec, (size_t) dlen);
 }
 
+/* How long a crashing CPU waits for the other participants, and the iteration
+ * cap that ends the wait whatever the time counter says.
+ */
+#define CRASH_RENDEZVOUS_MS 1000
+#define CRASH_RENDEZVOUS_MAX_SPINS 500000000UL
+
 /* crash_rendezvous — join the SMP crash rendezvous, then halt.
  *
  * Called once this CPU has finished accumulating its diagnostic into its
  * per-CPU crash_buf. Protocol:
  *
  *   1. set this CPU's bit in crash_arrived_mask — announce arrival.
- *   2. Spin briefly so siblings still finishing their dumps catch up
- *      (bounded loop, not a wall-clock timer — no dependency on the
- *      timer subsystem which itself may be broken at crash time).
+ *   2. Spin so siblings still finishing their dumps catch up (bounded by
+ *      this hart's time counter and an iteration cap, with no dependency
+ *      on the timer subsystem, which itself may be broken at crash time).
  *   3. cmpxchg(crash_printer_picked, 0 -> 1).  Whoever wins is the
  *      printer; the rest just halt.  Their bytes still get printed —
  *      the printer walks every CPU's buffer.
@@ -1102,12 +1108,25 @@ void crash_rendezvous(void)
                              memory_order_acq_rel);
 
     /* Bounded spin — long enough that any sibling crashing in the same window
-     * will reach this rendezvous, short enough not to stall a lone crasher
-     * noticeably. ~50M iterations ≈ tens of milliseconds at GHz clocks.
+     * will reach this rendezvous. A lone crasher is its whole participant set
+     * and does not wait at all. The bound is CRASH_RENDEZVOUS_MS of this hart's
+     * own time counter and at least 50M iterations: an iteration count alone is
+     * tens of milliseconds, which a sibling whose virtual CPU the host has
+     * descheduled can miss, and its dump is then printed as absent. The hard
+     * iteration cap ends the wait when the counter does not advance. When the
+     * clock rate is not known yet the time bound is zero, and the wait is the
+     * 50M iterations alone.
      */
+    uint64_t cps = qtimeptr ? qtimeptr->cycles_per_sec : 0;
+    uint64_t wait = cps / 1000 * CRASH_RENDEZVOUS_MS;
+    uint64_t t0 = r_time();
+
     arrived = atomic_load_explicit(&crash_arrived_mask, memory_order_acquire);
     set = crash_participants();
-    for (volatile unsigned long i = 0; i < 50000000UL && (arrived & set) != set;
+    for (volatile unsigned long i = 0;
+         (arrived & set) != set &&
+         (i < 50000000UL ||
+          (i < CRASH_RENDEZVOUS_MAX_SPINS && r_time() - t0 < wait));
          i++) {
         __asm__ volatile("" ::: "memory");
         arrived =

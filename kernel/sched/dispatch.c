@@ -989,10 +989,12 @@ int rdecl sched_thread(thread_t *thp, int policy, struct sched_param *param)
             thp->schedinfo.ss_info->org_priority = (uint8_t) new_prio;
         }
 
-        /* SchedSet sets the base. A loan above it (a PI waiter, a ceiling, a
-         * message being served) keeps the thread at the loan until it ends.
+        /* SchedSet sets the base and ends a notification loan. A loan above it
+         * (a PI waiter, a ceiling, a request being served, a send still queued)
+         * keeps the thread at the loan until it ends.
          */
         old_prio = thp->priority;
+        thread_end_notification_loan(thp);
         thread_set_base_prio(thp, new_prio);
         (void) thread_prio_update_dpp(thp, thp->dpp, 0);
 
@@ -1109,10 +1111,11 @@ int rdecl sched_thread(thread_t *thp, int policy, struct sched_param *param)
     /* Change policy and priority after fiddling with attributes */
     thp->policy = (uint8_t) policy;
 
-    /* The base only; a loan above it holds until it ends. An unchanged priority
-     * still sends the caller to the tail of its level, as adjust_priority() did
-     * for an equal priority.
+    /* The base, and the end of a notification loan; any other loan above it
+     * holds until it ends. An unchanged priority still sends the caller to the
+     * tail of its level, as adjust_priority() did for an equal priority.
      */
+    thread_end_notification_loan(thp);
     thread_set_base_prio(thp, new_prio);
     if (!thread_prio_update_dpp(thp, thp->dpp, 0) &&
         thp == get_active_thread(get_cpunum()))
@@ -1962,6 +1965,34 @@ unready_release_and_exit(thread_t *thp, int newstate, kspinlock_t *to_release)
  * searching through the dispatch is necessary.
  */
 
+/* Queue a thread that ready_default is making runnable at the end of its
+ * priority list, or, for a round-robin client whose msg_sendvnc just completed,
+ * at the head: the server blocks right after the reply, and the client then
+ * runs on the CPU and in the cache the server left.
+ *
+ * A client that blocks in every send is never displaced, so the ticks each head
+ * insertion adds were never spent, and its peers at the same priority waited
+ * behind it for good. The budget bounds that: once it is used up the client
+ * goes to the end and starts over. A FIFO or sporadic thread that becomes
+ * runnable goes to the end of its list whatever woke it: it has no round-robin
+ * budget to bound the head placement with.
+ */
+static inline void ready_enqueue_client(kdispatch_t *dpp,
+                                        thread_t *thp,
+                                        unsigned prio,
+                                        bool was_sendvnc)
+{
+    if (was_sendvnc && IS_SCHED_RR(thp)) {
+        RR_ADD_PREEMPT_TICK(thp);
+        if (RR_GET_TICKS(thp) < RR_MAXTICKS) {
+            LINK3_BEG(DISPATCH_LST(dpp, prio), &thp->link3_link, thread_t);
+            return;
+        }
+    }
+    RR_RESET_TICK(thp);
+    LINK3_END(DISPATCH_LST(dpp, prio), &thp->link3_link, thread_t);
+}
+
 /* ready_default takes the per-CPU dispatch lock internally around the
  * dispatch-list mutation; all callers funnel through the same lock.
  *
@@ -2085,15 +2116,7 @@ static void rdecl ready_default(thread_t *thp)
                 thp->dpp = target_dpp;
                 thp->state = STATE_READY;
                 _TRACE_TH_EMIT_STATE(thp, READY);
-                if (was_sendvnc) {
-                    RR_ADD_PREEMPT_TICK(thp);
-                    LINK3_BEG(DISPATCH_LST(target_dpp, prio), &thp->link3_link,
-                              thread_t);
-                } else {
-                    RR_RESET_TICK(thp);
-                    LINK3_END(DISPATCH_LST(target_dpp, prio), &thp->link3_link,
-                              thread_t);
-                }
+                ready_enqueue_client(target_dpp, thp, prio, was_sendvnc);
                 DISPATCH_SET(target_dpp, thp);
                 SENDIPI((unsigned) target_cpu, IPI_RESCHED);
                 SCHED_UNLOCK(target_dpp);
@@ -2111,13 +2134,7 @@ static void rdecl ready_default(thread_t *thp)
              */
             thp->state = STATE_READY;
             _TRACE_TH_EMIT_STATE(thp, READY);
-            if (was_sendvnc) {
-                RR_ADD_PREEMPT_TICK(thp);
-                LINK3_BEG(DISPATCH_LST(dpp, prio), &thp->link3_link, thread_t);
-            } else {
-                RR_RESET_TICK(thp);
-                LINK3_END(DISPATCH_LST(dpp, prio), &thp->link3_link, thread_t);
-            }
+            ready_enqueue_client(dpp, thp, prio, was_sendvnc);
             DISPATCH_SET(dpp, thp);
 #if CONFIG_PROCESSORS_MAX > 1
             /* The "server blocks right after" assumption fails when the server
@@ -2151,15 +2168,7 @@ static void rdecl ready_default(thread_t *thp)
                 thp->dpp = target_dpp;
                 thp->state = STATE_READY;
                 _TRACE_TH_EMIT_STATE(thp, READY);
-                if (was_sendvnc) {
-                    RR_ADD_PREEMPT_TICK(thp);
-                    LINK3_BEG(DISPATCH_LST(target_dpp, prio), &thp->link3_link,
-                              thread_t);
-                } else {
-                    RR_RESET_TICK(thp);
-                    LINK3_END(DISPATCH_LST(target_dpp, prio), &thp->link3_link,
-                              thread_t);
-                }
+                ready_enqueue_client(target_dpp, thp, prio, was_sendvnc);
                 DISPATCH_SET(target_dpp, thp);
 
                 SENDIPI((unsigned) cpu, IPI_RESCHED);
@@ -2234,13 +2243,7 @@ static void rdecl ready_default(thread_t *thp)
          * queue, unless it was blocked due to a msg_sendvnc call (see the above
          * description of this issue.
          */
-        if (was_sendvnc) {
-            RR_ADD_PREEMPT_TICK(thp);
-            LINK3_BEG(DISPATCH_LST(dpp, prio), &thp->link3_link, thread_t);
-        } else {
-            RR_RESET_TICK(thp);
-            LINK3_END(DISPATCH_LST(dpp, prio), &thp->link3_link, thread_t);
-        }
+        ready_enqueue_client(dpp, thp, prio, was_sendvnc);
     enqueue_done:;
     }
 #else
@@ -2287,13 +2290,7 @@ static void rdecl ready_default(thread_t *thp)
          * queue, unless it was blocked due to a msg_sendvnc call (see the above
          * description of this issue.
          */
-        if (was_sendvnc) {
-            RR_ADD_PREEMPT_TICK(act);
-            LINK3_BEG(DISPATCH_LST(dpp, prio), &thp->link3_link, thread_t);
-        } else {
-            RR_RESET_TICK(thp);
-            LINK3_END(DISPATCH_LST(dpp, prio), &thp->link3_link, thread_t);
-        }
+        ready_enqueue_client(dpp, thp, prio, was_sendvnc);
     }
 #endif
     _TRACE_TH_EMIT_STATE(thp, READY);
@@ -2817,7 +2814,19 @@ static void rdecl adjust_priority_default(thread_t *thp,
     dpp = thp->dpp;
     switch (thp->state) {
     case STATE_READY:
-        CRASHCHECK(thp == act);
+#ifndef NDEBUG
+        /* CRASHCHECK(thp == act), naming the thread. crash_halt writes to the
+         * crash buffer, so it never waits on the console lock under SCHED_LOCK.
+         */
+        if (thp == act)
+            crash_halt("sched: priority %u -> %u of the active thread %d.%d, "
+                       "which is READY (runcpu %u, internal flags 0x%x, "
+                       "flags 0x%x)",
+                       (unsigned) thp->priority, (unsigned) prio,
+                       thp->process ? (int) thp->process->pid : -1,
+                       (int) thp->tid, (unsigned) thp->runcpu,
+                       (unsigned) thp->internal_flags, (unsigned) thp->flags);
+#endif
         chk_thread(thp);
 
         /* Unlink from the ready queue */
@@ -2828,14 +2837,12 @@ static void rdecl adjust_priority_default(thread_t *thp,
 
         thp->priority = (uint8_t) prio;
 #if CONFIG_PROCESSORS_MAX > 1
-#ifndef NDEBUG
 
-        /* pretty hokey, but ready_default() has a
-         *     CRASHCHECK(thp->state == STATE_READY)
-         * and we want to keep that check
+        /* pretty hokey, but ready_default() returns at once for a thread that
+         * is already READY, and this one was just taken off its queue. Done in
+         * every build: without it the thread would be dropped here.
          */
         thp->state = STATE_DEAD;
-#endif
 
         /* ready() takes its own per-CPU dispatch lock — drop ours around it.
          * After ready() returns, thp may have been routed to a different hart's

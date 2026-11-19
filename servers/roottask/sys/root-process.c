@@ -90,6 +90,35 @@ pid_t root_session_leader(const root_process_t *p)
     return p->session ? p->session->leader : ROOTTASK_PID;
 }
 
+/* Take one link on the session of process pid, and report its session id, in
+ * one hold of slot_lock: root_process_fini clears the slot and takes its
+ * session away under the same lock, so a parent that is being torn down cannot
+ * have its session freed between the read and the link. A process that no
+ * longer owns its slot, or has no session, is in the system session: NULL, and
+ * *sid is roottask's; its group is then its own pid. The caller drops the link
+ * with proc_session_unref.
+ */
+session_t *root_session_link_of(pid_t pid, pid_t *sid, pid_t *pgid)
+{
+    root_process_t *p = root_proc(pid);
+    session_t *sep = NULL;
+
+    *sid = ROOTTASK_PID;
+    *pgid = pid;
+    pthread_mutex_lock(&slot_lock);
+    if (p->pid == pid) {
+        /* The group and the session of one owner of the slot, read together. */
+        *pgid = root_process_pgrp(p);
+        if (p->session) {
+            sep = p->session;
+            *sid = sep->leader;
+            (void) atomic_add_value(&sep->links, 1);
+        }
+    }
+    pthread_mutex_unlock(&slot_lock);
+    return sep;
+}
+
 /* The system session. It is static, so that creating it cannot fail and no
  * process is ever without a session object. One link is roottask's own; the
  * other is never dropped, so that an unbalanced release cannot free a static

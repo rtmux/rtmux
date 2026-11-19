@@ -4,8 +4,8 @@
 # usage: bench-malloc.sh WITH_COUNTERS WITHOUT_COUNTERS
 #
 # Each argument is a malloc-stats test binary that takes "bench". The two are
-# run alternately, ROUNDS times each (default 7), so a drift in host load hits
-# both alike. Each run is already the best of several passes. The report gives
+# run alternately, ROUNDS times each (default 7), and the build that goes first
+# swaps every round, so a drift in host load hits both alike. Each run is already the best of several passes. The report gives
 # the median of each build and the spread of its samples, (max - min) / median.
 # The noise threshold is the larger of the two spreads: a difference of the
 # medians at or below it is reported as within noise, not as a cost. Compare
@@ -21,13 +21,20 @@ rounds=${ROUNDS:-7}
     echo "usage: $0 WITH_COUNTERS WITHOUT_COUNTERS" >&2
     exit 2
 }
+case $rounds in
+'' | *[!0-9]* | 0*)
+    echo "bench-malloc: ROUNDS must be a positive integer, not '$rounds'" >&2
+    exit 2
+    ;;
+esac
 
 tmp=$(mktemp) || exit 1
 trap 'rm -f "$tmp"' EXIT
 
 i=0
 while [ "$i" -lt "$rounds" ]; do
-    for b in with without; do
+    if [ $((i % 2)) -eq 0 ]; then order="with without"; else order="without with"; fi
+    for b in $order; do
         if [ "$b" = with ]; then bin=$with; else bin=$without; fi
         out=$("$bin" bench) || { echo "bench-malloc: $bin failed" >&2; exit 1; }
         printf '%s\n' "$out" | awk -v b="$b" 'NF >= 8 { print b, $2, $8 }' >>"$tmp"

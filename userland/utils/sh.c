@@ -561,6 +561,12 @@ static void sh_run_traps_on_tty(struct sh *sh, const struct termios *saved)
     (void) sh_enable_raw(&raw_again);
 }
 
+/* Trap i has an action to run: neither the default nor ignored. */
+static bool trap_armed(const struct sh *sh, int i)
+{
+    return sh->traps[i] && *sh->traps[i];
+}
+
 /* Wait for input on stdin without losing a trapped signal that arrives between
  * the check for one that is pending and the read: those signals are blocked
  * while it is made, and unblocked only inside pselect, which then returns at
@@ -579,7 +585,7 @@ static bool sh_await_input(struct sh *sh)
 
     sigemptyset(&block);
     for (int i = 1; i < SH_NTRAPS; i++) {
-        if (sh->traps[i] && *sh->traps[i]) {
+        if (trap_armed(sh, i)) {
             sigaddset(&block, sh_trap_sigs[i].sig);
             armed = true;
         }
@@ -928,9 +934,10 @@ static char *sh_join_params(struct sh *sh)
     size_t len = 0;
     size_t cap = 0;
 
+    const char joiner = ifs_joiner();
+
     for (int i = 0; i < sh->nparams; i++) {
-        if ((i > 0 && ifs_joiner() &&
-             append_char(&buf, &len, &cap, ifs_joiner()) != 0) ||
+        if ((i > 0 && joiner && append_char(&buf, &len, &cap, joiner) != 0) ||
             append_str(&buf, &len, &cap, sh->params[i]) != 0) {
             free(buf);
             return NULL;
@@ -1051,6 +1058,13 @@ static char *mark_literal(char *s)
     return r;
 }
 
+static int expand_dollar(struct sh *sh,
+                         const char **pp,
+                         char **buf,
+                         size_t *len,
+                         size_t *cap,
+                         int xf);
+
 /* Parse and expand ${ ... }. On entry *pp points just past '{'; on return just
  * past the matching '}'. Supports length (${#name}), ${@}/${*},
  * defaults/assign/ error/alt (${n:-w} ${n-w} ${n:=w} ${n=w} ${n:?w} ${n?w}
@@ -1080,6 +1094,23 @@ static char *expand_braced(struct sh *sh, const char **pp, int xf)
     if (!content)
         return strdup("");
     *pp = sc.p;
+
+    /* ${#} ${?} ${$} ${!} ${-}: the special parameters, as without braces. */
+    if (content[0] != '\0' && content[1] == '\0' &&
+        strchr("#?$!-", content[0])) {
+        const char *q = content;
+        char *val = NULL;
+        size_t vlen = 0;
+        size_t vcap = 0;
+        int rc = expand_dollar(sh, &q, &val, &vlen, &vcap, 0);
+
+        free(content);
+        if (rc != 0) {
+            free(val);
+            return strdup("");
+        }
+        return val ? val : strdup("");
+    }
 
     /* ${#name} -> length of the value ($# count is handled in expand_dollar).
      */
@@ -3233,7 +3264,7 @@ static void sh_run_traps(struct sh *sh)
         if (!sh_trap_pending[i])
             continue;
         sh_trap_pending[i] = 0;
-        if (sh->traps[i] && *sh->traps[i] && !sh->trap_inherited[i]) {
+        if (trap_armed(sh, i) && !sh->trap_inherited[i]) {
             (void) run_text(sh, sh->traps[i]);
             if (!sh->exit_requested)
                 sh->last_status = status;
@@ -3645,8 +3676,27 @@ fail:
     return 127;
 }
 
+static int sh_redir_apply(int in_fd, int out_fd, int err_fd, int saved[3]);
+static void sh_redir_restore(int saved[3]);
+
+/* Keep fd out of the program an exec starts: it is a source or a saved copy of
+ * a standard descriptor, not one the program is meant to inherit.
+ */
+static void exec_hide_fd(int fd)
+{
+    if (fd > STDERR_FILENO)
+        (void) fcntl(fd, F_SETFD, FD_CLOEXEC);
+}
+
+/* `exec` with no command makes its redirections the shell's own. With one, they
+ * are the command's: applied for the exec and, if it fails, taken back so the
+ * shell goes on with the descriptors it had.
+ */
 static int builtin_exec(char **argv, int in_fd, int out_fd, int err_fd)
 {
+    int saved[3];
+    int err;
+
     if (!argv[1]) {
         if (in_fd == SH_FD_CLOSED)
             close(STDIN_FILENO);
@@ -3662,8 +3712,20 @@ static int builtin_exec(char **argv, int in_fd, int out_fd, int err_fd)
             dup2(err_fd, STDERR_FILENO);
         return 0;
     }
+    if (sh_redir_apply(in_fd, out_fd, err_fd, saved) != 0) {
+        fprintf(stderr, "sh: redirection failed: %s\n", strerror(errno));
+        sh_redir_restore(saved);
+        return 1;
+    }
+    exec_hide_fd(in_fd);
+    exec_hide_fd(out_fd);
+    exec_hide_fd(err_fd);
+    for (int k = 0; k < 3; k++)
+        exec_hide_fd(saved[k]);
     execvp(argv[1], &argv[1]);
-    fprintf(stderr, "%s: %s\n", argv[1], strerror(errno));
+    err = errno;
+    sh_redir_restore(saved);
+    fprintf(stderr, "%s: %s\n", argv[1], strerror(err));
     return 127;
 }
 
@@ -3673,11 +3735,12 @@ static int builtin_exec(char **argv, int in_fd, int out_fd, int err_fd)
  * itself (it is in the background, or writes into a pipe whose reader is not
  * running yet) runs in a child `sh -S FD`. The parent writes the state the
  * child needs to FD, an inherited pipe: a run of NUL-terminated fields that
- * sh_state_load() reads back in the same order. Values are never quoted, so a
+ * sh_state_run() reads back in the same order. Values are never quoted, so a
  * value cannot be mistaken for a field boundary or for shell syntax.
  *
  * Variables are not in it: every shell variable lives in environ (setenv),
- * which the child inherits. The shell has no traps to carry.
+ * which the child inherits. The traps are: `trap` lists them in the child, but
+ * it never runs them (sh_state_run).
  */
 #define SH_STATE_MAGIC "sh-state-1"
 
@@ -4450,9 +4513,9 @@ static bool case_at_command(const char *start, const char *at)
 
     while (b > start && (b[-1] == ' ' || b[-1] == '\t'))
         b--;
-    if (b == start || strchr(";&|(){", b[-1]) != NULL)
+    if (b == start || strchr(";&|(){\n", b[-1]) != NULL)
         return true;
-    while (b > start && !strchr(" \t;&|(){", b[-1]))
+    while (b > start && !strchr(" \t\n;&|(){", b[-1]))
         b--; /* the word before it */
     return starts_any(b, lead);
 }
@@ -5176,8 +5239,10 @@ static int find_matching(struct sh_script *sc,
             (!strcmp(open1, "{") && starts_func_def(tmp) && tmp[0] != '\0' &&
              tmp[strlen(tmp) - 1] == '{')) /* a function opens a group too */
             depth++;
-        if (depth == 0 && mid && starts_word(tmp, mid))
-            *mid_out = i;
+        if (depth == 0 && mid && *mid_out < 0 &&
+            (starts_word(tmp, mid) ||
+             (!strcmp(mid, "else") && starts_word(tmp, "elif"))))
+            *mid_out = i; /* the first else, or elif, of an if */
         if (starts_word(tmp, close)) {
             if (depth == 0)
                 return i;
@@ -5242,6 +5307,9 @@ static int loop_consume(struct sh *sh)
 
 /* The runners below take the opening line `at` and the closing line, which
  * compound_end found; run_block leaves the caller past the latter.
+ *
+ * An if's else_i is its first else or elif line: an elif is run as an if of its
+ * own that ends at the same fi.
  */
 static int run_if(struct sh *sh,
                   struct sh_script *sc,
@@ -5252,11 +5320,12 @@ static int run_if(struct sh *sh,
     char cond[SH_LINE_MAX];
     char *thenp;
     int then_i;
+    int kw = starts_word(sc->line[at], "elif") ? 4 : 2;
     int rc;
 
     snprintf(cond, sizeof(cond), "%s", sc->line[at]);
     trim(cond);
-    memmove(cond, cond + 2, strlen(cond + 2) + 1);
+    memmove(cond, cond + kw, strlen(cond + kw) + 1);
     trim(cond);
     thenp = strstr(cond, "; then");
     if (thenp) {
@@ -5276,10 +5345,18 @@ static int run_if(struct sh *sh,
     sh->errexit_suppress++; /* set -e is ignored while testing the condition */
     rc = run_line(sh, cond);
     sh->errexit_suppress--;
-    if (rc == 0)
+    if (rc == 0) {
         rc = run_script_range(sh, sc, then_i, else_i >= 0 ? else_i : fi_i);
-    else if (else_i >= 0)
+    } else if (else_i >= 0 && starts_word(sc->line[else_i], "elif")) {
+        int next;
+
+        (void) find_matching(sc, else_i + 1, fi_i, "if", "else", "fi", &next);
+        rc = run_if(sh, sc, else_i, fi_i, next);
+    } else if (else_i >= 0) {
         rc = run_script_range(sh, sc, else_i + 1, fi_i);
+    } else {
+        rc = 0; /* no condition held and there is no else: success */
+    }
     return rc;
 }
 
@@ -5413,9 +5490,12 @@ static int run_while(struct sh *sh,
 }
 
 /* Whether word matches one of the alternatives of a case pattern list, a|b|c,
- * which may open with the ( that POSIX allows.
+ * which may open with the ( that POSIX allows. Each alternative is expanded as
+ * a pattern, so a quoted character in it matches only itself.
  */
-static bool case_pattern_matches(const char *list, const char *word)
+static bool case_pattern_matches(struct sh *sh,
+                                 const char *list,
+                                 const char *word)
 {
     char *pats = strdup(list + (*list == '('));
     char *alt = pats;
@@ -5423,11 +5503,14 @@ static bool case_pattern_matches(const char *list, const char *word)
 
     while (pats && alt) {
         char *bar = (char *) sh_scan_find(alt, "|");
+        char *pat;
 
         if (bar)
             *bar = '\0';
         trim(alt);
-        hit = fnmatch(alt, word, 0) == 0;
+        pat = expand_word(sh, alt, true, 0);
+        hit = fnmatch(pat ? pat : alt, word, 0) == 0;
+        free(pat);
         if (hit || !bar)
             break;
         alt = bar + 1;
@@ -5437,7 +5520,8 @@ static bool case_pattern_matches(const char *list, const char *word)
 }
 
 /* The ;; that ends the arm whose command text is rp, or NULL: the first one
- * outside quotes and outside a case command of the arm's own.
+ * outside quotes and outside a case command of the arm's own, or none while
+ * such a case command is not yet closed.
  */
 static char *arm_end(char *rp)
 {
@@ -5455,8 +5539,9 @@ static char *arm_end(char *rp)
         if (starts_word(at, "case") && case_at_command(rp, at)) {
             const char *esac = sh_scan_case_end(at);
 
-            if (esac)
-                sc.p = esac;
+            if (!esac)
+                return NULL; /* its esac is on a later line: the arm goes on */
+            sc.p = esac;
         } else if (*at == ';' && at[1] == ';') {
             return (char *) at;
         }
@@ -5487,22 +5572,50 @@ static int run_case(struct sh *sh, struct sh_script *sc, int at, int esac_i)
     for (int i = at + 1; i < esac_i && !sh->exit_requested; i++) {
         char line[SH_LINE_MAX];
         char *rp;
+        char *arm;
+
         snprintf(line, sizeof(line), "%s", sc->line[i]);
         trim(line);
-        rp = strchr(line, ')');
+        rp = (char *) sh_scan_find(line,
+                                   ")"); /* the one that ends the pattern */
         if (!rp)
             continue;
         *rp++ = '\0';
         trim(line);
-        if (case_pattern_matches(line, word)) {
-            char *end = arm_end(rp);
+
+        /* The arm goes on over the following lines until its ;; (or the esac),
+         * whether or not it is the one that runs.
+         */
+        arm = strdup(rp);
+        while (arm && !arm_end(arm) && i + 1 < esac_i) {
+            size_t n = strlen(arm);
+            size_t m = strlen(sc->line[i + 1]);
+            char *grown = realloc(arm, n + m + 2);
+
+            if (!grown) {
+                free(arm);
+                arm = NULL;
+                break;
+            }
+            arm = grown;
+            arm[n] = '\n';
+            memcpy(arm + n + 1, sc->line[++i], m + 1);
+        }
+        if (!arm) {
+            rc = 1;
+            break;
+        }
+        if (case_pattern_matches(sh, line, word)) {
+            char *end = arm_end(arm);
 
             if (end)
                 *end = '\0';
-            trim(rp);
-            rc = run_text(sh, rp); /* a list that may hold compound commands */
+            trim(arm);
+            rc = run_text(sh, arm); /* a list that may hold compound commands */
+            free(arm);
             break;
         }
+        free(arm);
     }
     free(word);
     return rc;
@@ -5976,9 +6089,9 @@ static int script_explode(struct sh_script *sc)
         trim(t);
         if (heredoc_find(t))
             last = heredoc_skip(sc, i, sc->count, t);
-        else if (!starts_func_def(t) && (case_explode(sc->line[i], &one) ||
-                                         sh_explode(sc->line[i], &one)))
-            last = -1;
+        else if (!starts_func_def(t) && (sh_explode(sc->line[i], &one) ||
+                                         case_explode(sc->line[i], &one)))
+            last = -1; /* sh_explode splits a line of several commands */
         for (int k = 0; k < one.count && rc == 0; k++)
             rc = script_add(&out, one.line[k]);
         for (; i <= last && rc == 0; i++)
@@ -6036,6 +6149,7 @@ static int run_block(struct sh *sh,
     else
         rc = run_case(sh, sc, *ip, end);
     *ip = end;
+    sh->last_status = rc; /* a loop or an if that ran nothing is a success */
     return rc;
 }
 
@@ -6061,12 +6175,6 @@ static int sh_sub_script(struct sh_script *sc,
 static int closer_len(const char *line)
 {
     return starts_word(line, "fi") ? 2 : starts_word(line, "}") ? 1 : 4;
-}
-
-/* The first `|` in line outside quotes, escapes and substitutions, or NULL. */
-static char *find_pipe(char *line)
-{
-    return (char *) sh_scan_find(line, "|");
 }
 
 /* Run the compound command from line *ip to line end, whose trimmed closing
@@ -6116,7 +6224,7 @@ static __attribute__((noinline)) int run_compound_tail(struct sh *sh,
         *ip = end;
         return 2;
     }
-    pipe_at = find_pipe(tail);
+    pipe_at = (char *) sh_scan_find(tail, "|"); /* outside quotes */
     if (pipe_at) {
         *pipe_at++ = '\0';
         if (pipe(pfd) != 0) {
@@ -6196,10 +6304,7 @@ static __attribute__((noinline)) int run_compound_tail(struct sh *sh,
     return rest && !sh->exit_requested ? run_list(sh, rest, sep, rc) : rc;
 }
 
-/* Run the compound command opening at line *ip, and leave *ip at its last line.
- * A trailing `&` on its closing fi, done or esac runs the whole command in a
- * background subshell; any other text there is a tail for run_compound_tail.
- * The & that ends the first statement of tail, the text after a closing keyword
+/* The & that ends the first statement of tail, the text after a closing keyword
  * (so the compound command is to run in the background), or NULL; *rest gets
  * what follows it.
  */
@@ -6219,6 +6324,10 @@ static char *tail_background(char *tail, const char **rest)
     return amp;
 }
 
+/* Run the compound command opening at line *ip, and leave *ip at its last line.
+ * A trailing `&` on its closing fi, done or esac runs the whole command in a
+ * background subshell; any other text there is a tail for run_compound_tail.
+ */
 static __attribute__((noinline)) int run_compound_rest(struct sh *sh,
                                                        struct sh_script *sc,
                                                        int *ip,

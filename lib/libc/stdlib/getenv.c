@@ -228,8 +228,7 @@ static long env_owner(char *const *vec,
 static void env_release(char *const *live,
                         size_t n,
                         size_t *owned,
-                        const void *keep,
-                        const void *keep2)
+                        const void *keep)
 {
     char **vec = env.vec;
     size_t *size = env.owned;
@@ -261,8 +260,7 @@ static void env_release(char *const *live,
     for (size_t e = 0; e < m; e++) {
         size_t sz = size[e] & ENV_SIZE_MASK;
 
-        if (!(size[e] >> ENV_HITS_SHIFT) && !env_within(keep, vec[e], sz) &&
-            !env_within(keep2, vec[e], sz))
+        if (!(size[e] >> ENV_HITS_SHIFT) && !env_within(keep, vec[e], sz))
             free(vec[e]);
     }
     free(vec);
@@ -271,10 +269,10 @@ static void env_release(char *const *live,
 /* Make environ libc's own vector, with room for extra more entries.
  *
  * Returns the entry count, or -1 with errno ENOMEM and nothing changed. An
- * outgrown vector of libc's is retired, not freed (see the top). keep and keep2
- * are pointers the caller still needs, which a replacement must not free.
+ * outgrown vector of libc's is retired, not freed (see the top). keep is a
+ * pointer the caller still needs, which a replacement must not free.
  */
-static long env_reserve(size_t extra, const void *keep, const void *keep2)
+static long env_reserve(size_t extra, const void *keep)
 {
     size_t n = env_count();
     int mine = environ && environ == env.vec;
@@ -302,7 +300,7 @@ static long env_reserve(size_t extra, const void *keep, const void *keep2)
     if (mine)
         memcpy(owned, env.owned, n * sizeof *owned);
     else if (env.vec)
-        env_release(vec, n, owned, keep, keep2);
+        env_release(vec, n, owned, keep);
     free(env.owned); /* only libc reads the side array, so it can go */
     env.vec = vec;
     env.owned = owned;
@@ -318,7 +316,7 @@ static long env_reserve(size_t extra, const void *keep, const void *keep2)
  */
 static int env_store(long i, char *s, size_t owned)
 {
-    long n = env_reserve(i < 0 ? 1 : 0, s, NULL);
+    long n = env_reserve(i < 0 ? 1 : 0, s);
 
     if (n < 0)
         return -1;
@@ -386,7 +384,7 @@ int setenv(const char *name, const char *value, int overwrite)
      * so that a buffer libc allocated there can be reused in place.
      */
     if (i >= 0 && environ != env.vec) {
-        if (env_reserve(0, s, NULL) < 0) {
+        if (env_reserve(0, s) < 0) {
             free(s);
             rc = -1;
             goto out;
@@ -439,7 +437,7 @@ int unsetenv(const char *name)
      */
     if (env_find(name, len) < 0)
         goto out;
-    if (env_reserve(0, name, NULL) < 0) {
+    if (env_reserve(0, name) < 0) {
         rc = -1;
         goto out;
     }

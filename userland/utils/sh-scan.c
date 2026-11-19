@@ -180,14 +180,14 @@ static const char *scan_group(const char *p, char close, int nest, bool *closed)
 static void set_body(struct sh_unit *u,
                      enum sh_unit_kind kind,
                      const char *p,
-                     size_t open,
+                     size_t skip,
                      const char *end,
                      bool closed,
                      size_t close)
 {
     u->kind = kind;
-    u->body = p + open;
-    u->body_len = (size_t) (end - (p + open));
+    u->body = p + skip;
+    u->body_len = (size_t) (end - (p + skip));
     u->closed = closed;
     u->len = (size_t) (end - p) + (closed ? close : 0);
 }

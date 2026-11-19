@@ -4858,9 +4858,19 @@ static void test_namespace_open_race(void)
     }
     (void) pthread_detach(tid);
 
+    /* Progress lines: a guest that stalls here leaves the last one in the log,
+     * which says whether the open loop or the wait for the churner stopped.
+     */
+    printf("  namespace open race: churner started, %d opens\n", (int) ITERS);
+    fflush(stdout);
     clean = stale = bad = 0;
     for (int i = 0; i < ITERS; i++) {
         int fd;
+
+        if (i && i % 32 == 0) {
+            printf("  namespace open race: %d opens done\n", i);
+            fflush(stdout);
+        }
 
         errno = 0;
         fd = open("/sys/namespace-stats", O_RDONLY);
@@ -4874,6 +4884,8 @@ static void test_namespace_open_race(void)
         }
     }
 
+    printf("  namespace open race: opens done, stopping churner\n");
+    fflush(stdout);
     atomic_store_explicit(&args->stop, 1, memory_order_release);
     while (!atomic_load_explicit(&args->done, memory_order_acquire))
         (void) __sched_yield();
@@ -7315,6 +7327,27 @@ static void test_spawn_malformed_messages_fail_closed(void)
                                             sizeof(pspawn_msg.i), NULL, 0));
     check(rc == EMSGSIZE, "spawn rejects short POSIX message",
           "_PROC_POSIX_SPAWN must reject declared regions outside msglen");
+
+    /* The sender picks attr_bytes, so the file actions can start at an odd
+     * address; the receiver must refuse that rather than build a key mask.
+     */
+    {
+        static union {
+            proc_posixspawn_t m;
+            char raw[sizeof(proc_posixspawn_t) + 4096 + 1 + 8];
+        } buf;
+        proc_posixspawn_t *m = &buf.m;
+
+        memset(&buf, 0, sizeof buf);
+        m->i.type = _PROC_POSIX_SPAWN;
+        m->i.subtype = _PROC_SPAWN_START;
+        m->i.attr_bytes = 4096 + 1;
+        m->i.filact_bytes = 8;
+        rc = roottask_errno_status(
+            msg_sendnc_r(ROOTTASK_COID, &buf, sizeof buf, NULL, 0));
+        check(rc == EINVAL, "spawn rejects misaligned file actions",
+              "an odd attr_bytes must fail EINVAL, not reach key_mask_create");
+    }
 }
 
 /* End-to-end: a valid close/dup2 file-actions object must actually spawn. */
@@ -10541,6 +10574,12 @@ struct spawn_worker {
     int idx;
     int bad_spawn, bad_report, bad_exit;
     int spawn_err; /* first posix_spawn error, for the failure detail */
+    /* The first bad report: its round, whether the read itself failed, and
+     * what was read, printed when the check fails.
+     */
+    int bad_round;
+    bool bad_read;
+    char bad_line[48];
     /* Progress, read by the joining thread to name a stalled worker. */
     _Atomic int round, phase, done;
     pid_t pids[SPAWN_ROUNDS];
@@ -10626,10 +10665,19 @@ static void *spawn_worker_body(void *arg)
             WEXITSTATUS(status) != 0)
             w->bad_exit++;
         w->phase = 3; /* reading the report */
-        if (!spawn_read_report(w->pipefd[0], line, sizeof line) ||
-            strncmp(line, tag, strlen(tag)) || line[strlen(tag)] != ' ' ||
-            strtol(line + strlen(tag) + 1, NULL, 10) != (long) pid)
-            w->bad_report++;
+        bool read_ok = spawn_read_report(w->pipefd[0], line, sizeof line);
+
+        if (!read_ok || strncmp(line, tag, strlen(tag)) ||
+            line[strlen(tag)] != ' ' ||
+            strtol(line + strlen(tag) + 1, NULL, 10) != (long) pid) {
+            if (!w->bad_report++) {
+                w->bad_round = r;
+                w->bad_read = !read_ok;
+                snprintf(w->bad_line, sizeof w->bad_line, "%s",
+                         read_ok ? line : "");
+                w->bad_line[strcspn(w->bad_line, "\n")] = '\0';
+            }
+        }
     }
     w->done = 1;
     return NULL;
@@ -10820,6 +10868,13 @@ void test_spawn_concurrent(void)
                  "spawn=%d (%s) report=%d exit=%d dup_pid=%d fds %u->%u", bad_spawn,
                  spawn_err ? strerror(spawn_err) : "-", bad_report, bad_exit, dup_pid,
                  fds_before, fds_after);
+        for (int i = 0; i < piped && bad_report; i++)
+            if (w[i].bad_report)
+                printf("spawn_concurrent: w%d %d bad report(s), first in round "
+                       "%d: %s \"%s\" (pid %d)\n",
+                       i, w[i].bad_report, w[i].bad_round,
+                       w[i].bad_read ? "read failed" : "read", w[i].bad_line,
+                       (int) w[i].pids[w[i].bad_round]);
         check(!bad_spawn && !bad_report && !bad_exit && !dup_pid &&
                   fds_before == fds_after,
               "spawn_concurrent 8x100 exact argv/envp, unique pids, no fd leak",
