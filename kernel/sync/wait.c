@@ -706,7 +706,6 @@ bool rdecl thread_prio_update_dpp(thread_t *thp,
                                   kdispatch_t *dpp,
                                   int priority_inherit)
 {
-    inject_note_prio_work();
     if (!prio_apply(thp, dpp, priority_inherit, NULL))
         return false;
     prio_chain_from(thp);
@@ -715,7 +714,6 @@ bool rdecl thread_prio_update_dpp(thread_t *thp,
 
 void rdecl thread_prio_settle(thread_t *thp)
 {
-    inject_note_prio_work();
     (void) prio_apply(thp, thp->dpp, 1, NULL); /* fences first */
 }
 

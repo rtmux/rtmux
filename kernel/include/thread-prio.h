@@ -193,61 +193,22 @@ static inline bool thread_end_msg_loan(thread_t *thp, uint64_t seen)
     }
 }
 
-/* End the request loan of a server that has no client left. A receive that made
- * a client its client installs the loan after it published the link, so a
- * client that left in between found no loan to end; the loan then stays until
- * this runs. The caller applies the new effective priority.
- *
- * The fence pairs with the one in thread_client_departed: the departing side
- * stores the client link and then loads the loan, this side stores the loan and
- * then loads the link, so with both fences at least one of them sees the
- * other's store and a loan installed after the client left is ended by one of
- * them. The generation alone cannot replace that: a notification lend or a
- * REPLY propagation also bumps it, so a loan install that failed on a
- * generation change could not tell a departed client from a busy server.
- *
- * Returns whether it ended a loan.
+/* After lending thp's priority to act as its server: a timeout or signal may
+ * have sent thp away before the loan existed, with none then to end, so drop
+ * the loan of a client that is gone. A departure after this check finds the
+ * loan and ends it (force_ready).
  */
-static inline bool thread_end_orphan_loan(thread_t *srv)
+static inline void thread_drop_gone_client_loan(thread_t *act,
+                                                const thread_t *thp)
 {
-    uint64_t now;
-
-    cpu_smp_mb();
-    now = thread_msg_loan_word(srv);
-    if (__atomic_load_n(&srv->client, __ATOMIC_ACQUIRE) != NULL)
-        return false;
-    return thread_end_msg_loan(srv, now);
-}
-
-/* The one way a server stops serving `client`: take the client link, then end
- * the loan the client lent. It serves every departure: a timeout, signal or
- * channel destroy of the client (force_ready), the server naming another client
- * or none (MsgCurrent), and a receive that finds its client already gone. It
- * takes only atomics, so it is safe in timer and event context.
- *
- * Returns whether the loan ended, and so whether the server's priority must be
- * reapplied. A caller in thread context with no lock held does so with
- * thread_prio_update; one that may not (force_ready) calls
- * thread_prio_defer_settle.
- */
-static inline bool thread_client_departed(thread_t *srv, thread_t *client)
-{
-    thread_t *expect = client;
-    uint64_t seen;
-    bool ended;
-
-    /* Read the loan before the client link, as the REPLY walk does: a receive
-     * sets the new client before it bumps the generation. A vthread carries no
-     * loan.
+    /* The loan store above and the client load below must not reorder, and
+     * force_ready's client store and loan load likewise: with both fences at
+     * least one side sees the other's store, so a loan installed after the
+     * client left is ended by one of them.
      */
-    seen = TYPE_MASK(srv->type) == TYPE_THREAD ? thread_msg_loan_word(srv) : 0;
-    if (!__atomic_compare_exchange_n(&srv->client, &expect, NULL, false,
-                                     __ATOMIC_ACQ_REL, __ATOMIC_RELAXED) ||
-        TYPE_MASK(srv->type) != TYPE_THREAD)
-        return false;
-    ended = thread_end_msg_loan(srv, seen);
-    ended |= thread_end_orphan_loan(srv);
-    return ended;
+    cpu_smp_mb();
+    if (__atomic_load_n(&act->client, __ATOMIC_ACQUIRE) != thp)
+        thread_lend_msg(act, 0, false);
 }
 
 /* Whether thp's message loan came from a client (it ends when the server has no
@@ -319,32 +280,6 @@ static inline void thread_prio_update(thread_t *thp)
 {
     (void) thread_prio_update_dpp(thp, thp->dpp, 1);
 }
-
-/* A client left server srv and its loan ended (thread_client_departed) in a
- * context that may not take the PI lock or walk a wait chain (force_ready runs
- * from timer and event delivery under caller locks): queue srv on this hart's
- * list of servers whose priority is stale. The hart settles them, following the
- * chain each is blocked in as the REPLY propagation does, at its next kernel
- * exit, before it resumes or idles (thread_prio_run_deferred). srv need be
- * neither running nor ready: a server blocked on a second server is settled
- * too. Takes one leaf spinlock (LOCK_CLASS_PRIO_DEFER) and no other lock.
- */
-void rdecl thread_prio_defer_settle(thread_t *srv);
-
-/* Settle the servers queued on this hart, in thread context with no spinlock
- * held. Reapplies thread_effective_prio, so a settle another path did meanwhile
- * makes it a no-op.
- */
-void rdecl thread_prio_run_deferred(void);
-
-/* Take thp off its hart's queue before it is freed, after the RCU drain that
- * ends every departure still able to queue it and before the pin wait that ends
- * a settle already running on it.
- */
-void rdecl thread_prio_defer_cancel(thread_t *thp);
-
-/* Servers queued on each hart, for the kernel exit's cheap test. */
-extern _Atomic unsigned prio_defer_pending[CONFIG_PROCESSORS_MAX];
 
 /* Recheck after storing thp->priority directly on the IPC fast path, where thp
  * was on no queue: reapply if a concurrent loan change raced the store.

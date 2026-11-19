@@ -81,7 +81,6 @@ void *nano_query(unsigned type,
                  void *objbuf,
                  size_t objsize);
 int rdecl force_ready(thread_t *thp, unsigned err);
-void prio_defer_init(void);
 void specialret_attr specialret(thread_t *thp);
 void rdecl deliver_fault(thread_t *thp, siginfo_t *info);
 uint64_t rlimit_cpu_to_ns(uint64_t secs);
