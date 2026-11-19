@@ -31,3 +31,9 @@ void roottask_heap_note_nomem(const char *what, size_t want)
         what, want, n + 1, hs.arena, hs.used, hs.extents, hs.extent_bytes,
         hs.largest, hs.dropped, ms.bytes_in_use, ms.bytes_peak);
 }
+
+/* probe: the old heap keeps no such statistics */
+void roottask_heap_stats(struct roottask_heap_stats *st)
+{
+    *st = (struct roottask_heap_stats){0};
+}
