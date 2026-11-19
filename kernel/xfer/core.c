@@ -693,7 +693,7 @@ int xfermsg(thread_t *dthp, thread_t *sthp, size_t doff, size_t soff)
  */
 int xfermsg_bounded(thread_t *dthp, thread_t *sthp, size_t doff, size_t soff)
 {
-    int status = xfermsg_run(dthp, sthp, doff, soff, true);
+    int status = xfermsg_run(dthp, sthp, doff, soff, false);
 
     /* A cursor is for the restart of a call that yielded, not for a later call
      * that happens to look the same.
