@@ -324,6 +324,22 @@ static void unmap_fdt_nomap(void)
         if (plic_base)
             crash_if_overlap(start, end, plic_base, plic_base + plic_size,
                              "the PLIC");
+#ifdef CONFIG_MONITORING_KTHREAD
+        /* The monitor reaches PCI through the ECAM and window maps made above;
+         * unmapping any of them would fault it on its first access.
+         */
+        if (pci_fdt.ecam_size)
+            crash_if_overlap(start, end, pci_fdt.ecam_base,
+                             pci_fdt.ecam_base + pci_fdt.ecam_size,
+                             "the PCI ECAM");
+        for (unsigned w = 0; w < pci_fdt.num_windows; w++) {
+            if (pci_fdt.windows[w].size)
+                crash_if_overlap(
+                    start, end, pci_fdt.windows[w].cpu_addr,
+                    pci_fdt.windows[w].cpu_addr + pci_fdt.windows[w].size,
+                    "a PCI window");
+        }
+#endif
         /* The identity map, then its high-VA mirror. */
         for (unsigned v = 0; v < 2; v++) {
             uintptr_t off = v ? KERNEL_VIRT_BASE : 0;

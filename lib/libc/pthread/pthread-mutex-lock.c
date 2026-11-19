@@ -26,7 +26,7 @@ int(pthread_mutex_lock)(pthread_mutex_t *mutex)
      * EOWNERDEAD if the holder dies. Keep the lockless fast path for the
      * others.
      */
-    if ((mutex->count & (RTMUX_SYNC_PRIOCEILING | RTMUX_SYNC_ROBUST)) != 0) {
+    if ((mutex->count & RTMUX_SYNC_KERNEL_PATH) != 0) {
         unsigned long depth_mask = rtmux_sync_depth_mask(mutex->count);
 
         /* A re-lock by the current owner of a RECURSIVE mutex recurses in user

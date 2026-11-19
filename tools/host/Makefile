@@ -587,7 +587,9 @@ host-fuzz:
 	    -print_final_stats=1 $(FUZZ_CORPUS)/vfprintf
 
 clean:
-	$(Q)rm -f $(PROGS) $(BUILD_BASE)/strftime-asan-test
+	$(Q)rm -f $(PROGS) $(BUILD_BASE)/strftime-asan-test $(BUILD_BASE)/tz-asan-test \
+	    $(BUILD_BASE)/sh-host $(BUILD_BASE)/malloc-nostats-bench
+	$(Q)rm -rf $(TZ_ZONES)
 	$(Q)rm -rf $(FUZZ_OUT)
 
 .PHONY: all clean host-tests cap-table-test host-sanitize host-fuzz

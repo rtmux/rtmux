@@ -53,7 +53,11 @@ Per-map admission is the enforced control today, and it applies two per-process
 caps. rlimit_blown in servers/roottask/mem/mm-rlimit.c refuses a new mapping
 with ENOMEM when it would take the process's address space past its RLIMIT_AS
 soft limit, or its private anonymous memory (heap, thread stacks and anonymous
-loader segments; not the primary stack) past its RLIMIT_DATA soft limit. The check runs
+loader segments; not the primary stack) past its RLIMIT_DATA soft limit. The
+primary stack has its own cap: setup_mappings in
+servers/roottask/mem/as/mmap.c refuses it with ENOMEM when the part it backs
+up front is larger than the RLIMIT_STACK soft limit. The RLIMIT_AS and
+RLIMIT_DATA check runs
 under the address space's write lock, so concurrent mappers of one process
 cannot exceed a limit together. A MAP_FIXED replacement is checked on the total
 after the replaced ranges are uncharged, and munmap uncharges what it removes,

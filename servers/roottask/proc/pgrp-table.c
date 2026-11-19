@@ -9,9 +9,16 @@
 #include <stddef.h>
 #include "pgrp-table.h"
 
+/* A pid is a 12-bit slot index under a generation, and each reuse of a slot
+ * adds 4096, a multiple of the bucket count: the index alone would put every
+ * generation of one slot in one chain. Fold the generation into the index so
+ * that groups named for successive holders of a slot spread out.
+ */
 static unsigned pgrp_bucket(pid_t pgid)
 {
-    return (unsigned) pgid % PGRP_TABLE_BUCKETS;
+    unsigned p = (unsigned) pgid;
+
+    return (p ^ (p >> 12)) % PGRP_TABLE_BUCKETS;
 }
 
 /* The node of group pgid, or NULL. *link, if link is not NULL, is left at the

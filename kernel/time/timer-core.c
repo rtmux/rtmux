@@ -1002,7 +1002,16 @@ static void timer_activate_impl(ktimer_t *tip, int defer)
 
     WHEEL_LOCK();
 
-    CRASHCHECK(tip->queue);
+#ifndef NDEBUG
+    /* CRASHCHECK(tip->queue), naming the timer. crash_halt writes to the crash
+     * buffer, so it never waits on the console lock with the wheel held.
+     */
+    if (tip->queue)
+        crash_halt("timer: activating %p, already queued on %p (flags 0x%x, "
+                   "itime %llu)",
+                   (void *) tip, (void *) tip->queue, (unsigned) tip->flags,
+                   (unsigned long long) tip->itime.nsec);
+#endif
     tip->flags |= RTMUX_TI_ACTIVE;
 
     if (tip->flags & RTMUX_TI_ABSOLUTE) {

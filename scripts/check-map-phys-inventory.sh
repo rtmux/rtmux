@@ -34,7 +34,7 @@ bad=$(
     grep -Ev '^servers/virtio-mmio/main\.c:' |
     grep -Ev '^servers/roottask/(include/root-process\.h|mem/.*|path/cpiofs\.c|path/devmem\.c|proc/detach\.c|proc/kext-wrappers\.c|sys/loader-elf\.c):' |
     grep -Ev '^tests/userland/capgate\.c:' |
-    grep -Ev '^tests/userland/rt-latency/(irq-latency|irq-notify|lkl-contain-test|lkl-iommu-probe|preempt-latency|tracelogger)\.c:' |
+    grep -Ev '^tests/userland/rt-latency/(ipc-roundtrip|irq-latency|irq-notify|lkl-contain-test|lkl-iommu-probe|preempt-latency|tracelogger)\.c:' |
     grep -Ev '^userland/dev-nvme/main\.c:' |
     grep -Ev '^userland/dev-serial-(8250|sifive)/main\.c:' || true
 )

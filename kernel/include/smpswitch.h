@@ -71,8 +71,10 @@ _Static_assert(CONFIG_PROCESSORS_MAX <= 64,
 /* online_cpu_mask — the logical CPUs that have joined and are running: the boot
  * CPU from kernel init, an AP when it publishes pc_alive (cpu_idle), and never
  * a hart that failed to start or arrived late. The bit is set just before
- * pc_alive, so whoever waits for pc_alive finds it set. Every loop that visits
- * other CPUs, signals one or waits for one tests cpu_online();
+ * pc_alive, so whoever waits for pc_alive finds it set. Every loop that signals
+ * other CPUs or waits for one tests cpu_online(). Scheduler queue scans do not:
+ * idle_pick_thread() and select_thread_default() visit every CPU's queue so a
+ * thread queued on an AP that was dropped or has not joined is still taken.
  * LEGAL_CPU_BITMASK differs only in still holding an AP that has not joined
  * yet, which the scheduler may queue a thread for. send_ipi() refuses a CPU
  * outside LEGAL_CPU_BITMASK and counts the attempt in pc_ipi_refused.

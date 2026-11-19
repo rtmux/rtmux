@@ -111,6 +111,13 @@ int main(void)
               "-c 4 is refused");
     }
     {
+        char *av[] = {"pci", "-c", "5", NULL};
+
+        a = defaults();
+        CHECK(RUN(av, &first, &bad, &a) == PCI_ARGS_BAD_CLASS,
+              "-c 5 is refused");
+    }
+    {
         char *av[] = {"pci", "-n", "3", NULL};
 
         a = defaults();

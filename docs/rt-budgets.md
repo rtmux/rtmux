@@ -661,16 +661,19 @@ message has ended (see `msg_readiov` in sys/rtmux-core.h). In the preemption
 inventory the loop is now `bounded`, with `cap:` VIOV_STEP_MAX.
 
 The offset skip is charged and resumable (K21). Each entry the offset skips
-costs one step against the same VIOV_STEP_MAX, so one call spends at most 128
-steps on the entries before the offset, then at most 128 more on the parts. A
+costs one step against the same VIOV_STEP_MAX, and the skips and the parts
+share one step counter (`steps` in `viov_to_piov`): one call charges at most
+128 steps in all, the skipped entries first and the parts with what is left,
+with the step that makes the first part free. A
 call that spends the skip budget before it has a part cannot return the parts
 so far, because it has none, and a return of 0 already means the message has
 ended. It returns -1 with EINTR instead, having written how far it got to the
 `struct _iov_cursor` the caller passed in the sixth argument. The cursor holds
 the index of the entry that has the next unread byte and the bytes of the iov
 before it. The caller keeps one cursor per message and passes it to every call;
-the kernel starts at the entry it names, so a continuation rereads nothing and the skips of a whole message add
-up to one pass over its entries. A caller that passes no cursor has nowhere to
+the kernel starts at the entry it names, so a continuation rereads only that
+entry, never the ones before it, and the skips of a whole message add up to
+one pass over its entries. A caller that passes no cursor has nowhere to
 keep that progress, so a skip longer than the budget fails with E2BIG. The
 state lives with the caller, not on the reply-blocked client: an rcvid names a
 connection and a thread slot but not one message, so a cursor cached on the
@@ -762,11 +765,8 @@ reports it. msg_sendv checks that its send and reply arrays lie inside the
 caller's boundary and are no longer than XFER_IOV_LIMIT entries, as
 msg_receivev always has, and fails with EFAULT before reading them.
 
-Not bounded by this: a wake from a timer or an interrupt does not preempt a
-running user thread before the next scheduler tick on this tree (see the
-interrupt-wake gap below), so no test can time the gap between two restarts of
-one call from user space; and the loops that total and check the send, receive
-and reply vectors of msg_sendv, msg_receivev and msg_replyv before the copy are
+Not bounded by this: the loops that total and check the send, receive and
+reply vectors of msg_sendv, msg_receivev and msg_replyv before the copy are
 still not stepped (an array of up to XFER_IOV_LIMIT entries, now at least
 inside the caller's space, is read in one kernel entry).
 
@@ -822,8 +822,8 @@ metric: p99 and max latency of one msg_readiov call (rdtime span, upper bound on
 command: scripts/qemu-regress.sh --mode ipc-roundtrip --timeout 600 (readiov-large line)
 config: local host (48 cores, load average 20 to 35 from other guests), CPUS=1, QEMU 11.0.0 TCG virt 256 MB, bundled OpenSBI, 64 MiB message, 16384-entry output array, 4 walks
 baseline: max 7108400 ns (one boot) and max 7780900 ns, p99 6795300 ns (a second boot): the whole message in 1 call per walk, without the step cap (dev 98d4eb5 plus the readiov-large check)
-result: VIOV_STEP_MAX 128, 128 calls per walk, 512 calls per boot: max 124000 ns on a quieter boot, then p99 212700 to 260000 ns and max 329300 ns to 2197900 ns on four loaded boots (the 2.2 ms max is host descheduling: same cap, same boot class)
-rollback-threshold: a p99 per call above 250000 ns, or a walk that takes one call or fails to cover the message, withdraws the cap claim
+result: VIOV_STEP_MAX 128, 128 calls per walk, 512 calls per boot: max 124000 ns on a quieter boot, then p99 212700 to 260000 ns and max 329300 ns to 2197900 ns on four loaded boots (the 2.2 ms max is host descheduling: same cap, same boot class); the 260000 ns p99 is above the per-call threshold below, so these loaded boots do not settle it and a reference-host run of the readiov-large line is still owed
+rollback-threshold: a walk that takes one call or fails to cover the message withdraws the cap claim on any host; a p99 per call above 250000 ns on the reference host withdraws it as well
 ```
 
 ```perf-evidence

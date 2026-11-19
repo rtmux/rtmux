@@ -276,7 +276,7 @@ void kext_process_create(void *data)
 
     /* Link the new process in as a child of its creator. */
     prp->child = NULL;
-    prp->parent = parent;
+    __atomic_store_n(&prp->parent, parent, __ATOMIC_RELEASE);
     kspinlock_lock(&parent->vec_slock);
     prp->sibling = parent->child;
     parent->child = prp;
@@ -420,7 +420,7 @@ void kext_process_destroy(void *data)
         if (!(prp = vector_lookup(&process_vector, PINDEX(pid))) ||
             prp->pid != pid || prp->destroying)
             err = ESRCH;
-        else if (prp->querying)
+        else if (prp->querying || prp->reparenting)
             err = EAGAIN;
         else
             prp->destroying = true;
@@ -445,19 +445,28 @@ void kext_process_destroy(void *data)
             break;
         }
         prp->child = child->sibling;
-        child->parent = proc;
-        child->sibling = proc->child;
-        proc->child = child;
-        --prp->num_processes;
-        ++proc->num_processes;
         if (proc_hooks->proc_threads_destroyed &&
             (((child->flags & (RTMUX_FLG_PROC_LOADING | RTMUX_FLG_PROC_TERMING |
                                RTMUX_FLG_PROC_ZOMBIE)) ==
               RTMUX_FLG_PROC_ZOMBIE) ||
              (child->flags & RTMUX_FLG_PROC_NOZOMBIE))) {
-            child->flags &= ~(RTMUX_FLG_PROC_ZOMBIE | RTMUX_FLG_PROC_WAITINFO);
+            __atomic_fetch_and(
+                &child->flags,
+                ~(unsigned) (RTMUX_FLG_PROC_ZOMBIE | RTMUX_FLG_PROC_WAITINFO),
+                __ATOMIC_RELAXED);
             send_event = 1;
         }
+
+        /* The flags go before the new parent is published, so that a lockless
+         * reader (kext_proc_query) that sees the new parent cannot still see
+         * the ZOMBIE this takes on itself the reap of, and destroy the child
+         * under the callback below.
+         */
+        __atomic_store_n(&child->parent, proc, __ATOMIC_RELEASE);
+        child->sibling = proc->child;
+        proc->child = child;
+        --prp->num_processes;
+        ++proc->num_processes;
         process_child_locks_unlock(prp, proc);
 
         if (send_event) {
@@ -594,20 +603,35 @@ void kext_process_destroy(void *data)
      */
 
     /* Unlink from parent under parent->vec_slock */
-    parent = prp->parent;
-    kspinlock_lock(&parent->vec_slock);
+    for (;;) {
+        parent = __atomic_load_n(&prp->parent, __ATOMIC_ACQUIRE);
+        kspinlock_lock(&parent->vec_slock);
+
+        /* The parent's own teardown moves its children to the kernel process
+         * under the old parent's lock, so a parent still named after the lock
+         * is taken stays the parent. That move happens at most once, so this
+         * retries at most once; kext_reparent cannot run here, because the
+         * destroying claim above keeps it out.
+         */
+        if (__atomic_load_n(&prp->parent, __ATOMIC_ACQUIRE) == parent)
+            break;
+        kspinlock_unlock(&parent->vec_slock);
+    }
     --parent->num_processes;
     if (prp == parent->child) {
         parent->child = prp->sibling;
     } else {
-        for (parent = parent->child; parent; parent = parent->sibling) {
-            if (parent->sibling == prp) {
-                parent->sibling = prp->sibling;
+        process_t *sib;
+
+        for (sib = parent->child; sib; sib = sib->sibling) {
+            if (sib->sibling == prp) {
+                sib->sibling = prp->sibling;
                 break;
             }
         }
     }
-    kspinlock_unlock(&prp->parent->vec_slock);
+    /* The lock taken above, not a fresh read of prp->parent. */
+    kspinlock_unlock(&parent->vec_slock);
 
     /* Revoke every process capability naming this dying process across all
      * process tables before its soul is recycled, mirroring the connection
@@ -1011,6 +1035,14 @@ static inline uint64_t pshut_ticks(void)
     return cpu_clock_ticks();
 }
 
+/* Cycles to ns without forming cyc * 1e9, which wraps past about 1.8e10 cycles:
+ * whole seconds first, then the remainder, which is below cps.
+ */
+static uint64_t pshut_ns(uint64_t cyc, uint64_t cps)
+{
+    return cyc / cps * 1000000000ULL + cyc % cps * 1000000000ULL / cps;
+}
+
 /* Print the teardown cost in ns. Called throttled from clock_handler next to
  * nonpreempt_report(), outside any lock.
  */
@@ -1035,10 +1067,10 @@ void process_shutdown_report(void)
         "total_avg_ns=%llu total_max_ns=%llu\n",
         (unsigned long long) n, (unsigned long long) (visit_sum / n),
         (unsigned long long) visit_max,
-        (unsigned long long) (unbind_sum / n * 1000000000ULL / cps),
-        (unsigned long long) (unbind_max * 1000000000ULL / cps),
-        (unsigned long long) (total_sum / n * 1000000000ULL / cps),
-        (unsigned long long) (total_max * 1000000000ULL / cps));
+        (unsigned long long) pshut_ns(unbind_sum / n, cps),
+        (unsigned long long) pshut_ns(unbind_max, cps),
+        (unsigned long long) pshut_ns(total_sum / n, cps),
+        (unsigned long long) pshut_ns(total_max, cps));
 }
 #else
 static inline uint64_t pshut_ticks(void)
@@ -1339,23 +1371,46 @@ void kext_thread_tls(void *data)
 
 
 struct reparent_args {
-    process_t *prp;
+    pid_t pid;
 };
 
 /* kext_reparent — reparent a process onto kernel_threads_prp.
  *
  * Unlinks the process from its current parent's child list and links it into
  * kernel_threads_prp's child list, adjusting num_processes on both. Parameters:
- *   data : struct reparent_args * (prp)
+ *   data : struct reparent_args * (pid, generation included)
+ *
+ * The caller names the process by pid, not by pointer: roottask can destroy a
+ * dying process without holding its slot lock, so a pointer it looked up
+ * earlier may already be freed. The lookup pins the process the way an
+ * in-flight query does, so kext_process_destroy answers EAGAIN, and the caller
+ * of destroy retries, until the move is done. Fails with ESRCH when the pid is
+ * stale or its teardown has already been claimed.
  */
 void kext_reparent(void *data)
 {
     struct reparent_args *args = data;
-    process_t *prp = args->prp;
-    process_t *old_parent = prp->parent;
+    pid_t pid = args->pid;
+    thread_t *act = get_active_thread(get_cpunum());
+    process_t *prp;
+    process_t *old_parent;
     process_t *new_parent = kernel_threads_prp;
     process_t **pp;
 
+    kspinlock_lock(&process_vector_slock);
+    prp = vector_lookup(&process_vector, PINDEX(pid));
+    if (!prp || prp->pid != pid || prp->destroying || prp->reparenting) {
+        kspinlock_unlock(&process_vector_slock);
+        kcall_err(act, ESRCH);
+        return;
+    }
+    prp->reparenting = true;
+    kspinlock_unlock(&process_vector_slock);
+
+    /* Only destroy changes the parent besides this call, and the pin above
+     * keeps destroy out, so the parent read here stays the parent.
+     */
+    old_parent = __atomic_load_n(&prp->parent, __ATOMIC_ACQUIRE);
     process_child_locks_lock(old_parent, new_parent);
 
     /* Unlink from old parent's child list */
@@ -1368,12 +1423,17 @@ void kext_reparent(void *data)
     --old_parent->num_processes;
 
     /* Link into new parent's child list */
-    prp->parent = new_parent;
+    __atomic_store_n(&prp->parent, new_parent, __ATOMIC_RELEASE);
     prp->sibling = new_parent->child;
     new_parent->child = prp;
     ++new_parent->num_processes;
 
     process_child_locks_unlock(old_parent, new_parent);
+
+    kspinlock_lock(&process_vector_slock);
+    prp->reparenting = false;
+    kspinlock_unlock(&process_vector_slock);
+    SETKSTATUS(act, EOK);
 }
 
 

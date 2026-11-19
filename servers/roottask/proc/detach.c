@@ -32,6 +32,7 @@ int proc_detach(ioserv_context_t *ctp, proc_detach_t *msg)
     process_t *prp;
     root_proc_info_t qinfo;
     pid_t pid;
+    int rc;
 
     pid = ctp->info.pid;
     if (!(prp = root_proc_lock(pid)))
@@ -58,13 +59,14 @@ int proc_detach(ioserv_context_t *ctp, proc_detach_t *msg)
     root_proc_unlock(pid);
     proc_nozombie(pid, msg->i.status);
 
-    /* Reparent to pid 1 (priv body lives in kernel/ext/reparent.c). */
+    /* Reparent to pid 1 (priv body is kext_reparent in kernel/ext/process.c).
+     */
     if (!(prp = root_proc_lock(pid)))
         return ESRCH;
-    process_reparent(prp);
+    rc = process_reparent(pid);
 
     root_proc_unlock(pid);
-    return EOK;
+    return rc;
 }
 
 /* proc_phys_contain — handle _PROC_PHYS_CONTAIN.

@@ -142,6 +142,27 @@ static inline void thread_lend_msg(thread_t *thp, unsigned prio, bool request)
                                           __ATOMIC_RELEASE, __ATOMIC_RELAXED));
 }
 
+/* End a notification loan: a SchedSet replaces the priority a received
+ * notification lent, as it replaced the priority the receive wrote into the
+ * base before loans were separate. A request loan stays, since its client still
+ * waits on thp, and so does a PI or ceiling loan. The caller then applies the
+ * new effective priority.
+ */
+static inline void thread_end_notification_loan(thread_t *thp)
+{
+    uint64_t old, next;
+
+    if (TYPE_MASK(thp->type) != TYPE_THREAD)
+        return;
+    old = __atomic_load_n(&thp->msg_loan, __ATOMIC_RELAXED);
+    do {
+        if ((old & MSG_LOAN_REQUEST) || !(old & MSG_LOAN_PRIO_MASK))
+            return;
+        next = (old & ~(MSG_LOAN_GEN_ONE - 1)) + MSG_LOAN_GEN_ONE;
+    } while (!__atomic_compare_exchange_n(&thp->msg_loan, &old, next, false,
+                                          __ATOMIC_RELEASE, __ATOMIC_RELAXED));
+}
+
 /* The loan word, for a later thread_relend_msg(). */
 static inline uint64_t thread_msg_loan_word(const thread_t *thp)
 {
@@ -300,6 +321,15 @@ static inline unsigned channel_pending_loan_locked(channel_t *chp)
  * The caller holds no spinlock. Defined in kernel/sync/wait.c.
  */
 void rdecl channel_lend_pending(channel_t *chp, unsigned pending, bool walk);
+
+/* Set thp's pending-send loan again from the queue of the channel it last
+ * received on, or to nothing when that channel is gone. A loan is otherwise
+ * reset only by thp's own next receive or reply, so a thread that received once
+ * and moved on keeps the priority of a send another thread has long since
+ * taken. The caller holds no spinlock and then applies the new effective
+ * priority. Defined in kernel/ipc/fastmsg.c.
+ */
+void rdecl thread_pend_loan_resettle(thread_t *thp);
 
 /* Bring thp->priority to thread_effective_prio(thp) through adjust_priority,
  * then carry the change along the chain thp is blocked in: a PI mutex it waits

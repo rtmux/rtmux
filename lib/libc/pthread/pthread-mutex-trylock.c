@@ -17,7 +17,7 @@ int(pthread_mutex_trylock)(pthread_mutex_t *mutex)
     unsigned long owner, id = LIBC_TLS()->__owner;
     int ret;
 
-    if ((mutex->count & (RTMUX_SYNC_PRIOCEILING | RTMUX_SYNC_ROBUST)) != 0) {
+    if ((mutex->count & RTMUX_SYNC_KERNEL_PATH) != 0) {
         unsigned long depth_mask = rtmux_sync_depth_mask(mutex->count);
 
         /* Re-lock by the owner: recurse in user space if the type allows (a

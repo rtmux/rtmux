@@ -41,8 +41,9 @@
  * Storage: one "struct pcpu" per slot in "pcpu_array[PROCESSORS_MAX]", defined
  * in kernel/core/globals.c. startup_entry stamps slot 0 for the boot hart and
  * syspage_init the others before any AP starts; from then on the struct is
- * CPU-local except for the cross-CPU fields (pc_ipicmds, pc_alive) which are
- * written by remote senders.
+ * CPU-local except for the cross-CPU fields: pc_ipicmds and
+ * pc_ipi_refused are written by remote senders, and pc_alive is published by
+ * the CPU it describes (cpu_idle) and read by its peers.
  *
  * Required prior includes:
  *   <inttypes.h>           (uint32_t, uint64_t, uintptr_t)
@@ -183,7 +184,7 @@ _Static_assert((sizeof(struct pcpu) & (sizeof(struct pcpu) - 1)) == 0,
  *
  * Use:
  *   - self-hart:   get_pcpu()               (reads tp, no chain)
- *   - cross-hart:  &pcpu_array[remote_hart]
+ *   - cross-hart:  &pcpu_array[remote_cpu]  (logical CPU, not hart_ids[])
  *
  * The get_pcpu() accessor is defined in <arch/runtime.h>.
  */

@@ -9,6 +9,10 @@
 - `qemu-system-riscv64` and OpenSBI firmware (`scripts/emu.sh` uses a system
   copy when present, otherwise QEMU's built-in one).
 - `git` and `python3`. Kconfiglib is cloned on demand into `tools/kconfig/`.
+- `zic`, the time zone compiler (`libc-bin` on Debian/Ubuntu, in the base
+  system on macOS; override with `ZIC=`). `scripts/gen-zoneinfo.sh` compiles
+  the pinned zone files into the image's `/usr/share/zoneinfo`, and
+  `scripts/emu.sh` stops when it is missing.
 - For the LKL servers: a `riscv64-linux-gnu-` cross toolchain (to build the
   archive from `lkl/linux`) and `e2fsprogs`.
 

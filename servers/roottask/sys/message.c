@@ -54,6 +54,18 @@ static int root_dispatch_handler(dispatch_context_t *ctp)
 {
     int ret = dispatch_handler(ctp);
 
+    /* A block function that fails at once, every time, makes the pool reblock
+     * in a loop that never sleeps; say so, a few times, with the errno.
+     */
+    if (!ctp) {
+        static atomic_uint nulls;
+        unsigned n = atomic_fetch_add(&nulls, 1);
+
+        if ((n & 0x3ff) == 0)
+            root_log("roottask: receive returned no context (errno %d) x%u\n",
+                     errno, n + 1);
+    }
+
     /* dispatch_handler accepts a NULL context (the block function came out
      * early on a signal or error) and tells the pool to reblock.
      */

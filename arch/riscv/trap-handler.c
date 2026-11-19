@@ -1330,12 +1330,12 @@ void strap_handler_c(CPU_REGISTERS *regs)
             /* Descend only through interior entries: an L2 leaf's PPN names the
              * mapped memory, not an L1 table.
              */
-            if ((l2e & PTE_V) && !(l2e & (PTE_R | PTE_W | PTE_X))) {
+            if ((l2e & PTE_V) && !sv39_is_leaf(l2e)) {
                 pagetable_t l1 =
                     (pagetable_t) ((PTE2PA(l2e)) + KERNEL_VIRT_BASE);
                 unsigned long l1e = (unsigned long) l1[l1_idx];
                 kprintf("  pgwalk:   L1@%p[%u]=%lx\n", l1, l1_idx, l1e);
-                if ((l1e & PTE_V) && !(l1e & (PTE_R | PTE_W | PTE_X))) {
+                if ((l1e & PTE_V) && !sv39_is_leaf(l1e)) {
                     pagetable_t l0 =
                         (pagetable_t) ((PTE2PA(l1e)) + KERNEL_VIRT_BASE);
                     unsigned l0_idx = (unsigned) ((stval >> 12) & 0x1ff);

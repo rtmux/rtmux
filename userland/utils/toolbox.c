@@ -150,6 +150,7 @@ static const struct toolbox_applet applets[] = {
      "fail-alloc POOL PID | fail-turnstile PID | alloc-status | "
      "fail-sched-set PID COUNT | sched-set-status | "
      "sched-set-displaced MIN | stall-lock PID MS | "
+     "stall-lock-early PID MS | stall-lock-propagated PID MS | "
      "stall-force-ready PID MS | pte-superpage PID VA | "
      "pte-clear-superpage PID VA | pte-probe PID VA | "
      "fail-pte-map PID PAGES | manip-partial MIN | "

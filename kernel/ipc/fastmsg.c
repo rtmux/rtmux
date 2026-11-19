@@ -1496,6 +1496,49 @@ int kdecl ksys_msg_sendv(thread_t *act, struct kcall_args_msg_sendv *kap)
  *   kap : kcall args (coid, priority, notification code, notification value)
  * Return value: EOK on success; an errno on failure.
  */
+void rdecl thread_pend_loan_resettle(thread_t *thp)
+{
+    int32_t last = thp->last_chid;
+    unsigned chid = (unsigned) last;
+    vector_t *chvec = &thp->process->chancons;
+    kspinlock_t *lookup_lock = &thp->process->vec_slock;
+    channel_t *chp;
+
+    if (TYPE_MASK(thp->type) != TYPE_THREAD)
+        return;
+    if (last < 0) {
+        thread_set_pend_loan(thp, 0);
+        return;
+    }
+    if (chid & RTMUX_GLOBAL_CHANNEL) {
+        chid &= ~RTMUX_GLOBAL_CHANNEL;
+        chvec = &global_channel_vector;
+        lookup_lock = &global_channel_slock;
+    }
+
+    /* The read section keeps chp from being freed between the lookup and its
+     * lock, as it does for a receive.
+     */
+    rcu_read_lock(&connobj_rcu);
+    kspinlock_lock(lookup_lock);
+    chp = vector_lookup(chvec, chid);
+    kspinlock_unlock(lookup_lock);
+    if (!chp || chp->type != TYPE_CHANNEL) {
+        thread_set_pend_loan(thp, 0);
+    } else {
+        /* Under chp->lock, so a send queued meanwhile raises after it. A
+         * receive on another channel since the read above owns the loan now.
+         */
+        kspinlock_lock(&chp->lock);
+        if (thp->last_chid == last)
+            thread_set_pend_loan(thp, thp->last_chid == chp->chid
+                                          ? channel_pending_loan_locked(chp)
+                                          : 0);
+        kspinlock_unlock(&chp->lock);
+    }
+    rcu_read_unlock(&connobj_rcu);
+}
+
 /* A received notification lends its priority to its receiver until the next
  * receive; a fixed-priority channel lends nothing and drops a loan left from an
  * earlier receive. Either way the receiver moves to its process's default

@@ -646,6 +646,11 @@ static int64_t median_i64(int64_t *v, int n)
 
 struct cputime_round {
     int64_t med_err, med_dcpu, med_dbusy;
+
+    /* The spread of the per-pair errors, for the failure detail: a small bias
+     * in every pair and a few large outliers have different causes.
+     */
+    int64_t err_min, err_q1, err_q3, err_max;
     uint64_t dbusy_total, spin_cpu, spin_busy, spin_wall;
     uint64_t ctl_cpu, ctl_wall;
 };
@@ -674,7 +679,11 @@ static void cputime_round_run(struct cputime_round *r, int pairs, int per_block)
         r->ctl_wall += cw;
         r->dbusy_total += (uint64_t) (dbusy > 0 ? dbusy : 0);
     }
-    r->med_err = median_i64(err, pairs);
+    r->med_err = median_i64(err, pairs); /* sorts err */
+    r->err_min = err[0];
+    r->err_q1 = err[pairs / 4];
+    r->err_q3 = err[pairs * 3 / 4];
+    r->err_max = err[pairs - 1];
     r->med_dcpu = median_i64(dcpu_v, pairs);
     r->med_dbusy = median_i64(dbusy_v, pairs);
 }
@@ -686,7 +695,7 @@ static void test_cputime_short_bursts(void)
     struct cputime_round r;
     uint64_t res_ns = 0, tol = 0, c0, c1;
     int round, ok_pair = 0, ok_totals = 0, ok_dcpu = 0, ok_ctl = 0;
-    char detail[300], hist[100] = "";
+    char detail[400], hist[100] = "";
 
     if (clock_getres(CLOCK_MONOTONIC, &res) == 0)
         res_ns = ts_ns(&res);
@@ -749,12 +758,14 @@ static void test_cputime_short_bursts(void)
         round = ROUNDS;
     snprintf(detail, sizeof detail,
              "attempt %d: median pair err=%lld ns (x%d=%lld) tol=%llu "
-             "med dcpu=%lld dbusy=%lld dbusy_total=%llu res=%llu ns errs:%s",
+             "med dcpu=%lld dbusy=%lld dbusy_total=%llu res=%llu ns errs:%s "
+             "pair err min=%lld q1=%lld q3=%lld max=%lld",
              round, (long long) r.med_err, PAIRS,
              (long long) r.med_err * PAIRS, (unsigned long long) tol,
              (long long) r.med_dcpu, (long long) r.med_dbusy,
              (unsigned long long) r.dbusy_total, (unsigned long long) res_ns,
-             hist);
+             hist, (long long) r.err_min, (long long) r.err_q1,
+             (long long) r.err_q3, (long long) r.err_max);
     check(ok_pair, "cputime_short_bursts", detail);
     snprintf(detail, sizeof detail,
              "attempt %d: spin cpu=%llu busy=%llu wall=%llu", round,
@@ -1124,10 +1135,9 @@ static void test_rlimit_inherit(void)
  * case restores the process's limits when it is done.
  *
  * The process's usage is not exported, so rlm_usage finds it: with the soft
- * limit at L bytes a one-page private anonymous mapping fits exactly when
- * usage + page <= L, so a binary search over L recovers usage to the page. The
- * cases then set the limit to usage plus RLM_N chunks and check where mapping
- * stops.
+ * limit at L bytes a one-page private anonymous mapping fits exactly when usage
+ * + page <= L, so a binary search over L recovers usage to the page. The cases
+ * then set the limit to usage plus RLM_N chunks and check where mapping stops.
  */
 #define RLM_PAGE 4096UL
 #define RLM_CHUNK (64UL * 1024)
@@ -1188,8 +1198,9 @@ static size_t rlm_usage(int res)
     return (hi - 1) * RLM_PAGE;
 }
 
-/* Map RLM_CHUNK pieces into v[] until one fails or max are held. Returns the
- * count; *err is the failing errno, or 0 if none failed.
+/* Map RLM_CHUNK pieces into v[] until one fails or max are held.
+ *
+ * Returns the count; *err is the failing errno, or 0 if none failed.
  */
 static int rlm_fill(void **v, int max, int *err)
 {
@@ -1365,8 +1376,8 @@ static void test_rlimit_data(void)
     check(err == ENOMEM, "rlimit_data: private mmap past the limit fails ENOMEM",
           strerror(err));
 
-    /* MAP_ELF and MAP_STACK are not a way out: anonymous private memory is
-     * data either way.
+    /* MAP_ELF and MAP_STACK are not a way out: anonymous private memory is data
+     * either way.
      */
     err = rlm_try_mapf(big, MAP_PRIVATE | MAP_ANON | MAP_ELF);
     check(err == ENOMEM, "rlimit_data: MAP_ELF anonymous mmap is charged as data",

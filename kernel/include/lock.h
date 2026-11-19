@@ -118,8 +118,9 @@ enum lock_class {
     LOCK_CLASS_SOUL,       /* object soul freelists + accounting (soul_slock):
                             * ranked after the object locks that callers hold on
                             * an object_alloc/object_free path (CHANNEL, PROCVEC,
-                            * THREAD, TIMER, INTREVENT) and before MEMPART so a
-                            * grow/shrink may nest SOUL -> MEMPART into the heap.
+                            * THREAD, TIMER, INTREVENT) and before MEMPART: only
+                            * a free that returns a block to the heap nests
+                            * SOUL -> MEMPART; a grow allocates with it released.
                             */
     LOCK_CLASS_MEMPART,    /* memory partition / heap */
     LOCK_CLASS_PA,         /* physical quantum allocator (pa_slock):
