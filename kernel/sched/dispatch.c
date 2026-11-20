@@ -2105,6 +2105,11 @@ static void rdecl ready_default(thread_t *thp)
     /* If new thread is higher priority we make it active */
     act = get_active_thread(get_cpunum());
     if (!act) {
+        /* Set the activation time, clear the consumed, as the path below does
+         * for a hart with an active thread.
+         */
+        SS_MARK_ACTIVATION(thp);
+
         /* Only idle harts steal from another dispatch queue, so a busy legal
          * hart must be handed thp directly.
          */
