@@ -144,6 +144,9 @@ int fdmem_done(path_object_t *obp)
             fdmem_zombies = obp;
             ++fdmem_zombie_gen;
             ++fdmem_zombie_count;
+            /* Wake a cleaner waiting on opens once, as it turns forced. */
+            if (fdmem_zombie_count == MMAPFD_STALES_HIGHWATER + 1)
+                pthread_cond_broadcast(&fdmem_condvar);
             (void) vm_fd_compact();
         }
     } else if (obp->hdr.next) {
@@ -593,11 +596,19 @@ static int vm_fd_cleanup(message_context_t *ctp,
                 break;
             if (pa_free_size() < MIN_MEM_FREE_SIZE)
                 force = 1;
-            if (force) {
-                atomic_or(&fdmem_close_lock, MMAPFD_CLOSE_WAIT);
-            }
-            while (fdmem_open_lock) {
-                /* opening operation is still on, need to wait */
+            for (;;) {
+                /* Checked before every wait, so fdmem_done only has to wake us
+                 * when the count crosses the mark while we sleep.
+                 */
+                force |= fdmem_zombie_count > MMAPFD_STALES_HIGHWATER;
+                if (force)
+                    atomic_or(&fdmem_close_lock, MMAPFD_CLOSE_WAIT);
+                if (!fdmem_open_lock)
+                    break;
+
+                /* opening operation is still on, need to wait; fdmem_done wakes
+                 * us when the list passes the highwater mark.
+                 */
                 pthread_cond_wait(&fdmem_condvar, &fdmem_mutex);
             }
             atomic_clr(&fdmem_close_lock, MMAPFD_CLOSE_WAIT);
@@ -617,14 +628,14 @@ static int vm_fd_cleanup(message_context_t *ctp,
                 fdmem_cleaner_object = obp;
                 r = object_done(obp);
                 fdmem_cleaner_object = NULL;
-                if (!r) {
-                    /* Free failed for some reason, put things back */
-                    *owner = obp;
-                    ++fdmem_zombie_count;
-                    nexttime = currtime;
+                if (r) {
+                    /* owner already points at the next entry. */
+                    continue;
                 }
-                if (*owner == ZOMBIE_END)
-                    break;
+                /* Free failed for some reason, put things back */
+                *owner = obp;
+                ++fdmem_zombie_count;
+                nexttime = currtime;
             } else if (mtime < nexttime) {
                 if (mtime == 0)
                     crash();
