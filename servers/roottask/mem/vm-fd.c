@@ -637,8 +637,7 @@ static int vm_fd_cleanup(message_context_t *ctp,
         proc_thread_pool_reserve_done();
     }
 
-    fdmem_cleanup = 0;
-
+    pthread_mutex_lock(&fdmem_mutex);
     /* wake up opener if any */
     MMAPFD_WAKEUP_OPENER if (fdmem_zombies != ZOMBIE_END)
     {
@@ -660,6 +659,12 @@ static int vm_fd_cleanup(message_context_t *ctp,
                 errno);
         }
     }
+
+    /* Keep cleanup claimed through the shared timer rearm. Clear it under
+     * fdmem_mutex so a newly queued zombie cannot lose its cleanup request.
+     */
+    fdmem_cleanup = 0;
+    pthread_mutex_unlock(&fdmem_mutex);
 
     return EOK;
 }
