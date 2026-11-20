@@ -1014,7 +1014,7 @@ static int virtnet_add_dma_range(struct rtmux_virtio_dma_range *ranges,
 {
     if (*count >= VIRTNET_IOMMU_RANGE_MAX)
         return EOVERFLOW;
-    ranges[*count] = (struct rtmux_virtio_dma_range){
+    ranges[*count] = (struct rtmux_virtio_dma_range) {
         .paddr = paddr,
         .size = size,
     };

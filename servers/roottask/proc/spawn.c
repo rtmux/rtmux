@@ -536,9 +536,9 @@ int proc_spawn(ioserv_context_t *ctp, void *vmsg)
              * image unmarked, and undone if the swap fails. The slot outlives
              * the swap, so the mark does too. The exec'ing process is the
              * loader's parent (kext_process_exec swaps the image into
-             * child->parent), hence ppid. The mark is set under the group
-             * lock so that a setpgid already past its execed check finishes
-             * its move before the swap rather than after it.
+             * child->parent), hence ppid. The mark is set under the group lock
+             * so that a setpgid already past its execed check finishes its move
+             * before the swap rather than after it.
              */
             proc_pgrp_lock();
             root_proc(exec_pid)->execed = 1;

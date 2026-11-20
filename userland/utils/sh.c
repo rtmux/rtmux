@@ -3210,7 +3210,7 @@ static int builtin_trap(struct sh *sh, int argc, char **argv)
                 continue;
             fputs("trap -- '", stdout);
             for (const char *c = sh->traps[i]; *c; c++)
-                fputs(*c == '\'' ? "'\\''" : (char[2]){*c, '\0'}, stdout);
+                fputs(*c == '\'' ? "'\\''" : (char[2]) {*c, '\0'}, stdout);
             printf("' %s\n", sh_trap_sigs[i].name);
         }
         return 0;
@@ -5958,7 +5958,7 @@ static int case_explode(const char *line, struct sh_script *out)
     /* The word, which ends at the first blank outside quotes and substitutions,
      * and the `in` after it.
      */
-    sc = (struct sh_scan){p, 0};
+    sc = (struct sh_scan) {p, 0};
     for (;;) {
         const char *at = sc.p;
 
@@ -5982,7 +5982,7 @@ static int case_explode(const char *line, struct sh_script *out)
     /* The arms, which end at ;; ; the last one, at the esac that is a command.
      */
     arm = p;
-    sc = (struct sh_scan){p, 0};
+    sc = (struct sh_scan) {p, 0};
     for (;;) {
         const char *at = sc.p;
         bool end_arm = false;

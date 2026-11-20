@@ -2819,13 +2819,14 @@ static void rdecl adjust_priority_default(thread_t *thp,
          * crash buffer, so it never waits on the console lock under SCHED_LOCK.
          */
         if (thp == act)
-            crash_halt("sched: priority %u -> %u of the active thread %d.%d, "
-                       "which is READY (runcpu %u, internal flags 0x%x, "
-                       "flags 0x%x)",
-                       (unsigned) thp->priority, (unsigned) prio,
-                       thp->process ? (int) thp->process->pid : -1,
-                       (int) thp->tid, (unsigned) thp->runcpu,
-                       (unsigned) thp->internal_flags, (unsigned) thp->flags);
+            crash_halt(
+                "sched: priority %u -> %u of the active thread %d.%d, "
+                "which is READY (runcpu %u, internal flags 0x%x, "
+                "flags 0x%x)",
+                (unsigned) thp->priority, (unsigned) prio,
+                thp->process ? (int) thp->process->pid : -1, (int) thp->tid,
+                (unsigned) thp->runcpu, (unsigned) thp->internal_flags,
+                (unsigned) thp->flags);
 #endif
         chk_thread(thp);
 

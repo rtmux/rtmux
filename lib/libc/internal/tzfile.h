@@ -80,9 +80,9 @@ size_t __tzfile_types_in(const struct tzfile *f,
                          size_t max) __hidden;
 
 /* The standard and DST types of the latest transitions of each kind. With no
- * standard transition, *std is type 0; with no DST transition, *dst is a copy of
- * *std (not type 0), and *has_dst, which says whether any DST type was seen, is
- * 0.
+ * standard transition, *std is type 0; with no DST transition, *dst is a copy
+ * of *std (not type 0), and *has_dst, which says whether any DST type was seen,
+ * is 0.
  */
 void __tzfile_last_types(const struct tzfile *f,
                          struct tzfile_type *std,

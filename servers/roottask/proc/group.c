@@ -73,8 +73,8 @@ void proc_pgrp_window(unsigned where)
         return;
     ms = atomic_load(&pgrp_window_ms);
     (void) nanosleep(
-        &(struct timespec){.tv_sec = ms / 1000,
-                           .tv_nsec = (long) (ms % 1000) * 1000000L},
+        &(struct timespec) {.tv_sec = ms / 1000,
+                            .tv_nsec = (long) (ms % 1000) * 1000000L},
         NULL);
 }
 #endif

@@ -555,8 +555,8 @@ static int xfermsg_run(thread_t *dthp,
                     spent.ents += (unsigned) parts;
 
                     SET_XFER_HANDLER(&xfer_src_handlers);
-                    w = (struct xfer_walk){iovlist, src, parts,  sparts, 0,
-                                           soff,    0,   sbound, sp};
+                    w = (struct xfer_walk) {iovlist, src, parts,  sparts, 0,
+                                            soff,    0,   sbound, sp};
                     if ((status = xferiov(sthp, &w)) != 0) {
                         if (status == XFER_YIELD) {
                             return xfer_yield(
@@ -616,8 +616,8 @@ static int xfermsg_run(thread_t *dthp,
                 sflags |= MAPADDR_FLAGS_NOTFIRST;
                 spent.ents += (unsigned) parts;
 
-                w = (struct xfer_walk){dst, iovlist, dparts, parts, doff,
-                                       0,   dbound,  0,      sp};
+                w = (struct xfer_walk) {dst, iovlist, dparts, parts, doff,
+                                        0,   dbound,  0,      sp};
                 if ((status = xferiov(sthp, &w)) != 0) {
                     if (status == XFER_YIELD) {
                         return xfer_yield(

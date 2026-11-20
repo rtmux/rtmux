@@ -59,8 +59,9 @@ gid_t getegid(void)
     return info.cred.egid;
 }
 
-/* Ask roottask for the ids of `pid`, or of the caller when 0. Returns -1 when
- * the request fails.
+/* Ask roottask for the ids of `pid`, or of the caller when 0.
+ *
+ * Returns -1 when the request fails.
  */
 static int getid_msg(pid_t pid, proc_getsetid_t *msg)
 {

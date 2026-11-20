@@ -796,14 +796,14 @@ int kdecl ksys_channel_destroy(thread_t *act,
 
             if (cop) {
                 if (cop->links == 0) {
-                    /* Server connection unpublished from chancons; recycle it. */
+                    /* Server connection unpublished from chancons; recycle it.
+                     */
                     connect_soul_free(prp, cop);
                 } else {
                     do {
                         if (cop->process && cop->process->death_chp) {
-                            connect_coid_disconnect(cop,
-                                                    cop->process->death_chp,
-                                                    act->priority);
+                            connect_coid_disconnect(
+                                cop, cop->process->death_chp, act->priority);
                         }
                         /* Null channel pointer since it is gone. */
                         cop->channel = NULL;

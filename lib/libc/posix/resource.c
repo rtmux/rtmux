@@ -55,10 +55,10 @@ int getrlimit(int resource, struct rlimit *rlim)
  * the process's summed thread time), and RLIMIT_DATA and RLIMIT_AS (bytes of
  * private anonymous memory and of address space, enforced when a mapping is
  * created: mmap fails with ENOMEM when the new mapping would pass the soft
- * limit, and so does malloc when it needs a new mapping to satisfy a request.
- * A request malloc can serve from memory it already has mapped still succeeds,
- * even after the limit is lowered below current use). Other resources fail
- * with ENOSYS.
+ * limit, and so does malloc when it needs a new mapping to satisfy a request. A
+ * request malloc can serve from memory it already has mapped still succeeds,
+ * even after the limit is lowered below current use). Other resources fail with
+ * ENOSYS.
  */
 int setrlimit(int resource, const struct rlimit *rlim)
 {

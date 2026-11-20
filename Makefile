@@ -996,14 +996,29 @@ INDENT_FIND := find $(INDENT_DIRS) \
 
 # commentflow (the comment-style pass) is not yet publicly released, so it is
 # optional: environments without it still get the mandatory clang-format pass.
-# clang-format is required.
 HAVE_COMMENTFLOW := $(shell command -v commentflow >/dev/null 2>&1 && echo 1)
 
+# clang-format 20 is required. Prefer the versioned executable, then accept an
+# unversioned one only if it reports the required major version. An explicit
+# CLANG_FORMAT override is checked by check-style-deps too.
+CLANG_FORMAT_VERSION_RE := 'clang-format version 20([.]|$$)'
+ifndef CLANG_FORMAT
+CLANG_FORMAT := $(shell for tool in clang-format-20 clang-format; do \
+    command -v "$$tool" >/dev/null 2>&1 || continue; \
+    version=$$("$$tool" --version 2>/dev/null) || continue; \
+    printf '%s\n' "$$version" | grep -Eq $(CLANG_FORMAT_VERSION_RE) || continue; \
+    command -v "$$tool"; break; done)
+endif
+
 check-style-deps:
-	@command -v clang-format >/dev/null 2>&1 || \
-	    { echo "Error: clang-format not found in PATH."; \
-	      echo "  Debian/Ubuntu: apt install clang-format"; \
-	      echo "  macOS:         brew install clang-format"; exit 1; }
+	@test -n "$(CLANG_FORMAT)" && \
+	    version=$$("$(CLANG_FORMAT)" --version 2>/dev/null) && \
+	    printf '%s\n' "$$version" | grep -Eq $(CLANG_FORMAT_VERSION_RE) || \
+	    { echo "Error: clang-format 20 not found (CLANG_FORMAT=$(CLANG_FORMAT))."; \
+	      echo "  Debian/Ubuntu: apt install clang-format-20"; \
+	      echo "  macOS:         brew install llvm@20 (keg-only: set CLANG_FORMAT"; \
+	      echo "                 to its bin/clang-format, see brew --prefix llvm@20)"; \
+	      echo "  Or set CLANG_FORMAT to a clang-format 20 executable."; exit 1; }
 ifneq ($(HAVE_COMMENTFLOW),1)
 	@echo "  Note: commentflow not found; skipping the comment-style pass."
 	@echo "        Install from https://github.com/sysprog21/commentflow."
@@ -1015,12 +1030,12 @@ ifeq ($(HAVE_COMMENTFLOW),1)
 	$(Q)$(INDENT_FIND) | xargs -P 8 -n 50 commentflow
 endif
 	$(msg) INDENT  clang-format pass 1/2
-	$(Q)$(INDENT_FIND) | xargs -P 8 -n 1 clang-format -i
+	$(Q)$(INDENT_FIND) | xargs -P 8 -n 1 "$(CLANG_FORMAT)" -i
 ifeq ($(HAVE_COMMENTFLOW),1)
 	$(msg) INDENT  commentflow pass 2/2
 	$(Q)$(INDENT_FIND) | xargs -P 8 -n 50 commentflow
 	$(msg) INDENT  clang-format pass 2/2
-	$(Q)$(INDENT_FIND) | xargs -P 8 -n 1 clang-format -i
+	$(Q)$(INDENT_FIND) | xargs -P 8 -n 1 "$(CLANG_FORMAT)" -i
 endif
 
 check-indent: check-style-deps
@@ -1033,8 +1048,8 @@ check-indent: check-style-deps
 	                 echo "$$1: commentflow drift"' _ >> $$drift; \
 	    fi; \
 	    $(INDENT_FIND) | xargs -P 8 -n 1 sh -c \
-	        'clang-format --dry-run --Werror "$$1" >/dev/null 2>&1 || \
-	             echo "$$1: clang-format drift"' _ >> $$drift; \
+	        '"$$1" --dry-run --Werror "$$2" >/dev/null 2>&1 || \
+	             echo "$$2: clang-format drift"' _ "$(CLANG_FORMAT)" >> $$drift; \
 	    if [ -s $$drift ]; then \
 	        echo "  FAIL    files out of style:"; \
 	        sort -u $$drift | sed 's/^/    /' | head -50; \

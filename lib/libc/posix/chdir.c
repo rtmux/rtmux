@@ -62,6 +62,7 @@ int __chdir_resolve(const char *path, char *out, size_t outsz)
         errno = EINVAL;
         return -1;
     }
+
     /* The root of the path namespace has no object to stat, so the lookup below
      * answers EINVAL for it and there is no mode to check: it is always
      * searchable.

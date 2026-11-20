@@ -267,10 +267,10 @@ static pid_t kernel_parent(pid_t child_pid)
         return qi.parent_pid;
 
     /* The kernel frees the index before roottask releases the slot, so a new
-     * generation may already own it: its parent_pid is not this child's. A
-     * slot that no longer carries the child's full pid means the child is gone,
-     * and a gone child has no parent but roottask, which adopts orphans and
-     * never waits.
+     * generation may already own it: its parent_pid is not this child's. A slot
+     * that no longer carries the child's full pid means the child is gone, and
+     * a gone child has no parent but roottask, which adopts orphans and never
+     * waits.
      */
     if (tmp->pid != child_pid)
         return ROOTTASK_PID;

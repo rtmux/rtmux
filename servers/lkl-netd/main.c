@@ -1275,7 +1275,7 @@ static void watch_collect(struct netd_watch *w,
         w->set |= NETD_WATCH_HUP; /* poll reports it whatever events say */
     if (!w->set)
         return;
-    pfd[*n] = (struct lkl_pollfd){.fd = w->fd, .events = events};
+    pfd[*n] = (struct lkl_pollfd) {.fd = w->fd, .events = events};
     gens[*n] = w->gen;
     who[(*n)++] = w;
 }
@@ -1311,8 +1311,8 @@ static void *netd_watcher(void *arg)
         pthread_mutex_unlock(&netd_watch_lock);
 
         if (kick)
-            pfd[n] = (struct lkl_pollfd){.fd = netd_watch_kick,
-                                         .events = LKL_POLLIN};
+            pfd[n] = (struct lkl_pollfd) {.fd = netd_watch_kick,
+                                          .events = LKL_POLLIN};
         ret = lkl_sys_poll(pfd, n + kick,
                            kick ? NETD_WATCH_IDLE_MS : NETD_WATCH_MS);
         if (kick && pfd[n].revents) {

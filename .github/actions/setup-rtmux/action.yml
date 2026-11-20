@@ -38,7 +38,7 @@ runs:
       shell: bash
       run: |
         mkdir -p ~/apt-cache
-        pkgs="build-essential lld python3 git e2fsprogs"
+        pkgs="build-essential lld python3 git e2fsprogs clang-format-20"
         if [ "${{ inputs.qemu }}" = "true" ]; then
           pkgs="$pkgs qemu-system-misc opensbi ipxe-qemu"
         fi
@@ -91,6 +91,7 @@ runs:
           apt update
         fi
         apt install -y --no-install-recommends -o "Dir::Cache::Archives=$HOME/apt-cache" $pkgs ${{ inputs.packages }}
+        clang-format-20 --version | grep -Eq 'clang-format version 20([.]|$)'
         # apt ran as root, and its partial directory is not readable by the
         # runner user that saves the cache next.
         sudo chown -R "$(id -u):$(id -g)" "$HOME/apt-cache"

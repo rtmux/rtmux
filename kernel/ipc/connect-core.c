@@ -49,7 +49,8 @@ void rdecl connect_detach(connect_t *cop, unsigned prio)
                  * attaches a new connection to this server. Serialize the
                  * slot/free-list update with connect_attach's vec_slocks;
                  * otherwise a vector growth can copy the soon-to-be-removed
-                 * slot, leaving a stale connection in the replacement table. */
+                 * slot, leaving a stale connection in the replacement table.
+                 */
                 kspinlock_lock(&chp->process->vec_slock);
                 vector_rem(&chp->process->chancons, cop->scoid);
                 kspinlock_unlock(&chp->process->vec_slock);

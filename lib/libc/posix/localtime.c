@@ -319,9 +319,9 @@ static int parse_tz(const char *s, struct tz_zone *z, char *std, char *dst)
             return -1;
         if (!*s) {
             /* No rules: the United States rules POSIX leaves to the system. */
-            z->start = (struct tz_rule){
+            z->start = (struct tz_rule) {
                 .kind = 'M', .m = 3, .w = 2, .d = 0, .time = 7200};
-            z->end = (struct tz_rule){
+            z->end = (struct tz_rule) {
                 .kind = 'M', .m = 11, .w = 1, .d = 0, .time = 7200};
         } else if (*s++ != ',' || get_rule(&s, &z->start) || *s++ != ',' ||
                    get_rule(&s, &z->end) || *s) {
@@ -365,7 +365,7 @@ static void relink(struct tz_loaded *ld)
 {
     struct tz_zone *z = &ld->zone;
 
-    *z = (struct tz_zone){.loaded = ld};
+    *z = (struct tz_zone) {.loaded = ld};
     if (ld->has_footer) {
         ld->footer.std_name = ld->footer_std;
         ld->footer.dst_name =
@@ -796,7 +796,7 @@ static long long file_local_to_utc(const struct tz_zone *z,
 
         n = add_cand(cand, n, &own);
         if (z->daylight) {
-            own = (struct tzfile_type){-z->dst_off, 1, z->dst_name};
+            own = (struct tzfile_type) {-z->dst_off, 1, z->dst_name};
             n = add_cand(cand, n, &own);
         }
     }

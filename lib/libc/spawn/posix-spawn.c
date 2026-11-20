@@ -341,7 +341,7 @@ static int materialize_open_actions(_posix_spawn_file_actions_t *fact,
     for (unsigned i = 0; i <= max_fd; i++) {
         if (literal_slot[i] && map[i] != SPAWN_FDCLOSED &&
             (map[i] != (int) i || open_slot[i])) {
-            mat->action[nentries++] = (posix_spawn_file_actions_list_t){
+            mat->action[nentries++] = (posix_spawn_file_actions_list_t) {
                 .type = posix_file_action_type_DUP,
                 ._type.dup.fd = map[i],
                 ._type.dup.new_fd = (int32_t) i,
@@ -351,7 +351,7 @@ static int materialize_open_actions(_posix_spawn_file_actions_t *fact,
     for (unsigned i = 0; i <= max_fd; i++) {
         if (!literal_slot[i] && map[i] != SPAWN_FDCLOSED &&
             (map[i] != (int) i || open_slot[i])) {
-            mat->action[nentries++] = (posix_spawn_file_actions_list_t){
+            mat->action[nentries++] = (posix_spawn_file_actions_list_t) {
                 .type = posix_file_action_type_DUP,
                 ._type.dup.fd = map[i],
                 ._type.dup.new_fd = (int32_t) i,
@@ -360,7 +360,7 @@ static int materialize_open_actions(_posix_spawn_file_actions_t *fact,
     }
     for (unsigned i = 0; i <= max_fd; i++) {
         if (map[i] == SPAWN_FDCLOSED && close_slot[i]) {
-            mat->action[nentries++] = (posix_spawn_file_actions_list_t){
+            mat->action[nentries++] = (posix_spawn_file_actions_list_t) {
                 .type = posix_file_action_type_CLOSE,
                 ._type.close.fd = (int32_t) i,
             };

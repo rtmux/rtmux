@@ -54,8 +54,9 @@ static void thread_recycle_reset(thread_t *thp)
     thp->un.lcl.stackaddr = NULL;
     thp->un.lcl.stacksize = 0;
     thp->client = NULL;
-    /* Past real_priority, so the memset above misses them, and a thread soul
-     * is not cleared on free: a stale link would stop a later departure from
+
+    /* Past real_priority, so the memset above misses them, and a thread soul is
+     * not cleared on free: a stale link would stop a later departure from
      * queueing this server, or send the cancel down a list it is not on.
      */
     thp->prio_defer_next = NULL;
