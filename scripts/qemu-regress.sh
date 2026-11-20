@@ -2696,8 +2696,24 @@ run_one()
 
     if grep -Fq "$FAIL_MARKER" "$log"; then
         echo "  FAIL     ${MODE} reported guest failure"
-        # The tail can scroll the failing test out of view; name it first.
-        grep -En '^  FAIL  ' "$log" | head -n 40
+
+        # The tail can scroll the failing test out of view; name it first. Some
+        # suites put one space after the verdict, others two.
+        grep -En '^  FAIL ' "$log" | head -n 40
+
+        # Then show each failure with the last lines its test printed since the
+        # previous verdict: a test prints its per-case detail there, and CI
+        # keeps no guest log.
+        awk '/^  (PASS|FAIL|GAP|SKIP|ok) /{
+                 if ($0 ~ /^  FAIL /) {
+                     for (i = (n > 24 ? n - 24 : 0); i < n; i++)
+                         print ctx[i % 24]
+                     print NR ":" $0
+                 }
+                 n = 0
+                 next
+             }
+             { ctx[n++ % 24] = NR "-" $0 }' "$log" | head -n 120
         tail -n 160 "$log"
         return 1
     fi
