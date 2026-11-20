@@ -1982,12 +1982,10 @@ static inline void ready_enqueue_client(kdispatch_t *dpp,
                                         unsigned prio,
                                         bool was_sendvnc)
 {
-    if (was_sendvnc && thp->policy != SCHED_FIFO) {
+    if (was_sendvnc) { /* PROBE: the enqueue before the hang fix */
         RR_ADD_PREEMPT_TICK(thp);
-        if (!IS_SCHED_RR(thp) || RR_GET_TICKS(thp) < RR_MAXTICKS) {
-            LINK3_BEG(DISPATCH_LST(dpp, prio), &thp->link3_link, thread_t);
-            return;
-        }
+        LINK3_BEG(DISPATCH_LST(dpp, prio), &thp->link3_link, thread_t);
+        return;
     }
     RR_RESET_TICK(thp);
     LINK3_END(DISPATCH_LST(dpp, prio), &thp->link3_link, thread_t);
