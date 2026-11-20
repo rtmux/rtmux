@@ -685,11 +685,11 @@ int memory_reference(struct mm_map **mmp,
 
     /* Memory-pressure policy (section 18): RTMux does not reclaim, page out, or
      * swap a process's mapped memory, and has no OOM killer, so a process keeps
-     * its mapped memory until it frees it or exits. The RLIMIT_AS check at map
-     * time (rlimit_blown in mm-rlimit.c) is currently a stub that always
-     * passes, so no per-process address-space or resident cap is actually
-     * enforced. A future policy could enforce that check or add a resident
-     * budget; realtime processes stay safe by allocating their working set up
+     * its mapped memory until it frees it or exits. The per-process cap is
+     * RLIMIT_AS (and RLIMIT_DATA for private anonymous memory), checked at map
+     * time by rlimit_blown in mm-rlimit.c; with no demand paging a mapping is
+     * backed when it is created, so that cap also bounds what the process can
+     * allocate. Realtime processes stay safe by allocating their working set up
      * front, since it is never reclaimed.
      */
 

@@ -13,6 +13,7 @@
 
 #include <startup.h>
 #include <startup-api.h>
+#include <asm/boot-stack.h>
 
 struct ram_entry {
     paddr64_t addr;
@@ -40,15 +41,22 @@ static size_t ram_list_size;
 #define MAX_RAM_LIST_SIZE KILO(6)
 #define MAX_AVOID_LIST_SIZE KILO(2)
 
+/* First byte past the startup stack, which fills [_end, _end + BOOT_STACK_SIZE)
+ * (head.S). The boot workspace sits above it, never over it: the stack grows
+ * down toward _end and the workspace grows up from here, so the two ranges
+ * cannot meet however deep the startup path goes.
+ */
+static paddr_t boot_stack_top(void)
+{
+    return (paddr_t) (uintptr_t) _end + BOOT_STACK_SIZE;
+}
+
 static void ws_init(void)
 {
     LOGF_T("%s\n", __func__);
 
-    /* Assume there is some RAM after our kernel Take into account also the
-     * stack for ourselves, which is located directly after _end (see head.S for
-     * details).
-     */
-    ws_early_next = ROUND(_end, __PAGESIZE);
+    /* Assume there is some RAM after our kernel and its startup stack. */
+    ws_early_next = ROUND(boot_stack_top(), __PAGESIZE);
 
     avoid_list = MAKE_1TO1_PTR(ws_early_next);
     avoid_list[0].start = ws_early_next;
@@ -60,6 +68,9 @@ static void ws_init(void)
     ram_list = ws_alloc(MAX_RAM_LIST_SIZE);
     ram_list->size = 0;
     ram_list_size = sizeof(struct ram_entry);
+
+    /* The startup stack is in use too: keep the allocator off it. */
+    avoid_ram((paddr_t) (uintptr_t) _end, BOOT_STACK_SIZE);
 
 #ifdef CPU_MEM_AVOID_START
     /* Avoid using memory that might have something interesting */
@@ -439,6 +450,62 @@ void add_ram(paddr_t start, uint64_t size)
     }
 }
 
+/* boot_in_use_end — first byte past the memory startup is already using above
+ * _start: the kernel image, the startup stack (BOOT_STACK_SIZE above _end, see
+ * head.S) and the boot workspace handed out so far, which starts above the
+ * stack. Meaningful only before the first add_ram().
+ */
+paddr_t boot_in_use_end(void)
+{
+    if (!avoid_list)
+        ws_init();
+    return ws_early_next;
+}
+
+/* boot_layout_check — crash if the startup stack and the boot workspace
+ * intersect or the stack ran out, and report how deep the stack went.
+ *
+ * head.S filled the stack with BOOT_STACK_FILL, so the untouched words at its
+ * low end show the high-water mark. This is a watermark, not a bound: it
+ * crashes once the lowest BOOT_STACK_GUARD bytes are touched, but a frame can
+ * skip them. Called once the startup path is done with deep calls, before the
+ * switch to the high mapping; the kernel runs on this stack for a while after,
+ * which this does not cover.
+ */
+void boot_layout_check(void)
+{
+    const uint64_t *lo = (const uint64_t *) (uintptr_t) _end;
+    size_t untouched = 0;
+    paddr_t ws_start;
+
+    if (!avoid_list)
+        ws_init();
+
+    /* The avoid list is the first object ws_init() placed in the workspace, so
+     * its address, not the base ws_init() computed, is where the workspace
+     * really starts.
+     */
+    ws_start = (paddr_t) (uintptr_t) avoid_list - STARTUP_PADDR_BIAS;
+    if (ws_start < boot_stack_top())
+        crash("boot workspace %lx overlaps the startup stack [%lx..%lx)\n",
+              (unsigned long) ws_start, (unsigned long) (uintptr_t) _end,
+              (unsigned long) boot_stack_top());
+    while (untouched < BOOT_STACK_SIZE / sizeof lo[0] &&
+           lo[untouched] == BOOT_STACK_FILL)
+        untouched++;
+    if (untouched * sizeof lo[0] < BOOT_STACK_GUARD)
+        crash("startup stack [%lx..%lx) overflowed\n",
+              (unsigned long) (uintptr_t) _end,
+              (unsigned long) boot_stack_top());
+    kprintf(
+        "boot: stack [%lx..%lx) used %lu of %u bytes, workspace "
+        "[%lx..%lx) disjoint\n",
+        (unsigned long) (uintptr_t) _end, (unsigned long) boot_stack_top(),
+        (unsigned long) (BOOT_STACK_SIZE - untouched * sizeof lo[0]),
+        BOOT_STACK_SIZE, (unsigned long) ws_start,
+        (unsigned long) ws_early_next);
+}
+
 /**
  * \brief Add a given region to the avoid list.
  */
@@ -451,6 +518,9 @@ void avoid_ram(paddr_t start, size_t size)
     if (!avoid_list) {
         ws_init();
     }
+    if (avoid_list_size + sizeof(*avoid) > MAX_AVOID_LIST_SIZE)
+        crash("%s: more than %u reserved ranges\n", __func__,
+              (unsigned) (MAX_AVOID_LIST_SIZE / sizeof(*avoid) - 1));
     avoid = (void *) ((uint8_t *) avoid_list + avoid_list_size);
 
     avoid[-1].start = start;
@@ -502,9 +572,21 @@ void *ws_alloc(size_t size)
 
     size = ROUND(size, sizeof(uint64_t));
     if (ram_list_size <= sizeof(struct ram_entry)) {
-        /* No add_ram()'s have been done yet */
+        /* No add_ram()'s have been done yet, so the workspace grows up from
+         * _end without find_ram()'s avoid-list check. Refuse to grow into a
+         * range already reserved (an FDT reservation just above the image).
+         */
         paddr = ws_early_next;
         ws_early_next += size;
+        for (struct avoid_entry *a = avoid_list; a->end != 0; ++a) {
+            if (a->start < ws_early_next && a->end > paddr)
+                crash(
+                    "%s: boot workspace [%lx..%lx) runs into reserved "
+                    "[%lx..%lx)\n",
+                    __func__, (unsigned long) paddr,
+                    (unsigned long) ws_early_next, (unsigned long) a->start,
+                    (unsigned long) a->end);
+        }
     } else {
         /* We've been told where memory is */
         paddr = find_ram(size, sizeof(uint64_t), 0, 0);

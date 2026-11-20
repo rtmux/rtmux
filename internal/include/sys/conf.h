@@ -56,7 +56,6 @@
 
 #define _CONF_LINK_PTR (_CONF_INDIRECT | _CONF_LINK)
 #define _CONF_CALL_PTR (_CONF_INDIRECT | _CONF_CALL)
-#define _CONF_VALUE_PTR (_CONF_INDIRECT | _CONF_VALUE)
 
 /* Values must have STR or NUM conditions, so make some common entries */
 #define _CONF_VALUE_STR (_CONF_STR | _CONF_VALUE)

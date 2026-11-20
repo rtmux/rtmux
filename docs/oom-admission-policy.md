@@ -47,18 +47,33 @@ realtime process that instead allocates lazily during its critical phase is
 exposed not to reclaim but to its own allocation returning ENOMEM, which is a
 program bug under this policy, not a kernel behavior to tune.
 
-## Current caps and the honest gap
+## Current caps and the remaining gap
 
-Per-map admission is the enforced control today. The RLIMIT_AS check at map time
-(rlimit_blown in servers/roottask/mem/mm-rlimit.c) is currently a stub that
-always passes, so there is no per-process address-space or resident-set cap
-actually enforced: a single process can consume physical memory up to global
+Per-map admission is the enforced control today, and it applies two per-process
+caps. rlimit_blown in servers/roottask/mem/mm-rlimit.c refuses a new mapping
+with ENOMEM when it would take the process's address space past its RLIMIT_AS
+soft limit, or its private anonymous memory (heap, thread stacks and anonymous
+loader segments; not the primary stack) past its RLIMIT_DATA soft limit. The
+primary stack has its own cap: setup_mappings in
+servers/roottask/mem/as/mmap.c refuses it with ENOMEM when the part it backs
+up front is larger than the RLIMIT_STACK soft limit. The RLIMIT_AS and
+RLIMIT_DATA check runs
+under the address space's write lock, so concurrent mappers of one process
+cannot exceed a limit together. A MAP_FIXED replacement is checked on the total
+after the replaced ranges are uncharged, and munmap uncharges what it removes,
+so the accounting does not drift. If the limits cannot be read the mapping is
+refused. Roottask and system mappings are exempt. Since nothing is demand
+paged, a mapping is backed when it is created, and the caps bound what a
+process can allocate.
+
+Both limits default to RLIM_INFINITY and are inherited across spawn, so a
+process that sets neither can still consume physical memory up to global
 exhaustion, at which point it, and any concurrent allocator, sees ENOMEM. This
 is safe for the protected classes (they are never reclaimed regardless) but it
-is not fair: one greedy non-realtime process can deny memory to another
-non-realtime process. Closing that gap means enforcing the RLIMIT_AS check or
-adding a resident-memory budget per process or per class; it does not change the
-victim-selection policy, which stays "no victim, admission failure only."
+is not fair: one greedy non-realtime process with no limit can deny memory to
+another non-realtime process. Closing that gap means default limits or a
+resident-memory budget per class; it does not change the victim-selection
+policy, which stays "no victim, admission failure only."
 
 ## Regression
 

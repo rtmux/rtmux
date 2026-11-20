@@ -10,6 +10,24 @@
 #include <startup.h>
 #include <startup-api.h>
 
+/* Depth of the node being parsed; the root is 1. Only a root child is a memory
+ * node: a /reserved-memory child may also be named "memory@...", and taking it
+ * for RAM would turn a reservation into RAM.
+ */
+static unsigned meminfo_depth;
+
+static void handle_node_meminfo(const char *name)
+{
+    (void) name;
+    meminfo_depth++;
+}
+
+static void handle_end_node_meminfo(void)
+{
+    if (meminfo_depth)
+        meminfo_depth--;
+}
+
 static void handle_property_meminfo(const char *node,
                                     const char *prop,
                                     void *data,
@@ -18,7 +36,8 @@ static void handle_property_meminfo(const char *node,
     const uint64_t *ranges = data;
     unsigned nranges = datalen / (2 * sizeof *ranges);
 
-    if (strncmp(node, "memory@", 7) || strcmp(prop, "reg"))
+    if (meminfo_depth != 2 || strncmp(node, "memory@", 7) ||
+        strcmp(prop, "reg"))
         return;
 
     for (unsigned i = 0; i < nranges; i++) {
@@ -53,7 +72,11 @@ void init_raminfo(void)
 {
     LOGF_I("%s\n", __func__);
 
-    fdt_handle_node_cb = NULL;
+    meminfo_depth = 0;
+    fdt_handle_node_cb = handle_node_meminfo;
+    fdt_handle_end_node_cb = handle_end_node_meminfo;
     fdt_handle_property_cb = handle_property_meminfo;
     parse_fdt(NULL);
+    fdt_handle_node_cb = NULL;
+    fdt_handle_end_node_cb = NULL;
 }

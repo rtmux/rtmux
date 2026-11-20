@@ -86,7 +86,7 @@ void intrevent_preemption(unsigned prio)
  *      timer) INKERNEL_NOW IS set; the inline xfer path is correct.
  *   2. No lock is held at entry.  Downstream lock acquisitions
  *      (sched_slock via ready/force_ready, channel_slock via
- *      notification_deliver, sync_slock via force_ready STATE_CONDVAR/
+ *      notification_deliver, chain locks via force_ready STATE_CONDVAR/
  *      MUTEX/SEM) are rank-disjoint from the trap-entry state.
  */
 void sigevent_deliver_inline(const struct sigevent *evp,

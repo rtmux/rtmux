@@ -18,7 +18,7 @@ CPPFLAGS += -I. -Iinclude -I$(INCDIR) -I$(ARCHINCDIR) -I$(LIBCDIR) \
             -I$(LIBC_INTERNALDIR) -include $(LIBCDIR)/rtmux-libc-local.h
 CFLAGS   += -std=gnu17 -g
 
-SRCS = hwres-client.c globals.c config.c scan.c enum.c resource.c \
+SRCS = args.c hwres-client.c globals.c config.c scan.c enum.c resource.c \
        bridge.c client.c attach.c main.c ecam.c \
        dwmsi.c dw-atu.c
 OBJS = $(SRCS:%.c=$(OBJDIR)/%.o)
@@ -27,7 +27,7 @@ TARGET = $(BUILD_BASE)/pci-server
 
 all: $(TARGET)
 
-$(OBJDIR)/%.o: %.c server.h pcidrvr.h globals.h slogcodes.h
+$(OBJDIR)/%.o: %.c server.h pcidrvr.h globals.h args.h slogcodes.h
 	@mkdir -p $(@D)
 	$(msg) CC $@
 	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) $(DEPFLAGS) -c -o $@ $<

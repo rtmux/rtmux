@@ -13,8 +13,11 @@ TIMEOUT=180
 TIMEOUT_SET=0
 REPEAT=1
 LAPS=
-KEEP_LOGS=0
-GDB_ON_TIMEOUT=0
+PROCS=
+# QEMU_REGRESS_GDB_ON_TIMEOUT=1 is --gdb-on-timeout for a caller (CI) that
+# cannot pass the flag through its make targets.
+GDB_ON_TIMEOUT=${QEMU_REGRESS_GDB_ON_TIMEOUT:-0}
+KEEP_LOGS=$GDB_ON_TIMEOUT
 REQUIRE_SUPPORTED=0
 DISK_SUITE=0
 NVME_SMOKE=0
@@ -43,21 +46,25 @@ http_pid=
 udp_pid=
 dns_pid=
 payload_pid=
+poll_pid=
 LAST_LOG=
 IOMMU_METADATA_DTB=
 IOMMU_METADATA_DTS=
 IOMMU_METADATA_ERR=
 FDT_CPU_DTB=
 FDT_CPU_DTS=
+FDT_RESV_DTB=
+FDT_RESV_DTS=
 FDT_CPU_SEEN=
 FDT_CPU_BASE_OPTS=
 
 cleanup()
 {
     kill "${http_pid:-}" "${udp_pid:-}" "${dns_pid:-}" "${payload_pid:-}" \
-        2>/dev/null || true
+        "${poll_pid:-}" 2>/dev/null || true
     rm -f "${IOMMU_METADATA_DTB:-}" "${IOMMU_METADATA_DTS:-}" \
-        "${IOMMU_METADATA_ERR:-}" "${FDT_CPU_DTB:-}" "${FDT_CPU_DTS:-}"
+        "${IOMMU_METADATA_ERR:-}" "${FDT_CPU_DTB:-}" "${FDT_CPU_DTS:-}" \
+        "${FDT_RESV_DTB:-}" "${FDT_RESV_DTS:-}"
     if [ "$RESTORE_CONFIG" -eq 1 ]; then
         if [ "$HAD_CONFIG" -eq 1 ]; then
             cp "$CONFIG_SAVE" .config
@@ -520,7 +527,8 @@ Options:
                     syslog-wrap (CONFIG_ROOTTASK_SYSLOG_SIZE=4096; /sys/log
                     wrap and EOVERFLOW),
                     serial-unblock (dev-serial-8250 drops a SIGKILLed parked
-                    reader; the host injects one UART byte),
+                    reader, and poll/select see terminal readiness;
+                    the host injects each UART byte the guest asks for),
                     irq-notify (guest IRQ notification smoke; run it with
                     EMU_QEMU_OPTS="-dtb X" to boot a patched DTB; every
                     latency attempt must end ok, none early or timeout),
@@ -538,7 +546,10 @@ Options:
                     host-authored ext4 with hardlinks/sparse/big dir),
                     lkl-netd-crash, lkl-netd-direct-denied, lkl-netd-http,
                     lkl-netd-http-split, lkl-netd-http-isolated, lkl-netd-revoke,
-                    lkl-netd-stale,
+                    lkl-netd-stale, lkl-netd-poll (poll() on lkl-netd data
+                    sockets, against a host peer on 127.0.0.1:8004-8008),
+                    lkl-netd-poll-spent (the same with no notify retries
+                    left, so every arm takes the last-attempt path),
                     lkl-multi (boots lkl-fsd and lkl-netd together and
                     exercises both domains concurrently), or lkl-multi-crash
                     (crashes lkl-netd mid-workload and checks lkl-fsd survives),
@@ -579,6 +590,13 @@ Options:
   --repeat N        Number of boots to run (default: 1)
   --laps N          syscall-testing/leak-gate: run the suite N times in one boot
                     (guest rtmux.laps=N) and require N 'lap=<n> PASS' lines
+  --procs N         spawn-storm: keep N idle processes alive across the storm
+                    (guest rtmux.spawn_procs=N) and print the kernel's teardown
+                    cost (pshut) and longest interrupts-off window (irqoff)
+                    logged before the storm ends (cumulative since boot: the
+                    storm's 800 exits are all but one of the pshut samples);
+                    forces CONFIG_INSTRUMENTATION=y; at most 256 residents;
+                    above 100 the guest gets 2 MiB more RAM per resident
   --gdb-on-timeout  On a timeout, dump every hart through a live gdb stub
                     (scripts/gdb/dump-state.gdb) into build/lkl-logs/MODE-N.dump
                     before killing QEMU; implies --keep-logs
@@ -996,37 +1014,227 @@ patch_fdt_cpu_status_dts()
     ' "$in_dts" >"$out_dts"
 }
 
+# patch_fdt_sparse_harts_dts IN OUT: mark cpu@1..cpu@8 disabled, leaving harts 0
+# and 9 of a 10-hart virt machine: a hart ID past PROCESSORS_MAX (8) that must
+# still get a logical CPU.
+patch_fdt_sparse_harts_dts()
+{
+    awk '
+        /^\t\tcpu@[1-8] \{$/ { print; print "\t\t\tstatus = \"disabled\";"; n++; skip = 1; next }
+        skip && /^\t\t\tstatus = / { skip = 0; next }
+        /^\t\t};/ { skip = 0 }
+        { print }
+        END { exit(n == 8 ? 0 : 1) }
+    ' "$1" >"$2"
+}
+
+# setup_fdt_sparse_harts_or_skip: boot 10 harts on the patched DTB above.
+setup_fdt_sparse_harts_or_skip()
+{
+    FDT_CPU_DTB="$(mktemp /tmp/rtmux-fdt-cpu-dtb.XXXXXX)"
+    FDT_CPU_DTS="$(mktemp /tmp/rtmux-fdt-cpu-dts.XXXXXX)"
+    build_patched_dtb "$FDT_CPU_DTB" "$FDT_CPU_DTS" patch_fdt_sparse_harts_dts ||
+        fixture_unsupported "cannot build sparse-hart DTB fixture"
+    export EMU_QEMU_OPTS="${EMU_QEMU_OPTS:+$EMU_QEMU_OPTS }-dtb $FDT_CPU_DTB"
+}
+
+# check_smp_bringup LOG: the bring-up verdicts for the smp-* modes. OpenSBI
+# picks the boot hart by lottery, so the checks name logical CPUs (the boot hart
+# is always CPU 0; the injected fault hits the last, CPU 3 of 4) rather than
+# hart IDs.
+check_smp_bringup()
+{
+    local log="$1"
+
+    # Nothing may send an IPI to a CPU that was dropped at bring-up: send_ipi
+    # refuses one and reports it, so the line must not appear.
+    if grep -aq 'send_ipi: cpu [0-9]* was dropped at bring-up' "$log"; then
+        echo "  FAIL     ${MODE}: an IPI was sent to a dropped CPU"
+        grep -a 'send_ipi: cpu' "$log"
+        return 1
+    fi
+
+    case "$MODE" in
+    smp-hart-start-fail)
+        require_log_patterns "$log" "injected start failure" \
+            'cpu_start_others: hart [0-9]+ \(cpu 3\) failed' \
+            'smp: hart [0-9]+ \(cpu 3\) did not start, dropped' \
+            'smp: 3 harts online[[:space:]]*$' || return 1
+        ;;
+    smp-ap-crash-early)
+        require_log_patterns "$log" "crash before join" \
+            'cpu_start_others: hart [0-9]+ \(cpu 3\) failed' \
+            'injected crash on cpu 2 before it joined' \
+            'crash rendezvous: 3 arrived, 3 expected' || return 1
+        ;;
+    smp-hart-start-late)
+        require_log_patterns "$log" "late hart" \
+            'smp: hart [0-9]+ \(cpu 3\) did not start, dropped' \
+            'smp: hart [0-9]+ \(cpu 3\) arrived late, parked' \
+            'smp: 3 harts online[[:space:]]*$' || return 1
+        ;;
+    smp-sparse-harts)
+        # The boot hart is never withheld, so a disabled hart that wins the
+        # lottery comes up too: 2 or 3 harts, hart 9 always among them.
+        if ! grep -aEq 'Boot HART ID[[:space:]]*: 9[[:space:]]*$' "$log" &&
+           ! grep -aEq 'cpu_start_others: hart 9 \(cpu [12]\) started' "$log"; then
+            echo "  FAIL     ${MODE}: hart 9 neither booted nor started"
+            grep -a 'Boot HART ID\|cpu_start_others' "$log"
+            return 1
+        fi
+        if ! grep -aEq 'smp: [23] harts online[[:space:]]*$' "$log"; then
+            echo "  FAIL     ${MODE}: expected 2 or 3 harts online"
+            grep -a 'smp: ' "$log"
+            return 1
+        fi
+        ;;
+    smp-too-many-harts)
+        require_log_patterns "$log" "harts past PROCESSORS_MAX" \
+            'smp: 8 harts online[[:space:]]*$' || return 1
+        if [ "$(grep -ac 'fdt: hart [0-9]* parked: no logical CPU slot' "$log")" -ne 2 ]; then
+            echo "  FAIL     ${MODE}: expected two harts parked for want of a slot"
+            grep -a 'parked' "$log"
+            return 1
+        fi
+        ;;
+    esac
+}
+
+# fixture_unsupported WHAT: report that the WHAT DTB fixture cannot be built and
+# leave, failing only under --require-supported.
+fixture_unsupported()
+{
+    echo "  UNSUPPORTED ${MODE}: $1"
+    [ "$REQUIRE_SUPPORTED" -eq 1 ] && exit 2
+    exit 0
+}
+
+# build_patched_dtb DTB DTS PATCH_FN [ARGS...]: dump QEMU's DTB for CPUS harts,
+# decompile it, run PATCH_FN IN_DTS OUT_DTS ARGS..., and compile OUT_DTS into
+# DTB. Leaves the mode as unsupported without dtc; fails if any step does.
+build_patched_dtb()
+{
+    local dtb="$1" dts="$2" patch="$3" rc=0
+    shift 3
+
+    command -v dtc >/dev/null 2>&1 ||
+        fixture_unsupported "dtc is required to build the DTB fixture"
+
+    "${QEMU_HEADLESS_ENV[@]}" "${QEMU:-qemu-system-riscv64}" \
+        -machine "virt,graphics=off,dumpdtb=$dtb.raw" -m 256M -smp "${CPUS:-1}" \
+        -nographic -serial none -monitor none -S >/dev/null 2>&1 &&
+        dtc -I dtb -O dts "$dtb.raw" >"$dts.raw" 2>/dev/null &&
+        "$patch" "$dts.raw" "$dts" "$@" &&
+        dtc -I dts -O dtb "$dts" -o "$dtb" 2>/dev/null || rc=1
+    rm -f "$dtb.raw" "$dts.raw"
+    return "$rc"
+}
+
 # setup_fdt_cpu_status_or_skip PLACEMENT BASE_OPTS: dump QEMU's DTB for CPUS
 # harts, patch cpu@1 to disabled, and point the guest at it.
 setup_fdt_cpu_status_or_skip()
 {
-    local where="$1" base="$2" ok=1 raw raw_dts
+    local where="$1" base="$2"
 
-    if ! command -v dtc >/dev/null 2>&1; then
-        echo "  UNSUPPORTED ${MODE}: dtc is required to build the cpu status DTB fixture"
-        [ "$REQUIRE_SUPPORTED" -eq 1 ] && exit 2
-        exit 0
-    fi
     rm -f "$FDT_CPU_DTB" "$FDT_CPU_DTS"
     FDT_CPU_DTB="$(mktemp /tmp/rtmux-fdt-cpu-dtb.XXXXXX)"
     FDT_CPU_DTS="$(mktemp /tmp/rtmux-fdt-cpu-dts.XXXXXX)"
-    raw="$FDT_CPU_DTB.raw"
-    raw_dts="$FDT_CPU_DTS.raw"
-    if ! "${QEMU_HEADLESS_ENV[@]}" "${QEMU:-qemu-system-riscv64}" \
-            -machine "virt,graphics=off,dumpdtb=$raw" -m 256M -smp "${CPUS:-1}" \
-            -nographic -serial none -monitor none -S >/dev/null 2>&1 ||
-       ! dtc -I dtb -O dts "$raw" >"$raw_dts" 2>/dev/null ||
-       ! patch_fdt_cpu_status_dts "$raw_dts" "$FDT_CPU_DTS" 1 "$where" ||
-       ! dtc -I dts -O dtb "$FDT_CPU_DTS" -o "$FDT_CPU_DTB" 2>/dev/null; then
-        ok=0
-    fi
-    rm -f "$raw" "$raw_dts"
-    if [ "$ok" -eq 0 ]; then
-        echo "  UNSUPPORTED ${MODE}: cannot build cpu status DTB fixture"
-        [ "$REQUIRE_SUPPORTED" -eq 1 ] && exit 2
-        exit 0
-    fi
+    build_patched_dtb "$FDT_CPU_DTB" "$FDT_CPU_DTS" patch_fdt_cpu_status_dts \
+        1 "$where" || fixture_unsupported "cannot build cpu status DTB fixture"
     export EMU_QEMU_OPTS="${base:+$base }-dtb $FDT_CPU_DTB"
+}
+
+# patch_fdt_resv_dts IN OUT: add a /memreserve/ entry and a /reserved-memory
+# node holding a no-map child with two reg pairs, a plain child, a reusable
+# child and 32 more plain children, and pad the root with 64 KiB of cells.
+# Properties must precede subnodes, so the node goes in before the root's
+# first child.
+patch_fdt_resv_dts()
+{
+    awk '
+        /^\/dts-v1\/;/ && !hdr {
+            print; print "/memreserve/ 0x8c400000 0x10000;"; hdr = 1; next
+        }
+        /^\t[^\t].*\{$/ && !root {
+            # A large property on the root: the FDT grows by 64 KiB, so the
+            # startup path parses a bigger tree and the printed stack
+            # watermark covers it.
+            printf "\trtmux-fdt-pad = <"
+            for (i = 0; i < 16384; i++)
+                printf "0x0%s", (i < 16383 ? " " : "")
+            print ">;"
+            print "\treserved-memory {"
+            print "\t\t#address-cells = <0x02>;"
+            print "\t\t#size-cells = <0x02>;"
+            print "\t\tranges;"
+            print "\t\tmmode_resv0@8c000000 {"
+            print "\t\t\treg = <0x00 0x8c000000 0x00 0x10000>, <0x00 0x8c100000 0x00 0x10000>;"
+            print "\t\t\tno-map;"
+            print "\t\t};"
+            print "\t\trtmux-resv-test@8c200000 {"
+            print "\t\t\treg = <0x00 0x8c200000 0x00 0x20000>;"
+            print "\t\t};"
+            print "\t\trtmux-resv-reusable@8c300000 {"
+            print "\t\t\treg = <0x00 0x8c300000 0x00 0x10000>;"
+            print "\t\t\treusable;"
+            print "\t\t};"
+            for (i = 0; i < 32; i++) {
+                a = 2354053120 + i * 131072
+                printf "\t\trtmux-resv-extra%d@%x {\n", i, a
+                printf "\t\t\treg = <0x00 0x%x 0x00 0x10000>;\n", a
+                print "\t\t};"
+            }
+            print "\t};"
+            print; root = 1; next
+        }
+        { print }
+        END { exit(hdr && root ? 0 : 1) }
+    ' "$1" >"$2"
+}
+
+# setup_fdt_resv_or_skip: boot the guest on QEMU's DTB patched by
+# patch_fdt_resv_dts. The ranges sit in the middle of the 256 MiB of RAM, clear
+# of the kernel, the initramfs and the FDT, and must match resv_fixture[] in
+# tests/userland/main.c. OpenSBI adds its own mmode_resv nodes beside these.
+setup_fdt_resv_or_skip()
+{
+    FDT_RESV_DTB="$(mktemp /tmp/rtmux-fdt-resv-dtb.XXXXXX)"
+    FDT_RESV_DTS="$(mktemp /tmp/rtmux-fdt-resv-dts.XXXXXX)"
+    build_patched_dtb "$FDT_RESV_DTB" "$FDT_RESV_DTS" patch_fdt_resv_dts ||
+        fixture_unsupported "cannot build reserved-memory DTB fixture"
+    export EMU_QEMU_OPTS="${EMU_QEMU_OPTS:+$EMU_QEMU_OPTS }-dtb $FDT_RESV_DTB"
+}
+
+# check_fdt_resv LOG: both reg pairs of the no-map child, the plain and the
+# reusable child, and the /memreserve/ entry are each reserved, and the no-map
+# pairs are left out of the kernel's mappings (init_mmu checks the final PTEs
+# before it prints "unmapped").
+check_fdt_resv()
+{
+    local line top ws used size
+
+    require_log_patterns "$1" "reserved-memory fixture" \
+        'fdt: reserved mmode_resv0@8c000000 \[8c000000\.\.8c010000\) no-map' \
+        'fdt: reserved mmode_resv0@8c000000 \[8c100000\.\.8c110000\) no-map' \
+        'fdt: reserved rtmux-resv-test@8c200000 \[8c200000\.\.8c220000\)[[:space:]]*$' \
+        'fdt: reserved rtmux-resv-reusable@8c300000 \[8c300000\.\.8c310000\) reusable' \
+        'fdt: reserved /memreserve/ \[8c400000\.\.8c410000\)[[:space:]]*$' \
+        'unmapped no-map \[8c000000\.\.8c010000\)' \
+        'unmapped no-map \[8c100000\.\.8c110000\)' \
+        'fdt: reserved rtmux-resv-extra31@8c8e0000 ' \
+        'boot: stack \[[0-9a-f]+\.\.[0-9a-f]+\) used [0-9]+ of [0-9]+ bytes, workspace \[[0-9a-f]+\.\.[0-9a-f]+\) disjoint' \
+        '^  PASS  fdt-reserved-memory outside[[:space:]]*$' || return 1
+    # The workspace must start at or above the stack top, and the stack must
+    # not have used more than its size.
+    line="$(grep -a 'boot: stack ' "$1" | head -n 1)"
+    top="$(sed -E 's/.*stack \[[0-9a-f]+\.\.([0-9a-f]+)\).*/\1/' <<<"$line")"
+    ws="$(sed -E 's/.*workspace \[([0-9a-f]+)\.\..*/\1/' <<<"$line")"
+    used="$(sed -E 's/.*used ([0-9]+) of ([0-9]+) bytes.*/\1/' <<<"$line")"
+    size="$(sed -E 's/.*used ([0-9]+) of ([0-9]+) bytes.*/\2/' <<<"$line")"
+    if [ $((16#$ws)) -lt $((16#$top)) ] || [ "$used" -gt "$size" ]; then
+        echo "  FAIL     ${MODE}: boot stack and workspace overlap: $line"
+        return 1
+    fi
 }
 
 # check_fdt_cpu_status LOG PLACEMENT: OpenSBI picks the boot hart by lottery, so
@@ -1091,6 +1299,17 @@ mode_needs_net_helpers()
         lkl-multi|tracelogger-lkl-netd|tracelogger-lkl-netd-default)
             return 0
             ;;
+    esac
+    return 1
+}
+
+# lkl-netd-poll polls sockets against a peer whose behaviour the test picks by
+# port, so it needs the poll peer below rather than the HTTP, UDP and DNS
+# helpers.
+mode_needs_poll_helper()
+{
+    case "$MODE" in
+        lkl-netd-poll|lkl-netd-poll-spent) return 0 ;;
     esac
     return 1
 }
@@ -1193,6 +1412,10 @@ while [ $# -gt 0 ]; do
             LAPS="$2"
             shift 2
             ;;
+        --procs)
+            PROCS="$2"
+            shift 2
+            ;;
         --keep-logs)
             KEEP_LOGS=1
             shift
@@ -1242,6 +1465,27 @@ case "$LAPS" in
     *)
         if [ "$MODE" != "syscall-testing" ] && [ "$MODE" != "leak-gate" ]; then
             echo "qemu-regress: --laps is only valid with --mode syscall-testing or leak-gate" >&2
+            exit 2
+        fi
+        ;;
+esac
+
+case "$PROCS" in
+    "") ;;
+    *[!0-9]*)
+        echo "qemu-regress: --procs needs a non-negative integer" >&2
+        exit 2
+        ;;
+    *)
+        if [ "$MODE" != "spawn-storm" ]; then
+            echo "qemu-regress: --procs is only valid with --mode spawn-storm" >&2
+            exit 2
+        fi
+        # Normalize (the guest echoes the parsed count) and bound it by the
+        # guest fixture's resident table.
+        PROCS=$(printf '%s' "$PROCS" | sed 's/^0*//'); PROCS=${PROCS:-0}
+        if [ "${#PROCS}" -gt 3 ] || [ "$PROCS" -gt 256 ]; then
+            echo "qemu-regress: --procs is at most 256" >&2
             exit 2
         fi
         ;;
@@ -1427,6 +1671,58 @@ case "$MODE" in
         setup_pci_iommu_or_skip
         [ "$TIMEOUT_SET" -eq 0 ] && TIMEOUT=60
         ;;
+    smp-hart-start-fail|smp-hart-start-late)
+
+        # K3: a debug-inject kernel fails (or delays past its wait) the SBI start
+        # of the last of 4 harts; the system must reach login on the other 3.
+        BEGIN_MARKER='Mounting '
+        PASS_MARKER='^login:'
+        PASS_GREP=-E
+        FAIL_MARKER='*** /usr unavailable'
+        MODE_ARG="rtmux.inject=${MODE#smp-}"
+        NEEDS_DEBUG_INJECT=1
+        CPUS=4
+        export CPUS
+        ;;
+    smp-ap-crash-early)
+
+        # K32: the last of 4 harts fails to start and cpu 2 crashes after it
+        # committed to joining but before it is online, with cpu 1 online. The
+        # crash dump must complete, and its rendezvous must have waited for
+        # the exact set: cpu 0, cpu 1 and the crashing cpu 2.
+        BEGIN_MARKER='Boot command line:'
+        PASS_MARKER='=== END CRASH DUMP ==='
+        FAIL_MARKER='*** /usr unavailable'
+        MODE_ARG="rtmux.inject=hart-start-fail rtmux.inject=ap-crash-early"
+        NEEDS_DEBUG_INJECT=1
+        CPUS=4
+        export CPUS
+        ;;
+    smp-sparse-harts|smp-too-many-harts)
+
+        # K3: 10 harts against PROCESSORS_MAX=8. sparse-harts disables cpu@1..8
+        # in the DTB so hart 9 must get a logical CPU; too-many-harts boots all
+        # 10 so two must be parked.
+        BEGIN_MARKER='Mounting '
+        PASS_MARKER='^login:'
+        PASS_GREP=-E
+        FAIL_MARKER='*** /usr unavailable'
+        MODE_ARG=''
+        CPUS=10
+        export CPUS
+        [ "$MODE" = "smp-sparse-harts" ] && setup_fdt_sparse_harts_or_skip
+        ;;
+    fdt-reserved-memory)
+
+        # K8: boots a DTB with extra /reserved-memory children and a
+        # /memreserve/ entry; the guest fills RAM and checks that no frame comes
+        # from those ranges, and check_fdt_resv() checks the boot log.
+        BEGIN_MARKER="RTMux ${MODE}: BEGIN"
+        PASS_MARKER="RTMux ${MODE}: PASS"
+        FAIL_MARKER="RTMux ${MODE}: FAIL"
+        MODE_ARG="rtmux.run=${MODE}"
+        setup_fdt_resv_or_skip
+        ;;
     fdt-cpu-status)
 
         # Boots the irq-notify guest on a DTB with cpu@1 disabled; the host
@@ -1516,7 +1812,7 @@ case "$MODE" in
         NEEDS_LKL_SERVERS=1
         [ "$TIMEOUT_SET" -eq 0 ] && TIMEOUT=60
         ;;
-    lkl-fsd-crash|lkl-fsd-tree|lkl-fsd-tree-split|lkl-fsd-tree-isolated|lkl-fsd-tricky|lkl-fsd-restart|lkl-netd-crash|lkl-netd-direct-denied|lkl-netd-http|lkl-netd-http-split|lkl-netd-http-isolated|lkl-netd-revoke|lkl-netd-restart|lkl-netd-stale|lkl-multi|lkl-multi-crash|lkl-multi-stress)
+    lkl-fsd-crash|lkl-fsd-tree|lkl-fsd-tree-split|lkl-fsd-tree-isolated|lkl-fsd-tricky|lkl-fsd-restart|lkl-netd-crash|lkl-netd-direct-denied|lkl-netd-http|lkl-netd-http-split|lkl-netd-http-isolated|lkl-netd-revoke|lkl-netd-restart|lkl-netd-stale|lkl-netd-poll|lkl-netd-poll-spent|lkl-multi|lkl-multi-crash|lkl-multi-stress)
         BEGIN_MARKER="RTMux ${MODE}: BEGIN"
         PASS_MARKER="RTMux ${MODE}: PASS"
         FAIL_MARKER="RTMux ${MODE}: FAIL"
@@ -1632,6 +1928,15 @@ if [ "$MODE" = "lkl-fsd-crash" ] || [ "$MODE" = "lkl-netd-crash" ] ||
    [ "$MODE" = "lkl-fsd-restart" ]; then
     BAD_RE='FATAL|CRASH|Kernel panic|panic:|lkl-host: panic|FREED-ACTIVE|__kernel_restore bad ptr|/usr unavailable|Undefined symbol|No such file or directory|Bad file descriptor'
 fi
+
+# smp-ap-crash-early crashes on purpose and checks the dump itself.
+if [ "$MODE" = "smp-ap-crash-early" ]; then
+    BAD_RE='FATAL|Kernel panic|panic:|FREED-ACTIVE|__kernel_restore bad ptr|/usr unavailable|Undefined symbol'
+fi
+
+# spawn-storm --procs measures teardown cost, which only an instrumented kernel
+# reports (pshut and irqoff lines from clock_handler).
+[ -n "$PROCS" ] && NEEDS_INSTRUMENTATION=1
 
 if [ "$NEEDS_LKL_SERVERS" -eq 1 ] || [ "$NEEDS_INSTRUMENTATION" -eq 1 ] ||
    [ "$NEEDS_DEBUG_INJECT" -eq 1 ] || [ "$NEEDS_STALL_DETECTOR" -eq 1 ] ||
@@ -2010,11 +2315,65 @@ dump_hang_state()
                     printf '#   %s -> %s\n' "$v" \
                         "$("$a2l" -f -e "$roottask" "$v" 2>/dev/null | paste -sd' ')" >>"$dump"
                 done
+            # The saved pc/ra of each READY or running thread, by the same map.
+            echo "# thread pc/ra at 0xc0000000+:" >>"$dump"
+            grep -aoE '(pc|ra)=0xc[0-9a-f]{7}' "$dump" | sort -u |
+                while IFS== read -r k v; do
+                    printf '#   %s %s -> %s\n' "$k" "$v" \
+                        "$("$a2l" -f -e "$roottask" "$v" 2>/dev/null | paste -sd' ')" >>"$dump"
+                done
         fi
     else
         echo "# result: GDB FAILED or timed out; this dump is INCOMPLETE" >>"$dump"
         echo "  HANG     ${MODE}: gdb dump failed or incomplete (see ${dump})"
     fi
+}
+
+# check_spawn_storm_loader LOG: a resident whose loader could not map its data
+# was starved of a roottask resource (K26): the run fails, whatever the tests
+# reported.
+check_spawn_storm_loader()
+{
+    local log="$1"
+
+    if grep -q 'mmap of data failed' "$log"; then
+        echo "  FAIL     spawn-storm: a process failed to map its data (ENOMEM in roottask)"
+        grep -m 3 'mmap of data failed' "$log"
+        return 1
+    fi
+}
+
+# report_spawn_storm_cost LOG: print the last pshut line and each hart's last
+# irqoff line logged before the guest's "storm done" marker, so they cover the
+# storm at PROCS resident processes and not the residents' own exits after it.
+report_spawn_storm_cost()
+{
+    local log="$1" out rc
+
+    out=$(tr -d '\r' <"$log" | awk -v procs="$PROCS" '
+        /spawn_storm: storm done residents=/ { done = ($NF == "residents=" procs); exit }
+        match($0, /pshut: .*/) { pshut = substr($0, RSTART) }
+        match($0, /irqoff: cpu=[0-9]+ .*/) {
+            line = substr($0, RSTART)
+            split(line, f, " ")
+            last[f[2]] = line
+        }
+        END {
+            if (!done) {
+                print "  FAIL     spawn-storm did not finish its storm with " procs " residents"
+                exit 1
+            }
+            if (pshut == "") {
+                print "  FAIL     spawn-storm logged no pshut line (CONFIG_INSTRUMENTATION=y?)"
+                exit 1
+            }
+            print "  procs=" procs " " pshut
+            for (c in last)
+                print "  procs=" procs " " last[c]
+        }')
+    rc=$?
+    printf '%s\n' "$out" | sort -s -k2,2 -k3,3
+    return $rc
 }
 
 # check_hartwatch_reports LOG: neighbour-watchdog verdict. hart-watchdog needs
@@ -2063,6 +2422,34 @@ check_hartwatch_reports()
         fi
     fi
     return 0
+}
+
+# check_fault_report_bound LOG PATTERN N: a kernel report rate-limited by
+# KPRINTF_RATELIMITED (kernel/include/log.h) that fired N times may print at
+# most BURST + ceil(N / INTERVAL) + 1 lines, and once N passes the burst at
+# least one line must carry the suppressed count, proving the events reached it.
+check_fault_report_bound()
+{
+    local log="$1" pattern="$2" events="$3" burst interval limit lines
+
+    burst=$(sed -nE 's/^#define[[:space:]]+KPRINTF_RL_BURST[[:space:]]+([0-9]+).*/\1/p' kernel/include/log.h)
+    interval=$(sed -nE 's/^#define[[:space:]]+KPRINTF_RL_INTERVAL[[:space:]]+([0-9]+).*/\1/p' kernel/include/log.h)
+    if [ -z "$burst" ] || [ -z "$interval" ]; then
+        echo "  FAIL     ${MODE}: cannot read KPRINTF_RL_BURST/INTERVAL from kernel/include/log.h"
+        return 1
+    fi
+    limit=$((burst + (events + interval - 1) / interval + 1))
+    lines=$(grep -aF -c -- "$pattern" "$log" || true)
+    if [ "$lines" -gt "$limit" ]; then
+        echo "  FAIL     ${MODE}: ${lines} '${pattern}' lines for ${events} events, limit ${limit}"
+        return 1
+    fi
+    if [ "$events" -gt $((burst + interval - 1)) ] &&
+       ! grep -aF -- "$pattern" "$log" | grep -Eq 'suppressed, [0-9]+ total\)'; then
+        echo "  FAIL     ${MODE}: no rate-limited '${pattern}' line carries a suppressed count"
+        return 1
+    fi
+    echo "  OK       ${MODE}: ${lines} '${pattern}' lines for ${events} events (limit ${limit})"
 }
 
 # check_roottask_wait_reports LOG: roottask wait-scan verdict. Each held sync
@@ -2167,6 +2554,16 @@ run_one()
     if [ -n "$LAPS" ]; then
         cmd+=("rtmux.laps=${LAPS}")
     fi
+    if [ -n "$PROCS" ]; then
+        cmd+=("rtmux.spawn_procs=${PROCS}")
+        # Each resident /bin/cat takes about 1.6 MiB of physical memory, so the
+        # default 256 MiB guest holds about 140 of them (K26): above 100, add
+        # 2 MiB per resident to the default.
+        if [ "$PROCS" -gt 100 ] &&
+           [ "${EMU_MEM_MB:-0}" -lt $((256 + 2 * PROCS)) ]; then
+            export EMU_MEM_MB=$((256 + 2 * PROCS))
+        fi
+    fi
     if [ "${#EXTRA_ARGS[@]}" -gt 0 ]; then
         cmd+=("${EXTRA_ARGS[@]}")
     fi
@@ -2182,9 +2579,12 @@ run_one()
         wrap_timeout=$((TIMEOUT + ${HANG_DUMP_TIMEOUT:-120} + 20)) # headroom for the dump
     fi
 
-    # serial-unblock feeds one byte to the guest UART (QEMU's stdio) once the
-    # guest prints "serial-unblock: WAITING"; every other mode reads nothing.
-    local stdin_src=/dev/null serial_fifo= serial_fd= serial_sent=0
+    # serial-unblock feeds the guest UART (QEMU's stdio) the bytes the guest
+    # asks for: each "serial-inject: <seq> <hex>" line, seq counting from 0,
+    # sends the byte 0x<hex> once, and so does each "console-inject: <seq>
+    # <hex>" line, counted separately. Every other mode reads nothing.
+    local stdin_src=/dev/null serial_fifo= serial_fd= serial_sent=0 serial_hex=
+    local console_sent=0
     if [ "$MODE" = "serial-unblock" ]; then
         serial_fifo="$(mktemp -u "/tmp/rtmux-serial-unblock-fifo.XXXXXX")"
         mkfifo "$serial_fifo" || return 1
@@ -2201,11 +2601,18 @@ run_one()
             kill "$runner" 2>/dev/null || true
             break
         fi
-        if [ -n "$serial_fd" ] && [ "$serial_sent" -eq 0 ] &&
-           grep -Fq 'serial-unblock: WAITING' "$log"; then
-            printf x >&"$serial_fd"
-            serial_sent=1
-        fi
+        while [ -n "$serial_fd" ] &&
+              serial_hex="$(grep -m1 -aoE \
+                  "console-inject: $console_sent [0-9a-f]{2}" "$log")"; do
+            printf "\\x${serial_hex##* }" >&"$serial_fd"
+            console_sent=$((console_sent + 1))
+        done
+        while [ -n "$serial_fd" ] &&
+              serial_hex="$(grep -m1 -aoE \
+                  "serial-inject: $serial_sent [0-9a-f]{2}" "$log")"; do
+            printf "\\x${serial_hex##* }" >&"$serial_fd"
+            serial_sent=$((serial_sent + 1))
+        done
         if [ "$pass_seen" -eq 0 ] &&
            grep -q "$PASS_GREP" "$PASS_MARKER" "$log"; then
             pass_seen=1
@@ -2263,6 +2670,7 @@ run_one()
         else
             echo "  FAIL     ${MODE} exited rc=${rc}"
         fi
+        grep -En '^  FAIL  ' "$log" | head -n 40
         tail -n 120 "$log"
         return 1
     fi
@@ -2288,6 +2696,8 @@ run_one()
 
     if grep -Fq "$FAIL_MARKER" "$log"; then
         echo "  FAIL     ${MODE} reported guest failure"
+        # The tail can scroll the failing test out of view; name it first.
+        grep -En '^  FAIL  ' "$log" | head -n 40
         tail -n 160 "$log"
         return 1
     fi
@@ -2411,6 +2821,13 @@ run_one()
         check_roottask_wait_reports "$log" || return 1
     fi
 
+    if [ "$MODE" = "spawn-storm" ]; then
+        check_spawn_storm_loader "$log" || return 1
+        if [ -n "$PROCS" ]; then
+            report_spawn_storm_cost "$log" || return 1
+        fi
+    fi
+
     if [ "$MODE" = "logger-restart" ]; then
         if ! grep -Eq '^logger-restart: PASS first=[0-9]+ second=[0-9]+' "$log"; then
             echo "  FAIL     ${MODE} did not prove logger respawn"
@@ -2418,6 +2835,16 @@ run_one()
             return 1
         fi
     fi
+
+    if [ "$MODE" = "fdt-reserved-memory" ]; then
+        check_fdt_resv "$log" || return 1
+    fi
+
+    case "$MODE" in
+    smp-hart-start-fail|smp-hart-start-late|smp-ap-crash-early|smp-sparse-harts|smp-too-many-harts)
+        check_smp_bringup "$log" || return 1
+        ;;
+    esac
 
     if [ "$MODE" = "fault-recovery" ]; then
         require_log_patterns_in_order "$log" "fault recovery probes" \
@@ -2430,6 +2857,13 @@ run_one()
             '^  PASS  fault-recovery readonly_write_fault[[:space:]]*$' || return 1
         require_log_patterns "$log" "fault recovery readonly event" \
             '^fault-event event_id=user-page-fault severity=thread-fatal subject=self cause=--fault-mprotect-ro action=reported-signal authority_delta=none[[:space:]]*$' || return 1
+        require_log_patterns_in_order "$log" "fault recovery report floods" \
+            '^  PASS  fault-recovery bad_syscall_enosys[[:space:]]*$' \
+            '^fault-event event_id=illegal-syscall severity=deny subject=self cause=out-of-range-call action=return-ENOSYS authority_delta=none[[:space:]]*$' \
+            '^  PASS  fault-recovery crash_loop[[:space:]]*$' || return 1
+        check_fault_report_bound "$log" 'ecall: invalid syscall' 100000 || return 1
+        # Two single faults above, then the crash loop's forty children.
+        check_fault_report_bound "$log" 'user fault: ' 42 || return 1
     fi
 
     if [ "$MODE" = "rcu-lookup-measure" ]; then
@@ -2663,6 +3097,69 @@ PY
     if ! kill -0 "$payload_pid" 2>/dev/null; then
         echo "qemu-regress: failed to start payload helper on 127.0.0.1:8003" >&2
         cat /tmp/rtmux-lkl-payload.log >&2
+        exit 1
+    fi
+fi
+
+# The poll peer of lkl-netd-poll: a TCP server per behaviour (see
+# tests/userland/rt-latency/lkl-netd-poll-test.c). 8004 is idle, 8005 sends
+# "hello" a second after accept, 8006 resets after a second, 8007 closes after
+# a second, 8008 sends "hello" after two seconds.
+if mode_needs_poll_helper; then
+    python3 - <<'PY' >/tmp/rtmux-lkl-poll.log 2>&1 &
+import socket
+import struct
+import threading
+import time
+
+def peer(conn, delay, action):
+    try:
+        time.sleep(delay)
+        if action == "send":
+            conn.sendall(b"hello")
+        elif action == "reset":
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                            struct.pack("ii", 1, 0))
+            conn.close()
+            return
+        elif action == "fin":
+            conn.close()
+            return
+        conn.settimeout(60)
+        while conn.recv(4096):
+            pass
+    except OSError:
+        pass
+    finally:
+        conn.close()
+
+def listener(port):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("127.0.0.1", port))
+    s.listen(64)
+    return s
+
+def serve(s, delay, action):
+    while True:
+        conn, _ = s.accept()
+        threading.Thread(target=peer, args=(conn, delay, action),
+                         daemon=True).start()
+
+# Bind every port here, so that one already taken ends the helper at once.
+for port, delay, action in ((8004, 0, "idle"), (8005, 1, "send"),
+                            (8006, 1, "reset"), (8007, 1, "fin"),
+                            (8008, 2, "send")):
+    threading.Thread(target=serve, args=(listener(port), delay, action),
+                     daemon=True).start()
+while True:
+    time.sleep(3600)
+PY
+    poll_pid=$!
+    sleep 1
+    if ! kill -0 "$poll_pid" 2>/dev/null; then
+        echo "qemu-regress: failed to start poll helper on 127.0.0.1:8004-8008" >&2
+        cat /tmp/rtmux-lkl-poll.log >&2
         exit 1
     fi
 fi

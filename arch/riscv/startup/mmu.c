@@ -10,6 +10,7 @@
  *         SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <stdbool.h>
 #include <startup.h>
 #include <startup-api.h>
 #include <paging.h>
@@ -19,6 +20,7 @@ paddr_t page_directory;
 uint64_t boot_satp_val;
 
 #define MEGAPAGE_SIZE (2UL * 1024UL * 1024UL)
+#define GIGAPAGE_SIZE (1UL << PXSHIFT(2))
 #define ALIGN_UP_2M(x) (((x) + MEGAPAGE_SIZE - 1) & ~(MEGAPAGE_SIZE - 1))
 #define ALIGN_UP_4K(x) (((x) + 0xFFFUL) & ~0xFFFUL)
 
@@ -95,29 +97,33 @@ static inline int pte_is_leaf(pte_t entry)
 }
 
 /**
- * \brief Split a megapage (2MB leaf at L1) into 512 individual 4KB PTEs.
+ * \brief Split a superpage leaf (2MB at L1, 1GB at L2) into 512 smaller leaves.
  *
- * Allocates a new L0 page table, fills it with 512 entries that reproduce the
- * same mapping as the original megapage, then replaces the L1 leaf with a
- * pointer to the new L0 table.
+ * Allocates a new page table one level down, fills it with 512 entries that
+ * reproduce the same mapping as the original leaf (4KB pages under a megapage,
+ * megapages under a gigapage), then replaces the leaf with a pointer to the new
+ * table. \a level is the level the leaf sits at.
  */
-static void split_megapage(pte_t *l1_table, unsigned l1_idx, pte_t entry)
+static void split_leaf(pte_t *table, unsigned idx, pte_t entry, int level)
 {
-    paddr_t mega_pa = PTE2PA(entry);
-    uint64_t flags =
-        entry & (PTE_R | PTE_W | PTE_X | PTE_U | PTE_V | PTE_A | PTE_D | PTE_G);
+    paddr_t base_pa = PTE2PA(entry);
+    uint64_t step = 1UL << PXSHIFT(level - 1);
+    /* Every bit but the PPN carries over: permissions, and the memory type and
+     * software bits above and below the PPN.
+     */
+    uint64_t flags = entry & ~(PTE_PPN_MASK << 10);
 
     paddr_t new_pt = calloc_ram(__PAGESIZE, __PAGESIZE);
-    pte_t *l0_table = MAKE_1TO1_PTR(new_pt);
+    pte_t *lower = MAKE_1TO1_PTR(new_pt);
 
     for (unsigned i = 0; i < 512; i++) {
-        l0_table[i] = PA2PTE(mega_pa + i * PGSIZE) | flags;
+        lower[i] = PA2PTE(base_pa + i * step) | flags;
     }
 
-    /* Replace the megapage leaf with a pointer to the L0 table */
-    l1_table[l1_idx] = PA2PTE(new_pt) | PTE_V;
+    /* Replace the leaf with a pointer to the new table */
+    table[idx] = PA2PTE(new_pt) | PTE_V;
 
-    /* Flush stale TLB entries for the old megapage */
+    /* Flush stale TLB entries for the old superpage */
     sfence_vma();
 }
 
@@ -151,11 +157,12 @@ static void map_page(paddr_t root,
         pte_t entry = pgtable[idx];
 
         if (entry & PTE_V) {
-            if (level == 1 && !megapage && pte_is_leaf(entry)) {
-                /* Existing 2MB megapage leaf, but we need 4KB granularity.
-                 * Split it into 512 individual page entries.
+            if (pte_is_leaf(entry)) {
+                /* An existing superpage leaf stands where a table must be:
+                 * descending would read its PPN as one. Split it into 512
+                 * leaves of the next size down, until the one we want fits.
                  */
-                split_megapage(pgtable, idx, entry);
+                split_leaf(pgtable, idx, entry, level);
                 entry = pgtable[idx];
             }
             /* Descend to next level */
@@ -173,11 +180,185 @@ static void map_page(paddr_t root,
     pgtable[idx] = PA2PTE(pa) | pte_flags;
 }
 
+/* range_step — advance past [va, next) within a range of len bytes left.
+ * Works on the distance rather than on end addresses, so a range that runs to
+ * the very top of the address space (end == 0) is still walked, and a skip
+ * past the last slot cannot wrap to VA 0.
+ */
+static inline size_t range_step(uintptr_t va, uintptr_t next, size_t len)
+{
+    size_t step = (size_t) (next - va); /* modular: correct across the top */
+
+    return step < len ? len - step : 0;
+}
+
+/* unmap_range — drop [va, va + len) from the boot page table, before the MMU
+ * is on.
+ *
+ * A gigapage or megapage wholly inside the range is cleared at its own level;
+ * one the range only partly covers is split first, so the rest of it stays
+ * mapped. Unmapped stretches are skipped. va and len must be page-aligned.
+ */
+static void unmap_range(uintptr_t va, size_t len)
+{
+    while (len) {
+        pte_t *l2 = MAKE_1TO1_PTR(page_directory);
+        pte_t entry = l2[PX(2, va)];
+        pte_t *l1;
+        uintptr_t next;
+        unsigned idx;
+
+        if (!(entry & PTE_V)) {
+            next = (va | (GIGAPAGE_SIZE - 1)) + 1;
+            len = range_step(va, next, len);
+            va = next;
+            continue;
+        }
+        if (pte_is_leaf(entry)) {
+            if ((va & (GIGAPAGE_SIZE - 1)) == 0 && len >= GIGAPAGE_SIZE) {
+                l2[PX(2, va)] = 0;
+                len -= GIGAPAGE_SIZE;
+                va += GIGAPAGE_SIZE;
+                continue;
+            }
+            split_leaf(l2, PX(2, va), entry, 2);
+            entry = l2[PX(2, va)];
+        }
+        l1 = MAKE_1TO1_PTR(PTE2PA(entry));
+        idx = PX(1, va);
+        entry = l1[idx];
+        if (!(entry & PTE_V)) {
+            next = (va | (MEGAPAGE_SIZE - 1)) + 1;
+            len = range_step(va, next, len);
+            va = next;
+            continue;
+        }
+        if (pte_is_leaf(entry)) {
+            if ((va & (MEGAPAGE_SIZE - 1)) == 0 && len >= MEGAPAGE_SIZE) {
+                l1[idx] = 0;
+                len -= MEGAPAGE_SIZE;
+                va += MEGAPAGE_SIZE;
+                continue;
+            }
+            split_leaf(l1, idx, entry, 1);
+            entry = l1[idx];
+        }
+        ((pte_t *) MAKE_1TO1_PTR(PTE2PA(entry)))[PX(0, va)] = 0;
+        len = range_step(va, va + PGSIZE, len);
+        va += PGSIZE;
+    }
+}
+
+/* range_mapped — true if any page of [va, va + len) is mapped in the boot
+ * table. An invalid entry at a level skips everything it would have covered.
+ */
+static bool range_mapped(uintptr_t va, size_t len)
+{
+    while (len) {
+        pte_t *pt = MAKE_1TO1_PTR(page_directory);
+        uintptr_t next = va + PGSIZE;
+
+        for (int level = 2; level >= 0; level--) {
+            pte_t entry = pt[PX(level, va)];
+
+            if (!(entry & PTE_V)) {
+                next = (va | ((1UL << PXSHIFT(level)) - 1)) + 1;
+                break;
+            }
+            if (pte_is_leaf(entry))
+                return true;
+            pt = MAKE_1TO1_PTR(PTE2PA(entry));
+        }
+        len = range_step(va, next, len);
+        va = next;
+    }
+    return false;
+}
+
+/* crash_if_overlap — a no-map range over memory the boot needs is a firmware
+ * bug the kernel cannot run through.
+ */
+static void crash_if_overlap(paddr_t start,
+                             paddr_t end,
+                             paddr_t lo,
+                             paddr_t hi,
+                             const char *what)
+{
+    if (start < hi && end > lo)
+        crash("fdt: no-map range %lx..%lx overlaps %s\n",
+              (unsigned long) start, (unsigned long) end, what);
+}
+
+/* Leave every FDT no-map reservation out of the identity and high-VA maps,
+ * then check that no page of it is still mapped. Each range is rounded outward
+ * to whole pages (losing the rest of a shared page is the safe direction) and
+ * clipped to the physical span the high-VA window can address. Runs after every
+ * other boot mapping is made, so a device or FDT mapping it overlaps is caught
+ * by the checks below rather than silently restored.
+ */
+static void unmap_fdt_nomap(void)
+{
+    const paddr_t pa_limit = (paddr_t) 0 - (paddr_t) KERNEL_VIRT_BASE;
+
+    for (unsigned i = 0; i < fdt_nomap_count; i++) {
+        paddr_t start = TRUNCPG(fdt_nomap[i].start);
+        paddr_t end = fdt_nomap[i].end;
+
+        if (start >= pa_limit)
+            continue; /* beyond anything the boot tables can map */
+        if (end > pa_limit)
+            end = pa_limit;
+        end = ROUNDPG(end); /* pa_limit is page-aligned, so this cannot wrap */
+
+        /* board.c already refused one over the kernel image and workspace. */
+        crash_if_overlap(start, end, (paddr_t) fdt_addr,
+                         (paddr_t) fdt_addr + fdt_size, "the FDT");
+        crash_if_overlap(start, end, initramfs_phys_start, initramfs_phys_end,
+                         "the initramfs");
+        if (uart_base)
+            crash_if_overlap(start, end, uart_base, uart_base + PGSIZE,
+                             "the UART");
+        if (clint_base)
+            crash_if_overlap(start, end, clint_base, clint_base + 0x10000,
+                             "the CLINT");
+        if (plic_base)
+            crash_if_overlap(start, end, plic_base, plic_base + plic_size,
+                             "the PLIC");
+#ifdef CONFIG_MONITORING_KTHREAD
+        /* The monitor reaches PCI through the ECAM and window maps made above;
+         * unmapping any of them would fault it on its first access.
+         */
+        if (pci_fdt.ecam_size)
+            crash_if_overlap(start, end, pci_fdt.ecam_base,
+                             pci_fdt.ecam_base + pci_fdt.ecam_size,
+                             "the PCI ECAM");
+        for (unsigned w = 0; w < pci_fdt.num_windows; w++) {
+            if (pci_fdt.windows[w].size)
+                crash_if_overlap(
+                    start, end, pci_fdt.windows[w].cpu_addr,
+                    pci_fdt.windows[w].cpu_addr + pci_fdt.windows[w].size,
+                    "a PCI window");
+        }
+#endif
+        /* The identity map, then its high-VA mirror. */
+        for (unsigned v = 0; v < 2; v++) {
+            uintptr_t off = v ? KERNEL_VIRT_BASE : 0;
+
+            unmap_range((uintptr_t) start + off, (size_t) (end - start));
+            if (range_mapped((uintptr_t) start + off, (size_t) (end - start)))
+                crash("fdt: no-map range %lx..%lx still mapped\n",
+                      (unsigned long) start, (unsigned long) end);
+        }
+        kprintf("  unmapped no-map [%lx..%lx)\n", (unsigned long) start,
+                (unsigned long) end);
+    }
+}
+
 /**
  * \brief Invalidate the PTE for a single 4KB page, creating a guard page.
  *
- * If the page is part of a 2MB megapage, splits it first. After this call, any
- * access to \a va will trigger a page fault.
+ * If the page is part of a 2MB megapage or a 1GB gigapage, splits it first.
+ * After this call, any access to \a va will trigger a page fault.
  */
 void kernel_guard_page(uintptr_t va)
 {
@@ -191,8 +372,8 @@ void kernel_guard_page(uintptr_t va)
         if (!(entry & PTE_V))
             return; /* not mapped at all — already a guard */
 
-        if (level == 1 && pte_is_leaf(entry)) {
-            split_megapage(pgtable, idx, entry);
+        if (pte_is_leaf(entry)) {
+            split_leaf(pgtable, idx, entry, level);
             entry = pgtable[idx];
         }
         pgtable = MAKE_1TO1_PTR(PTE2PA(entry));
@@ -464,6 +645,9 @@ void init_mmu(void)
         high_va_map(base, base + size, RISCV_MAP_DEVICE | RISCV_MAP_NOEXEC);
     }
 #endif
+
+    /* Last, so no boot mapping above can put a no-map page back. */
+    unmap_fdt_nomap();
 
     /* Pre-allocate empty L1 page tables for every kernel L2 slot.
      *

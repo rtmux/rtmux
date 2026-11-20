@@ -88,9 +88,10 @@ void shutdown(unsigned sigcode, const CPU_REGISTERS *reg)
             }
         }
         kprintf("\nRTMux %s (%s)", os_version_string, timestamp);
-        extern unsigned hart_ids[];
         for (int _hi = 0; _hi < num_processors; ++_hi) {
-            i = hart_ids[_hi];
+            i = (unsigned) _hi;
+            if (!cpu_online(i) && i != get_cpunum())
+                continue;
             thp = get_active_thread(i);
             if (!thp)
                 continue;

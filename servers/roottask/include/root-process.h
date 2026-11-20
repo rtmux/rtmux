@@ -62,10 +62,10 @@ typedef union path_object path_object_t;
  */
 typedef struct root_process_entry {
     pid_t pid;                            /* full pid; 0 = slot free */
-    pid_t parent_pid;                     /* mirror of parent->pid; needed
-                                           * by root_proc_lock_parent without
-                                           * dereferencing the kernel-half
-                                           * process_t.parent pointer
+    pid_t parent_pid;                     /* parent at spawn; stale once
+                                           * the kernel reparents the child,
+                                           * so only a fallback for
+                                           * root_proc_lock_parent
                                            */
     struct proc_mux_lock *lock;           /* roottask-side process mux —
                                            * lazily allocated by acquire_lock
@@ -154,6 +154,21 @@ typedef struct root_process_entry {
     struct session_entry *session;
     siginfo_t siginfo;
 
+    /* The process's place in the group table (proc/group.c): whether it is
+     * counted in group pgrp, and which incarnation of that group, so that
+     * leaving never takes a count from a later group of the same id. Changed
+     * under the group table's lock; pgrp_member is set once the process has
+     * entered its first group and cleared when it is reaped.
+     */
+    uint32_t pgrp_gen;
+    unsigned char pgrp_member;
+
+    /* The process has itself replaced its image (exec). The only thing it
+     * affects is setpgid, which POSIX refuses from the parent after that; a
+     * spawned child that has not exec'd stays movable.
+     */
+    unsigned char execed;
+
     /* Job control: which of SIGTTIN/SIGTTOU the process blocks or ignores
      * (_JOBCTL_HOLD_* bits), as its libc reports through _PROC_JOBCTL_STATE. A
      * terminal server reads it to choose between EIO and a stop signal.
@@ -193,8 +208,22 @@ static inline root_process_t *root_proc(pid_t pid)
     return &root_process[ROOT_PINDEX(pid)];
 }
 
+/* The one rule for a process with no session: it belongs to the system session,
+ * which roottask leads. Boot gives roottask that session and every process
+ * inherits one (root_process_boot_session), so no process is without one after
+ * startup; every reader of a session id still goes through this, or through
+ * root_proc_info_t.sess_leader, which process_query_info fills by it, so that
+ * getsid, setpgid, kill and the job-control checks cannot disagree.
+ */
+pid_t root_session_leader(const root_process_t *p);
+
+/* The one rule for a process group: a process that joined none is in its own.
+ */
+pid_t root_process_pgrp(const root_process_t *p);
+
 void root_process_init(pid_t pid, pid_t parent_pid); /* claim slot at create */
-void root_process_fini(pid_t pid); /* release slot at destroy */
+void root_process_boot_session(pid_t pid); /* give pid a session it leads */
+void root_process_fini(pid_t pid);         /* release slot at destroy */
 void memcap_process_fini(root_process_t *tmp);
 
 /* root_proc_info_t — see kernel/include/private/root-proc-info.h for the shared
@@ -226,6 +255,8 @@ int soul_stats(struct kstat_soul_rec *out,
                unsigned *live_timeouts,
                uint64_t *timer_intr,
                unsigned timer_n,
-               unsigned *timer_count);
+               unsigned *timer_count,
+               uint64_t *prio_reply_overflow,
+               unsigned *prio_reply_depth);
 
 #endif /* _ROOTTASK_ROOT_PROCESS_H */

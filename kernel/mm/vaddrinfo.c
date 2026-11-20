@@ -18,11 +18,9 @@
  */
 
 #include <core/globals.h>
-#include "as.h"         /* CPU_1TO1_VADDR_BIAS, PA_TO_VA */
-#include <cpu-paging.h> /* PTE_R / PTE_W / PTE_X / PGSIZE / PXSHIFT */
+#include "as.h"          /* CPU_1TO1_VADDR_BIAS, PA_TO_VA */
+#include <sv39-lookup.h> /* PTE_*, cpu_pte_lookup, sv39_leaf_paddr */
 #include <sys/mman.h>
-
-extern pte_t *cpu_pte_lookup(pagetable_t pgdir, uintptr_t vaddr);
 
 /* mm_vaddrinfo — translate a virtual address to its physical mapping.
  *
@@ -32,7 +30,8 @@ extern pte_t *cpu_pte_lookup(pagetable_t pgdir, uintptr_t vaddr);
  *   prp    : process whose page table is walked
  *   vaddr  : virtual address to translate
  *   paddrp : if non-NULL, receives the physical address
- *   lenp   : if non-NULL, receives the contiguous length from vaddr
+ *   lenp   : if non-NULL, receives the bytes from vaddr to the end of the
+ *            leaf that maps it (4 KiB, 2 MiB or 1 GiB page)
  *   flags  : reserved (unused)
  * Return value: the PROT_* bits for the mapping, PROT_NONE if unmapped.
  */
@@ -67,40 +66,31 @@ unsigned mm_vaddrinfo(pid_t pid,
         return PROT_NONE;
 
     pagetable_t pgdir = (pagetable_t) prp->memory->cpu.pgdir;
-    pte_t *pte = cpu_pte_lookup(pgdir, vaddr);
-    if (!pte || !(*pte & PTE_V))
+
+    /* Use the entry as the walk checked it, so prot and paddr describe one leaf
+     * even if a concurrent unmap or remap changes it afterwards.
+     */
+    int level;
+    pte_t pv;
+    if (!cpu_pte_lookup(pgdir, vaddr, &level, &pv))
         return PROT_NONE;
 
     /* Translate PTE bits → POSIX prot bits. PTE_U doesn't matter for the caller
      * (kernel S-mode access uses SUM); we report read/write/exec presence.
      */
-    if (*pte & PTE_R)
+    if (pv & PTE_R)
         prot |= PROT_READ;
-    if (*pte & PTE_W)
+    if (pv & PTE_W)
         prot |= PROT_WRITE;
-    if (*pte & PTE_X)
+    if (pv & PTE_X)
         prot |= PROT_EXEC;
 
-    /* Compute PA: extract PPN from PTE, OR with VA's intra-page offset.
-     * Megapage leaves at L1 cover 2 MiB; detect via the R/W/X bits at the L1
-     * slot via cpu_pte_lookup's contract — for a 4 KiB leaf the offset is the
-     * 12 low bits, for a megapage it's the low 21 bits. Simple heuristic: check
-     * the page's PA alignment in the PTE. Cleaner: walk levels here ourselves.
+    /* The leaf's level fixes how many low VA bits are the offset into it: 12
+     * for 4 KiB, 21 for a 2 MiB megapage, 30 for a 1 GiB gigapage.
      */
-    paddr_t base = PTE2PA(*pte);
-    if (paddrp) {
-        /* Conservative: assume 4 KiB granularity. This is correct for
-         * cpu_pte_lookup returning an L0 PTE. For a megapage (rare; kernel
-         * callsites operate on user mappings which are 4 KiB after the
-         * initramfs loader), the low 9 bits of VA's L0 portion are folded —
-         * we'd return a PA aligned down to the megapage boundary. Acceptable
-         * for IPC validation (PROT match) but TODO: distinguish megapage leaves
-         * and add VA's low 21 bits in that case.
-         */
-        *paddrp = base | (vaddr & (__PAGESIZE - 1));
-    }
-    if (lenp)
-        *lenp = __PAGESIZE - (vaddr & (__PAGESIZE - 1));
+    paddr_t paddr = (paddr_t) sv39_leaf_paddr(pv, level, vaddr, lenp);
+    if (paddrp)
+        *paddrp = paddr;
 
     return prot;
 }

@@ -4,8 +4,9 @@
  * Provides LOGF_E/W/I/D/T macros for structured logging at different verbosity
  * levels. Safe to include from kernel, roottask, and libc.
  *
- * E/W/I always print. D prints with -v (kopt.loglevel >= 1). T prints with -vv
- * (kopt.loglevel >= 2).
+ * E/I always print. W prints regardless of level but is rate-limited per call
+ * site, so a warning repeated in a burst may drop lines. D prints with -v
+ * (kopt.loglevel >= 1). T prints with -vv (kopt.loglevel >= 2).
  *
  * kopt.loglevel is set by '-v' options in common-options.c.
  *
@@ -15,6 +16,7 @@
 #ifndef _KERNEL_LOG_H_INCLUDED
 #define _KERNEL_LOG_H_INCLUDED
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdarg.h>
 #include <options.h>
@@ -29,6 +31,46 @@
  */
 int kprintf(const char *fmt, ...);
 void kprintf_raw(const char *buf, size_t len);
+
+/* Per-call-site rate limit for reports a caller can trigger at will (a bad
+ * system call, a user fault, a recovered copy fault). A synchronous console
+ * write costs hundreds of microseconds (the kcall-dbgprint row in
+ * docs/rt-budgets.md), so an unthrottled report is both a console flood and a
+ * latency hazard. The first KPRINTF_RL_BURST reports print; after that one in
+ * KPRINTF_RL_INTERVAL does, at most once a second, carrying the count
+ * suppressed. Assumption class: tuning. Revisit trigger: a debugging session
+ * that needs the full stream.
+ */
+#define KPRINTF_RL_BURST 16
+#define KPRINTF_RL_INTERVAL 1000
+
+struct kprintf_ratelimit {
+    unsigned long events;     /* reports seen at this site; atomic */
+    unsigned long printed_at; /* events when the last line printed */
+    unsigned long next_tick;  /* rdtime before which no line prints */
+};
+
+bool kprintf_rl_admit(struct kprintf_ratelimit *rl,
+                      unsigned long *seen,
+                      unsigned long *last);
+void kprintf_rl_print(unsigned long seen,
+                      unsigned long last,
+                      const char *fmt,
+                      ...);
+
+/* KPRINTF_RATELIMITED(fmt, ...) — kprintf with a static limiter private to this
+ * call site. The arguments are evaluated only for a report that prints, so a
+ * dropped one costs the admit check alone.
+ */
+#define KPRINTF_RATELIMITED(fmt, ...)                                 \
+    do {                                                              \
+        static struct kprintf_ratelimit kprintf_rl_site_;             \
+        unsigned long kprintf_rl_seen_, kprintf_rl_last_;             \
+        if (kprintf_rl_admit(&kprintf_rl_site_, &kprintf_rl_seen_,    \
+                             &kprintf_rl_last_))                      \
+            kprintf_rl_print(kprintf_rl_seen_, kprintf_rl_last_, fmt, \
+                             ##__VA_ARGS__);                          \
+    } while (0)
 #ifdef CONFIG_STALL_DETECTOR
 /* kprintf that parks the line (flushed by this CPU's next kprintf) instead of
  * spinning for ever on a busy console lock. Interrupt-context callers only.
@@ -118,7 +160,11 @@ void crash_quiesce_self(void) __attribute__((noreturn));
 
 /* Structured logging macros */
 #define LOGF_E(fmt, ...) kprintf("ERROR: " fmt, ##__VA_ARGS__)
-#define LOGF_W(fmt, ...) kprintf("WARNING: " fmt, ##__VA_ARGS__)
+
+/* Rate-limited per call site by the KPRINTF_RATELIMITED limiter: a warning that
+ * fires in a loop prints its burst, then at most one line a second.
+ */
+#define LOGF_W(fmt, ...) KPRINTF_RATELIMITED("WARNING: " fmt, ##__VA_ARGS__)
 #define LOGF_I(fmt, ...) kprintf(fmt, ##__VA_ARGS__)
 #define LOGF_D(fmt, ...)                 \
     do {                                 \

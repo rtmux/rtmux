@@ -23,6 +23,9 @@ struct pshared_region {
 #define PSHARED_ITERS 300
 #define PSHARED_ITERS_ARG "300"
 
+/* Counters behind the hooks below (report.c). */
+extern struct test_counts suite_counts;
+
 void test_ok(const char *name);
 void test_fail(const char *name, const char *detail);
 void check(int cond, const char *name, const char *detail);
@@ -40,22 +43,59 @@ int rlimit_cpu_child(void);
 int rlimit_inherit_child(void);
 int rlimit_inherit_grandchild(void);
 void test_sync(void);
+void test_prio_loan(void);
 int sync_pi_large_pid_child(void);
 void test_printf(void);
 void test_setjmp(void);
+void test_time(void);
+void test_strftime(void);
+void test_qsort(void);
+void test_getopt(void);
+void test_env(void);
+void test_malloc_stats(void);
+int env_expect_child(const char *assignment);
 void test_signals(void);
 void test_vfs(void);
 void test_native_file_io(void);
 void test_native_io_boundaries(void);
 int spawn_echo_child(const char *tag);
+int spawn_bigargs_child(int argc, char *argv[]);
 void test_posix_cap_boundary(void);
 int posix_cap_boundary_child(void);
 void test_notifications(void);
 void test_serial_unblock(void);
+void test_serial_poll(void);
+void serial_inject(int c);
+void test_console_poll(void);
+void console_inject(int c);
+void sleep_ms(long ms);
 int serial_unblock_child(int announce);
 int disconnect_under_alloc_failure(void);
+int inject_run(const char *a1, const char *a2, const char *a3);
+int test_pin_mask(unsigned mask);
+int condloan_create(pthread_t *tid, int prio, void *(*fn)(void *), void *arg);
+int sched_set_error_after_lowering(void);
+int loan_settle_context(void);
+int sched_set_error_while_migrating(void);
+int condvar_reacquire_alloc_failure(void);
+int mutex_waiting_republish(void);
+int mutex_handoff_loan(void);
+int mutex_waiting_withdrawn(void);
+int condvar_interrupt_stale(void);
+int ns_open_deferral(void);
+int pte_partial_map(void);
+int pgrp_races(void);
+int pgrp_exec_hold(void);
+int pgrp_tty_child(int race);
 int disconnect_child(const char *pid_arg, const char *chid_arg);
 void test_posix_options(void);
+void test_sysconf(void);
+
+/* The initial envp, found after main()'s argv rather than through environ,
+ * which libc or a setenv() may have moved. The auxiliary vector follows its
+ * NULL terminator.
+ */
+extern char **test_initial_envp;
 void test_capgate(void);
 void test_leak(void);
 void test_gauges(void);
@@ -79,6 +119,9 @@ void *test_unmapped_user_addr(void);
 
 void test_trace_negative(void);
 void test_spawn_concurrent(void);
+void test_orphan_exit(void);
+int orphan_exit_mid(void);
+void test_spawn_storm(unsigned residents);
 void test_user_ptr_negative(void);
 int capgate_child_connect(const char *chid_arg);
 int capgate_child_dup_attack(int argc, char **argv);

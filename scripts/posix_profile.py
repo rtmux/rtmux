@@ -347,6 +347,7 @@ OPTION_REQUIREMENTS = {
         "posix_spawn_file_actions_init", "posix_spawn_file_actions_destroy",
         "posix_spawn_file_actions_addopen", "posix_spawn_file_actions_addclose",
         "posix_spawn_file_actions_adddup2",
+        "posix_spawn_file_actions_addchdir", "posix_spawn_file_actions_addfchdir",
         "posix_spawnattr_init", "posix_spawnattr_destroy",
         "posix_spawnattr_getflags", "posix_spawnattr_setflags",
         "posix_spawnattr_getpgroup", "posix_spawnattr_setpgroup",

@@ -13,40 +13,41 @@
 static int roottask_sysconf_get(int name, long *value, char *str);
 static int roottask_confstr_get(int name, long *value, char *str);
 
-/* sc_nprocessors / sc_clk_tck — backing functions for _SC_NPROCESSORS_* and
- * _SC_CLK_TCK lookups. roottask pulls both from the syspage directly. The
- * syspage is read-only-mapped into every process, so this is safe from U-mode
- * roottask. Tick rate is derived from qtime.nsec_inc (nanoseconds per tick),
- * the syspage equivalent of clk_tck.
+/* Backing functions for the _CONF_FCN entries below, which _conf_get calls as
+ * long (*)(int); a narrower field is widened here rather than loaded through a
+ * _CONF_INDIRECT pointer. The processor count and tick rate come from the
+ * read-only syspage; the tick rate from qtime.nsec_inc.
  */
-static unsigned sc_nprocessors(int name)
+static long sc_nprocessors(int name)
 {
     (void) name;
-    return _syspage_ptr->num_cpu;
+    return (long) _syspage_ptr->num_cpu;
 }
 
-static unsigned sc_clk_tck(int name)
+static long sc_clk_tck(int name)
 {
     (void) name;
     unsigned long inc = SYSPAGE_ENTRY(qtime)->nsec_inc;
-    return inc ? (unsigned) (1000000000UL / inc) : 100;
+    return inc ? (long) (1000000000UL / inc) : 100;
 }
 
-/* roottask_max_fds is a 32-bit unsigned; a _CONF_INDIRECT entry loads a whole
- * long from the address and returned the next 4 bytes of .data in the upper
- * half. Widen it through a function instead.
- */
 static long sc_open_max(int name)
 {
     (void) name;
     return (long) roottask_max_fds;
 }
 
+long roottask_sc_pagesize(int name)
+{
+    (void) name;
+    return (long) root_vm_ops.pagesize;
+}
+
 static const long roottask_sysconf_table[] = {
     _CONF_CALL_FCN, (intptr_t) roottask_sysconf_get,
     _CONF_VALUE_NUM | _SC_ARG_MAX, ARG_MAX, _CONF_VALUE_NUM | _SC_VERSION,
-    _POSIX_VERSION, _CONF_VALUE_MIN | _CONF_INDIRECT | _SC_PAGESIZE,
-    (intptr_t) &root_vm_ops.pagesize,
+    _POSIX_VERSION, _CONF_VALUE_MIN | _CONF_FCN | _SC_PAGESIZE,
+    (intptr_t) roottask_sc_pagesize,
 
     /* These entries live entirely on the roottask side; kernel scalars
      * (kopt.max_fds, clk_tck, num_processors) are not reachable from U-mode
@@ -271,18 +272,26 @@ int roottask_sysconf_msg(ioserv_context_t *ctp, sys_conf_t *msg)
             long room = (long) (ctp->msg_max_size - sizeof msg->i);
             size_t size;
 
-            size = (size_t) msg->i.value;
-            value = min_long(msg->i.value, room);
+            /* A negative size copies nothing, and so does a miss: value would
+             * still hold the buffer size, i.e. stale receive-buffer bytes. On a
+             * hit value is the full length, which confstr() reports. Fix the
+             * payload length before the reply is byte-swapped.
+             */
+            size = msg->i.value < 0 || room < 0
+                       ? 0
+                       : (size_t) min_long(msg->i.value, room);
+            value = (long) size;
             msg->o.match = _conf_get(roottask_sysconf_table, msg->i.name,
                                      &value, (char *) (&msg->o + 1));
-            msg->o.value = min_long(value, room);
+            if (msg->o.match == -1 || value < 0)
+                value = 0;
+            msg->o.value = value;
+            size = min_size(size, (size_t) value);
             if (ctp->info.flags & RTMUX_MI_ENDIAN_DIFF) {
                 ENDIAN_SWAP32(&msg->o.match);
                 ENDIAN_SWAP64(&msg->o.value);
             }
-            return IOSERV_PTR(
-                ctp, &msg->o,
-                sizeof msg->o + min_size(size, (size_t) msg->o.value));
+            return IOSERV_PTR(ctp, &msg->o, sizeof msg->o + size);
         } else if (msg->i.cmd & _CONF_NUM) {
             value = msg->i.value;
             msg->o.match =

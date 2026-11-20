@@ -121,6 +121,7 @@ void init_objects()
     kspinlock_init(&roottask_stack_slock, LOCK_CLASS_MEMPART,
                    "roottask_stack_slock");
     kspinlock_init(&pa_slock, LOCK_CLASS_PA, "pa_slock");
+    prio_defer_init();
 
     /* alloc_slock is initialized at the top of heap_init() — must be ready
      * before the very first _scalloc, which happens earlier in boot than
@@ -193,28 +194,23 @@ void init_objects()
     dpp = init_scheduler();
     prp->default_dpp = dpp;
 
-    /* Build LEGAL_CPU_BITMASK from hart_ids[] */
-    {
-        extern unsigned hart_ids[];
-        unsigned mask = 0;
-        for (unsigned k = 0; k < num_processors; k++)
-            mask |= (1U << hart_ids[k]);
-        legal_cpu_bitmask = mask;
-    }
+    /* Every logical CPU starts legal; kext_smp_bringup() drops one whose hart
+     * does not start.
+     */
+    legal_cpu_bitmask =
+        num_processors >= 64 ? ~(uint64_t) 0 : (1ULL << num_processors) - 1;
 
-    /* Create idle threads — one per CPU, indexed by hart ID.
-     *
-     * hart_ids[] is populated by the FDT parser in startup and contains the
-     * actual RISC-V hart IDs. The kernel uses these directly as indices into
-     * actives[], ksys_stack[], cpupageptr[], etc. No logical-to-physical CPU
-     * mapping — hart IDs are the only CPU identifiers in the system.
+    /* Only the boot CPU is running; an AP joins in cpu_idle(). */
+    online_cpu_mask = 1ULL << boot_cpunum;
+
+    /* Create idle threads — one per logical CPU. Every per-CPU array
+     * (actives[], ksys_stack[], cpupageptr[], ...) is indexed by logical CPU;
+     * hart_ids[cpu] gives the hart ID SBI needs.
      */
     {
-        extern unsigned hart_ids[];
-
         i = 0;
         do {
-            unsigned cpu = hart_ids[i];
+            unsigned cpu = (unsigned) i;
             uintptr_t stack_top;
             void *dummy __attribute__((unused));
 
@@ -241,7 +237,7 @@ void init_objects()
              * User __thread_create enforces priority > 0 (lifecycle.c), so no
              * user thread can compete with idle at this priority.
              */
-            thp->real_priority = thp->priority = 0;
+            thread_init_prio(thp, 0);
             thp->start_time = prp->start_time;
             thp->un.lcl.stackaddr = (void *) _smalloc(sizeof(startup_stack));
             thp->un.lcl.stacksize = sizeof(startup_stack);
@@ -334,7 +330,7 @@ extern int mm_map_xfer(process_t *actprp,
                        process_t *prp,
                        iov_t **piov,
                        int *pparts,
-                       int *poff,
+                       size_t *poff,
                        iov_t *niov,
                        int *pnparts,
                        unsigned flags);

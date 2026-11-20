@@ -21,6 +21,7 @@
         __interrupt_attach_event;
         __interrupt_mask;
         __interrupt_unmask;
+        __rtmux_mallocstats;
         __rtmux_syschan_init;
         __sched_get;
         __sched_get_r;
@@ -119,9 +120,11 @@
         crypt;
         ctime;
         ctime_r;
+        daylight;
         dbgprint;
         dbgprintf;
         devctl;
+        difftime;
         dispatch_block;
         dispatch_context_alloc;
         dispatch_context_free;
@@ -191,6 +194,10 @@
         getlogin;
         getlogin_r;
         getopt;
+        getopt_long;
+        getopt_long_only;
+        getpagesize;
+        getpgid;
         getpgrp;
         getpid;
         getppid;
@@ -201,6 +208,7 @@
         getpwuid_r;
         getrlimit;
         getrusage;
+        getsid;
         getsubopt;
         gettimeofday;
         getuid;
@@ -229,6 +237,11 @@
         ioserv_msgreadv;
         ioserv_msgwrite;
         ioserv_msgwritev;
+        ioserv_notify;
+        ioserv_notify_init;
+        ioserv_notify_ready;
+        ioserv_notify_remove;
+        ioserv_notify_trigger;
         ioserv_ocb;
         ioserv_open_bind;
         ioserv_reply_counters_format;
@@ -264,6 +277,7 @@
         memset;
         message_attach;
         message_connect;
+        mktime;
         mlock;
         mlockall;
         mmap;
@@ -347,6 +361,7 @@
         opterr;
         optind;
         optopt;
+        optreset;
         pathconf;
         pause;
         perror;
@@ -355,8 +370,10 @@
         posix_mem_offset;
         posix_memalign;
         posix_spawn;
+        posix_spawn_file_actions_addchdir;
         posix_spawn_file_actions_addclose;
         posix_spawn_file_actions_adddup2;
+        posix_spawn_file_actions_addfchdir;
         posix_spawn_file_actions_addopen;
         posix_spawn_file_actions_destroy;
         posix_spawn_file_actions_init;
@@ -432,6 +449,7 @@
         pthread_key_create;
         pthread_key_delete;
         pthread_kill;
+        pthread_mutex_consistent;
         pthread_mutex_destroy;
         pthread_mutex_getprioceiling;
         pthread_mutex_init;
@@ -444,11 +462,13 @@
         pthread_mutexattr_getprioceiling;
         pthread_mutexattr_getprotocol;
         pthread_mutexattr_getpshared;
+        pthread_mutexattr_getrobust;
         pthread_mutexattr_gettype;
         pthread_mutexattr_init;
         pthread_mutexattr_setprioceiling;
         pthread_mutexattr_setprotocol;
         pthread_mutexattr_setpshared;
+        pthread_mutexattr_setrobust;
         pthread_mutexattr_settype;
         pthread_once;
         pthread_rwlock_destroy;
@@ -486,6 +506,7 @@
         puts;
         pwrite;
         qsort;
+        qsort_r;
         raise;
         rand_r;
         read;
@@ -608,6 +629,7 @@
         tcflush;
         tcgetattr;
         tcgetpgrp;
+        tcgetsid;
         tcsendbreak;
         tcsetattr;
         tcsetpgrp;
@@ -625,15 +647,19 @@
         thread_pool_create;
         thread_pool_start;
         time;
+        timegm;
         timer_create;
         timer_delete;
         timer_getoverrun;
         timer_gettime;
         timer_settime;
         times;
+        timezone;
         trace_event;
         ttyname;
         ttyname_r;
+        tzname;
+        tzset;
         umask;
         uname;
         ungetc;

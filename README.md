@@ -59,7 +59,7 @@ capability contracts, kernel subsystem map, and source layout.
 ## Quick start
 
 Prerequisites: a RISC-V bare-metal toolchain (`riscv-none-elf-`), `lld`,
-`qemu-system-riscv64`, OpenSBI, `git`, and `python3`.
+`qemu-system-riscv64`, OpenSBI, `git`, `python3`, and `zic`.
 
 ```bash
 make defconfig     # first time only

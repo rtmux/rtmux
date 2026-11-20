@@ -76,9 +76,9 @@ DEFINE_PER_CPU(unsigned, in_kcall);
 
 /* Per-CPU aggregated control structure.
  *
- * One slot per hart, indexed by hart ID. Allocated as BSS — zero-init is the
- * correct initial state for every field (pc_curthread starts as the idle
- * thread, pc_hart is stamped by bootstrap).
+ * One slot per logical CPU. Allocated as BSS — zero-init is the correct initial
+ * state for every field (pc_curthread starts as the idle thread, pc_cpu is
+ * stamped by bootstrap).
  *
  * Defined here so it lands adjacent to the other per-CPU storage and stays
  * inside the .data/.bss layout that monitor.c and other tools walk. Declared in
@@ -236,6 +236,8 @@ void nonpreempt_report(void)
      */
     if (!warmed) {
         warmed = 1;
+
+        /* Zeroes every slot of the statistics arrays; it visits no CPU. */
         for (cpu = 0; cpu < CONFIG_PROCESSORS_MAX; cpu++) {
             unsigned i;
 

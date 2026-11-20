@@ -638,6 +638,204 @@ reviewed and recorded. The gate is pure static text analysis, so it runs in the
 default make check next to check-lock-rank. Check: make check-preempt-inventory.
 The current tree classifies 141 loops (73 bounded, 9 checkpointed, 59 irqoff).
 
+### msg_readiov walk over a large message
+
+`viov_to_piov` (kernel/ipc/message-core.c), the walk behind `msg_readiov`, used
+to translate every leaf of the client's message in one kernel call, holding the
+client's MSG_DELIVERY claim and coalescing a physically contiguous run with no
+cap. The walk runs with interrupts on, after `ksys_msg_readiov` drops the
+channel lock. Its only kspinlock windows are the two short channel-lock
+sections that take and release the claim, and their length does not depend on
+the message. But the walk is non-preemptible: the scheduler preempts a kernel
+call only at a checkpoint, and a timer trap inside a kernel call only rearms
+the timer, so a timer wake of a higher-priority thread waits for the call to
+return. `nonpreempt_report()` times only kspinlock windows and does not see it.
+
+The walk now stops before its next step after VIOV_STEP_MAX (128) steps, or
+earlier when NEED_PREEMPT shows that an interrupt readied a thread that should
+preempt the caller, as long as it has produced a part. A step is one leaf
+translation or one iov entry read, and the step that makes the first part is
+free, so one call covers about 512 KiB of 4 KiB pages. The call returns the parts so far, and the caller continues at the
+offset they reach, so a count below the output capacity no longer means the
+message has ended (see `msg_readiov` in sys/rtmux-core.h). In the preemption
+inventory the loop is now `bounded`, with `cap:` VIOV_STEP_MAX.
+
+The offset skip is charged and resumable (K21). Each entry the offset skips
+costs one step against the same VIOV_STEP_MAX, and the skips and the parts
+share one step counter (`steps` in `viov_to_piov`): one call charges at most
+128 steps in all, the skipped entries first and the parts with what is left,
+with the step that makes the first part free. A
+call that spends the skip budget before it has a part cannot return the parts
+so far, because it has none, and a return of 0 already means the message has
+ended. It returns -1 with EINTR instead, having written how far it got to the
+`struct _iov_cursor` the caller passed in the sixth argument. The cursor holds
+the index of the entry that has the next unread byte and the bytes of the iov
+before it. The caller keeps one cursor per message and passes it to every call;
+the kernel starts at the entry it names, so a continuation rereads only that
+entry, never the ones before it, and the skips of a whole message add up to
+one pass over its entries. A caller that passes no cursor has nowhere to
+keep that progress, so a skip longer than the budget fails with E2BIG. The
+state lives with the caller, not on the reply-blocked client: an rcvid names a
+connection and a thread slot but not one message, so a cursor cached on the
+client could not tell a new message with the same iov address from a
+continuation. The kernel treats the cursor as untrusted input: an entry past the
+part count, a start past the offset, a nonzero start at entry 0, or a nonzero
+reserved field fails with EINVAL (the readiov-skip check covers each). A
+cursor inside those bounds is accepted, and a wrong one only changes which
+bytes of the client's own message the caller's parts describe. The
+interface is documented at `msg_readiov` in sys/rtmux-core.h. Entries of zero
+length count as skips as well, which also bounds a run of them that used to be
+uncharged.
+
+The readiov-skip check measures the case that was worst before: 65536 entries
+of 1 KiB, and a call for the last entry. One call took 55.5 ms in the check
+before this change (it was 20 to 45 ms on other loaded boots). The check now
+asks for the same entry with a cursor and expects EINTR until it arrives, then
+walks the whole message from offset 0 with one cursor and 16 parts of room per
+call, and requires both to finish in a number of calls linear in the entry
+count (the walk has to stay within SKIP_PARTS / 16 calls; a rescan per call
+would not). It also checks that a call without a cursor fails with E2BIG past
+the budget and still works within it.
+
+The pre-claim iov check of `msg_readv` and `msg_writev`
+(kernel/ipc/message.c) was the one loop this did not cover: it read the
+caller's own iovec entry by entry with plain loads, with no cap and no
+checkpoint. It is now `xfer_iov_check` (kernel/ipc/message.c). It examines at
+most XFER_IOV_CHECK_STEP (512) entries per kernel entry, through
+`xfer_memchk`, so an unmapped page of the array fails with EFAULT instead of
+faulting the kernel, and then restarts the call with KCALL_RESTART. The
+prefix already checked is kept on the thread (`iovchk_*`), keyed by the array
+and its length, so the restart resumes instead of rereading from entry 0 and a
+periodic higher-priority thread cannot starve it. The trap handler drops the
+saved prefix at the next kernel call that is not `msg_readv` or `msg_writev`,
+so a thread cannot edit entries it has already passed. The check holds no
+claim, so a restart has nothing to undo. An array longer than XFER_IOV_LIMIT
+fails with EFAULT before any entry is read. The loop is gone, so the
+inventory has no entry for it.
+
+The copy that follows the check is bounded the same way. `xfermsg_bounded`
+(kernel/xfer/core.c) does at most XFER_STEP_ENTRIES (128) vector entries
+stepped over or copied and XFER_STEP_BYTES (8 KiB) bytes in one kernel entry,
+then saves a cursor on the thread (`xcur`: the entry index and the offset to
+move forward from it, for each vector) and restarts the call through
+`xfer_preempt`, which closes the rcvid lookup window the trap handler would
+have closed, restores the saved arguments and returns through kernel_exit. The
+restart resumes from the cursor instead of skipping msglen bytes again, so
+neither the offset skip nor the vectors passed are rescanned; a cursor is used
+only for the thread pair and message length that saved it. The offset skip
+(`xfer_skip`, and the skip inside `mm_map_xfer`, which returns XFER_MAP_YIELD
+with the position handed back) and a run of empty entries count against the
+same step. The check's saved state now also records that the vector was
+checked, so a restart inside the copy does not walk it again; msg_readv and
+msg_writev drop it, the cursor and the restart link on every return.
+
+Each vector entry the same-address-space copy uses is read once into a
+snapshot, checked against the process boundary of the vector's owner (not for
+roottask or a kernel buffer) and offset against its length, under a fault env
+armed around the whole walk, so another thread that rewrites an entry after
+the check gets EFAULT and a vector that is unmapped under the call does not
+fault the kernel. This covers the other side too, which the call never checked
+before: the client's send or reply vector. The short-message branch no longer
+reads the whole destination vector to find how much arrived (`xferlen_upto`
+stops once the entries add up to the message). `rcvmsg`, unused, and its
+unbounded boundary scans are gone.
+
+The other callers of `xfermsg` are stepped the same way. Send, receive and
+reply (kernel/ipc/fastmsg.c) call `xfermsg_bounded` through `fastmsg_xfer`,
+and a copy that uses its step up gives up the claim on the peer under the
+channel lock (`fastmsg_step_yield`), honors a wake deferred meanwhile and
+returns through the call to be restarted; the trap handler keeps the cursor for
+msg_sendv, msg_receivev and msg_replyv as it does for msg_readv and
+msg_writev. A message of more than XFER_STEP_PARTS_MAX (4096) entries on
+either side is copied in one piece, as each restart would scan both vectors
+again, and so is a message that carries capabilities (a native header
+installed ahead of the copy, which a restart would install twice). The loops
+that total and check a send, receive or reply vector before the copy are not
+stepped either. The head of a message the receive peeks at goes through
+`xfermsg` and used to clear the restart links the cursor needs, so the peek now
+gives them back. The short message branch of msg_readv copies into a
+destination of many entries a step at a time (`xfer_cpy_diov_step`), so a
+vector of empty entries is not walked to its end; a destination of one entry
+or none keeps the one shot copy. `xfer_preempt` closes every level of the
+rcvid lookup window (`lookup_rcvid_release_all`) and not only the outermost's
+one, which left the RCU sections open across the restart of a call that had
+looked up twice. The offsets and the cursor are `size_t`, as is the offset
+`vm_ops->map_xfer` takes; the byte count of a message stays 32 bit, as the ABI
+reports it. msg_sendv checks that its send and reply arrays lie inside the
+caller's boundary and are no longer than XFER_IOV_LIMIT entries, as
+msg_receivev always has, and fails with EFAULT before reading them.
+
+Not bounded by this: the loops that total and check the send, receive and
+reply vectors of msg_sendv, msg_receivev and msg_replyv before the copy are
+still not stepped (an array of up to XFER_IOV_LIMIT entries, now at least
+inside the caller's space, is read in one kernel entry).
+
+ipc-roundtrip's iov-send, iov-receive-reply and iov-path-big checks cover the
+three paths. Over 32 entries of 16 bytes each way a send is one step: the time
+from the sender's entry into msg_sendv to the receiver's return from its
+receive may exceed the same message in one entry by no more than 250 us at the
+p99 (the delivery includes waking the receiver, which a loaded host slows
+whatever the kernel does, so the step is judged by its addition), and a receive
+from a queued sender and a reply are each under 250 us at the p99. Over 2048
+entries each way both orders of receiver and sender move the bytes through many
+restarts. iov-short reads a short message into 64 entries, all empty but the
+last, in one step (p99 under 250 us), and into 65536 entries, which move the
+same bytes. sendv-array sends with arrays in kernel space, wrapping past the
+top of memory and longer than XFER_IOV_LIMIT, which must fail with EFAULT.
+
+ipc-roundtrip's iov-steps check covers the check on 65536 one-byte entries:
+the bytes arrive intact through `msg_readv` and `msg_writev`, a bad entry past
+the first step and an array whose tail page is unmapped fail with EFAULT, and
+a call over exactly one step whose last entry is bad (the longest kernel entry
+the check makes) has a p99 under 250 us. On one loaded boot that p99 was
+39 us (max 75 us) and the same failure at the end of the whole array took
+3.3 ms p99, which is 128 steps.
+
+The copy is checked on the same boot: iov-peer rewrites one entry of the
+sender's send vector, then of its reply vector, to a kernel address and
+`msg_readv` and `msg_writev` must fail with EFAULT (an unfixed kernel faults on
+it and crashes); iov-race flips an entry of the sender's vector between good
+and a kernel address from a thread above the receiver while 12 whole calls
+read through it, and each call must be a whole good transfer or EFAULT, with at
+least one EFAULT, which also shows the long call yields to a woken higher
+priority thread between its steps (the unfixed kernel finishes all 12 without
+the flipper running); iov-steps times a call of one step of entries (64 entries
+on each side) and iov-bytes a call of one step of bytes (8 KiB), both for
+readv and writev, and their p99 must stay under 250 us. On boots at a load
+average of 24 the step of entries was 94 to 101 us p99 (max 118 to 129 us) and
+the step of bytes 127 to 178 us p99 (max 144 to 198 us); on one boot at a load
+of 40 the same checks were 185 us and 1.3 ms, which is the host and not the
+kernel, as with the other checks here. A whole 65536 entry call takes 33 to
+57 ms, in steps of at most 128 entries each.
+
+Measured by ipc-roundtrip's readiov-large check (`scripts/qemu-regress.sh
+--mode ipc-roundtrip --timeout 600`). The rdtime span around each call bounds
+that call's non-preemptible span and every interrupts-off window inside it.
+The runs used a loaded local host, not the reference host, and the loaded
+per-call figures sit at its noise floor: the same boot's empty round-trip p99
+was about 335 us, and halving the cap to 64 left the call p99 unchanged
+(164 / 212 us). All numbers are QEMU-TCG figures.
+
+```perf-evidence
+claim: one msg_readiov call over a 64 MiB message no longer walks the whole message without a preemption point
+metric: p99 and max latency of one msg_readiov call (rdtime span, upper bound on its non-preemptible span)
+command: scripts/qemu-regress.sh --mode ipc-roundtrip --timeout 600 (readiov-large line)
+config: local host (48 cores, load average 20 to 35 from other guests), CPUS=1, QEMU 11.0.0 TCG virt 256 MB, bundled OpenSBI, 64 MiB message, 16384-entry output array, 4 walks
+baseline: max 7108400 ns (one boot) and max 7780900 ns, p99 6795300 ns (a second boot): the whole message in 1 call per walk, without the step cap (dev 98d4eb5 plus the readiov-large check)
+result: VIOV_STEP_MAX 128, 128 calls per walk, 512 calls per boot: max 124000 ns on a quieter boot, then p99 212700 to 260000 ns and max 329300 ns to 2197900 ns on four loaded boots (the 2.2 ms max is host descheduling: same cap, same boot class); the 260000 ns p99 is above the per-call threshold below, so these loaded boots do not settle it and a reference-host run of the readiov-large line is still owed
+rollback-threshold: a walk that takes one call or fails to cover the message withdraws the cap claim on any host; a p99 per call above 250000 ns on the reference host withdraws it as well
+```
+
+```perf-evidence
+claim: a msg_readiov continuation over many short iov entries no longer rescans the entries before its offset, and one call spends a bounded number of steps on them
+metric: time of the one call that skips to the last of 65536 1 KiB entries (before), and p99 and max time per call over the cursor walk of the same message (after)
+command: scripts/qemu-regress.sh --mode ipc-roundtrip --keep-logs --timeout 900 (readiov-skip line)
+config: local host (48 cores, load average 38 to 83 from other guests), CPUS=1, QEMU 11.0.0 TCG virt 256 MB, bundled OpenSBI, 64 MiB message as 65536 entries, 16 parts of output room
+baseline: one call 55454600 ns (dev 2892851, readiov-skip), every skipped entry read on every call
+result: 1521 calls (512 skip-only calls to the last entry, then the 64 MiB walk): p99 127600 ns, max 377200 ns on the first boot; on the rebased tree p99 157200 and 205700 ns, max 353100 and 1017200 ns on two boots at load 71 to 83 (readiov-large, unchanged by this, read p99 290700 and 295400 ns on the same boots, so those p99s are the host floor)
+rollback-threshold: a p99 per call above 250000 ns, or a walk that takes more than SKIP_PARTS / 16 calls, withdraws the claim
+```
+
 ### Wake-to-dispatch preemption latency and the interrupt-wake gap
 
 The wake-to-dispatch probe measures how long a higher-priority thread waits to
@@ -1151,8 +1349,9 @@ thread, and every already-admitted process, in particular the protected classes
 (realtime driver/IST processes, critical servers), keeps its full working set.
 Protected classes are safe by construction rather than by a tunable priority
 comparison: nothing is ever reclaimed, so nothing can be victimized. The full
-policy, including the honest gap that the per-process RLIMIT_AS cap is currently
-a stub, is in docs/oom-admission-policy.md.
+policy, including the per-process RLIMIT_AS and RLIMIT_DATA caps checked at map
+time and the gap left by their RLIM_INFINITY defaults, is in
+docs/oom-admission-policy.md.
 
 The memory-growth bound this implies: a realtime process's resident set is
 monotonic and owned. Once it has allocated and touched its working set, that

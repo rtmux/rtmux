@@ -77,6 +77,8 @@ int posix_spawn_file_actions_destroy(posix_spawn_file_actions_t *fact_p)
         for (i = 0; i < _fact_p->num_entries; i++) {
             if (_fact_p->action[i].type == posix_file_action_type_OPEN)
                 free(_fact_p->action[i]._type.open);
+            else if (_fact_p->action[i].type == posix_file_action_type_CHDIR)
+                free(_fact_p->action[i]._type.chdir_path);
         }
         free(_fact_p);
         SET_FACTP(fact_p, NULL);
@@ -177,6 +179,56 @@ int posix_spawn_file_actions_addopen(
     fact->action[fact->num_entries - 1] = (posix_spawn_file_actions_list_t){
         .type = posix_file_action_type_OPEN,
         ._type.open = open_action,
+    };
+    return EOK;
+}
+
+/* addchdir/addfchdir (POSIX.1-2024) only record the request. posix_spawn() runs
+ * every action in the order added, so the directory a chdir names and the
+ * descriptor an fchdir names are looked up at spawn time, after the earlier
+ * actions have run.
+ */
+int posix_spawn_file_actions_addchdir(
+    posix_spawn_file_actions_t *restrict fact_p,
+    const char *restrict path)
+{
+    _posix_spawn_file_actions_t *fact;
+    char *copy;
+    int ret;
+
+    if (!valid_factp(fact_p) || !path)
+        return EINVAL;
+    copy = strdup(path);
+    if (!copy)
+        return ENOMEM;
+    ret = file_action_reserve(fact_p, &fact);
+    if (ret != EOK) {
+        free(copy);
+        return ret;
+    }
+    fact->action[fact->num_entries - 1] = (posix_spawn_file_actions_list_t){
+        .type = posix_file_action_type_CHDIR,
+        ._type.chdir_path = copy,
+    };
+    return EOK;
+}
+
+int posix_spawn_file_actions_addfchdir(posix_spawn_file_actions_t *fact_p,
+                                       int fd)
+{
+    _posix_spawn_file_actions_t *fact;
+    int ret;
+
+    if (!valid_factp(fact_p))
+        return EINVAL;
+    if (!valid_spawn_fd_target(fd))
+        return EBADF;
+    ret = file_action_reserve(fact_p, &fact);
+    if (ret != EOK)
+        return ret;
+    fact->action[fact->num_entries - 1] = (posix_spawn_file_actions_list_t){
+        .type = posix_file_action_type_FCHDIR,
+        ._type.fchdir_fd = fd,
     };
     return EOK;
 }

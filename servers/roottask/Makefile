@@ -35,6 +35,7 @@ SYS_OBJECTS = \
 	sys/root-process.o \
 	sys/main.o \
 	sys/heap.o \
+	sys/heap-note.o \
 	sys/message.o \
 	sys/proc-loader.o \
 	sys/proc-read.o \
@@ -60,6 +61,7 @@ PROC_OBJECTS = \
 	proc/ids.o \
 	proc/session.o \
 	proc/group.o \
+	proc/pgrp-table.o \
 	proc/umask.o \
 	proc/event.o \
 	proc/resource.o \

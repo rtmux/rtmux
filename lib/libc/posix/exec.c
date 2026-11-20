@@ -12,8 +12,9 @@
 #include <unistd.h>
 #include <sys/procmsg.h>
 
-extern char **environ;
-
+/* A NULL envp passes environ, which the spawn path then reads under the
+ * environment lock.
+ */
 static int exec_spawn(const char *path,
                       char *const argv[],
                       char *const envp[],
@@ -44,12 +45,12 @@ int execve(const char *path, char *const argv[], char *const envp[])
 
 int execv(const char *path, char *const argv[])
 {
-    return execve(path, argv, environ);
+    return exec_spawn(path, argv, NULL, 0);
 }
 
 int execvp(const char *file, char *const argv[])
 {
-    return exec_spawn(file, argv, environ, 1);
+    return exec_spawn(file, argv, NULL, 1);
 }
 
 static int count_args(const char *arg0, va_list ap)
@@ -97,7 +98,7 @@ int execl(const char *path, const char *arg0, ...)
     int ret;
 
     va_start(ap, arg0);
-    ret = execv_from_args(path, arg0, ap, environ, 0);
+    ret = execv_from_args(path, arg0, ap, NULL, 0);
     va_end(ap);
     return ret;
 }
@@ -108,7 +109,7 @@ int execlp(const char *file, const char *arg0, ...)
     int ret;
 
     va_start(ap, arg0);
-    ret = execv_from_args(file, arg0, ap, environ, 1);
+    ret = execv_from_args(file, arg0, ap, NULL, 1);
     va_end(ap);
     return ret;
 }

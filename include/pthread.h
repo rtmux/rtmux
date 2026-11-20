@@ -30,6 +30,8 @@ __BEGIN_DECLS
 #define RTMUX_SYNC_PRIOCEILING 0x20000000  /* mutexes */
 #define RTMUX_SYNC_PRIONONE 0x10000000     /* mutexes */
 #define RTMUX_SYNC_PRIOINHERIT 0x08000000  /* mutexes */
+#define RTMUX_SYNC_ROBUST 0x04000000       /* mutexes: robust */
+#define RTMUX_SYNC_INCONSISTENT 0x02000000 /* mutexes: robust, owner died */
 #define RTMUX_SYNC_COUNTMASK 0x00ffffff    /* mutexes */
 
 /* For PRIO_PROTECT mutexes the low 24 bits (COUNTMASK) are split: the priority
@@ -42,6 +44,18 @@ __BEGIN_DECLS
 #define RTMUX_SYNC_CEIL_SHIFT 16
 #define RTMUX_SYNC_CEIL_MASK 0x00ff0000   /* mutexes: PRIO_PROTECT ceiling */
 #define RTMUX_SYNC_PPDEPTHMASK 0x0000ffff /* mutexes: PRIO_PROTECT depth */
+
+/* Count bits that send a mutex through the kernel on every lock and unlock. */
+#define RTMUX_SYNC_KERNEL_PATH (RTMUX_SYNC_PRIOCEILING | RTMUX_SYNC_ROBUST)
+
+/* The recursion-depth bits of a mutex count: a PRIO_PROTECT mutex keeps its
+ * ceiling above the low 16 bits.
+ */
+static inline unsigned long rtmux_sync_depth_mask(long count)
+{
+    return (count & RTMUX_SYNC_PRIOCEILING) ? RTMUX_SYNC_PPDEPTHMASK
+                                            : RTMUX_SYNC_COUNTMASK;
+}
 /* On owner */
 #define RTMUX_SYNC_MUTEX_FREE \
     0x00000000U /*    0  mutexes, and old cond, sem, spin */
@@ -64,7 +78,10 @@ __BEGIN_DECLS
 #define RTMUX_SYNC_COND 0xfffffffb      /*   -5  cond (count is clockid) */
 #define RTMUX_SYNC_SPIN 0xfffffffa      /*   -6  spin (count is internal) */
 #define RTMUX_SYNC_DEAD \
-    0xffffff00 /* -256  mutex (when a process dies with a mutex locked) */
+    0xffffff00 /* -256  robust mutex whose owner died holding it */
+#define RTMUX_SYNC_NOTRECOVERABLE                                            \
+    0xffffff01 /* -255  robust mutex unlocked without being made consistent, \
+                *       or any mutex whose owner died holding it */
 
 #define PTHREAD_DETACHSTATE_MASK 0x01
 #define PTHREAD_CREATE_JOINABLE 0x00
@@ -220,6 +237,12 @@ extern int pthread_setspecific(pthread_key_t __key, const void *__value);
 #define PTHREAD_ERRORCHECK_ENABLE 0x00
 #define PTHREAD_ERRORCHECK_DISABLE 0x04
 
+#define PTHREAD_ROBUST_MASK 0x08 /* attr flags: PTHREAD_MUTEX_ROBUST */
+
+/* Robustness, the pthread_mutexattr_setrobust values. */
+#define PTHREAD_MUTEX_STALLED 0
+#define PTHREAD_MUTEX_ROBUST 1
+
 #define RTMUX_ATTR_FLAGS                                 \
     0x0000ffff /* These flags are verified for each type \
                 */
@@ -312,6 +335,15 @@ extern int pthread_rwlockattr_setpshared(pthread_rwlockattr_t *__attr,
 extern int pthread_mutexattr_gettype(const pthread_mutexattr_t *__attr,
                                      int *__type);
 extern int pthread_mutexattr_settype(pthread_mutexattr_t *__attr, int __type);
+
+/* Robust mutexes: a lock that finds the owner died returns EOWNERDEAD with the
+ * mutex held, and pthread_mutex_consistent marks the protected state repaired.
+ */
+extern int pthread_mutexattr_getrobust(const pthread_mutexattr_t *__attr,
+                                       int *__robust);
+extern int pthread_mutexattr_setrobust(pthread_mutexattr_t *__attr,
+                                       int __robust);
+extern int pthread_mutex_consistent(pthread_mutex_t *__mutex);
 
 /* dynamically change the priority ceiling of a mutex */
 extern int pthread_condattr_destroy(pthread_condattr_t *__attr);

@@ -232,6 +232,20 @@ process_t *root_proc_lock(pid_t pid)
     return prp;
 }
 
+/* Make mutex priority-inheriting, for the locks a real-time client can wait on.
+ * Boot, before the mutex is first used.
+ */
+void root_mutex_init_pi(pthread_mutex_t *mutex)
+{
+    pthread_mutexattr_t attr;
+
+    if (pthread_mutexattr_init(&attr) != EOK ||
+        pthread_mutexattr_setprotocol(&attr, PTHREAD_PRIO_INHERIT) != EOK ||
+        pthread_mutex_init(mutex, &attr) != EOK)
+        crash();
+    pthread_mutexattr_destroy(&attr);
+}
+
 /* Release the lock taken by root_proc_lock for the given pid. Parameters:
  *   pid : the process id to unlock
  */
@@ -240,8 +254,35 @@ void root_proc_unlock(pid_t pid)
     release_lock(&root_proc(pid)->lock);
 }
 
+/* The parent the kernel names for a child now, or the pid recorded at spawn
+ * when the kernel no longer lists the child. Parameters:
+ *   child_pid : the child whose parent to look up
+ */
+static pid_t kernel_parent(pid_t child_pid)
+{
+    root_process_t *tmp = root_proc(child_pid);
+    root_proc_info_t qi;
+
+    if (process_query_info(child_pid, &qi) == EOK && qi.parent_pid != 0)
+        return qi.parent_pid;
+
+    /* The kernel frees the index before roottask releases the slot, so a new
+     * generation may already own it: its parent_pid is not this child's. A
+     * slot that no longer carries the child's full pid means the child is gone,
+     * and a gone child has no parent but roottask, which adopts orphans and
+     * never waits.
+     */
+    if (tmp->pid != child_pid)
+        return ROOTTASK_PID;
+    return tmp->parent_pid;
+}
+
 /* Lock a child's parent process, waiting out any parent death transition.
- * Parameters:
+ *
+ * The parent is the kernel's current one: when a parent is destroyed, or the
+ * child detaches, the kernel hands the child to another parent, but
+ * root_process_t.parent_pid keeps the parent at spawn. That pid is only the
+ * fallback for a child the kernel no longer lists. Parameters:
  *   child_pid      : the child whose parent to lock
  *   parent_pid_out : out — the parent's pid (may be NULL)
  * Return value: the locked parent process_t.
@@ -256,10 +297,14 @@ process_t *root_proc_lock_parent(pid_t child_pid, pid_t *parent_pid_out)
     /* Parent could be in a death transition */
     count = 0;
     for (;;) {
-        ppid = root_proc(child_pid)->parent_pid;
+        ppid = kernel_parent(child_pid);
         parent = root_proc_lock(ppid);
-        if (parent)
-            break;
+        if (parent) {
+            /* The child may have been handed on while the lock was taken. */
+            if (kernel_parent(child_pid) == ppid)
+                break;
+            root_proc_unlock(ppid);
+        }
         if (count > 100) {
             /* Sleep for one tick to give the transition more time to complete
              */

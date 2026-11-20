@@ -9,6 +9,7 @@
 #include <sys/types.h>
 #include <posix-types.h>
 #include <arch/cpu-def.h>
+#include <arch/cpu-paging.h> /* PA_TO_VA, KERNEL_VIRT_BASE */
 #include <arch/pcpu.h> /* struct pcpu — uses struct tags only */
 
 #define xfer_setjmp(_env) _setjmp(_env)
@@ -73,8 +74,8 @@
 /* Convert physical address to pointer value and vice-versa when in a physical
  * memory model. Identity mapping for standalone kernel test.
  */
-#define PHYS_TO_PTR(phys) ((void *) ((uintptr_t) (phys) + KERNEL_VIRT_BASE))
-#define PTR_TO_PHYS(ptr) ((uintptr_t) (ptr) - KERNEL_VIRT_BASE)
+#define PHYS_TO_PTR(phys) PA_TO_VA(phys)
+#define PTR_TO_PHYS(ptr) ((uintptr_t) VA_TO_PA(ptr))
 
 /* Memory probes — simple volatile access for physical mode. In the future,
  * these should handle faults properly. HAVE_KERSTACK_STORAGE /
@@ -87,31 +88,31 @@
 
 #if CONFIG_PROCESSORS_MAX > 1
 
-/* get_cpunum — return the RISC-V hart ID of the CPU we are running on.
+/* get_cpunum — return the logical CPU number of the CPU we are running on.
  *
- * The value is NOT a sequential 0..N-1 index. It is the hardware hart
- * identifier assigned by the platform (e.g. QEMU virt may boot on hart 3 even
- * with -smp 1). All per-CPU arrays are indexed by hart ID. Code that iterates
- * over all CPUs must use hart_ids[0..num_processors-1] for indirection.
+ * A dense index in 0..num_processors-1, with the boot hart at 0. Every per-CPU
+ * array is indexed by it. The architectural hart ID, which SBI and the PLIC
+ * context table need, is hart_ids[cpu]; it may be sparse or large, so no
+ * per-CPU array is indexed by it. Only the PLIC context table, sized to the
+ * largest hart ID, is.
  *
- * Implementation: one load from offset PC_HART of *tp. tp is invariant per hart
+ * Implementation: one load from offset PC_CPU of *tp. tp is invariant per hart
  * in S-mode (set once at bootstrap, never reassigned), so this is always
  * correct — tp follows the hart, not the thread.
  *
- * Return value: this CPU's hart ID.
+ * Return value: this CPU's logical number.
  */
 /* This is an AXIOM, not a proved contract, and it is the only one in the tree.
  * The body is a load through tp, and no prover can look inside inline asm, so
  * WP cannot establish the bound; it is instead a property of bootstrap, which
- * writes PC_HART before any of this code runs, and of the per-CPU arrays being
- * sized CONFIG_PROCESSORS_MAX and indexed by hart ID.
+ * writes PC_CPU before any of this code runs: startup_entry stamps slot 0, and
+ * _smpstart refuses a logical CPU at or above CONFIG_PROCESSORS_MAX before it
+ * points tp at a slot.
  *
  * It has to be stated because every per-CPU array access depends on it: leave
  * it out and each one is an unprovable index_bound obligation.  A source that
  * relies on it names it in a "framac-assume:" marker, so every gate run prints
- * the assumption rather than letting it pass silently.  If the platform ever
- * hands out a hart ID at or above CONFIG_PROCESSORS_MAX, this is false and
- * every proof resting on it is void.
+ * the assumption rather than letting it pass silently.
  */
 /*@ assigns \nothing;
     ensures \result < CONFIG_PROCESSORS_MAX;
@@ -119,9 +120,9 @@
 static inline unsigned get_cpunum(void)
 {
 #if CONFIG_PROCESSORS_MAX > 1
-    unsigned hart;
-    __asm__ volatile("lw %0, %c1(tp)" : "=&r"(hart) : "i"(PC_HART));
-    return hart;
+    unsigned cpu;
+    __asm__ volatile("lw %0, %c1(tp)" : "=&r"(cpu) : "i"(PC_CPU));
+    return cpu;
 #else
     return 0;
 #endif

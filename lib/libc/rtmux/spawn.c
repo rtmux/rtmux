@@ -9,12 +9,12 @@
 #include <unistd.h>
 #include <errno.h>
 #include <string.h>
-#include <alloca.h>
 #include <pthread.h>
 #include <sys/rtmux-core.h>
 #include <sys/procmsg.h>
 #include <sys/iomsg.h>
-#include <sys/mman.h>
+
+#include "env-lock.h"
 
 extern char **environ;
 
@@ -30,50 +30,78 @@ static pid_t spawn_common(const char *path,
     iov_t iov[6];
     char *const *arg;
     char *src;
-    char *search;
+    char *search = NULL; /* PATH, copied under the environment lock */
     char *dst, *data;
-    unsigned mmapped_len = 0;
+    size_t nargv = 0, narge = 0;
     pid_t pid;
     int coid;
 
     msg.i.type = _PROC_SPAWN;
     msg.i.subtype = _PROC_SPAWN_START;
 
-    search = 0;
+    /* Hold the environment lock while PATH, argv, and envp are measured and
+     * copied: a concurrent setenv may edit environ, or rewrite in place a value
+     * that any vector the caller built can point at. It is released before the
+     * spawn IPC.
+     */
+    __env_lock();
+    if (!envp)
+        envp = environ;
+
     if (inherit) {
         msg.i.parms = *inherit;
-        if (inherit->flags & SPAWN_SEARCH_PATH)
-            search = getenv("PATH");
+        if (inherit->flags & SPAWN_SEARCH_PATH) {
+            const char *path_env = getenv("PATH");
+
+            if (path_env) {
+                size_t len = strlen(path_env) + 1;
+
+                /* The wire length is 16 bits; a longer PATH cannot be sent. */
+                if (len > UINT16_MAX || !(search = malloc(len))) {
+                    __env_unlock();
+                    errno = len > UINT16_MAX ? E2BIG : ENOMEM;
+                    return -1;
+                }
+                memcpy(search, path_env, len);
+            }
+        }
     } else {
         msg.i.parms.flags = 0;
     }
 
-    msg.i.nbytes = msg.i.nargv = msg.i.narge = 0;
+    msg.i.nbytes = 0;
     if (argv) {
-        for (arg = argv; *arg;
-             msg.i.nbytes += strlen(*arg++) + 1, msg.i.nargv++)
+        for (arg = argv; *arg; msg.i.nbytes += strlen(*arg++) + 1, nargv++)
             ;
     }
-    if (!envp)
-        envp = environ;
     if (envp) {
-        for (arg = envp; *arg;
-             msg.i.nbytes += strlen(*arg++) + 1, msg.i.narge++)
+        for (arg = envp; *arg; msg.i.nbytes += strlen(*arg++) + 1, narge++)
             ;
     }
+    /* nargv and narge are 16 bits on the wire; count before narrowing. */
+    if (nargv > UINT16_MAX || narge > UINT16_MAX) {
+        __env_unlock();
+        free(search);
+        errno = E2BIG;
+        return -1;
+    }
+    msg.i.nargv = (uint16_t) nargv;
+    msg.i.narge = (uint16_t) narge;
 
     msg.i.nfds = (uint16_t) fd_count;
+    msg.i.cwdlen = 0;
 
     coid = ROOTTASK_COID;
-    data = alloca(msg.i.nbytes);
+
+    /* Heap, not alloca: the environment has no size bound, and alloca cannot
+     * report failure. malloc may run under the environment lock (env-lock.h).
+     */
+    data = malloc(msg.i.nbytes ? msg.i.nbytes : 1);
     if (!data) {
-        mmapped_len = (unsigned) msg.i.nbytes;
-        data = mmap(NULL, mmapped_len, PROT_READ | PROT_WRITE,
-                    MAP_ANON | MAP_PRIVATE, NOFD, 0);
-        if (data == MAP_FAILED) {
-            errno = ENOMEM;
-            return -1;
-        }
+        __env_unlock();
+        free(search);
+        errno = ENOMEM;
+        return -1;
     }
     dst = data;
     SETIOV(iov + 5, data, 0);
@@ -91,6 +119,7 @@ static pid_t spawn_common(const char *path,
                 ;
         }
     }
+    __env_unlock();
 
     SETIOV(iov + 0, &msg.i, sizeof msg.i);
     SETIOV(iov + 1, fd_map, (size_t) fd_count * sizeof fd_map[0]);
@@ -115,8 +144,8 @@ static pid_t spawn_common(const char *path,
          * the proc service's own handle in xfers[0].id.
          */
         if (thread_ctl(RTMUX_TCTL_NATIVE_REPLY, (void *) 1) == -1) {
-            if (mmapped_len != 0)
-                munmap(data, mmapped_len);
+            free(data);
+            free(search);
             return -1;
         }
         msg.i.parms.flags |= SPAWN_PROC_CAP;
@@ -143,8 +172,8 @@ static pid_t spawn_common(const char *path,
         pid = msg_sendvnc(coid, iov + 0, 6, 0, 0);
     }
 
-    if (mmapped_len != 0)
-        munmap(data, mmapped_len);
+    free(data);
+    free(search);
     return pid;
 }
 

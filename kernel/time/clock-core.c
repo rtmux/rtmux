@@ -314,6 +314,7 @@ const struct sigevent *clock_handler(void *dummy, int id)
             if (qtp->nsec - irqoff_last_report >= 1000000000ULL) {
                 irqoff_last_report = qtp->nsec;
                 nonpreempt_report();
+                process_shutdown_report();
 
                 /* Composite idle deadline, diagnostics only for now: show the
                  * winning owner plus every owner's own candidate (relative to
@@ -347,8 +348,12 @@ const struct sigevent *clock_handler(void *dummy, int id)
                  */
                 static uint64_t stimer_last[CONFIG_PROCESSORS_MAX];
                 for (unsigned i = 0; i < num_processors; i++) {
-                    uint64_t cur = atomic_load_explicit(&stimer_intr_count[i],
-                                                        memory_order_relaxed);
+                    uint64_t cur;
+
+                    if (!cpu_online(i))
+                        continue;
+                    cur = atomic_load_explicit(&stimer_intr_count[i],
+                                               memory_order_relaxed);
                     kprintf("[tickless] cpu=%u stimer=%lu/s\n", i,
                             (unsigned long) (cur - stimer_last[i]));
                     stimer_last[i] = cur;

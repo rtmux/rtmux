@@ -38,6 +38,8 @@ static void thread_recycle_reset(thread_t *thp)
     thp->internal_flags = 0;
     thp->timestamp_last_block = 0;
     thp->as_prp = NULL;
+    thp->as_borrow_next = NULL;
+    thp->as_borrow_pprev = NULL;
     atomic_store_explicit(&thp->async_flags, 0, memory_order_relaxed);
     thp->dpp = NULL;
     thp->timeout_flags = 0;
@@ -52,10 +54,23 @@ static void thread_recycle_reset(thread_t *thp)
     thp->un.lcl.stackaddr = NULL;
     thp->un.lcl.stacksize = 0;
     thp->client = NULL;
+    /* Past real_priority, so the memset above misses them, and a thread soul
+     * is not cleared on free: a stale link would stop a later departure from
+     * queueing this server, or send the cancel down a list it is not on.
+     */
+    thp->prio_defer_next = NULL;
+    thp->prio_defer_cpu = 0;
     thp->blocked_on = NULL;
     thp->blocked_on_turnstile = NULL;
+    thp->ts_bound_next = NULL;
     thp->owned_turnstiles = NULL;
+    thp->robust_held = NULL;
+    thp->robust_spare = NULL;
+    thp->ts_spare = NULL;
+    thp->robust_nheld = 0;
     thp->restart = NULL;
+    thp->iovchk_iov = NULL;
+    thp->xcur.armed = false;
     memset(&thp->args.wa, 0, sizeof(thp->args.wa));
     thp->runmask = 0;
     thp->default_runmask = 0;
@@ -83,6 +98,7 @@ static void thread_recycle_reset(thread_t *thp)
     thp->held_ceiling_n = 0;
     thp->held_ceiling_floor = 0;
     thp->held_ceiling_saturated = false;
+    thread_init_prio(thp, 0);
     thp->stall_reported_ts = 0;
 }
 
@@ -581,7 +597,6 @@ static uint64_t thread_destroy_cycles_to_ns(uint64_t cycles_delta)
 
 static void thread_destroy_wait_inactive(thread_t *thp, process_t *prp)
 {
-    extern unsigned hart_ids[];
     unsigned self = get_cpunum();
     unsigned spins = 0;
 
@@ -591,16 +606,16 @@ static void thread_destroy_wait_inactive(thread_t *thp, process_t *prp)
         unsigned depth = 0;
 
         for (hi = 0; hi < num_processors; hi++) {
-            unsigned hart = hart_ids[hi];
+            unsigned cpu = hi;
             thread_t *cur;
 
-            if (hart == self)
+            if (cpu == self || !cpu_online(cpu))
                 continue;
-            cur = __atomic_load_n(&pcpu_array[hart].pc_curthread,
+            cur = __atomic_load_n(&pcpu_array[cpu].pc_curthread,
                                   __ATOMIC_ACQUIRE);
             if (cur == thp) {
-                active_hart = (int) hart;
-                depth = __atomic_load_n(&in_kcall[hart], __ATOMIC_ACQUIRE);
+                active_hart = (int) cpu;
+                depth = __atomic_load_n(&in_kcall[cpu], __ATOMIC_ACQUIRE);
                 break;
             }
         }
@@ -639,6 +654,8 @@ static void thread_destroy_wait_inactive(thread_t *thp, process_t *prp)
  */
 static void thread_soul_free(process_t *prp, thread_t *thp)
 {
+    THR_EV(thp);
+    sync_chains_assert_not_queued(thp, "freed");
     cap_revoke_object_all_tables(thp);
     object_free(prp, &thread_souls, thp);
 }
@@ -649,15 +666,14 @@ static void thread_soul_free(process_t *prp, thread_t *thp)
  */
 int thread_active_hart(thread_t *thp)
 {
-    extern unsigned hart_ids[];
-
-    for (unsigned hi = 0; hi < num_processors; hi++) {
-        unsigned hart = hart_ids[hi];
+    for (unsigned cpu = 0; cpu < num_processors; cpu++) {
         thread_t *cur;
 
-        cur = __atomic_load_n(&pcpu_array[hart].pc_curthread, __ATOMIC_ACQUIRE);
+        if (!cpu_online(cpu))
+            continue;
+        cur = __atomic_load_n(&pcpu_array[cpu].pc_curthread, __ATOMIC_ACQUIRE);
         if (cur == thp)
-            return (int) hart;
+            return (int) cpu;
     }
     return -1;
 }
@@ -695,6 +711,14 @@ static int roottask_stack_alloc(thread_t *thp)
         return EOK;
     }
     kspinlock_unlock(&roottask_stack_slock);
+
+    /* The caller turns this into EAGAIN for whatever needed the thread: say so,
+     * or a spawn or mmap fails far from its cause.
+     */
+    KPRINTF_RATELIMITED(
+        "roottask: no pool stack for a new thread (%u active "
+        "threads)\n",
+        (unsigned) thp->process->num_active_threads);
     return EAGAIN;
 }
 
@@ -863,30 +887,78 @@ static bool tthread_wait_unpinned(thread_t *thp)
     return waited;
 }
 
+/* Whether thp running in prp's address space borrows it. A thread's own process
+ * needs neither a pin nor a list entry; any other address space gets both.
+ */
+static inline bool thread_as_is_borrow(const thread_t *thp,
+                                       const process_t *prp)
+{
+    return prp && prp != thp->process;
+}
+
+/* Link thp on prp->as_borrowers. Caller holds thread_as_slock and the pin that
+ * the link owns.
+ */
+static void thread_as_link(thread_t *thp, process_t *prp)
+{
+    if (thp->as_borrow_pprev)
+        crash();
+    thp->as_borrow_next = prp->as_borrowers;
+    if (prp->as_borrowers)
+        prp->as_borrowers->as_borrow_pprev = &thp->as_borrow_next;
+    thp->as_borrow_pprev = &prp->as_borrowers;
+    prp->as_borrowers = thp;
+}
+
+/* Detach thp from its address space: if it borrows one, unlink it and drop the
+ * pin the link owned; either way clear as_prp. Caller holds thread_as_slock.
+ */
+static void thread_as_unbind(thread_t *thp)
+{
+    process_t *prp = thp->as_prp;
+
+    if (thread_as_is_borrow(thp, prp)) {
+        if (!thp->as_borrow_pprev)
+            crash();
+        *thp->as_borrow_pprev = thp->as_borrow_next;
+        if (thp->as_borrow_next)
+            thp->as_borrow_next->as_borrow_pprev = thp->as_borrow_pprev;
+        thp->as_borrow_next = NULL;
+        thp->as_borrow_pprev = NULL;
+        process_unpin(prp);
+    }
+    thp->as_prp = NULL;
+}
+
+/* Set the address space thp runs in. A borrow of another process's address
+ * space pins that process and links thp on its as_borrowers list, so teardown
+ * finds every borrower without scanning the system.
+ *
+ * Returns ESRCH if prp's teardown has already released its borrowers: mdestroy
+ * is next, and a borrow now would outlive it.
+ */
 int rdecl thread_set_as_prp(thread_t *thp, process_t *prp)
 {
-    process_t *old;
-    int status;
+    bool borrow;
+    int status = EOK;
 
     if (!thp)
         return ESRCH;
     kspinlock_lock(&thread_as_slock);
     if (thp->as_prp == prp)
         goto out;
-    if (prp && prp != thp->process) {
-        status = process_pin(prp);
-        if (status != EOK) {
-            kspinlock_unlock(&thread_as_slock);
-            return status;
-        }
-    }
-    old = thp->as_prp;
+    borrow = thread_as_is_borrow(thp, prp);
+    if (borrow)
+        status = prp->as_borrow_closed ? ESRCH : process_pin(prp);
+    if (status != EOK)
+        goto out;
+    thread_as_unbind(thp);
+    if (borrow)
+        thread_as_link(thp, prp);
     thp->as_prp = prp;
-    if (old && old != thp->process)
-        process_unpin(old);
 out:
     kspinlock_unlock(&thread_as_slock);
-    return EOK;
+    return status;
 }
 
 void rdecl thread_clear_as_prp_if(thread_t *thp, process_t *prp)
@@ -895,12 +967,37 @@ void rdecl thread_clear_as_prp_if(thread_t *thp, process_t *prp)
         return;
 
     kspinlock_lock(&thread_as_slock);
-    if (thp->as_prp == prp) {
-        thp->as_prp = NULL;
-        if (prp && prp != thp->process)
-            process_unpin(prp);
+    if (thp->as_prp == prp)
+        thread_as_unbind(thp);
+    kspinlock_unlock(&thread_as_slock);
+}
+
+/* Refuse new borrows of prp's address space and release every thread that still
+ * borrows it, for kext_process_shutdown before mdestroy.
+ *
+ * Costs O(borrowers of prp), not O(threads in the system). thread_as_slock is
+ * dropped between borrowers, so each interrupts-off window covers one unlink:
+ * once as_borrow_closed is set the list only shrinks, and a borrower that
+ * switches away or exits on another hart meanwhile unlinks itself under the
+ * same lock.
+ *
+ * Returns how many borrowers it released.
+ */
+unsigned rdecl thread_as_release_borrowers(process_t *prp)
+{
+    thread_t *thp;
+    unsigned released = 0;
+
+    kspinlock_lock(&thread_as_slock);
+    prp->as_borrow_closed = true;
+    while ((thp = prp->as_borrowers)) {
+        thread_as_unbind(thp);
+        released++;
+        kspinlock_unlock(&thread_as_slock);
+        kspinlock_lock(&thread_as_slock);
     }
     kspinlock_unlock(&thread_as_slock);
+    return released;
 }
 
 
@@ -942,7 +1039,7 @@ int rdecl kernel_thread_create(void (*entry)(void *),
     thp->type = TYPE_THREAD;
     thp->state = STATE_DEAD;
     thp->policy = SCHED_RR;
-    thp->priority = thp->real_priority = (uint8_t) priority;
+    thread_init_prio(thp, priority);
     thp->dpp = thp->orig_dpp = kernel_threads_prp->default_dpp;
     thp->runmask = thp->default_runmask = runmask;
     thp->last_chid = -1;
@@ -1036,7 +1133,12 @@ int rdecl thread_create(thread_t *act,
     thp->syscall = -1;
     thp->client = 0;
     thp->blocked_on_turnstile = NULL;
+    thp->ts_bound_next = NULL;
     thp->owned_turnstiles = NULL;
+    thp->robust_held = NULL;
+    thp->robust_spare = NULL;
+    thp->ts_spare = NULL;
+    thp->robust_nheld = 0;
     thp->held_ceiling_n = 0;
     thp->held_ceiling_floor = 0;
     thp->held_ceiling_saturated = false;
@@ -1098,7 +1200,7 @@ int rdecl thread_create(thread_t *act,
      * block active, we don't want priority inversion if the new thread is a
      * lower priority.
      */
-    thp->priority = thp->real_priority = act->real_priority;
+    thread_init_prio(thp, thread_inherit_prio(act));
     thp->policy = act->policy;
 
     /* Inherit scheduler partition.
@@ -1295,12 +1397,35 @@ int rdecl thread_create(thread_t *act,
  */
 void fpu_drop_claims(thread_t *thp)
 {
-    for (unsigned c = 0; c < CONFIG_PROCESSORS_MAX; c++) {
+    for (unsigned c = 0; c < num_processors; c++) {
         struct thread_entry *me = thp;
+
+        if (!cpu_online(c))
+            continue;
 
         __atomic_compare_exchange_n(&pcpu_array[c].pc_active_fpu, &me, NULL, 0,
                                     __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
     }
+}
+
+/* Give up what a dying thread holds in the sync layer: its mutex hold list, the
+ * robust mutexes it owns, and the waiters of mutexes it held (see
+ * sync_thread_cleanup). Shared by thread_destroy and by proc_exit, which stamps
+ * some threads dead without running thread_destroy's teardown. Repeating it is
+ * harmless.
+ */
+void rdecl thread_sync_teardown(thread_t *thp)
+{
+    ksync_t *syp;
+
+    while ((syp = thp->mutex_holdlist)) {
+        thread_t *waiting = pril_first(&syp->waiting);
+
+        CRASHCHECK(waiting->args.mu.owner == 0);
+        mutex_holdlist_rem(syp);
+        waiting->args.mu.owner = 0;
+    }
+    sync_thread_cleanup(thp);
 }
 
 /* Destroy a thread.
@@ -1319,7 +1444,6 @@ void rdecl thread_destroy(thread_t *thp)
 {
     process_t *prp = thp->process;
     unsigned i;
-    ksync_t *syp;
     thread_t *jthp = NULL;
     int join_owned = 0;
     int last_active = 0; /* set iff this reap emptied prp->threads */
@@ -1355,6 +1479,8 @@ void rdecl thread_destroy(thread_t *thp)
      * wait rather than bail for the self path.
      */
     int self_reap = (thp == get_active_thread(get_cpunum()));
+
+    THR_EV(thp);
 
     /* Destroy-claim — see banner on thread_t::destroy_claim in objects.h.
      * Atomically claim destruction of this thread.
@@ -1521,14 +1647,7 @@ void rdecl thread_destroy(thread_t *thp)
             kcall_op_thread_destroy_hook(thp);
         }
 
-        /* purge mutex hold list */
-        while ((syp = thp->mutex_holdlist)) {
-            thread_t *waiting = pril_first(&syp->waiting);
-            CRASHCHECK(waiting->args.mu.owner == 0);
-            mutex_holdlist_rem(syp);
-            waiting->args.mu.owner = 0;
-        }
-        sync_thread_cleanup(thp);
+        thread_sync_teardown(thp);
 
         /* clear client field */
         if (thp->client != 0) {
@@ -1847,6 +1966,7 @@ void rdecl thread_destroy(thread_t *thp)
         stats_destroy_t0 = cpu_clock_ticks();
         (void) rcu_sched_synchronize_detail(&stats_busy);
         stats_destroy_t1 = cpu_clock_ticks();
+        thread_prio_defer_cancel(thp);
         stats_pin_waited = tthread_wait_unpinned(thp);
 
         /* Freed-active gate. The RCU drain above covers in-flight kernel
@@ -1871,6 +1991,8 @@ void rdecl thread_destroy(thread_t *thp)
          * instrumented path frees through object_free_track_heap_detail, so it
          * cannot share that helper.
          */
+        THR_EV(thp);
+        sync_chains_assert_not_queued(thp, "freed");
         cap_revoke_object_all_tables(thp);
         object_free_track_heap_detail(prp, &thread_souls, thp,
                                       &stats_object_free_heap,
@@ -1879,6 +2001,7 @@ void rdecl thread_destroy(thread_t *thp)
         stats_have = true;
     } else {
         rcu_sched_synchronize();
+        thread_prio_defer_cancel(thp);
         (void) tthread_wait_unpinned(thp);
         thread_destroy_wait_inactive(thp, prp);
         thread_soul_free(prp, thp);

@@ -45,6 +45,7 @@ typedef struct notification_entry notification_t;
 typedef struct syncevent_entry sync_event_t;
 typedef struct sync_entry ksync_t;
 typedef struct turnstile_entry turnstile_t;
+struct robust_hold;
 
 /* Opaque identity token for a sync object's wait queue. Today it is the user
  * sync_t's virtual address; process-shared syncs will key on a physical address
@@ -214,6 +215,11 @@ typedef struct process_entry {
      * proc_mux_lock *lock". It is purely roottask bookkeeping (the kernel never
      * observed it beyond a NULL-on-destroy assertion) and now lives in
      * root_process_t.lock — see servers/roottask/include/root-process.h.
+     * Written under the child locks, always with a release store. A reader that
+     * holds those locks may load it plainly; one that does not (the process
+     * query) loads it with acquire, so a reparent's earlier flag changes are
+     * seen first. The diagnostic readers in trace and debug code load it
+     * plainly and accept a stale answer.
      */
     struct process_entry *parent;
     vector_t threads;
@@ -283,6 +289,17 @@ typedef struct process_entry {
      * vectors/credentials/object pools.
      */
     volatile unsigned pin_count;
+
+    /* Threads of other processes that run in this address space (as_prp == this
+     * process, process != this process). Each linked thread holds one pin_count
+     * reference, but the pin count is not the list length: kcalls that promote
+     * an RCU lookup pin the process too. as_borrow_closed is set once, when
+     * teardown releases the borrowers, and refuses every later borrow, so the
+     * list stays empty from then until mdestroy. Both fields are guarded by
+     * thread_as_slock (kernel/thread/lifecycle.c).
+     */
+    thread_t *as_borrowers;
+    bool as_borrow_closed;
     ulong_t rlimit_vals_soft[RLIM_NLIMITS];
     ulong_t rlimit_vals_hard[RLIM_NLIMITS];
 
@@ -300,6 +317,12 @@ typedef struct process_entry {
      * the teardown; a concurrent destroy of the same pid sees it and backs off.
      */
     bool destroying;
+
+    /* Set under process_vector_slock by kext_reparent while it moves this
+     * process between child lists; kext_process_destroy answers EAGAIN until it
+     * clears, as it does for querying.
+     */
+    bool reparenting;
     unsigned pending_interrupts;
 
     /* Per-process vector spinlock (LOCK_CLASS_PROCVEC). Initialized by
@@ -546,9 +569,32 @@ typedef struct thread_entry { /* Also used for vthread_entry */
     turnstile_t *blocked_on_turnstile; /* PI/PC wait-chain object, not
                                         * blocked_on channel state
                                         */
+    thread_t *ts_bound_next; /* link in blocked_on_turnstile's bound list */
     turnstile_t
         *owned_turnstiles; /* turnstiles currently boosting this owner */
+    /* Robust mutexes this thread holds (under sync_pi_slock), and one spare
+     * record kept so a lock after an unlock does not allocate. Only the thread
+     * itself touches the spare. See kernel/sync/wait.c.
+     */
+    struct robust_hold *robust_held;
+    struct robust_hold *robust_spare;
+
+    /* One idle turnstile kept for this thread's next contended PI lock, so that
+     * a condvar wait can reserve it before it gives the mutex up: the reacquire
+     * on wake then cannot fail for want of memory. Only the thread itself
+     * touches it. See kernel/sync/wait.c.
+     */
+    turnstile_t *ts_spare;
+    unsigned robust_nheld; /* length of robust_held (under sync_pi_slock) */
     thread_t *restart;
+
+    /* Resume point of the msg_readv / msg_writev iov check (xfer_iov_check):
+     * the array being checked, its part count, and how many entries are done.
+     * Valid only until the thread makes any other kernel call.
+     */
+    const iov_t *iovchk_iov;
+    int32_t iovchk_parts;
+    uint32_t iovchk_done;
 
     /* The following is used to hold arguments when a thread blocks to make them
      * easy to access in another threads context. Only a very small number of
@@ -712,6 +758,13 @@ typedef struct thread_entry { /* Also used for vthread_entry */
      */
     volatile unsigned pin_count;
 
+    /* Link on as_prp->as_borrowers while as_prp is another process's address
+     * space; as_borrow_pprev is NULL while unlinked. Guarded by
+     * thread_as_slock.
+     */
+    thread_t *as_borrow_next;
+    thread_t **as_borrow_pprev;
+
     /* Saved syscall argument registers (a0..a5), captured at every kcall entry.
      * KCALL_RESTART restores these into the saved register frame before the
      * user PC is rewound to the ecall, so a re-executed syscall sees its
@@ -750,12 +803,64 @@ typedef struct thread_entry { /* Also used for vthread_entry */
     uint8_t held_ceiling_floor;
     bool held_ceiling_saturated;
 
+    /* Priority loans (docs/pi-pc-design.md "Base and Effective Priority").
+     * real_priority is the thread's own base; these carry what other threads
+     * lend it, and the effective priority (thp->priority) is the maximum of all
+     * four. They are plain words so the IPC fast path lends without allocating
+     * or taking a lock.
+     *
+     * msg_loan: the request (a client in REPLY on this thread) or notification
+     * being served; priority, request flag and generation packed as described
+     * in <thread-prio.h>.
+     *
+     * pend_loan: the highest send or notification still queued on the channel
+     * this thread serves; raised when one is queued, reset from the queue head
+     * when this thread receives or replies.
+     *
+     * pi_loan: the highest priority a PI waiter or a PRIO_PROTECT ceiling
+     * lends: the cached result of the owned-turnstile walk, refreshed under
+     * sync_pi_slock (sync_pi_target_locked).
+     *
+     * Only the accessors in <thread-prio.h> and kernel/sync/wait.c write these
+     * and real_priority; scripts/check-prio-writes.sh enforces that.
+     */
+    uint64_t msg_loan;
+    uint8_t pend_loan;
+    uint8_t pi_loan;
+
+    /* Link in a hart's list of servers whose priority settle a client's
+     * departure deferred (thread_prio_defer_settle), and that hart plus one, or
+     * 0 when not queued. Both are written under prio_defer_slock. Appended at
+     * the tail like the fields above.
+     */
+    thread_t *prio_defer_next;
+    uint8_t prio_defer_cpu;
+
     /* timestamp_last_block value the stall detector has already reported for
      * this thread (stall_scan_roottask_waiters, CONFIG_STALL_DETECTOR). Written
      * only by that scan, which runs on the boot hart alone; 0 = never reported.
      * Appended at the tail like the fields above.
      */
     uint64_t stall_reported_ts;
+
+    /* Resume cursor of a bounded msg_readv / msg_writev transfer (xfermsg).
+     * Each side is an entry index into its vector and a byte offset to move
+     * forward from that entry (an offset still to be skipped is kept whole), so
+     * a restart neither rescans the entries it passed nor trusts them. Valid
+     * while armed, for the thread pair, vectors, offsets and message length of
+     * the transfer that saved it, and dropped with the iov check state.
+     * Appended at the tail like the fields above it.
+     */
+    struct {
+        thread_t *sthp, *dthp;
+        const void *smsg, *rmsg; /* the vectors the transfer was started on */
+        int32_t sparts, rparts;
+        size_t soff0, doff0; /* and the offsets the call asked for */
+        uint32_t msglen;
+        uint32_t sidx, didx;
+        size_t soff, doff;
+        bool armed;
+    } xcur;
 } thread_t;
 
 /* Map a dispatch-list LINK3_NODE pointer back to its enclosing thread_t. The

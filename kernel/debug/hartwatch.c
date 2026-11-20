@@ -114,7 +114,6 @@ static void hartwatch_report(unsigned target, uint64_t stamp, uint64_t now)
  */
 void hartwatch_tick(void)
 {
-    extern unsigned hart_ids[];
     unsigned n = num_processors;
     unsigned self = get_cpunum();
     unsigned si = 0;
@@ -132,16 +131,15 @@ void hartwatch_tick(void)
      * is free, not only on this hart's next unrelated print.
      */
     kprintf_flush_parked(HARTWATCH_LOCK_RETRIES);
-    if (n < 2 || !pcpu_array[self].pc_alive)
+    if (n < 2 || !cpu_online(self))
         return;
-    while (si < n && hart_ids[si] != self)
-        si++;
-    if (si == n)
+    si = self;
+    if (si >= n)
         return;
     for (unsigned k = 1; k < n; k++) {
-        unsigned h = hart_ids[(si + k) % n];
-        if (__atomic_load_n(&pcpu_array[h].pc_alive, __ATOMIC_ACQUIRE)) {
-            target = h;
+        unsigned cpu = (si + k) % n;
+        if (cpu_online(cpu)) {
+            target = cpu;
             break;
         }
     }

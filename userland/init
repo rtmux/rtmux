@@ -20,12 +20,14 @@ export PATH
 mainfs=/dev/nvme0n1p8
 rtmux_run=
 rtmux_laps=
+rtmux_spawn_procs=0
 if read cmdline < /sys/cmdline; then
     for arg in $cmdline; do
         case "$arg" in
             mainfs=*) mainfs=${arg#mainfs=} ;;
             rtmux.run=*) rtmux_run=${arg#rtmux.run=} ;;
             rtmux.laps=*) rtmux_laps=${arg#rtmux.laps=} ;;
+            rtmux.spawn_procs=*) rtmux_spawn_procs=${arg#rtmux.spawn_procs=} ;;
         esac
     done
 fi
@@ -130,7 +132,85 @@ if test "$rtmux_run" = "debug-inject"; then
             ok=2
         fi
     fi
+    # A failing kcall must keep its error status when its caller was switched
+    # out inside the call, also when the caller may run on every hart.
     if test "$ok" = 2; then
+        if /bin/syscall_testing --sched-set-error &&
+            /bin/syscall_testing --sched-set-error-migrate; then
+            ok=3
+        fi
+    fi
+    # A condition wait on a PI mutex must not lose the mutex to a failing
+    # turnstile allocation.
+    if test "$ok" = 3; then
+        if /bin/syscall_testing --condvar-reacquire-alloc-failure; then
+            ok=4
+        fi
+    fi
+    # A PI mutex waiter that has published itself but not yet queued must not
+    # be stranded by another unlock.
+    if test "$ok" = 4; then
+        if /bin/syscall_testing --mutex-waiting-republish; then
+            ok=5
+        fi
+    fi
+    # An interrupt of a condition wait that lost the race with the wakeup must
+    # leave the woken thread alone.
+    if test "$ok" = 5; then
+        if /bin/syscall_testing --condvar-interrupt-stale; then
+            ok=6
+        fi
+    fi
+    # A request parked behind another on one namespace node must not cost the
+    # request it waited for its combined result or its connection state.
+    if test "$ok" = 6; then
+        if /bin/syscall_testing --ns-open-deferral; then
+            ok=7
+        fi
+    fi
+    # A MAP that meets a superpage half way must report its progress, so the
+    # pages it already mapped are unmapped, and must leave no page behind.
+    if test "$ok" = 7; then
+        if /bin/syscall_testing --pte-partial-map; then
+            ok=8
+        fi
+    fi
+    # A waiter that must lend its priority but is not yet queued still counts
+    # when the owner hands the mutex on, and a contended lock that cannot get a
+    # turnstile takes back the WAITING bit it published.
+    if test "$ok" = 8; then
+        if /bin/syscall_testing --mutex-handoff-loan; then
+            ok=9
+        fi
+    fi
+    if test "$ok" = 9; then
+        if /bin/syscall_testing --mutex-waiting-withdrawn; then
+            ok=10
+        fi
+    fi
+    # setpgid and tcsetsid(-1) racing a reap and a rebind, each held open at the
+    # point where it has checked and not yet changed. The case spawns children
+    # that wait on pipes, and binds a terminal the init session does not own.
+    if test "$ok" = 10; then
+        /bin/pipe &
+        /sbin/logger
+        /sbin/virtio-mmio
+        /sbin/virtio-mmio --register-boot
+        /bin/dev-serial-8250 &
+        if waitfor /dev/pipe 10 && waitfor /dev/ser1 5 &&
+            /bin/syscall_testing --pgrp-races; then
+            ok=11
+        fi
+    fi
+    # A client that leaves REPLY by timeout while its server is blocked on a
+    # second server must have the server settled in thread context, along the
+    # chain, and no priority work run in the departure itself.
+    if test "$ok" = 11; then
+        if /bin/syscall_testing --prio-loan-context; then
+            ok=12
+        fi
+    fi
+    if test "$ok" = 12; then
         echo "RTMux debug-inject: PASS"
     else
         echo "RTMux debug-inject: FAIL"
@@ -409,15 +489,20 @@ if test "$rtmux_run" = "trace-negative"; then
 fi
 
 # Serial reader-death regression: the driver must drop a parked reader that was
-# SIGKILLed. The host writes one byte to the UART once the test prints
-# "serial-unblock: WAITING".
+# SIGKILLed, and poll and select must see terminal readiness. The host writes
+# each byte the test asks for with a "serial-inject: <seq> <hex>" line. Console
+# (/dev/text) readiness is checked first, while no driver owns the UART, with
+# bytes asked for by "console-inject: <seq> <hex>" lines.
 if test "$rtmux_run" = "serial-unblock"; then
     /sbin/logger
     /sbin/virtio-mmio
     /sbin/virtio-mmio --register-boot
     echo "RTMux serial-unblock: BEGIN"
+    serial_fail=0
+    /bin/syscall_testing --console-poll || serial_fail=1
     /bin/dev-serial-8250 &
-    if waitfor /dev/ser1 5 && /bin/syscall_testing --serial-unblock; then
+    waitfor /dev/ser1 5 && /bin/syscall_testing --serial-unblock || serial_fail=1
+    if test "$serial_fail" = "0"; then
         echo "RTMux serial-unblock: PASS"
     else
         echo "RTMux serial-unblock: FAIL"
@@ -506,6 +591,18 @@ if test "$rtmux_run" = "logger-restart"; then
     exec /bin/sh -i
 fi
 
+if test "$rtmux_run" = "fdt-reserved-memory"; then
+    echo "RTMux fdt-reserved-memory: BEGIN"
+    if /bin/syscall_testing --resv-fill; then
+        echo "RTMux fdt-reserved-memory: PASS"
+    else
+        echo "RTMux fdt-reserved-memory: FAIL"
+    fi
+    shutdown -h
+    sleep 1
+    exec /bin/sh -i
+fi
+
 if test "$rtmux_run" = "fault-recovery"; then
     echo "RTMux fault-recovery: BEGIN"
     if /bin/syscall_testing --fault-recovery; then
@@ -566,7 +663,7 @@ lkl_start_fsd_isolated() {
 }
 
 lkl_start_net() {
-    /sbin/lkl-netd --serve-net &&
+    /sbin/lkl-netd "$@" --serve-net &&
         waitfor /net/ipifc 10
 }
 
@@ -677,6 +774,8 @@ run_lkl_regress() {
         lkl-netd-revoke) run_lkl_selftest lkl-netd-revoke 'lkl_start_net_crash /net/ping && /bin/lkl-measure net-revoke 1 && /bin/lkl-gate' ;;
         lkl-netd-restart) run_lkl_selftest lkl-netd-restart '/bin/lkl-supervisor /net/ipifc 1 /net/ping /sbin/lkl-netd --serve-net-crash-on-ping' ;;
         lkl-netd-stale) run_lkl_selftest lkl-netd-stale 'lkl_start_net_crash /net/dns && /bin/lkl-stale-handle-test' ;;
+        lkl-netd-poll) run_lkl_selftest lkl-netd-poll 'lkl_start_net && /bin/lkl-netd-poll-test' ;;
+        lkl-netd-poll-spent) run_lkl_selftest lkl-netd-poll-spent 'lkl_start_net --notify-retries=0 && /bin/lkl-netd-poll-test' ;;
         lkl-multi) run_lkl_selftest lkl-multi 'lkl_start_pipe && lkl_start_net && lkl_start_fsd && /bin/ls /fs/root && /bin/cat /fs/root/hello.txt && /bin/verify-lkl-net --helpers && /bin/cat /net/stats && /bin/lkl-multi-test && /bin/cat /stats' ;;
         lkl-multi-crash) run_lkl_selftest lkl-multi-crash 'lkl_start_pipe && lkl_start_net_crash /net/ping && lkl_start_fsd && /bin/cat /fs/root/hello.txt && /bin/lkl-measure net-revoke 1 && /bin/cat /fs/root/hello.txt && /bin/lkl-gate /net /net/ping /net/stats /net/tcp/clone /net/udp/clone /net/dns' ;;
         lkl-multi-stress) run_lkl_selftest lkl-multi-stress 'lkl_start_pipe && lkl_start_net && lkl_start_fsd && /bin/lkl-multi-test 10 && /bin/timer-jitter 20 60' ;;
@@ -928,7 +1027,7 @@ if test "$mount_ok" = "1"; then
         echo
         echo "RTMux spawn-storm: BEGIN"
         /bin/pipe &
-        if /bin/syscall_testing --spawn-storm; then
+        if /bin/syscall_testing --spawn-storm "$rtmux_spawn_procs"; then
             echo "RTMux spawn-storm: PASS"
         else
             echo "RTMux spawn-storm: FAIL"

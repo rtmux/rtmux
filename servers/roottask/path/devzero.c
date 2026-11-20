@@ -141,6 +141,7 @@ static const ioserv_ops_t zero_io_funcs = {
     .write = zero_write,
     .stat = zero_stat,
     .devctl = zero_devctl,
+    .notify = devnull_notify,
     .openfd = zero_openfd,
 };
 

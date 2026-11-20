@@ -239,11 +239,11 @@ static int fastmsg_copy_source_prefix(thread_t *sender,
     return EOK;
 }
 
-static int fastmsg_native_cap_install_long(thread_t *sender,
-                                           thread_t *receiver,
-                                           bool reply,
-                                           fastmsg_native_cap_tx_t *tx,
-                                           int *patched)
+static int fastmsg_native_cap_install_long_peek(thread_t *sender,
+                                                thread_t *receiver,
+                                                bool reply,
+                                                fastmsg_native_cap_tx_t *tx,
+                                                int *patched)
 {
     struct _io_msg msg;
     struct _io_native_hdr hdr;
@@ -330,6 +330,44 @@ static int fastmsg_native_cap_install_long(thread_t *sender,
     return EOK;
 }
 
+/* fastmsg_native_cap_install_long_peek reads the head of the message through
+ * xfermsg, which ends by clearing the restart links and the byte count of the
+ * transfer it borrowed them from. A stepped copy that has yielded keeps its
+ * cursor on exactly those, so the peek must give them back, or each restart
+ * would begin the copy again and never get past its first step.
+ */
+static int fastmsg_native_cap_install_long(thread_t *sender,
+                                           thread_t *receiver,
+                                           bool reply,
+                                           fastmsg_native_cap_tx_t *tx,
+                                           int *patched)
+{
+    thread_t *rrestart = receiver->restart, *srestart = sender->restart;
+    thread_t *sdthp = sender->args.ms.dthp;
+    uint32_t msglen = sender->args.ms.msglen;
+    int ret;
+
+    /* Only a copy that yielded leaves links to give back. */
+    if (!rrestart && !srestart)
+        return fastmsg_native_cap_install_long_peek(sender, receiver, reply, tx,
+                                                    patched);
+
+    /* The peek starts at the head of the message: a copy that yielded left
+     * links that would make xfermsg resume it, so they are cleared for the peek
+     * and given back.
+     */
+    receiver->restart = sender->restart = NULL;
+    sender->args.ms.dthp = NULL;
+    sender->args.ms.msglen = 0;
+    ret = fastmsg_native_cap_install_long_peek(sender, receiver, reply, tx,
+                                               patched);
+    receiver->restart = rrestart;
+    sender->restart = srestart;
+    sender->args.ms.dthp = sdthp;
+    sender->args.ms.msglen = msglen;
+    return ret;
+}
+
 #define STUFF_RCVINFO(thp, cop, info) fastmsg_fill_rcvinfo(thp, cop, info)
 
 /* send_queue mixes thread senders with queued notifications, and only a thread
@@ -402,6 +440,65 @@ static thread_t *receive_candidate(channel_t *chp, int notification_only)
 #define END_SMP_XFER(act, thp)
 #define END_SMP_XFER_SELF(act)
 #endif
+
+/* The copy of a message between a thread and its peer, for send, receive and
+ * reply. One that carries capabilities (cap_patched: a native header was
+ * installed ahead of the copy, and a restart would install it twice) runs in
+ * one piece, as before; any other does at most a step of work per kernel entry
+ * (xfermsg_bounded) and returns XFER_RESTART when it used the step up.
+ */
+static inline int fastmsg_xfer(thread_t *dthp, thread_t *sthp, bool cap_patched)
+{
+    if (!cap_patched && sthp->args.ms.sparts <= XFER_STEP_PARTS_MAX &&
+        dthp->args.ms.rparts <= XFER_STEP_PARTS_MAX)
+        return xfermsg_bounded(dthp, sthp, 0, 0);
+    if (!cap_patched)
+        return xfermsg(dthp, sthp, 0, 0);
+    return xfermsg(dthp, sthp, sizeof(struct _io_native_hdr),
+                   sizeof(struct _io_native_hdr));
+}
+
+/* A stepped copy used its step up and arranged for the call to run again
+ * (xfer_yield did the KCALL_RESTART): give up the claim on the peer, and on
+ * ourselves, under the channel lock, so that another thread can use the peer in
+ * the meantime, and honor a wake that was deferred while the claim was held.
+ * The caller returns ENOERROR. The cursor and the restart links stay for the
+ * restarted call to resume from.
+ */
+static void fastmsg_step_yield(channel_t *chp, thread_t *act, thread_t *thp)
+{
+    unsigned status = 0;
+    bool wake = false;
+
+    kspinlock_lock(&chp->lock);
+    END_SMP_XFER(act, thp);
+    if (thp->internal_flags & RTMUX_ITF_MSG_FORCE_RDY) {
+        ITF_CLR(thp, RTMUX_ITF_MSG_FORCE_RDY);
+        status = (unsigned) KSTATUS(thp);
+        wake = true;
+    }
+    kspinlock_unlock(&chp->lock);
+    if (wake)
+        force_ready(thp, status);
+}
+
+/* Whether an iov array of parts entries, which the kernel reads itself, lies
+ * inside the process's boundary and is no longer than a transfer takes. An
+ * array with no entry to read passes.
+ */
+static bool fastmsg_iov_array_ok(const iov_t *iov,
+                                 int parts,
+                                 const process_t *prp)
+{
+    uintptr_t base = (uintptr_t) iov, last;
+
+    if (parts <= 0)
+        return true;
+    if (parts > XFER_IOV_LIMIT)
+        return false;
+    last = base + (size_t) parts * sizeof(iov_t) - 1;
+    return base <= last && WITHIN_BOUNDARY(base, last, prp->boundary_addr);
+}
 
 /* Handle CPU vm_ops->as implementations that need the kernel locked */
 #define SWITCH_AS(as_prp, asp, act) vm_ops->as(as_prp, asp)
@@ -540,7 +637,7 @@ static int sendv_body(thread_t *act,
 
     _TRACE_COMM_EMIT_SMSG(act, cop, (act->tid << 16) | cop->scoid);
 
-    if (PENDCAN(TLS_FLAGS_SAFE(act)) && (type != __KSYS_MSG_SENDVNC)) {
+    if ((type != __KSYS_MSG_SENDVNC) && PENDCAN(tls_flags_load(act))) {
         SETKIP_FUNC(act, act->process->canstub);
         return ENOERROR;
     }
@@ -591,6 +688,15 @@ static int sendv_body(thread_t *act,
     atomic_clr(&sender->flags, RTMUX_FLG_THR_BUFF_MSG);
     /* Make sure the SPECRET_PENDING bit isn't set when we don't need it. */
     ITF_CLR(sender, RTMUX_ITF_SPECRET_PENDING);
+
+    /* The loops below read both arrays themselves: they must lie inside the
+     * sender's boundary, as the receive side requires of its own. (For remote
+     * IPC rmsg is not an array.)
+     */
+    if (!fastmsg_iov_array_ok(kap->smsg, kap->sparts, act->process) ||
+        (!(cop->flags & COF_NETCON) &&
+         !fastmsg_iov_array_ok(kap->rmsg, kap->rparts, act->process)))
+        return EFAULT;
 
     /* Validate incoming IOVs - override for remote IPC - rparts/rmsg have
      * special meaning
@@ -842,9 +948,11 @@ static int sendv_body(thread_t *act,
             }
             START_SMP_XFER(act, thp);
             /* Yes. Transfer the data. */
-            xferstat = xfermsg(thp, act,
-                               cap_patched ? sizeof(struct _io_native_hdr) : 0,
-                               cap_patched ? sizeof(struct _io_native_hdr) : 0);
+            xferstat = fastmsg_xfer(thp, act, cap_patched);
+            if (xferstat == XFER_RESTART) {
+                fastmsg_step_yield(chp, act, thp);
+                return ENOERROR;
+            }
             sender->args.ms.msglen = act->args.ms.msglen;
             if (cap_patched)
                 sender->args.ms.msglen +=
@@ -1014,8 +1122,16 @@ static int sendv_body(thread_t *act,
             !(cop->flags & COF_NETCON) &&
             !(chp->flags & RTMUX_FLG_CHF_FIXED_PRIORITY) &&
             !IS_SCHED_SS(sender)) {
-            /* By default the receiver runs with message driven priority. */
-            thp->real_priority = thp->priority = sender->priority;
+            /* By default the receiver runs with message driven priority: the
+             * sender lends its priority for the request (thp->client was set
+             * above), and nothing is queued behind it, or thp would not have
+             * been waiting. thp is on no queue, so store the effective priority
+             * directly; settle below reconciles a loan change that raced the
+             * store.
+             */
+            thread_lend_msg(thp, sender->priority, true);
+            thread_set_pend_loan(thp, 0);
+            thp->priority = (uint8_t) thread_effective_prio(thp);
             thp->dpp = sender->dpp;
             CRITICAL_INHERIT(thp, sender);
 
@@ -1052,13 +1168,18 @@ static int sendv_body(thread_t *act,
 #else
             block_and_ready(thp);
 #endif
+            thread_prio_settle(thp);
         } else {
             if ((chp->flags & RTMUX_FLG_CHF_FIXED_PRIORITY) == 0) {
                 /* By default the receiver runs with message driven priority. */
-                thp->real_priority = thp->priority = sender->priority;
+                thread_lend_msg(thp, sender->priority, true);
                 thp->dpp = sender->dpp;
                 CRITICAL_INHERIT(thp, sender);
+            } else {
+                thread_lend_msg(thp, 0, false);
             }
+            thread_set_pend_loan(thp, 0);
+            thread_prio_settle(thp); /* thp is on no queue yet */
             sender->state =
                 STATE_REPLY; /* Must be set before calling block_and_ready() */
             _TRACE_TH_EMIT_STATE(sender, REPLY);
@@ -1086,6 +1207,7 @@ static int sendv_body(thread_t *act,
 
         /* Block the active thread and ready the receiver thread */
         sender->blocked_on = cop;
+        IPC_BLK(sender);
 
         /* Link the now reply blocked sending thread in the reply queue Queue
          * mutation under chp->lock. No ->destroying recheck here (unlike the
@@ -1173,6 +1295,7 @@ static int sendv_body(thread_t *act,
         snap_time(&sender->timestamp_last_block, 0);
         _TRACE_TH_EMIT_STATE(sender, SEND);
         sender->blocked_on = cop;
+        IPC_BLK(sender);
         /* Queue mutation under chp->lock */
         kspinlock_lock(&chp->lock);
         if (chp->destroying || cop->channel != chp) {
@@ -1180,6 +1303,7 @@ static int sendv_body(thread_t *act,
             ITF_CLR(sender, RTMUX_ITF_WAIT_PENDING);
             atomic_clr(&sender->flags, RTMUX_FLG_THR_BUFF_MSG);
             sender->blocked_on = NULL;
+            IPC_BLK(sender);
             sender->state = STATE_STOPPED;
             return ESRCH;
         }
@@ -1261,6 +1385,7 @@ static int sendv_body(thread_t *act,
          * blocked_on after they exit the spin sees this assignment.
          */
         sender->blocked_on = cop;
+        IPC_BLK(sender);
     }
 
     *heldp = NULL; /* the reply-side drop releases it */
@@ -1284,10 +1409,15 @@ static int sendv_body(thread_t *act,
             if (VECP(thp, &chp->process->threads, i) &&
                 thp->last_chid == chp->chid) {
                 int may_run = may_thread_run(thp);
-                if (thp->priority < sender->priority) {
-                    adjust_priority(thp, sender->priority,
-                                    may_run ? thp->dpp : sender->dpp, 1);
-                    thp->real_priority = thp->priority;
+
+                /* A loan for the pending send, whether or not another loan
+                 * already holds thp higher; it is reset when this thread next
+                 * receives or replies.
+                 */
+                if (thp->pend_loan < sender->priority) {
+                    thread_raise_pend_loan(thp, sender->priority);
+                    (void) thread_prio_update_dpp(
+                        thp, may_run ? thp->dpp : sender->dpp, 1);
                 } else {
                     if (!may_run) {
                         /* server threads are higher prio, but have no budget.
@@ -1353,8 +1483,66 @@ int kdecl ksys_msg_sendv(thread_t *act, struct kcall_args_msg_sendv *kap)
      * and the send failing all at once; the soul then stays until exit.
      */
     if (held)
-        (void) connect_client_drop(held, act->real_priority);
+        (void) connect_client_drop(held, thread_base_prio(act));
     return r;
+}
+
+void rdecl thread_pend_loan_resettle(thread_t *thp)
+{
+    int32_t last = thp->last_chid;
+    unsigned chid = (unsigned) last;
+    vector_t *chvec = &thp->process->chancons;
+    kspinlock_t *lookup_lock = &thp->process->vec_slock;
+    channel_t *chp;
+
+    if (TYPE_MASK(thp->type) != TYPE_THREAD)
+        return;
+    if (last < 0) {
+        thread_set_pend_loan(thp, 0);
+        return;
+    }
+    if (chid & RTMUX_GLOBAL_CHANNEL) {
+        chid &= ~RTMUX_GLOBAL_CHANNEL;
+        chvec = &global_channel_vector;
+        lookup_lock = &global_channel_slock;
+    }
+
+    /* The read section keeps chp from being freed between the lookup and its
+     * lock, as it does for a receive.
+     */
+    rcu_read_lock(&connobj_rcu);
+    kspinlock_lock(lookup_lock);
+    chp = vector_lookup(chvec, chid);
+    kspinlock_unlock(lookup_lock);
+    if (!chp || chp->type != TYPE_CHANNEL) {
+        thread_set_pend_loan(thp, 0);
+    } else {
+        /* Under chp->lock, so a send queued meanwhile raises after it. A
+         * receive on another channel since the read above owns the loan now.
+         */
+        kspinlock_lock(&chp->lock);
+        if (thp->last_chid == last)
+            thread_set_pend_loan(thp, thp->last_chid == chp->chid
+                                          ? channel_pending_loan_locked(chp)
+                                          : 0);
+        kspinlock_unlock(&chp->lock);
+    }
+    rcu_read_unlock(&connobj_rcu);
+}
+
+/* A received notification lends its priority to its receiver until the next
+ * receive; a fixed-priority channel lends nothing and drops a loan left from an
+ * earlier receive. Either way the receiver moves to its process's default
+ * partition, as message-driven priority always did.
+ */
+static void notification_lend(thread_t *thp, channel_t *chp, unsigned prio)
+{
+    bool fixed = (chp->flags & RTMUX_FLG_CHF_FIXED_PRIORITY) != 0;
+
+    thread_lend_msg(thp, fixed ? 0 : prio, false);
+    if (!thread_prio_update_dpp(thp, thp->process->default_dpp, 1) &&
+        thp->dpp != thp->process->default_dpp)
+        adjust_priority(thp, thp->priority, thp->process->default_dpp, 1);
 }
 
 /* Send a notification on a connection (msg_send_notification kcall).
@@ -1506,15 +1694,7 @@ int kdecl ksys_msg_sendnotification(thread_t *act,
 #endif
             kspinlock_unlock(&chp->lock);
 
-            /* By default the receiver runs with message driven priority. */
-            if (thp->priority != prio &&
-                (chp->flags & RTMUX_FLG_CHF_FIXED_PRIORITY) == 0) {
-                adjust_priority(thp, prio, thp->process->default_dpp, 1);
-                thp->real_priority = thp->priority;
-            } else if (thp->dpp != thp->process->default_dpp) {
-                adjust_priority(thp, thp->priority, thp->process->default_dpp,
-                                1);
-            }
+            notification_lend(thp, chp, prio);
 
             /* Note - since this is a user-delivered notification, it cannot
              * have the VTID flag on @@Add assert
@@ -1568,7 +1748,6 @@ int kdecl ksys_msg_receivev(thread_t *act, struct kcall_args_msg_receivev *kap)
     int tid;
     int notification_only = KTYPE(act) == __KSYS_MSG_RECEIVENOTIFICATIONV;
     unsigned chid;
-    unsigned tls_flags;
     vector_t *chvec;
 
     /* Channel-queue exclusion stays under chp->lock; sender-thread claim under
@@ -1741,6 +1920,8 @@ restart_recv:
              * of the slock drop.
              */
             notification_remove(chp->process, &chp->send_queue, pup);
+            /* Under chp->lock, so a send queued meanwhile raises after it. */
+            thread_set_pend_loan(act, channel_pending_loan_locked(chp));
         } else if (IMTO(thp, STATE_REPLY)) {
             /* Don't claim — leave for force_ready outside the lock. */
             imto_bounce = 1;
@@ -1785,29 +1966,28 @@ restart_recv:
         act->timeout_flags = 0;
 
         /* By default the receiver runs with message driven priority. RUSH: Fix
-         * for partition inheritance
+         * for partition inheritance Drop the client link before the new loan,
+         * so a REPLY propagation from that client sees the new generation
+         * (thread_lend_msg).
          */
-        if (act->priority != notification_priority &&
-            (chp->flags & RTMUX_FLG_CHF_FIXED_PRIORITY) == 0) {
-            adjust_priority(act, notification_priority,
-                            act->process->default_dpp, 1);
-            act->real_priority = act->priority;
-        } else if (act->dpp != act->process->default_dpp) {
-            adjust_priority(act, act->priority, act->process->default_dpp, 1);
-        }
-
         if ((thp = act->client) != 0) {
             /* need to clear client's server field */
             act->client = 0;
             thp->args.ms.server = 0;
         }
+        notification_lend(act, chp, notification_priority);
 
+        /* The lend can lower act and switch it out here, and the trap path
+         * writes a returned status only while act still runs: publish it.
+         */
         if (xferstat) {
-            return EFAULT;
+            kcall_err(act, EFAULT);
+            return ENOERROR;
         }
         _TRACE_COMM_IPC_RET(act);
 
-        return EOK;
+        SETKSTATUS(act, EOK);
+        return ENOERROR;
     }
 
     if (imto_bounce) {
@@ -1852,9 +2032,11 @@ restart_recv:
             capstat = fastmsg_native_cap_install_long(thp, act, false, &captx,
                                                       &cap_patched);
             if (capstat == EOK) {
-                xferstat = xfermsg(
-                    act, thp, cap_patched ? sizeof(struct _io_native_hdr) : 0,
-                    cap_patched ? sizeof(struct _io_native_hdr) : 0);
+                xferstat = fastmsg_xfer(act, thp, cap_patched);
+                if (xferstat == XFER_RESTART) {
+                    fastmsg_step_yield(chp, act, thp);
+                    return ENOERROR;
+                }
             } else if (capstat & (XFER_SRC_FAULT | XFER_DST_FAULT)) {
                 xferstat = capstat;
                 capstat = EOK;
@@ -1987,6 +2169,8 @@ restart_recv:
          */
         kspinlock_lock(&chp->lock);
         pril_rem(&chp->send_queue, thp);
+        /* Under chp->lock, so a send queued meanwhile raises after it. */
+        thread_set_pend_loan(act, channel_pending_loan_locked(chp));
         if (thp->state == STATE_SEND) {
             thp->state = STATE_REPLY;
             snap_time(&thp->timestamp_last_block, 0);
@@ -2015,14 +2199,18 @@ restart_recv:
         /* By default the receiver runs with message driven priority. RUSH: Fix
          * for partition inheritance
          */
-        if ((act->priority != thp->priority || act->dpp != thp->dpp) &&
-            (chp->flags & RTMUX_FLG_CHF_FIXED_PRIORITY) == 0) {
-            CRITICAL_INHERIT(act, thp);
-            adjust_priority(act, thp->priority, thp->dpp, 1);
-            if (act->real_priority != act->priority)
-                act->real_priority = act->priority;
+        if ((chp->flags & RTMUX_FLG_CHF_FIXED_PRIORITY) == 0) {
+            if (act->priority != thp->priority || act->dpp != thp->dpp)
+                CRITICAL_INHERIT(act, thp);
+            else
+                CRITICAL_CLEAR(act);
+            thread_lend_msg(act, thp->priority, true); /* act->client = thp */
+            (void) thread_end_orphan_loan(act);
+            (void) thread_prio_update_dpp(act, thp->dpp, 1);
         } else {
             CRITICAL_CLEAR(act);
+            thread_lend_msg(act, 0, false);
+            thread_prio_update(act);
         }
 
         return ENOERROR;
@@ -2049,7 +2237,6 @@ restart_recv:
      * RTMUX_ITF_WAIT_PENDING before pril_rem'ing the receiver, so they never
      * see act in a half-blocked state.
      */
-    tls_flags = TLS_FLAGS_SAFE(act);
     _TRACE_COMM_IPC_RET(act);
 
     if ((thp = act->client) != 0) {
@@ -2062,7 +2249,7 @@ restart_recv:
         return ETIMEDOUT;
     }
 
-    if (PENDCAN(tls_flags)) {
+    if (PENDCAN(tls_flags_load(act))) {
         SETKIP_FUNC(act, act->process->canstub);
         return ENOERROR;
     }
@@ -2144,6 +2331,7 @@ restart_recv:
      * blocked_on).
      */
     act->blocked_on = chp;
+    IPC_BLK(act);
     act->args.ri.rmsg = kap->rmsg;
     act->args.ri.rparts = kap->rparts;
     act->args.ri.info = kap->info;
@@ -2187,7 +2375,29 @@ restart_recv:
  *   kap : kcall args (rcvid, reply iov smsg/sparts, status)
  * Return value: EOK on success; an errno on fault/lookup failure.
  */
-int kdecl ksys_msg_replyv(thread_t *act, struct kcall_args_msg_replyv *kap)
+/* Caller holds chp->lock, having just unlinked a replied client. If that left
+ * act with no client on the channel it serves, reset its pending-send loan to
+ * the queue head here, under the lock, so a send queued meanwhile raises it
+ * afterwards rather than being overwritten. Sets *changedp when it changed.
+ */
+static void reply_pending_loan_locked(thread_t *act,
+                                      channel_t *chp,
+                                      bool *changedp)
+{
+    unsigned pending;
+
+    if (act->client || act->last_chid != chp->chid)
+        return;
+    pending = channel_pending_loan_locked(chp);
+    if (act->pend_loan != pending) {
+        thread_set_pend_loan(act, pending);
+        *changedp = true;
+    }
+}
+
+static int msg_replyv_body(thread_t *act,
+                           struct kcall_args_msg_replyv *kap,
+                           bool *changedp)
 {
     connect_t *cop;
     thread_t *thp;
@@ -2427,9 +2637,11 @@ int kdecl ksys_msg_replyv(thread_t *act, struct kcall_args_msg_replyv *kap)
             }
             START_SMP_XFER(act, thp);
             /* Yes. Transfer the data. */
-            xferstat = xfermsg(thp, act,
-                               cap_patched ? sizeof(struct _io_native_hdr) : 0,
-                               cap_patched ? sizeof(struct _io_native_hdr) : 0);
+            xferstat = fastmsg_xfer(thp, act, cap_patched);
+            if (xferstat == XFER_RESTART) {
+                fastmsg_step_yield(chp, act, thp);
+                return ENOERROR;
+            }
             /* Keep thp's claim until the success tail unlinks it. */
             END_SMP_XFER_SELF(act);
 
@@ -2470,6 +2682,7 @@ int kdecl ksys_msg_replyv(thread_t *act, struct kcall_args_msg_replyv *kap)
             } else {
                 xferstat = 0;
                 thp->blocked_on = thp;
+                IPC_BLK(thp);
                 atomic_or(&thp->flags,
                           (RTMUX_FLG_THR_BUFF_MSG | RTMUX_FLG_THR_SHORT_MSG));
             }
@@ -2516,6 +2729,7 @@ int kdecl ksys_msg_replyv(thread_t *act, struct kcall_args_msg_replyv *kap)
      */
     kspinlock_lock(&chp->lock);
     LINKPRIL_REM(thp);
+    reply_pending_loan_locked(act, chp, changedp);
 
     /* Completed under the lock: a force_ready (ConnectDetach's EBADF sweep)
      * that wins the lock after our release sees blocked_on != cop and leaves
@@ -2523,8 +2737,10 @@ int kdecl ksys_msg_replyv(thread_t *act, struct kcall_args_msg_replyv *kap)
      * short-reply copy above already set blocked_on to thp itself, which the
      * client's special return needs.)
      */
-    if (thp->blocked_on == cop)
+    if (thp->blocked_on == cop) {
         thp->blocked_on = NULL;
+        IPC_BLK(thp);
+    }
 #if CONFIG_PROCESSORS_MAX > 1 && defined(CONFIG_SMP_MSGOPT)
     /* The reply completes the exchange, so it supersedes an abort a channel
      * destroy deferred to us; drop that flag with the claim, in the same lock
@@ -2560,9 +2776,12 @@ xfer_err:
      */
     kspinlock_lock(&chp->lock);
     LINKPRIL_REM(thp);
+    reply_pending_loan_locked(act, chp, changedp);
     /* Complete the exchange under the lock; see ksys_msg_replyv. */
-    if (thp->blocked_on == cop)
+    if (thp->blocked_on == cop) {
         thp->blocked_on = NULL;
+        IPC_BLK(thp);
+    }
 #if CONFIG_PROCESSORS_MAX > 1 && defined(CONFIG_SMP_MSGOPT)
     ITF_CLR(thp, RTMUX_ITF_MSG_DELIVERY | RTMUX_ITF_MSG_FORCE_RDY);
 #endif
@@ -2589,7 +2808,9 @@ xfer_err:
  * Return value: EOK on success; ESRCH if the rcvid no longer names a
  *               reply-blocked client.
  */
-int kdecl ksys_msg_error(thread_t *act, struct kcall_args_msg_error *kap)
+static int msg_error_body(thread_t *act,
+                          struct kcall_args_msg_error *kap,
+                          bool *changedp)
 {
     connect_t *cop;
     thread_t *thp;
@@ -2726,9 +2947,12 @@ int kdecl ksys_msg_error(thread_t *act, struct kcall_args_msg_error *kap)
      */
     kspinlock_lock(&chp->lock);
     LINKPRIL_REM(thp);
+    reply_pending_loan_locked(act, chp, changedp);
     /* Complete the exchange under the lock; see ksys_msg_replyv. */
-    if (thp->blocked_on == cop)
+    if (thp->blocked_on == cop) {
         thp->blocked_on = NULL;
+        IPC_BLK(thp);
+    }
 #if CONFIG_PROCESSORS_MAX > 1 && defined(CONFIG_SMP_MSGOPT)
     ITF_CLR(thp, RTMUX_ITF_MSG_DELIVERY);
 #endif
@@ -2740,4 +2964,51 @@ int kdecl ksys_msg_error(thread_t *act, struct kcall_args_msg_error *kap)
 
     act->restart = NULL;
     return EOK;
+}
+
+/* A server's request loan ends when it has no client left: it replied to (or
+ * errored) the client that lent it, or that client already left by timeout,
+ * signal or teardown (the reply then fails, but the loan is just as stale).
+ * `pend_changed` says the body reset the pending-send loan under chp->lock
+ * (reply_pending_loan_locked). A notification loan stays until the next
+ * receive, and replying to an older client while serving a newer one keeps the
+ * newer client's loan.
+ *
+ * Dropping a loan can switch act out right here, and the trap path writes a
+ * returned status only while act is still running, so publish the status first
+ * and return ENOERROR.
+ */
+static int msg_reply_loan_end(thread_t *act, bool pend_changed, int r)
+{
+    bool end_request;
+
+    if (__atomic_load_n(&act->client, __ATOMIC_ACQUIRE) != NULL)
+        return r;
+    end_request = thread_msg_loan_is_request(act);
+    if (!end_request && !pend_changed)
+        return r;
+    if (r != ENOERROR) {
+        kcall_err(act, r);
+        r = ENOERROR;
+    }
+    if (end_request)
+        thread_lend_msg(act, 0, false);
+    thread_prio_update(act);
+    return r;
+}
+
+int kdecl ksys_msg_replyv(thread_t *act, struct kcall_args_msg_replyv *kap)
+{
+    bool pend_changed = false;
+    int r = msg_replyv_body(act, kap, &pend_changed);
+
+    return msg_reply_loan_end(act, pend_changed, r);
+}
+
+int kdecl ksys_msg_error(thread_t *act, struct kcall_args_msg_error *kap)
+{
+    bool pend_changed = false;
+    int r = msg_error_body(act, kap, &pend_changed);
+
+    return msg_reply_loan_end(act, pend_changed, r);
 }

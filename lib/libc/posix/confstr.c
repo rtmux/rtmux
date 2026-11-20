@@ -11,6 +11,7 @@
 #include <sys/conf.h>
 #include <sys/sysmsg.h>
 #include <inttypes.h>
+#include <limits.h>
 
 static int _confstr_get(int name, long *value, char *str)
 {
@@ -40,7 +41,8 @@ static long _confstr_table[] = {
 
 size_t confstr(int name, char *buff, size_t len)
 {
-    long size = (long) len;
+    /* The request carries the size as a signed long; clamp rather than wrap. */
+    long size = len > LONG_MAX ? LONG_MAX : (long) len;
 
     /* POSIX: an invalid name is EINVAL (return 0). RTMux's valid _CS_ names are
      * the standard _CS_PATH.._CS_ARCHITECTURE and the vendor-reserved range

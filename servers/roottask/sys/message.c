@@ -11,6 +11,7 @@
 #include <sched.h>
 #include <sys/mman.h> /* mmap, MAP_*, PROT_*, NOFD */
 #include <errno.h>
+#include <stdatomic.h>
 
 static pthread_attr_t thread_attr;
 
@@ -46,11 +47,38 @@ static dispatch_context_t *roottask_dispatch_block(dispatch_context_t *ctp)
 #define ROOT_BLOCK_FN dispatch_block
 #endif
 
+/* Dispatch one message, then restart what the path server parked behind it:
+ * that waits for this thread's reply.
+ */
+static int root_dispatch_handler(dispatch_context_t *ctp)
+{
+    int ret = dispatch_handler(ctp);
+
+    /* A block function that fails at once, every time, makes the pool reblock
+     * in a loop that never sleeps; say so, a few times, with the errno.
+     */
+    if (!ctp) {
+        static atomic_uint nulls;
+        unsigned n = atomic_fetch_add(&nulls, 1);
+
+        if ((n & 0x3ff) == 0)
+            root_log("roottask: receive returned no context (errno %d) x%u\n",
+                     errno, n + 1);
+    }
+
+    /* dispatch_handler accepts a NULL context (the block function came out
+     * early on a signal or error) and tells the pool to reblock.
+     */
+    if (ctp)
+        path_open_resume((ioserv_context_t *) ctp);
+    return ret;
+}
+
 static thread_pool_attr_t pool_attr = {
     NULL,                   /* Handle */
     ROOT_BLOCK_FN,          /* Block function */
     NULL,                   /* Unblock func */
-    dispatch_handler,       /* Handler function */
+    root_dispatch_handler,  /* Handler function */
     dispatch_context_alloc, /* Context allocation */
     dispatch_context_free,  /* Context free */
     &thread_attr,           /* Thread attribute struct */
@@ -195,6 +223,8 @@ int message_start(void)
      */
     {
         syscall_priv(__KSYS_PRIV_SMP_BRINGUP, NULL);
+        legal_cpu_bitmask =
+            (uint64_t) syscall_priv(__KSYS_PRIV_LEGAL_CPU_MASK, NULL);
     }
 
     /* Wait until at least one pool thread is blocked in msg_receive on the
@@ -268,7 +298,14 @@ int proc_thread_pool_reserve()
      * messages (sopen, spawn) through the same dispatch channel deadlock
      * non-deterministically when no other worker is in msg_receive yet.
      */
-    return thread_pool_reserve(tpp, 1);
+    static _Atomic unsigned fails;
+    int rc = thread_pool_reserve(tpp, 1);
+
+    /* The first failure and every 64th after it are logged. */
+    if (rc != 0 && (atomic_fetch_add(&fails, 1) & 63) == 0)
+        root_log("roottask: cannot reserve a dispatch worker (errno %d)\n",
+                 errno);
+    return rc;
 }
 
 /* Release the spare dispatch worker reserved by proc_thread_pool_reserve.

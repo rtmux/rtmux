@@ -8,13 +8,276 @@
 #include "externs.h"
 #include "private.h"
 #include "root-process.h"
+#include "pgrp-table.h"
 
-/* proc_setpgid — handle a _PROC_SETPGID message (setpgid()).
+/* Two locks, in this order and below every other roottask lock but the slot
+ * locks of root_proc_lock:
+ *
+ *   pgrp_mutex   serializes every change of a process's group or session
+ *                (setpgid and setsid here and in session.c, and the inheritance
+ *                at spawn), so that a check made about a group or a session
+ *                still holds when the change is applied. It is the outermost
+ *                lock of those paths: taken before any process slot lock, and
+ *                never while one is held. A terminal's bind and unbind
+ *                (session.c) have a lock of their own, outside this one.
+ *   pgtab_lock   the group table and the pgrp, pgrp_gen and pgrp_member of the
+ *                slots. A leaf: nothing is taken under it. A reap leaves its
+ *                group under it with slot locks held, which is why pgrp_mutex
+ *                cannot be what protects the count.
+ *
+ * Both inherit priority, as a real-time client can wait on either.
+ *
+ * A group is its members, a zombie included, until the last is reaped: a reap
+ * (the waiter's collect, or the teardown of a child nobody waits for) leaves
+ * it, and an exit does not. So the member leaving, and a process joining, are
+ * each one step under pgtab_lock that also reads whether the group is still
+ * there: setpgid cannot join a group whose last member is reaped between its
+ * check and its change, and cannot move a process that is reaped between them.
+ */
+static pthread_mutex_t pgrp_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t pgtab_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct pgrp_table pgtab;
+
+void proc_pgrp_lock(void)
+{
+    pthread_mutex_lock(&pgrp_mutex);
+}
+
+void proc_pgrp_unlock(void)
+{
+    pthread_mutex_unlock(&pgrp_mutex);
+}
+
+#ifdef CONFIG_DEBUG_INJECT
+/* A window a test armed holds the next operation that reaches it for the armed
+ * time, once, so that another operation can be started inside it.
+ */
+static atomic_uint pgrp_window_where;
+static atomic_uint pgrp_window_ms;
+
+int proc_pgrp_window_arm(unsigned where, unsigned ms)
+{
+    if (where > PGRP_WINDOW_DETACH || ms > 5000)
+        return EINVAL;
+    atomic_store(&pgrp_window_ms, ms);
+    atomic_store(&pgrp_window_where, where);
+    return EOK;
+}
+
+void proc_pgrp_window(unsigned where)
+{
+    unsigned ms;
+
+    if (atomic_load(&pgrp_window_where) != where ||
+        atomic_exchange(&pgrp_window_where, PGRP_WINDOW_NONE) != where)
+        return;
+    ms = atomic_load(&pgrp_window_ms);
+    (void) nanosleep(
+        &(struct timespec){.tv_sec = ms / 1000,
+                           .tv_nsec = (long) (ms % 1000) * 1000000L},
+        NULL);
+}
+#endif
+
+/* proc_pgrp_session - the session group pgrp is in: EOK with *sid set (if not
+ * NULL) while the group has a member, a zombie included, or ESRCH. A group is
+ * its members, not its leader's pid: it outlives a leader that exited, was
+ * reaped or left it.
+ */
+int proc_pgrp_session(pid_t pgrp, pid_t *sid)
+{
+    int rc;
+
+    pthread_mutex_lock(&pgtab_lock);
+    rc = pgrp_table_find(&pgtab, pgrp, sid);
+    pthread_mutex_unlock(&pgtab_lock);
+    return rc;
+}
+
+/* Count process pid in group pgid of session sid, for the first time. The slot
+ * is not yet reachable (a new process), or is roottask's own at boot.
+ */
+static int pgrp_first_enter(pid_t pid, pid_t pgid, pid_t sid)
+{
+    root_process_t *p = root_proc(pid);
+    uint32_t gen;
+    int rc;
+
+    pthread_mutex_lock(&pgtab_lock);
+    rc = pgrp_table_enter(&pgtab, pgid, sid, PGRP_JOIN_OR_CREATE, &gen);
+    if (rc == EOK) {
+        p->pgrp = pgid;
+        p->pgrp_gen = gen;
+        p->pgrp_member = 1;
+    }
+    pthread_mutex_unlock(&pgtab_lock);
+    return rc;
+}
+
+/* Roottask's own group, which its session leads. Make the group locks, and the
+ * terminal bind lock, priority-inheriting and empty the table first: boot,
+ * before the first process exists.
+ */
+int proc_pgrp_boot(pid_t pid)
+{
+    root_mutex_init_pi(&pgrp_mutex);
+    root_mutex_init_pi(&pgtab_lock);
+    pgrp_table_init(&pgtab);
+    proc_tty_init();
+    return pgrp_first_enter(pid, pid, pid);
+}
+
+/* A new process starts in its parent's group and session: it takes one link on
+ * the session (root_process_fini drops it) and is counted in the group. A
+ * process with no parent leads a group of its own, in the system session. Under
+ * pgrp_mutex, so that the parent cannot change group or session between the two
+ * reads, which would count the child in a group its parent has left, or take a
+ * link on a session the parent just dropped.
+ *
+ * Returns EOK, or the errno of the failed count (the table is as large as the
+ * process table, so only a corrupt slot fails).
+ */
+int proc_pgrp_inherit(pid_t child, pid_t parent)
+{
+    root_process_t *c = root_proc(child);
+    session_t *drop = NULL;
+    int rc;
+
+    proc_pgrp_lock();
+    if (parent == 0) {
+        rc = pgrp_first_enter(child, child, ROOTTASK_PID);
+    } else {
+        pid_t sid, pgid;
+        session_t *sep = root_session_link_of(parent, &sid, &pgid);
+
+        rc = pgrp_first_enter(child, pgid, sid);
+        if (rc == EOK)
+            c->session = sep;
+        else
+            drop = sep;
+    }
+    proc_pgrp_unlock();
+
+    /* The last link of a session unbinds its terminal, which takes the bind
+     * lock and may message the terminal server: both are ordered before
+     * pgrp_mutex, so the drop waits until it is released.
+     */
+    if (drop)
+        proc_session_unref(drop);
+    return rc;
+}
+
+/* Take a process out of its group for good: reaped (the waiter collected it),
+ * or its slot released. Idempotent, and a pid that no longer names the slot's
+ * process leaves nothing. Callable with slot locks held.
+ */
+void proc_pgrp_reap(pid_t pid)
+{
+    root_process_t *p = root_proc(pid);
+
+    pthread_mutex_lock(&pgtab_lock);
+    if (p->pid == pid && p->pgrp_member) {
+        pgrp_table_leave(&pgtab, p->pgrp, p->pgrp_gen);
+        p->pgrp_member = 0;
+    }
+    pthread_mutex_unlock(&pgtab_lock);
+}
+
+/* Move the process whose slot lock the caller holds into group pgid of session
+ * sid. The destination is entered before the old group is left, so a failed
+ * move changes nothing, and a process reaped in the meantime is not moved.
+ * Returns EOK, EPERM (no such group, or one in another session), or ESRCH.
+ */
+static int pgrp_move(root_process_t *p,
+                     pid_t pgid,
+                     pid_t sid,
+                     enum pgrp_enter_mode mode)
+{
+    uint32_t gen;
+    int rc;
+
+    pthread_mutex_lock(&pgtab_lock);
+    if (!p->pgrp_member) {
+        rc = ESRCH;
+    } else if ((rc = pgrp_table_enter(&pgtab, pgid, sid, mode, &gen)) == EOK) {
+        pgrp_table_leave(&pgtab, p->pgrp, p->pgrp_gen);
+        p->pgrp = pgid;
+        p->pgrp_gen = gen;
+    }
+    pthread_mutex_unlock(&pgtab_lock);
+    return rc;
+}
+
+/* setsid's new group: the process leads group pid, in session pid. The caller
+ * holds pgrp_mutex and the process's slot lock. EPERM when a group of that id
+ * exists, which is what POSIX asks for a process whose pid names one.
+ */
+int proc_pgrp_new(pid_t pid)
+{
+    return pgrp_move(root_proc(pid), pid, pid, PGRP_CREATE);
+}
+
+/* The checks and the change of one setpgid, with pgrp_mutex held. At most one
+ * process slot is locked at a time, so the lock order of the rest of proc
+ * (child, then parent) is never in play; nothing else can move a process
+ * between groups or sessions while pgrp_mutex is held, so the sessions and the
+ * group read here are the ones the change applies to. The group's own end is
+ * the one thing that can still happen, and the change checks it itself.
+ */
+static int setpgid_locked(pid_t caller, pid_t target, pid_t pgid)
+{
+    struct proc_snap self, tgt;
+    int rc;
+
+    if (proc_snapshot(caller, &self) != EOK)
+        return EL2HLT;
+    if (target == caller) {
+        tgt = self;
+    } else {
+        /* Only the caller's own children. */
+        if (proc_snapshot(target, &tgt) != EOK ||
+            (tgt.flags & RTMUX_FLG_PROC_WAITDONE) || tgt.ppid != caller)
+            return ESRCH;
+
+        /* A child that has replaced its image by exec is no longer the parent's
+         * to move. A spawned child that has not is: RTMux spawns rather than
+         * forks, so it is movable until it execs or exits.
+         */
+        if (tgt.execed)
+            return EACCES;
+    }
+
+    /* A session leader may not change group, and the target must be in the
+     * caller's session. A process with no session is in the system session, as
+     * for getsid.
+     */
+    if ((tgt.flags & RTMUX_FLG_PROC_SLEADER) || tgt.sid != self.sid)
+        return EPERM;
+
+    /* pgid 0 means the target's own pid: a group of its own. Any other group
+     * must have a member in the caller's session, whether or not the process it
+     * is named for is still there.
+     */
+    if (pgid == 0)
+        pgid = target;
+    if (pgid == tgt.pgrp)
+        return EOK;
+
+    proc_pgrp_window(PGRP_WINDOW_SETPGID);
+
+    if (!root_proc_lock(target))
+        return ESRCH;
+    rc = pgrp_move(root_proc(target), pgid, self.sid,
+                   pgid == target ? PGRP_JOIN_OR_CREATE : PGRP_JOIN);
+    root_proc_unlock(target);
+    return rc;
+}
+
+/* proc_setpgid - handle a _PROC_SETPGID message (setpgid()).
  *
  * Moves the target process into the requested process group, enforcing the
- * POSIX rules (target must be the caller or a non-exec'd child in the same
- * session, and the destination group must be in that session). Locks are taken
- * child-then-parent to preserve the system-wide lock order and avoid deadlock.
+ * POSIX rules (target must be the caller or one of its children in the same
+ * session, and the destination group must have a member in that session).
  *
  * Parameters:
  *   ctp : I/O service context (ctp->info.pid = calling process)
@@ -23,156 +286,15 @@
  */
 int proc_setpgid(ioserv_context_t *ctp, proc_setpgid_t *msg)
 {
-    process_t *prp1, *prp2, *prp3;
-    pid_t pid1, pid2, pid3;
+    pid_t target = msg->i.pid ? (pid_t) msg->i.pid : ctp->info.pid;
     int ret;
 
     /* If pgid is less than zero return EINVAL */
-    if (msg->i.pgid < 0) {
+    if (msg->i.pgid < 0)
         return EINVAL;
-    }
 
-    /* Note that we have to be careful in here to maintain the lock order used
-     * elsewhere in proc - child then parent else we can deadlock. See PR 23567.
-     */
-    ret = EOK;
-    prp3 = NULL;
-    prp1 = NULL;
-    pid1 = pid2 = pid3 = 0;
-    if (msg->i.pid == 0 || msg->i.pid == ctp->info.pid) {
-        pid1 = ctp->info.pid;
-        if (!(prp1 = root_proc_lock(pid1))) {
-            return EL2HLT;
-        }
-        prp2 = prp1;
-        pid2 = pid1;
-    } else {
-        root_proc_info_t qinfo2;
-
-        pid2 = (pid_t) msg->i.pid;
-        /* Lock prp2 first. */
-        if (!(prp2 = root_proc_lock(pid2))) {
-            ret = ESRCH;
-            goto out_unlock;
-        }
-
-        /* prp2 fields (parent / flags) live in the kernel-half process_t
-         * (gated); read via the process_query_info snapshot.
-         */
-        if (process_query_info(pid2, &qinfo2) != EOK ||
-            qinfo2.parent_pid == 0) {
-            ret = ESRCH;
-            goto out_unlock;
-        }
-
-        /* If pid is not a child of the calling process return ESRCH */
-        if (qinfo2.parent_pid != ctp->info.pid) {
-            ret = ESRCH;
-            goto out_unlock;
-        }
-
-        /* If pid is a child that has execed, return EACCES @@@ This catches
-         * spawns _and_ exec's
-         */
-        if (!(qinfo2.flags & RTMUX_FLG_PROC_FORKED)) {
-            ret = EACCES;
-            goto out_unlock;
-        }
-
-        /* prp1 is the parent so now we can lock him */
-        pid1 = ctp->info.pid;
-        if (!(prp1 = root_proc_lock(pid1))) {
-            ret = EL2HLT;
-            goto out_unlock;
-        }
-    }
-
-    /* session/pgrp moved to root_process_t (POSIX policy out of the kernel
-     * process_t). Use the roottask-side slots throughout.
-     */
-    {
-        root_process_t *tmp1 = root_proc(pid1);
-        root_process_t *tmp2 = root_proc(pid2);
-        root_proc_info_t qinfo2;
-
-        if (process_query_info(pid2, &qinfo2) != EOK) {
-            ret = ESRCH;
-            goto out_unlock;
-        }
-
-        /* If pid is a session leader or not in the same session return EPERM */
-        if ((qinfo2.flags & RTMUX_FLG_PROC_SLEADER) ||
-            tmp1->session != tmp2->session) {
-            ret = EPERM;
-            goto out_unlock;
-        }
-
-        /* If session is null for either prp1 or prp2 return ESRCH */
-        if (!tmp1->session || !tmp2->session) {
-            ret = ESRCH;
-            goto out_unlock;
-        }
-
-        /* if pgid is zero, set process group to indicated pid */
-        if (msg->i.pgid == 0) {
-            tmp2->pgrp = pid2;
-        } else {
-            /* If process group is same as calling pid, set process group */
-            if (msg->i.pgid != pid1) {
-                pid_t leader1, leader3;
-
-                leader1 = tmp1->session->leader;
-
-                if (msg->i.pgid == pid2) {
-                    prp3 = prp2;
-                    pid3 = pid2;
-                    leader3 = root_proc(pid3)->session->leader;
-                } else {
-                    /* Careful.. unlock prp1/prp2 first */
-                    root_proc_unlock(pid1);
-                    if (prp2 != prp1)
-                        root_proc_unlock(pid2);
-                    prp1 = prp2 = NULL;
-
-                    /* If this is not a process group at all, don't set it */
-                    pid3 = (pid_t) msg->i.pgid;
-                    if (!(prp3 = root_proc_lock(pid3)) ||
-                        root_proc(pid3)->pgrp != msg->i.pgid) {
-                        ret = EPERM;
-                        goto out_unlock;
-                    }
-                    /* Defensive */
-                    if (!root_proc(pid3)->session) {
-                        ret = ESRCH;
-                        goto out_unlock;
-                    }
-
-                    leader3 = root_proc(pid3)->session->leader;
-                    root_proc_unlock(pid3);
-                    prp3 = NULL;
-
-                    /* Now we need to relock prp2 */
-                    if (!(prp2 = root_proc_lock(pid2))) {
-                        ret = ESRCH;
-                        goto out_unlock;
-                    }
-                }
-
-                /* If no process group leader is not in same session return
-                 * EPERM
-                 */
-                if (leader1 != leader3) {
-                    ret = EPERM;
-                    goto out_unlock;
-                }
-            }
-            root_proc(pid2)->pgrp = msg->i.pgid;
-        }
-    }
-out_unlock:
-    if (prp3 && prp3 != prp2 && prp3 != prp1)
-        root_proc_unlock(pid3);
-    if (prp2 && prp2 != prp1)
-        root_proc_unlock(pid2);
-    return proc_error(ret, pid1);
+    proc_pgrp_lock();
+    ret = setpgid_locked(ctp->info.pid, target, (pid_t) msg->i.pgid);
+    proc_pgrp_unlock();
+    return ret;
 }

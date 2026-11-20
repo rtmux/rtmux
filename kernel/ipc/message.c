@@ -11,6 +11,8 @@
 /* #define   MSG_XFER_CHUNK_SIZE     1024 */
 
 
+static int msg_current_take(thread_t *act, struct kcall_args_msg_current *kap);
+
 /* Establish the calling thread as the server for a given rcvid (msg_current
  * kcall).
  *
@@ -21,31 +23,56 @@
  *   act : the calling (active) thread
  *   kap : kcall args; kap->rcvid identifies the client thread
  * Return value: EOK on success; ESRCH if the rcvid no longer names a
- *               reply-blocked client.
+ *               reply-blocked client. Either way the loan of the prior client
+ *               has ended.
  */
 int kdecl ksys_msg_current(thread_t *act, struct kcall_args_msg_current *kap)
+{
+    thread_t *prior_client = act->client;
+    bool ended = false;
+    int r;
+
+    /* Disown act's prior client, if any, and end the loan it lent, whatever
+     * this call then does: a call that fails must not leave act running at the
+     * priority of a client it no longer serves. The prior client briefly
+     * observes server=0 with act->client cleared; eventually consistent for its
+     * own ksys_msg_current.
+     */
+    if (prior_client) {
+        prior_client->args.ms.server = 0;
+        ended = thread_client_departed(act, prior_client);
+        if (ended)
+            CRITICAL_CLEAR(act);
+    }
+
+    r = kap->rcvid == 0 ? EOK : msg_current_take(act, kap);
+
+    /* A new client's loan, once taken, replaced the ended one and was applied
+     * by msg_current_take; with none, or on an error return, apply the end.
+     * Applying can switch act out, and the trap path writes a returned status
+     * only while act still runs, so publish the status first.
+     */
+    if (ended && (kap->rcvid == 0 || r != EOK)) {
+        if (r != EOK && r != ENOERROR) {
+            kcall_err(act, r);
+            r = ENOERROR;
+        }
+        thread_prio_update(act);
+    }
+    return r;
+}
+
+/* Make the client named by kap->rcvid act's current one and lend its priority.
+ *
+ * Returns EOK on success, ESRCH if the rcvid no longer names a reply-blocked
+ * client, or ENOERROR when lookup_rcvid already set the error.
+ */
+static int msg_current_take(thread_t *act, struct kcall_args_msg_current *kap)
 {
     connect_t *cop;
     thread_t *thp;
     int do_pi = 0;
-    uint8_t new_prio = 0;
     kdispatch_t *new_dpp = NULL;
-
-
-    /* Disown act's prior client, if any. Single-pointer atomic writes; the
-     * prior client briefly observes server=0 with act->client cleared —
-     * eventually-consistent for the prior client's own ksys_msg_current. A
-     * per-thread_t lock would close this window; not yet instantiated
-     * (LOCK_CLASS_THREAD placeholder).
-     */
-    if (act->client != 0) {
-        act->client->args.ms.server = 0;
-        act->client = 0;
-    }
-
-    if (kap->rcvid == 0) {
-        return EOK;
-    }
 
     /* lookup_rcvid runs unlocked: the chancons/threads vec_lookups share the
      * helper-level vec_slock race surface common to every IPC kcall.
@@ -117,7 +144,6 @@ int kdecl ksys_msg_current(thread_t *act, struct kcall_args_msg_current *kap)
      */
     if ((cop->channel->flags & RTMUX_FLG_CHF_FIXED_PRIORITY) == 0) {
         do_pi = 1;
-        new_prio = thp->priority;
         new_dpp = thp->dpp;
     }
 
@@ -125,13 +151,137 @@ int kdecl ksys_msg_current(thread_t *act, struct kcall_args_msg_current *kap)
 
     /* PI propagation — outside cop->lock to honor SCHED-vs-CONNECT rank. */
     if (do_pi) {
-        act->real_priority = new_prio;
-        /* TODO: confirm adjust_priority() is needed here as well as below. */
+        /* act now serves thp, which lends its priority until act replies. Read
+         * thp's priority after act->client = thp is published, not snapshotted
+         * under cop->lock: a REPLY propagation that raced the snapshot fails
+         * its swap against the generation this lend starts, so a stale value
+         * here would stay.
+         */
         CRITICAL_INHERIT(act, thp);
-        adjust_priority(act, new_prio, new_dpp, 1);
+        thread_lend_msg(act, __atomic_load_n(&thp->priority, __ATOMIC_ACQUIRE),
+                        true);
+        (void) thread_end_orphan_loan(act);
+        (void) thread_prio_update_dpp(act, new_dpp, 1);
+    } else {
+        /* A fixed-priority channel lends nothing. Drop the loan an earlier
+         * client left, or a REPLY propagation from thp would relend it.
+         */
+        thread_lend_msg(act, 0, false);
+        thread_prio_update(act);
     }
 
     return EOK;
+}
+
+/* Forget what a restarted msg_readv or msg_writev kept for its next entry: the
+ * vector it checked, the cursor of its copy and its restart link.
+ */
+static void msg_resume_drop(thread_t *act)
+{
+    act->iovchk_iov = NULL;
+    act->xcur.armed = false;
+    act->restart = NULL;
+}
+
+/* Check the caller's own iov array against its boundary, at most
+ * XFER_IOV_CHECK_STEP entries per kernel entry. parts is at least 1.
+ *
+ * msg_readv and msg_writev check their iov first of all, before they look up or
+ * claim the client, so there is nothing to undo when the call restarts and
+ * every return path of the call has consumed or dropped the saved prefix. The
+ * checked prefix is kept on the thread (iovchk_*), keyed by the array and its
+ * length, so a restart resumes where this entry stopped instead of rereading
+ * from entry 0. Each entry that has more to check ends with KCALL_RESTART,
+ * which returns through kernel_exit and lets a higher-priority thread run, so
+ * no kernel entry spends more than one step on the check. The trap handler
+ * drops the saved prefix at the next kernel call that is not msg_readv or
+ * msg_writev, so this thread cannot edit the entries it has already passed
+ * between the restart and the resume. Another thread sharing the array can, so
+ * the transfer paths still check the entries they use. Entries are read through
+ * xfer_memchk, which recovers from a fault.
+ *
+ * Returns 0 (all entries are inside the boundary), EFAULT (one is not, a page
+ * of the array is unmapped, the array itself is not in the caller's space, or
+ * it is longer than XFER_IOV_LIMIT), or XFER_CALL_RESTART (the call was
+ * restarted: return ENOERROR).
+ */
+static int xfer_iov_check(thread_t *act, const iov_t *iov, int parts)
+{
+    uint32_t done = 0, n;
+    int bad;
+    const iov_t *saved = act->iovchk_iov;
+    uintptr_t base = (uintptr_t) iov, last;
+
+    act->iovchk_iov = NULL;
+    if (parts > XFER_IOV_LIMIT)
+        return EFAULT;
+
+    /* The array itself must lie in the caller's space: a fault-recovering read
+     * still succeeds on a mapped kernel address.
+     */
+    last = base + (size_t) parts * sizeof(iov_t) - 1;
+    if (!base || base > last ||
+        !WITHIN_BOUNDARY(base, last, act->process->boundary_addr))
+        return EFAULT;
+    if (saved == iov && act->iovchk_parts == parts)
+        done = act->iovchk_done;
+
+    /* Checked already by an earlier entry of this call, which restarted in the
+     * copy: the copy reads and checks every entry it uses, so do not walk the
+     * vector again on each restart.
+     */
+    if (done == (uint32_t) parts) {
+        act->iovchk_iov = iov;
+        return 0;
+    }
+
+    n = (uint32_t) parts - done;
+    if (n > XFER_IOV_CHECK_STEP)
+        n = XFER_IOV_CHECK_STEP;
+    SET_XFER_HANDLER(&xfer_src_handlers);
+    bad = xfer_memchk(act->process->boundary_addr, iov + done, n);
+    SET_XFER_HANDLER(0);
+    if (bad)
+        return EFAULT;
+    done += n;
+    act->iovchk_iov = iov;
+    act->iovchk_parts = parts;
+    act->iovchk_done = done;
+    if (done == (uint32_t) parts)
+        return 0;
+    KCALL_RESTART(act);
+    return XFER_CALL_RESTART;
+}
+
+/* Check the caller's own iov (the destination of msg_readv, the source of
+ * msg_writev) against the process boundary, before the client is claimed.
+ *
+ * It runs first, ahead of lookup_rcvid(), so that a saved xfer_iov_check()
+ * prefix is always consumed or dropped by the call it belongs to, and so that
+ * every later path, the remote one included, sees a vector that is in range and
+ * no longer than XFER_IOV_LIMIT. A negative count is one flat buffer, which has
+ * no entries to read; an entry is read only by xfer_iov_check(), which recovers
+ * from a fault and does at most one step of the work per kernel entry.
+ *
+ * Returns 0, an errno, or XFER_CALL_RESTART when the call was restarted.
+ */
+static int msg_iov_check(thread_t *act, const iov_t *iov, int parts)
+{
+    if (parts < 0) {
+        uintptr_t base = (uintptr_t) iov, last;
+
+        act->iovchk_iov = NULL;
+        last = base + PARTS_TO_LEN(parts) - 1;
+        if (base > last ||
+            !WITHIN_BOUNDARY(base, last, act->process->boundary_addr))
+            return EFAULT;
+        return 0;
+    }
+    if (parts == 0) {
+        act->iovchk_iov = NULL;
+        return 0;
+    }
+    return xfer_iov_check(act, iov, parts);
 }
 
 /* Read a (partially received) message from a client into the server's iov
@@ -146,11 +296,11 @@ int kdecl ksys_msg_current(thread_t *act, struct kcall_args_msg_current *kap)
  * Return value: ENOERROR (transferred length or error reported via
  * KSTATUS/kcall_err).
  */
-int kdecl ksys_msg_readv(thread_t *act, struct kcall_args_msg_readv *kap)
+static int msg_readv_body(thread_t *act, struct kcall_args_msg_readv *kap)
 {
     connect_t *cop;
     thread_t *thp;
-    int xferstat;
+    int xferstat, status;
     unsigned slen;
     int do_force_ready = 0;
     unsigned thp_status = 0;
@@ -161,6 +311,10 @@ int kdecl ksys_msg_readv(thread_t *act, struct kcall_args_msg_readv *kap)
      * as the long-msg path, so a concurrent replyv cannot overwrite the source
      * buffer mid-read.
      */
+
+    status = msg_iov_check(act, kap->rmsg, kap->rparts);
+    if (status)
+        return status;
 
     if ((cop = lookup_rcvid((kcall_args_t *) (void *) kap, kap->rcvid, &thp)) ==
         NULL) {
@@ -197,53 +351,6 @@ int kdecl ksys_msg_readv(thread_t *act, struct kcall_args_msg_readv *kap)
 
     act->args.ms.rmsg = kap->rmsg;
     act->args.ms.rparts = kap->rparts;
-
-    /* Validate iov_t boundary */
-    if (kap->rparts < 0) {
-        /* Single part */
-        uintptr_t base, last;
-        size_t len;
-
-        base = (uintptr_t) kap->rmsg;
-        len = PARTS_TO_LEN(kap->rparts);
-        last = base + len - 1;
-        if ((base > last) ||
-            !WITHIN_BOUNDARY(base, last, act->process->boundary_addr)) {
-            return EFAULT;
-        }
-    } else if (kap->rparts == 1) {
-        /* One iov_t */
-        uintptr_t base, last;
-        size_t len;
-
-        base = (uintptr_t) GETIOVBASE(kap->rmsg);
-        len = GETIOVLEN(kap->rmsg);
-        last = base + len - 1;
-        if (((base > last) ||
-             !WITHIN_BOUNDARY(base, last, act->process->boundary_addr)) &&
-            (len != 0)) {
-            return EFAULT;
-        }
-    } else {
-        /* Multi-iov_t. Walk IOVs for boundary check. */
-        uintptr_t base, last;
-        size_t len;
-        int rparts = kap->rparts;
-        iov_t *iov = kap->rmsg;
-
-        while (rparts) {
-            base = (uintptr_t) GETIOVBASE(iov);
-            len = GETIOVLEN(iov);
-            last = base + len - 1;
-            if (((base > last) ||
-                 !WITHIN_BOUNDARY(base, last, act->process->boundary_addr)) &&
-                (len != 0)) {
-                return EFAULT;
-            }
-            iov++;
-            --rparts;
-        }
-    }
 
     /* State-recheck + MSG_DELIVERY claim under channel_slock. Synchronizes with
      * ksys_msg_replyv (which takes the same slock for its own claim). If state
@@ -283,13 +390,48 @@ int kdecl ksys_msg_readv(thread_t *act, struct kcall_args_msg_readv *kap)
         unsigned dlen;
 
         slen = thp->args.msbuff.msglen;
-        if (kap->offset < slen) {
+        if (kap->offset < slen && act->args.ms.rparts > 1) {
+            /* A destination of many entries is walked a step at a time, so a
+             * vector of empty ones does not hold the kernel to its end; the
+             * cursor is the entry reached and the bytes placed, for the same
+             * client, vector and offset.
+             */
+            unsigned idx = 0;
+            size_t copied = 0;
+
+            slen -= kap->offset;
+            if (act->xcur.armed && act->xcur.sthp == thp &&
+                act->xcur.rmsg == act->args.ms.rmsg &&
+                act->xcur.rparts == (int32_t) act->args.ms.rparts &&
+                act->xcur.soff0 == kap->offset && act->xcur.msglen == slen) {
+                idx = act->xcur.didx;
+                copied = act->xcur.soff;
+            }
+            xferstat = xfer_cpy_diov_step(
+                act, act->args.ms.rmsg, act->args.ms.rparts,
+                thp->args.msbuff.buff + kap->offset, slen, &idx, &copied);
+            if (xferstat == XFER_YIELD) {
+                act->xcur.armed = true;
+                act->xcur.sthp = thp;
+                act->xcur.rmsg = act->args.ms.rmsg;
+                act->xcur.rparts = (int32_t) act->args.ms.rparts;
+                act->xcur.soff0 = kap->offset;
+                act->xcur.msglen = (uint32_t) slen;
+                act->xcur.didx = idx;
+                act->xcur.soff = copied;
+                KCALL_RESTART(act);
+                xferstat = XFER_RESTART;
+            } else {
+                act->xcur.armed = false;
+                slen = (unsigned) copied;
+            }
+        } else if (kap->offset < slen) {
             slen -= kap->offset;
             xferstat = xfer_cpy_diov(act, act->args.ms.rmsg,
                                      thp->args.msbuff.buff + kap->offset,
                                      act->args.ms.rparts, slen);
-            dlen =
-                (unsigned) xferlen(act, act->args.ms.rmsg, act->args.ms.rparts);
+            dlen = (unsigned) xferlen_upto(act, act->args.ms.rmsg,
+                                           act->args.ms.rparts, slen);
             if (dlen < slen)
                 slen = dlen;
         } else {
@@ -307,11 +449,12 @@ int kdecl ksys_msg_readv(thread_t *act, struct kcall_args_msg_readv *kap)
         *(volatile void **) &(act->blocked_on) = thp;
         ITF_SET(act, RTMUX_ITF_MSG_DELIVERY);
 #endif
-        xferstat = xfermsg(act, thp, 0, kap->offset);
+        xferstat = xfermsg_bounded(act, thp, 0, kap->offset);
         slen = thp->args.ms.msglen;
 #if CONFIG_PROCESSORS_MAX > 1 && defined(CONFIG_SMP_MSGOPT)
         ITF_CLR(act, RTMUX_ITF_MSG_DELIVERY);
         act->blocked_on = 0;
+        IPC_BLK(act);
 #endif
     }
 
@@ -331,6 +474,13 @@ int kdecl ksys_msg_readv(thread_t *act, struct kcall_args_msg_readv *kap)
     kspinlock_unlock(&cop->channel->lock);
     if (do_force_ready)
         force_ready(thp, thp_status);
+
+    /* The copy used up its step and arranged for the call to run again; the
+     * client is given up above, so another thread can reply to it, and is
+     * claimed again by the restarted call.
+     */
+    if (xferstat == XFER_RESTART)
+        return XFER_CALL_RESTART;
 
     if (xferstat) {
         kcall_err(act, (xferstat & XFER_SRC_FAULT) ? EFAULT : EFAULT);
@@ -354,11 +504,11 @@ int kdecl ksys_msg_readv(thread_t *act, struct kcall_args_msg_readv *kap)
  * Return value: ENOERROR (transferred length or error reported via
  * KSTATUS/kcall_err).
  */
-int kdecl ksys_msg_writev(thread_t *act, struct kcall_args_msg_writev *kap)
+static int msg_writev_body(thread_t *act, struct kcall_args_msg_writev *kap)
 {
     connect_t *cop;
     thread_t *thp;
-    int xferstat;
+    int xferstat, status;
     int do_force_ready = 0;
     unsigned thp_status = 0;
 
@@ -366,6 +516,10 @@ int kdecl ksys_msg_writev(thread_t *act, struct kcall_args_msg_writev *kap)
      * state-recheck + MSG_DELIVERY claim + claim-release, xfer outside the
      * slock, force_ready outside (sched_slock-internal, SCHED < CHANNEL rank).
      */
+
+    status = msg_iov_check(act, kap->smsg, kap->sparts);
+    if (status)
+        return status;
 
     if ((cop = lookup_rcvid((kcall_args_t *) (void *) kap, kap->rcvid, &thp)) ==
         NULL) {
@@ -397,52 +551,6 @@ int kdecl ksys_msg_writev(thread_t *act, struct kcall_args_msg_writev *kap)
         if (!cop || (cop->flags & COF_VCONNECT) == 0 ||
             cop->un.lcl.cop != cop1) {
             return ESRCH;
-        }
-    }
-    /* Validate iov_t boundary */
-    if (kap->sparts < 0) {
-        /* Single part */
-        uintptr_t base, last;
-        size_t len;
-
-        base = (uintptr_t) kap->smsg;
-        len = PARTS_TO_LEN(kap->sparts);
-        last = base + len - 1;
-        if ((base > last) ||
-            !WITHIN_BOUNDARY(base, last, act->process->boundary_addr)) {
-            return EFAULT;
-        }
-    } else if (kap->sparts == 1) {
-        /* One iov_t */
-        uintptr_t base, last;
-        size_t len;
-
-        base = (uintptr_t) GETIOVBASE(kap->smsg);
-        len = GETIOVLEN(kap->smsg);
-        last = base + len - 1;
-        if (((base > last) ||
-             !WITHIN_BOUNDARY(base, last, act->process->boundary_addr)) &&
-            (len != 0)) {
-            return EFAULT;
-        }
-    } else {
-        /* Multi-iov_t. Walk IOVs for boundary check. */
-        uintptr_t base, last;
-        size_t len;
-        int rparts = kap->sparts;
-        iov_t *iov = kap->smsg;
-
-        while (rparts) {
-            base = (uintptr_t) GETIOVBASE(iov);
-            len = GETIOVLEN(iov);
-            last = base + len - 1;
-            if (((base > last) ||
-                 !WITHIN_BOUNDARY(base, last, act->process->boundary_addr)) &&
-                (len != 0)) {
-                return EFAULT;
-            }
-            iov++;
-            --rparts;
         }
     }
 
@@ -479,10 +587,11 @@ int kdecl ksys_msg_writev(thread_t *act, struct kcall_args_msg_writev *kap)
 #endif
     act->args.ms.smsg = kap->smsg;
     act->args.ms.sparts = kap->sparts;
-    xferstat = xfermsg(thp, act, kap->offset, 0);
+    xferstat = xfermsg_bounded(thp, act, kap->offset, 0);
 #if CONFIG_PROCESSORS_MAX > 1 && defined(CONFIG_SMP_MSGOPT)
     ITF_CLR(act, RTMUX_ITF_MSG_DELIVERY);
     act->blocked_on = 0;
+    IPC_BLK(act);
 #endif
 
     /* Claim release + MSG_FORCE_RDY drain under channel_slock. */
@@ -497,6 +606,13 @@ int kdecl ksys_msg_writev(thread_t *act, struct kcall_args_msg_writev *kap)
     if (do_force_ready)
         force_ready(thp, thp_status);
 
+    /* The copy used up its step and arranged for the call to run again; the
+     * client is given up above, so another thread can reply to it, and is
+     * claimed again by the restarted call.
+     */
+    if (xferstat == XFER_RESTART)
+        return XFER_CALL_RESTART;
+
     if (xferstat) {
         kcall_err(act, (xferstat & XFER_SRC_FAULT) ? EFAULT : EFAULT);
     } else {
@@ -509,15 +625,49 @@ int kdecl ksys_msg_writev(thread_t *act, struct kcall_args_msg_writev *kap)
 
 
 
+/* msg_readv and msg_writev: the iov check first, then the transfer. A call that
+ * returns here is over, so the check's saved state (it holds the vector as
+ * checked, for a restart of the copy) is dropped on every path but a restart,
+ * whether the check's or the copy's, which both return XFER_CALL_RESTART.
+ * ENOERROR is a finished call (its status already stored), not a restart.
+ */
+int kdecl ksys_msg_readv(thread_t *act, struct kcall_args_msg_readv *kap)
+{
+    int rc = msg_readv_body(act, kap);
+
+    if (rc == XFER_CALL_RESTART)
+        return ENOERROR;
+    msg_resume_drop(act);
+    return rc;
+}
+
+int kdecl ksys_msg_writev(thread_t *act, struct kcall_args_msg_writev *kap)
+{
+    int rc = msg_writev_body(act, kap);
+
+    if (rc == XFER_CALL_RESTART)
+        return ENOERROR;
+    msg_resume_drop(act);
+    return rc;
+}
+
 /* Read a message into the server's iov, mapping the client's iov directly
  * (msg_readiov kcall).
  *
  * Like msg_readv, but the source is described as the client's send (or reply)
  * iov and is mapped part-by-part via viov_to_piov. The client is claimed via
- * MSG_DELIVERY for the duration of the walk. Parameters:
+ * MSG_DELIVERY for the duration of the walk. The walk is capped per call (see
+ * VIOV_STEP_MAX), entries skipped by the offset included, so the parts may
+ * cover only a prefix of the message; the caller continues at the offset they
+ * reach, with the cursor the call updated. Parameters:
  *   act : the calling (active) thread (the server)
- *   kap : kcall args (rcvid, destination iov, offset, REPLY/SEND flag)
- * Return value: ENOERROR (transferred length or error reported via KSTATUS).
+ *   kap : kcall args (rcvid, destination iov, offset, REPLY/SEND flag, cursor)
+ * Return value: ENOERROR (part count reported via KSTATUS); EINVAL for a
+ *               nonpositive part count or a short send the kernel buffered;
+ *               ENOTSUP for a client iov array in another process; EINTR if
+ *               the skip spent its budget before a part (call again); E2BIG
+ *               if it did with no cursor; EFAULT if an iov entry cannot be
+ *               read or the result cannot be written.
  */
 int kdecl ksys_msg_readiov(thread_t *act, struct kcall_args_msg_readiov *kap)
 {
@@ -534,6 +684,9 @@ int kdecl ksys_msg_readiov(thread_t *act, struct kcall_args_msg_readiov *kap)
      * slock with the claim held to gate replyv, claim release + MSG_FORCE_RDY
      * drain, force_ready outside (sched_slock-internal, SCHED < CHANNEL rank).
      */
+
+    if (kap->parts <= 0)
+        return EINVAL;
 
     if ((cop = lookup_rcvid((kcall_args_t *) (void *) kap, kap->rcvid, &thp)) ==
         NULL) {
@@ -596,14 +749,33 @@ int kdecl ksys_msg_readiov(thread_t *act, struct kcall_args_msg_readiov *kap)
         src_msg = thp->args.ms.rmsg;
         src_parts = thp->args.ms.rparts;
     } else {
+        /* A short send was copied into the thread's buffer and smsg/sparts were
+         * not recorded (they hold a previous send's values), so there is no
+         * client iov to describe.
+         */
+        if (thp->flags & RTMUX_FLG_THR_BUFF_MSG) {
+            kspinlock_unlock(&cop->channel->lock);
+            return EINVAL;
+        }
         src_msg = thp->args.ms.smsg;
         src_parts = thp->args.ms.sparts;
+    }
+
+    /* viov_to_piov reads an iov array through the caller's address space, so it
+     * can only walk one that lives there. A flat buffer (negative parts) is
+     * described by the saved arguments alone and is translated in the client's
+     * page table, so it works from any process.
+     */
+    if (src_parts > 0 && thp->process != act->process) {
+        kspinlock_unlock(&cop->channel->lock);
+        return ENOTSUP;
     }
     ITF_SET(thp, RTMUX_ITF_MSG_DELIVERY);
     kspinlock_unlock(&cop->channel->lock);
 
-    n = viov_to_piov(thp->process, kap->iov, kap->parts, src_msg, src_parts,
-                     (int) kap->offset);
+    n = viov_to_piov(act, thp->process, kap->iov, kap->parts, src_msg,
+                     src_parts, kap->offset,
+                     (kap->flags & RTMUX_READIOV_CURSOR) ? kap->cursor : NULL);
 
     /* Claim release + MSG_FORCE_RDY drain under channel_slock. */
     kspinlock_lock(&cop->channel->lock);

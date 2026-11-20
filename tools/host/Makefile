@@ -36,7 +36,12 @@ PROGS = $(BUILD_BASE)/mkasmoff $(BUILD_BASE)/mkromfs $(BUILD_BASE)/treeromfs \
         $(BUILD_BASE)/ldso-hash-test $(BUILD_BASE)/ldso-page-test \
         $(BUILD_BASE)/ldso-parse-test $(BUILD_BASE)/ldso-path-test \
         $(BUILD_BASE)/cpio-parser-test $(BUILD_BASE)/spawn-fd-policy-test \
-        $(BUILD_BASE)/serial-reply-test $(BUILD_BASE)/outcomes-test
+        $(BUILD_BASE)/serial-reply-test $(BUILD_BASE)/outcomes-test \
+        $(BUILD_BASE)/sv39-lookup-test $(BUILD_BASE)/sv39-manip-test \
+        $(BUILD_BASE)/strftime-test $(BUILD_BASE)/sh-scan-test $(BUILD_BASE)/tz-test \
+        $(BUILD_BASE)/malloc-stats-test $(BUILD_BASE)/pci-args-test \
+        $(BUILD_BASE)/libc-algorithms-test $(BUILD_BASE)/pgrp-table-test \
+        $(BUILD_BASE)/heap-arena-test
 
 # Each tool compiles and links its sources in one command, so -MMD cannot give a
 # per-tool dependency file (with several sources it writes one named after each
@@ -61,20 +66,209 @@ $(BUILD_BASE)/spawn-fd-policy-test: $(TEST_DIR)/test-spawn-fd-policy.c \
 	$(Q)$(HOST_CC) $(HOST_CPPFLAGS) -I../../internal/include -I../../include $(HOST_CFLAGS) -o $@ \
 	    $(TEST_DIR)/test-spawn-fd-policy.c
 
+$(BUILD_BASE)/pgrp-table-test: $(TEST_DIR)/test-pgrp-table.c \
+                               ../../servers/roottask/proc/pgrp-table.c \
+                               ../../servers/roottask/include/pgrp-table.h
+	@mkdir -p $(@D)
+	$(msg) HOSTCC $(notdir $@)
+	$(Q)$(HOST_CC) $(HOST_CPPFLAGS) -I../../servers/roottask/include $(HOST_CFLAGS) -o $@ \
+	    $(TEST_DIR)/test-pgrp-table.c ../../servers/roottask/proc/pgrp-table.c
+
 # Outcome accounting (pass/fail/gap/skip) shared with the guest suite.
 $(BUILD_BASE)/outcomes-test: $(TEST_DIR)/test-outcomes.c
 	@mkdir -p $(@D)
 	$(msg) HOSTCC $(notdir $@)
 	$(Q)$(HOST_CC) -I../../tests/userland $(HOST_CFLAGS) -o $@ $(TEST_DIR)/test-outcomes.c
 
+# The guest libc suites with no system dependency, linked against the RTMux
+# sources, whose definitions take precedence over the host libc's. _GNU_SOURCE
+# makes the host <stdlib.h> declare qsort_r, which glibc gives the POSIX.1-2024
+# signature. libc-host-shim.h routes their allocations through a counting
+# allocator; the host headers mark the getenv family nonnull, which the RTMux
+# NULL checks would otherwise warn about. Environment strings and vectors are
+# never freed by design, so the sanitizer run suppresses leaks from getenv.c
+# alone (libc-algorithms.lsan).
+LIBC_ALGO_SRCS = ../../tests/userland/report.c ../../tests/userland/qsort-test.c \
+                 ../../lib/libc/stdlib/qsort.c ../../tests/userland/getopt-test.c \
+                 ../../lib/libc/stdlib/getopt.c ../../tests/userland/env-test.c \
+                 ../../lib/libc/stdlib/getenv.c
+LIBC_ALGO_FLAGS = -I../../tests/userland -I$(TEST_DIR) -idirafter ../../internal/include \
+                  -idirafter ../../lib/libc/internal -D_GNU_SOURCE -DLIBC_HOST_TEST \
+                  -include $(TEST_DIR)/libc-host-shim.h -pthread -Wno-nonnull-compare
+$(BUILD_BASE)/libc-algorithms-test: $(TEST_DIR)/test-libc-algorithms.c $(LIBC_ALGO_SRCS) \
+                                     ../../tests/userland/test.h $(TEST_DIR)/libc-host-shim.h \
+                                     ../../lib/libc/internal/env-lock.h
+	@mkdir -p $(@D)
+	$(msg) HOSTCC $(notdir $@)
+	$(Q)$(HOST_CC) $(LIBC_ALGO_FLAGS) $(HOST_CFLAGS) -o $@ \
+	    $(TEST_DIR)/test-libc-algorithms.c $(LIBC_ALGO_SRCS)
+
+# The PCI server's command line, with the libc getopt_long it runs on the guest.
+$(BUILD_BASE)/pci-args-test: $(TEST_DIR)/test-pci-args.c ../../servers/pci/args.c \
+                             ../../servers/pci/args.h ../../lib/libc/stdlib/getopt.c
+	@mkdir -p $(@D)
+	$(msg) HOSTCC $(notdir $@)
+	$(Q)$(HOST_CC) -I../../servers/pci -idirafter ../../internal/include \
+	    -idirafter ../../lib/libc/internal -D_GNU_SOURCE -DLIBC_HOST_TEST \
+	    -pthread $(HOST_CFLAGS) -o $@ $(TEST_DIR)/test-pci-args.c \
+	    ../../servers/pci/args.c ../../lib/libc/stdlib/getopt.c
+
 # The shared serial service is compiled against the tree's own headers with the
 # IPC calls stubbed (the host libc has no ssp/string.h, so fortify is off).
 SERIAL_DIR = ../../userland/dev-serial-common
-$(BUILD_BASE)/serial-reply-test: $(TEST_DIR)/test-serial-reply.c $(SERIAL_DIR)/serial-service.h
+NOTIFY_LIST = ../../lib/libc/ioserv/notify-list.c
+$(BUILD_BASE)/serial-reply-test: $(TEST_DIR)/test-serial-reply.c $(SERIAL_DIR)/serial-service.h \
+                                 $(NOTIFY_LIST)
 	@mkdir -p $(@D)
 	$(msg) HOSTCC $(notdir $@)
 	$(Q)$(HOST_CC) -I$(SERIAL_DIR) -I../../include -I../../internal/include $(HOST_CFLAGS) \
-	    -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -o $@ $(TEST_DIR)/test-serial-reply.c
+	    -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -o $@ $(TEST_DIR)/test-serial-reply.c \
+	    $(NOTIFY_LIST)
+
+# libc strftime against the host headers, renamed so the host copy is never
+# called. When the host compiler supports AddressSanitizer a second build runs
+# with it, so a byte touched outside the arguments fails host-tests.
+STRFTIME_SRCS = ../../lib/libc/posix/strftime.c ../../lib/libc/posix/time-conv.c
+STRFTIME_FLAGS = -I../../lib/libc/internal -I../../tests/userland -Dstrftime=rtmux_strftime
+STRFTIME_DEPS = $(TEST_DIR)/test-strftime.c $(STRFTIME_SRCS) \
+                ../../lib/libc/internal/time-conv.h ../../tests/userland/strftime-cases.h
+$(BUILD_BASE)/strftime-test: $(STRFTIME_DEPS)
+	@mkdir -p $(@D)
+	$(msg) HOSTCC $(notdir $@)
+	$(Q)$(HOST_CC) $(STRFTIME_FLAGS) $(HOST_CFLAGS) -o $@ \
+	    $(TEST_DIR)/test-strftime.c $(STRFTIME_SRCS)
+
+# libc localtime, mktime and the TZif reader against the host libc as reference
+# (Europe/Berlin over 10^5 times, plus fixture zone files). The time functions
+# are renamed, in one translation unit each, so the host copies are never
+# called; with AddressSanitizer a second build also traps stray accesses.
+TZ_DIR_SRC = ../../lib/libc/posix
+TZ_RENAME = -Dgmtime_r=rtmux_gmtime_r -Dgmtime=rtmux_gmtime \
+            -Dlocaltime_r=rtmux_localtime_r -Dlocaltime=rtmux_localtime \
+            -Dmktime=rtmux_mktime -Dtimegm=rtmux_timegm -Dtzset=rtmux_tzset \
+            -Dtzname=rtmux_tzname -Dtimezone=rtmux_timezone \
+            -Ddaylight=rtmux_daylight -Ddifftime=rtmux_difftime \
+            -Dasctime_r=rtmux_asctime_r -Dasctime=rtmux_asctime \
+            -Dctime_r=rtmux_ctime_r -Dctime=rtmux_ctime
+TZ_CFLAGS = -I../../lib/libc/internal -D__hidden= -DLIBC_HOST_TEST
+TZ_DEPS = $(TEST_DIR)/test-tz.c $(TZ_DIR_SRC)/localtime.c $(TZ_DIR_SRC)/tzfile.c \
+          $(TZ_DIR_SRC)/time-conv.c ../../lib/libc/internal/tzfile.h \
+          ../../lib/libc/internal/time-conv.h
+# $(1): sanitizer flags, $(2): output.
+define build-tz-test
+	$(Q)$(HOST_CC) $(TZ_CFLAGS) $(TZ_RENAME) $(HOST_CFLAGS) $(1) -c \
+	    $(TZ_DIR_SRC)/localtime.c -o $(2).localtime.o
+	$(Q)$(HOST_CC) $(TZ_CFLAGS) $(HOST_CFLAGS) $(1) -c \
+	    $(TZ_DIR_SRC)/tzfile.c -o $(2).tzfile.o
+	$(Q)$(HOST_CC) $(TZ_CFLAGS) $(HOST_CFLAGS) $(1) -c \
+	    $(TZ_DIR_SRC)/time-conv.c -o $(2).time-conv.o
+	$(Q)$(HOST_CC) $(HOST_CFLAGS) $(1) -o $(2) $(TEST_DIR)/test-tz.c \
+	    $(2).localtime.o $(2).tzfile.o $(2).time-conv.o
+	$(Q)rm -f $(2).localtime.o $(2).tzfile.o $(2).time-conv.o
+endef
+# The zone files the image ships, compiled once for the tests to read.
+TZ_ZONES = $(BUILD_BASE)/zoneinfo
+$(TZ_ZONES)/.stamp: ../../scripts/gen-zoneinfo.sh ../../scripts/zoneinfo-2025b.zi
+	@mkdir -p $(@D)
+	$(msg) ZONEINFO $(notdir $(TZ_ZONES))
+	$(Q)../../scripts/gen-zoneinfo.sh $(TZ_ZONES) && touch $@
+
+$(BUILD_BASE)/tz-test: $(TZ_DEPS)
+	@mkdir -p $(@D)
+	$(msg) HOSTCC $(notdir $@)
+	$(call build-tz-test,,$@)
+
+# Without sanitizer support the "binary" is a script that reports the skip.
+$(BUILD_BASE)/tz-asan-test: $(TZ_DEPS)
+	@mkdir -p $(@D)
+	$(msg) HOSTCC $(notdir $@)
+	$(Q)if echo 'int main(void){return 0;}' | \
+	    $(HOST_CC) $(SAN_FLAGS) -x c - -o $@.probe 2>/dev/null; then \
+	    rm -f $@.probe; $(MAKE) --no-print-directory tz-asan-real; \
+	else \
+	    rm -f $@.probe; \
+	    printf '#!/bin/sh\necho "tz-test: SKIP ASan (unsupported)"\n' > $@; \
+	    chmod +x $@; \
+	fi
+
+.PHONY: tz-asan-real
+tz-asan-real:
+	$(call build-tz-test,$(SAN_FLAGS),$(BUILD_BASE)/tz-asan-test)
+
+# The allocator's counters, with the real malloc-core.c linked in. The same source
+# without the counters (MALLOC_NO_STATS) is the baseline of host-bench-malloc.
+MALLOC_FLAGS = -I../../lib/common -I../../lib/libc/alloc -idirafter ../../include \
+               -D__hidden= -DMALLOC_HOST_TEST -pthread
+MALLOC_DEPS = $(TEST_DIR)/test-malloc-stats.c ../../lib/libc/alloc/malloc-core.c \
+              ../../lib/libc/alloc/malloc-core.h ../../include/sys/mallocstats.h
+$(BUILD_BASE)/malloc-stats-test: $(MALLOC_DEPS)
+	@mkdir -p $(@D)
+	$(msg) HOSTCC $(notdir $@)
+	$(Q)$(HOST_CC) $(MALLOC_FLAGS) $(HOST_CFLAGS) -o $@ \
+	    $(TEST_DIR)/test-malloc-stats.c ../../lib/libc/alloc/malloc-core.c
+
+# Roottask's malloc arena (servers/roottask/sys/heap.c) under the real allocator.
+HEAP_DEPS = $(TEST_DIR)/test-heap-arena.c ../../lib/libc/alloc/malloc-core.c \
+            ../../servers/roottask/sys/heap.c \
+            ../../servers/roottask/include/heap-stats.h
+$(BUILD_BASE)/heap-arena-test: $(HEAP_DEPS)
+	@mkdir -p $(@D)
+	$(msg) HOSTCC $(notdir $@)
+	$(Q)$(HOST_CC) $(MALLOC_FLAGS) -I../../servers/roottask/include \
+	    -DCONFIG_ROOTTASK_HEAP_SIZE=4194304 $(HOST_CFLAGS) -o $@ \
+	    $(TEST_DIR)/test-heap-arena.c ../../lib/libc/alloc/malloc-core.c \
+	    ../../servers/roottask/sys/heap.c
+
+$(BUILD_BASE)/malloc-nostats-bench: $(MALLOC_DEPS)
+	@mkdir -p $(@D)
+	$(msg) HOSTCC $(notdir $@)
+	$(Q)$(HOST_CC) $(MALLOC_FLAGS) -DMALLOC_NO_STATS $(HOST_CFLAGS) -o $@ \
+	    $(TEST_DIR)/test-malloc-stats.c ../../lib/libc/alloc/malloc-core.c
+
+# Alternating runs of the two builds, each the best of 7 passes of 2e6 malloc/free
+# pairs, and a verdict against the noise of the samples (scripts/bench-malloc.sh).
+host-bench-malloc: $(BUILD_BASE)/malloc-stats-test $(BUILD_BASE)/malloc-nostats-bench
+	@../../scripts/bench-malloc.sh $(BUILD_BASE)/malloc-stats-test \
+	    $(BUILD_BASE)/malloc-nostats-bench
+.PHONY: host-bench-malloc
+
+$(BUILD_BASE)/strftime-asan-test: $(STRFTIME_DEPS)
+	@mkdir -p $(@D)
+	$(msg) HOSTCC $(notdir $@)
+	$(Q)if echo 'int main(void){return 0;}' | \
+	    $(HOST_CC) $(SAN_FLAGS) -x c - -o $@.probe 2>/dev/null; then ok=1; else ok=0; fi; \
+	rm -f $@.probe; \
+	if [ $$ok = 1 ]; then \
+	    $(HOST_CC) $(STRFTIME_FLAGS) $(HOST_CFLAGS) $(SAN_FLAGS) -o $@ \
+	        $(TEST_DIR)/test-strftime.c $(STRFTIME_SRCS); \
+	else \
+	    printf '#!/bin/sh\necho "strftime-test: SKIP ASan (unsupported)"\n' > $@; \
+	    chmod +x $@; \
+	fi
+
+# The toolbox shell's quote and substitution scanner, against a table of quoting
+# cases whose fields were made by a reference shell (gen-sh-quote-cases.py).
+SH_DIR = ../../userland/utils
+$(BUILD_BASE)/sh-scan-test: $(TEST_DIR)/test-sh-scan.c $(SH_DIR)/sh-scan.c $(SH_DIR)/sh-scan.h \
+                            $(TEST_DIR)/sh-quote-cases.h
+	@mkdir -p $(@D)
+	$(msg) HOSTCC $(notdir $@)
+	$(Q)$(HOST_CC) -I$(SH_DIR) -I$(TEST_DIR) $(HOST_CFLAGS) -o $@ \
+	    $(TEST_DIR)/test-sh-scan.c $(SH_DIR)/sh-scan.c
+
+# The shell itself as a host program, built with the hook that lets a test send
+# it a signal at the one moment a read could lose it (tests/host/sh-host-shim.c).
+# Subshells run this same binary. The format-truncation warning is about the
+# line editor's path buffers, which the target compiler does not report.
+$(BUILD_BASE)/sh-host: $(TEST_DIR)/sh-host-shim.c $(SH_DIR)/sh.c $(SH_DIR)/sh-scan.c \
+                       $(SH_DIR)/sh-scan.h ../../userland/include/toolbox.h
+	@mkdir -p $(@D)
+	$(msg) HOSTCC $(notdir $@)
+	$(Q)$(HOST_CC) -std=gnu11 -D_GNU_SOURCE -DEOK=0 \
+	    -DSH_TEST_AWAIT_WINDOW=sh_test_await_window \
+	    '-DSH_SELF_PATH="$(abspath $@)"' -I../../userland/include -I$(SH_DIR) \
+	    $(HOST_CFLAGS) -Wno-format-truncation -o $@ \
+	    $(TEST_DIR)/sh-host-shim.c $(SH_DIR)/sh.c $(SH_DIR)/sh-scan.c
 
 cap-table-test: $(BUILD_BASE)/cap-table-test
 	$(Q)$<
@@ -124,6 +318,24 @@ $(BUILD_BASE)/elf-range-test: $(TEST_DIR)/test-elf-range.c ../../kernel/include/
 	$(Q)$(HOST_CC) $(HOST_CPPFLAGS) $(HOST_CFLAGS) -o $@ \
 	    $(TEST_DIR)/test-elf-range.c
 
+# Sv39 leaf walk and superpage address arithmetic, from the kernel's header.
+$(BUILD_BASE)/sv39-lookup-test: $(TEST_DIR)/test-sv39-lookup.c \
+                              ../../arch/riscv/include/sv39-lookup.h \
+                              ../../arch/riscv/include/cpu-paging.h
+	@mkdir -p $(@D)
+	$(msg) HOSTCC $(notdir $@)
+	$(Q)$(HOST_CC) -I../../arch/riscv/include $(HOST_CFLAGS) -o $@ \
+	    $(TEST_DIR)/test-sv39-lookup.c
+
+# The loop behind cpu_pte_manipulate: error mapping and the progress it leaves.
+$(BUILD_BASE)/sv39-manip-test: $(TEST_DIR)/test-sv39-manip.c \
+                              ../../arch/riscv/include/sv39-lookup.h \
+                              ../../arch/riscv/include/cpu-paging.h
+	@mkdir -p $(@D)
+	$(msg) HOSTCC $(notdir $@)
+	$(Q)$(HOST_CC) -I../../arch/riscv/include $(HOST_CFLAGS) -o $@ \
+	    $(TEST_DIR)/test-sv39-manip.c
+
 $(BUILD_BASE)/ldso-hash-test: $(TEST_DIR)/test-ldso-hash.c ../../lib/ldso/hash.c \
                               ../../lib/ldso/hash.h
 	@mkdir -p $(@D)
@@ -165,7 +377,14 @@ host-tests: $(BUILD_BASE)/path-normalize-test $(BUILD_BASE)/cap-table-test \
             $(BUILD_BASE)/ldso-hash-test $(BUILD_BASE)/ldso-page-test \
             $(BUILD_BASE)/ldso-parse-test $(BUILD_BASE)/ldso-path-test \
             $(BUILD_BASE)/cpio-parser-test $(BUILD_BASE)/spawn-fd-policy-test \
-            $(BUILD_BASE)/serial-reply-test $(BUILD_BASE)/outcomes-test
+            $(BUILD_BASE)/serial-reply-test $(BUILD_BASE)/outcomes-test \
+            $(BUILD_BASE)/sv39-lookup-test $(BUILD_BASE)/sv39-manip-test \
+            $(BUILD_BASE)/strftime-test $(BUILD_BASE)/strftime-asan-test \
+            $(BUILD_BASE)/sh-scan-test $(BUILD_BASE)/libc-algorithms-test \
+            $(BUILD_BASE)/tz-test $(BUILD_BASE)/tz-asan-test $(TZ_ZONES)/.stamp \
+            $(BUILD_BASE)/malloc-stats-test $(BUILD_BASE)/pci-args-test \
+            $(BUILD_BASE)/pgrp-table-test $(BUILD_BASE)/heap-arena-test \
+            $(BUILD_BASE)/sh-host
 	$(Q)$<
 	$(Q)$(BUILD_BASE)/cap-table-test
 	$(Q)$(BUILD_BASE)/bootstrap-manifest-test
@@ -176,8 +395,26 @@ host-tests: $(BUILD_BASE)/path-normalize-test $(BUILD_BASE)/cap-table-test \
 	$(Q)$(BUILD_BASE)/ldso-path-test
 	$(Q)$(BUILD_BASE)/cpio-parser-test
 	$(Q)$(BUILD_BASE)/spawn-fd-policy-test
+	$(Q)$(BUILD_BASE)/pgrp-table-test
 	$(Q)$(BUILD_BASE)/serial-reply-test
 	$(Q)$(BUILD_BASE)/outcomes-test >/dev/null
+	$(Q)$(BUILD_BASE)/sv39-lookup-test
+	$(Q)$(BUILD_BASE)/sv39-manip-test
+	$(Q)$(BUILD_BASE)/strftime-test
+	$(Q)$(BUILD_BASE)/strftime-asan-test
+	$(Q)$(BUILD_BASE)/sh-scan-test
+	$(Q)if command -v dash >/dev/null; then \
+	    $(PYTHON) $(TEST_DIR)/gen-sh-quote-cases.py --check; fi
+	$(Q)$(PYTHON) $(TEST_DIR)/test-sh-host.py $(abspath $(BUILD_BASE)/sh-host) \
+	    $(abspath ../../tests/userland/sh-posix/gaps.sh)
+	$(Q)if command -v dash >/dev/null; then \
+	    SH=dash dash ../../tests/userland/sh-posix/gaps.sh >/dev/null; fi
+	$(Q)RTMUX_TZDIR=$(abspath $(TZ_ZONES))/ $(BUILD_BASE)/tz-test
+	$(Q)RTMUX_TZDIR=$(abspath $(TZ_ZONES))/ $(BUILD_BASE)/tz-asan-test
+	$(Q)$(BUILD_BASE)/malloc-stats-test
+	$(Q)$(BUILD_BASE)/heap-arena-test
+	$(Q)$(BUILD_BASE)/pci-args-test
+	$(Q)out=$$($(BUILD_BASE)/libc-algorithms-test) || { printf '%s\n' "$$out"; exit 1; }
 	$(Q)$(PYTHON) $(TEST_DIR)/test-capability-namespace-doc.py
 	$(Q)$(PYTHON) $(TEST_DIR)/test-management-ipc-lock.py
 	$(Q)HOST_CC="$(HOST_CC)" $(PYTHON) -I $(TEST_DIR)/test-lkl-iommu-contract.py
@@ -264,11 +501,11 @@ GETSUBOPT_SRC = ../../lib/libc/stdlib/getsubopt.c
 # RTMux header world (-nostdinc plus the RTMux include dirs and the libc build
 # prelude) and link against the host-world harness by plain vsnprintf prototype.
 # The vfprintf target is therefore built on its own below, not through the shared
-# tuple loop.
+# tuple loop. STDIO_DEBUG turns on vfprintf's queued-buffer assertion.
 VFP_STDIO   = ../../lib/libc/stdio/vfprintf.c ../../lib/libc/stdio/vsnprintf.c \
               ../../lib/libc/stdio/fvwrite.c
 VFP_BUILTIN := $(shell $(CLANG) -print-file-name=include)
-VFP_NS      = -nostdinc -isystem $(VFP_BUILTIN) \
+VFP_NS      = -nostdinc -isystem $(VFP_BUILTIN) -DSTDIO_DEBUG \
               -include ../../lib/libc/rtmux-libc-local.h \
               -I../../include -I../../internal/include -I../../lib/libc/stdio
 
@@ -307,6 +544,11 @@ host-sanitize:
 	    $(FUZZ_DIR)/fuzz-vfprintf.c $(FUZZ_DIR)/standalone-main.c \
 	    $(FUZZ_OUT)/vfp-san-*.o; \
 	$(FUZZ_OUT)/san-vfprintf $(FUZZ_CORPUS)/vfprintf/*; \
+	printf '  %-8s %s\n' SANITIZE libc-algorithms; \
+	$(CLANG) $(SAN_FLAGS) $(LIBC_ALGO_FLAGS) -o $(FUZZ_OUT)/san-libc-algorithms \
+	    $(TEST_DIR)/test-libc-algorithms.c $(LIBC_ALGO_SRCS); \
+	LSAN_OPTIONS=suppressions=$(TEST_DIR)/libc-algorithms.lsan \
+	    $(FUZZ_OUT)/san-libc-algorithms >/dev/null; \
 	printf '  %-8s %s\n' SANITIZE oob-selftest; \
 	$(CLANG) $(SAN_FLAGS) -o $(FUZZ_OUT)/san-oob \
 	    $(FUZZ_DIR)/fuzz-oob-selftest.c $(FUZZ_DIR)/standalone-main.c; \
@@ -345,7 +587,9 @@ host-fuzz:
 	    -print_final_stats=1 $(FUZZ_CORPUS)/vfprintf
 
 clean:
-	$(Q)rm -f $(PROGS)
+	$(Q)rm -f $(PROGS) $(BUILD_BASE)/strftime-asan-test $(BUILD_BASE)/tz-asan-test \
+	    $(BUILD_BASE)/sh-host $(BUILD_BASE)/malloc-nostats-bench
+	$(Q)rm -rf $(TZ_ZONES)
 	$(Q)rm -rf $(FUZZ_OUT)
 
 .PHONY: all clean host-tests cap-table-test host-sanitize host-fuzz

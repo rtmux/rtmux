@@ -62,12 +62,87 @@ void root_process_init(pid_t pid, pid_t parent_pid)
 {
     root_process_t *tmp = root_proc(pid);
 
-    /* Wipe stale process state; the proc-mux lock belongs to the slot. */
+    /* Wipe stale process state; the proc-mux lock belongs to the slot. A
+     * previous generation whose fini has not run yet leaves its group first, or
+     * its count would never end.
+     */
     pthread_mutex_lock(&slot_lock);
+    if (tmp->pid)
+        proc_pgrp_reap(tmp->pid);
     root_process_clear(tmp);
     tmp->pid = pid;
     tmp->parent_pid = parent_pid;
+    tmp->pgrp = pid;
     pthread_mutex_unlock(&slot_lock);
+}
+
+/* The process group of p. A slot starts in its own group (root_process_init),
+ * so the pid fallback only covers a slot that was never initialized.
+ */
+pid_t root_process_pgrp(const root_process_t *p)
+{
+    return p->pgrp ? p->pgrp : p->pid;
+}
+
+/* The session id of p: its session's leader, or the system session's. */
+pid_t root_session_leader(const root_process_t *p)
+{
+    return p->session ? p->session->leader : ROOTTASK_PID;
+}
+
+/* Take one link on the session of process pid, and report its session id, in
+ * one hold of slot_lock: root_process_fini clears the slot and takes its
+ * session away under the same lock, so a parent that is being torn down cannot
+ * have its session freed between the read and the link. A process that no
+ * longer owns its slot, or has no session, is in the system session: NULL, and
+ * *sid is roottask's; its group is then its own pid. The caller drops the link
+ * with proc_session_unref.
+ */
+session_t *root_session_link_of(pid_t pid, pid_t *sid, pid_t *pgid)
+{
+    root_process_t *p = root_proc(pid);
+    session_t *sep = NULL;
+
+    *sid = ROOTTASK_PID;
+    *pgid = pid;
+    pthread_mutex_lock(&slot_lock);
+    if (p->pid == pid) {
+        /* The group and the session of one owner of the slot, read together. */
+        *pgid = root_process_pgrp(p);
+        if (p->session) {
+            sep = p->session;
+            *sid = sep->leader;
+            (void) atomic_add_value(&sep->links, 1);
+        }
+    }
+    pthread_mutex_unlock(&slot_lock);
+    return sep;
+}
+
+/* The system session. It is static, so that creating it cannot fail and no
+ * process is ever without a session object. One link is roottask's own; the
+ * other is never dropped, so that an unbalanced release cannot free a static
+ * object. Roottask never exits, so it is never freed.
+ */
+static session_t boot_session;
+
+/* Make pid the leader of the system session and of its own group, with no
+ * controlling terminal; its children inherit both. Boot does this for roottask,
+ * so that the session exists before any process is created; the leader's
+ * SLEADER flag is not set, because roottask never calls setsid or setpgid.
+ */
+void root_process_boot_session(pid_t pid)
+{
+    root_process_t *tmp = root_proc(pid);
+
+    boot_session.links = 2; /* roottask's, and one that is never dropped */
+    boot_session.leader = pid;
+    boot_session.pgrp = boot_session.fd = -1;
+    pthread_mutex_lock(&slot_lock);
+    tmp->session = &boot_session;
+    pthread_mutex_unlock(&slot_lock);
+    if (proc_pgrp_boot(pid) != EOK)
+        crash();
 }
 
 /* Release the root_process[] slot for a pid.
@@ -79,6 +154,7 @@ void root_process_init(pid_t pid, pid_t parent_pid)
 void root_process_fini(pid_t pid)
 {
     root_process_t *tmp = root_proc(pid);
+    session_t *sep = NULL;
 
     /* Idempotent: callers (proc_exit) sometimes hit the destroy path twice on a
      * swap-during-exit sequence. Only clear if the slot still claims this pid;
@@ -87,16 +163,12 @@ void root_process_fini(pid_t pid)
     pthread_mutex_lock(&slot_lock);
     if (tmp->pid == pid) {
         free(tmp->debug_name); /* tolerates NULL */
-        if (tmp->session && atomic_sub_value(&tmp->session->links, 1) == 1) {
-            /* The last member is gone: release the controlling terminal
-             * descriptor, if one was bound, and the session itself.
-             */
-            if (tmp->session->fd >= 0)
-                (void) close(tmp->session->fd);
-            free(tmp->session);
-        }
+        proc_pgrp_reap(pid); /* a no-op for a child its waiter already reaped */
+        sep = tmp->session;  /* its link is dropped below, outside the lock */
         memcap_process_fini(tmp);
         root_process_clear(tmp);
     }
     pthread_mutex_unlock(&slot_lock);
+    if (sep)
+        proc_session_unref(sep);
 }

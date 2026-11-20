@@ -6,6 +6,7 @@
  */
 
 #include <alloca.h>
+#include <limits.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -21,7 +22,10 @@
 #define PATH_MAX 1024
 #endif
 
-static int chdir_send(const char *path)
+/* Ask proc to make `path` (absolute, relative to the process root) the cwd of
+ * the sending process. The spawn loader also uses this to set a child's cwd.
+ */
+int __chdir_send(const char *path)
 {
     struct _io_connect msg = {
         .type = _PATH_CHDIR,
@@ -36,30 +40,42 @@ static int chdir_send(const char *path)
     return 0;
 }
 
-int chdir(const char *path)
+/* Resolve `path` as chdir() would, without changing the working directory: the
+ * target must exist, be a directory, and grant the caller search permission. On
+ * success the canonical path relative to the process root, the form _PATH_CHDIR
+ * takes, is written to `out`.
+ *
+ * Returns 0, or -1 with errno set. posix_spawn() uses this to check addchdir
+ * and addfchdir targets in the parent.
+ */
+int __chdir_resolve(const char *path, char *out, size_t outsz)
 {
     struct _connect_ctrl ctrl;
     struct _io_connect msg;
     int fd;
     int euid;
-    int ret;
-    /* Should use fpathconf(path, _PC_PATH_MAX) */
-    char buffer[PATH_MAX + 1];
     struct _io_stat s;
     struct stat r;
+    size_t len;
 
+    if (outsz < 2 || outsz > INT_MAX) {
+        errno = EINVAL;
+        return -1;
+    }
+    /* The root of the path namespace has no object to stat, so the lookup below
+     * answers EINVAL for it and there is no mode to check: it is always
+     * searchable.
+     */
     if (path && !strcmp(path, "/")) {
-        int rc = chdir_send(path);
-
-        if (rc == 0)
-            __atfd_chdir("/");
-        return rc;
+        memcpy(out, "/", 2);
+        return 0;
     }
 
+    /* Resolve straight into out; the chroot prefix is stripped in place. */
     memset(&ctrl, 0x00, sizeof ctrl);
     ctrl.base = RTMUX_SIDE_CHANNEL;
-    ctrl.path = buffer;
-    ctrl.pathsize = sizeof buffer;
+    ctrl.path = out;
+    ctrl.pathsize = (int) outsz;
     ctrl.send = msg_sendvnc;
     ctrl.msg = &msg;
     ctrl.extra = &s;
@@ -78,7 +94,7 @@ int chdir(const char *path)
     }
     __connect_detach((uint64_t) fd);
 
-    if (buffer[0] == '\0') {
+    if (out[0] == '\0') {
         errno = ENAMETOOLONG;
         return -1;
     }
@@ -126,16 +142,22 @@ int chdir(const char *path)
         }
     }
 
-    /* Pass the fully resolved path to proc. */
-    path = buffer;
-    if (ctrl.chroot_len >= strlen(path)) {
-        /* we are in the chroot-ed directory */
-        path = "/";
-    } else {
-        path += ctrl.chroot_len;
-    }
-    ret = chdir_send(path);
-    if (ret == 0)
-        __atfd_chdir(path);
-    return ret;
+    /* proc resolves the path against the process root: drop the chroot part. */
+    len = strlen(out);
+    if (ctrl.chroot_len >= len)
+        memcpy(out, "/", 2); /* we are in the chroot-ed directory */
+    else
+        memmove(out, out + ctrl.chroot_len, len - ctrl.chroot_len + 1);
+    return 0;
+}
+
+int chdir(const char *path)
+{
+    char resolved[PATH_MAX + 1];
+
+    if (__chdir_resolve(path, resolved, sizeof resolved) != 0 ||
+        __chdir_send(resolved) != 0)
+        return -1;
+    __atfd_chdir(resolved);
+    return 0;
 }

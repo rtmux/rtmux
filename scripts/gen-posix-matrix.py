@@ -194,9 +194,11 @@ POSIX_NAMES = {
     # maturity varies, see STUB_OVERRIDES for getpgrp/setsid/tcgetpgrp/tcsetpgrp.
     "getpid",
     "setpgid",
+    "getpgid",
     "getpgrp",
     "setsid",
     "tcgetpgrp",
+    "tcgetsid",
     "tcsetpgrp",
     # crypt is an XSI extension (not POSIX.1 base); RTMux implements and uses it
     # for login, so the matrix tracks it.
@@ -213,6 +215,7 @@ POSIX_NAMES = {
     "timer_settime",
     "umask",
     "getppid",
+    "getsid",
     "pthread_cancel",
     "pthread_create",
     "pthread_detach",
@@ -275,6 +278,9 @@ POSIX_NAMES = {
     "pthread_mutexattr_setprotocol",
     "pthread_mutexattr_setpshared",
     "pthread_mutexattr_settype",
+    "pthread_mutexattr_getrobust",
+    "pthread_mutexattr_setrobust",
+    "pthread_mutex_consistent",
     "pthread_mutex_getprioceiling",
     "pthread_mutex_setprioceiling",
     "pthread_barrier_init",
@@ -312,8 +318,10 @@ POSIX_NAMES = {
     "pthread_setspecific",
     "pthread_testcancel",
     "posix_spawn",
+    "posix_spawn_file_actions_addchdir",
     "posix_spawn_file_actions_addclose",
     "posix_spawn_file_actions_adddup2",
+    "posix_spawn_file_actions_addfchdir",
     "posix_spawn_file_actions_addopen",
     "posix_spawn_file_actions_destroy",
     "posix_spawn_file_actions_init",
@@ -588,9 +596,26 @@ STUB_OVERRIDES = {
     ),
     "posix_spawnattr_setflags": (
         "implemented",
-        "stores supported spawn flags, including POSIX_SPAWN_RESETIDS; "
-        "RESETIDS resets child effective ids to real ids unless setuid/setgid "
-        "file bits override them",
+        "stores supported spawn flags, including POSIX_SPAWN_RESETIDS and "
+        "POSIX_SPAWN_SETSID; RESETIDS resets child effective ids to real ids "
+        "unless setuid/setgid file bits override them; a SETSID child leads a "
+        "new session with no controlling terminal (regression-tested)",
+    ),
+    "posix_spawn_file_actions_addchdir": (
+        "implemented",
+        "POSIX.1-2024; runs in order with the other file actions at spawn "
+        "time: later relative addopen paths and a relative image path resolve "
+        "against it, and the final directory becomes the child cwd; ordered "
+        "open/chdir/open, chained relative chdir, relative image, ENOENT for "
+        "a missing directory, and temp-descriptor cleanup are regression-tested",
+    ),
+    "posix_spawn_file_actions_addfchdir": (
+        "implemented",
+        "POSIX.1-2024; the descriptor is looked up at spawn time in the child "
+        "descriptor table the earlier actions produced (fchdir after addopen "
+        "and adddup2 works, after addclose is EBADF, on a file is ENOTDIR); "
+        "the directory is found by the path it was opened with, so a "
+        "descriptor whose path libc cannot recover fails with ENOSYS",
     ),
     "poll": (
         "implemented",
@@ -658,6 +683,14 @@ STUB_OVERRIDES = {
 }
 
 DESIGN_NOTES = {
+    "pthread_mutex_consistent": "clears the inconsistent state an EOWNERDEAD "
+    "lock left; an unlock without it makes the mutex ENOTRECOVERABLE",
+    "pthread_mutexattr_setrobust": "a robust mutex always locks and unlocks "
+    "through the kernel, which hands it to the next waiter (or the next "
+    "locker) with EOWNERDEAD when the owning thread or process dies; works "
+    "process-shared with PTHREAD_PRIO_NONE (pthread_mutex_init refuses a "
+    "process-shared PRIO_INHERIT or PRIO_PROTECT mutex with ENOTSUP) and with "
+    "PRIO_INHERIT/PRIO_PROTECT in a process-private mutex",
     "crypt": "XSI; SHA-512 modular form ($6$salt$hash) only (from FreeBSD)",
     "pthread_attr_setscope": "PTHREAD_SCOPE_SYSTEM only; PTHREAD_SCOPE_PROCESS is "
     "correctly ENOTSUP and an unknown scope is EINVAL (RTMux threads are 1:1 "
@@ -767,7 +800,7 @@ COVERAGE_HEADERS = [
     "include/sys/wait.h",
     "include/sys/utsname.h",
 ]
-COVERAGE_EXCLUDE = {"chroot", "issetugid"}  # issetugid: BSD, not POSIX
+COVERAGE_EXCLUDE = {"chroot", "getpagesize", "issetugid"}  # BSD, not POSIX
 
 
 def validate_header_coverage():

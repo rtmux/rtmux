@@ -84,15 +84,10 @@ typedef struct {
 #define RISCV_VPN_BITS 9    /* 512 entries per page table */
 #define RISCV_PAGE_LEVELS 3 /* Sv39: 3 levels */
 
-/* PTE physical address mask (bits 53:10 hold PPN) */
-#define PTE_PADDR_BITS 0x003FFFFFFFFFFC00ULL
-
-/* PA↔VA conversion for VM code. Uses the kernel's 1-to-1 direct mapping at
- * KERNEL_VIRT_BASE. These are equivalent to PHYS_TO_PTR / PTR_TO_PHYS in
- * runtime.h but defined here for use by roottask code.
+/* PA_TO_VA / VA_TO_PA, the kernel's direct map, and PTE_PPN_MASK come from
+ * <cpu-paging.h>.
  */
-#define PA_TO_VA(pa) ((void *) ((uintptr_t) (pa) + CPU_1TO1_VADDR_BIAS))
-#define VA_TO_PA(va) ((paddr_t) ((uintptr_t) (va) - CPU_1TO1_VADDR_BIAS))
+#include <cpu-paging.h>
 
 extern void pgtbl_init(void);
 

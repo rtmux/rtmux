@@ -1,0 +1,260 @@
+a b c
+'a b'
+a\ b
+'a"b'
+'a\b'
+"a\\b"
+"a\`b"
+a\'b
+""
+"" ''
+"a b"'c d'e
+'a b'"c d"
+'"'
+\'
+'\'
+"$A"
+\$A
+x${A}y
+$B
+a$B
+"$C"
+"x"${C}"y"
+"$A$A"
+${A}${A}
+"$D"
+"$B""$B"
+""$B
+"$(echo a b)"
+'$(echo a b)'
+$(echo "a b")
+$(echo "a)b")
+$(echo a\)b)
+$(echo $(echo a b))
+"$(echo $A)"
+$(echo '$A')
+$(echo "a;b")
+$(echo a | cat)
+`echo a b`
+`echo 'a b'`
+`echo "a b"`
+$(echo a b)$(echo c d)
+$(echo a)$(echo b)
+a$(echo "")b
+"$(echo)"
+"${A:-z}"
+${B-z}
+${Z:-"z w"}
+${Z:-'z w'}
+${A:+p q}
+${Z:+p q}
+${A#x}
+"${A#x }"
+"$((1+2))"
+$((1+2))$((3+4))
+$((1+2)) $((3*4))
+a'b'c'd'e
+'a''b'
+"a" "b"
+$ a
+"$"
+$.a
+x$1y
+'a;b'
+"a&b"
+"a<b"
+"#"
+a\;b
+\>
+a\	b
+	"a b"
+'~'
+a~
+"*"
+\*
+"a"*
+[a]
+\[a]
+\a\ \b
+"\\\\"
+"\a"
+'\n'
+\t
+"a$ b"
+$ A
+"${A}${A}"
+"${A}"x"${A}"
+"$A""$B""$A"
+"$A"'$A'
+$A\$A
+"$A\$A"
+"\"$A\""
+'"' "'"
+"$(echo "a b" 'c d')"
+"$(echo a   b)"
+"$(echo "a   b")"
+x$(echo ' a ')y
+''$(echo)''
+"$(echo a)"
+b"$(echo a)"
+''''
+"a"""
+\"\"
+"\"\""
+'a'\''b'
+"a b"\ "c d"
+\ 
+"\ "
+"  "
+\ \ 
+"	"
+"$A	$A"
+$C$A
+${C}x
+x $C x
+${C}${C}
+${C}${B}
+${A}${B}${A}
+""${B}
+"" ${B} ""
+"$B" "$B"
+"${B:-}"
+"${B:-}x"
+"${A:+x}"
+"${A:+x y}"
+${Z-}
+${Z:-}x
+x${Z:-}
+${Z:-}""
+"a${Z:-}b"
+$Z
+$Z$Z
+$Z"$Z"
+x $Z
+x "$Z" y
+""$Z""
+""'$Z'
+\'''
+\\'a'
+$(echo \")
+$(echo '"')
+$(echo "'")
+"$(echo '\')"
+"`echo \\`"
+"`echo \"a b\"`"
+`echo a``echo b`
+`echo a` `echo b`
+$(echo a;)b
+"$(echo "#")"
+${A#"x"}
+"${A#'x'}"
+${A%%?}
+"${A##*}"
+"${A#*}"
+"${D#p}"
+"${D#p*}"
+${D#'p*'}
+'a''b''c'
+a'b'"c"d
+a\'b\'c
+"a"\ "b"
+a\ \ b
+"a"' '"b"
+"a" " " "b"
+"a" ' ' "b"
+a "" b
+a """" b
+a '' '' b
+"" $A
+'' $A
+"$A" ""
+"$A" ''
+"$A" "$A" "$A"
+"$A"$A"$A"
+'$A'$A'$A'
+$A""$A
+$A\ $A
+"$A\"$A"
+"$A\'$A"
+"$A\`$A"
+"$A$"
+"$ $A"
+$'a'
+$"a b"
+"a"$'b'
+$(echo ")")
+"$(echo ")")"
+$(echo '(')
+""$(echo "a")''
+$(echo "a b"c)
+$(echo 'a b''c d')
+"$(echo "a b"'c d')"
+$(echo a b)c
+c$(echo a b)d
+c"$(echo " a ")"d
+'c$(echo a b)d'
+"$(echo "$(echo "a b")")"
+$(echo '$(echo a b)')
+"$(echo "\$(echo a b)")"
+"$(echo "`echo a b`")"
+"`echo "$(echo a b)"`"
+"`echo \`echo a b\``"
+"`echo a b`"`echo c d`
+"""""""".
+""" "
+"'" "'" "'"
+a'b"c'd"e'f"g
+"a"\b"c"
+"a"\b'c'
+\'a\'
+"\'a\'"
+"\"a\" b"
+'a \"b\" c'
+"a 'b' c"
+a' b 'c
+'a 'b' c'
+'a '"b"' c'
+""'a b'""
+a=b
+a=$A
+a=$C
+x=y z=w
+$A=b
+a=$(echo b c)
+a="`echo b c`"
+-a
+"-a" b
+-"a b"
+-'a b'
+'-'a
+-\ \ a
+'' '' ''
+"" a '' b ""
+"a" "" "b"
+"a"''
+"" "a"
+\\
+"a\\\b"
+'a\\b'
+"\\a"
+'\\a'
+"a\\"
+"a\\" b
+'a\\\' b
+"\\\\\\"
+"\"\"\""
+"\" \" \""
+"\"" "\""
+"\'" "\'"
+"\\\'" "\\\'"
+'a' '\\' 'b'
+'a' "\\" 'b'
+a\\b c\\d
+'a\\ b' 'c\\ d'
+'a\ b' 'c\ d'
+a\\ b
+"a\\\\" b
+""a\\""
+"a" b\\ "c"
+'a' b\\\ 'c'
+'a' b'\\' 'c'

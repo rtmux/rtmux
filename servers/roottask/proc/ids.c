@@ -27,7 +27,6 @@ int proc_getsetid(ioserv_context_t *ctp, proc_getsetid_t *msg)
     int isroot;
     int *rid, *eid, *sid;
     struct _cred_info info;
-    pid_t leader;
     root_proc_info_t qinfo; /* snapshot of prp's kernel-half fields */
 
     locked_pid = msg->i.pid ? (pid_t) msg->i.pid : ctp->info.pid;
@@ -38,9 +37,12 @@ int proc_getsetid(ioserv_context_t *ctp, proc_getsetid_t *msg)
     /* Pre-PTE_U=0 this code dereferenced prp directly (prp->pid, prp->pgrp,
      * prp->parent->pid, prp->session->leader). prp lives in the kernel heap
      * (PTE_U=0); U-mode roottask cannot read it. Snapshot the fields once via
-     * process_query_info and use the snapshot for the rest of the function.
+     * process_query_info and use the snapshot for the rest of the function. A
+     * reaped child (WAITDONE) lingers until its teardown finishes, but its pid
+     * no longer names a process. A zombie still does.
      */
-    if (process_query_info(locked_pid, &qinfo) != EOK) {
+    if (process_query_info(locked_pid, &qinfo) != EOK ||
+        (qinfo.flags & RTMUX_FLG_PROC_WAITDONE)) {
         root_proc_unlock(locked_pid);
         return ESRCH;
     }
@@ -48,42 +50,36 @@ int proc_getsetid(ioserv_context_t *ctp, proc_getsetid_t *msg)
     (void) cred_get_call(locked_pid, &info);
 
     switch (msg->i.subtype) {
-    case _PROC_ID_GETID:
+    case _PROC_ID_GETID: {
+        pid_t sess = qinfo.sess_leader;
 
-        /* Fill in return parameters before the check below as we need to first
-         * unlock prp (to avoid deadlocks)
+        /* The reply overlays the request (o.pgrp shares i.pid's bytes), so
+         * locked_pid, taken above, is the only copy of the target from here.
          */
         msg->o.pgrp = qinfo.pgrp;
         msg->o.ppid = qinfo.parent_pid ? qinfo.parent_pid : ROOTTASK_PID;
-        msg->o.sid = qinfo.sess_leader;
+        msg->o.sid = sess;
         msg->o.cred = info;
         SETIOV(ctp->iov + 0, &msg->o,
                offsetof(struct _proc_getsetid_reply, cred.grouplist) +
                    msg->o.cred.ngroups * sizeof info.grouplist[0]);
-
-        /* Only check session match if we are looking up a foreign pid @@@:
-         * Should sessionless people be allowed to see each other?
-         */
-        leader = qinfo.sess_leader ? qinfo.sess_leader : -1;
+        /* Unlock the target before locking the caller: never hold two. */
         root_proc_unlock(locked_pid);
-        prp = NULL;
 
-        if (msg->i.pid && msg->i.pid != ctp->info.pid) {
-            root_proc_info_t qinfo2;
-            process_t *prp2;
+        /* POSIX lets getsid() refuse a process in another session (EPERM). */
+        if (locked_pid != ctp->info.pid) {
+            root_proc_info_t self;
 
-            if (!(prp2 = root_proc_lock(ctp->info.pid))) {
+            if (!root_proc_lock(ctp->info.pid))
                 return ESRCH;
-            }
-            if (process_query_info(ctp->info.pid, &qinfo2) != EOK ||
-                qinfo2.sess_leader == 0 || qinfo2.sess_leader != leader) {
-                root_proc_unlock(ctp->info.pid);
+            if (process_query_info(ctp->info.pid, &self) != EOK ||
+                self.sess_leader != sess)
                 return proc_error(EPERM, ctp->info.pid);
-            }
             root_proc_unlock(ctp->info.pid);
         }
 
         return IOSERV_NPARTS(1);
+    }
 
     case _PROC_ID_SETGROUPS:
         if (!proc_isaccess(0, &ctp->info)) {

@@ -91,7 +91,7 @@ jobs:
       - name: ${{ matrix.name }}
         run: ${{ matrix.run }}
 
-      - if: failure()
+      - if: failure() || cancelled()
         uses: ./.github/actions/upload-logs
         with:
           name: lkl-qemu-logs-${{ matrix.name }}

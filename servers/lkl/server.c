@@ -5,6 +5,7 @@
  */
 
 #include <errno.h>
+#include <pthread.h>
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -62,12 +63,15 @@ size_t rtmux_lkl_text_format(char *buf, size_t bufsz, const char *fmt, ...)
     return (size_t) n;
 }
 
+/* Takes the admission lock, or refuses a busy object with EAGAIN. A lone
+ * _IO_NOTIFY is dispatched without it (IOSERV_OPS_NOTIFY_UNLOCKED), since the
+ * EAGAIN would be read as "armed".
+ */
 int rtmux_lkl_admission_lock(ioserv_context_t *ctp, void *msg, void *ocb)
 {
     (void) ctp;
     (void) msg;
     (void) ocb;
-
     return pthread_mutex_trylock(&admission_lock) == EOK ? EOK : EAGAIN;
 }
 
@@ -86,7 +90,6 @@ int rtmux_lkl_admission_unlock(ioserv_context_t *ctp, void *msg, void *ocb)
     (void) ctp;
     (void) msg;
     (void) ocb;
-
     pthread_mutex_unlock(&admission_lock);
     return EOK;
 }

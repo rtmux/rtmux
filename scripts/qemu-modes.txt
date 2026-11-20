@@ -11,6 +11,7 @@ boot-manifest
 debug-inject
 fault-recovery
 fdt-cpu-status
+fdt-reserved-memory
 gpio-latency    # waived: needs the FU740 GPIO loopback; under QEMU it only reports UNSUPPORTED (the preflight in scripts/fu740-gpio-latency.sh, which the board script runs unless given --skip-preflight)
 hang-inject    # waived: needs a gdb stub and a deliberately hung guest (--gdb-on-timeout); run on demand through scripts/hunt-hang.sh
 hart-watchdog
@@ -48,6 +49,8 @@ lkl-netd-http
 lkl-netd-http-isolated
 lkl-netd-http-split
 lkl-netd-iommu-fail-closed
+lkl-netd-poll
+lkl-netd-poll-spent
 lkl-netd-restart
 lkl-netd-revoke
 lkl-netd-stale
@@ -73,7 +76,12 @@ shutdown-sync
 shutdown-sync-ignore
 shutdown-sync-negative
 shutdown-sync-wedge
+smp-ap-crash-early
+smp-hart-start-fail
+smp-hart-start-late
 smp-invariants
+smp-sparse-harts
+smp-too-many-harts
 spawn-storm
 sporadic-budget
 syscall-testing

@@ -222,13 +222,23 @@ right shape for shared keys.  The hook must fire when the shm object's backing
 frames are actually freed (last mapper gone), not on a single process's private
 `munmap` of a still-shared page; a per-process unmap of a shared page only
 detaches that process, leaving the shared queue intact while others map it.
-Owner death on a shared mutex returns `EOWNERDEAD` to the next waiter.
+Owner death on a shared mutex returns `EOWNERDEAD` to the next waiter when the
+mutex is robust (`pthread_mutexattr_setrobust`). A robust mutex always locks
+and unlocks through the kernel, which keeps a record of the holder; when the
+holder thread is destroyed, the kernel hands the mutex to the highest-priority
+waiter (or stores `RTMUX_SYNC_DEAD` for the next locker) through the kernel
+direct map, after checking under `as_slock` that the new owner's mapping, or
+the dead owner's, still leads to the mutex's physical key (the "ROBUST
+MUTEXES" comment in `kernel/sync/wait.c`). A non-robust shared mutex whose
+owner dies is left `RTMUX_SYNC_NOTRECOVERABLE` (see "OWNER DEATH" in
+`kernel/sync/wait.c`): its waiters and later blocking lockers fail with
+`ENOTRECOVERABLE`.
 
 ## Priority inheritance across processes — scoped OUT of v1
 
 The turnstile path implements PI: a blocked waiter boosts the mutex owner.  Across
 processes the "owner" is a thread in another process, and PI propagation
-(`sync_pi_propagate`) walks owner threads.  Cross-process PI raises hard
+(`prio_chain_walk`) walks owner threads.  Cross-process PI raises hard
 questions (priority meaning across scheduling domains, owner lookup by
 `(pid,tid)` from a shared lock word).  v1 supports **non-PI** shared mutexes only
 (`PTHREAD_PRIO_NONE`) and process-shared condvars; a shared mutex requesting

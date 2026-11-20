@@ -228,6 +228,7 @@ int proc_spawn(ioserv_context_t *ctp, void *vmsg)
             ENDIAN_SWAP16(&msg->spawn.i.nfds);
             ENDIAN_SWAP16(&msg->spawn.i.nargv);
             ENDIAN_SWAP16(&msg->spawn.i.narge);
+            ENDIAN_SWAP16(&msg->spawn.i.cwdlen);
             ENDIAN_SWAP32(&msg->spawn.i.nbytes);
             break;
         case _PROC_SPAWN_FD:
@@ -250,6 +251,7 @@ int proc_spawn(ioserv_context_t *ctp, void *vmsg)
 
         off = sizeof(struct _proc_spawn);
         if (spawn_add_size(&off, msg->spawn.i.searchlen) != EOK ||
+            spawn_add_size(&off, msg->spawn.i.cwdlen) != EOK ||
             spawn_add_size(&off, msg->spawn.i.pathlen) != EOK ||
             spawn_add_size(
                 &off, (size_t) msg->spawn.i.nfds * sizeof(int32_t)) != EOK ||
@@ -261,8 +263,11 @@ int proc_spawn(ioserv_context_t *ctp, void *vmsg)
             return E2BIG;
         msgsize = (unsigned) off;
 
-        /* most time one msg can hold full args */
-        if (msgsize > sizeof(lcp->msg)) {
+        /* Keep only the head when the arguments were not all received; the
+         * loader then fetches them from the sender (_PROC_SPAWN_ARGS). A
+         * message proc_pspawn() rebuilt is all here and is kept whole.
+         */
+        if (msgsize > sizeof(lcp->msg) && msgsize > ctp->info.msglen) {
             msgsize -= (unsigned) msg->spawn.i.nbytes;
             if (msgsize < sizeof(lcp->msg)) {
                 msgsize = (unsigned) sizeof(lcp->msg);
@@ -274,6 +279,7 @@ int proc_spawn(ioserv_context_t *ctp, void *vmsg)
                   LC_SPAWN | (((ctp->info.flags & RTMUX_MI_ENDIAN_DIFF))
                                   ? LC_CROSS_ENDIAN
                                   : 0)))) {
+            roottask_heap_note_nomem("loader context", msgsize);
             return ENOMEM;
         }
 
@@ -283,8 +289,13 @@ int proc_spawn(ioserv_context_t *ctp, void *vmsg)
             memcpy(&lcp->msg, msg, msgsize);
         } else {
             memcpy(&lcp->msg, msg, (len = (size_t) ctp->info.msglen));
-            (void) msg_read(ctp->rcvid, (char *) &lcp->msg + len,
-                            (int) (msgsize - len), (int) len);
+            /* The head (fd map, cwd, path) must arrive whole. */
+            if (msg_read(ctp->rcvid, (char *) &lcp->msg + len,
+                         (int) (msgsize - len),
+                         (int) len) != (int) (msgsize - len)) {
+                loader_context_free(lcp);
+                return EFAULT;
+            }
         }
         lcp->ctx.rcvid = ctp->rcvid;
 
@@ -465,19 +476,20 @@ int proc_spawn(ioserv_context_t *ctp, void *vmsg)
         if (ctp->info.nd == RTMUX_LOCAL_NODE &&
             (lcp = process_startup(ctp->info.pid, 0, 0)) &&
             (uintptr_t) lcp < (uintptr_t) -256L) {
-            void *buff = &msg->spawn_args.i + sizeof msg->spawn_args.i;
+            char *buff = (char *) (&msg->spawn_args.i + 1);
             unsigned off = 0;
             unsigned len;
+            int n;
 
             while (msg->spawn_args.i.nbytes) {
                 len = min(msg->spawn_args.i.nbytes, 512u);
-                if (msg_read(lcp->ctx.rcvid, buff, (int) len,
-                             (int) msg->spawn_args.i.offset) == -1) {
+                /* A short read means the sender's message ended early. */
+                n = msg_read(lcp->ctx.rcvid, buff, (int) len,
+                             (int) msg->spawn_args.i.offset);
+                if (n != (int) len)
+                    return n == -1 ? errno : EFAULT;
+                if (msg_write(ctp->rcvid, buff, (int) len, (int) off) == -1)
                     return errno;
-                }
-                if (msg_write(ctp->rcvid, buff, (int) len, (int) off) == -1) {
-                    return errno;
-                }
                 off += len;
                 msg->spawn_args.i.offset += len;
                 msg->spawn_args.i.nbytes -= len;
@@ -511,14 +523,29 @@ int proc_spawn(ioserv_context_t *ctp, void *vmsg)
         }
         {
             int rcvid = lcp->ctx.rcvid;
+            pid_t exec_pid = lcp->ctx.ppid;
 
             root_trace(
                 "SPAWN_EXEC: calling process_exec lcp=%p rcvid=%d "
                 "ctp->rcvid=%d "
                 "ppid=%d\n",
                 lcp, rcvid, ctp->rcvid, lcp->ctx.ppid);
+
+            /* Once the image is replaced the parent can no longer setpgid the
+             * process. Marked before the swap, so that no setpgid sees the new
+             * image unmarked, and undone if the swap fails. The slot outlives
+             * the swap, so the mark does too. The exec'ing process is the
+             * loader's parent (kext_process_exec swaps the image into
+             * child->parent), hence ppid. The mark is set under the group
+             * lock so that a setpgid already past its execed check finishes
+             * its move before the swap rather than after it.
+             */
+            proc_pgrp_lock();
+            root_proc(exec_pid)->execed = 1;
+            proc_pgrp_unlock();
             if (process_exec(lcp, &lcp->ctx.rcvid, ctp->rcvid, lcp->ctx.ppid) ==
                 -1) {
+                root_proc(exec_pid)->execed = 0;
                 msg_error(ctp->rcvid, errno);
                 return IOSERV_NOREPLY;
             }

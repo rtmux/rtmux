@@ -1085,7 +1085,9 @@ static void test_sys_kstats(void)
               kstats_get(snap, "thread.live") <= kstats_get(snap, "soul.thread.used") + 2 &&
               kstats_get(snap, "timeout.live") >= 0 &&
               kstats_get(snap, "timeout.live") <= kstats_get(snap, "thread.live") &&
-              lines == (int) (3 * (sizeof pools / sizeof pools[0]) + 5 + (size_t) harts),
+              kstats_get(snap, "prio.reply_depth") > 0 &&
+              kstats_get(snap, "prio.reply_depth_overflow") >= 0 &&
+              lines == (int) (3 * (sizeof pools / sizeof pools[0]) + 9 + (size_t) harts),
           "sys_kstats_format documented keys appear exactly once",
           "a documented key is missing, duplicated, or extra");
 
@@ -1985,6 +1987,348 @@ static void test_posix_poll_readiness(void)
           "a negative descriptor must be ignored with revents 0");
 }
 
+/* /dev/null and /dev/zero never block, so poll reports them readable and
+ * writable at once and select counts them ready; a condition they never raise
+ * (POLLPRI) waits out its timeout instead of reporting POLLERR.
+ */
+static void test_posix_poll_null_devices(void)
+{
+    static const char *const devs[] = {"/dev/null", "/dev/zero"};
+
+    for (size_t i = 0; i < sizeof devs / sizeof devs[0]; i++) {
+        struct pollfd pfd;
+        fd_set rset, wset;
+        struct timeval tv = {0};
+        char name[64];
+        int fd = open(devs[i], O_RDWR);
+
+        if (fd < 0) {
+            snprintf(name, sizeof name, "poll %s open", devs[i]);
+            test_fail(name, strerror(errno));
+            continue;
+        }
+        pfd = (struct pollfd){.fd = fd, .events = POLLIN | POLLOUT};
+        snprintf(name, sizeof name, "poll %s readable and writable", devs[i]);
+        check(poll(&pfd, 1, 0) == 1 &&
+                  pfd.revents == (POLLRDNORM | POLLOUT),
+              name,
+              "a device that never blocks must poll POLLRDNORM|POLLOUT only");
+
+        pfd = (struct pollfd){.fd = fd, .events = POLLPRI};
+        snprintf(name, sizeof name, "poll %s POLLPRI times out", devs[i]);
+        check(poll(&pfd, 1, 50) == 0 && pfd.revents == 0, name,
+              "a condition the device never raises must not report POLLERR");
+
+        FD_ZERO(&rset);
+        FD_ZERO(&wset);
+        FD_SET(fd, &rset);
+        FD_SET(fd, &wset);
+        snprintf(name, sizeof name, "select %s ready", devs[i]);
+        check(select(fd + 1, &rset, &wset, NULL, &tv) == 2 &&
+                  FD_ISSET(fd, &rset) && FD_ISSET(fd, &wset),
+              name, "select must count a never-blocking device ready both ways");
+        (void) close(fd);
+    }
+}
+
+/* A service in this process whose _IO_NOTIFY handler misbehaves on demand, to
+ * check how poll() takes a service that runs out of memory, and that a poll
+ * cancelled while it waits takes its arms away.
+ */
+#define POLL_FAULT_PATH "/poll-fault-test"
+
+enum {
+    POLL_FAULT_NOMEM_ALL, /* every _IO_NOTIFY fails with ENOMEM */
+    POLL_FAULT_NOMEM_ARM, /* not ready; recording an arm fails with ENOMEM */
+    POLL_FAULT_WAIT,      /* not ready; arms are recorded and never fire */
+};
+
+static atomic_int poll_fault_mode;
+static atomic_int poll_fault_arms;    /* arms recorded in POLL_FAULT_WAIT */
+static atomic_int poll_fault_disarms; /* POLL passes seen in POLL_FAULT_WAIT */
+static int poll_fault_ocb;
+
+static int poll_fault_open(ioserv_context_t *ctp,
+                           io_open_t *msg,
+                           void *handle,
+                           void *extra)
+{
+    (void) msg;
+    (void) handle;
+    (void) extra;
+    return ioserv_open_bind(ctp, &poll_fault_ocb, NULL) == -1 ? errno : EOK;
+}
+
+static int poll_fault_notify(ioserv_context_t *ctp, io_notify_t *msg, void *ocb)
+{
+    int mode = atomic_load(&poll_fault_mode);
+    int action = msg->i.action;
+
+    (void) ocb;
+    if (mode == POLL_FAULT_NOMEM_ALL)
+        return ENOMEM;
+    if (action == _NOTIFY_ACTION_CONDARM) {
+        if (mode == POLL_FAULT_NOMEM_ARM)
+            return ENOMEM;
+        atomic_fetch_add(&poll_fault_arms, 1);
+        return EAGAIN;
+    }
+    if (action == _NOTIFY_ACTION_POLL && mode == POLL_FAULT_WAIT)
+        atomic_fetch_add(&poll_fault_disarms, 1);
+    memset(&msg->o, 0, sizeof msg->o);
+    return IOSERV_PTR(ctp, &msg->o, sizeof msg->o);
+}
+
+static const ioserv_connect_ops_t poll_fault_connect_ops = {
+    .nfuncs = IOSERV_CONNECT_NFUNCS,
+    .open = poll_fault_open,
+};
+
+static const ioserv_ops_t poll_fault_io_ops = {
+    .nfuncs = IOSERV_IO_NFUNCS,
+    .notify = poll_fault_notify,
+};
+
+static void *poll_fault_server(void *raw)
+{
+    dispatch_context_t *ctp = dispatch_context_alloc(raw);
+
+    while (ctp && (ctp = dispatch_block(ctp)))
+        (void) dispatch_handler(ctp);
+    return NULL;
+}
+
+static void *poll_fault_waiter(void *raw)
+{
+    struct pollfd pfd = {.fd = *(int *) raw, .events = POLLIN};
+
+    (void) poll(&pfd, 1, 20000);
+    return NULL;
+}
+
+static void test_posix_poll_service_faults(void)
+{
+    struct pollfd pfd;
+    fd_set rset;
+    struct timeval tv = {0};
+    dispatch_t *dpp;
+    pthread_t server, waiter;
+    int id, fd, rc, err, arms, disarms;
+
+    if (!(dpp = dispatch_create())) {
+        test_fail("poll fault service dispatch", strerror(errno));
+        return;
+    }
+    /* SELF: roottask resolves a path to a server in the caller's own process
+     * only for a mount that asks for it, and the client here is that process.
+     */
+    id = ioserv_attach(dpp, NULL, POLL_FAULT_PATH, _FTYPE_ANY,
+                       IOSERV_FLAG_DIR | IOSERV_FLAG_SELF,
+                       &poll_fault_connect_ops, &poll_fault_io_ops, NULL);
+    if (id == -1) {
+        test_skip("poll fault service", "cannot attach a test path");
+        (void) dispatch_destroy(dpp);
+        return;
+    }
+    if (pthread_create(&server, NULL, poll_fault_server, dpp) != 0) {
+        test_fail("poll fault service thread", "pthread_create failed");
+        (void) ioserv_detach(dpp, id, 0);
+        (void) dispatch_destroy(dpp);
+        return;
+    }
+    fd = open(POLL_FAULT_PATH "/node", O_RDONLY);
+    if (fd < 0) {
+        test_fail("poll fault service open", strerror(errno));
+        goto out;
+    }
+
+    /* Out of memory answering the poll pass: an error, not POLLERR. */
+    atomic_store(&poll_fault_mode, POLL_FAULT_NOMEM_ALL);
+    pfd = (struct pollfd){.fd = fd, .events = POLLIN};
+    errno = 0;
+    rc = poll(&pfd, 1, 0);
+    err = errno;
+    check(rc == -1 && err == EAGAIN, "poll service ENOMEM fails with EAGAIN",
+          "a service out of memory must not be reported as POLLERR");
+    FD_ZERO(&rset);
+    FD_SET(fd, &rset);
+    errno = 0;
+    rc = select(fd + 1, &rset, NULL, NULL, &tv);
+    err = errno;
+    check(rc == -1 && err == EAGAIN, "select service ENOMEM fails with EAGAIN",
+          "select must not count a service out of memory as ready");
+
+    /* Out of memory recording the arm of a blocking wait. */
+    atomic_store(&poll_fault_mode, POLL_FAULT_NOMEM_ARM);
+    pfd = (struct pollfd){.fd = fd, .events = POLLIN};
+    errno = 0;
+    rc = poll(&pfd, 1, 100);
+    err = errno;
+    check(rc == -1 && err == EAGAIN, "poll arm ENOMEM fails with EAGAIN",
+          "a service that cannot record an arm must not be reported as POLLERR");
+
+    /* A poll cancelled while it waits disarms what it armed. */
+    atomic_store(&poll_fault_mode, POLL_FAULT_WAIT);
+    atomic_store(&poll_fault_arms, 0);
+    atomic_store(&poll_fault_disarms, 0);
+    if (pthread_create(&waiter, NULL, poll_fault_waiter, &fd) != 0) {
+        test_fail("poll cancel waiter", "pthread_create failed");
+        goto out_fd;
+    }
+    for (int i = 0; i < 100 && atomic_load(&poll_fault_arms) == 0; i++)
+        sleep_ms(10);
+    sleep_ms(50);
+    disarms = atomic_load(&poll_fault_disarms);
+    (void) pthread_cancel(waiter);
+    (void) pthread_join(waiter, NULL);
+    arms = atomic_load(&poll_fault_arms);
+    check(arms == 1 && atomic_load(&poll_fault_disarms) > disarms,
+          "poll cancelled while waiting disarms",
+          "a cancelled poll must send the disarm pass for what it armed");
+out_fd:
+    (void) close(fd);
+out:
+    (void) ioserv_detach(dpp, id, 0);
+    (void) pthread_cancel(server);
+    (void) pthread_join(server, NULL);
+    (void) dispatch_destroy(dpp);
+}
+
+/* A service in this process that answers _IO_NOTIFY with the real
+ * ioserv_notify, to check what it arms: a hangup already known is the reply, so
+ * nothing is armed for it, whether the request is a condition arm or a
+ * transition arm; with no hangup the same requests are armed.
+ */
+#define HUP_ARM_PATH "/hup-arm-test"
+
+static ioserv_notify_t hup_arm_lists[IOSERV_NOTIFY_COUNT];
+static atomic_uint hup_arm_hup;   /* the hangup codes the service reports */
+static atomic_int hup_arm_armed;  /* lists armed after the last request */
+static int hup_arm_ocb;
+
+static int hup_arm_open(ioserv_context_t *ctp,
+                        io_open_t *msg,
+                        void *handle,
+                        void *extra)
+{
+    (void) msg;
+    (void) handle;
+    (void) extra;
+    return ioserv_open_bind(ctp, &hup_arm_ocb, NULL) == -1 ? errno : EOK;
+}
+
+static int hup_arm_notify(ioserv_context_t *ctp, io_notify_t *msg, void *ocb)
+{
+    int ret, armed = 0;
+
+    (void) ocb;
+    ret = ioserv_notify(ctp, msg, hup_arm_lists, 0, atomic_load(&hup_arm_hup),
+                        NULL);
+    for (int i = 0; i < IOSERV_NOTIFY_COUNT; i++)
+        armed += ioserv_notify_armed(hup_arm_lists, i, INT_MAX) != 0;
+    atomic_store(&hup_arm_armed, armed);
+    return ret;
+}
+
+static const ioserv_connect_ops_t hup_arm_connect_ops = {
+    .nfuncs = IOSERV_CONNECT_NFUNCS,
+    .open = hup_arm_open,
+};
+
+static const ioserv_ops_t hup_arm_io_ops = {
+    .nfuncs = IOSERV_IO_NFUNCS,
+    .notify = hup_arm_notify,
+};
+
+/* Send fd an _IO_NOTIFY of the given action that asks for input and carries a
+ * pulse event. Returns 0 or the errno of the send.
+ */
+static int hup_arm_send(int fd, int action, unsigned *hup)
+{
+    io_notify_t msg = {0};
+
+    msg.i.type = _IO_NOTIFY;
+    msg.i.combine_len = sizeof msg.i;
+    msg.i.action = (uint16_t) action;
+    msg.i.flags = (unsigned) _NOTIFY_COND_INPUT;
+    SIGEV_NOTIFICATION_INIT(&msg.i.event, fd, -1, 0, 0);
+    if (msg_sendnc(fd, &msg.i, sizeof msg.i, &msg.o, sizeof msg.o) == -1)
+        return errno;
+    *hup = msg.o.flags_exten;
+    return 0;
+}
+
+static void test_notify_hangup_arm(void)
+{
+    static const struct {
+        int action;
+        const char *name;
+    } kinds[] = {
+        {_NOTIFY_ACTION_CONDARM, "condition arm"},
+        {_NOTIFY_ACTION_TRANARM, "transition arm"},
+    };
+    dispatch_t *dpp;
+    pthread_t server;
+    char what[96];
+    int id, fd;
+
+    if (!(dpp = dispatch_create())) {
+        test_fail("hangup arm service dispatch", strerror(errno));
+        return;
+    }
+    id = ioserv_attach(dpp, NULL, HUP_ARM_PATH, _FTYPE_ANY,
+                       IOSERV_FLAG_DIR | IOSERV_FLAG_SELF,
+                       &hup_arm_connect_ops, &hup_arm_io_ops, NULL);
+    if (id == -1) {
+        test_skip("hangup arm service", "cannot attach a test path");
+        (void) dispatch_destroy(dpp);
+        return;
+    }
+    if (pthread_create(&server, NULL, poll_fault_server, dpp) != 0) {
+        test_fail("hangup arm service thread", "pthread_create failed");
+        (void) ioserv_detach(dpp, id, 0);
+        (void) dispatch_destroy(dpp);
+        return;
+    }
+    fd = open(HUP_ARM_PATH "/node", O_RDONLY);
+    if (fd < 0) {
+        test_fail("hangup arm service open", strerror(errno));
+        goto out;
+    }
+    /* Both kinds, with a hangup and without. Only one transition arm may be
+     * held on the input, and a condition arm leaves a node there, so the
+     * transition arm comes first when something is armed.
+     */
+    for (int hung = 1; hung >= 0; hung--) {
+        for (size_t n = 0; n < sizeof kinds / sizeof *kinds; n++) {
+            size_t k = hung ? n : sizeof kinds / sizeof *kinds - 1 - n;
+            unsigned hup = 0;
+            int err, armed;
+
+            atomic_store(&hup_arm_hup, hung ? (unsigned) POLLHUP : 0u);
+            atomic_store(&hup_arm_armed, -1);
+            err = hup_arm_send(fd, kinds[k].action, &hup);
+            armed = atomic_load(&hup_arm_armed);
+            snprintf(what, sizeof what, "hangup %s %s",
+                     hung ? "known: no arm for a" : "unknown: an arm for a",
+                     kinds[k].name);
+            if (hung)
+                check((err == 0 && (hup & POLLHUP) && armed == 0), what,
+                      "a hangup already known must be the reply, with nothing "
+                      "armed");
+            else
+                check((err == EAGAIN || err == 0) && armed == 1, what,
+                      "without a hangup the request must be armed");
+        }
+    }
+    (void) close(fd);
+out:
+    (void) ioserv_detach(dpp, id, 0);
+    (void) pthread_cancel(server);
+    (void) pthread_join(server, NULL);
+    (void) dispatch_destroy(dpp);
+}
+
 /* Make a pipe read end readable ~50 ms from now, while a blocked poll waits. */
 static void *poll_wake_writer(void *raw)
 {
@@ -2282,6 +2626,424 @@ static void test_posix_select(void)
 
     (void) close(fds[0]);
     (void) close(fds[1]);
+}
+
+/* poll() and select() readiness on a terminal (dev-serial-8250 at /dev/ser1).
+ * Run by the serial-unblock mode, whose harness writes each byte asked for by
+ * serial_inject() to the UART within about a second. Covers an idle line
+ * timing out, a close while polled, two pollers waking on the same byte, a
+ * queued byte being reported at once, and a partial canonical line staying
+ * unreadable until its terminator arrives.
+ */
+#define SERIAL_POLL_DEV "/dev/ser1"
+
+/* How a serial poller waits: poll() on one entry, select(), or poll() with a
+ * second entry for the same descriptor asking only for POLLPRI, which a
+ * terminal never raises and which must not cancel the first entry's arm.
+ */
+enum { SERIAL_WAIT_POLL, SERIAL_WAIT_SELECT, SERIAL_WAIT_POLL_REPEAT };
+
+struct serial_poller {
+    int fd;
+    int how;
+    int timeout_ms;
+    atomic_int done;
+    int rc;
+    int ready; /* 1 readable, 0 not, -1 POLLNVAL */
+};
+
+/* One readability wait on fd, in the given SERIAL_WAIT_* way. */
+static int serial_poll_once(int fd, int how, int timeout_ms, int *ready)
+{
+    int rc;
+
+    if (how == SERIAL_WAIT_SELECT) {
+        struct timeval tv = {.tv_sec = timeout_ms / 1000,
+                             .tv_usec = (timeout_ms % 1000) * 1000};
+        fd_set rset;
+
+        FD_ZERO(&rset);
+        FD_SET(fd, &rset);
+        rc = select(fd + 1, &rset, NULL, NULL, &tv);
+        *ready = rc > 0 && FD_ISSET(fd, &rset);
+    } else {
+        struct pollfd pfd[2] = {{.fd = fd, .events = POLLIN},
+                                {.fd = fd, .events = POLLPRI}};
+
+        rc = poll(pfd, how == SERIAL_WAIT_POLL_REPEAT ? 2 : 1, timeout_ms);
+        *ready = rc > 0 && (pfd[0].revents & POLLIN);
+        if (rc > 0 && (pfd[0].revents & POLLNVAL))
+            *ready = -1;
+    }
+    return rc;
+}
+
+static void *serial_poller_thread(void *raw)
+{
+    struct serial_poller *p = raw;
+
+    p->rc = serial_poll_once(p->fd, p->how, p->timeout_ms, &p->ready);
+    atomic_store(&p->done, 1);
+    return NULL;
+}
+
+static int serial_poller_start(pthread_t *tid, struct serial_poller *p)
+{
+    atomic_init(&p->done, 0);
+    if (pthread_create(tid, NULL, serial_poller_thread, p) == 0)
+        return 0;
+    test_fail("serial_poll poller thread", "pthread_create failed");
+    return -1;
+}
+
+/* Read one byte only once poll says it is there, so a lost injection fails the
+ * check instead of hanging the test. Returns the byte or -1.
+ */
+static int serial_poll_read_ready(int fd)
+{
+    char ch;
+    int ready;
+
+    if (serial_poll_once(fd, SERIAL_WAIT_POLL, 0, &ready) != 1 || ready != 1 ||
+        read(fd, &ch, 1) != 1)
+        return -1;
+    return (unsigned char) ch;
+}
+
+/* Hang the line up (output speed B0) a moment after the poller starts. */
+static void *tty_hangup_setter(void *arg)
+{
+    int fd = (int) (intptr_t) arg;
+    struct termios t;
+
+    sleep_ms(300);
+    if (tcgetattr(fd, &t) == 0 && cfsetospeed(&t, B0) == 0)
+        (void) tcsetattr(fd, TCSANOW, &t);
+    return NULL;
+}
+
+/* A poll that asks for no event waits for hangup alone: it times out on a live
+ * line, ends at once when the line is hung up (B0) and keeps reporting it until
+ * a speed is set again.
+ */
+static void tty_hangup_check(const char *name, const char *path, int fd)
+{
+    char what[96];
+    struct termios saved;
+    struct pollfd pfd = {.fd = fd, .events = 0};
+    struct timespec t0, t1;
+    pthread_t th;
+    long ms;
+    char ch;
+    int rc;
+    bool hup_ok, out_ok, write_ok, read_ok;
+    int nfd;
+
+    if (tcgetattr(fd, &saved) != 0) {
+        test_fail(name, "hangup tcgetattr failed");
+        return;
+    }
+    if (saved.c_ospeed == B0)
+        cfsetospeed(&saved, B38400);
+    snprintf(what, sizeof what, "%s hangup-only poll times out on a live line", name);
+    rc = poll(&pfd, 1, 100);
+    check(rc == 0, what, "poll with no events must wait for hangup alone");
+
+    if (pthread_create(&th, NULL, tty_hangup_setter, (void *) (intptr_t) fd) != 0) {
+        test_fail(name, "hangup thread failed");
+        return;
+    }
+    nfd = open(path, O_RDWR | O_NONBLOCK);
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    rc = poll(&pfd, 1, 10000);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    (void) pthread_join(th, NULL);
+    ms = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+    hup_ok = rc == 1 && (pfd.revents & POLLHUP) && ms < 5000;
+
+    /* The terminal may be where the results are printed, and a hung-up line
+     * refuses writes: everything is measured first and reported after the
+     * speed is set again.
+     */
+    pfd = (struct pollfd){.fd = fd, .events = POLLOUT};
+    out_ok = poll(&pfd, 1, 0) == 1 && (pfd.revents & POLLHUP) &&
+             !(pfd.revents & POLLOUT);
+    errno = 0;
+    write_ok = write(fd, "x", 1) == -1 && errno == EIO;
+    /* A descriptor opened non blocking, so that a line that wrongly waits
+     * fails this check rather than hanging the test.
+     */
+    read_ok = nfd >= 0 && read(nfd, &ch, 1) == 0;
+
+    (void) tcsetattr(fd, TCSANOW, &saved);
+    if (nfd >= 0)
+        (void) close(nfd);
+    snprintf(what, sizeof what, "%s hangup-only poll returns at once on hangup", name);
+    check(hup_ok, what,
+          "a hangup-only poll must return POLLHUP when the line is hung up");
+    snprintf(what, sizeof what, "%s hung-up line reports POLLHUP, not POLLOUT", name);
+    check(out_ok, what,
+          "a hung-up line must report POLLHUP at once and not be writable");
+    snprintf(what, sizeof what, "%s write on a hung-up line fails with EIO", name);
+    check(write_ok, what, "a write to a hung-up line must fail with EIO");
+    snprintf(what, sizeof what, "%s read on a hung-up line is at end of file", name);
+    check(read_ok, what, "a read from a hung-up line must return end of file");
+    pfd = (struct pollfd){.fd = fd, .events = 0};
+    snprintf(what, sizeof what, "%s hangup ends when a speed is set", name);
+    check(poll(&pfd, 1, 50) == 0, what,
+          "setting a speed again must end the hangup");
+}
+
+void test_serial_poll(void)
+{
+    struct serial_poller a = {0}, b = {0}, c = {0}, d = {0};
+    struct pollfd pfd;
+    struct termios t, saved;
+    pthread_t ta, tb, tc, td;
+    int fd, fd2, rc, ready, c1, c2;
+
+    printf("[serial-poll]\n");
+    fd = open(SERIAL_POLL_DEV, O_RDWR);
+    if (fd < 0) {
+        test_fail("serial_poll open", strerror(errno));
+        return;
+    }
+    if (tcgetattr(fd, &saved) != 0) {
+        test_fail("serial_poll tcgetattr", strerror(errno));
+        (void) close(fd);
+        return;
+    }
+    t = saved;
+    t.c_lflag &= ~(tcflag_t) (ICANON | ECHO);
+    if (tcsetattr(fd, TCSAFLUSH, &t) != 0) {
+        test_fail("serial_poll tcsetattr", strerror(errno));
+        goto out;
+    }
+
+    /* Idle line: a bounded wait times out with nothing ready. */
+    rc = serial_poll_once(fd, SERIAL_WAIT_POLL, 50, &ready);
+    check(rc == 0, "serial_poll idle poll times out",
+          "poll({ser, POLLIN}, 50) on an idle line must return 0");
+    rc = serial_poll_once(fd, SERIAL_WAIT_SELECT, 50, &ready);
+    check(rc == 0, "serial_poll idle select times out",
+          "select on an idle line must return 0");
+
+    /* Output is synchronous, so the line is always writable. */
+    pfd = (struct pollfd){.fd = fd, .events = POLLOUT};
+    check(poll(&pfd, 1, 0) == 1 && (pfd.revents & POLLOUT),
+          "serial_poll writable", "a terminal must poll POLLOUT");
+    tty_hangup_check("serial_poll", SERIAL_POLL_DEV, fd);
+
+    /* Close while polled: the armed notification goes with the open, and the
+     * poller ends at its timeout instead of hanging or waking spuriously.
+     */
+    fd2 = open(SERIAL_POLL_DEV, O_RDWR);
+    if (fd2 < 0) {
+        test_fail("serial_poll second open", strerror(errno));
+        goto out;
+    }
+    c.fd = fd2;
+    c.timeout_ms = 600;
+    if (serial_poller_start(&tc, &c) != 0) {
+        (void) close(fd2);
+        goto out;
+    }
+    sleep_ms(200);
+    (void) close(fd2);
+    (void) pthread_join(tc, NULL);
+    check(c.rc == 0 || (c.rc == 1 && c.ready == -1), "serial_poll close while polled",
+          "a poll whose descriptor was closed must time out or report POLLNVAL");
+
+    /* Concurrent pollers, by poll, by select and by poll with a repeated entry
+     * for the descriptor, all wake on the one injected byte, which none
+     * consumes.
+     */
+    a.fd = b.fd = d.fd = fd;
+    a.timeout_ms = b.timeout_ms = d.timeout_ms = 20000;
+    b.how = SERIAL_WAIT_SELECT;
+    d.how = SERIAL_WAIT_POLL_REPEAT;
+    if (serial_poller_start(&ta, &a) != 0)
+        goto out;
+    if (serial_poller_start(&tb, &b) != 0) {
+        (void) pthread_join(ta, NULL);
+        goto out;
+    }
+    if (serial_poller_start(&td, &d) != 0) {
+        (void) pthread_join(ta, NULL);
+        (void) pthread_join(tb, NULL);
+        goto out;
+    }
+    sleep_ms(300);
+    check(!atomic_load(&a.done) && !atomic_load(&b.done) && !atomic_load(&d.done),
+          "serial_poll pollers wait on an idle line",
+          "a poller returned before any byte arrived");
+    serial_inject('y');
+    (void) pthread_join(ta, NULL);
+    (void) pthread_join(tb, NULL);
+    (void) pthread_join(td, NULL);
+    check(a.rc == 1 && a.ready == 1, "serial_poll poll wakes on injected byte",
+          "poll({ser, POLLIN}) must return 1 once a byte arrives");
+    check(b.rc == 1 && b.ready == 1, "serial_poll select wakes on injected byte",
+          "select must report the line readable once a byte arrives");
+    check(d.rc == 1 && d.ready == 1, "serial_poll repeated entry keeps the arm",
+          "a second pollfd for the same terminal must not cancel the first's wait");
+
+    /* The byte is still queued: both calls report it at once. */
+    rc = serial_poll_once(fd, SERIAL_WAIT_POLL, 50, &ready);
+    check(rc == 1 && ready == 1, "serial_poll queued byte polls readable",
+          "data present before poll must be reported");
+    rc = serial_poll_once(fd, SERIAL_WAIT_SELECT, 50, &ready);
+    check(rc == 1 && ready == 1, "serial_poll queued byte selects readable",
+          "data present before select must be reported");
+    check(serial_poll_read_ready(fd) == 'y', "serial_poll read injected byte",
+          "wrong byte, or no byte to read");
+    rc = serial_poll_once(fd, SERIAL_WAIT_POLL, 50, &ready);
+    check(rc == 0, "serial_poll drained line idle again",
+          "a drained line must not poll readable");
+
+    /* Canonical mode: 'z' alone is a partial line and must not be readable;
+     * the CR (ICRNL: newline) completes it and wakes a blocked poller.
+     */
+    t.c_lflag |= ICANON;
+    if (tcsetattr(fd, TCSANOW, &t) != 0) {
+        test_fail("serial_poll canonical tcsetattr", strerror(errno));
+        goto out;
+    }
+    serial_inject('z');
+    rc = serial_poll_once(fd, SERIAL_WAIT_POLL, 3000, &ready);
+    check(rc == 0, "serial_poll partial canonical line not readable",
+          "a line without its terminator must not poll readable");
+    a = (struct serial_poller){.fd = fd, .timeout_ms = 20000};
+    if (serial_poller_start(&ta, &a) != 0)
+        goto out;
+    sleep_ms(300);
+    check(!atomic_load(&a.done), "serial_poll canonical poller waits",
+          "a poller returned on a partial line");
+    serial_inject('\r');
+    (void) pthread_join(ta, NULL);
+    check(a.rc == 1 && a.ready == 1, "serial_poll line terminator wakes poller",
+          "completing a canonical line must make it readable");
+    c1 = serial_poll_read_ready(fd);
+    c2 = serial_poll_read_ready(fd);
+    check(c1 == 'z' && c2 == '\n', "serial_poll read completed line",
+          "the completed line must read back as \"z\\n\"");
+out:
+    (void) tcsetattr(fd, TCSANOW, &saved);
+    (void) close(fd);
+}
+
+/* poll() and select() readiness on the console (/dev/text). Run by the
+ * serial-unblock mode before the serial driver starts, so the bytes the harness
+ * writes for console_inject() reach the console. Covers an idle console timing
+ * out, output always ready, a poller and a select waking on a typed character,
+ * and a typed character being reported at once until it is read.
+ */
+/* A reader that waits on the console when the line is hung up and the speed is
+ * set again at once, before the reader looks again, still gets end of file:
+ * the hangup is not lost because it was over by the time the reader woke.
+ */
+struct hangup_reader {
+    int fd;
+    atomic_int done;
+    ssize_t rc;
+};
+
+static void *hangup_reader_main(void *raw)
+{
+    struct hangup_reader *r = raw;
+    char ch;
+
+    r->rc = read(r->fd, &ch, 1);
+    atomic_store(&r->done, 1);
+    return NULL;
+}
+
+static void console_hangup_wakes_reader(int fd)
+{
+    struct hangup_reader r = {.fd = fd};
+    struct termios saved, hung;
+    pthread_t th;
+    bool woke;
+
+    if (tcgetattr(fd, &saved) != 0 ||
+        pthread_create(&th, NULL, hangup_reader_main, &r) != 0) {
+        test_fail("console_poll hangup wakes a reader", "setup failed");
+        return;
+    }
+    sleep_ms(150); /* the reader is waiting */
+    hung = saved;
+    cfsetospeed(&hung, B0);
+    (void) tcsetattr(fd, TCSANOW, &hung);
+    (void) tcsetattr(fd, TCSANOW, &saved);
+    for (int i = 0; i < 200 && !atomic_load(&r.done); i++)
+        sleep_ms(10);
+    woke = atomic_load(&r.done) && r.rc == 0;
+    if (!atomic_load(&r.done))
+        console_inject('g'); /* let the reader go */
+    (void) pthread_join(th, NULL);
+    check(woke, "console_poll hangup wakes a reader",
+          "a reader that waits must get end of file when the line is hung up, "
+          "also when the speed is set again before it looks");
+}
+
+void test_console_poll(void)
+{
+    struct serial_poller a = {0}, b = {0};
+    struct pollfd pfd;
+    pthread_t ta, tb;
+    int fd, rc, ready;
+
+    printf("[console-poll]\n");
+    fd = open("/dev/text", O_RDWR);
+    if (fd < 0) {
+        test_fail("console_poll open", strerror(errno));
+        return;
+    }
+
+    rc = serial_poll_once(fd, SERIAL_WAIT_POLL, 50, &ready);
+    check(rc == 0, "console_poll idle poll times out",
+          "poll({/dev/text, POLLIN}, 50) with nothing typed must return 0");
+    rc = serial_poll_once(fd, SERIAL_WAIT_SELECT, 50, &ready);
+    check(rc == 0, "console_poll idle select times out",
+          "select on an idle console must return 0");
+    pfd = (struct pollfd){.fd = fd, .events = POLLOUT};
+    check(poll(&pfd, 1, 0) == 1 && pfd.revents == POLLOUT,
+          "console_poll writable", "the console must poll POLLOUT only");
+    tty_hangup_check("console_poll", "/dev/text", fd);
+    test_notify_hangup_arm();
+    console_hangup_wakes_reader(fd);
+
+    a.fd = b.fd = fd;
+    a.timeout_ms = b.timeout_ms = 20000;
+    b.how = SERIAL_WAIT_SELECT;
+    if (serial_poller_start(&ta, &a) != 0)
+        goto out;
+    if (serial_poller_start(&tb, &b) != 0) {
+        (void) pthread_join(ta, NULL);
+        goto out;
+    }
+    sleep_ms(300);
+    check(!atomic_load(&a.done) && !atomic_load(&b.done),
+          "console_poll pollers wait on an idle console",
+          "a poller returned before anything was typed");
+    console_inject('k');
+    (void) pthread_join(ta, NULL);
+    (void) pthread_join(tb, NULL);
+    check(a.rc == 1 && a.ready == 1, "console_poll poll wakes on typed byte",
+          "poll({/dev/text, POLLIN}) must return 1 once a byte is typed");
+    check(b.rc == 1 && b.ready == 1, "console_poll select wakes on typed byte",
+          "select must report the console readable once a byte is typed");
+
+    rc = serial_poll_once(fd, SERIAL_WAIT_POLL, 50, &ready);
+    check(rc == 1 && ready == 1, "console_poll typed byte polls readable",
+          "a byte typed before poll must be reported");
+    check(serial_poll_read_ready(fd) == 'k', "console_poll read typed byte",
+          "wrong byte, or no byte to read");
+    rc = serial_poll_once(fd, SERIAL_WAIT_POLL, 50, &ready);
+    check(rc == 0, "console_poll drained console idle again",
+          "a drained console must not poll readable");
+out:
+    (void) close(fd);
 }
 
 /* A pipe end carries a fixed direction: lseek on a pipe is ESPIPE, writing the
@@ -2601,6 +3363,9 @@ static void test_posix_session_jobcontrol(void)
                   tcgetpgrp(STDIN_FILENO) == pgrp,
               "tc pgrp terminal round trip",
               "terminal foreground process-group get/set must round trip");
+        check(tcgetsid(STDIN_FILENO) == getsid(0),
+              "tcgetsid names the controlling terminal's session",
+              "tcgetsid must return the caller's session leader");
         errno = 0;
         check(tcsetpgrp(STDIN_FILENO, 1000000) == -1 && errno == EPERM,
               "tcsetpgrp rejects foreign pgrp",
@@ -2616,6 +3381,9 @@ static void test_posix_session_jobcontrol(void)
           "setsid must return the caller's pid as the new session id");
     check(getpgrp() == getpid(), "getpgrp tracks setsid",
           "setsid must make the caller's process group equal its pid");
+    check(getsid(0) == getpid() && getsid(getpid()) == getpid(),
+          "getsid tracks setsid",
+          "a session leader's session id must be its own pid");
     errno = 0;
     check(setsid() == -1 && errno == EPERM, "setsid rejects group leader",
           "setsid must fail once the caller is a process-group leader");
@@ -2632,6 +3400,10 @@ static void test_posix_session_jobcontrol(void)
         check(tcsetpgrp(STDIN_FILENO, getpgrp()) == -1 && errno == ENOTTY,
               "tcsetpgrp on a terminal that is not ours",
               "tcsetpgrp must fail ENOTTY on another session's terminal");
+        errno = 0;
+        check(tcgetsid(STDIN_FILENO) == -1 && errno == ENOTTY,
+              "tcgetsid on a terminal that is not ours",
+              "tcgetsid must fail ENOTTY on another session's terminal");
     }
 
     fd = open("/dev/null", O_RDONLY);
@@ -2642,6 +3414,12 @@ static void test_posix_session_jobcontrol(void)
     errno = 0;
     check(tcgetpgrp(fd) == -1 && errno == ENOTTY, "tcgetpgrp on a non-terminal",
           "tcgetpgrp must fail ENOTTY on a non-terminal descriptor");
+    errno = 0;
+    check(tcgetsid(fd) == -1 && errno == ENOTTY, "tcgetsid on a non-terminal",
+          "tcgetsid must fail ENOTTY on a non-terminal descriptor");
+    errno = 0;
+    check(tcgetsid(-1) == -1 && errno == EBADF, "tcgetsid bad fd",
+          "tcgetsid must fail EBADF on a bad descriptor");
     errno = 0;
     check(tcsetpgrp(fd, getpid()) == -1 && errno == ENOTTY,
           "tcsetpgrp on a non-terminal",
@@ -4080,9 +4858,19 @@ static void test_namespace_open_race(void)
     }
     (void) pthread_detach(tid);
 
+    /* Progress lines: a guest that stalls here leaves the last one in the log,
+     * which says whether the open loop or the wait for the churner stopped.
+     */
+    printf("  namespace open race: churner started, %d opens\n", (int) ITERS);
+    fflush(stdout);
     clean = stale = bad = 0;
     for (int i = 0; i < ITERS; i++) {
         int fd;
+
+        if (i && i % 32 == 0) {
+            printf("  namespace open race: %d opens done\n", i);
+            fflush(stdout);
+        }
 
         errno = 0;
         fd = open("/sys/namespace-stats", O_RDONLY);
@@ -4096,6 +4884,8 @@ static void test_namespace_open_race(void)
         }
     }
 
+    printf("  namespace open race: opens done, stopping churner\n");
+    fflush(stdout);
     atomic_store_explicit(&args->stop, 1, memory_order_release);
     while (!atomic_load_explicit(&args->done, memory_order_acquire))
         (void) __sched_yield();
@@ -4169,14 +4959,27 @@ static void test_namespace_open_entry_generation_race(void)
     mismatch_without_generation_bump = 0;
     for (int i = 0; i < ITERS; i++) {
         unsigned long long gen_before;
+        unsigned long long gen_mid;
         unsigned long long gen_after;
         int fd;
         int saw_access;
+        int have_gen;
 
+        /* Bracket the access with two samples of the generation. A removal
+         * that falls between the access and a single sample after it would
+         * bump before the sample and read as a miss with no bump, while one
+         * sample before it lets an attach in the same gap hide a removal that
+         * never bumped. Only when the two agree did the access see the entry
+         * at that generation, so any later removal must move it on.
+         */
+        gen_before = gen_mid = gen_after = 0;
+        have_gen =
+            read_namespace_counter("namespace_version", &gen_before) != -1;
         saw_access = access(path, F_OK) == 0;
-        gen_before = gen_after = 0;
         if (saw_access)
-            (void) read_namespace_counter("namespace_version", &gen_before);
+            have_gen = have_gen &&
+                       read_namespace_counter("namespace_version", &gen_mid) !=
+                           -1;
         errno = 0;
         fd = name_open(name, 0);
         if (fd != -1) {
@@ -4188,9 +4991,10 @@ static void test_namespace_open_entry_generation_race(void)
             absent++;
             if (saw_access) {
                 access_open_mismatch++;
-                if (read_namespace_counter("namespace_version", &gen_after) ==
+                if (!have_gen ||
+                    read_namespace_counter("namespace_version", &gen_after) ==
                         -1 ||
-                    gen_after == gen_before)
+                    (gen_mid == gen_before && gen_after == gen_mid))
                     mismatch_without_generation_bump++;
             }
         } else {
@@ -4224,6 +5028,152 @@ static void test_namespace_open_entry_generation_race(void)
         check(mismatch_without_generation_bump == 0,
               "namespace access/open generation", detail);
     }
+}
+
+/* ns_open_deferral: a stat or access that was in flight when an unlink of the
+ * same node arrived still returns its result and leaves no connection state
+ * behind.
+ *
+ * The namespace server parks the unlink behind the first request and restarts
+ * it when that finishes. It used to answer the request first, with no result,
+ * and skip the combined stat and close, so the call "succeeded" with a zeroed
+ * buffer and its binding stayed on the connection id for good: the next request
+ * that was given that id failed with EBUSY, long after the race. That is the
+ * second round, an access that follows a stat. A node named
+ * rtmux-open-stall-MS holds each open of it for MS ms in a CONFIG_DEBUG_INJECT
+ * image, which keeps the first request in flight while the unlink arrives;
+ * elsewhere it is not held and the case is skipped.
+ */
+#define NSD_STALL_MS 600
+#define NSD_NAME "rtmux-open-stall-600"
+#define NSD_PATH "/dev/name/local/" NSD_NAME
+#define NSD_ATTEMPTS 3
+
+static struct {
+    bool use_access;
+    atomic_int started;
+    int rc;
+    int err;
+    struct stat st;
+    long ms;
+} nsd;
+
+static long nsd_ms_since(const struct timespec *t0)
+{
+    struct timespec t1;
+
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    return (t1.tv_sec - t0->tv_sec) * 1000L + (t1.tv_nsec - t0->tv_nsec) / 1000000L;
+}
+
+static void *nsd_thread(void *arg)
+{
+    struct timespec t0;
+
+    (void) arg;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    atomic_store(&nsd.started, 1);
+    errno = 0;
+    nsd.rc = nsd.use_access ? access(NSD_PATH, F_OK) : stat(NSD_PATH, &nsd.st);
+    nsd.err = errno;
+    nsd.ms = nsd_ms_since(&t0);
+    return NULL;
+}
+
+/* One round. Returns 1 when the request was held and the unlink parked behind
+ * it, 0 when the unlink was not held (a late thread; the caller retries), and
+ * -1 after a failure it has reported.
+ */
+static int nsd_round(bool use_access)
+{
+    const char *what = use_access ? "access" : "stat";
+    char name[48], why[112];
+    name_attach_t *attach;
+    pthread_t th;
+    struct timespec t0;
+    long unlink_ms;
+    int unlink_rc, unlink_err;
+
+    (void) unlink(NSD_PATH);
+    attach = name_attach(NULL, NSD_NAME, 0);
+    if (!attach) {
+        test_fail("ns_open_deferral fixture", strerror(errno));
+        return -1;
+    }
+    memset(&nsd, 0, sizeof nsd);
+    nsd.use_access = use_access;
+    if (pthread_create(&th, NULL, nsd_thread, NULL) != 0) {
+        test_fail("ns_open_deferral fixture", "pthread_create");
+        (void) name_detach(attach, 0);
+        return -1;
+    }
+    while (!atomic_load(&nsd.started))
+        (void) __sched_yield();
+    /* The request is held in the server by now; this unlink parks behind it. */
+    (void) nanosleep(&(struct timespec){.tv_nsec = (NSD_STALL_MS / 4) * 1000000L}, NULL);
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    errno = 0;
+    unlink_rc = unlink(NSD_PATH);
+    unlink_err = errno;
+    unlink_ms = nsd_ms_since(&t0);
+    (void) pthread_join(th, NULL);
+    (void) name_detach(attach, 0);
+
+    if (unlink_ms < NSD_STALL_MS / 4)
+        return 0; /* it ran before the request reached the server, or after it */
+
+    snprintf(name, sizeof name, "ns_open_deferral %s result", what);
+    snprintf(why, sizeof why, "rc %d errno %d mode %#o after %ld ms; unlink rc %d errno %d", nsd.rc,
+             nsd.err, (unsigned) nsd.st.st_mode, nsd.ms, unlink_rc, unlink_err);
+    check(nsd.rc == 0 && (use_access || S_ISNAM(nsd.st.st_mode)), name, why);
+    snprintf(name, sizeof name, "ns_open_deferral %s parked unlink", what);
+    check(unlink_rc == 0 || unlink_err == ENOENT, name,
+          "the unlink parked behind the request must complete");
+    return 1;
+}
+
+int ns_open_deferral(void)
+{
+    struct stat st;
+    struct timespec t0;
+    name_attach_t *attach;
+    long ms;
+    int rc;
+
+    /* Is the stall in this image? A held stat of the fixture node takes the
+     * stall; judged on its time alone when it succeeds, so that a stat that
+     * fails fast is a failure and not a skip.
+     */
+    (void) unlink(NSD_PATH);
+    attach = name_attach(NULL, NSD_NAME, 0);
+    if (!attach) {
+        test_fail("ns_open_deferral fixture", strerror(errno));
+        return 0;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    rc = stat(NSD_PATH, &st);
+    ms = nsd_ms_since(&t0);
+    (void) name_detach(attach, 0);
+    if (rc != 0) {
+        test_fail("ns_open_deferral fixture", strerror(errno));
+        return 0;
+    }
+    if (ms < NSD_STALL_MS / 2)
+        return TC_EXIT_SKIP;
+
+    for (int round = 0; round < 2; round++) {
+        int held = 0;
+
+        for (int i = 0; i < NSD_ATTEMPTS && !held; i++)
+            held = nsd_round(round == 1);
+        if (held < 0)
+            return 0;
+        if (!held) {
+            test_fail("ns_open_deferral", "the unlink was never held behind the request");
+            return 0;
+        }
+    }
+    return 0;
 }
 
 static void test_namespace_uncacheable_bypass(void)
@@ -6377,6 +7327,27 @@ static void test_spawn_malformed_messages_fail_closed(void)
                                             sizeof(pspawn_msg.i), NULL, 0));
     check(rc == EMSGSIZE, "spawn rejects short POSIX message",
           "_PROC_POSIX_SPAWN must reject declared regions outside msglen");
+
+    /* The sender picks attr_bytes, so the file actions can start at an odd
+     * address; the receiver must refuse that rather than build a key mask.
+     */
+    {
+        static union {
+            proc_posixspawn_t m;
+            char raw[sizeof(proc_posixspawn_t) + 4096 + 1 + 8];
+        } buf;
+        proc_posixspawn_t *m = &buf.m;
+
+        memset(&buf, 0, sizeof buf);
+        m->i.type = _PROC_POSIX_SPAWN;
+        m->i.subtype = _PROC_SPAWN_START;
+        m->i.attr_bytes = 4096 + 1;
+        m->i.filact_bytes = 8;
+        rc = roottask_errno_status(
+            msg_sendnc_r(ROOTTASK_COID, &buf, sizeof buf, NULL, 0));
+        check(rc == EINVAL, "spawn rejects misaligned file actions",
+              "an odd attr_bytes must fail EINVAL, not reach key_mask_create");
+    }
 }
 
 /* End-to-end: a valid close/dup2 file-actions object must actually spawn. */
@@ -6680,6 +7651,893 @@ static void test_spawnattr_resetids_runtime(void)
               WEXITSTATUS(status) == 0,
           "spawnattr resetids runtime",
           "POSIX_SPAWN_RESETIDS must reset child effective ids to real ids");
+}
+
+/* Spawn path with the given actions, attributes and environment (NULL for the
+ * caller's). Returns the posix_spawn() result; on success *code is the child's
+ * exit status, or -1 if it did not exit normally.
+ */
+static int spawn_wait_code(const char *path,
+                           const posix_spawn_file_actions_t *actions,
+                           const posix_spawnattr_t *attr,
+                           char *argv[],
+                           char *envp[],
+                           pid_t *pid_out,
+                           int *code)
+{
+    pid_t pid = (pid_t) -1;
+    int status;
+    int rc;
+
+    *code = -1;
+    rc = posix_spawn(&pid, path, actions, attr, argv, envp);
+    if (pid_out)
+        *pid_out = pid;
+    if (rc == EOK && wait_child_exit(pid, &status, 500) && WIFEXITED(status))
+        *code = WEXITSTATUS(status);
+    return rc;
+}
+
+static unsigned spawn_count_open_fds(void)
+{
+    long max = sysconf(_SC_OPEN_MAX);
+    unsigned n = 0;
+
+    for (long fd = 0; fd < max; fd++)
+        if (fcntl((int) fd, F_GETFD) != -1)
+            n++;
+    return n;
+}
+
+static void test_spawnattr_setsid(void)
+{
+    posix_spawnattr_t attr;
+    char *argv[] = {"syscall_testing", "--expect-setsid", NULL};
+    short flags = 0;
+    int code;
+    int rc;
+
+    rc = posix_spawnattr_init(&attr);
+    if (rc != EOK) {
+        test_fail("spawnattr setsid init", strerror(rc));
+        return;
+    }
+    rc = posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSID);
+    check(rc == EOK && posix_spawnattr_getflags(&attr, &flags) == EOK &&
+              flags == POSIX_SPAWN_SETSID,
+          "spawnattr setsid round trip",
+          "POSIX_SPAWN_SETSID must be accepted and stored");
+    if (rc == EOK) {
+        rc = spawn_wait_code("/bin/syscall_testing", NULL, &attr, argv, NULL,
+                             NULL, &code);
+        check(rc == EOK && code == 0, "spawnattr setsid runtime",
+              "a SETSID child must lead a new session with no controlling "
+              "terminal");
+    }
+    (void) posix_spawnattr_destroy(&attr);
+}
+
+/* One chdir/fchdir file-action scenario: the setup adds the actions, then the
+ * spawn must return want_rc and, on success, the child must see cwd `want`.
+ */
+struct spawn_chdir_case {
+    const char *name;
+    const char *path;   /* image, NULL for syscall_testing; a relative one
+                         * resolves after the actions */
+    const char *want;   /* expected child cwd */
+    const char *fds[3]; /* descriptors the child must find open */
+    int want_rc;
+};
+
+static void run_spawn_chdir_case(const struct spawn_chdir_case *c,
+                                 posix_spawn_file_actions_t *actions)
+{
+    char *argv[7] = {"syscall_testing", "--expect-cwd", (char *) c->want};
+    char detail[96];
+    pid_t pid;
+    int code;
+    int rc;
+    int nargs = 3;
+
+    for (int i = 0; i < 3 && c->fds[i]; i++)
+        argv[nargs++] = (char *) c->fds[i];
+    argv[nargs] = NULL;
+    rc = spawn_wait_code(c->path ? c->path : "/bin/syscall_testing", actions,
+                         NULL, argv, NULL, &pid, &code);
+    (void) posix_spawn_file_actions_destroy(actions);
+    snprintf(detail, sizeof detail, "rc=%d want=%d code=%d", rc, c->want_rc,
+             code);
+    if (c->want_rc != EOK)
+        check(rc == c->want_rc && pid == (pid_t) -1, c->name, detail);
+    else
+        check(rc == EOK && code == 0, c->name, detail);
+}
+
+static void test_spawn_file_actions_chdir(void)
+{
+    const char shm_file[] = "/dev/shmem/spawn-chdir-f2";
+    const char created[] = "/dev/shmem/spawn-chdir-created";
+    posix_spawn_file_actions_t fa;
+    char saved[PATH_MAX + 1];
+    char shm[PATH_MAX + 1];
+    char dirfd_arg[16];
+    unsigned before;
+    int fd, dfd;
+
+    if (!getcwd(saved, sizeof saved) || chdir("/dev/shmem") != 0 ||
+        !getcwd(shm, sizeof shm) || chdir(saved) != 0) {
+        test_fail("spawn chdir fixture", strerror(errno));
+        return;
+    }
+
+    check(posix_spawn_file_actions_init(&fa) == EOK &&
+              posix_spawn_file_actions_addfchdir(&fa, -1) == EBADF &&
+              posix_spawn_file_actions_addchdir(&fa, NULL) == EINVAL,
+          "spawn addfchdir/addchdir argument checks",
+          "a negative fd is EBADF and a NULL path EINVAL");
+    (void) posix_spawn_file_actions_destroy(&fa);
+
+    /* addchdir to an absolute directory. */
+    (void) posix_spawn_file_actions_init(&fa);
+    (void) posix_spawn_file_actions_addchdir(&fa, "/dev/shmem");
+    run_spawn_chdir_case(
+        &(struct spawn_chdir_case){
+            "spawn addchdir sets child cwd", NULL, shm, {NULL}, EOK},
+        &fa);
+
+    /* A relative chdir resolves against the previous one. */
+    (void) posix_spawn_file_actions_init(&fa);
+    (void) posix_spawn_file_actions_addchdir(&fa, "/dev");
+    (void) posix_spawn_file_actions_addchdir(&fa, "shmem");
+    run_spawn_chdir_case(
+        &(struct spawn_chdir_case){
+            "spawn relative addchdir chains", NULL, shm, {NULL}, EOK},
+        &fa);
+
+    /* A relative image path resolves in the directory the actions leave. */
+    (void) posix_spawn_file_actions_init(&fa);
+    (void) posix_spawn_file_actions_addchdir(&fa, "/bin");
+    run_spawn_chdir_case(
+        &(struct spawn_chdir_case){"spawn relative image after addchdir",
+                                   "syscall_testing",
+                                   "/bin",
+                                   {NULL},
+                                   EOK},
+        &fa);
+
+    /* After a chdir, an empty chdir or open path is still ENOENT. */
+    (void) posix_spawn_file_actions_init(&fa);
+    (void) posix_spawn_file_actions_addchdir(&fa, "/dev");
+    (void) posix_spawn_file_actions_addchdir(&fa, "");
+    run_spawn_chdir_case(
+        &(struct spawn_chdir_case){
+            "spawn empty addchdir after addchdir is ENOENT", NULL, shm, {NULL},
+            ENOENT},
+        &fa);
+    (void) posix_spawn_file_actions_init(&fa);
+    (void) posix_spawn_file_actions_addchdir(&fa, "/dev");
+    (void) posix_spawn_file_actions_addopen(&fa, 3, "", O_RDONLY, 0);
+    run_spawn_chdir_case(
+        &(struct spawn_chdir_case){
+            "spawn empty addopen after addchdir is ENOENT", NULL, shm, {NULL},
+            ENOENT},
+        &fa);
+
+    /* Without chdir actions a relative image resolves in the caller's cwd. */
+    if (chdir("/bin") == 0) {
+        char *argv[] = {"syscall_testing", "--expect-cwd", "/bin", NULL};
+        int code;
+        int rc = spawn_wait_code("syscall_testing", NULL, NULL, argv, NULL,
+                                 NULL, &code);
+
+        (void) chdir(saved);
+        check(rc == EOK && code == 0, "spawn relative image in caller cwd",
+              "a relative path must resolve against the caller's cwd");
+    } else {
+        test_fail("spawn relative image fixture", strerror(errno));
+    }
+
+    /* A missing directory fails the spawn with ENOENT and no child. */
+    (void) posix_spawn_file_actions_init(&fa);
+    (void) posix_spawn_file_actions_addchdir(&fa, "/missing-spawn-chdir");
+    run_spawn_chdir_case(
+        &(struct spawn_chdir_case){
+            "spawn addchdir missing dir is ENOENT", NULL, shm, {NULL}, ENOENT},
+        &fa);
+
+    /* open, chdir, open: f1 resolves in the caller's cwd, f2 in the new one.
+     * Each file exists only where the right resolution looks for it.
+     */
+    fd = open(shm_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0 || chdir("/dev") != 0) {
+        test_fail("spawn chdir ordered fixture", strerror(errno));
+        if (fd >= 0)
+            (void) close(fd);
+        (void) chdir(saved);
+        return;
+    }
+    (void) close(fd);
+    (void) posix_spawn_file_actions_init(&fa);
+    (void) posix_spawn_file_actions_addopen(&fa, 3, "zero", O_RDONLY, 0);
+    (void) posix_spawn_file_actions_addchdir(&fa, shm);
+    (void) posix_spawn_file_actions_addopen(&fa, 4, "spawn-chdir-f2", O_RDONLY,
+                                            0);
+    run_spawn_chdir_case(
+        &(struct spawn_chdir_case){
+            "spawn addopen/addchdir/addopen order", NULL, shm, {"3", "4"}, EOK},
+        &fa);
+    (void) chdir(saved);
+    (void) unlink(shm_file);
+
+    /* fchdir to a descriptor an earlier addopen produced. */
+    (void) posix_spawn_file_actions_init(&fa);
+    (void) posix_spawn_file_actions_addopen(&fa, 5, "/dev/shmem", O_RDONLY, 0);
+    (void) posix_spawn_file_actions_addfchdir(&fa, 5);
+    run_spawn_chdir_case(
+        &(struct spawn_chdir_case){
+            "spawn addopen then addfchdir", NULL, shm, {"5"}, EOK},
+        &fa);
+
+    /* fchdir to an addopen of a file is ENOTDIR. */
+    (void) posix_spawn_file_actions_init(&fa);
+    (void) posix_spawn_file_actions_addopen(&fa, 5, "/dev/zero", O_RDONLY, 0);
+    (void) posix_spawn_file_actions_addfchdir(&fa, 5);
+    run_spawn_chdir_case(
+        &(struct spawn_chdir_case){"spawn addfchdir non-directory is ENOTDIR",
+                                   NULL,
+                                   shm,
+                                   {NULL},
+                                   ENOTDIR},
+        &fa);
+
+    dfd = open("/dev/shmem", O_RDONLY);
+    if (dfd < 0) {
+        test_fail("spawn fchdir dirfd fixture", strerror(errno));
+        return;
+    }
+    snprintf(dirfd_arg, sizeof dirfd_arg, "%d", dfd);
+
+    /* fchdir follows the descriptor an earlier dup2 placed. */
+    (void) posix_spawn_file_actions_init(&fa);
+    (void) posix_spawn_file_actions_adddup2(&fa, dfd, 6);
+    (void) posix_spawn_file_actions_addfchdir(&fa, 6);
+    run_spawn_chdir_case(
+        &(struct spawn_chdir_case){
+            "spawn adddup2 then addfchdir", NULL, shm, {"6"}, EOK},
+        &fa);
+
+    /* fchdir of a descriptor an earlier addclose closed is EBADF, even though
+     * the caller still has it open.
+     */
+    (void) posix_spawn_file_actions_init(&fa);
+    (void) posix_spawn_file_actions_addclose(&fa, dfd);
+    (void) posix_spawn_file_actions_addfchdir(&fa, dfd);
+    run_spawn_chdir_case(
+        &(struct spawn_chdir_case){
+            "spawn addclose then addfchdir is EBADF", NULL, shm, {NULL}, EBADF},
+        &fa);
+    (void) close(dfd);
+
+    /* A failing chdir after an open must not leak the parent's temporary
+     * descriptor.
+     */
+    (void) unlink(created);
+    before = spawn_count_open_fds();
+    (void) posix_spawn_file_actions_init(&fa);
+    (void) posix_spawn_file_actions_addopen(&fa, 7, created, O_WRONLY | O_CREAT,
+                                            0600);
+    (void) posix_spawn_file_actions_addchdir(&fa, "/missing-spawn-chdir");
+    run_spawn_chdir_case(
+        &(struct spawn_chdir_case){
+            "spawn addchdir failure after addopen", NULL, shm, {NULL}, ENOENT},
+        &fa);
+    check(spawn_count_open_fds() == before,
+          "spawn addchdir failure closes temps",
+          "a failed spawn must close the descriptors its actions opened");
+    (void) unlink(created);
+}
+
+/* Large-argument spawns. roottask receives at most one proc message union
+ * inline (a few KiB); the rest of a longer message stays with the sender. A
+ * native _PROC_SPAWN that long is streamed: the loader fetches its arguments
+ * with _PROC_SPAWN_ARGS at their offset in the sender's message. posix_spawn()
+ * sends another layout, which roottask must read whole and rebuild. Every
+ * pattern string is SPAWN_BIG_LEN bytes counting its NUL and derives from its
+ * index, so the child rebuilds each one and compares it byte for byte.
+ */
+enum { SPAWN_BIG_LEN = 1024, SPAWN_BIG_HIGH_FD = 1000 };
+
+static void spawn_big_fill(char *buf, unsigned idx, bool env)
+{
+    int n = env ? snprintf(buf, SPAWN_BIG_LEN, "BIGENV%u=", idx) : 0;
+
+    for (int k = n; k < SPAWN_BIG_LEN - 1; k++)
+        buf[k] = (char) (0x21 + (idx * 31u + (unsigned) k * 7u) % 94u);
+    buf[SPAWN_BIG_LEN - 1] = '\0';
+}
+
+static bool spawn_big_matches(const char *s, unsigned idx, bool env)
+{
+    char want[SPAWN_BIG_LEN];
+
+    if (!s)
+        return false;
+    spawn_big_fill(want, idx, env);
+    return memcmp(s, want, SPAWN_BIG_LEN) == 0;
+}
+
+/* Child: argv is name, mode, nargs, nenv, fd, then nargs pattern strings; the
+ * environment must be exactly nenv pattern strings, and fd (unless -1) open.
+ */
+int spawn_bigargs_child(int argc, char *argv[])
+{
+    unsigned nargs, nenv;
+    int fd;
+    struct stat st;
+
+    if (argc < 5)
+        return 2;
+    nargs = (unsigned) atoi(argv[2]);
+    nenv = (unsigned) atoi(argv[3]);
+    fd = atoi(argv[4]);
+    if ((unsigned) argc != 5 + nargs)
+        return 3;
+    for (unsigned i = 0; i < nargs; i++)
+        if (!spawn_big_matches(argv[5 + i], i, false))
+            return 4;
+    if (!environ)
+        return 8;
+    for (unsigned i = 0; i < nenv; i++)
+        if (!spawn_big_matches(environ[i], i, true))
+            return 5;
+    if (environ[nenv])
+        return 6;
+    if (fd != -1 && fstat(fd, &st) != 0)
+        return 7;
+    return EXIT_SUCCESS;
+}
+
+/* Spawn the child with nargs + nenv pattern strings and, when fd != -1, fd
+ * as a copy of stdout. `native` sends a _PROC_SPAWN through rtmux_spawn()
+ * instead of posix_spawn(). Returns the spawn result; *code as for
+ * spawn_wait_code().
+ */
+static int spawn_big(bool native,
+                     unsigned nargs,
+                     unsigned nenv,
+                     int fd,
+                     int *code)
+{
+    posix_spawn_file_actions_t fa, *fap = NULL;
+    char nums[3][16];
+    char **argv = calloc(6 + nargs, sizeof(*argv));
+    char **envp = calloc(1 + nenv, sizeof(*envp));
+    char *pool = malloc((size_t) (nargs + nenv) * SPAWN_BIG_LEN + 1);
+    int *fd_map = NULL;
+    int rc = ENOMEM;
+
+    *code = -1;
+    if (!argv || !envp || !pool)
+        goto out;
+    snprintf(nums[0], sizeof nums[0], "%u", nargs);
+    snprintf(nums[1], sizeof nums[1], "%u", nenv);
+    snprintf(nums[2], sizeof nums[2], "%d", fd);
+    argv[0] = "syscall_testing";
+    argv[1] = "--spawn-bigargs-child";
+    argv[2] = nums[0];
+    argv[3] = nums[1];
+    argv[4] = nums[2];
+    for (unsigned i = 0; i < nargs; i++) {
+        argv[5 + i] = pool + (size_t) i * SPAWN_BIG_LEN;
+        spawn_big_fill(argv[5 + i], i, false);
+    }
+    for (unsigned i = 0; i < nenv; i++) {
+        envp[i] = pool + (size_t) (nargs + i) * SPAWN_BIG_LEN;
+        spawn_big_fill(envp[i], i, true);
+    }
+    if (native) {
+        int nfds = fd != -1 ? fd + 1 : 3;
+        pid_t pid;
+        int status;
+
+        /* The fd map rides ahead of the arguments, so a long one moves the
+         * offset the streamed arguments are fetched from.
+         */
+        if (!(fd_map = malloc((size_t) nfds * sizeof(*fd_map))))
+            goto out;
+        for (int i = 0; i < nfds; i++)
+            fd_map[i] = i < 3 ? i : SPAWN_FDCLOSED;
+        if (fd != -1)
+            fd_map[fd] = 1;
+        pid =
+            rtmux_spawn("/bin/syscall_testing", nfds, fd_map, NULL, argv, envp);
+        rc = pid == -1 ? errno : EOK;
+        if (rc == EOK && wait_child_exit(pid, &status, 500) &&
+            WIFEXITED(status))
+            *code = WEXITSTATUS(status);
+        goto out;
+    }
+    if (fd != -1) {
+        if ((rc = posix_spawn_file_actions_init(&fa)) != EOK)
+            goto out;
+        fap = &fa;
+        if ((rc = posix_spawn_file_actions_adddup2(fap, 1, fd)) != EOK)
+            goto out;
+    }
+    rc = spawn_wait_code("/bin/syscall_testing", fap, NULL, argv, envp, NULL,
+                         code);
+out:
+    if (fap)
+        (void) posix_spawn_file_actions_destroy(fap);
+    free(fd_map);
+    free(pool);
+    free(envp);
+    free(argv);
+    return rc;
+}
+
+static void test_spawn_large_arguments(void)
+{
+    static const struct {
+        const char *name;
+        bool native;
+        unsigned nargs, nenv;
+        bool high_fd;
+    } cases[] = {
+        /* sizes either side of the inline limit, then 32 KiB of argv plus
+         * 32 KiB of envp
+         */
+        {"spawn 4 KiB envp", false, 2, 4, false},
+        {"spawn 32 KiB argv", false, 32, 0, false},
+        {"spawn 32 KiB envp", false, 2, 32, false},
+        {"spawn 64 KiB argv+envp byte for byte", false, 32, 32, false},
+        /* a request that fits inline, but the dup2 target needs a 4 KiB
+         * fdmap, which pushes the _PROC_SPAWN roottask builds past it
+         */
+        {"spawn high-fd dup2 with tiny arguments", false, 0, 0, true},
+        {"spawn high-fd dup2 with 4 KiB arguments", false, 2, 2, true},
+        {"spawn 64 KiB arguments with a high-fd dup2", false, 32, 32, true},
+        /* the streamed native path, with and without a long fd map */
+        {"native spawn streams 32 KiB envp", true, 2, 32, false},
+        {"native spawn streams 64 KiB arguments", true, 32, 32, false},
+        {"native spawn streams arguments after a long fd map", true, 32, 32,
+         true},
+    };
+    /* the highest descriptor a child may have */
+    long open_max = sysconf(_SC_OPEN_MAX);
+    int high_fd = (int) (open_max > 0 && open_max <= SPAWN_BIG_HIGH_FD + 1
+                             ? open_max - 1
+                             : SPAWN_BIG_HIGH_FD);
+    char detail[64];
+    int code;
+
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        int rc = spawn_big(cases[i].native, cases[i].nargs, cases[i].nenv,
+                           cases[i].high_fd ? high_fd : -1, &code);
+
+        snprintf(detail, sizeof detail, "rc=%d (%s) child=%d", rc, strerror(rc),
+                 code);
+        check(rc == EOK && code == 0, cases[i].name, detail);
+    }
+}
+
+/* Spawn a --getsid-hold child, with POSIX_SPAWN_SETSID when `setsid`, and wait
+ * until it runs. It exits once *hold is closed. Returns its pid, or -1.
+ */
+static pid_t getsid_hold_spawn(bool setsid, int *hold)
+{
+    char *argv[] = {"syscall_testing", "--getsid-hold", NULL};
+    posix_spawn_file_actions_t fa;
+    posix_spawnattr_t attr;
+    int in[2], out[2];
+    pid_t pid = (pid_t) -1;
+    char c;
+    int rc;
+
+    *hold = -1;
+    if (pipe(in) != 0)
+        return -1;
+    if (pipe(out) != 0) {
+        (void) close(in[0]);
+        (void) close(in[1]);
+        return -1;
+    }
+    /* Only this child may hold the write end, or its EOF never comes. */
+    (void) fcntl(in[1], F_SETFD, FD_CLOEXEC);
+    (void) fcntl(out[0], F_SETFD, FD_CLOEXEC);
+    (void) posix_spawn_file_actions_init(&fa);
+    (void) posix_spawn_file_actions_adddup2(&fa, in[0], 0);
+    (void) posix_spawn_file_actions_adddup2(&fa, out[1], 1);
+    (void) posix_spawn_file_actions_addclose(&fa, in[0]);
+    (void) posix_spawn_file_actions_addclose(&fa, out[1]);
+    (void) posix_spawnattr_init(&attr);
+    if (setsid)
+        (void) posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSID);
+    rc = posix_spawn(&pid, "/bin/syscall_testing", &fa, &attr, argv, NULL);
+    (void) posix_spawnattr_destroy(&attr);
+    (void) posix_spawn_file_actions_destroy(&fa);
+    (void) close(in[0]);
+    (void) close(out[1]);
+    if (rc == EOK && read(out[0], &c, 1) == 1) {
+        *hold = in[1];
+    } else {
+        (void) close(in[1]);
+        if (rc == EOK)
+            (void) wait_child_exit(pid, &(int) {0}, 500);
+        pid = (pid_t) -1;
+    }
+    (void) close(out[0]);
+    return pid;
+}
+
+/* Release a getsid_hold_spawn() child and reap it. True when it saw EOF and
+ * exited cleanly rather than being killed.
+ */
+static bool getsid_hold_release(pid_t pid, int hold)
+{
+    int status;
+
+    (void) close(hold);
+    return wait_child_exit(pid, &status, 500) && WIFEXITED(status) &&
+           WEXITSTATUS(status) == 0;
+}
+
+/* getsid table: the caller, a child in the caller's session, a child leading
+ * its own session, and pids that name no process. Each row gives the expected
+ * result, or -1 with the expected errno. POSIX lets getsid refuse a process in
+ * another session with EPERM, and RTMux does.
+ */
+static void test_getsid_cases(void)
+{
+    pid_t self = getsid(0);
+    pid_t child, leader;
+    int child_hold, leader_hold;
+    char detail[64];
+
+    check(self > 0, "getsid self",
+          "getsid(0) must report the caller's session");
+    child = getsid_hold_spawn(false, &child_hold);
+    leader = getsid_hold_spawn(true, &leader_hold);
+    check(child != (pid_t) -1 && leader != (pid_t) -1, "getsid spawn holders",
+          "the getsid table needs two live children");
+    if (self > 0 && child != (pid_t) -1 && leader != (pid_t) -1) {
+        const struct {
+            const char *name;
+            pid_t pid;
+            pid_t want;
+            int want_errno;
+        } cases[] = {
+            {"getsid self by pid", getpid(), self, 0},
+            {"getsid child shares session", child, self, 0},
+            {"getsid other session is EPERM", leader, -1, EPERM},
+            {"getsid negative pid is ESRCH", -2, -1, ESRCH},
+            {"getsid INT_MAX pid is ESRCH", INT_MAX, -1, ESRCH},
+        };
+
+        for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+            pid_t got;
+            int err;
+
+            errno = 0;
+            got = getsid(cases[i].pid);
+            err = errno;
+            snprintf(detail, sizeof detail, "got %d errno %d, want %d errno %d",
+                     (int) got, err, (int) cases[i].want, cases[i].want_errno);
+            check(got == cases[i].want &&
+                      (got != -1 || err == cases[i].want_errno),
+                  cases[i].name, detail);
+        }
+    }
+    if (leader != (pid_t) -1)
+        check(getsid_hold_release(leader, leader_hold),
+              "getsid session leader released",
+              "the held session leader must exit on EOF");
+    if (child != (pid_t) -1) {
+        bool clean = getsid_hold_release(child, child_hold);
+        pid_t got;
+        int err;
+
+        /* A reaped child's pid names no process. */
+        errno = 0;
+        got = getsid(child);
+        err = errno;
+        snprintf(detail, sizeof detail, "clean exit %d, got %d errno %d",
+                 (int) clean, (int) got, err);
+        check(clean && got == -1 && err == ESRCH, "getsid reaped pid is ESRCH",
+              detail);
+    }
+}
+
+/* Release a getsid_hold_spawn() child ahead of its siblings, ignoring a child
+ * that never started.
+ */
+static bool hold_release(pid_t pid, int hold)
+{
+    return pid == (pid_t) -1 || getsid_hold_release(pid, hold);
+}
+
+/* getpgid table, setpgid by the parent, and a group that outlives its leader.
+ * A process group is its members: a spawned child starts in its parent's
+ * group, the parent may move it (setpgid from parent to spawned child), and a
+ * group stays joinable, and signalled by kill(-pgid), while any member lives
+ * even after the process it is named for has exited.
+ */
+static void test_pgrp_model(void)
+{
+    pid_t self_pg = getpgrp();
+    pid_t a, b, d, e, l, kid;
+    int ah, bh, dh, eh, lh, kh;
+    char detail[96];
+    int err;
+
+    kid = getsid_hold_spawn(false, &kh);
+    l = getsid_hold_spawn(true, &lh);
+    check(kid != (pid_t) -1 && l != (pid_t) -1, "pgrp model spawn children",
+          "the group table needs two live children");
+    if (kid == (pid_t) -1 || l == (pid_t) -1)
+        goto out_kid;
+
+    /* getpgid: the caller, a child (which starts in the caller's group), a
+     * child in another session (EPERM, as for getsid), and no process.
+     */
+    {
+        const struct {
+            const char *name;
+            pid_t pid;
+            pid_t want;
+            int want_errno;
+        } cases[] = {
+            {"getpgid(0) is getpgrp", 0, self_pg, 0},
+            {"getpgid self by pid", getpid(), self_pg, 0},
+            {"getpgid child starts in the caller's group", kid, self_pg, 0},
+            {"getpgid other session is EPERM", l, -1, EPERM},
+            {"getpgid negative pid is ESRCH", -2, -1, ESRCH},
+            {"getpgid INT_MAX pid is ESRCH", INT_MAX, -1, ESRCH},
+        };
+
+        for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+            pid_t got;
+
+            errno = 0;
+            got = getpgid(cases[i].pid);
+            err = errno;
+            snprintf(detail, sizeof detail, "got %d errno %d, want %d errno %d",
+                     (int) got, err, (int) cases[i].want, cases[i].want_errno);
+            check(got == cases[i].want &&
+                      (got != -1 || err == cases[i].want_errno),
+                  cases[i].name, detail);
+        }
+    }
+
+    /* setpgid from the parent to a spawned child: into a group of its own, and
+     * back into the parent's.
+     */
+    check(setpgid(kid, kid) == 0 && getpgid(kid) == kid,
+          "setpgid parent to spawned child leads a group",
+          "the parent must be able to move a spawned child into its own group");
+    check(kill(-kid, 0) == 0, "the child's new group is signalable",
+          "kill(-pgid, 0) must reach the new group");
+    errno = 0;
+    err = setpgid(kid, l) == -1 ? errno : 0;
+    check(err == EPERM, "setpgid to a group of another session is EPERM",
+          "a group in another session cannot be joined");
+    check(setpgid(kid, self_pg) == 0 && getpgid(kid) == self_pg,
+          "setpgid parent moves a child back to the parent's group",
+          "joining the caller's own group must work");
+    errno = 0;
+    err = setpgid(l, l) == -1 ? errno : 0;
+    check(err == EPERM, "setpgid of another session's leader is EPERM",
+          "a session leader may not change group");
+
+    /* A group that outlives its leader. */
+    a = getsid_hold_spawn(false, &ah);
+    b = getsid_hold_spawn(false, &bh);
+    if (a != (pid_t) -1 && b != (pid_t) -1) {
+        bool a_ok;
+        pid_t grp, a_pid;
+
+        check(setpgid(a, a) == 0 && setpgid(b, a) == 0 && getpgid(b) == a,
+              "two children share a group led by the first",
+              "the second child must join the first's group");
+        a_pid = a;
+        a_ok = hold_release(a, ah);
+        a = (pid_t) -1;
+        check(a_ok, "the group leader exits", "the held child must exit");
+        grp = getpgid(b);
+        check(grp == a_pid && kill(-grp, 0) == 0,
+              "a group is still signalable after its leader is gone",
+              "kill(-pgid, 0) must find the surviving member");
+        d = getsid_hold_spawn(false, &dh);
+        if (d != (pid_t) -1) {
+            snprintf(detail, sizeof detail, "group %d, d in %d", (int) grp,
+                     (int) getpgid(d));
+            check(setpgid(d, grp) == 0 && getpgid(d) == grp,
+                  "a group whose leader exited can still be joined", detail);
+            (void) hold_release(d, dh);
+        }
+        (void) hold_release(b, bh);
+        b = (pid_t) -1;
+        /* No member is left: the group no longer exists. */
+        errno = 0;
+        e = getsid_hold_spawn(false, &eh);
+        err = (e != (pid_t) -1 && setpgid(e, grp) == -1) ? errno : 0;
+        check(err == EPERM && kill(-grp, 0) == -1,
+              "a group with no member left cannot be joined or signalled",
+              "an empty group must not exist");
+        (void) hold_release(e, eh);
+    } else {
+        test_fail("pgrp model spawn group", "two children are needed");
+    }
+    (void) hold_release(a, ah);
+    (void) hold_release(b, bh);
+
+out_kid:
+    (void) hold_release(l, lh);
+    (void) hold_release(kid, kh);
+}
+
+static bool spawn_read_report(int fd, char *buf, size_t sz);
+
+/* A --session-probe child: its report, and the pipe that holds it alive. */
+struct session_probe {
+    pid_t pid;
+    int hold;
+    int sid, pg0, rc, err, pg1;
+};
+
+/* The integer after key in line, or `none` when key is absent. */
+static int probe_field(const char *line, const char *key, int none)
+{
+    const char *p = strstr(line, key);
+
+    return p ? atoi(p + strlen(key)) : none;
+}
+
+/* Spawn a --session-probe child (in a session of its own when `setsid`, joining
+ * group `join` when it is positive), and read its one-line report. False if it
+ * did not start or reported nothing readable.
+ */
+static bool session_probe_spawn(bool setsid,
+                                pid_t join,
+                                struct session_probe *sp)
+{
+    char joinarg[16];
+    char *argv[] = {"syscall_testing", "--session-probe", NULL, NULL};
+    posix_spawn_file_actions_t fa;
+    posix_spawnattr_t attr;
+    int in[2], out[2];
+    char line[128] = "";
+    int rc;
+
+    memset(sp, 0, sizeof *sp);
+    sp->pid = (pid_t) -1;
+    sp->hold = -1;
+    if (join > 0) {
+        snprintf(joinarg, sizeof joinarg, "%d", (int) join);
+        argv[2] = joinarg;
+    }
+    if (pipe(in) != 0)
+        return false;
+    if (pipe(out) != 0) {
+        (void) close(in[0]);
+        (void) close(in[1]);
+        return false;
+    }
+    (void) fcntl(in[1], F_SETFD, FD_CLOEXEC);
+    (void) fcntl(out[0], F_SETFD, FD_CLOEXEC);
+    (void) posix_spawn_file_actions_init(&fa);
+    (void) posix_spawn_file_actions_adddup2(&fa, in[0], 0);
+    (void) posix_spawn_file_actions_adddup2(&fa, out[1], 1);
+    (void) posix_spawn_file_actions_addclose(&fa, in[0]);
+    (void) posix_spawn_file_actions_addclose(&fa, out[1]);
+    (void) posix_spawnattr_init(&attr);
+    if (setsid)
+        (void) posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSID);
+    rc = posix_spawn(&sp->pid, "/bin/syscall_testing", &fa, &attr, argv, NULL);
+    (void) posix_spawnattr_destroy(&attr);
+    (void) posix_spawn_file_actions_destroy(&fa);
+    (void) close(in[0]);
+    (void) close(out[1]);
+    if (rc == EOK && !spawn_read_report(out[0], line, sizeof line))
+        line[0] = '\0';
+    (void) close(out[0]);
+    if (rc == EOK && strstr(line, "pg1=")) {
+        sp->sid = probe_field(line, "sid=", -1);
+        sp->pg0 = probe_field(line, "pg0=", -1);
+        sp->rc = probe_field(line, "rc=", -2);
+        sp->err = probe_field(line, "err=", -1);
+        sp->pg1 = probe_field(line, "pg1=", -1);
+        sp->hold = in[1];
+        return true;
+    }
+    (void) close(in[1]);
+    if (rc == EOK)
+        (void) wait_child_exit(sp->pid, &(int){0}, 500);
+    sp->pid = (pid_t) -1;
+    return false;
+}
+
+static void session_probe_release(struct session_probe *sp)
+{
+    if (sp->pid != (pid_t) -1)
+        (void) getsid_hold_release(sp->pid, sp->hold);
+}
+
+/* One rule for "no session": the caller, two children that never called setsid
+ * (one joins the other's group), one that did, and a child that tries to join
+ * that one's group, must agree between getsid, setpgid and kill. A process that
+ * never called setsid belongs to its starter's session, so it reports the
+ * caller's session, may lead a group or join one in that session, and is
+ * signalled by group like any other; a session leader reports itself, is
+ * refused setpgid (EPERM), and is another session for getsid (EPERM) and for
+ * joining its group (EPERM). (tcgetsid needs a terminal, so test_posix_session_
+ * jobcontrol covers it.)
+ */
+static void test_session_rule(void)
+{
+    struct session_probe a, b, c, l;
+    pid_t self = getsid(0);
+    bool ok_a = session_probe_spawn(false, 0, &a);
+    bool ok_l = session_probe_spawn(true, 0, &l);
+    bool ok_b = ok_a && session_probe_spawn(false, a.pid, &b);
+    bool ok_c = ok_l && session_probe_spawn(false, l.pid, &c);
+    char detail[160];
+
+    check(ok_a && ok_l && ok_b && ok_c, "session rule spawn probes",
+          "the session table needs four live children");
+    if (!(ok_a && ok_l && ok_b && ok_c))
+        goto out;
+
+    snprintf(detail, sizeof detail, "a sid %d b sid %d self %d", a.sid, b.sid,
+             (int) self);
+    check(a.sid == self && b.sid == self && a.sid == b.sid,
+          "never-setsid children report the caller's session", detail);
+    snprintf(detail, sizeof detail, "rc %d err %d pg %d pid %d", a.rc, a.err,
+             a.pg1, (int) a.pid);
+    check(a.rc == 0 && a.pg1 == a.pid,
+          "setpgid(0, 0) in a never-setsid child leads its own group", detail);
+    snprintf(detail, sizeof detail, "rc %d err %d pg %d want %d", b.rc, b.err,
+             b.pg1, (int) a.pid);
+    check(b.rc == 0 && b.pg1 == a.pid,
+          "setpgid into another group unlocks the caller once (join succeeds)",
+          detail);
+    snprintf(detail, sizeof detail, "rc %d err %d pg %d", c.rc, c.err, c.pg1);
+    check(c.rc == -1 && c.err == EPERM && c.pg1 == c.pg0,
+          "setpgid into a group of another session is EPERM", detail);
+    snprintf(detail, sizeof detail, "sid %d pid %d rc %d err %d", l.sid,
+             (int) l.pid, l.rc, l.err);
+    check(l.sid == l.pid && l.rc == -1 && l.err == EPERM && l.pg1 == l.pid,
+          "a session leader reports itself and setpgid refuses it", detail);
+
+    {
+        pid_t got_a, got_b, got_l;
+        int e_l, k_a, k_l;
+
+        got_a = getsid(a.pid);
+        got_b = getsid(b.pid);
+        errno = 0;
+        got_l = getsid(l.pid);
+        e_l = errno;
+        snprintf(detail, sizeof detail, "a %d b %d l %d errno %d self %d",
+                 (int) got_a, (int) got_b, (int) got_l, e_l, (int) self);
+        check(got_a == self && got_b == self && got_l == -1 && e_l == EPERM,
+              "getsid from the caller: same session, other session EPERM",
+              detail);
+        k_a = kill(-a.pid, 0);
+        k_l = kill(-l.pid, 0);
+        snprintf(detail, sizeof detail, "kill(-a) %d kill(-l) %d", k_a, k_l);
+        check(k_a == 0 && k_l == 0,
+              "kill by group reaches both sessions' groups", detail);
+    }
+out:
+    if (ok_c)
+        session_probe_release(&c);
+    if (ok_b)
+        session_probe_release(&b);
+    if (ok_a)
+        session_probe_release(&a);
+    if (ok_l)
+        session_probe_release(&l);
 }
 
 static int name_fd_matches(int fd, const name_attach_t *attach)
@@ -8707,6 +10565,7 @@ static void test_posix_at_fd_relative(void)
  * legitimately fail the spawn with EBADF.
  */
 enum { SPAWN_WORKERS = 8, SPAWN_ROUNDS = 100, SPAWN_REPORT_FD = 3 };
+enum { SPAWN_RESIDENTS_MAX = 256 };
 
 struct spawn_worker {
     pthread_t th;
@@ -8715,6 +10574,12 @@ struct spawn_worker {
     int idx;
     int bad_spawn, bad_report, bad_exit;
     int spawn_err; /* first posix_spawn error, for the failure detail */
+    /* The first bad report: its round, whether the read itself failed, and
+     * what was read, printed when the check fails.
+     */
+    int bad_round;
+    bool bad_read;
+    char bad_line[48];
     /* Progress, read by the joining thread to name a stalled worker. */
     _Atomic int round, phase, done;
     pid_t pids[SPAWN_ROUNDS];
@@ -8800,10 +10665,19 @@ static void *spawn_worker_body(void *arg)
             WEXITSTATUS(status) != 0)
             w->bad_exit++;
         w->phase = 3; /* reading the report */
-        if (!spawn_read_report(w->pipefd[0], line, sizeof line) ||
-            strncmp(line, tag, strlen(tag)) || line[strlen(tag)] != ' ' ||
-            strtol(line + strlen(tag) + 1, NULL, 10) != (long) pid)
-            w->bad_report++;
+        bool read_ok = spawn_read_report(w->pipefd[0], line, sizeof line);
+
+        if (!read_ok || strncmp(line, tag, strlen(tag)) ||
+            line[strlen(tag)] != ' ' ||
+            strtol(line + strlen(tag) + 1, NULL, 10) != (long) pid) {
+            if (!w->bad_report++) {
+                w->bad_round = r;
+                w->bad_read = !read_ok;
+                snprintf(w->bad_line, sizeof w->bad_line, "%s",
+                         read_ok ? line : "");
+                w->bad_line[strcspn(w->bad_line, "\n")] = '\0';
+            }
+        }
     }
     w->done = 1;
     return NULL;
@@ -8926,17 +10800,6 @@ static void spawn_join(struct spawn_worker *w)
         (void) pthread_join(w[i].th, NULL);
 }
 
-static unsigned spawn_count_open_fds(void)
-{
-    long max = sysconf(_SC_OPEN_MAX);
-    unsigned n = 0;
-
-    for (long fd = 0; fd < max; fd++)
-        if (fcntl((int) fd, F_GETFD) != -1)
-            n++;
-    return n;
-}
-
 static int spawn_count_dup_pids(const struct spawn_worker *w)
 {
     int dup = 0;
@@ -9005,9 +10868,246 @@ void test_spawn_concurrent(void)
                  "spawn=%d (%s) report=%d exit=%d dup_pid=%d fds %u->%u", bad_spawn,
                  spawn_err ? strerror(spawn_err) : "-", bad_report, bad_exit, dup_pid,
                  fds_before, fds_after);
+        for (int i = 0; i < piped && bad_report; i++)
+            if (w[i].bad_report)
+                printf("spawn_concurrent: w%d %d bad report(s), first in round "
+                       "%d: %s \"%s\" (pid %d)\n",
+                       i, w[i].bad_report, w[i].bad_round,
+                       w[i].bad_read ? "read failed" : "read", w[i].bad_line,
+                       (int) w[i].pids[w[i].bad_round]);
         check(!bad_spawn && !bad_report && !bad_exit && !dup_pid &&
                   fds_before == fds_after,
               "spawn_concurrent 8x100 exact argv/envp, unique pids, no fd leak",
+              detail);
+    }
+}
+
+/* Print roottask's heap use and the free physical memory with "residents" idle
+ * processes alive, so a run shows how close the storm came to exhausting either
+ * (K26).
+ */
+static void spawn_storm_report_memory(unsigned residents)
+{
+    char snap[4096];
+    int fd = open("/sys/kstats", O_RDONLY);
+
+    if (fd < 0)
+        return;
+    if (kstats_read(fd, snap, sizeof snap) > 0)
+        printf("spawn_storm: residents=%u roottask.heap_used=%ld pa.free_bytes=%ld\n",
+               residents, kstats_get(snap, "roottask.heap_used"),
+               kstats_get(snap, "pa.free_bytes"));
+    (void) close(fd);
+}
+
+/* The middle process of the orphan test: leave a grandchild blocked on stdin,
+ * report its pid on stdout, and exit before it. Stdin is the gate the test
+ * closes, stdout the report pipe.
+ */
+int orphan_exit_mid(void)
+{
+    posix_spawn_file_actions_t fa;
+    char *argv[] = {"cat", NULL};
+    char *envp[] = {NULL};
+    char buf[32];
+    pid_t g;
+    int n, rc;
+
+    /* The grandchild keeps neither the report pipe nor stdout. */
+    rc = posix_spawn_file_actions_init(&fa);
+    if (rc)
+        return EXIT_FAILURE;
+    rc = posix_spawn_file_actions_addclose(&fa, SPAWN_REPORT_FD);
+    if (!rc)
+        rc = posix_spawn_file_actions_addopen(&fa, STDOUT_FILENO, "/dev/null",
+                                              O_WRONLY, 0);
+    if (!rc)
+        rc = posix_spawn(&g, "/bin/cat", &fa, NULL, argv, envp);
+    (void) posix_spawn_file_actions_destroy(&fa);
+    if (rc)
+        return EXIT_FAILURE;
+    n = snprintf(buf, sizeof buf, "%d\n", (int) g);
+    return write(SPAWN_REPORT_FD, buf, (size_t) n) == n ? EXIT_SUCCESS
+                                                      : EXIT_FAILURE;
+}
+
+/* True if procfs lists pid. */
+static bool proc_listed(pid_t pid)
+{
+    char path[32];
+    int fd;
+
+    snprintf(path, sizeof path, "/proc/%d", (int) pid);
+    if ((fd = open(path, O_RDONLY)) < 0)
+        return false;
+    (void) close(fd);
+    return true;
+}
+
+/* A child that outlives its parent must still finish exiting. Roottask kept
+ * the parent pid recorded at spawn, so once that parent was gone the orphan's
+ * exit retried for ever to lock it, holding a pool thread and never leaving the
+ * process table.
+ */
+void test_orphan_exit(void)
+{
+    char *argv[] = {"syscall_testing", "--orphan-exit-mid", NULL};
+    posix_spawn_file_actions_t fa;
+    int gate[2] = {-1, -1}, rep[2] = {-1, -1}, status = 0, rc, gone = 0;
+    char line[32];
+    pid_t mid = -1, g = -1;
+    bool reaped = false;
+
+    /* Only the middle process and its grandchild may hold the gate's read end,
+     * and only the test its write end, or EOF would never come.
+     */
+    rc = pipe(gate) != 0 || pipe(rep) != 0;
+    for (int i = 0; !rc && i < 2; i++)
+        rc = fcntl(gate[i], F_SETFD, FD_CLOEXEC) != 0 ||
+             fcntl(rep[i], F_SETFD, FD_CLOEXEC) != 0;
+    if (rc) {
+        test_fail("orphan_exit fixture", strerror(errno));
+        goto out;
+    }
+    rc = posix_spawn_file_actions_init(&fa);
+    if (!rc) {
+        rc = posix_spawn_file_actions_adddup2(&fa, gate[0], STDIN_FILENO);
+        if (!rc)
+            rc = posix_spawn_file_actions_adddup2(&fa, rep[1], SPAWN_REPORT_FD);
+        if (!rc)
+            rc = posix_spawn(&mid, "/bin/syscall_testing", &fa, NULL, argv, NULL);
+        (void) posix_spawn_file_actions_destroy(&fa);
+    }
+    (void) close(gate[0]);
+    gate[0] = -1;
+    (void) close(rep[1]);
+    rep[1] = -1;
+    if (rc) {
+        test_fail("orphan_exit spawn", strerror(rc));
+        goto out;
+    }
+    if (!spawn_read_report(rep[0], line, sizeof line) ||
+        (g = (pid_t) strtol(line, NULL, 10)) <= 0) {
+        test_fail("orphan_exit fixture", "middle process did not report");
+        goto out;
+    }
+    reaped = waitpid(mid, &status, 0) == mid;
+    if (!reaped || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        test_fail("orphan_exit fixture", "middle process did not exit cleanly");
+        goto out;
+    }
+    if (!proc_listed(g)) {
+        test_fail("orphan_exit fixture", "the orphan is not in /proc");
+        goto out;
+    }
+    (void) close(gate[1]); /* EOF: the orphan reads it and exits */
+    gate[1] = -1;
+    /* kill() already says ESRCH once a process is exiting: ask procfs, which
+     * lists the orphan until roottask has destroyed it.
+     */
+    for (int i = 0; i < 100 && !gone; i++) {
+        gone = !proc_listed(g);
+        if (!gone)
+            sleep_ms(50);
+    }
+    check(gone, "orphan_exit a child whose parent is gone finishes exiting",
+          "the orphan stayed in the process table");
+    if (!gone)
+        (void) kill(g, SIGKILL);
+out:
+    if (mid > 0 && !reaped) {
+        (void) kill(mid, SIGKILL);
+        (void) waitpid(mid, &status, 0);
+    }
+    for (int i = 0; i < 2; i++) {
+        if (gate[i] >= 0)
+            (void) close(gate[i]);
+        if (rep[i] >= 0)
+            (void) close(rep[i]);
+    }
+}
+
+#define SPAWN_HEAP_ROUNDS 2
+
+/* Run the spawn storm with residents idle processes alive across it: each is
+ * /bin/cat (the small toolbox binary) blocked reading a pipe until EOF. The
+ * kernel's pshut and irqoff lines (CONFIG_INSTRUMENTATION) printed before the
+ * "storm done" marker cover the storm's exits at that process count.
+ */
+void test_spawn_storm(unsigned residents)
+{
+    static pid_t pids[SPAWN_RESIDENTS_MAX];
+    char *argv[] = {"cat", NULL};
+    char *envp[] = {NULL};
+    unsigned spawned = 0, bad_exit = 0;
+    char detail[96];
+    int p[2];
+
+    if (residents > SPAWN_RESIDENTS_MAX || pipe(p) != 0) {
+        test_fail("spawn_storm residents fixture",
+                  residents > SPAWN_RESIDENTS_MAX ? "too many" : strerror(errno));
+        return;
+    }
+    /* A resident that kept the write end open would never see EOF. */
+    if (fcntl(p[0], F_SETFD, FD_CLOEXEC) != 0 || fcntl(p[1], F_SETFD, FD_CLOEXEC) != 0) {
+        test_fail("spawn_storm residents fixture", strerror(errno));
+        (void) close(p[0]);
+        (void) close(p[1]);
+        return;
+    }
+    spawn_storm_report_memory(0);
+    for (; spawned < residents; spawned++) {
+        posix_spawn_file_actions_t fa;
+
+        if (spawned && spawned % 50 == 0)
+            spawn_storm_report_memory(spawned);
+        int rc = posix_spawn_file_actions_init(&fa);
+
+        if (!rc) {
+            rc = posix_spawn_file_actions_adddup2(&fa, p[0], STDIN_FILENO);
+            if (!rc)
+                rc = posix_spawn_file_actions_addopen(&fa, STDOUT_FILENO, "/dev/null",
+                                                      O_WRONLY, 0);
+            if (!rc)
+                rc = posix_spawn(&pids[spawned], "/bin/cat", &fa, NULL, argv, envp);
+            (void) posix_spawn_file_actions_destroy(&fa);
+        }
+        if (rc) {
+            snprintf(detail, sizeof detail, "resident %u: %s", spawned, strerror(rc));
+            test_fail("spawn_storm residents", detail);
+            break;
+        }
+    }
+    printf("spawn_storm: residents=%u\n", spawned);
+    spawn_storm_report_memory(spawned);
+    if (spawned == residents) {
+        /* Spawns with 32 and 64 KiB arguments after each concurrent storm:
+         * the storm leaves roottask's fixed heap holding blocks of many
+         * sizes, and these needed new backing the heap could no longer give
+         * (K43).
+         */
+        for (int round = 0; round < SPAWN_HEAP_ROUNDS; round++) {
+            test_spawn_concurrent();
+            spawn_storm_report_memory(spawned);
+            test_spawn_large_arguments();
+            spawn_storm_report_memory(spawned);
+        }
+        sleep(2); /* let one more pshut/irqoff report land before the marker */
+        printf("spawn_storm: storm done residents=%u\n", spawned);
+    }
+    (void) close(p[1]);
+    (void) close(p[0]);
+    for (unsigned i = 0; i < spawned; i++) {
+        int status;
+
+        if (waitpid(pids[i], &status, 0) != pids[i] || !WIFEXITED(status) ||
+            WEXITSTATUS(status) != 0)
+            bad_exit++;
+    }
+    if (residents) {
+        snprintf(detail, sizeof detail, "%u of %u residents exited badly", bad_exit,
+                 spawned);
+        check(spawned == residents && !bad_exit, "spawn_storm residents spawn and exit",
               detail);
     }
 }
@@ -9037,6 +11137,7 @@ void test_vfs(void)
     test_sys_kstats();
     test_sys_log_read();
     test_spawn_concurrent();
+    test_orphan_exit();
     test_malloc_growth();
     test_posix_errno_corners();
     test_posix_access_and_path_corners();
@@ -9053,6 +11154,8 @@ void test_vfs(void)
     test_posix_open_creat_excl_existing();
     test_posix_fstat_file_types();
     test_posix_poll_readiness();
+    test_posix_poll_null_devices();
+    test_posix_poll_service_faults();
     test_posix_poll_blocking();
     test_posix_poll_hup();
     test_posix_select();
@@ -9065,6 +11168,11 @@ void test_vfs(void)
     test_posix_isatty();
     test_posix__exit();
     test_posix_crypt();
+    /* Before the suite's own setsid: its children are then still in the session
+     * the suite was started in, which for a boot-time starter is the system
+     * session.
+     */
+    test_session_rule();
     test_posix_session_jobcontrol();
     test_posix_fsync();
     test_posix_sync();
@@ -9125,6 +11233,11 @@ void test_vfs(void)
     test_spawnp_absolute_path();
     test_spawnattr_flags();
     test_spawnattr_resetids_runtime();
+    test_spawnattr_setsid();
+    test_spawn_file_actions_chdir();
+    test_spawn_large_arguments();
+    test_getsid_cases();
+    test_pgrp_model();
     test_proc_lifecycle_burst_wait();
     test_proc_wait_handle_stale_after_reap();
     test_kill_zero_after_reap();

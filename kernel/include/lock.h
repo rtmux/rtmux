@@ -109,26 +109,31 @@ enum lock_class {
      * then act" pattern for IPC namespace kcalls (ksys_connect_attach / detach
      * / *_info, ksys_channel_*).
      */
-    LOCK_CLASS_PROCVEC, /* per-process fdcons/chancons vector ops */
-    LOCK_CLASS_CHANNEL, /* per-channel state */
-    LOCK_CLASS_CONNECT, /* per-connection state */
-    LOCK_CLASS_SYNC,    /* sync_t hash + ksync_t */
-    LOCK_CLASS_PROCESS, /* per-process struct (non-vec scalar fields) */
-    LOCK_CLASS_THREAD,  /* per-thread struct */
-    LOCK_CLASS_SOUL,    /* object soul freelists + accounting (soul_slock):
-                         * ranked after the object locks that callers hold on
-                         * an object_alloc/object_free path (CHANNEL, PROCVEC,
-                         * THREAD, TIMER, INTREVENT) and before MEMPART so a
-                         * grow/shrink may nest SOUL -> MEMPART into the heap.
-                         */
-    LOCK_CLASS_MEMPART, /* memory partition / heap */
-    LOCK_CLASS_PA,      /* physical quantum allocator (pa_slock):
-                         * leaf, ranked after MEMPART so the heap
-                         * (alloc_slock, MEMPART) may call pa_alloc
-                         * while held.  pa_alloc/_pa_free take no
-                         * other lock while holding it.
-                         */
-    LOCK_CLASS_DEBUG,   /* debugger interlock */
+    LOCK_CLASS_PROCVEC,    /* per-process fdcons/chancons vector ops */
+    LOCK_CLASS_CHANNEL,    /* per-channel state */
+    LOCK_CLASS_CONNECT,    /* per-connection state */
+    LOCK_CLASS_SYNC,       /* sync_t hash + ksync_t */
+    LOCK_CLASS_PROCESS,    /* per-process struct (non-vec scalar fields) */
+    LOCK_CLASS_THREAD,     /* per-thread struct */
+    LOCK_CLASS_SOUL,       /* object soul freelists + accounting (soul_slock):
+                            * ranked after the object locks that callers hold on
+                            * an object_alloc/object_free path (CHANNEL, PROCVEC,
+                            * THREAD, TIMER, INTREVENT) and before MEMPART: only
+                            * a free that returns a block to the heap nests
+                            * SOUL -> MEMPART; a grow allocates with it released.
+                            */
+    LOCK_CLASS_MEMPART,    /* memory partition / heap */
+    LOCK_CLASS_PA,         /* physical quantum allocator (pa_slock):
+                            * leaf, ranked after MEMPART so the heap
+                            * (alloc_slock, MEMPART) may call pa_alloc
+                            * while held.  pa_alloc/_pa_free take no
+                            * other lock while holding it.
+                            */
+    LOCK_CLASS_PRIO_DEFER, /* the lists of servers awaiting a priority
+                            * settle, one per hart: leaf, taken by force_ready
+                            * under any caller lock and holding nothing else.
+                            */
+    LOCK_CLASS_DEBUG,      /* debugger interlock */
 
     LOCK_CLASS_NR /* must stay last */
 };

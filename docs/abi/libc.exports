@@ -20,6 +20,7 @@ __get_errno_ptr	FUNC	GLOBAL	DEFAULT	-
 __interrupt_attach_event	FUNC	WEAK	DEFAULT	-
 __interrupt_mask	FUNC	WEAK	DEFAULT	-
 __interrupt_unmask	FUNC	WEAK	DEFAULT	-
+__rtmux_mallocstats	FUNC	GLOBAL	DEFAULT	-
 __rtmux_syschan_init	FUNC	GLOBAL	DEFAULT	-
 __sched_get	FUNC	WEAK	DEFAULT	-
 __sched_get_r	FUNC	WEAK	DEFAULT	-
@@ -118,9 +119,11 @@ creat	FUNC	GLOBAL	DEFAULT	-
 crypt	FUNC	GLOBAL	DEFAULT	-
 ctime	FUNC	GLOBAL	DEFAULT	-
 ctime_r	FUNC	GLOBAL	DEFAULT	-
+daylight	OBJECT	GLOBAL	DEFAULT	-
 dbgprint	FUNC	WEAK	DEFAULT	-
 dbgprintf	FUNC	GLOBAL	DEFAULT	-
 devctl	FUNC	GLOBAL	DEFAULT	-
+difftime	FUNC	GLOBAL	DEFAULT	-
 dispatch_block	FUNC	GLOBAL	DEFAULT	-
 dispatch_context_alloc	FUNC	GLOBAL	DEFAULT	-
 dispatch_context_free	FUNC	GLOBAL	DEFAULT	-
@@ -133,7 +136,7 @@ dup	FUNC	GLOBAL	DEFAULT	-
 dup2	FUNC	GLOBAL	DEFAULT	-
 endgrent	FUNC	GLOBAL	DEFAULT	-
 endpwent	FUNC	GLOBAL	DEFAULT	-
-environ	OBJECT	GLOBAL	DEFAULT	-
+environ	OBJECT	WEAK	DEFAULT	-
 execl	FUNC	GLOBAL	DEFAULT	-
 execle	FUNC	GLOBAL	DEFAULT	-
 execlp	FUNC	GLOBAL	DEFAULT	-
@@ -190,6 +193,10 @@ getgroups	FUNC	GLOBAL	DEFAULT	-
 getlogin	FUNC	GLOBAL	DEFAULT	-
 getlogin_r	FUNC	GLOBAL	DEFAULT	-
 getopt	FUNC	GLOBAL	DEFAULT	-
+getopt_long	FUNC	GLOBAL	DEFAULT	-
+getopt_long_only	FUNC	GLOBAL	DEFAULT	-
+getpagesize	FUNC	GLOBAL	DEFAULT	-
+getpgid	FUNC	GLOBAL	DEFAULT	-
 getpgrp	FUNC	GLOBAL	DEFAULT	-
 getpid	FUNC	GLOBAL	DEFAULT	-
 getppid	FUNC	GLOBAL	DEFAULT	-
@@ -200,6 +207,7 @@ getpwuid	FUNC	GLOBAL	DEFAULT	-
 getpwuid_r	FUNC	GLOBAL	DEFAULT	-
 getrlimit	FUNC	GLOBAL	DEFAULT	-
 getrusage	FUNC	GLOBAL	DEFAULT	-
+getsid	FUNC	GLOBAL	DEFAULT	-
 getsubopt	FUNC	GLOBAL	DEFAULT	-
 gettimeofday	FUNC	GLOBAL	DEFAULT	-
 getuid	FUNC	GLOBAL	DEFAULT	-
@@ -228,6 +236,11 @@ ioserv_msgread	FUNC	GLOBAL	DEFAULT	-
 ioserv_msgreadv	FUNC	GLOBAL	DEFAULT	-
 ioserv_msgwrite	FUNC	GLOBAL	DEFAULT	-
 ioserv_msgwritev	FUNC	GLOBAL	DEFAULT	-
+ioserv_notify	FUNC	GLOBAL	DEFAULT	-
+ioserv_notify_init	FUNC	GLOBAL	DEFAULT	-
+ioserv_notify_ready	FUNC	GLOBAL	DEFAULT	-
+ioserv_notify_remove	FUNC	GLOBAL	DEFAULT	-
+ioserv_notify_trigger	FUNC	GLOBAL	DEFAULT	-
 ioserv_ocb	FUNC	GLOBAL	DEFAULT	-
 ioserv_open_bind	FUNC	GLOBAL	DEFAULT	-
 ioserv_reply_counters_format	FUNC	GLOBAL	DEFAULT	-
@@ -263,6 +276,7 @@ memobj_handle_from_fd_r	FUNC	GLOBAL	DEFAULT	-
 memset	FUNC	GLOBAL	DEFAULT	-
 message_attach	FUNC	GLOBAL	DEFAULT	-
 message_connect	FUNC	GLOBAL	DEFAULT	-
+mktime	FUNC	GLOBAL	DEFAULT	-
 mlock	FUNC	GLOBAL	DEFAULT	-
 mlockall	FUNC	GLOBAL	DEFAULT	-
 mmap	FUNC	GLOBAL	DEFAULT	-
@@ -346,6 +360,7 @@ optarg	OBJECT	GLOBAL	DEFAULT	-
 opterr	OBJECT	GLOBAL	DEFAULT	-
 optind	OBJECT	GLOBAL	DEFAULT	-
 optopt	OBJECT	GLOBAL	DEFAULT	-
+optreset	OBJECT	GLOBAL	DEFAULT	-
 pathconf	FUNC	GLOBAL	DEFAULT	-
 pause	FUNC	GLOBAL	DEFAULT	-
 perror	FUNC	GLOBAL	DEFAULT	-
@@ -354,8 +369,10 @@ poll	FUNC	GLOBAL	DEFAULT	-
 posix_mem_offset	FUNC	GLOBAL	DEFAULT	-
 posix_memalign	FUNC	GLOBAL	DEFAULT	-
 posix_spawn	FUNC	GLOBAL	DEFAULT	-
+posix_spawn_file_actions_addchdir	FUNC	GLOBAL	DEFAULT	-
 posix_spawn_file_actions_addclose	FUNC	GLOBAL	DEFAULT	-
 posix_spawn_file_actions_adddup2	FUNC	GLOBAL	DEFAULT	-
+posix_spawn_file_actions_addfchdir	FUNC	GLOBAL	DEFAULT	-
 posix_spawn_file_actions_addopen	FUNC	GLOBAL	DEFAULT	-
 posix_spawn_file_actions_destroy	FUNC	GLOBAL	DEFAULT	-
 posix_spawn_file_actions_init	FUNC	GLOBAL	DEFAULT	-
@@ -431,6 +448,7 @@ pthread_join	FUNC	GLOBAL	DEFAULT	-
 pthread_key_create	FUNC	GLOBAL	DEFAULT	-
 pthread_key_delete	FUNC	GLOBAL	DEFAULT	-
 pthread_kill	FUNC	GLOBAL	DEFAULT	-
+pthread_mutex_consistent	FUNC	GLOBAL	DEFAULT	-
 pthread_mutex_destroy	FUNC	GLOBAL	DEFAULT	-
 pthread_mutex_getprioceiling	FUNC	GLOBAL	DEFAULT	-
 pthread_mutex_init	FUNC	GLOBAL	DEFAULT	-
@@ -443,11 +461,13 @@ pthread_mutexattr_destroy	FUNC	GLOBAL	DEFAULT	-
 pthread_mutexattr_getprioceiling	FUNC	GLOBAL	DEFAULT	-
 pthread_mutexattr_getprotocol	FUNC	GLOBAL	DEFAULT	-
 pthread_mutexattr_getpshared	FUNC	GLOBAL	DEFAULT	-
+pthread_mutexattr_getrobust	FUNC	GLOBAL	DEFAULT	-
 pthread_mutexattr_gettype	FUNC	GLOBAL	DEFAULT	-
 pthread_mutexattr_init	FUNC	GLOBAL	DEFAULT	-
 pthread_mutexattr_setprioceiling	FUNC	GLOBAL	DEFAULT	-
 pthread_mutexattr_setprotocol	FUNC	GLOBAL	DEFAULT	-
 pthread_mutexattr_setpshared	FUNC	GLOBAL	DEFAULT	-
+pthread_mutexattr_setrobust	FUNC	GLOBAL	DEFAULT	-
 pthread_mutexattr_settype	FUNC	GLOBAL	DEFAULT	-
 pthread_once	FUNC	GLOBAL	DEFAULT	-
 pthread_rwlock_destroy	FUNC	GLOBAL	DEFAULT	-
@@ -485,6 +505,7 @@ putenv	FUNC	GLOBAL	DEFAULT	-
 puts	FUNC	GLOBAL	DEFAULT	-
 pwrite	FUNC	GLOBAL	DEFAULT	-
 qsort	FUNC	GLOBAL	DEFAULT	-
+qsort_r	FUNC	GLOBAL	DEFAULT	-
 raise	FUNC	GLOBAL	DEFAULT	-
 rand_r	FUNC	GLOBAL	DEFAULT	-
 read	FUNC	GLOBAL	DEFAULT	-
@@ -607,6 +628,7 @@ tcflow	FUNC	GLOBAL	DEFAULT	-
 tcflush	FUNC	GLOBAL	DEFAULT	-
 tcgetattr	FUNC	GLOBAL	DEFAULT	-
 tcgetpgrp	FUNC	GLOBAL	DEFAULT	-
+tcgetsid	FUNC	GLOBAL	DEFAULT	-
 tcsendbreak	FUNC	GLOBAL	DEFAULT	-
 tcsetattr	FUNC	GLOBAL	DEFAULT	-
 tcsetpgrp	FUNC	GLOBAL	DEFAULT	-
@@ -624,15 +646,19 @@ thread_join_r	FUNC	WEAK	DEFAULT	-
 thread_pool_create	FUNC	GLOBAL	DEFAULT	-
 thread_pool_start	FUNC	GLOBAL	DEFAULT	-
 time	FUNC	GLOBAL	DEFAULT	-
+timegm	FUNC	GLOBAL	DEFAULT	-
 timer_create	FUNC	GLOBAL	DEFAULT	-
 timer_delete	FUNC	GLOBAL	DEFAULT	-
 timer_getoverrun	FUNC	GLOBAL	DEFAULT	-
 timer_gettime	FUNC	GLOBAL	DEFAULT	-
 timer_settime	FUNC	GLOBAL	DEFAULT	-
 times	FUNC	GLOBAL	DEFAULT	-
+timezone	OBJECT	GLOBAL	DEFAULT	-
 trace_event	FUNC	WEAK	DEFAULT	-
 ttyname	FUNC	GLOBAL	DEFAULT	-
 ttyname_r	FUNC	GLOBAL	DEFAULT	-
+tzname	OBJECT	GLOBAL	DEFAULT	-
+tzset	FUNC	GLOBAL	DEFAULT	-
 umask	FUNC	GLOBAL	DEFAULT	-
 uname	FUNC	GLOBAL	DEFAULT	-
 ungetc	FUNC	GLOBAL	DEFAULT	-

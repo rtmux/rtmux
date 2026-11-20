@@ -50,10 +50,6 @@ struct pipe;
 #define PIPE_ATTR_ATIME 0x00000001
 #define PIPE_ATTR_MTIME 0x00000002
 #define PIPE_ATTR_CTIME 0x00000004
-#define PIPE_NOTIFY_INPUT 0
-#define PIPE_NOTIFY_OUTPUT 1
-#define PIPE_NOTIFY_OBAND 2
-#define PIPE_NOTIFY_COUNT 3
 #define PIPE_OCB_LAST_INUSE 0x0001
 #define PIPE_OCB_LAST_READER 0x0002
 #define PIPE_OCB_LAST_WRITER 0x0004
@@ -89,21 +85,6 @@ typedef struct pipe_attr {
     pthread_mutex_t mutex;
 } pipe_attr_t;
 
-typedef struct pipe_notify_event {
-    struct pipe_notify_event *next;
-    int rcvid;
-    int scoid;
-    int coid;
-    int cnt;
-    unsigned flags;
-    struct sigevent event;
-} pipe_notify_event_t;
-
-typedef struct pipe_notify {
-    int cnt;
-    pipe_notify_event_t *list;
-} pipe_notify_t;
-
 struct pipe_ocb {
     pipe_attr_t *attr;
     int32_t ioflag;
@@ -122,8 +103,8 @@ typedef struct blocked {
 
 typedef struct pipe {
     pipe_attr_t attr;
-    pipe_notify_t notify[PIPE_NOTIFY_COUNT];
-    struct blocked *waiting[PIPE_NOTIFY_COUNT];
+    ioserv_notify_t notify[IOSERV_NOTIFY_COUNT];
+    struct blocked *waiting[IOSERV_NOTIFY_COUNT];
     char *name;
     int fd;
     dev_t devno;
@@ -145,7 +126,7 @@ static pthread_attr_t thread_attr;
 static struct sigevent Event;
 static size_t BufferSize, AtomicSize;
 static int SelWrite1;
-static int NotifyCounts[PIPE_NOTIFY_COUNT];
+static int NotifyCounts[IOSERV_NOTIFY_COUNT];
 
 static int pipe_attr_lock(pipe_attr_t *attr)
 {
@@ -163,16 +144,6 @@ static int pipe_attr_trylock(pipe_attr_t *attr)
 static int pipe_attr_unlock(pipe_attr_t *attr)
 {
     return pthread_mutex_unlock(&attr->mutex);
-}
-
-static void pipe_notify_init(pipe_notify_t *notify)
-{
-    int i;
-
-    for (i = 0; i < PIPE_NOTIFY_COUNT; ++i) {
-        notify[i].cnt = INT_MAX;
-        notify[i].list = NULL;
-    }
 }
 
 static void pipe_attr_init(pipe_attr_t *attr,
@@ -353,154 +324,12 @@ static int pipe_ocb_detach(struct pipe_ocb *ocb)
     return (int) flags;
 }
 
-static pipe_notify_event_t *pipe_notify_lookup(int rcvid, pipe_notify_t *notify)
+static int pipe_notify_input_check(const ioserv_notify_t *notify,
+                                   int cnt,
+                                   int trans)
 {
-    pipe_notify_event_t *event;
-
-    for (event = notify->list; event; event = event->next) {
-        if (event->rcvid == rcvid)
-            return event;
-    }
-    event = malloc(sizeof(*event));
-    if (!event)
-        return NULL;
-    event->next = notify->list;
-    notify->list = event;
-    return event;
-}
-
-static int pipe_notify_input_check(pipe_notify_t *notify, int cnt, int trans)
-{
-    return notify[PIPE_NOTIFY_INPUT].cnt <= cnt &&
-           (notify[PIPE_NOTIFY_INPUT].cnt || trans);
-}
-
-static int pipe_notify_output_check(pipe_notify_t *notify, int cnt)
-{
-    return notify[PIPE_NOTIFY_OUTPUT].cnt <= cnt;
-}
-
-static int pipe_notify(ioserv_context_t *ctp,
-                       io_notify_t *msg,
-                       pipe_notify_t *notify,
-                       int trig,
-                       int hup,
-                       const int *notifycnts)
-{
-    pipe_notify_event_t *event;
-    unsigned msgflags, trig_u, ext;
-    int i, action;
-
-    trig_u = (unsigned) trig;
-    trig_u |= trig_u << 28;
-    trig_u &= ~(unsigned) _NOTIFY_COND_EXTEN;
-    trig_u |= trig_u >> 28;
-
-    action = msg->i.action;
-    msgflags = msg->i.flags;
-    ext = msgflags & (unsigned) _NOTIFY_COND_EXTEN;
-    msgflags &= ~(unsigned) _NOTIFY_COND_EXTEN;
-
-    if (action != _NOTIFY_ACTION_TRANARM) {
-        trig_u &= msgflags;
-    } else {
-        for (event = notify[PIPE_NOTIFY_INPUT].list; event;
-             event = event->next) {
-            if (SIGEV_GET_TYPE(&event->event) != SIGEV_NONE) {
-                if (event->scoid != ctp->info.scoid ||
-                    SIGEV_GET_TYPE(&msg->i.event) != SIGEV_NONE)
-                    return EBUSY;
-            }
-        }
-        trig_u = 0;
-    }
-
-    msgflags |= msgflags >> 28;
-    msgflags &= ((1u << _NOTIFY_MAXCOND) - 1u);
-    for (i = 0; i < PIPE_NOTIFY_COUNT && msgflags; i++, msgflags >>= 1) {
-        if ((msgflags & 1u) == 0)
-            continue;
-        event = pipe_notify_lookup(ctp->rcvid, &notify[i]);
-        if (!event)
-            return ENOMEM;
-        event->rcvid = ctp->rcvid;
-        event->scoid = ctp->info.scoid;
-        event->coid = ctp->info.coid;
-        event->flags = ext;
-        if (trig_u == 0 && action != _NOTIFY_ACTION_POLL) {
-            event->event = msg->i.event;
-            event->cnt = action == _NOTIFY_ACTION_TRANARM ? 0 : notifycnts[i];
-            if (event->cnt < notify[i].cnt)
-                notify[i].cnt = event->cnt;
-        } else {
-            SIGEV_NONE_INIT(&event->event);
-            event->cnt = INT_MAX;
-        }
-    }
-
-    /* Report hangup/error as extended (POLL*) flags via flags_exten -- they do
-     * not fit the four-bit _NOTIFY_COND nibble. A poll client reads them as
-     * output-only revents (POLLHUP/POLLERR), which is why a set hup also makes
-     * the descriptor "ready" here regardless of the requested conditions.
-     */
-    msg->o.flags_exten = (uint32_t) hup;
-    if ((msg->o.flags = (uint32_t) trig_u) != 0)
-        msg->o.flags |= (uint32_t) ext;
-    if (action & _NOTIFY_ACTION_POLL)
-        return IOSERV_PTR(ctp, &msg->o, sizeof(msg->o));
-    if (trig_u || hup || action != _NOTIFY_ACTION_CONDARM)
-        return IOSERV_PTR(ctp, &msg->o, sizeof(msg->o));
-    return EAGAIN;
-}
-
-static void pipe_notify_remove(ioserv_context_t *ctp, pipe_notify_t *notify)
-{
-    pipe_notify_event_t *prev, *event;
-    int i;
-
-    for (i = 0; i < PIPE_NOTIFY_COUNT; ++i) {
-        prev = (pipe_notify_event_t *) &notify[i].list;
-        while ((event = prev->next)) {
-            if (!ctp || (event->scoid == ctp->info.scoid &&
-                         event->coid == ctp->info.coid)) {
-                prev->next = event->next;
-                free(event);
-            } else {
-                prev = event;
-            }
-        }
-    }
-}
-
-static void pipe_notify_trigger(pipe_notify_t *notify, int cnt, int index)
-{
-    pipe_notify_event_t *event;
-
-    notify += index;
-    notify->cnt = INT_MAX;
-    for (event = notify->list; event; event = event->next) {
-        if (SIGEV_GET_TYPE(&event->event) == SIGEV_NONE)
-            continue;
-        if (event->cnt <= cnt) {
-            if (SIGEV_GET_TYPE(&event->event) >= SIGEV_SIGNAL &&
-                SIGEV_GET_TYPE(&event->event) <= SIGEV_NOTIFICATION &&
-                event->event.sigev_code == SI_NOTIFY) {
-                event->event.sigev_value.sival_int |=
-                    (int) ((unsigned) _NOTIFY_COND_INPUT << index);
-                if (event->flags & _NOTIFY_COND_EXTEN) {
-                    event->event.sigev_value.sival_int |=
-                        (int) _NOTIFY_COND_EXTEN;
-                    event->event.sigev_code =
-                        (short) -(int) (_NOTIFY_CONDE_RDNORM << index);
-                }
-            }
-            (void) msg_deliver_event(event->rcvid, &event->event);
-            event->event.sigev_notify = SIGEV_NONE;
-            event->cnt = INT_MAX;
-        }
-        if (notify->cnt > event->cnt)
-            notify->cnt = event->cnt;
-    }
+    return notify[IOSERV_NOTIFY_INPUT].cnt <= cnt &&
+           (notify[IOSERV_NOTIFY_INPUT].cnt || trans);
 }
 
 static int pipe_read_verify(io_read_t *msg, struct pipe_ocb *ocb, int *nonblock)
@@ -761,11 +590,11 @@ static pipe_t *create_pipe(pipe_t *head,
                                owner);
                 p->devno = head->attr.mount->dev;
                 p->attr.inode = (uintptr_t) p;
-                pipe_notify_init(p->notify);
+                ioserv_notify_init(p->notify);
                 p->fd = -1;
-                p->waiting[PIPE_NOTIFY_INPUT] = NULL;
-                p->waiting[PIPE_NOTIFY_OUTPUT] = NULL;
-                p->waiting[PIPE_NOTIFY_OBAND] = NULL;
+                p->waiting[IOSERV_NOTIFY_INPUT] = NULL;
+                p->waiting[IOSERV_NOTIFY_OUTPUT] = NULL;
+                p->waiting[IOSERV_NOTIFY_OBAND] = NULL;
                 p->rd = p->wr = 0;
                 pipe_attr_lock(&p->attr);
                 LOCK(head);
@@ -807,7 +636,7 @@ static int destroy_pipe(pipe_t *head, pipe_t *p, int error)
         update_pipe(p, true);
     if (p->fd != -1)
         close(p->fd);
-    pipe_notify_remove(NULL, p->notify);
+    ioserv_notify_remove(NULL, p->notify);
     pipe_attr_unlock(&p->attr);
     pthread_mutex_destroy(&p->attr.mutex);
     free(p->buffer);
@@ -966,7 +795,7 @@ static void check_readers(pipe_t *pipe, int trans)
     size_t avail;
     ssize_t chunk;
 
-    bb = &pipe->waiting[PIPE_NOTIFY_INPUT];
+    bb = &pipe->waiting[IOSERV_NOTIFY_INPUT];
     while ((avail = (size_t) pipe->attr.nbytes) != 0 && (b = *bb)) {
         if ((chunk = read_from_pipe(pipe, b->rcvid, b->size, 0)) < 0)
             msg_error(b->rcvid, (int) -chunk);
@@ -976,7 +805,7 @@ static void check_readers(pipe_t *pipe, int trans)
         free(b);
     }
     if (avail != 0 && pipe_notify_input_check(pipe->notify, (int) avail, trans))
-        pipe_notify_trigger(pipe->notify, (int) avail, PIPE_NOTIFY_INPUT);
+        ioserv_notify_trigger(pipe->notify, (int) avail, IOSERV_NOTIFY_INPUT);
 }
 
 /* check_writers() - unblock any writers that can now make progress
@@ -989,7 +818,7 @@ static void check_writers(pipe_t *pipe)
     size_t room;
     ssize_t chunk;
 
-    bb = &pipe->waiting[PIPE_NOTIFY_OUTPUT];
+    bb = &pipe->waiting[IOSERV_NOTIFY_OUTPUT];
     while ((room = BufferSize - (size_t) pipe->attr.nbytes) != 0 && (b = *bb)) {
         if (b->size > AtomicSize || b->nbytes <= room) {
             chunk = write_to_pipe(pipe, b->rcvid, b->nbytes, b->offset, NULL);
@@ -1010,8 +839,8 @@ static void check_writers(pipe_t *pipe)
             bb = &b->link;
         }
     }
-    if (room != 0 && pipe_notify_output_check(pipe->notify, (int) room))
-        pipe_notify_trigger(pipe->notify, (int) room, PIPE_NOTIFY_OUTPUT);
+    if (room != 0)
+        ioserv_notify_trigger(pipe->notify, (int) room, IOSERV_NOTIFY_OUTPUT);
 }
 
 /* block_client() - add a blocking entry for a client
@@ -1098,12 +927,12 @@ static int open_semantics(pipe_t *pipe, ioserv_context_t *ctp, int ioflag)
     if (!(ioflag & (_IO_FLAG_RD | _IO_FLAG_WR)))
         error = EOK;
     else if (pipe->attr.rcount != 0 && pipe->attr.wcount != 0)
-        unblock_clients(&pipe->waiting[PIPE_NOTIFY_OBAND], NULL, -1,
+        unblock_clients(&pipe->waiting[IOSERV_NOTIFY_OBAND], NULL, -1,
                         error = EOK);
     else if (ioflag & O_NONBLOCK)
         error = EOK;
-    else if (block_client(&pipe->waiting[PIPE_NOTIFY_OBAND], ctp, 0, 0, 0, 0) ==
-             NULL)
+    else if (block_client(&pipe->waiting[IOSERV_NOTIFY_OBAND], ctp, 0, 0, 0,
+                          0) == NULL)
         error = ENOMEM;
     else
         error = IOSERV_NOREPLY;
@@ -1198,7 +1027,7 @@ static int pipe_service_read(ioserv_context_t *ctp,
             error = EOK;
         else if (nonblock)
             error = EAGAIN;
-        else if (!(b = block_client(&pipe->waiting[PIPE_NOTIFY_INPUT], ctp, 0,
+        else if (!(b = block_client(&pipe->waiting[IOSERV_NOTIFY_INPUT], ctp, 0,
                                     nbytes, nbytes, !0)))
             error = ENOMEM;
         else
@@ -1265,7 +1094,7 @@ static int pipe_service_write(ioserv_context_t *ctp,
     if (!count && nonblock) {
         error = EAGAIN;
     } else if (count != nbytes && chunk >= 0 && !nonblock) {
-        b = block_client(&pipe->waiting[PIPE_NOTIFY_OUTPUT], ctp,
+        b = block_client(&pipe->waiting[IOSERV_NOTIFY_OUTPUT], ctp,
                          offset + count, nbytes, nbytes - count, !0);
         if (!b)
             error = ENOMEM;
@@ -1295,13 +1124,15 @@ static int pipe_service_closeocb(ioserv_context_t *ctp,
     free(ocb);
     if (S_ISFIFO(pipe->attr.mode) && flags != 0) {
         if (flags & PIPE_OCB_LAST_READER) {
-            unblock_clients(&pipe->waiting[PIPE_NOTIFY_OUTPUT], NULL, -1,
+            unblock_clients(&pipe->waiting[IOSERV_NOTIFY_OUTPUT], NULL, -1,
                             EPIPE);
-            pipe_notify_trigger(pipe->notify, INT_MAX, PIPE_NOTIFY_OUTPUT);
+            ioserv_notify_trigger(pipe->notify, INT_MAX, IOSERV_NOTIFY_OUTPUT);
+            ioserv_notify_trigger(pipe->notify, INT_MAX, IOSERV_NOTIFY_OBAND);
         }
         if (flags & PIPE_OCB_LAST_WRITER) {
-            unblock_clients(&pipe->waiting[PIPE_NOTIFY_INPUT], NULL, -1, EOK);
-            pipe_notify_trigger(pipe->notify, INT_MAX, PIPE_NOTIFY_INPUT);
+            unblock_clients(&pipe->waiting[IOSERV_NOTIFY_INPUT], NULL, -1, EOK);
+            ioserv_notify_trigger(pipe->notify, INT_MAX, IOSERV_NOTIFY_INPUT);
+            ioserv_notify_trigger(pipe->notify, INT_MAX, IOSERV_NOTIFY_OBAND);
         }
         if (flags & PIPE_OCB_LAST_INUSE) {
             pipe->attr.nbytes = 0;
@@ -1356,11 +1187,11 @@ static int pipe_service_notify(ioserv_context_t *ctp,
         int hup = 0;
 
         trigger = 0;
-        if ((int) pipe->attr.nbytes >= NotifyCounts[PIPE_NOTIFY_INPUT] ||
+        if ((int) pipe->attr.nbytes >= NotifyCounts[IOSERV_NOTIFY_INPUT] ||
             !pipe->attr.wcount)
             trigger |= _NOTIFY_COND_INPUT;
         if ((int) (BufferSize - (size_t) pipe->attr.nbytes) >=
-                NotifyCounts[PIPE_NOTIFY_OUTPUT] ||
+                NotifyCounts[IOSERV_NOTIFY_OUTPUT] ||
             !pipe->attr.rcount)
             trigger |= _NOTIFY_COND_OUTPUT;
 
@@ -1372,7 +1203,8 @@ static int pipe_service_notify(ioserv_context_t *ctp,
             hup |= POLLHUP;
         if ((ocb->ioflag & _IO_FLAG_WR) && !pipe->attr.rcount)
             hup |= POLLERR;
-        error = pipe_notify(ctp, msg, pipe->notify, trigger, hup, NotifyCounts);
+        error = ioserv_notify(ctp, msg, pipe->notify, (unsigned) trigger,
+                              (unsigned) hup, NotifyCounts);
     }
     return error;
 }
@@ -1420,9 +1252,9 @@ static int pipe_service_unblock(ioserv_context_t *ctp,
     if (msg_info(ctp->rcvid, &info) != -1 &&
         (info.flags & RTMUX_MI_UNBLOCK_REQ)) {
         pipe_attr_lock(&pipe->attr);
-        unblock_clients(&pipe->waiting[PIPE_NOTIFY_INPUT], ctp, !0, EINTR);
-        unblock_clients(&pipe->waiting[PIPE_NOTIFY_OUTPUT], ctp, !0, -EINTR);
-        unblock_clients(&pipe->waiting[PIPE_NOTIFY_OBAND], ctp, !0, EINTR);
+        unblock_clients(&pipe->waiting[IOSERV_NOTIFY_INPUT], ctp, !0, EINTR);
+        unblock_clients(&pipe->waiting[IOSERV_NOTIFY_OUTPUT], ctp, !0, -EINTR);
+        unblock_clients(&pipe->waiting[IOSERV_NOTIFY_OBAND], ctp, !0, EINTR);
         pipe_attr_unlock(&pipe->attr);
     }
     return IOSERV_NOREPLY;
@@ -1572,10 +1404,10 @@ static int pipe_service_closedup(ioserv_context_t *ctp,
 
     pipe = OCB2PIPE(ocb);
     pipe_attr_lock(&pipe->attr);
-    unblock_clients(&pipe->waiting[PIPE_NOTIFY_INPUT], ctp, 0, EBADF);
-    unblock_clients(&pipe->waiting[PIPE_NOTIFY_OUTPUT], ctp, 0, EBADF);
-    unblock_clients(&pipe->waiting[PIPE_NOTIFY_OBAND], ctp, 0, EBADF);
-    pipe_notify_remove(ctp, pipe->notify);
+    unblock_clients(&pipe->waiting[IOSERV_NOTIFY_INPUT], ctp, 0, EBADF);
+    unblock_clients(&pipe->waiting[IOSERV_NOTIFY_OUTPUT], ctp, 0, EBADF);
+    unblock_clients(&pipe->waiting[IOSERV_NOTIFY_OBAND], ctp, 0, EBADF);
+    ioserv_notify_remove(ctp, pipe->notify);
     pipe_attr_unlock(&pipe->attr);
     return EOK;
 }
@@ -1744,9 +1576,9 @@ int main(int argc, char *argv[])
     IoServiceAttr.nparts_max = 1;
     IoServiceAttr.msg_max_size = sizeof(struct _io_connect) + _POSIX_PATH_MAX;
     SIGEV_SIGNAL_THREAD_INIT(&Event, SIGPIPE, 0, SI_USER);
-    NotifyCounts[PIPE_NOTIFY_INPUT] = 1;
-    NotifyCounts[PIPE_NOTIFY_OBAND] = 1;
-    NotifyCounts[PIPE_NOTIFY_OUTPUT] = SelWrite1 ? 1 : (int) AtomicSize;
+    NotifyCounts[IOSERV_NOTIFY_INPUT] = 1;
+    NotifyCounts[IOSERV_NOTIFY_OBAND] = 1;
+    NotifyCounts[IOSERV_NOTIFY_OUTPUT] = SelWrite1 ? 1 : (int) AtomicSize;
 
     memset(&Mount, 0, sizeof(Mount));
     Mount.conf = PIPE_PC_CHOWN_RESTRICTED | PIPE_PC_NO_TRUNC | PIPE_PC_SYNC_IO;

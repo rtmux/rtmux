@@ -130,8 +130,7 @@ static int _io_write_log(ioserv_context_t *ctp,
                 printf("ioserv_msg_again failed\n");
         }
     }
-    if (trp->notify[SLOG_NOTIFY_INPUT].cnt <= (int) trp->cnt)
-        slog_notify_trigger(trp, SLOG_NOTIFY_INPUT);
+    ioserv_notify_trigger(trp->notify, (int) trp->cnt, IOSERV_NOTIFY_INPUT);
 
     return EOK;
 }

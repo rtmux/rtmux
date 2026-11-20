@@ -82,8 +82,7 @@ int main(int argc, char *argv[])
     }
     trp->end = trp->beg + NumInts;
     logger_init(trp);
-    for (int i = 0; i < SLOG_NOTIFY_COUNT; i++)
-        trp->notify[i].cnt = INT_MAX;
+    ioserv_notify_init(trp->notify);
 
     /* Create a dispatch context to receive messages. */
     if (!(dpp = dispatch_create())) {
@@ -326,7 +325,7 @@ static int slog_close_ocb(ioserv_context_t *ctp,
     struct ocbs *cur, *prev;
 
     (void) reserved;
-    slog_notify_remove(ctp, trp);
+    ioserv_notify_remove(ctp, trp->notify);
     prev = (struct ocbs *) &trp->ocbs;
     for (; (cur = prev->next); prev = cur)
         if (cur->ocb == ocb) {

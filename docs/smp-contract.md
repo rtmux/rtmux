@@ -25,9 +25,11 @@ instance-ordering rule.
 | 9 | `LOCK_CLASS_SYNC` | `ksync_t` paths | Do not use for new sync-chain code. |
 | 10 | `LOCK_CLASS_PROCESS` | process scalar state | Not for vector mutation. |
 | 11 | `LOCK_CLASS_THREAD` | thread scalar state | Per-thread fields outside queue ownership. |
-| 12 | `LOCK_CLASS_MEMPART` | kernel heap | May call into physical allocator. |
-| 13 | `LOCK_CLASS_PA` | physical allocator | Leaf after memory partition. |
-| 14 | `LOCK_CLASS_DEBUG` | debugger/crash interlocks | Avoid acquiring normal subsystem locks while held. |
+| 12 | `LOCK_CLASS_SOUL` | object soul freelists and accounting (`soul_slock`) | Ranked after the object locks held on an `object_alloc`/`object_free` path and before `MEMPART`. Only a free that returns a block to the heap nests `SOUL -> MEMPART`; a grow allocates with `soul_slock` released. |
+| 13 | `LOCK_CLASS_MEMPART` | kernel heap | May call into physical allocator. |
+| 14 | `LOCK_CLASS_PA` | physical allocator | Leaf after memory partition. |
+| 15 | `LOCK_CLASS_PRIO_DEFER` | per-hart deferred priority settle list | Leaf: `force_ready` takes it under any caller lock; nothing is acquired while it is held. |
+| 16 | `LOCK_CLASS_DEBUG` | debugger/crash interlocks | Avoid acquiring normal subsystem locks while held. |
 
 `CONFIG_LOCK_DEBUG` records nested acquisitions and rejects rank cycles.  It is
 part of the realtime test surface, not optional documentation.  It only catches
@@ -57,8 +59,8 @@ silently.
 | `kernel/irq/interrupt.c` and `arch/riscv/trap-handler.c` | interrupt metadata `LOCK_CLASS_INTREVENT`; scheduler wake path | `INTREVENT -> SCHED` for readying attached ISTs; hard-IRQ code does not allocate or block. |
 | `kernel/ipc/channel.c` | process vector `LOCK_CLASS_PROCVEC`; channel `LOCK_CLASS_CHANNEL`; connect `LOCK_CLASS_CONNECT` | `PROCVEC -> CHANNEL -> CONNECT`; drop object locks before scheduler block/ready. |
 | `kernel/ipc/message.c` | channel/connect locks plus scheduler locks | Queue mutation under `CHANNEL`/`CONNECT`; state transition through scheduler helpers after queue membership is published. |
-| `kernel/thread/lifecycle.c` | process vector `LOCK_CLASS_PROCVEC`; thread scalar `LOCK_CLASS_THREAD`; scheduler locks | `PROCVEC -> THREAD -> SCHED` only for bounded local state changes; teardown does not walk arbitrary foreign queues. |
-| `kernel/object/core.c` and allocators | memory partition `LOCK_CLASS_MEMPART`; physical allocator `LOCK_CLASS_PA` | `MEMPART -> PA`; allocator locks are leaf locks and not held across IPC/scheduler state changes. |
+| `kernel/thread/lifecycle.c` | process vector `LOCK_CLASS_PROCVEC`; thread scalar `LOCK_CLASS_THREAD`; scheduler locks | `PROCVEC -> THREAD -> SCHED` only for bounded local state changes; teardown does not walk arbitrary foreign queues. `thread_as_slock` (`LOCK_CLASS_THREAD`) guards `thread_t.as_prp` and each address space's borrower list; address-space teardown walks that list and the dying process's own threads, never other processes (see `process_t.as_borrowers` in `objects.h`). |
+| `kernel/object/core.c` and allocators | object soul lists `LOCK_CLASS_SOUL`; memory partition `LOCK_CLASS_MEMPART`; physical allocator `LOCK_CLASS_PA` | `SOUL -> MEMPART` (a free that returns a block to the heap), `MEMPART -> PA`; allocator locks are leaf locks and not held across IPC/scheduler state changes. |
 | `kernel/debug/*` | debug/crash `LOCK_CLASS_DEBUG` | Crash/debug locks are terminal.  Avoid acquiring ordinary subsystem locks once held. |
 
 ## RCU Lifetime Rules
@@ -279,6 +281,34 @@ server's `client` link and the client's `args.ms.server` are cleared by the
 server's receive as two separate stores, so a `force_ready` of the client may see
 the pair half-cleared; it clears the server's link with a compare-exchange against
 the client and does not treat the half-cleared state as corruption.
+
+It then ends the server's request loan of that client: `thread_client_departed`
+(link compare-exchange, loan end) is the primitive a departure uses, called by
+`force_ready` and `ksys_msg_current`.  The receive does not call it: it
+publishes the client, installs the loan (`thread_lend_msg`) and then calls
+`thread_end_orphan_loan` (`ksys_msg_receivev`; `msg_current_take` does the
+same when `MsgCurrent` names a new client).
+Since the loan is installed after the client is published, the two sides meet
+through a store-buffering handshake: the receiver stores the loan, fences and
+re-reads the client (`thread_end_orphan_loan`), and `thread_client_departed`
+stores the cleared client, then fences and re-reads the loan word through the
+same `thread_end_orphan_loan`.  With both fences
+at least one of them sees the other's store, so a loan installed after its
+client left is always ended by one of them.  A loan-generation bump by the
+departing client cannot replace the fence: a notification lend or a REPLY
+propagation bumps the generation too, so a loan install failing on it could not
+tell a departed client from a busy server.
+
+The priority settle and the chain walk do not run here.  `force_ready` only
+queues the server on its hart's list (`thread_prio_defer_settle`, under the leaf
+lock `LOCK_CLASS_PRIO_DEFER`); `kernel_exit` settles that list before the hart
+resumes or idles, in thread context, and follows the chain a blocked server waits
+in.  The loan-end store precedes the list lock's release and the settle pops
+under the same lock, so it reads the store; a departure that finds the server
+already queued adds nothing because the settle has not popped it.
+`thread_destroy` takes a queued server off the list after the RCU drain and
+before the pin wait, so no entry outlives its thread and a settle in progress
+holds a pin the destroy waits out.
 
 ### Unblock notification of a reply-blocked client
 

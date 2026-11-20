@@ -16,6 +16,7 @@
 #include <fcntl.h>
 #include <limits.h> /* PATH_MAX */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <dirent.h>
@@ -26,7 +27,6 @@
 #include <sys/mount.h>
 #include <sys/syspage.h>
 #include <sys/mman.h> /* mmap, MAP_PHYS|MAP_SHARED, NOFD */
-#include <sys/pool-canary.h>
 #include <devctl/common.h>
 #include "externs.h"
 #include "pinode.h"
@@ -69,57 +69,57 @@ int cpiofs_cpio_image(const uint8_t **base, size_t *size)
 #define CPIOFS_SYMLINK_MAX PATH_MAX
 
 struct cpiofs_ocb {
-    POOL_CANARY_HEAD
-    const uint8_t *data;            /* pointer into CPIO archive */
-    uint32_t size;                  /* file size */
-    uint32_t mode;                  /* file mode */
-    off_t pos;                      /* current read position */
-    char prefix[CPIOFS_PREFIX_MAX]; /* directory path for readdir */
+    const uint8_t *data; /* pointer into CPIO archive */
+    uint32_t size;       /* file size */
+    uint32_t mode;       /* file mode */
+    off_t pos;           /* current read position */
+    char *prefix;        /* directory path for readdir, NULL otherwise */
     int prefix_len;
-    POOL_CANARY_TAIL
 };
 
-/* Maximum number of simultaneous opens (static pool, no malloc needed). Dynamic
- * executables transiently hold several cpiofs OCBs while the loader reads the
- * main image, interpreter, and mmap-backed file handles, so early boot can
- * burst well past a small pool.
+/* One OCB per open file or mapping, taken from the roottask heap as demand
+ * requires: every resident dynamic executable keeps a mapping OCB for its libc,
+ * so the fixed pool of 128 that stood here capped the resident process count
+ * (K26). CPIOFS_MAX_OCBS keeps a runaway client from filling the fixed heap
+ * arena; reaching it, or the heap running out, is logged (the first failure and
+ * each doubling).
  */
-#define CPIOFS_MAX_OCBS 128
+#define CPIOFS_MAX_OCBS 2048
 
-static struct cpiofs_ocb ocb_pool[CPIOFS_MAX_OCBS];
-static int ocb_inuse[CPIOFS_MAX_OCBS];
-static pthread_mutex_t ocb_lock = PTHREAD_MUTEX_INITIALIZER;
+static unsigned ocb_live;
+static unsigned ocb_failures;
+
+static void ocb_fail_note(const char *what)
+{
+    unsigned n = __atomic_add_fetch(&ocb_failures, 1, __ATOMIC_RELAXED);
+
+    if ((n & (n - 1)) == 0)
+        root_warn("cpiofs: %s (%u OCBs live, failure %u)\n", what,
+                  __atomic_load_n(&ocb_live, __ATOMIC_RELAXED), n);
+}
 
 static struct cpiofs_ocb *ocb_alloc(void)
 {
-    struct cpiofs_ocb *ocb = NULL;
+    struct cpiofs_ocb *ocb;
 
-    pthread_mutex_lock(&ocb_lock);
-    for (int i = 0; i < CPIOFS_MAX_OCBS; i++) {
-        if (!ocb_inuse[i]) {
-            pool_canary_check(&ocb_pool[i], "cpiofs_ocb", i);
-            ocb_inuse[i] = 1;
-            memset(&ocb_pool[i], 0, sizeof(ocb_pool[i]));
-            pool_canary_arm(&ocb_pool[i]);
-            ocb = &ocb_pool[i];
-            break;
-        }
+    if (__atomic_add_fetch(&ocb_live, 1, __ATOMIC_RELAXED) > CPIOFS_MAX_OCBS) {
+        __atomic_sub_fetch(&ocb_live, 1, __ATOMIC_RELAXED);
+        ocb_fail_note("OCB limit reached");
+        return NULL;
     }
-    pthread_mutex_unlock(&ocb_lock);
+    ocb = calloc(1, sizeof(*ocb));
+    if (!ocb) {
+        __atomic_sub_fetch(&ocb_live, 1, __ATOMIC_RELAXED);
+        ocb_fail_note("roottask heap exhausted allocating an OCB");
+    }
     return ocb;
 }
 
 static void ocb_free(struct cpiofs_ocb *ocb)
 {
-    pthread_mutex_lock(&ocb_lock);
-    for (int i = 0; i < CPIOFS_MAX_OCBS; i++) {
-        if (&ocb_pool[i] == ocb) {
-            pool_canary_check(ocb, "cpiofs_ocb", i);
-            ocb_inuse[i] = 0;
-            break;
-        }
-    }
-    pthread_mutex_unlock(&ocb_lock);
+    free(ocb->prefix);
+    free(ocb);
+    __atomic_sub_fetch(&ocb_live, 1, __ATOMIC_RELAXED);
 }
 
 /* Connect function: open */
@@ -152,8 +152,6 @@ static int cpiofs_open(ioserv_context_t *ctp,
         ocb->size = 0;
         ocb->mode = S_IFDIR | 0555;
         ocb->pos = 0;
-        ocb->prefix[0] = '\0';
-        ocb->prefix_len = 0;
         if (ioserv_open_bind(ctp, ocb, 0) == -1) {
             ocb_free(ocb);
             return errno;
@@ -271,12 +269,13 @@ static int cpiofs_open(ioserv_context_t *ctp,
             ocb_free(ocb);
             return ENAMETOOLONG;
         }
-        memcpy(ocb->prefix, path, plen);
-        ocb->prefix[plen] = '\0';
+        ocb->prefix = strdup(path);
+        if (!ocb->prefix) {
+            ocb_fail_note("roottask heap exhausted copying a directory path");
+            ocb_free(ocb);
+            return ENOMEM;
+        }
         ocb->prefix_len = (int) plen;
-    } else {
-        ocb->prefix[0] = '\0';
-        ocb->prefix_len = 0;
     }
 
     if (ioserv_open_bind(ctp, ocb, 0) == -1) {
@@ -652,8 +651,6 @@ static int find_ramdisk(struct asinfo_entry *as, char *name, void *data)
 int cpiofs_init(void)
 {
     ioserv_attr_t rattr;
-
-    pool_canary_init(ocb_pool, CPIOFS_MAX_OCBS);
 
     /* Locate the CPIO archive in physical memory */
     walk_asinfo("ramdisk", find_ramdisk, NULL);

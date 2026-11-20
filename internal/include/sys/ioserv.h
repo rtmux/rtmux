@@ -87,4 +87,100 @@ void ioserv_reply_counters_record(int error, uint64_t queue_depth);
 void ioserv_reply_counters_snapshot(ioserv_reply_counters_t *out);
 int ioserv_reply_counters_format(char *buf, size_t size);
 
+/* The counters ioserv_reply_counters_format prints, one line each: the name
+ * shown and the field of ioserv_reply_counters_t. The text, the arguments that
+ * print it and its longest size all come from this list.
+ */
+#define IOSERV_REPLY_COUNTERS(X) \
+    X(ioserv_sends, sends)       \
+    X(ioserv_receives, receives) \
+    X(ioserv_denied_sends, denied_sends) \
+    X(ioserv_timeouts, timeouts) \
+    X(ioserv_queue_full, queue_full) \
+    X(ioserv_max_depth, max_depth)
+#define IOSERV_COUNTER_LINE(name, field) #name " %llu\n"
+#define IOSERV_COUNTER_ONE(name, field) +1
+#define IOSERV_COUNTER_ARG(name, field) , (unsigned long long) c.field
+#define IOSERV_REPLY_COUNTERS_FMT IOSERV_REPLY_COUNTERS(IOSERV_COUNTER_LINE)
+
+/* The most characters the text takes, with every counter at 20 digits (a %llu
+ * is 4 characters of the format), and not counting the NUL.
+ */
+#define IOSERV_REPLY_COUNTERS_MAX                  \
+    (sizeof(IOSERV_REPLY_COUNTERS_FMT) - 1 +       \
+     (0 IOSERV_REPLY_COUNTERS(IOSERV_COUNTER_ONE)) * 16)
+
+/* Readiness notification lists for an _IO_NOTIFY handler (poll and select).
+ * A service keeps an array of IOSERV_NOTIFY_COUNT lists per object, one per
+ * condition, and serializes every call on it with its own lock. Each list holds
+ * one node per waiting client thread and open: a node is allocated when armed
+ * with the client's event and a threshold, and freed when it is delivered by
+ * ioserv_notify_trigger, disarmed by the client's next pass, or its open
+ * closes.
+ */
+#define IOSERV_NOTIFY_INPUT 0 /* _NOTIFY_COND_INPUT */
+#define IOSERV_NOTIFY_OUTPUT 1 /* _NOTIFY_COND_OUTPUT */
+#define IOSERV_NOTIFY_OBAND 2 /* _NOTIFY_COND_OBAND */
+#define IOSERV_NOTIFY_COUNT 3
+
+typedef struct ioserv_notify_event {
+    struct ioserv_notify_event *next;
+    int rcvid;
+    int scoid;
+    int coid;
+    int cnt;        /* units that must be available to deliver it */
+    unsigned flags; /* _NOTIFY_COND_EXTEN when the client asked for POLL* */
+    struct sigevent event;
+} ioserv_notify_event_t;
+
+typedef struct ioserv_notify {
+    int cnt; /* lowest armed threshold on the list; INT_MAX when none */
+    ioserv_notify_event_t *list;
+} ioserv_notify_t;
+
+/* Empty all IOSERV_NOTIFY_COUNT lists of nop. */
+void ioserv_notify_init(ioserv_notify_t *nop);
+
+/* Answer an _IO_NOTIFY. trig holds the _NOTIFY_COND_* conditions satisfied
+ * now, hup the POLLHUP/POLLERR codes to report regardless of the request, and
+ * notifycnts[i] the threshold list i is armed with (NULL: one unit each). The
+ * reply carries what is satisfied; a condition arm with nothing satisfied
+ * records the client's event and returns EAGAIN. Only recording an arm
+ * allocates, so only an arm can fail with ENOMEM; the poll pass and a ready
+ * reply always succeed.
+ */
+int ioserv_notify(ioserv_context_t *ctp,
+                  io_notify_t *msg,
+                  ioserv_notify_t *nop,
+                  unsigned trig,
+                  unsigned hup,
+                  const int *notifycnts);
+
+/* Answer an _IO_NOTIFY for an object whose reads and writes never wait:
+ * input and output are satisfied at once and nothing is armed. hup holds the
+ * POLLHUP/POLLERR codes to report regardless of the request.
+ */
+int ioserv_notify_ready(ioserv_context_t *ctp, io_notify_t *msg, unsigned hup);
+
+/* cnt units are now available on condition index: deliver and disarm every
+ * node on that list armed with a threshold of at most cnt. Cheap when nothing
+ * waits, so callers need not check first.
+ */
+void ioserv_notify_trigger(ioserv_notify_t *nop, int cnt, int index);
+
+/* True when a node on list index waits for no more than cnt units. A zeroed
+ * array of lists is valid and empty, so a static one needs no initializer.
+ */
+static inline int ioserv_notify_armed(const ioserv_notify_t *nop,
+                                      int index,
+                                      int cnt)
+{
+    return nop[index].list && nop[index].cnt <= cnt;
+}
+
+/* Free the nodes of the open ctp names (scoid and coid), or of every open when
+ * ctp is NULL.
+ */
+void ioserv_notify_remove(const ioserv_context_t *ctp, ioserv_notify_t *nop);
+
 #endif /* _SYS_IOSERV_H */

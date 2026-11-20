@@ -37,7 +37,7 @@ struct fault_info;
     MMF(int, fault, (struct fault_info *), extra)                             \
     MMF(int, map_xfer,                                                        \
         (process_t * actprp, process_t * prp, iov_t * *piov, int *pparts,     \
-         int *poff, iov_t *niov, int *pnparts, unsigned flags),               \
+         size_t *poff, iov_t *niov, int *pnparts, unsigned flags),            \
         extra)                                                                \
     MMF(int, mcreate, (process_t * prp), extra)                               \
     MMF(void, mdestroy, (process_t * prp), extra)                             \
@@ -146,6 +146,7 @@ typedef struct proc_hooks_entry {
 #define MAPADDR_FLAGS_WRITE 0x1
 #define MAPADDR_FLAGS_SYSPRP 0x2
 #define MAPADDR_FLAGS_NOTFIRST 0x4
+#define MAPADDR_FLAGS_STEP 0x10 /* cap the work; XFER_MAP_YIELD at the cap */
 #define MAPADDR_FLAGS_IOVKERNEL 0x8000
 
 #endif

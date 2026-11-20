@@ -216,7 +216,7 @@ static void ksys_start_roottask_umode(void)
     thp->state = STATE_DEAD; /* ready() does the transition */
     thp->policy = SCHED_RR;
     thp->dpp = thp->orig_dpp = prp->default_dpp;
-    thp->priority = thp->real_priority = 10; /* roottask base prio */
+    thread_init_prio(thp, 10); /* roottask base prio */
     /* runmask semantics: a *cleared* bit means "may run on this CPU". 0 = any
      * CPU welcome. (Idle threads use ~(1<<cpu) — pinned to their own CPU only.)
      * A non-zero mask here would prevent the scheduler from ever picking the

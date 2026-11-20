@@ -81,26 +81,27 @@ static void process_child_locks_unlock(process_t *a, process_t *b)
     }
 }
 
-static void process_clear_as_bindings(process_t *target)
+/* Detach every thread from target's address space before it is destroyed: the
+ * threads of other processes that borrow it, from target's own borrower list,
+ * then target's own threads. Neither step looks at any other process, so the
+ * cost does not grow with the number of processes in the system.
+ * Returns how many threads it visited.
+ */
+static unsigned process_clear_as_bindings(process_t *target)
 {
-    process_t *owner;
     thread_t *thp;
-    int pidx, tid;
+    int tid;
+    unsigned visited = thread_as_release_borrowers(target);
 
-    rcu_read_lock(&process_rcu);
-    for (pidx = 1; pidx < process_vector.nentries; ++pidx) {
-        owner = vector_lookup(&process_vector, (unsigned) pidx);
-        if (!owner)
-            continue;
-
-        kspinlock_lock(&owner->vec_slock);
-        for (tid = 0; tid < owner->threads.nentries; ++tid) {
-            if (VECP(thp, &owner->threads, tid))
-                thread_clear_as_prp_if(thp, target);
+    kspinlock_lock(&target->vec_slock);
+    for (tid = 0; tid < target->threads.nentries; ++tid) {
+        if (VECP(thp, &target->threads, tid)) {
+            thread_clear_as_prp_if(thp, target);
+            visited++;
         }
-        kspinlock_unlock(&owner->vec_slock);
     }
-    rcu_read_unlock(&process_rcu);
+    kspinlock_unlock(&target->vec_slock);
+    return visited;
 }
 
 /* kext_process_create — allocate and initialize a new process_t.
@@ -170,6 +171,8 @@ void kext_process_create(void *data)
      */
     kspinlock_init(&prp->vec_slock, LOCK_CLASS_PROCVEC, "process_t.vec_slock");
     prp->pin_count = 0;
+    prp->as_borrowers = NULL;
+    prp->as_borrow_closed = false;
     if (rtmux_cap_table_init(&prp->endpoint_caps, prp->endpoint_cap_slots,
                              RTMUX_PROCESS_ENDPOINT_CAP_SLOTS) != EOK) {
         object_free(NULL, &process_souls, prp);
@@ -273,7 +276,7 @@ void kext_process_create(void *data)
 
     /* Link the new process in as a child of its creator. */
     prp->child = NULL;
-    prp->parent = parent;
+    __atomic_store_n(&prp->parent, parent, __ATOMIC_RELEASE);
     kspinlock_lock(&parent->vec_slock);
     prp->sibling = parent->child;
     parent->child = prp;
@@ -352,7 +355,8 @@ void kext_process_destroyall(void *data)
     for (unsigned tid = 0; tid < prp->threads.nentries; ++tid) {
         thread_t *t = vector_lookup2(&prp->threads, tid);
 
-        if (!t || t == thp || t->state != STATE_STOPPED || tthread_pin(t) != EOK)
+        if (!t || t == thp || t->state != STATE_STOPPED ||
+            tthread_pin(t) != EOK)
             continue;
         kspinlock_unlock(&prp->vec_slock);
         unparked |= exit_ready_stopped(t);
@@ -416,7 +420,7 @@ void kext_process_destroy(void *data)
         if (!(prp = vector_lookup(&process_vector, PINDEX(pid))) ||
             prp->pid != pid || prp->destroying)
             err = ESRCH;
-        else if (prp->querying)
+        else if (prp->querying || prp->reparenting)
             err = EAGAIN;
         else
             prp->destroying = true;
@@ -441,19 +445,28 @@ void kext_process_destroy(void *data)
             break;
         }
         prp->child = child->sibling;
-        child->parent = proc;
-        child->sibling = proc->child;
-        proc->child = child;
-        --prp->num_processes;
-        ++proc->num_processes;
         if (proc_hooks->proc_threads_destroyed &&
             (((child->flags & (RTMUX_FLG_PROC_LOADING | RTMUX_FLG_PROC_TERMING |
                                RTMUX_FLG_PROC_ZOMBIE)) ==
               RTMUX_FLG_PROC_ZOMBIE) ||
              (child->flags & RTMUX_FLG_PROC_NOZOMBIE))) {
-            child->flags &= ~(RTMUX_FLG_PROC_ZOMBIE | RTMUX_FLG_PROC_WAITINFO);
+            __atomic_fetch_and(
+                &child->flags,
+                ~(unsigned) (RTMUX_FLG_PROC_ZOMBIE | RTMUX_FLG_PROC_WAITINFO),
+                __ATOMIC_RELAXED);
             send_event = 1;
         }
+
+        /* The flags go before the new parent is published, so that a lockless
+         * reader (kext_proc_query) that sees the new parent cannot still see
+         * the ZOMBIE this takes on itself the reap of, and destroy the child
+         * under the callback below.
+         */
+        __atomic_store_n(&child->parent, proc, __ATOMIC_RELEASE);
+        child->sibling = proc->child;
+        proc->child = child;
+        --prp->num_processes;
+        ++proc->num_processes;
         process_child_locks_unlock(prp, proc);
 
         if (send_event) {
@@ -590,20 +603,35 @@ void kext_process_destroy(void *data)
      */
 
     /* Unlink from parent under parent->vec_slock */
-    parent = prp->parent;
-    kspinlock_lock(&parent->vec_slock);
+    for (;;) {
+        parent = __atomic_load_n(&prp->parent, __ATOMIC_ACQUIRE);
+        kspinlock_lock(&parent->vec_slock);
+
+        /* The parent's own teardown moves its children to the kernel process
+         * under the old parent's lock, so a parent still named after the lock
+         * is taken stays the parent. That move happens at most once, so this
+         * retries at most once; kext_reparent cannot run here, because the
+         * destroying claim above keeps it out.
+         */
+        if (__atomic_load_n(&prp->parent, __ATOMIC_ACQUIRE) == parent)
+            break;
+        kspinlock_unlock(&parent->vec_slock);
+    }
     --parent->num_processes;
     if (prp == parent->child) {
         parent->child = prp->sibling;
     } else {
-        for (parent = parent->child; parent; parent = parent->sibling) {
-            if (parent->sibling == prp) {
-                parent->sibling = prp->sibling;
+        process_t *sib;
+
+        for (sib = parent->child; sib; sib = sib->sibling) {
+            if (sib->sibling == prp) {
+                sib->sibling = prp->sibling;
                 break;
             }
         }
     }
-    kspinlock_unlock(&prp->parent->vec_slock);
+    /* The lock taken above, not a fresh read of prp->parent. */
+    kspinlock_unlock(&parent->vec_slock);
 
     /* Revoke every process capability naming this dying process across all
      * process tables before its soul is recycled, mirroring the connection
@@ -966,12 +994,109 @@ struct kcall_args_process_shutdown {
     int exec;
 };
 
+#if defined(CONFIG_INSTRUMENTATION)
+/* Address-space teardown cost (section 18 companion to the irqoff report).
+ * "unbind" spans process_clear_as_bindings through process_wait_unpinned, the
+ * part whose cost used to grow with the number of processes in the system, and
+ * "visited" counts the threads process_clear_as_bindings looked at; "total"
+ * spans the whole address-space branch of kext_process_shutdown through
+ * mdestroy. Updated lock-free by any hart, read racily by the report.
+ */
+static uint64_t pshut_count, pshut_unbind_sum, pshut_unbind_max;
+static uint64_t pshut_visit_sum, pshut_visit_max;
+static uint64_t pshut_total_sum, pshut_total_max;
+
+static void pshut_max(uint64_t *slot, uint64_t cyc)
+{
+    uint64_t cur = __atomic_load_n(slot, __ATOMIC_RELAXED);
+
+    while (cyc > cur &&
+           !__atomic_compare_exchange_n(slot, &cur, cyc, 0, __ATOMIC_RELAXED,
+                                        __ATOMIC_RELAXED))
+        ;
+}
+
+static void pshut_record(uint64_t t0,
+                         uint64_t t1,
+                         uint64_t t2,
+                         unsigned visited)
+{
+    __atomic_fetch_add(&pshut_count, 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&pshut_visit_sum, visited, __ATOMIC_RELAXED);
+    pshut_max(&pshut_visit_max, visited);
+    __atomic_fetch_add(&pshut_unbind_sum, t1 - t0, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&pshut_total_sum, t2 - t0, __ATOMIC_RELAXED);
+    pshut_max(&pshut_unbind_max, t1 - t0);
+    pshut_max(&pshut_total_max, t2 - t0);
+}
+
+static inline uint64_t pshut_ticks(void)
+{
+    return cpu_clock_ticks();
+}
+
+/* Cycles to ns without forming cyc * 1e9, which wraps past about 1.8e10 cycles:
+ * whole seconds first, then the remainder, which is below cps.
+ */
+static uint64_t pshut_ns(uint64_t cyc, uint64_t cps)
+{
+    return cyc / cps * 1000000000ULL + cyc % cps * 1000000000ULL / cps;
+}
+
+/* Print the teardown cost in ns. Called throttled from clock_handler next to
+ * nonpreempt_report(), outside any lock.
+ */
+void process_shutdown_report(void)
+{
+    uint64_t cps = qtimeptr->cycles_per_sec ? qtimeptr->cycles_per_sec : 1;
+    uint64_t n = __atomic_load_n(&pshut_count, __ATOMIC_RELAXED);
+    uint64_t visit_sum = __atomic_load_n(&pshut_visit_sum, __ATOMIC_RELAXED);
+    uint64_t visit_max = __atomic_load_n(&pshut_visit_max, __ATOMIC_RELAXED);
+    uint64_t unbind_sum = __atomic_load_n(&pshut_unbind_sum, __ATOMIC_RELAXED);
+    uint64_t unbind_max = __atomic_load_n(&pshut_unbind_max, __ATOMIC_RELAXED);
+    uint64_t total_sum = __atomic_load_n(&pshut_total_sum, __ATOMIC_RELAXED);
+    uint64_t total_max = __atomic_load_n(&pshut_total_max, __ATOMIC_RELAXED);
+
+    static uint64_t last_n;
+
+    if (__atomic_exchange_n(&last_n, n, __ATOMIC_RELAXED) == n)
+        return;
+    kprintf(
+        "pshut: count=%llu visited_avg=%llu visited_max=%llu "
+        "unbind_avg_ns=%llu unbind_max_ns=%llu "
+        "total_avg_ns=%llu total_max_ns=%llu\n",
+        (unsigned long long) n, (unsigned long long) (visit_sum / n),
+        (unsigned long long) visit_max,
+        (unsigned long long) pshut_ns(unbind_sum / n, cps),
+        (unsigned long long) pshut_ns(unbind_max, cps),
+        (unsigned long long) pshut_ns(total_sum / n, cps),
+        (unsigned long long) pshut_ns(total_max, cps));
+}
+#else
+static inline uint64_t pshut_ticks(void)
+{
+    return 0;
+}
+
+static inline void pshut_record(uint64_t t0,
+                                uint64_t t1,
+                                uint64_t t2,
+                                unsigned visited)
+{
+    (void) t0;
+    (void) t1;
+    (void) t2;
+    (void) visited;
+}
+#endif
+
 /* kext_process_shutdown — tear down a process's address space.
  *
- * Walks prp->threads and NULLs every thp->as_prp, then IPI- coordinates remote
- * harts off the dying as via IPI_TLB_SAFE + ack-wait + MSG_DELIVERY drain
- * before calling vm_ops->mdestroy(prp). If the process has no address space,
- * instead notifies the parent and destroys the calling thread.
+ * Releases every thread bound to prp's address space (prp's borrower list, then
+ * prp->threads) and NULLs its thp->as_prp, then IPI- coordinates remote harts
+ * off the dying as via IPI_TLB_SAFE + ack-wait + MSG_DELIVERY drain before
+ * calling vm_ops->mdestroy(prp). If the process has no address space, instead
+ * notifies the parent and destroys the calling thread.
  *
  * prp->vec_slock guards the prp->threads walk. The IPI_TLB_SAFE round- trip is
  * load-bearing and runs without a slock. Parameters:
@@ -990,11 +1115,20 @@ void kext_process_shutdown(void *data)
     }
 
     if (prp->memory) {
+        uint64_t pshut_t0 = pshut_ticks();
+
         /* Make sure no native or foreign thread retains this as before it is
          * removed.
          */
-        process_clear_as_bindings(prp);
+        unsigned pshut_visited = process_clear_as_bindings(prp);
+
+        /* The borrower list is closed and drained now, so only transient pins
+         * (kcalls holding a promoted lookup) remain to drain.
+         */
+        if (prp->as_borrowers || !prp->as_borrow_closed)
+            crash();
         process_wait_unpinned(prp);
+        uint64_t pshut_t1 = pshut_ticks();
 
         /* Force every remote hart still pointing at the dying as to swap to the
          * roottask as before we free prp->memory. Once the dying pgdir PA is
@@ -1016,12 +1150,14 @@ void kext_process_shutdown(void *data)
          */
 #if CONFIG_PROCESSORS_MAX > 1
         {
-            extern unsigned hart_ids[];
             for (;;) {
                 bool matched = false;
                 for (int _hi = 0; _hi < num_processors; ++_hi) {
-                    unsigned i = hart_ids[_hi];
+                    unsigned i = (unsigned) _hi;
                     process_t *prp0;
+
+                    if (!cpu_online(i))
+                        continue;
 
                     /* On RISC-V 64-bit, pointer loads are atomic. */
                     prp0 = *((process_t *volatile *) &pcpu_array[i].pc_as_prp);
@@ -1103,6 +1239,7 @@ void kext_process_shutdown(void *data)
 #endif
 
         vm_ops->mdestroy(prp);
+        pshut_record(pshut_t0, pshut_t1, pshut_ticks(), pshut_visited);
 
         if (prp->memory || pcpu_array[get_cpunum()].pc_as_prp == prp) {
             crash();
@@ -1234,23 +1371,46 @@ void kext_thread_tls(void *data)
 
 
 struct reparent_args {
-    process_t *prp;
+    pid_t pid;
 };
 
 /* kext_reparent — reparent a process onto kernel_threads_prp.
  *
  * Unlinks the process from its current parent's child list and links it into
  * kernel_threads_prp's child list, adjusting num_processes on both. Parameters:
- *   data : struct reparent_args * (prp)
+ *   data : struct reparent_args * (pid, generation included)
+ *
+ * The caller names the process by pid, not by pointer: roottask can destroy a
+ * dying process without holding its slot lock, so a pointer it looked up
+ * earlier may already be freed. The lookup pins the process the way an
+ * in-flight query does, so kext_process_destroy answers EAGAIN, and the caller
+ * of destroy retries, until the move is done. Fails with ESRCH when the pid is
+ * stale or its teardown has already been claimed.
  */
 void kext_reparent(void *data)
 {
     struct reparent_args *args = data;
-    process_t *prp = args->prp;
-    process_t *old_parent = prp->parent;
+    pid_t pid = args->pid;
+    thread_t *act = get_active_thread(get_cpunum());
+    process_t *prp;
+    process_t *old_parent;
     process_t *new_parent = kernel_threads_prp;
     process_t **pp;
 
+    kspinlock_lock(&process_vector_slock);
+    prp = vector_lookup(&process_vector, PINDEX(pid));
+    if (!prp || prp->pid != pid || prp->destroying || prp->reparenting) {
+        kspinlock_unlock(&process_vector_slock);
+        kcall_err(act, ESRCH);
+        return;
+    }
+    prp->reparenting = true;
+    kspinlock_unlock(&process_vector_slock);
+
+    /* Only destroy changes the parent besides this call, and the pin above
+     * keeps destroy out, so the parent read here stays the parent.
+     */
+    old_parent = __atomic_load_n(&prp->parent, __ATOMIC_ACQUIRE);
     process_child_locks_lock(old_parent, new_parent);
 
     /* Unlink from old parent's child list */
@@ -1263,12 +1423,17 @@ void kext_reparent(void *data)
     --old_parent->num_processes;
 
     /* Link into new parent's child list */
-    prp->parent = new_parent;
+    __atomic_store_n(&prp->parent, new_parent, __ATOMIC_RELEASE);
     prp->sibling = new_parent->child;
     new_parent->child = prp;
     ++new_parent->num_processes;
 
     process_child_locks_unlock(old_parent, new_parent);
+
+    kspinlock_lock(&process_vector_slock);
+    prp->reparenting = false;
+    kspinlock_unlock(&process_vector_slock);
+    SETKSTATUS(act, EOK);
 }
 
 

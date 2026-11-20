@@ -118,6 +118,9 @@ void ksys_manipulate(void *data)
     manip->data.tlb_flush_pending = 0;
     kspinlock_lock(&as_slock);
     int r = do_manipulation(manip);
+    if (r != EOK && (manip->data.op & PTE_OP_MAP))
+        inject_note_manip_failure(
+            (unsigned) ((manip->mapped - manip->data.first) >> PGSHIFT));
     flush_pending = manip->data.tlb_flush_pending;
     kspinlock_unlock(&as_slock);
     if (flush_pending)

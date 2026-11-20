@@ -186,15 +186,30 @@ int rdecl interrupt_unmask(unsigned level, interrupt_t *itp);
 int rdecl get_interrupt_level(thread_t *act, unsigned vector);
 
 unsigned(xferiov_pos)(CPU_REGISTERS *regs);
-int(xferiov)(thread_t *sthp,
-             iov_t *dst,
-             iov_t *src,
-             int dparts,
-             int sparts,
-             unsigned doff,
-             unsigned soff);
+/* Work one bounded transfer step has done so far (see XFER_STEP_*). */
+struct xfer_spent {
+    unsigned ents, bytes;
+};
 
-int(xfermsg)(thread_t *dthp, thread_t *sthp, unsigned doff, unsigned soff);
+/* A copy position over two iov vectors. dst/src, dparts/sparts and doff/soff
+ * are the current entry, the entries left from it and the bytes already moved
+ * within it; xferiov advances them as it goes. A bound is the process boundary
+ * its vector's entries must lie inside (0: not checked), and spent, when set,
+ * makes the walk return XFER_YIELD, with the position left in place, once it
+ * has done a step of work.
+ */
+struct xfer_walk {
+    iov_t *dst, *src;
+    int dparts, sparts;
+    size_t doff, soff;
+    uintptr_t dbound, sbound;
+    struct xfer_spent *spent;
+};
+
+int(xferiov)(thread_t *sthp, struct xfer_walk *w);
+
+int(xfermsg)(thread_t *dthp, thread_t *sthp, size_t doff, size_t soff);
+int xfermsg_bounded(thread_t *dthp, thread_t *sthp, size_t doff, size_t soff);
 int(xfernotification)(thread_t *dthp,
                       iov_t *dst,
                       int parts,
@@ -202,10 +217,19 @@ int(xfernotification)(thread_t *dthp,
                       uintptr_t value,
                       int32_t scoid);
 int(xferlen)(thread_t *thp, iov_t *iov, int parts);
+int xferlen_upto(thread_t *thp, iov_t *iov, int parts, size_t cap);
 int(xfer_memcpy)(void *dst, const void *src, size_t len);
 int xfer_probe(void *loc, unsigned words, int write);
 int xfer_atomic_or_user(volatile unsigned *uaddr, unsigned bits);
 int xfer_fetch_or_user(volatile unsigned *uaddr, unsigned bits, unsigned *oldp);
+unsigned tls_flags_load(thread_t *thp);
+int xfer_cpy_diov_step(thread_t *thpd,
+                       iov_t *dst,
+                       int dparts,
+                       const uint8_t *saddr,
+                       size_t slen,
+                       unsigned *idx,
+                       size_t *copied);
 int(xfer_cpy_diov)(thread_t *thpd,
                    iov_t *dst,
                    uint8_t *saddr,
@@ -318,13 +342,105 @@ void cpu_intr_attach(interrupt_t *itp, thread_t *thp);
 void cpu_greg_load(thread_t *thp, CPU_REGISTERS *regs);
 void cpu_reboot(void);
 void cpu_shutdown(void);
-void cpu_start_others(uintptr_t start);
+unsigned cpu_start_others(uintptr_t start);
+
+/* Secondary-CPU start slots (arch/riscv/cpu-misc.c), indexed by logical CPU.
+ * The boot CPU opens a slot and notes the time before starting the hart.
+ * _smpstart swaps in ARRIVED and runs on only if the slot was still OPEN;
+ * cpu_idle() then commits with ARRIVED -> JOINED before it publishes pc_alive.
+ * kext_smp_bringup() gives up on a CPU by moving its slot from OPEN or ARRIVED
+ * to ABANDONED, so whichever side's compare-exchange wins decides, and a hart
+ * that loses parks in wfi without joining anything.
+ */
+#define SMP_SLOT_CLOSED 0U
+#define SMP_SLOT_OPEN 1U
+#define SMP_SLOT_ARRIVED 2U
+#define SMP_SLOT_ABANDONED 3U
+#define SMP_SLOT_JOINED 4U
+extern uint32_t smp_slot[];
+extern uint64_t smp_start_tick[];
+#ifdef CONFIG_DEBUG_INJECT
+bool smp_inject(unsigned cpu, const char *opt);
+void smp_inject_ap_crash(unsigned cpu);
+#endif
 void plic_init(void);
 void plic_inithart(void);
 void cpu_force_fpu_save(thread_t *thp);
 #ifdef CONFIG_DEBUG_INJECT
 int inject_should_fail_alloc(process_t *prp,
                              soul_t *soulp); /* debug/inject.c */
+void inject_mutex_lock_stall(process_t *prp);
+void inject_mutex_lock_early(process_t *prp);
+void inject_mutex_lock_propagated(process_t *prp);
+void inject_force_ready_stall(thread_t *thp);
+void ipc_blk_trace(const char *file, int line, thread_t *thp);
+#define IPC_BLK(thp) ipc_blk_trace(__FILE__, __LINE__, (thp))
+void thr_trace(const char *file, int line, thread_t *thp, void *ra);
+void thr_trace_dump(const thread_t *thp);
+void sync_chains_assert_not_queued(const thread_t *thp, const char *what);
+void sync_chains_assert_readied(const thread_t *thp);
+#define THR_EV(thp) \
+    thr_trace(__FILE__, __LINE__, (thp), __builtin_return_address(0))
+bool inject_should_fail_sched_set(thread_t *act, bool lowered);
+void inject_note_sched_return(thread_t *act, bool switched);
+void inject_in_departure(int on);
+void inject_note_prio_work(void);
+void inject_note_prio_deferred_run(void);
+int inject_should_fail_turnstile(process_t *prp); /* debug/inject.c */
+void inject_note_manip_failure(unsigned pages);
+bool inject_pte_map_stop(const void *adp, uintptr_t start, uintptr_t *endp);
+#else
+static inline void inject_mutex_lock_stall(process_t *prp)
+{
+    (void) prp;
+}
+static inline void inject_mutex_lock_early(process_t *prp)
+{
+    (void) prp;
+}
+static inline void inject_mutex_lock_propagated(process_t *prp)
+{
+    (void) prp;
+}
+static inline void inject_force_ready_stall(thread_t *thp)
+{
+    (void) thp;
+}
+#define IPC_BLK(thp) ((void) 0)
+#define THR_EV(thp) ((void) 0)
+#define thr_trace_dump(thp) ((void) 0)
+#define sync_chains_assert_not_queued(thp, what) ((void) 0)
+#define sync_chains_assert_readied(thp) ((void) 0)
+static inline bool inject_should_fail_sched_set(thread_t *act, bool lowered)
+{
+    (void) act;
+    (void) lowered;
+    return false;
+}
+static inline void inject_note_sched_return(thread_t *act, bool switched)
+{
+    (void) act;
+    (void) switched;
+}
+static inline void inject_in_departure(int on)
+{
+    (void) on;
+}
+static inline void inject_note_prio_work(void) {}
+static inline void inject_note_prio_deferred_run(void) {}
+static inline void inject_note_manip_failure(unsigned pages)
+{
+    (void) pages;
+}
+static inline bool inject_pte_map_stop(const void *adp,
+                                       uintptr_t start,
+                                       uintptr_t *endp)
+{
+    (void) adp;
+    (void) start;
+    (void) endp;
+    return false;
+}
 #endif
 void fpu_drop_claims(thread_t *thp);
 /* User FP context: save/restore f0-f31 and fcsr (arch/riscv/fpcontext.S). */
@@ -352,13 +468,6 @@ void rdecl cpu_free_perfregs(thread_t *thp);
 void rdecl cpu_debug_init_perfregs(void);
 /* int  rdecl    cpu_alloc_perfregs(thread_t *thp); */
 
-int(rcvmsg)(thread_t *dthp,
-            process_t *sprp,
-            void *destp,
-            int destparts,
-            void *srcp,
-            int srcparts);
-
 #undef MMF
 #define MMF(r, f, p, e) MMF_PROTO(r, f, p, e)
 MM_FUNCS(emm)
@@ -385,4 +494,6 @@ uint64_t cpu_clock_ticks(void);
 #if defined(CONFIG_INSTRUMENTATION)
 /* section 18 interrupt-disabled window stats dump (globals.c). */
 void nonpreempt_report(void);
+/* Address-space teardown cost dump (kernel/ext/process.c). */
+void process_shutdown_report(void);
 #endif

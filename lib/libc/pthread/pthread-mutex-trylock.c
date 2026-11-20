@@ -17,18 +17,20 @@ int(pthread_mutex_trylock)(pthread_mutex_t *mutex)
     unsigned long owner, id = LIBC_TLS()->__owner;
     int ret;
 
-    if ((mutex->count & RTMUX_SYNC_PRIOCEILING) != 0) {
-        /* Re-lock by the owner: recurse in user space if the type allows (depth
-         * in the low 16 bits, clear of the ceiling), else report busy without
-         * blocking, matching the non-ceiling trylock path. Otherwise take the
-         * kernel path (ceiling check + boost) with an immediate timeout so a
-         * contended trylock never blocks.
+    if ((mutex->count & RTMUX_SYNC_KERNEL_PATH) != 0) {
+        unsigned long depth_mask = rtmux_sync_depth_mask(mutex->count);
+
+        /* Re-lock by the owner: recurse in user space if the type allows (a
+         * PRIO_PROTECT depth sits in the low 16 bits, clear of the ceiling),
+         * else report busy without blocking, matching the plain trylock path.
+         * Otherwise take the kernel path (ceiling check and boost, or the
+         * robust holder record) with an immediate timeout so a contended
+         * trylock never blocks.
          */
         if ((mutex->owner & ~RTMUX_SYNC_WAITING) == id) {
             if ((mutex->count & RTMUX_SYNC_NONRECURSIVE) != 0)
                 return EBUSY;
-            if ((mutex->count & RTMUX_SYNC_PPDEPTHMASK) ==
-                RTMUX_SYNC_PPDEPTHMASK)
+            if (((unsigned long) mutex->count & depth_mask) == depth_mask)
                 return EAGAIN;
             ++mutex->count;
             __ulock_debug_acquire(mutex, __pc);
@@ -37,11 +39,11 @@ int(pthread_mutex_trylock)(pthread_mutex_t *mutex)
         (void) __timer_timeout_r(CLOCK_REALTIME, RTMUX_TIMEOUT_MUTEX, NULL,
                                  NULL, NULL);
         ret = __rtmux_pthread_ret(sync_mutex_lock_r((sync_t *) mutex));
-        if (ret != EOK)
+        if (ret != EOK && ret != EOWNERDEAD)
             return (ret == ETIMEDOUT) ? EBUSY : ret;
         ++mutex->count;
         __ulock_debug_acquire(mutex, __pc);
-        return EOK;
+        return ret;
     }
 
     /* Is it unlocked? */
@@ -53,6 +55,8 @@ int(pthread_mutex_trylock)(pthread_mutex_t *mutex)
     /* Is it recursive and locked by me? */
     if ((mutex->count & RTMUX_SYNC_NONRECURSIVE) == 0) {
         if ((owner & ~RTMUX_SYNC_WAITING) == id) {
+            if ((mutex->count & RTMUX_SYNC_COUNTMASK) == RTMUX_SYNC_COUNTMASK)
+                return EAGAIN; /* Unix 98 recursive-count saturation */
             ++mutex->count;
             __ulock_debug_acquire(mutex, __pc);
             return EOK;
@@ -74,6 +78,10 @@ int(pthread_mutex_trylock)(pthread_mutex_t *mutex)
 
     if (mutex->owner == RTMUX_SYNC_DESTROYED) {
         return EINVAL;
+    }
+    /* Left so by an owner that died holding a mutex that is not robust. */
+    if (mutex->owner == RTMUX_SYNC_NOTRECOVERABLE) {
+        return ENOTRECOVERABLE;
     }
 
     return EBUSY;

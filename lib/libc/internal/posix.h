@@ -34,6 +34,7 @@ int __atfd_abspath(int dirfd,
                    const char *path,
                    char *out,
                    size_t outsz) __hidden;
+int __chdir_resolve(const char *path, char *out, size_t outsz) __hidden;
 int __poll_pselect(struct pollfd *fds,
                    nfds_t nfds,
                    int timeout_ms,

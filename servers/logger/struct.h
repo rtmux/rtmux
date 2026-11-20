@@ -7,31 +7,10 @@
 
 #define LOGF_FLAG_OSYNC 0x00000001
 
-#define SLOG_NOTIFY_INPUT 0
-#define SLOG_NOTIFY_OUTPUT 1
-#define SLOG_NOTIFY_OBAND 2
-#define SLOG_NOTIFY_COUNT 3
-
-
 struct waiting {
     struct waiting *next;
     int rcvid;
     int priority;
-};
-
-struct slog_notify_event {
-    struct slog_notify_event *next;
-    int rcvid;
-    int scoid;
-    int coid;
-    int cnt;
-    unsigned flags;
-    struct sigevent event;
-};
-
-struct slog_notify {
-    int cnt;
-    struct slog_notify_event *list;
 };
 
 struct ocbs {
@@ -42,7 +21,7 @@ struct ocbs {
 struct slogdev {
     struct ocbs *ocbs;
     struct waiting *waiting;
-    struct slog_notify notify[SLOG_NOTIFY_COUNT];
+    ioserv_notify_t notify[IOSERV_NOTIFY_COUNT];
     unsigned cnt; /* Number of ints starting at get */
     int *put;     /* Points into buf for putting data */
     int *get;     /* Points into buf for getting data */

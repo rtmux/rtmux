@@ -421,11 +421,12 @@ int path_resolve_servers(ioserv_context_t *ctp,
          * the literal "prp->session && prp->session->leader == prp->pid &&
          * prp->session->fd == -1" deref chain — three kernel-heap loads in a
          * row. process_query_info copies the three session fields into a U-mode
-         * buffer in one kernel extension.
+         * buffer in one kernel extension. The flag keeps roottask, which leads
+         * the system session without calling setsid, from acquiring one.
          */
         if (process_query_info(ctp->info.pid, &info) == EOK &&
-            info.sess_leader != 0 && info.sess_leader == ctp->info.pid &&
-            info.sess_fd == -1) {
+            (info.flags & RTMUX_FLG_PROC_SLEADER) &&
+            info.sess_leader == ctp->info.pid && info.sess_fd == -1) {
             ret |= _IO_CONNECT_RET_NOCTTY;
         }
         root_proc_unlock(ctp->info.pid);

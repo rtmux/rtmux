@@ -12,6 +12,7 @@
  * for the particular machine.
  */
 
+#include <limits.h>
 #include <unistd.h>
 #include <setjmp.h>
 #include <core/globals.h>
@@ -29,7 +30,12 @@ static const struct fault_handlers xfer_fault_handlers_xferlen = {
     .restart = 0,
 };
 
-int xferlen(thread_t *thp, iov_t *iov, int parts)
+/* The total length of a vector, or cap once the entries add up to that: a
+ * transfer of at most cap bytes does not read a longer vector to its end. The
+ * sum is clamped at cap, so one entry far past it cannot carry the result over
+ * the int return range and wrap to a short length.
+ */
+int xferlen_upto(thread_t *thp, iov_t *iov, int parts, size_t cap)
 {
     size_t len;
     int status;
@@ -47,19 +53,32 @@ int xferlen(thread_t *thp, iov_t *iov, int parts)
 
     SET_XFER_ENV(&env);
     if ((status = xfer_setjmp(*GET_XFER_ENV()))) {
+        /* A fault longjmps here with the fault handler still armed. */
+        SET_XFER_HANDLER(0);
         return status;
     }
 
     SET_XFER_HANDLER(&xfer_fault_handlers_xferlen);
 
     len = 0;
-    while (parts > 0) {
-        len += GETIOVLEN(iov);
+    while (parts > 0 && len < cap) {
+        size_t n = GETIOVLEN(iov);
+
+        len += n < cap - len ? n : cap - len;
         ++iov;
         --parts;
     }
 
     SET_XFER_HANDLER(0);
 
-    return (int) len;
+    /* The result is an int, and no message can be longer than INT_MAX, so a
+     * total past it is clamped rather than wrapped to a small or negative
+     * length.
+     */
+    return len > (size_t) INT_MAX ? INT_MAX : (int) len;
+}
+
+int xferlen(thread_t *thp, iov_t *iov, int parts)
+{
+    return xferlen_upto(thp, iov, parts, SIZE_MAX);
 }

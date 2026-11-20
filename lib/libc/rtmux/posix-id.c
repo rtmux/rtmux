@@ -12,6 +12,7 @@
  * by thread_waaa().
  */
 
+#include <errno.h>
 #include <unistd.h>
 #include <sys/rtmux-core.h>
 #include <sys/storage.h>
@@ -58,32 +59,62 @@ gid_t getegid(void)
     return info.cred.egid;
 }
 
+/* Ask roottask for the ids of `pid`, or of the caller when 0. Returns -1 when
+ * the request fails.
+ */
+static int getid_msg(pid_t pid, proc_getsetid_t *msg)
+{
+    msg->i.type = _PROC_GETSETID;
+    msg->i.subtype = _PROC_ID_GETID;
+    msg->i.pid = pid;
+    return msg_sendnc(ROOTTASK_COID, &msg->i, sizeof msg->i, &msg->o,
+                      sizeof msg->o);
+}
+
 pid_t getpgrp(void)
 {
-    proc_getsetid_t msg = {
-        .i.type = _PROC_GETSETID,
-        .i.subtype = _PROC_ID_GETID,
-    };
+    proc_getsetid_t msg = {0};
 
-    if (msg_sendnc(ROOTTASK_COID, &msg.i, sizeof msg.i, &msg.o, sizeof msg.o) ==
-        -1) {
+    if (getid_msg(0, &msg) == -1)
         return getpid();
-    }
     return msg.o.pgrp > 0 ? msg.o.pgrp : getpid();
+}
+
+/* The process group (want_sid 0) or session (want_sid 1) of `pid`, or of the
+ * caller when 0. proc answers EPERM for a process in another session and ESRCH
+ * for no process.
+ */
+static pid_t getid_of(pid_t pid, int want_sid)
+{
+    proc_getsetid_t msg = {0};
+
+    if (pid < 0) {
+        errno = ESRCH;
+        return -1;
+    }
+    if (getid_msg(pid, &msg) == -1)
+        return -1;
+    return want_sid ? msg.o.sid : msg.o.pgrp;
+}
+
+pid_t getpgid(pid_t pid)
+{
+    return getid_of(pid, 0);
 }
 
 pid_t getppid(void)
 {
-    proc_getsetid_t msg = {
-        .i.type = _PROC_GETSETID,
-        .i.subtype = _PROC_ID_GETID,
-    };
+    proc_getsetid_t msg = {0};
 
-    if (msg_sendnc(ROOTTASK_COID, &msg.i, sizeof msg.i, &msg.o, sizeof msg.o) ==
-        -1) {
+    if (getid_msg(0, &msg) == -1)
         return 1;
-    }
     return msg.o.ppid;
+}
+
+/* getsid — the session leader's pid for `pid`, or for the caller when 0. */
+pid_t getsid(pid_t pid)
+{
+    return getid_of(pid, 1);
 }
 
 pid_t setsid(void)

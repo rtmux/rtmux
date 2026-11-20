@@ -88,6 +88,8 @@ static const char *class_name(uint8_t class_id)
         return "MEMPART";
     case LOCK_CLASS_PA:
         return "PA";
+    case LOCK_CLASS_PRIO_DEFER:
+        return "PRIO_DEFER";
     case LOCK_CLASS_DEBUG:
         return "DEBUG";
     default:

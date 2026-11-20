@@ -533,25 +533,35 @@ WEAK int msg_key_data(int rcvid,
                           L(newkey), L(iov), L(parts)));
 }
 
-/* 23: msg_readiov */
+/* 23: msg_readiov. The kernel reads the cursor only when the flag says it is
+ * there, so a caller that built against the five-argument form leaves it
+ * unread.
+ */
+#define READIOV_CURSOR_FLAGS(flags, cursor) \
+    ((flags) | ((cursor) ? RTMUX_READIOV_CURSOR : 0))
+
 WEAK int msg_readiov_r(int rcvid,
                        const void *iov,
                        int parts,
                        int offset,
-                       int flags)
+                       int flags,
+                       void *cursor)
 {
-    return (int) __sc5(__KSYS_MSG_READIOV, L(rcvid), L(iov), L(parts),
-                       L(offset), L(flags));
+    return (int) __sc6(__KSYS_MSG_READIOV, L(rcvid), L(iov), L(parts),
+                       L(offset), READIOV_CURSOR_FLAGS(flags, cursor),
+                       L(cursor));
 }
 
 WEAK int msg_readiov(int rcvid,
                      const void *iov,
                      int parts,
                      int offset,
-                     int flags)
+                     int flags,
+                     void *cursor)
 {
-    return __sc_err(__sc5(__KSYS_MSG_READIOV, L(rcvid), L(iov), L(parts),
-                          L(offset), L(flags)));
+    return __sc_err(__sc6(__KSYS_MSG_READIOV, L(rcvid), L(iov), L(parts),
+                          L(offset), READIOV_CURSOR_FLAGS(flags, cursor),
+                          L(cursor)));
 }
 
 /* 24: msg_receive_notificationv */

@@ -24,20 +24,11 @@
 #include <sbi.h>
 #include <arch/fault.h>
 #include "trace-ring.h"
-#include <cpu-paging.h> /* PTE_V/R/W/X/U/A/D, PX, PTE2PA */
+#include <sv39-lookup.h> /* PTE_*, PX, PTE2PA, cpu_pte_lookup */
 #include <stdatomic.h>
 #ifdef CONFIG_DEBUG_INJECT
 #include <private/inject.h> /* inject_spin_begin/end */
 #endif
-
-extern pte_t *cpu_pte_lookup(pagetable_t pgdir, uintptr_t vaddr);
-
-/* Recovered-xfer-fault reports to print per boot before going quiet. Assumption
- * class: tuning. Diagnostics only; the recovery itself is unaffected. Revisit
- * trigger: a debugging session that needs the full stream, which should raise
- * this rather than remove the throttle.
- */
-#define XFER_FAULT_REPORT_MAX 16
 
 /* Cause names for the most common S-mode exceptions. */
 static const char *scause_name(uint64_t cause)
@@ -77,8 +68,9 @@ static const char *scause_name(uint64_t cause)
 /* ===================================================================== *
  * Verbose U-mode fault report — gated on CONFIG_UMODE_VERBOSE_FAULT_REPORT.
  *
- * deliver_fault() always prints a one-line "user fault:" summary; that tells us
- * a process died but not where the corruption came from. When this option is
+ * deliver_fault() prints a one-line "user fault:" summary (rate-limited per
+ * call site, see KPRINTF_RATELIMITED); that tells us a process died but not
+ * where the corruption came from. When this option is
  * enabled, dump_umode_fault() additionally reports the exact scause, the
  * page-table state of both the fault IP and the fault address, the full
  * register file, and a fault-safe scan of the user stack for candidate return
@@ -105,20 +97,23 @@ static uint64_t fault_pte_decode(pagetable_t pgdir,
                                  uintptr_t va,
                                  const char *what)
 {
-    pte_t *pte = cpu_pte_lookup(pgdir, va);
-    uint64_t pv;
+    int level;
+    pte_t pv;
 
-    if (!pte) {
-        kprintf("  %-4s %lx  UNMAPPED\n", what, (unsigned long) va);
+    if (!cpu_pte_lookup(pgdir, va, &level, &pv)) {
+        /* Also reached for a leaf the hardware faults on (W without R, or a
+         * misaligned superpage), which is not a mapping either.
+         */
+        kprintf("  %-4s %lx  UNMAPPED or invalid leaf\n", what,
+                (unsigned long) va);
         return 0;
     }
-    pv = (uint64_t) *pte;
     kprintf("  %-4s %lx  pa=%lx [%c%c%c%c%c%c%c%c]\n", what, (unsigned long) va,
-            (unsigned long) PTE2PA(pv), (pv & PTE_V) ? 'V' : '-',
-            (pv & PTE_R) ? 'R' : '-', (pv & PTE_W) ? 'W' : '-',
-            (pv & PTE_X) ? 'X' : '-', (pv & PTE_U) ? 'U' : '-',
-            (pv & PTE_G) ? 'G' : '-', (pv & PTE_A) ? 'A' : '-',
-            (pv & PTE_D) ? 'D' : '-');
+            (unsigned long) sv39_leaf_paddr(pv, level, va, NULL),
+            (pv & PTE_V) ? 'V' : '-', (pv & PTE_R) ? 'R' : '-',
+            (pv & PTE_W) ? 'W' : '-', (pv & PTE_X) ? 'X' : '-',
+            (pv & PTE_U) ? 'U' : '-', (pv & PTE_G) ? 'G' : '-',
+            (pv & PTE_A) ? 'A' : '-', (pv & PTE_D) ? 'D' : '-');
     return pv;
 }
 
@@ -184,19 +179,17 @@ static void dump_umode_fault(thread_t *act, uint64_t scause)
     n = 0;
     for (a = sp; a < sp + FAULT_STACK_SCAN_BYTES && n < FAULT_STACK_SCAN_MAX;
          a += 8) {
-        pte_t *spte = cpu_pte_lookup(pgdir, a);
+        pte_t se, we;
         uint64_t w;
-        pte_t *wpte;
 
-        if (!spte ||
-            (*spte & (PTE_V | PTE_R | PTE_U)) != (PTE_V | PTE_R | PTE_U))
+        if (!cpu_pte_lookup(pgdir, a, NULL, &se) ||
+            (se & (PTE_V | PTE_R | PTE_U)) != (PTE_V | PTE_R | PTE_U))
             continue;
         w = *(volatile uint64_t *) a;
         if (w == 0 || w >= KERNEL_VIRT_BASE)
             continue;
-        wpte = cpu_pte_lookup(pgdir, (uintptr_t) w);
-        if (wpte &&
-            (*wpte & (PTE_V | PTE_X | PTE_U)) == (PTE_V | PTE_X | PTE_U)) {
+        if (cpu_pte_lookup(pgdir, (uintptr_t) w, NULL, &we) &&
+            (we & (PTE_V | PTE_X | PTE_U)) == (PTE_V | PTE_X | PTE_U)) {
             kprintf("    [sp+%-4lu] %lx\n", (unsigned long) (a - sp),
                     (unsigned long) w);
             n++;
@@ -474,8 +467,8 @@ static int fpu_first_use(thread_t *thp, CPU_REGISTERS *regs)
     fp = FPUDATA_PTR(thp->fpudata);
     if (!fp) {
         if (!(fp = object_alloc(thp->process, &fpu_souls))) {
-            kprintf("fpu_souls exhausted pid=%d tid=%u\n", thp->process->pid,
-                    thp->tid);
+            KPRINTF_RATELIMITED("fpu_souls exhausted pid=%d tid=%u\n",
+                                thp->process->pid, thp->tid);
             return 0;
         }
         memset(fp, 0, sizeof *fp);
@@ -823,7 +816,11 @@ void strap_handler_c(CPU_REGISTERS *regs)
      * kcallptr (ecall instruction in syspage).
      */
     if (RISCV_EXC_IS_ECALL(scause)) {
-        unsigned num = (unsigned) regs->gpr[RISCV_REG_A7];
+        /* Clamp before narrowing, so a number with high bits set is refused
+         * as out of range instead of aliasing a live call.
+         */
+        uint64_t a7 = regs->gpr[RISCV_REG_A7];
+        unsigned num = a7 < __KSYS_BAD ? (unsigned) a7 : __KSYS_BAD;
         int from_smode = (scause == RISCV_EXC_ECALL_S);
 
         /* Pack arguments from the trap frame (read-only: copies register values
@@ -840,7 +837,8 @@ void strap_handler_c(CPU_REGISTERS *regs)
         kap[5] = regs->gpr[RISCV_REG_A5];
 
 #ifdef CONFIG_TRACE_SYSCALLS
-        if (num != __KSYS_DBGPRINT) {
+        /* An out-of-range number is reported, rate-limited, below. */
+        if (num != __KSYS_DBGPRINT && num != __KSYS_BAD) {
             static const char *const _knames[] = {
                 [0] = "nop",
                 [1] = "trace_event",
@@ -996,14 +994,30 @@ void strap_handler_c(CPU_REGISTERS *regs)
          */
         act->reg.pc += 4;
 
+        /* A saved msg_readv/msg_writev iov check resumes only into the same
+         * call; any other kernel call in between discards it.
+         */
+        if ((act->iovchk_iov || act->xcur.armed) && num != __KSYS_MSG_READV &&
+            num != __KSYS_MSG_WRITEV) {
+            act->iovchk_iov = NULL;
+
+            /* A copy cursor resumes only into the call that saved it: one of
+             * the calls that copy a message in steps.
+             */
+            if (num != __KSYS_MSG_SENDV && num != __KSYS_MSG_SENDVNC &&
+                num != __KSYS_MSG_RECEIVEV && num != __KSYS_MSG_REPLYV)
+                act->xcur.armed = false;
+        }
+
         /* Reject invalid syscall numbers AFTER advancing the PC so the faulting
          * thread resumes past the ecall instead of re-triggering it in an
          * infinite loop.
          */
         if (num >= __KSYS_BAD) {
-            kprintf("ecall: invalid syscall %u from sepc=%lx\n", num,
-                    (unsigned long) (act->reg.pc - 4));
-            act->reg.gpr[RISCV_REG_A0] = (uint64_t) (-1L);
+            KPRINTF_RATELIMITED("ecall: invalid syscall %lx from sepc=%lx\n",
+                                (unsigned long) a7,
+                                (unsigned long) (act->reg.pc - 4));
+            SETKSTATUS(act, -ENOSYS); /* kcall_err()'s encoding */
             lookup_rcvid_release();
             in_kcall_dec();
             return;
@@ -1086,16 +1100,27 @@ void strap_handler_c(CPU_REGISTERS *regs)
              */
         }
 
-        if (act->state != STATE_RUNNING ||
-            get_active_thread(get_cpunum()) != act) {
+        /* Store the status before testing for a switch. SchedSet on itself
+         * defers its switch (RTMUX_ITF_DEFER_DISPLACE), so this store reaches
+         * the caller and kernel_exit switches afterwards (YIELD_TAIL). Other
+         * bodies that switch the caller out publish their status first, and
+         * this store repeats it; thread destroy (kcall 47) relies on it too.
+         */
+        SETKSTATUS(act, -(long) ret);
+
+        bool displaced = act->state != STATE_RUNNING ||
+                         get_active_thread(get_cpunum()) != act;
+        bool switch_pending =
+            displaced || (act->internal_flags & RTMUX_ITF_YIELD_TAIL) != 0;
+
+        inject_note_sched_return(act, switch_pending);
+        if (switch_pending) {
             kernel_exit();
             /* NOTREACHED — same as above. */
         }
 
-        /* Error return — write negated errno to act->reg (same as regs for
-         * U-mode, different for S-mode). For U-mode: regs == &act->reg, so
-         * writing regs works. For S-mode: we already copied to act->reg above,
-         * but the caller's stack frame also needs the return value.
+        /* S-mode: regs is the caller's stack frame, a different copy from
+         * act->reg, so it needs the return value too.
          */
         in_kcall_dec();
         regs->gpr[RISCV_REG_A0] = (uint64_t) (-(long) ret);
@@ -1122,29 +1147,18 @@ void strap_handler_c(CPU_REGISTERS *regs)
                  * Rate-limited because this is now reachable on demand: any
                  * process can hand a kcall a null or unmapped pointer and land
                  * here, and an unthrottled kprintf is both a console flood and
-                 * a realtime hazard, since a kernel-side console write costs
-                 * hundreds of microseconds (see the kcall-dbgprint row in
-                 * docs/rt-budgets.md). Keep the first few per boot for
-                 * diagnosis, then count silently. Racy across harts by design;
-                 * it is a log throttle, not an accounting record.
+                 * a realtime hazard (see KPRINTF_RATELIMITED).
                  */
-                static unsigned xfer_fault_reports;
                 thread_t *act = get_active_thread(cpu);
                 unsigned flags = RISCV_EXC_IS_STORE(scause) ? SIGCODE_STORE : 0;
 
-                if (xfer_fault_reports < XFER_FAULT_REPORT_MAX) {
-                    xfer_fault_reports++;
-                    kprintf(
-                        "XFER fault: cpu=%u sepc=%lx stval=%lx scause=%lu "
-                        "(%s) flags=%x pid=%d tid=%u%s\n",
-                        cpu, (unsigned long) r_sepc(),
-                        (unsigned long) fault_addr, scause, scause_name(scause),
-                        flags, (act && act->process) ? act->process->pid : -1,
-                        act ? act->tid : 0U,
-                        xfer_fault_reports == XFER_FAULT_REPORT_MAX
-                            ? " (further reports suppressed)"
-                            : "");
-                }
+                KPRINTF_RATELIMITED(
+                    "XFER fault: cpu=%u sepc=%lx stval=%lx scause=%lu "
+                    "(%s) flags=%x pid=%d tid=%u\n",
+                    cpu, (unsigned long) r_sepc(), (unsigned long) fault_addr,
+                    scause, scause_name(scause), flags,
+                    (act && act->process) ? act->process->pid : -1,
+                    act ? act->tid : 0U);
                 fh->fault(act, &act->reg, flags);
                 /* fault handler does longjmp — should not return */
             }
@@ -1211,7 +1225,16 @@ void strap_handler_c(CPU_REGISTERS *regs)
              * deliver_fault() prints the one-line summary either way. Compiled
              * out when the option is off (default).
              */
-            dump_umode_fault(act, scause);
+            {
+                /* Rate-limited like the one-line summary in deliver_fault(),
+                 * with its own counter: a crash loop must not buy a
+                 * multi-line dump per fault.
+                 */
+                static struct kprintf_ratelimit dump_rl;
+
+                if (kprintf_rl_admit(&dump_rl, NULL, NULL))
+                    dump_umode_fault(act, scause);
+            }
 #endif
 
             in_kcall_inc();
@@ -1290,19 +1313,29 @@ void strap_handler_c(CPU_REGISTERS *regs)
         uint64_t satp = r_satp();
         uint64_t pgdir_pa = (satp & ((1UL << 44) - 1)) << 12;
         pagetable_t pgdir = (pagetable_t) (pgdir_pa + KERNEL_VIRT_BASE);
-        pte_t *pte = cpu_pte_lookup(pgdir, (uintptr_t) stval);
-        if (!pte) {
+        int level;
+        pte_t leaf;
+        if (!cpu_pte_lookup(pgdir, (uintptr_t) stval, &level, &leaf)) {
             unsigned l2_idx = (unsigned) ((stval >> 30) & 0x1ff);
             unsigned l1_idx = (unsigned) ((stval >> 21) & 0x1ff);
             unsigned long l2e = (unsigned long) pgdir[l2_idx];
-            kprintf("  pgwalk: va=%lx UNMAPPED (pgdir@%p L2[%u]=%lx)\n",
+
+            /* Also reached for a leaf the hardware faults on (W without R, or a
+             * misaligned superpage); the raw entries below show which.
+             */
+            kprintf("  pgwalk: va=%lx UNMAPPED or invalid leaf "
+                    "(pgdir@%p L2[%u]=%lx)\n",
                     (unsigned long) stval, pgdir, l2_idx, l2e);
-            if (l2e & PTE_V) {
+
+            /* Descend only through interior entries: an L2 leaf's PPN names the
+             * mapped memory, not an L1 table.
+             */
+            if ((l2e & PTE_V) && !sv39_is_leaf(l2e)) {
                 pagetable_t l1 =
                     (pagetable_t) ((PTE2PA(l2e)) + KERNEL_VIRT_BASE);
                 unsigned long l1e = (unsigned long) l1[l1_idx];
                 kprintf("  pgwalk:   L1@%p[%u]=%lx\n", l1, l1_idx, l1e);
-                if ((l1e & PTE_V) && !(l1e & (PTE_R | PTE_W | PTE_X))) {
+                if ((l1e & PTE_V) && !sv39_is_leaf(l1e)) {
                     pagetable_t l0 =
                         (pagetable_t) ((PTE2PA(l1e)) + KERNEL_VIRT_BASE);
                     unsigned l0_idx = (unsigned) ((stval >> 12) & 0x1ff);
@@ -1324,9 +1357,10 @@ void strap_handler_c(CPU_REGISTERS *regs)
                 }
             }
         } else {
-            unsigned long pv = (unsigned long) *pte;
+            unsigned long pv = (unsigned long) leaf;
             kprintf("  pgwalk: va=%lx pte=%lx pa=%lx [%c%c%c%c%c%c%c%c]\n",
-                    (unsigned long) stval, pv, (unsigned long) PTE2PA(*pte),
+                    (unsigned long) stval, pv,
+                    (unsigned long) sv39_leaf_paddr(pv, level, stval, NULL),
                     (pv & PTE_V) ? 'V' : '-', (pv & PTE_R) ? 'R' : '-',
                     (pv & PTE_W) ? 'W' : '-', (pv & PTE_X) ? 'X' : '-',
                     (pv & PTE_U) ? 'U' : '-', (pv & (1UL << 5)) ? 'G' : '-',

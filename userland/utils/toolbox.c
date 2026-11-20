@@ -147,7 +147,15 @@ static const struct toolbox_applet applets[] = {
     {"id", applet_id, "id [USER]"},
     {"inject", applet_inject,
      "inject spin-irqoff HART MS | spin-console HART MS | hang-hart HART | "
-     "fail-alloc POOL PID | alloc-status"},
+     "fail-alloc POOL PID | fail-turnstile PID | alloc-status | "
+     "fail-sched-set PID COUNT | sched-set-status | "
+     "sched-set-displaced MIN | stall-lock PID MS | "
+     "stall-lock-early PID MS | stall-lock-propagated PID MS | "
+     "stall-force-ready PID MS | pte-superpage PID VA | "
+     "pte-clear-superpage PID VA | pte-probe PID VA | "
+     "fail-pte-map PID PAGES | manip-partial MIN | "
+     "prio-settle-thread MIN | prio-settle-departure MAX | "
+     "prio-settle-reset"},
     {"kill", applet_kill, "kill [-SIG] PID ..."},
     {"login", applet_login, "login [USER]"},
     {"less", applet_less, "less [FILE ...]"},
@@ -180,7 +188,7 @@ static const struct toolbox_applet applets[] = {
     {"true", applet_true, "true"},
     {"uniq", applet_uniq, "uniq [-cdu] [FILE]"},
     {"vi", toolbox_vi_main, "vi [FILE]"},
-    {"wc", applet_wc, "wc [FILE ...]"},
+    {"wc", applet_wc, "wc [-lwc] [FILE ...]"},
     {"which", applet_which, "which COMMAND ..."},
     {"whoami", applet_whoami, "whoami"},
     {"xargs", applet_xargs, "xargs [-n MAX] [COMMAND [ARG ...]]"},
@@ -3126,15 +3134,100 @@ static int applet_inject(int argc, char **argv)
         }
         rc = inject_call(INJECT_OP_FAIL_NEXT_ALLOC, id,
                          strtoul(argv[3], NULL, 0));
-    } else if (argc == 2 && !strcmp(argv[1], "alloc-status")) {
+    } else if (argc == 4 && !strcmp(argv[1], "fail-sched-set")) {
+        rc = inject_call(INJECT_OP_FAIL_NEXT_SCHED_SET,
+                         strtoul(argv[2], NULL, 0), strtoul(argv[3], NULL, 0));
+    } else if (argc == 2 && !strcmp(argv[1], "sched-set-status")) {
+        rc = inject_call(INJECT_OP_SCHED_SET_STATUS, 0, 0);
+        if (rc >= 0)
+            printf("sched-set-consumed=%d\n", rc);
+        return rc < 0 ? 1 : 0;
+    } else if (argc == 3 && !strcmp(argv[1], "sched-set-displaced")) {
+        /* Exit 0 when at least MIN error returns met a switched-out caller. */
+        rc = inject_call(INJECT_OP_SCHED_SET_DISPLACED, 0, 0);
+        if (rc >= 0)
+            printf("sched-set-displaced=%d\n", rc);
+        return rc >= 0 && (unsigned long) rc >= strtoul(argv[2], NULL, 0) ? 0
+                                                                          : 3;
+    } else if (argc == 3 && !strcmp(argv[1], "fail-turnstile")) {
+        rc = inject_call(INJECT_OP_FAIL_NEXT_TURNSTILE,
+                         strtoul(argv[2], NULL, 0), 0);
+    } else if (argc == 4 && !strcmp(argv[1], "stall-lock")) {
+        rc = inject_call(INJECT_OP_STALL_MUTEX_LOCK, strtoul(argv[2], NULL, 0),
+                         strtoul(argv[3], NULL, 0));
+    } else if (argc == 4 && !strcmp(argv[1], "stall-lock-early")) {
+        rc = inject_call(INJECT_OP_STALL_MUTEX_EARLY, strtoul(argv[2], NULL, 0),
+                         strtoul(argv[3], NULL, 0));
+    } else if (argc == 4 && !strcmp(argv[1], "stall-lock-propagated")) {
+        rc = inject_call(INJECT_OP_STALL_MUTEX_PROPAGATED,
+                         strtoul(argv[2], NULL, 0), strtoul(argv[3], NULL, 0));
+    } else if (argc == 4 && !strcmp(argv[1], "stall-force-ready")) {
+        rc = inject_call(INJECT_OP_STALL_FORCE_READY, strtoul(argv[2], NULL, 0),
+                         strtoul(argv[3], NULL, 0));
+    } else if (argc == 3 && !strcmp(argv[1], "prio-settle-thread")) {
+        /* Exit 0 when at least MIN deferred priority settles ran in thread
+         * context since the last reset.
+         */
+        rc = inject_call(INJECT_OP_PRIO_SETTLE_STATS, 0, 0);
+        if (rc >= 0)
+            printf("prio-settle-thread=%d\n", rc);
+        return rc >= 0 && (unsigned long) rc >= strtoul(argv[2], NULL, 0) ? 0
+                                                                          : 3;
+    } else if (argc == 3 && !strcmp(argv[1], "prio-settle-departure")) {
+        /* Exit 0 when at most MAX priority recomputations ran inside a client
+         * departure (timer and event context) since the last reset.
+         */
+        rc = inject_call(INJECT_OP_PRIO_SETTLE_STATS, 1, 0);
+        if (rc >= 0)
+            printf("prio-settle-departure=%d\n", rc);
+        return rc >= 0 && (unsigned long) rc <= strtoul(argv[2], NULL, 0) ? 0
+                                                                          : 3;
+    } else if (argc == 2 && !strcmp(argv[1], "prio-settle-reset")) {
+        rc = inject_call(INJECT_OP_PRIO_SETTLE_STATS, 2, 0);
+    } else if (argc == 4 && !strcmp(argv[1], "pte-superpage")) {
+        rc = inject_call(INJECT_OP_PTE_SUPERPAGE, strtoul(argv[2], NULL, 0),
+                         strtoul(argv[3], NULL, 0));
+    } else if (argc == 4 && !strcmp(argv[1], "pte-clear-superpage")) {
+        rc = inject_call(INJECT_OP_PTE_CLEAR_SUPERPAGE,
+                         strtoul(argv[2], NULL, 0), strtoul(argv[3], NULL, 0));
+    } else if (argc == 4 && !strcmp(argv[1], "pte-probe")) {
+        /* Exit 0 when PID's page table has no leaf at VA, 3 when it has one. */
+        rc = inject_call(INJECT_OP_PTE_PROBE, strtoul(argv[2], NULL, 0),
+                         strtoul(argv[3], NULL, 0));
+        if (rc >= 0)
+            printf("pte-mapped=%d\n", rc);
+        return rc < 0 ? 1 : (rc ? 3 : 0);
+    } else if (argc == 4 && !strcmp(argv[1], "fail-pte-map")) {
+        rc = inject_call(INJECT_OP_FAIL_PTE_MAP, strtoul(argv[2], NULL, 0),
+                         strtoul(argv[3], NULL, 0));
+    } else if (argc == 3 && !strcmp(argv[1], "manip-partial")) {
+        /* Exit 0 when the last failed MAP had done at least MIN pages. */
+        rc = inject_call(INJECT_OP_MANIP_PARTIAL, 0, 0);
+        if (rc >= 0)
+            printf("manip-partial=%d\n", rc);
+        return rc >= 0 && (unsigned long) rc >= strtoul(argv[2], NULL, 0) ? 0
+                                                                          : 3;
+    } else if ((argc == 2 || argc == 3) && !strcmp(argv[1], "alloc-status")) {
+        /* With "consumed", also exit nonzero until an armed injection fired. */
         rc = inject_call(INJECT_OP_ALLOC_STATUS, 0, 0);
         if (rc >= 0)
             printf("alloc-consumed=%d\n", rc);
+        if (argc == 3)
+            return rc == 1 && !strcmp(argv[2], "consumed") ? 0 : 3;
         return rc < 0 ? 1 : 0;
     } else {
         fprintf(stderr,
                 "usage: inject spin-irqoff HART MS | spin-console HART MS | "
-                "hang-hart HART | fail-alloc POOL PID | alloc-status\n");
+                "hang-hart HART | fail-alloc POOL PID | fail-turnstile PID | "
+                "alloc-status [consumed] | fail-sched-set PID COUNT | "
+                "sched-set-status | "
+                "sched-set-displaced MIN | stall-lock PID MS | "
+                "stall-force-ready PID MS | pte-superpage PID VA | "
+                "pte-clear-superpage PID VA | pte-probe PID VA | "
+                "fail-pte-map PID PAGES | manip-partial MIN | "
+                "stall-lock-early PID MS | stall-lock-propagated PID MS | "
+                "prio-settle-thread MIN | prio-settle-departure MAX | "
+                "prio-settle-reset\n");
         return 2;
     }
     return rc == 0 ? 0 : 1;
@@ -3390,7 +3483,8 @@ static int applet_true(int argc, char **argv)
     return 0;
 }
 
-static int wc_one(FILE *fp, const char *name, int print_name)
+/* show: which counts to print, bit 0 lines, bit 1 words, bit 2 bytes. */
+static int wc_one(FILE *fp, const char *name, int print_name, int show)
 {
     unsigned long lines = 0;
     unsigned long words = 0;
@@ -3409,7 +3503,18 @@ static int wc_one(FILE *fp, const char *name, int print_name)
             in_word = 1;
         }
     }
-    printf("%8lu %8lu %8lu", lines, words, bytes);
+    {
+        unsigned long v[3] = {lines, words, bytes};
+        const char *sep = "";
+
+        for (int k = 0; k < 3; k++) {
+            if (show & (1 << k)) {
+                /* A lone count is unpadded, so "$(wc -l <f)" = 3 holds. */
+                printf("%s%*lu", sep, (show & (show - 1)) ? 8 : 0, v[k]);
+                sep = " ";
+            }
+        }
+    }
     if (print_name)
         printf(" %s", name);
     putchar('\n');
@@ -3419,10 +3524,26 @@ static int wc_one(FILE *fp, const char *name, int print_name)
 static int applet_wc(int argc, char **argv)
 {
     int rc = 0;
+    static const char opts[] = "lwc";
+    int show = 0;
+    int i = 1;
 
-    if (argc == 1)
-        return wc_one(stdin, "-", 0);
-    for (int i = 1; i < argc; i++) {
+    for (; i < argc && argv[i][0] == '-' && argv[i][1] != '\0'; i++) {
+        for (const char *f = argv[i] + 1; *f != '\0'; f++) {
+            const char *opt = strchr(opts, *f);
+
+            if (!opt) {
+                fprintf(stderr, "usage: wc [-lwc] [FILE ...]\n");
+                return 1;
+            }
+            show |= 1 << (opt - opts);
+        }
+    }
+    if (!show)
+        show = 7;
+    if (i == argc)
+        return wc_one(stdin, "-", 0, show);
+    for (; i < argc; i++) {
         /* ipc-send: utils ->
          * roottask-fsio,roottask-core,romfs,lkl-fsd,lkl-netd,dev-nvme,dev-serial,pipe,logger-ring
          */
@@ -3432,7 +3553,7 @@ static int applet_wc(int argc, char **argv)
             rc = 1;
             continue;
         }
-        wc_one(fp, argv[i], 1);
+        wc_one(fp, argv[i], 1, show);
         fclose(fp);
     }
     return rc;

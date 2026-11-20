@@ -48,14 +48,14 @@ RTMUX_SRCS = sigemptyset.c sigfillset.c sigaddset.c sigdelset.c sigismember.c \
 POSIX1_SRCS = sleep.c write.c read.c close.c fstat.c fdatasync.c fsync.c sync.c \
               sigprocmask.c sigaction.c pthread-sigmask.c pthread-kill.c fpathconf.c \
               setpgid.c setids.c tcsetpgrp.c tcsetsid.c \
-              open.c stat.c access.c chdir.c chroot.c issetugid.c \
+              open.c stat.c access.c chdir.c chroot.c issetugid.c getpagesize.c \
               getgroups.c sysconf.c umask.c time-posix.c times.c \
               lseek.c dup.c kill.c pause.c \
               pipe.c waitpid.c getcwd.c isatty.c creat.c \
-              tcgetattr.c tcsetattr.c tcgetpgrp.c tcflush.c tcdrain.c \
+              tcgetattr.c tcsetattr.c tcgetpgrp.c tcgetsid.c tcflush.c tcdrain.c \
               tcflow.c tcsendbreak.c termios-speed.c \
               statvfs.c poll.c select.c resource.c fcntl.c signal.c iodir.c _exit.c exec.c raise.c unlink.c \
-              gettimeofday.c localtime.c strftime.c setjmp.c uname.c
+              gettimeofday.c localtime.c tzfile.c time-conv.c strftime.c setjmp.c uname.c
 
 ifeq ($(ARCH),riscv)
 POSIX1_ASM_SRCS = _setjmp.S
@@ -99,7 +99,7 @@ IOSERV_SRCS = open-bind.c handler.c io-handler.c \
               mmap-handler.c status.c \
               notify-handler.c openfd-handler.c \
               unblock-handler.c devino.c data.c \
-              detach-id.c
+              detach-id.c notify-list.c
 
 POSIX1D_SRCS = posix-spawnattr-getpgroup.c \
                posix-spawnattr-getsched.c posix-spawnattr-getsig.c \
@@ -127,7 +127,7 @@ endif
 PTHREAD_SRCS = pthread-self.c pthread-equal.c \
                pthread-mutex-init.c pthread-mutex-destroy.c \
                pthread-mutex-lock.c pthread-mutex-unlock.c pthread-mutex-trylock.c \
-               pthread-mutex-timedlock.c \
+               pthread-mutex-timedlock.c pthread-mutex-consistent.c \
                pthread-ulock-debug.c \
                pthread-mutexattr-init.c pthread-mutexattr-destroy.c \
                pthread-mutexattr-protocol.c \

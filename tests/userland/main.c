@@ -13,8 +13,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stddef.h>
 #include <semaphore.h>
 #include <pthread.h>
@@ -30,6 +32,11 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+/* __KSYS_BAD, for the out-of-range system call probe. Same relative-include
+ * convention user-ptr-negative.c uses.
+ */
+#include "../../internal/include/sys/calls.h"
+
 #include "outcome.h"
 #include "test.h"
 
@@ -43,8 +50,15 @@ static const struct test_suite test_suites[] = {
 #define TEST_SUITE_NAMED(label, token) {.name = (label), .run = test_##token}
     TEST_SUITE(timers),
     TEST_SUITE(sync),
+    TEST_SUITE_NAMED("prio-loan", prio_loan),
     TEST_SUITE(printf),
     TEST_SUITE(setjmp),
+    TEST_SUITE(time),
+    TEST_SUITE(strftime),
+    TEST_SUITE(qsort),
+    TEST_SUITE(getopt),
+    TEST_SUITE(env),
+    TEST_SUITE_NAMED("malloc-stats", malloc_stats),
     TEST_SUITE(signals),
     TEST_SUITE(notifications),
     TEST_SUITE(capgate),
@@ -52,13 +66,11 @@ static const struct test_suite test_suites[] = {
     TEST_SUITE_NAMED("user-ptr-negative", user_ptr_negative),
     TEST_SUITE(vfs),
     TEST_SUITE_NAMED("posix-options", posix_options),
+    TEST_SUITE(sysconf),
     TEST_SUITE(gauges),
 #undef TEST_SUITE_NAMED
 #undef TEST_SUITE
 };
-
-/* Test infrastructure */
-static struct test_counts counts;
 
 static volatile uintptr_t fault_addr_seed = 1U;
 
@@ -67,8 +79,8 @@ static volatile uintptr_t fault_addr_seed = 1U;
  */
 static int finish(int require_run)
 {
-    tc_summary(&counts);
-    return tc_status(&counts, require_run) ? EXIT_FAILURE : EXIT_SUCCESS;
+    tc_summary(&suite_counts);
+    return tc_status(&suite_counts, require_run) ? EXIT_FAILURE : EXIT_SUCCESS;
 }
 
 #define FAULT_RECOVERY_CHECK(name, expr, detail) \
@@ -112,33 +124,6 @@ struct pthread_cancel_child_ctx {
     pthread_t target;
 };
 
-void test_ok(const char *name)
-{
-    tc_ok(&counts, name);
-}
-
-void test_fail(const char *name, const char *detail)
-{
-    tc_fail(&counts, name, detail);
-}
-
-void test_gap(const char *name, const char *anchor, const char *expected, const char *observed)
-{
-    tc_gap(&counts, name, anchor, expected, observed);
-}
-
-void test_skip(const char *name, const char *reason)
-{
-    tc_skip(&counts, name, reason);
-}
-
-void check(int cond, const char *name, const char *detail)
-{
-    if (cond)
-        test_ok(name);
-    else
-        test_fail(name, detail);
-}
 
 static int join_must_be_canceled(pthread_t tid)
 {
@@ -756,6 +741,80 @@ static void test_loader_negative_subset(void)
     test_setid_loader();
 }
 
+/* Out-of-range system calls, and faulting children, in a loop. Each must come
+ * back with the documented result every time, and the kernel's report of each
+ * is rate-limited per call site: scripts/qemu-regress.sh counts the
+ * "ecall: invalid syscall" and "user fault:" lines this mode prints against
+ * KPRINTF_RL_BURST + ceil(N / KPRINTF_RL_INTERVAL) + 1.
+ */
+#define BAD_SYSCALL_CALLS 100000
+#define CRASH_LOOP_CHILDREN 40
+
+/* Raw zero-argument trap. Decodes the result the way libc's __sc_err does: a
+ * negative a0 is a negated errno.
+ */
+static long raw_kcall0_err(long n)
+{
+    register long a7 __asm__("a7") = n;
+    register long a0 __asm__("a0");
+
+    __asm__ volatile("ecall" : "=r"(a0) : "r"(a7) : "memory");
+    if (a0 < 0) {
+        errno = (int) -a0;
+        return -1;
+    }
+    return a0;
+}
+
+static void test_bad_syscall_enosys(void)
+{
+    /* Just past the table, far past it, all ones, and a number whose low 32
+     * bits name a live call (NOP), which must not alias it.
+     */
+    static const long nums[] = {
+        __KSYS_BAD, __KSYS_BAD + 1, 0x7fffffffL, -1L,
+        (long) ((1UL << 32) | __KSYS_NOP),
+    };
+    const size_t nnums = sizeof nums / sizeof nums[0];
+    long wrong = 0;
+    int first_errno = 0;
+    char detail[80];
+
+    for (long i = 0; i < BAD_SYSCALL_CALLS; i++) {
+        errno = 0;
+        if (raw_kcall0_err(nums[(size_t) i % nnums]) != -1 || errno != ENOSYS) {
+            if (!wrong++)
+                first_errno = errno;
+        }
+    }
+    snprintf(detail, sizeof detail, "%ld of %d calls wrong, first errno=%d",
+             wrong, BAD_SYSCALL_CALLS, first_errno);
+    FAULT_RECOVERY_CHECK(bad_syscall_enosys, wrong == 0, detail);
+    if (!wrong)
+        FAULT_RECOVERY_EVENT("illegal-syscall", "deny", "out-of-range-call",
+                             "return-ENOSYS");
+}
+
+static void test_crash_loop(void)
+{
+    int reaped = 0;
+
+    for (int i = 0; i < CRASH_LOOP_CHILDREN; i++) {
+        char *argv[] = {"syscall_testing", "--fault-sigsegv", NULL};
+        pid_t pid;
+        int status;
+
+        if (posix_spawn(&pid, "/bin/syscall_testing", NULL, NULL, argv,
+                        NULL) != EOK)
+            break;
+        if (waitpid(pid, &status, 0) == pid && WIFSIGNALED(status) &&
+            WTERMSIG(status) == SIGSEGV)
+            reaped++;
+    }
+    FAULT_RECOVERY_CHECK(crash_loop, reaped == CRASH_LOOP_CHILDREN,
+                         "every faulting child must be reaped with SIGSEGV");
+}
+
 static void test_fault_recovery_subset(void)
 {
     int msg = 0;
@@ -783,6 +842,107 @@ static void test_fault_recovery_subset(void)
                              "--fault-sigsegv", SIGSEGV);
     FAULT_RECOVERY_SPAWN_SIG(readonly_write_fault, "user-page-fault",
                              "--fault-mprotect-ro", SIGSEGV);
+
+    test_bad_syscall_enosys();
+    test_crash_loop();
+}
+
+/* fdt-reserved-memory: fill RAM and check that no frame handed out lies in a
+ * range the device tree reserved. The ranges are the fixture
+ * scripts/qemu-regress.sh builds for that mode (setup_fdt_resv_or_skip): two
+ * no-map reg pairs in one /reserved-memory child, a plain child, and a
+ * /memreserve/ entry. Keep the two in step.
+ */
+#define RESV_FILL_CHUNK (1UL << 20)
+#define RESV_FILL_MAX_MAPS 8192
+
+static const struct {
+    uint64_t start, end;
+} resv_fixture[] = {
+    {0x8c000000UL, 0x8c010000UL}, /* mmode_resv0, first reg pair, no-map */
+    {0x8c100000UL, 0x8c110000UL}, /* mmode_resv0, second reg pair */
+    {0x8c200000UL, 0x8c220000UL}, /* rtmux-resv-test, plain */
+    {0x8c300000UL, 0x8c310000UL}, /* rtmux-resv-reusable, reusable */
+    {0x8c400000UL, 0x8c410000UL}, /* /memreserve/ */
+};
+
+/* Count the physically contiguous runs of [p, p + len) that touch a fixture
+ * range (once per range touched); a page whose physical address is unknown
+ * counts in *unknown. One query covers each run.
+ */
+static void resv_check(unsigned char *p,
+                       size_t len,
+                       unsigned long *inside,
+                       unsigned long *unknown)
+{
+    for (size_t off = 0; off < len; off += __PAGESIZE)
+        p[off] = 0x5a;
+    for (size_t off = 0; off < len;) {
+        off_t pa;
+        size_t run;
+
+        /* mem_offset, not posix_mem_offset: POSIX answers only for a memory
+         * object, and this is anonymous memory.
+         */
+        if (mem_offset(p + off, NOFD, len - off, &pa, &run) || run == 0) {
+            (*unknown)++;
+            off += __PAGESIZE;
+            continue;
+        }
+        if (run > len - off)
+            run = len - off;
+        for (size_t r = 0; r < sizeof resv_fixture / sizeof resv_fixture[0];
+             r++) {
+            if ((uint64_t) pa < resv_fixture[r].end &&
+                (uint64_t) pa + run > resv_fixture[r].start) {
+                (*inside)++;
+                if (*inside == 1)
+                    printf("resv-fill: run at pa %#llx+%#zx is reserved\n",
+                           (unsigned long long) pa, run);
+            }
+        }
+        off += (run + __PAGESIZE - 1) & ~(size_t) (__PAGESIZE - 1);
+    }
+}
+
+/* Map 1 MiB chunks until that fails, then halve the size on each failure down
+ * to a single page, so the fill reaches the frames a fragmented free pool still
+ * holds.
+ */
+static int resv_fill(void)
+{
+    static void *maps[RESV_FILL_MAX_MAPS];
+    static size_t lens[RESV_FILL_MAX_MAPS];
+    unsigned nmaps = 0;
+    unsigned long pages = 0, inside = 0, unknown = 0;
+    size_t len = RESV_FILL_CHUNK;
+
+    while (nmaps < RESV_FILL_MAX_MAPS) {
+        unsigned char *p = mmap(NULL, len, PROT_READ | PROT_WRITE,
+                                MAP_PRIVATE | MAP_ANON, NOFD, 0);
+
+        if (p == MAP_FAILED) {
+            if (len == __PAGESIZE)
+                break;
+            len /= 2;
+            continue;
+        }
+        maps[nmaps] = p;
+        lens[nmaps++] = len;
+        pages += len / __PAGESIZE;
+        resv_check(p, len, &inside, &unknown);
+    }
+    for (unsigned i = 0; i < nmaps; i++)
+        munmap(maps[i], lens[i]);
+    printf("resv-fill: maps=%u pages=%lu inside=%lu unknown=%lu%s\n", nmaps,
+           pages, inside, unknown,
+           nmaps == RESV_FILL_MAX_MAPS ? " (map cap reached)" : "");
+    check(pages > 0 && unknown == 0 && nmaps < RESV_FILL_MAX_MAPS,
+          "fdt-reserved-memory fill",
+          "the fill must run RAM dry and learn every page's address");
+    check(inside == 0, "fdt-reserved-memory outside",
+          "no frame may come from a reserved range");
+    return finish(1);
 }
 
 /* --laps N: rerun every suite N times in one boot. Each lap resets the per-lap
@@ -796,17 +956,17 @@ static int run_laps(int laps)
     for (int lap = 1; lap <= laps; lap++) {
         int lap_failed;
 
-        counts = (struct test_counts) {0};
+        suite_counts = (struct test_counts) {0};
         printf("lap=%d BEGIN\n", lap);
         for (size_t i = 0; i < sizeof test_suites / sizeof test_suites[0]; i++) {
             printf("%s[%s]\n", i == 0 ? "" : "\n", test_suites[i].name);
             test_suites[i].run();
             leak_suite_delta(lap, test_suites[i].name);
         }
-        lap_failed = counts.failed + leak_lap_check(lap);
-        tc_summary(&counts);
+        lap_failed = suite_counts.failed + leak_lap_check(lap);
+        tc_summary(&suite_counts);
         /* A lap that ran no case (every one skipped) is not a pass. */
-        if (!lap_failed && tc_status(&counts, 1))
+        if (!lap_failed && tc_status(&suite_counts, 1))
             lap_failed = 1;
         total_failed += lap_failed;
         printf("lap=%d %s\n", lap, lap_failed ? "FAIL" : "PASS");
@@ -815,9 +975,13 @@ static int run_laps(int laps)
     return total_failed ? EXIT_FAILURE : EXIT_SUCCESS;
 }
 
+char **test_initial_envp;
+
 int main(int argc, char *argv[])
 {
     size_t i;
+
+    test_initial_envp = argv + argc + 1; /* argv is NULL-terminated, envp follows */
 
     if (argc == 3 && !strcmp(argv[1], "--pthread-cancel-child"))
         return pthread_cancel_child(argv[2]);
@@ -864,22 +1028,116 @@ int main(int argc, char *argv[])
             test_skip("disconnect_under_alloc_failure", "fault injection unavailable");
         return finish(1);
     }
+    if (argc == 2 && !strcmp(argv[1], "--sched-set-error")) {
+        printf("[sched_set_error_after_lowering]\n");
+        if (sched_set_error_after_lowering() == TC_EXIT_SKIP)
+            test_skip("sched_set_error_after_lowering", "fault injection unavailable");
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--prio-loan-context")) {
+        printf("[loan_settle_context]\n");
+        (void) loan_settle_context();
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--sched-set-error-migrate")) {
+        printf("[sched_set_error_while_migrating]\n");
+        if (sched_set_error_while_migrating() == TC_EXIT_SKIP)
+            test_skip("sched_set_error_while_migrating", "needs fault injection and two harts");
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--condvar-reacquire-alloc-failure")) {
+        printf("[condvar_reacquire_alloc_failure]\n");
+        if (condvar_reacquire_alloc_failure() == TC_EXIT_SKIP)
+            test_skip("condvar_reacquire_alloc_failure", "fault injection unavailable");
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--mutex-waiting-republish")) {
+        printf("[mutex_waiting_republish]\n");
+        if (mutex_waiting_republish() == TC_EXIT_SKIP)
+            test_skip("mutex_waiting_republish", "fault injection unavailable");
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--mutex-handoff-loan")) {
+        printf("[mutex_handoff_loan]\n");
+        if (mutex_handoff_loan() == TC_EXIT_SKIP)
+            test_skip("mutex_handoff_loan", "fault injection unavailable");
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--mutex-waiting-withdrawn")) {
+        printf("[mutex_waiting_withdrawn]\n");
+        if (mutex_waiting_withdrawn() == TC_EXIT_SKIP)
+            test_skip("mutex_waiting_withdrawn", "fault injection unavailable");
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--condvar-interrupt-stale")) {
+        printf("[condvar_interrupt_stale]\n");
+        if (condvar_interrupt_stale() == TC_EXIT_SKIP)
+            test_skip("condvar_interrupt_stale", "fault injection unavailable");
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--ns-open-deferral")) {
+        printf("[ns_open_deferral]\n");
+        if (ns_open_deferral() == TC_EXIT_SKIP)
+            test_skip("ns_open_deferral", "fault injection unavailable");
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--pte-partial-map")) {
+        printf("[pte_partial_map]\n");
+        if (pte_partial_map() == TC_EXIT_SKIP)
+            test_skip("pte_partial_map", "fault injection unavailable");
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--pgrp-races")) {
+        printf("[pgrp_races]\n");
+        if (pgrp_races() == TC_EXIT_SKIP)
+            test_skip("pgrp_races", "debug window unavailable");
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--pgrp-exec-hold"))
+        return pgrp_exec_hold();
+    if (argc == 2 && !strcmp(argv[1], "--pgrp-tty-bind"))
+        return pgrp_tty_child(0);
+    if (argc == 2 && !strcmp(argv[1], "--pgrp-tty-race"))
+        return pgrp_tty_child(1);
     if (argc == 3 && !strcmp(argv[1], "--serial-unblock-child"))
         return serial_unblock_child(!strcmp(argv[2], "announce"));
+    if (argc == 2 && !strcmp(argv[1], "--console-poll")) {
+        printf("=== RTMux Console Poll Test ===\n\n");
+        test_console_poll();
+        return finish(1);
+    }
     if (argc == 2 && !strcmp(argv[1], "--serial-unblock")) {
         printf("=== RTMux Serial Unblock Test ===\n\n");
         test_serial_unblock();
+        test_serial_poll();
         return finish(1);
     }
-    if (argc == 2 && !strcmp(argv[1], "--spawn-storm")) {
+    if ((argc == 2 || argc == 3) && !strcmp(argv[1], "--spawn-storm")) {
+        /* Optional count of idle processes kept alive across the storm. */
+        char *end = NULL;
+        unsigned long residents = 0;
+
+        if (argc == 3) {
+            errno = 0;
+            residents = strtoul(argv[2], &end, 10);
+            if (!isdigit((unsigned char) argv[2][0]) || *end || errno ||
+                (unsigned) residents != residents) {
+                printf("--spawn-storm: bad resident count '%s'\n", argv[2]);
+                return EXIT_FAILURE;
+            }
+        }
         printf("=== RTMux Concurrent Spawn Storm ===\n\n[spawn-storm]\n");
-        test_spawn_concurrent();
+        test_spawn_storm((unsigned) residents);
         return finish(1);
     }
     if (argc == 2 && !strcmp(argv[1], "--trace-negative")) {
         printf("=== RTMux Trace Negative Test ===\n\n[trace-negative]\n");
         test_trace_negative();
         return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--resv-fill")) {
+        printf("=== RTMux Reserved Memory Fill ===\n\n[fdt-reserved-memory]\n");
+        return resv_fill();
     }
     if (argc == 2 && !strcmp(argv[1], "--fault-recovery")) {
         printf("=== RTMux Fault Recovery Test ===\n\n");
@@ -889,8 +1147,14 @@ int main(int argc, char *argv[])
     }
     if (argc == 3 && !strcmp(argv[1], "--loader-execvp-child"))
         return loader_execvp_child(argv[2]);
+    if (argc == 3 && !strcmp(argv[1], "--env-expect"))
+        return env_expect_child(argv[2]);
+    if (argc == 2 && !strcmp(argv[1], "--orphan-exit-mid"))
+        return orphan_exit_mid();
     if (argc == 3 && !strcmp(argv[1], "--spawn-echo-child"))
         return spawn_echo_child(argv[2]);
+    if (argc >= 2 && !strcmp(argv[1], "--spawn-bigargs-child"))
+        return spawn_bigargs_child(argc, argv);
     if (argc == 2 && !strcmp(argv[1], "--spawn-full-fd-child"))
         return spawn_full_fd_child();
     if (argc == 2 && !strcmp(argv[1], "--loader-negative")) {
@@ -1061,6 +1325,69 @@ int main(int argc, char *argv[])
          */
         _exit(atoi(argv[2]));
     }
+    if (argc >= 3 && !strcmp(argv[1], "--expect-cwd")) {
+        /* argv[2] is the expected cwd; any further arguments are descriptors
+         * the file actions must have left open.
+         */
+        char cwd[PATH_MAX + 1];
+        struct stat st;
+
+        if (!getcwd(cwd, sizeof cwd) || strcmp(cwd, argv[2]) != 0)
+            return 2;
+        for (int i = 3; i < argc; i++) {
+            if (fstat(atoi(argv[i]), &st) != 0)
+                return 3;
+        }
+        return EXIT_SUCCESS;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--expect-setsid")) {
+        int fd;
+
+        if (getsid(0) != getpid() || getpgrp() != getpid())
+            return 2;
+        /* The parent stayed in the old session, which getsid refuses. */
+        errno = 0;
+        if (getsid(getppid()) != -1 || errno != EPERM)
+            return 5;
+        /* /dev/tty opens only for a session with a controlling terminal. */
+        fd = open("/dev/tty", O_RDWR);
+        if (fd != -1) {
+            (void) close(fd);
+            return 3;
+        }
+        return errno == ENXIO ? EXIT_SUCCESS : 4;
+    }
+    if ((argc == 2 || argc == 3) && !strcmp(argv[1], "--session-probe")) {
+        /* Report this process's view of its session and group, after joining
+         * the group argv[2] if given and otherwise leading its own (setpgid),
+         * on one line; then stay alive until stdin reaches EOF, so that the
+         * parent can probe it.
+         */
+        char line[128], c;
+        pid_t sid = getsid(0), pg0 = getpgrp();
+        int rc, err, n;
+
+        errno = 0;
+        rc = setpgid(0, argc == 3 ? (pid_t) atoi(argv[2]) : 0);
+        err = rc == 0 ? 0 : errno;
+        n = snprintf(line, sizeof line, "sid=%d pg0=%d rc=%d err=%d pg1=%d\n",
+                     (int) sid, (int) pg0, rc, err, (int) getpgrp());
+        if (n < 0 || write(STDOUT_FILENO, line, (size_t) n) != n)
+            return 2;
+        while (read(STDIN_FILENO, &c, 1) == 1)
+            ;
+        return EXIT_SUCCESS;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--getsid-hold")) {
+        /* Say it is running, then stay alive until stdin reaches EOF. */
+        char c;
+
+        if (write(STDOUT_FILENO, "r", 1) != 1)
+            return 2;
+        while (read(STDIN_FILENO, &c, 1) == 1)
+            ;
+        return EXIT_SUCCESS;
+    }
     if (argc == 2 && !strcmp(argv[1], "--expect-resetids")) {
         return getuid() == geteuid() && getgid() == getegid() ? EXIT_SUCCESS
                                                               : EXIT_FAILURE;
@@ -1145,6 +1472,38 @@ int main(int argc, char *argv[])
         }
         (void) munmap(r, sizeof *r);
         return EXIT_SUCCESS;
+    }
+    if (argc == 3 && (!strcmp(argv[1], "--robust-hold") ||
+                      !strcmp(argv[1], "--robust-exit") ||
+                      !strcmp(argv[1], "--robust-wait"))) {
+        /* Lock the robust mutex in shm argv[2] and die holding it:
+         * --robust-exit sets state to 1 and exits at once, --robust-hold waits
+         * for the parent's SIGKILL (or gives up after 3 s), and --robust-wait
+         * takes the lock whether or not the previous owner died (the parent
+         * holds it, so this blocks) and exits.
+         */
+        int fd = shm_open(argv[2], O_RDWR, 0600);
+        struct pshared_region *r;
+        struct timespec ts = {.tv_sec = 0, .tv_nsec = 10000000};
+        int lrc;
+
+        if (fd == -1)
+            _exit(2);
+        r = mmap(NULL, sizeof *r, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        (void) close(fd);
+        if (r == MAP_FAILED)
+            _exit(3);
+        lrc = pthread_mutex_lock(&r->mtx);
+        if (lrc != EOK && lrc != EOWNERDEAD)
+            _exit(3);
+        if (!strcmp(argv[1], "--robust-wait"))
+            _exit(0);
+        r->state = 1;
+        if (!strcmp(argv[1], "--robust-hold")) {
+            for (int i = 0; i < 300; i++)
+                (void) nanosleep(&ts, NULL);
+        }
+        _exit(0);
     }
     if (argc == 3 && !strcmp(argv[1], "--pshared-cond-wait")) {
         int fd = shm_open(argv[2], O_RDWR, 0600);

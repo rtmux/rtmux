@@ -24,6 +24,7 @@ int roottask_sysconf_set(pid_t pid,
                          long value,
                          const char *str);
 void roottask_sysconf_destroy(pid_t pid);
+long roottask_sc_pagesize(int name);
 
 /* ids.c */
 int proc_getsetid(ioserv_context_t *ctp, proc_getsetid_t *msg);
@@ -107,6 +108,38 @@ int proc_jobctl_signal_bg(pid_t server, pid_t pid, int signo);
 int proc_jobctl_setpgrp(pid_t server, pid_t pid, pid_t pgrp);
 int proc_jobctl_tty_busy(pid_t server, pid_t sid);
 
+/* Process groups are tracked by their members (group.c). proc_pgrp_session
+ * finds a group's session while it has a member, a zombie included.
+ * proc_pgrp_lock serializes every change of a process's group or session
+ * (setpgid, setsid, the inheritance at spawn) and is taken before any process
+ * slot lock; the group table has a lock of its own, below the slot locks, so
+ * that a reap can leave its group with one held.
+ */
+int proc_pgrp_session(pid_t pgrp, pid_t *sid);
+void proc_pgrp_lock(void);
+void proc_pgrp_unlock(void);
+int proc_pgrp_boot(pid_t pid);
+int proc_pgrp_inherit(pid_t child, pid_t parent);
+int proc_pgrp_new(pid_t pid);
+void proc_pgrp_reap(pid_t pid);
+
+/* Window a CONFIG_DEBUG_INJECT image can hold open, so that a test can put a
+ * second operation inside a race; arm one with _PROC_JOBCTL_DEBUG.
+ */
+#ifdef CONFIG_DEBUG_INJECT
+void proc_pgrp_window(unsigned where);
+int proc_pgrp_window_arm(unsigned where, unsigned ms);
+#else
+#define proc_pgrp_window(where) ((void) 0)
+#endif
+
+/* session.c: a process's link on its session ends, and with the last one the
+ * session's terminal is let go.
+ */
+void proc_tty_init(void);
+void proc_session_unref(session_t *sep);
+session_t *root_session_link_of(pid_t pid, pid_t *sid, pid_t *pgid);
+
 /* exit.c */
 int proc_exit(ioserv_context_t *ctp, union proc_msg_union *msg);
 int proc_terminate(message_context_t *ctp,
@@ -122,7 +155,7 @@ pid_t ProcessIndexToPid(unsigned index);
 int process_set_ocb_list(pid_t pid, void *head);
 int ProcessExitFinalize(pid_t pid);
 int ProcessFlagsOp(pid_t pid, uint32_t set, uint32_t clear);
-int ProcessSetRlimitCpu(pid_t pid, uint64_t cur, uint64_t max);
+int ProcessSetRlimit(pid_t pid, int resource, uint64_t cur, uint64_t max);
 int process_set_spawn(pid_t pid,
                       uintptr_t initial_ip,
                       uintptr_t initial_sp,

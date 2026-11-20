@@ -12,6 +12,7 @@
 
 #include <asmmacro.h>
 #include <asm/image.h>
+#include <asm/boot-stack.h>
 
 /* Supervisor interrupt enable register */
 #define CSR_SIE		0x104
@@ -79,10 +80,18 @@ _start_warm:
 	la	a3, _start_hang
 	csrw	CSR_STVEC, a3
 
-	/* Setup stack (16KB above BSS end) */
+	/* Setup stack (BOOT_STACK_SIZE above BSS end), filled with a known
+	 * pattern so boot_layout_check() can measure how much of it was used.
+	 */
 	la	a3, _end
-	li	a4, 0x4000
+	li	a4, BOOT_STACK_SIZE
 	add	sp, a3, a4
+	li	a5, BOOT_STACK_FILL
+	mv	a2, a3
+_stack_fill:
+	sd	a5, (a2)
+	add	a2, a2, __SIZEOF_POINTER__
+	blt	a2, sp, _stack_fill
 
 	/* Jump to startup_entry() */
 	la	a3, _boot_a0

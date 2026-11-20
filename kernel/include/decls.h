@@ -81,6 +81,7 @@ void *nano_query(unsigned type,
                  void *objbuf,
                  size_t objsize);
 int rdecl force_ready(thread_t *thp, unsigned err);
+void prio_defer_init(void);
 void specialret_attr specialret(thread_t *thp);
 void rdecl deliver_fault(thread_t *thp, siginfo_t *info);
 uint64_t rlimit_cpu_to_ns(uint64_t secs);
@@ -162,7 +163,9 @@ int exit_ready_stopped(thread_t *thp);
 void rdecl tthread_unpin(thread_t *thp);
 int rdecl thread_set_as_prp(thread_t *thp, process_t *prp);
 void rdecl thread_clear_as_prp_if(thread_t *thp, process_t *prp);
+unsigned rdecl thread_as_release_borrowers(process_t *prp);
 void rdecl sync_thread_cleanup(thread_t *thp);
+void rdecl thread_sync_teardown(thread_t *thp);
 uint32_t rdecl keygen(const unsigned char *buf, size_t n, uint64_t secret);
 uint64_t keydata_draw(uintptr_t salt);
 void keydata_stir(void);
@@ -236,12 +239,13 @@ connect_t *rdecl lookup_rcvid(kcall_args_t *kap, int rcvid, thread_t **thpp);
  * unconditionally). Call after the last dereference of cop / thp.
  */
 void rdecl lookup_rcvid_release(void);
+void rdecl lookup_rcvid_release_all(void);
 limits_t *rdecl lookup_limits(uid_t uid);
 ksync_t *rdecl sync_create(process_t *bill_prp, sync_t *sync, unsigned flags);
 int rdecl sync_destroy(process_t *prp, sync_t *sync);
 ksync_t *rdecl sync_lookup(sync_t *sync, unsigned create);
 void rdecl sync_wakeup(ksync_t *syp, int all);
-int rdecl sync_chain_force_ready(thread_t *thp);
+bool rdecl sync_chain_force_ready(thread_t *thp);
 
 notification_t *rdecl notification_add(process_t *prp,
                                        pril_head_t *queue,
@@ -322,12 +326,14 @@ int rdecl sigevent_notification_roottask(int code,
 void intrevent_preemption(unsigned);
 void intrevent_flush(void);
 
-int viov_to_piov(process_t *prp,
+int viov_to_piov(thread_t *act,
+                 process_t *prp,
                  iov_t *piop,
                  int pparts,
-                 iov_t *viop,
+                 const iov_t *viop,
                  int vparts,
-                 int offset);
+                 size_t voffset,
+                 struct _iov_cursor *curp);
 
 int rdecl debug_process(process_t *prp, debug_process_t *dpp);
 int rdecl debug_thread(process_t *prp, thread_t *thp, debug_thread_t *dtp);

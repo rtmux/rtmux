@@ -24,6 +24,7 @@
 
 #include <core/globals.h>
 #include <paging.h>
+#include <sv39-lookup.h>
 
 /* cpu_pgdir_create — allocate a user root page table with kernel mappings.
  *
@@ -93,30 +94,27 @@ pagetable_t cpu_pgdir_create(void)
     return pgdir;
 }
 
+/* walk_new_table — zeroed intermediate table from the kernel heap, for
+ * sv39_walk_slot. Returns the linking PTE, or 0 when the heap is out.
+ */
+static pte_t walk_new_table(void)
+{
+    void *table = _scalloc_page();
+
+    return table ? PA2PTE(PTR_TO_PHYS(table)) | PTE_V : 0;
+}
+
 /* walk — traverse the page table, optionally creating intermediate levels.
  *
  * Returns a pointer to the L0 PTE for the given VA, or NULL if alloc is false
- * and the mapping doesn't exist.
+ * and the mapping doesn't exist, if a superpage leaf covers the VA, or if an
+ * allocation fails.
  */
 static pte_t *walk(pagetable_t pgdir, uintptr_t va, int alloc)
 {
     if (va >= MAXVA)
         return NULL;
-
-    for (int level = 2; level > 0; level--) {
-        pte_t *pte = &pgdir[PX(level, va)];
-        if (*pte & PTE_V) {
-            pgdir = (pagetable_t) PHYS_TO_PTR(PTE2PA(*pte));
-        } else {
-            if (!alloc)
-                return NULL;
-            pgdir = (pagetable_t) _scalloc_page();
-            if (!pgdir)
-                return NULL;
-            *pte = PA2PTE(PTR_TO_PHYS(pgdir)) | PTE_V;
-        }
-    }
-    return &pgdir[PX(0, va)];
+    return sv39_walk_slot(pgdir, va, alloc ? walk_new_table : NULL, NULL);
 }
 
 /* cpu_map_pages — map VA → PA with given PTE flags in the page table.
@@ -160,11 +158,11 @@ extern void pa_free_paddr(paddr_t p, paddr_t s, paddr_t resv_size);
 extern void cpu_tlb_flush_complete(void);
 
 /* Free the table a non-leaf PTE points to, with the allocator that made it:
- * sv39_walk (cpu-pte.c) takes intermediate tables from pa_alloc and marks the
- * PTE with PTE_SW_PA; walk() above takes them from _scalloc_page. Freeing a pa
- * page into the kernel heap kept it from pa for good, a few pages per exited
- * process (and quietly refilled the heap that the pgdir's alignment slack
- * drained).
+ * sv39_new_table (cpu-pte.c) takes intermediate tables from pa_alloc and
+ * marks the PTE with PTE_SW_PA; walk() above takes them from _scalloc_page.
+ * Freeing a pa page into the kernel heap kept it from pa for good, a few pages
+ * per exited process (and quietly refilled the heap that the pgdir's alignment
+ * slack drained).
  */
 static void pgtable_page_free(pte_t entry)
 {
@@ -191,7 +189,7 @@ void cpu_pgdir_free(pagetable_t pgdir)
      * latter case, then the L1, then the pgdir itself.
      */
     pte_t l2_entry = pgdir[0];
-    if ((l2_entry & PTE_V) && !(l2_entry & (PTE_R | PTE_W | PTE_X))) {
+    if ((l2_entry & PTE_V) && !sv39_is_leaf(l2_entry)) {
         pagetable_t l1 = (pagetable_t) PHYS_TO_PTR(PTE2PA(l2_entry));
 
         /* A hart may still cache translations walked through these tables.
@@ -202,7 +200,7 @@ void cpu_pgdir_free(pagetable_t pgdir)
         cpu_tlb_flush_complete();
         for (int j = 0; j < 512; j++) {
             pte_t l1_entry = l1[j];
-            if ((l1_entry & PTE_V) && !(l1_entry & (PTE_R | PTE_W | PTE_X))) {
+            if ((l1_entry & PTE_V) && !sv39_is_leaf(l1_entry)) {
                 pgtable_page_free(l1_entry);
             }
         }
@@ -217,10 +215,12 @@ paddr_t cpu_va2pa(pagetable_t pgdir, uintptr_t va)
     if (va >= MAXVA)
         return 0;
 
-    pte_t *pte = walk(pgdir, va, 0);
-    if (!pte || !(*pte & PTE_V))
+    /* walk() would descend through a superpage leaf as if it were a table; the
+     * leaf lookup stops there and reports its level.
+     */
+    int level;
+    pte_t e;
+    if (!cpu_pte_lookup(pgdir, va, &level, &e))
         return 0;
-
-    paddr_t pa = PTE2PA(*pte);
-    return pa | (va & (PGSIZE - 1));
+    return (paddr_t) sv39_leaf_paddr(e, level, va, NULL);
 }

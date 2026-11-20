@@ -139,6 +139,16 @@ test -n "$(ps)" && ok ps || no ps
 test -n "$(date)" && ok date || no date
 test -n "$(dmesg)" && ok dmesg || no dmesg
 
+# --- shell expansion with applet output ---------------------------------------
+IFS=:
+set -- $(echo "$ROOTLINE" | head -n 1)
+test "$#" = 7 && test "$1" = root && test "$7" = /bin/sh && ok ifs-applet || no ifs-applet
+unset IFS
+x=$(grep -q nomatch-xyz /etc/passwd)
+test "$?" = 1 && ok assign-status-applet || no assign-status-applet
+echo hi | cat >&- 2>/dev/null
+test "$?" != 0 && ok close-stdout-applet || no close-stdout-applet
+
 # --- timing / sync ----------------------------------------------------------
 sleep 0 && ok sleep || no sleep
 sync && ok sync || no sync

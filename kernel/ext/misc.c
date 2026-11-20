@@ -70,11 +70,12 @@ void kext_con_getc(void *unused)
 }
 
 
-/* Return the bitmask of legal (active) hart IDs (PRIV kernel extension body).
+/* Return the bitmask of legal (online) logical CPUs (PRIV kernel extension
+ * body).
  *
- * legal_cpu_bitmask is set once at boot from hart_ids[] and never mutated
- * afterward, so no serialization is needed. The value is returned to the caller
- * via SETREGSTATUS. Parameters:
+ * legal_cpu_bitmask is set at boot and changes only during SMP bring-up, which
+ * runs before roottask refetches it, so no serialization is needed. The value
+ * is returned to the caller via SETREGSTATUS. Parameters:
  *   unused : ignored
  */
 void kext_legal_cpu_mask(void *unused)

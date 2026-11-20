@@ -7,6 +7,13 @@
 
 #include <core/globals.h>
 
+/* A killing force_ready rereads a sync waiter's state at most this many times
+ * while the waker that unlinked it readies it (usually a window of a few
+ * instructions, longer for a broadcast); past it force_ready returns 0 and
+ * leaves the wakeup to the waker.
+ */
+#define FORCE_READY_WAKER_SPINS 100000u
+
 /* Scheduler Rosetta Stone (comments/prose only; no symbol renames):
  *
  *   kdispatch_t              = per-CPU runqueue state
@@ -170,6 +177,7 @@ static int dispatch_unlink_ready(kdispatch_t *dpp, thread_t *thp)
     }
 
     LINK3_REM(*queue, &thp->link3_link, thread_t);
+    THR_EV(thp);
     if (!DISPATCH_THP(dpp, thp->priority))
         DISPATCH_CLR(dpp, thp);
     return 1;
@@ -186,15 +194,22 @@ static int dispatch_unlink_ready(kdispatch_t *dpp, thread_t *thp)
  */
 static void kick_idle_hart(thread_t *thp)
 {
-    extern unsigned hart_ids[];
     unsigned mycpu = get_cpunum();
+    uint64_t legal = __atomic_load_n(&LEGAL_CPU_BITMASK, __ATOMIC_RELAXED);
+    uint64_t live = legal & cpu_online_snapshot();
 
-    for (unsigned hi = 0; hi < num_processors; hi++) {
-        unsigned h = hart_ids[hi];
-        thread_t *act = get_active_thread(h);
+    for (unsigned h = 0; h < num_processors; h++) {
+        thread_t *act;
 
-        if (h != mycpu && (thp->runmask & (1u << h)) == 0 && act &&
-            act == pcpu_array[h].pc_idle_thp) {
+        /* A dropped CPU keeps the idle thread init_objects() gave it, so it
+         * would look asleep and absorb the kick; skip it, and a CPU that has
+         * not joined yet, which cannot take the interrupt.
+         */
+        if (!cpu_in_mask(live, h) || h == mycpu ||
+            (thp->runmask & (1u << h)) != 0)
+            continue;
+        act = get_active_thread(h);
+        if (act && act == pcpu_array[h].pc_idle_thp) {
             SENDIPI(h, IPI_RESCHED);
             return;
         }
@@ -208,11 +223,11 @@ static int rdecl select_cpu(thread_t *thp)
     int cpu = -1;
     unsigned minprio;
     unsigned alternates[PROCESSORS_MAX];
+    uint64_t legal = __atomic_load_n(&LEGAL_CPU_BITMASK, __ATOMIC_RELAXED);
 
     {
-        extern unsigned hart_ids[];
         for (int _hi = (int) num_processors - 1, _init = 1; _hi >= 0; --_hi) {
-            i = hart_ids[_hi];
+            i = (unsigned) _hi;
             if (_init) {
                 j = 0;
                 cpu = -1;
@@ -221,6 +236,8 @@ static int rdecl select_cpu(thread_t *thp)
             }
             if (!smp_dispatch_enabled && i != get_cpunum())
                 continue;
+            if (!cpu_in_mask(legal, i))
+                continue; /* offline: its hart never started */
             if ((thp->runmask & (1u << i)) == 0) {
                 act = get_active_thread(i);
                 if (!act)
@@ -298,14 +315,17 @@ static thread_t *rdecl select_thread_default(int cpu, int prio)
      * cycle if there is one).
      */
     {
-        extern unsigned hart_ids[];
         SCHED_UNLOCK(pcpu_array[cpu].pc_dispatch);
 
         for (int idx = 0; idx < (int) num_processors; idx++) {
-            unsigned hart = hart_ids[idx];
-            if (hart == (unsigned) cpu)
+            unsigned other = (unsigned) idx;
+
+            /* Not cpu_online(): a thread queued on an AP before it joined or
+             * was dropped is only ever taken from its queue here.
+             */
+            if (other == (unsigned) cpu)
                 continue;
-            kdispatch_t *odpp = pcpu_array[hart].pc_dispatch;
+            kdispatch_t *odpp = pcpu_array[other].pc_dispatch;
             if (!odpp)
                 continue;
             SCHED_LOCK(odpp);
@@ -396,6 +416,7 @@ static thread_t *rdecl select_thread_default(int cpu, int prio)
     }
 
     LINK3_REM(DISPATCH_LST(dpp, (thp)->priority), &(thp)->link3_link, thread_t);
+    THR_EV(thp);
 
     /* If that list is now empty, clear the readybit.   */
     if (!DISPATCH_THP(dpp, (thp)->priority)) {
@@ -420,7 +441,9 @@ static void rdecl mark_running_default(thread_t *new)
 
     old = get_active_thread(get_cpunum());
     was_intr = new->state == STATE_INTR;
+    THR_EV(new);
     if (!new->process) {
+        thr_trace_dump(new);
         kprintf(
             "FATAL: mark_running cpu=%u new=%p tid=%d process=NULL type=%u "
             "state=%u\n",
@@ -578,15 +601,20 @@ void rdecl sched_account_restart(void)
  */
 uint64_t rdecl sched_account_read(thread_t *thp, uint64_t now)
 {
-    for (unsigned hart = 0; hart < num_processors; hart++) {
-        struct pcpu *pc = &pcpu_array[hart];
+    uint64_t online = cpu_online_snapshot();
+
+    for (unsigned cpu = 0; cpu < num_processors; cpu++) {
+        struct pcpu *pc = &pcpu_array[cpu];
+
+        if (!cpu_in_mask(online, cpu))
+            continue;
 
         /* runcpu is set by mark_running on the hart that now runs thp, so a
          * hart that still names thp after it was handed to another (yield/
          * resched enqueue, then mark_running) is skipped.
          */
         if (__atomic_load_n(&pc->pc_curthread, __ATOMIC_ACQUIRE) != thp ||
-            thp->runcpu != hart)
+            thp->runcpu != cpu)
             continue;
         for (int tries = 0; tries < 3; tries++) {
             unsigned s1 =
@@ -665,17 +693,24 @@ void rdecl sched_ss_update(thread_t *thp,
     CRASHCHECK(ssrepl->amount == 0);
 
     if (drop) {
-        ssinfo->org_priority =
-            thp->real_priority; /* Guarantee no more ss operations */
-        if (thp->priority <= thp->real_priority) {
-            if (ssinfo->sched_locked)
-                /* thp is already blocked: see SS_STOP_RUNNING_LOCKED */
-                thp->priority = ssinfo->low_priority;
-            else
-                adjust_priority(thp, ssinfo->low_priority, thp->dpp,
-                                0); /* CHECKME */
+        unsigned target;
+
+        /* The drop lowers the base only: a loan (PI waiter, ceiling, message)
+         * above the low priority keeps holding the thread up.
+         */
+        ssinfo->org_priority = (uint8_t) thread_base_prio(
+            thp); /* Guarantee no more ss operations */
+        thread_set_base_prio(thp, ssinfo->low_priority);
+        if (ssinfo->sched_locked) {
+            /* thp is already blocked, and the caller holds the dispatch lock
+             * (see SS_STOP_RUNNING_LOCKED): store it; the next loan or base
+             * change on thp reapplies it under sync_pi_slock.
+             */
+            target = thread_effective_prio(thp);
+            thp->priority = (uint8_t) target;
+        } else {
+            (void) thread_prio_update_dpp(thp, thp->dpp, 0); /* CHECKME */
         }
-        thp->real_priority = ssinfo->low_priority;
     }
 }
 
@@ -726,11 +761,9 @@ int rdecl sched_ss_adjust()
                     ssinfo->activation_time = bound;
                     ssinfo->consumed = 0;
 
-                    if (thp->priority <= ssinfo->org_priority) {
-                        adjust_priority(thp, ssinfo->org_priority, thp->dpp,
-                                        0); /* CHECKME */
-                    }
-                    thp->real_priority = ssinfo->org_priority;
+                    thread_set_base_prio(thp, ssinfo->org_priority);
+                    (void) thread_prio_update_dpp(thp, thp->dpp,
+                                                  0); /* CHECKME */
 
                     ssinfo->org_priority = 0;
 
@@ -912,6 +945,7 @@ void rdecl sched_ss_queue(thread_t *thp)
 int rdecl sched_thread(thread_t *thp, int policy, struct sched_param *param)
 {
     unsigned new_prio;
+    unsigned old_prio;
     kdispatch_t *dpp;
     int verify;
     struct _ss_schedinfo *ss_info;
@@ -950,25 +984,27 @@ int rdecl sched_thread(thread_t *thp, int policy, struct sched_param *param)
             new_prio >= kopt.priv_prio) {
             return EPERM;
         }
-        if (new_prio != thp->priority) {
-            int lowered = (new_prio < thp->priority);
-
-            adjust_priority(thp, new_prio, thp->dpp, 0);
-
-            /* If we lowered priority, ensure we will be head of priority list
-             */
-            if (lowered && thp->state == STATE_READY) {
-                LINK3_REM(DISPATCH_LST(thp->dpp, thp->priority),
-                          &thp->link3_link, thread_t);
-                LINK3_BEG(DISPATCH_LST(thp->dpp, thp->priority),
-                          &thp->link3_link, thread_t);
-            }
-        }
         if (thp->policy == SCHED_SPORADIC &&
             thp->schedinfo.ss_info->org_priority != 0) {
             thp->schedinfo.ss_info->org_priority = (uint8_t) new_prio;
         }
-        thp->real_priority = (uint8_t) new_prio;
+
+        /* SchedSet sets the base and ends a notification loan. A loan above it
+         * (a PI waiter, a ceiling, a request being served, a send still queued)
+         * keeps the thread at the loan until it ends.
+         */
+        old_prio = thp->priority;
+        thread_end_notification_loan(thp);
+        thread_set_base_prio(thp, new_prio);
+        (void) thread_prio_update_dpp(thp, thp->dpp, 0);
+
+        /* If we lowered priority, ensure we will be head of priority list */
+        if (thp->priority < old_prio && thp->state == STATE_READY) {
+            LINK3_REM(DISPATCH_LST(thp->dpp, thp->priority), &thp->link3_link,
+                      thread_t);
+            LINK3_BEG(DISPATCH_LST(thp->dpp, thp->priority), &thp->link3_link,
+                      thread_t);
+        }
         return EOK;
     default:
         break;
@@ -1075,8 +1111,15 @@ int rdecl sched_thread(thread_t *thp, int policy, struct sched_param *param)
     /* Change policy and priority after fiddling with attributes */
     thp->policy = (uint8_t) policy;
 
-    adjust_priority(thp, new_prio, thp->dpp, 0);
-    thp->real_priority = (uint8_t) new_prio;
+    /* The base, and the end of a notification loan; any other loan above it
+     * holds until it ends. An unchanged priority still sends the caller to the
+     * tail of its level, as adjust_priority() did for an equal priority.
+     */
+    thread_end_notification_loan(thp);
+    thread_set_base_prio(thp, new_prio);
+    if (!thread_prio_update_dpp(thp, thp->dpp, 0) &&
+        thp == get_active_thread(get_cpunum()))
+        yield();
 
     return EOK;
 }
@@ -1094,9 +1137,13 @@ static void force_ready_msgxfer(thread_t *thp, unsigned err)
      * the msgxfer, and send ipi to preempt that one
      */
     {
-        extern unsigned hart_ids[];
+        uint64_t online = cpu_online_snapshot();
+
         for (int _hi = 0; _hi < num_processors; _hi++) {
-            unsigned h = hart_ids[_hi];
+            unsigned h = (unsigned) _hi;
+
+            if (!cpu_in_mask(online, h))
+                continue;
 
             /* Load the hart's active thread once: it clears to NULL whenever
              * that hart blocks into idle, so a second get_active_thread(h)
@@ -1118,91 +1165,6 @@ static void force_ready_msgxfer(thread_t *thp, unsigned err)
     }
 }
 #endif
-
-/**
- * Resettle the priorities of synchronization object owners after one of the
- * elements in the chain has adjusted its prioirity (down). The first pass is
- * used really to determine what kind of synchronization object is being worked
- * on (using the state as an overload) and the second pass uses the state of the
- * owner of that synchronization object to determine if there is a chain to
- * follow or not.
- */
-static void rdecl priority_chain_drop(thread_t *thp, int why)
-{
-    ksync_t *syp;
-    thread_t *next_owner;
-    unsigned restore_priority;
-
-    do {
-        /* Synchronizaion object switch */
-        switch (why) {
-        case STATE_MUTEX: {
-            restore_priority = thp->real_priority;
-            if ((syp = thp->mutex_holdlist) &&
-                (next_owner = pril_first(&syp->waiting))) {
-                if (restore_priority < next_owner->priority) {
-                    restore_priority = next_owner->priority;
-                }
-            }
-            if (thp->priority > restore_priority) {
-                adjust_priority(thp, restore_priority, thp->dpp, 1);
-            } else {
-                thp = NULL;
-            }
-            break;
-        }
-
-        case STATE_REPLY:
-        case STATE_SEND:
-            /* TODO: Chain through the I/O service */
-        default:
-            thp = NULL;
-        }
-
-        /* No change is expected */
-        if (!thp) {
-            break;
-        }
-
-        /* Synchronization object owner switch */
-        switch (thp->state) {
-        case STATE_MUTEX: {
-            process_t *prp;
-            int id;
-            unsigned long owner;
-
-            /* If we are not at the head of the list, then we aren't affecting
-             * anything
-             */
-            syp = thp->blocked_on;
-            if (pril_first(&syp->waiting) != thp) {
-                thp = NULL;
-                break;
-            }
-
-            /* Find the owner of the mutex we are blocked on and move to it */
-            owner = thp->args.mu.owner;
-            id = SYNC_PINDEX(owner);
-            if (id && id < process_vector.nentries &&
-                VECP(prp, &process_vector, id)) {
-                thp = vector_lookup(&prp->threads, SYNC_TID(owner));
-                why = STATE_MUTEX;
-            } else {
-                thp = NULL;
-            }
-            break;
-        }
-
-        case STATE_SEND:
-        case STATE_REPLY:
-            /* TODO: Chain through the I/O service */
-        default:
-            thp = NULL;
-        }
-
-
-    } while (thp);
-}
 
 /* Force a blocked thread out of its wait state.
  *
@@ -1253,6 +1215,9 @@ int rdecl force_ready(thread_t *thp, unsigned err)
      */
     bool unlinked = false;
 
+    /* Rereads of a sync waiter's state by a kill, while its wakeup settles. */
+    unsigned sync_wait_spins = 0;
+
     /* Set when control reaches the STATE_RECEIVE arm from the STATE_REPLY arm;
      * fr_chp (possibly NULL: channel gone) is then authoritative and blocked_on
      * must not be reinterpreted as a channel.
@@ -1265,6 +1230,7 @@ int rdecl force_ready(thread_t *thp, unsigned err)
         atomic_clr(&thp->flags, RTMUX_FLG_THR_BUFF_MSG);
     }
 
+reread_state:
     switch (thp->state) {
     case STATE_READY:
 #if CONFIG_PROCESSORS_MAX > 1 && defined(CONFIG_SMP_MSGOPT)
@@ -1433,6 +1399,7 @@ int rdecl force_ready(thread_t *thp, unsigned err)
             }
             LINKPRIL_REM(thp);
             thp->blocked_on = NULL; /* == cop, checked above under the lock */
+            IPC_BLK(thp);
             kspinlock_unlock(&fr_chp->lock);
             unlinked = true;
         }
@@ -1447,10 +1414,17 @@ int rdecl force_ready(thread_t *thp, unsigned err)
              * newer client the server has meanwhile taken is not overwritten.
              */
             thread_t *srv = thp->args.ms.server;
-            thread_t *expect = thp;
 
-            __atomic_compare_exchange_n(&srv->client, &expect, NULL, 0,
-                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
+            /* The server stops serving thp and its loan ends here; the priority
+             * it is owed now, and the chain it may be blocked in, are settled
+             * in thread context (thread_prio_defer_settle). This runs from
+             * timer and event delivery under caller locks, where taking the PI
+             * lock and walking the chain are not allowed.
+             */
+            inject_in_departure(1);
+            if (thread_client_departed(srv, thp))
+                thread_prio_defer_settle(srv);
+            inject_in_departure(0);
             thp->args.ms.server = NULL;
         }
         if (thp->restart) {
@@ -1471,8 +1445,10 @@ int rdecl force_ready(thread_t *thp, unsigned err)
          * outlive cop. The REPLY fall-through into STATE_RECEIVE uses fr_chp,
          * not blocked_on, so clearing it here is safe.
          */
-        if (thp->blocked_on == cop)
+        if (thp->blocked_on == cop) {
             thp->blocked_on = NULL;
+            IPC_BLK(thp);
+        }
         if (connect_links_drop(cop)) {
             connect_detach(cop, thp->priority);
         }
@@ -1622,8 +1598,10 @@ int rdecl force_ready(thread_t *thp, unsigned err)
          * keep the drain-before-null ordering to preserve this invariant.
          */
         if (!cop || !cop->channel) {
-            if (thp->blocked_on == cop)
+            if (thp->blocked_on == cop) {
                 thp->blocked_on = NULL;
+                IPC_BLK(thp);
+            }
             if (cop && connect_links_drop(cop))
                 connect_detach(cop, thp->priority);
             break;
@@ -1659,6 +1637,7 @@ int rdecl force_ready(thread_t *thp, unsigned err)
          * free cop (see the STATE_REPLY case above).
          */
         thp->blocked_on = NULL; /* == cop, checked above under the lock */
+        IPC_BLK(thp);
         kspinlock_unlock(&cop->channel->lock);
 
         if (connect_links_drop(cop)) {
@@ -1667,13 +1646,9 @@ int rdecl force_ready(thread_t *thp, unsigned err)
         break;
     }
 
-    case STATE_MUTEX: {
-        thread_t *thp2;
-        process_t *prp;
-        ksync_t *syp;
-        int id;
-        unsigned long owner;
-
+    case STATE_MUTEX:
+    case STATE_CONDVAR:
+    case STATE_SEM:
         CRASHCHECK(TYPE_MASK(thp->type) != TYPE_THREAD);
 
         /* Spin-wait for any in-flight wait-state transition to complete before
@@ -1683,98 +1658,31 @@ int rdecl force_ready(thread_t *thp, unsigned err)
         while (thp->internal_flags & RTMUX_ITF_WAIT_PENDING)
             __asm__ volatile("" ::: "memory");
         cpu_smp_mb();
-        if (sync_chain_force_ready(thp)) {
-            break;
-        }
 
-        /* Hold sync_slock across the whole MUTEX block so a concurrent
-         * sync_mutex_unlock observes a coherent wait-list / args.mu.owner
-         * state. Use the _locked variants of mutex_holdlist_* to avoid
-         * recursive acquire on the non-reentrant kspinlock.
-         *
-         * Read blocked_on UNDER sync_slock — sync_wakeup clears it after
-         * pril_rem (closing the adjust_priority stale-rem-add race); if it is
-         * NULL here the waiter has already been removed from its mutex
-         * waitlist, so fall through to the lower-half cleanup.
+        /* The state above was read unlocked: thp may have been woken, and be
+         * running or waiting elsewhere, by the time its chain is locked. Never
+         * ready or unlink it then. A one-shot unblock (interrupt, timeout,
+         * cancel) that lost the race to a wakeup is moot and is dropped. A kill
+         * must still take hold of the thread wherever it went, and a thread a
+         * waker unlinked has to be waited for first, or destroying it now would
+         * let the waker ready a dead thread. blocked_on is NULL for every chain
+         * waiter, so there is no other wait list to unlink it from. Test
+         * window: thp may be woken and move on before the chain is found and
+         * locked.
          */
-        kspinlock_lock(&sync_slock);
-        syp = thp->blocked_on;
-        if (syp && pril_first(&syp->waiting) == thp) {
-            thread_t *first;
+        inject_force_ready_stall(thp);
+        if (!sync_chain_force_ready(thp)) {
+            if (!(err & _FORCE_KILL_SELF))
+                return 1;
 
-            /* Remove the thread from the mutex list */
-            owner = thp->args.mu.owner;
-            if (owner != 0) {
-                mutex_holdlist_rem_locked(syp);
-            }
-            pril_rem(&syp->waiting, thp);
-
-            /* Clear blocked_on under sync_slock — same race rationale as the
-             * STATE_CONDVAR/SEM case below. A concurrent adjust_priority
-             * STATE_MUTEX arm reads blocked_on under sync_slock and does
-             * rem+add if non-null; clearing here makes it skip the stale rem.
+            /* The waker may still hold thp, so never ready it from here: past
+             * the bound report that another party will (as for a message
+             * claim), and let the caller retry or defer.
              */
-            thp->blocked_on = NULL;
-
-            /* Identify the owner of the mutex, could be null if orphaned */
-            thp2 = NULL;
-            id = SYNC_PINDEX(owner);
-            if (id && id < process_vector.nentries &&
-                VECP(prp, &process_vector, id)) {
-                thp2 = vector_lookup(&prp->threads, SYNC_TID(owner));
-            }
-
-            first = pril_first(&syp->waiting);
-            if (first && TYPE_MASK(first->type) == TYPE_THREAD) {
-                if (thp2) {
-                    mutex_holdlist_add_locked(thp2, syp);
-                } else {
-                    owner = 0;
-                }
-                first->args.mu.owner = owner;
-            }
-            kspinlock_unlock(&sync_slock);
-
-            /* Re-adjust the boosted mutex owner if required */
-            if (thp2 && (thp != thp2) && (thp->priority == thp2->priority) &&
-                (thp2->priority > thp2->real_priority)) {
-                priority_chain_drop(thp2, STATE_MUTEX);
-            }
-
-            break;
-        }
-        kspinlock_unlock(&sync_slock);
-    }
-        /* Fall Through */
-    case STATE_CONDVAR:
-    case STATE_SEM:
-        /* Spin-wait if the waiter is still mid-transition. */
-        while (thp->internal_flags & RTMUX_ITF_WAIT_PENDING)
-            __asm__ volatile("" ::: "memory");
-        if (sync_chain_force_ready(thp)) {
-            break;
-        }
-        /* blocked_on can be NULL here even though state is still CONDVAR/SEM —
-         * sync_wakeup clears blocked_on under sync_slock immediately after
-         * pril_rem, while the state→READY transition happens later (inside
-         * ready_default). If state==CONDVAR with !blocked_on, the waiter is
-         * already off its sync waiting list, so skip the redundant pril_rem.
-         *
-         * After pril_rem we ALSO clear blocked_on under the same lock, matching
-         * sync_wakeup's post-condition: a concurrent adjust_priority_default
-         * reads !blocked_on and skips its rem+add cycle (which would otherwise
-         * walk stale prev/next pointers and re-attach a removed pril). Cache
-         * the pointer to avoid a double-read under the lock.
-         */
-        {
-            ksync_t *bound;
-            kspinlock_lock(&sync_slock);
-            bound = (ksync_t *) thp->blocked_on;
-            if (bound) {
-                pril_rem(&bound->waiting, thp);
-                thp->blocked_on = NULL;
-            }
-            kspinlock_unlock(&sync_slock);
+            if (++sync_wait_spins >= FORCE_READY_WAKER_SPINS)
+                return 0;
+            cpu_smp_mb();
+            goto reread_state;
         }
         break;
 
@@ -1858,8 +1766,8 @@ int rdecl force_ready(thread_t *thp, unsigned err)
 /* block takes sched_slock around the dispatch mutation (FIND_HIGHEST,
  * mark_running, set_active_thread). The pre-mutation snap_time/ timeout_start
  * touch per-thread fields only and stay outside the lock. Callers MUST NOT hold
- * sched_slock on entry; cross-callers (unready, block_and_ready_default,
- * priority_chain_drop) drop it before calling.
+ * sched_slock on entry; cross-callers (unready, block_and_ready_default) drop
+ * it before calling.
  */
 void rdecl block(void)
 {
@@ -1908,6 +1816,7 @@ void rdecl block(void)
         break;
     default:
         thp->blocked_on = NULL;
+        IPC_BLK(thp);
     }
 
     /* Mark execution and schedule a replenishment if needed */
@@ -1995,6 +1904,7 @@ static void rdecl block_release(kspinlock_t *to_release)
         break;
     default:
         thp->blocked_on = NULL;
+        IPC_BLK(thp);
     }
 
     if (thp != act) {
@@ -2055,13 +1965,41 @@ unready_release_and_exit(thread_t *thp, int newstate, kspinlock_t *to_release)
  * searching through the dispatch is necessary.
  */
 
+/* Queue a thread that ready_default is making runnable at the end of its
+ * priority list, or, for a round-robin client whose msg_sendvnc just completed,
+ * at the head: the server blocks right after the reply, and the client then
+ * runs on the CPU and in the cache the server left.
+ *
+ * A client that blocks in every send is never displaced, so the ticks each head
+ * insertion adds were never spent, and its peers at the same priority waited
+ * behind it for good. The budget bounds that: once it is used up the client
+ * goes to the end and starts over. A FIFO or sporadic thread that becomes
+ * runnable goes to the end of its list whatever woke it: it has no round-robin
+ * budget to bound the head placement with.
+ */
+static inline void ready_enqueue_client(kdispatch_t *dpp,
+                                        thread_t *thp,
+                                        unsigned prio,
+                                        bool was_sendvnc)
+{
+    if (was_sendvnc && IS_SCHED_RR(thp)) {
+        RR_ADD_PREEMPT_TICK(thp);
+        if (RR_GET_TICKS(thp) < RR_MAXTICKS) {
+            LINK3_BEG(DISPATCH_LST(dpp, prio), &thp->link3_link, thread_t);
+            return;
+        }
+    }
+    RR_RESET_TICK(thp);
+    LINK3_END(DISPATCH_LST(dpp, prio), &thp->link3_link, thread_t);
+}
+
 /* ready_default takes the per-CPU dispatch lock internally around the
  * dispatch-list mutation; all callers funnel through the same lock.
  *
  * Callers MUST NOT hold sched_slock on entry. Direct callers in this file:
  * force_ready, adjust_priority_default (drops its lock around the internal
- * ready() calls), and priority_chain_drop. External callers (sync_wakeup) drop
- * sync_slock first per the SCHED < SYNC rank order.
+ * ready() calls). External callers (sync_wakeup) drop sync_slock first per the
+ * SCHED < SYNC rank order.
  */
 static void rdecl ready_default(thread_t *thp)
 {
@@ -2072,6 +2010,8 @@ static void rdecl ready_default(thread_t *thp)
 
     chk_dispatch(1);
     chk_thread(thp);
+    THR_EV(thp);
+    sync_chains_assert_readied(thp);
 
     if (thp->timeout_flags)
         timeout_stop(thp);
@@ -2164,7 +2104,8 @@ static void rdecl ready_default(thread_t *thp)
          * hart.
          */
         if ((thp->runmask & (1u << get_cpunum())) != 0) {
-            unsigned legal_mask = (~thp->runmask) & LEGAL_CPU_BITMASK;
+            unsigned legal_mask =
+                (unsigned) (~thp->runmask & LEGAL_CPU_BITMASK);
             if (legal_mask != 0) {
                 int target_cpu = 0;
                 while (((1U << target_cpu) & legal_mask) == 0)
@@ -2175,15 +2116,7 @@ static void rdecl ready_default(thread_t *thp)
                 thp->dpp = target_dpp;
                 thp->state = STATE_READY;
                 _TRACE_TH_EMIT_STATE(thp, READY);
-                if (was_sendvnc) {
-                    RR_ADD_PREEMPT_TICK(thp);
-                    LINK3_BEG(DISPATCH_LST(target_dpp, prio), &thp->link3_link,
-                              thread_t);
-                } else {
-                    RR_RESET_TICK(thp);
-                    LINK3_END(DISPATCH_LST(target_dpp, prio), &thp->link3_link,
-                              thread_t);
-                }
+                ready_enqueue_client(target_dpp, thp, prio, was_sendvnc);
                 DISPATCH_SET(target_dpp, thp);
                 SENDIPI((unsigned) target_cpu, IPI_RESCHED);
                 SCHED_UNLOCK(target_dpp);
@@ -2201,13 +2134,7 @@ static void rdecl ready_default(thread_t *thp)
              */
             thp->state = STATE_READY;
             _TRACE_TH_EMIT_STATE(thp, READY);
-            if (was_sendvnc) {
-                RR_ADD_PREEMPT_TICK(thp);
-                LINK3_BEG(DISPATCH_LST(dpp, prio), &thp->link3_link, thread_t);
-            } else {
-                RR_RESET_TICK(thp);
-                LINK3_END(DISPATCH_LST(dpp, prio), &thp->link3_link, thread_t);
-            }
+            ready_enqueue_client(dpp, thp, prio, was_sendvnc);
             DISPATCH_SET(dpp, thp);
 #if CONFIG_PROCESSORS_MAX > 1
             /* The "server blocks right after" assumption fails when the server
@@ -2241,15 +2168,7 @@ static void rdecl ready_default(thread_t *thp)
                 thp->dpp = target_dpp;
                 thp->state = STATE_READY;
                 _TRACE_TH_EMIT_STATE(thp, READY);
-                if (was_sendvnc) {
-                    RR_ADD_PREEMPT_TICK(thp);
-                    LINK3_BEG(DISPATCH_LST(target_dpp, prio), &thp->link3_link,
-                              thread_t);
-                } else {
-                    RR_RESET_TICK(thp);
-                    LINK3_END(DISPATCH_LST(target_dpp, prio), &thp->link3_link,
-                              thread_t);
-                }
+                ready_enqueue_client(target_dpp, thp, prio, was_sendvnc);
                 DISPATCH_SET(target_dpp, thp);
 
                 SENDIPI((unsigned) cpu, IPI_RESCHED);
@@ -2324,13 +2243,7 @@ static void rdecl ready_default(thread_t *thp)
          * queue, unless it was blocked due to a msg_sendvnc call (see the above
          * description of this issue.
          */
-        if (was_sendvnc) {
-            RR_ADD_PREEMPT_TICK(thp);
-            LINK3_BEG(DISPATCH_LST(dpp, prio), &thp->link3_link, thread_t);
-        } else {
-            RR_RESET_TICK(thp);
-            LINK3_END(DISPATCH_LST(dpp, prio), &thp->link3_link, thread_t);
-        }
+        ready_enqueue_client(dpp, thp, prio, was_sendvnc);
     enqueue_done:;
     }
 #else
@@ -2377,13 +2290,7 @@ static void rdecl ready_default(thread_t *thp)
          * queue, unless it was blocked due to a msg_sendvnc call (see the above
          * description of this issue.
          */
-        if (was_sendvnc) {
-            RR_ADD_PREEMPT_TICK(act);
-            LINK3_BEG(DISPATCH_LST(dpp, prio), &thp->link3_link, thread_t);
-        } else {
-            RR_RESET_TICK(thp);
-            LINK3_END(DISPATCH_LST(dpp, prio), &thp->link3_link, thread_t);
-        }
+        ready_enqueue_client(dpp, thp, prio, was_sendvnc);
     }
 #endif
     _TRACE_TH_EMIT_STATE(thp, READY);
@@ -2609,6 +2516,22 @@ void rdecl unready(thread_t *thp, int newstate)
  */
 
 
+/* A kcall that asked for its own displacement to wait (see
+ * RTMUX_ITF_DEFER_DISPLACE): post it for resched() at kernel_exit, which runs
+ * after the trap handler has stored the kcall's status.
+ *
+ * Returns whether it was deferred.
+ */
+static bool sched_defer_displacement(thread_t *act)
+{
+    if (!(act->internal_flags & RTMUX_ITF_DEFER_DISPLACE))
+        return false;
+    ITF_SET(act, RTMUX_ITF_YIELD_TAIL);
+    atomic_fetch_or_explicit(&act->async_flags, RTMUX_ATF_SMP_RESCHED,
+                             memory_order_release);
+    return true;
+}
+
 static void rdecl yield_default(void)
 {
     thread_t *act = get_active_thread(get_cpunum());
@@ -2644,7 +2567,7 @@ static void rdecl yield_default(void)
 #else
         thp = DISPATCH_THP(dpp, prio);
 #endif
-        if (!thp) {
+        if (!thp || sched_defer_displacement(act)) {
             SCHED_UNLOCK_LOCAL();
             return;
         }
@@ -2680,10 +2603,19 @@ static void rdecl resched_default(void)
     thread_t *thp;
     kdispatch_t *dpp = act->dpp;
     uint8_t prio = act->priority;
+    bool yield_tail;
+
+    /* A deferred displacement (see RTMUX_ITF_DEFER_DISPLACE): act asked to go
+     * behind the threads at its new level, so those are eligible too, and it
+     * queues at the tail like a thread whose slice ended.
+     */
+    yield_tail = (act->internal_flags & RTMUX_ITF_YIELD_TAIL) != 0;
+    if (yield_tail)
+        ITF_CLR(act, RTMUX_ITF_YIELD_TAIL);
 
     /* DO NOT preempt a thread that is mid-sync- transition. The WAIT_PENDING
      * flag is set inside cv_wait / mutex_lock / sem_wait between
-     * "pril_add(syp->waiting, act)" and the final "unready + blocked_on +
+     * "sync_enqueue(chain, act)" and the final "unready + blocked_on +
      * cpu_smp_mb + flag clear" sequence. Demoting act during that window
      *   - sets act->state = STATE_READY,
      *   - LINK3s act onto cpu1's dispatch queue,
@@ -2691,7 +2623,7 @@ static void rdecl resched_default(void)
      * mark_runnings act on cpu2 while cpu1's cv_wait body is still mid-frame on
      * cpu1's kernel stack. Two CPUs end up "running" the same thread
      * (dispatch-double-entry), and the cv_wait body on cpu2 sees act already on
-     * syp->waiting → CV_WAIT REENTRY.
+     * its sync chain → CV_WAIT REENTRY.
      *
      * Under the BKL era this was masked because BKL acquire disabled SIE: timer
      * ISR couldn't fire and call resched_default. Under the Sync*-only no-BKL
@@ -2781,7 +2713,7 @@ static void rdecl resched_default(void)
      * select from to those higher than act's priority in that case.
      */
     prio = (uint8_t) ((act->runmask & (1u << get_cpunum())) ? 0
-                      : (act->policy == SCHED_FIFO)
+                      : (act->policy == SCHED_FIFO && !yield_tail)
                           ? min(act->priority + 1, NUM_PRI - 1)
                           : act->priority);
 
@@ -2803,7 +2735,8 @@ static void rdecl resched_default(void)
          * assumption is we've consummed our sched quantum. Otherwise, we've
          * been preempted and go back to the head of the queue.
          */
-        if (IS_SCHED_RR(act) && RR_GET_TICKS(act) >= RR_MAXTICKS) {
+        if (yield_tail ||
+            (IS_SCHED_RR(act) && RR_GET_TICKS(act) >= RR_MAXTICKS)) {
             RR_RESET_TICK(act);
             LINK3_END(DISPATCH_LST(dpp, act->priority), &act->link3_link,
                       thread_t);
@@ -2881,7 +2814,19 @@ static void rdecl adjust_priority_default(thread_t *thp,
     dpp = thp->dpp;
     switch (thp->state) {
     case STATE_READY:
-        CRASHCHECK(thp == act);
+#ifndef NDEBUG
+        /* CRASHCHECK(thp == act), naming the thread. crash_halt writes to the
+         * crash buffer, so it never waits on the console lock under SCHED_LOCK.
+         */
+        if (thp == act)
+            crash_halt("sched: priority %u -> %u of the active thread %d.%d, "
+                       "which is READY (runcpu %u, internal flags 0x%x, "
+                       "flags 0x%x)",
+                       (unsigned) thp->priority, (unsigned) prio,
+                       thp->process ? (int) thp->process->pid : -1,
+                       (int) thp->tid, (unsigned) thp->runcpu,
+                       (unsigned) thp->internal_flags, (unsigned) thp->flags);
+#endif
         chk_thread(thp);
 
         /* Unlink from the ready queue */
@@ -2892,14 +2837,12 @@ static void rdecl adjust_priority_default(thread_t *thp,
 
         thp->priority = (uint8_t) prio;
 #if CONFIG_PROCESSORS_MAX > 1
-#ifndef NDEBUG
 
-        /* pretty hokey, but ready_default() has a
-         *     CRASHCHECK(thp->state == STATE_READY)
-         * and we want to keep that check
+        /* pretty hokey, but ready_default() returns at once for a thread that
+         * is already READY, and this one was just taken off its queue. Done in
+         * every build: without it the thread would be dropped here.
          */
         thp->state = STATE_DEAD;
-#endif
 
         /* ready() takes its own per-CPU dispatch lock — drop ours around it.
          * After ready() returns, thp may have been routed to a different hart's
@@ -2950,7 +2893,33 @@ static void rdecl adjust_priority_default(thread_t *thp,
             SENDIPI(thp->runcpu, IPI_RESCHED);
             break;
         }
+#else
+        CRASHCHECK(thp != act);
+#endif
 
+        /* A priority loan changing under the running thread: never switch away
+         * from it here. The caller is inside one of act's own kernel calls (a
+         * condition wait giving up a PI mutex, an unlock, an IPC reply), which
+         * has to finish, and may block act with unready_release(), which
+         * requires act to be the active thread. Displacing act would also put a
+         * thread still running on this stack on a ready queue, where another
+         * hart can pick it up. Lower the priority and post a reschedule:
+         * kernel_exit, or the return from the interrupt, runs resched(), which
+         * moves to a thread that is due and puts act at the head of its new
+         * queue, as a preempted thread.
+         */
+        if (priority_inherit) {
+            if (prio < act->priority) {
+                atomic_fetch_or_explicit(&act->async_flags,
+                                         RTMUX_ATF_SMP_RESCHED,
+                                         memory_order_release);
+            }
+            act->priority = (uint8_t) prio;
+            _TRACE_TH_EMIT_ANY_STATE(act, act->state);
+            chk_dispatch(1);
+            break;
+        }
+#if CONFIG_PROCESSORS_MAX > 1
         /* Thread is running on this processor. */
         if (prio < act->priority) {
             /* If act is mid-sync-transition (WAIT_PENDING set), DO NOT demote
@@ -2962,6 +2931,11 @@ static void rdecl adjust_priority_default(thread_t *thp,
              */
             if (act->internal_flags & RTMUX_ITF_WAIT_PENDING) {
                 act->priority = (uint8_t) prio;
+                break;
+            }
+            if (sched_defer_displacement(act)) {
+                act->priority = (uint8_t) prio;
+                _TRACE_TH_EMIT_ANY_STATE(act, act->state);
                 break;
             }
             /* Did we lower our prio below another thread which can run? */
@@ -3001,8 +2975,8 @@ static void rdecl adjust_priority_default(thread_t *thp,
             _TRACE_TH_EMIT_ANY_STATE(act, act->state);
         }
 #else
-        CRASHCHECK(thp != act);
-        if (prio < act->priority && prio <= DISPATCH_HIGHEST_PRI(dpp)) {
+        if (prio < act->priority && !sched_defer_displacement(act) &&
+            prio <= DISPATCH_HIGHEST_PRI(dpp)) {
             thread_t *oldact = act;
 
             /* Put active into ready queue */
@@ -3082,90 +3056,10 @@ static void rdecl adjust_priority_default(thread_t *thp,
         break;
     }
 
-    case STATE_CONDVAR:
-    case STATE_SEM: {
-        ksync_t *syp;
-        uint8_t cur_state;
-
-        /* The switch dispatch read thp->state outside sync_slock. A concurrent
-         * sync_wakeup on another CPU can pril_rem + ready (state→READY) between
-         * that read and the pril_rem below. Without a re-check we'd pril_rem a
-         * thread that's no longer on syp->waiting (corruption / walk-off-end),
-         * and pril_add would re-attach the thread to a wait list it has already
-         * left — the upstream cause of the CV_WAIT REENTRY / sync_mutex_lock
-         * pril_add-while- still-on-CV-waiter corruption hunt.
-         *
-         * Take sync_slock, re-read state + blocked_on under it. If the thread
-         * is no longer in this case, fall through to the priority-only path.
-         */
-        kspinlock_lock(&sync_slock);
-        cur_state = thp->state;
-        syp = thp->blocked_on;
-        if ((cur_state == STATE_CONDVAR || cur_state == STATE_SEM) && syp) {
-            pril_rem(&syp->waiting, thp);
-            thp->priority = (uint8_t) prio;
-            pril_add(&syp->waiting, thp);
-            kspinlock_unlock(&sync_slock);
-        } else {
-            kspinlock_unlock(&sync_slock);
-            thp->priority = (uint8_t) prio;
-        }
-        break;
-    }
-
-    case STATE_MUTEX: {
-        ksync_t *syp;
-        thread_t *first;
-        process_t *prp;
-        unsigned long owner;
-        unsigned id;
-        uint8_t cur_state;
-
-        /* Mirror the CONDVAR/SEM fix above. The switch dispatch read thp->state
-         * outside sync_slock; a concurrent force_ready (cross-CPU
-         * sync_mutex_unlock cascade) can pril_rem + ready (state→READY) between
-         * the read and our pril_rem. Take sync_slock first, re-read state +
-         * blocked_on under it. If the thread is no longer in MUTEX, just adjust
-         * priority and bail.
-         */
-        kspinlock_lock(&sync_slock);
-        cur_state = thp->state;
-        syp = thp->blocked_on;
-        if (cur_state == STATE_MUTEX && syp) {
-            first = pril_first(&syp->waiting);
-
-            owner = first->args.mu.owner;
-            if (owner != 0) {
-                first->args.mu.owner = 0;
-                mutex_holdlist_rem_locked(syp);
-            }
-
-            /* Reposition the item on the waiting list to match new priority */
-            pril_rem(&syp->waiting, thp);
-            thp->priority = (uint8_t) prio;
-            pril_add(&syp->waiting, thp);
-
-            /* Put back on mutex hold list in proper place */
-            if (owner != 0) {
-                id = SYNC_PINDEX(owner);
-                if (id && id < process_vector.nentries &&
-                    VECP(prp, &process_vector, id)) {
-                    thp = vector_lookup(&prp->threads, SYNC_TID(owner));
-                    if (thp) {
-                        mutex_holdlist_add_locked(thp, syp);
-                        first = pril_first(&syp->waiting);
-                        first->args.mu.owner = owner;
-                    }
-                }
-            }
-            kspinlock_unlock(&sync_slock);
-        } else {
-            kspinlock_unlock(&sync_slock);
-            thp->priority = (uint8_t) prio;
-        }
-        break;
-    }
-
+    /* STATE_MUTEX, STATE_CONDVAR and STATE_SEM waiters sit on a sync chain, not
+     * on a ksync_t list (blocked_on is NULL or stale for them): the new
+     * priority is stored here and prio_apply repositions them on the chain.
+     */
     default:
         thp->priority = (uint8_t) prio;
     }
@@ -3323,8 +3217,6 @@ static void rdecl debug_moduleinfo_default(process_t *prp,
 
 kdispatch_t *init_scheduler_default(void)
 {
-    extern unsigned hart_ids[];
-
     /* Init function pointers */
     ready = ready_default;
     block_and_ready = block_and_ready_default;
@@ -3344,7 +3236,7 @@ kdispatch_t *init_scheduler_default(void)
      * (= ascending hart_id) order to avoid deadlock.
      */
     for (int idx = 0; idx < (int) num_processors; idx++) {
-        unsigned hart = hart_ids[idx];
+        unsigned hart = (unsigned) idx;
         pcpu_array[hart].pc_dispatch = _scalloc(sizeof(kdispatch_t));
         kspinlock_init(&pcpu_array[hart].pc_dispatch->lock, LOCK_CLASS_SCHED,
                        "sched_dpp");

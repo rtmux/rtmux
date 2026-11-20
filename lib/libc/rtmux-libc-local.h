@@ -64,4 +64,7 @@ int _vopen(const char *path, int oflag, int sflag, va_list ap) __hidden;
 
 extern const pthread_attr_t pthread_attr_default __hidden;
 
+/* The value of auxiliary vector entry `type`, or 0 when it is absent. */
+unsigned long __libc_auxv_get(unsigned long type) __hidden;
+
 #endif /* _RTMUX_LIBC_LOCAL_H */

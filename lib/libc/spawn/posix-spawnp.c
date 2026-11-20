@@ -16,9 +16,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-extern char **environ;
+#include "env-lock.h"
 
-static char *find_envvar(char *const envp[], const char *envvar);
 static int parse_envvar_str(char *str, const char *token, char ***value);
 
 /* posix_spawnp — like posix_spawn(), except that <file> may be a bare name; in
@@ -39,32 +38,31 @@ int posix_spawnp(pid_t *restrict pid,
 {
     if (!file || *file == '\0')
         return EINVAL;
-    if (strchr(file, '/')) {
-        char full[PATH_MAX + 1];
-        size_t len;
-        int n;
 
-        if (*file == '/')
-            return posix_spawn(pid, file, file_actions, attrp, argv, envp);
-        if (!getcwd(full, sizeof(full)))
-            return errno;
-        len = strlen(full);
-        n = snprintf(full + len, sizeof(full) - len, "/%s", file);
-        if (n < 0 || (size_t) n >= sizeof(full) - len)
-            return ENAMETOOLONG;
-        return posix_spawn(pid, full, file_actions, attrp, argv, envp);
-    }
+    /* A path with a slash is not searched; posix_spawn() resolves a relative
+     * one against the directory the chdir file actions leave.
+     */
+    if (strchr(file, '/'))
+        return posix_spawn(pid, file, file_actions, attrp, argv, envp);
 
     int num_paths;
     int r = -1;
     int i;
     char *envvar_str;
+    const char *path_env;
     char **env_path;
     char path[PATH_MAX + 1];
 
-    if (!(envvar_str = find_envvar(environ, "PATH")))
+    /* Copy PATH under the environment lock, so setenv cannot change it or free
+     * the vector while it is read.
+     */
+    __env_lock();
+    path_env = getenv("PATH");
+    envvar_str = path_env ? strdup(path_env) : NULL;
+    __env_unlock();
+    if (!path_env)
         return ENOENT;
-    if (!(envvar_str = strdup(envvar_str)))
+    if (!envvar_str)
         return ENOMEM;
 
     if ((num_paths = parse_envvar_str(envvar_str, ":", &env_path)) <= 0) {
@@ -75,7 +73,11 @@ int posix_spawnp(pid_t *restrict pid,
     for (i = 0; i < num_paths; i++) {
         struct stat dummy;
 
-        if (!strcmp(env_path[i], "./")) {
+        /* Resolve a relative $PATH entry against the caller's cwd, as the
+         * stat() below does, so posix_spawn() cannot resolve it against the
+         * directory chdir file actions leave and run a different file.
+         */
+        if (env_path[i][0] != '/') {
             char *b;
             int trys = 5;
 
@@ -88,18 +90,39 @@ int posix_spawnp(pid_t *restrict pid,
                 continue;  /* try next $PATH entry */
             }
             size_t len = strlen(path);
-            int n = snprintf(path + len, sizeof(path) - len, "/%s", file);
+            size_t elen = strlen(env_path[i]);
+            int n;
+
+            while (elen > 0 && env_path[i][elen - 1] == '/')
+                elen--;
+            /* "" and "." name the cwd itself; "./" was the old special case */
+            if (elen == 1 && env_path[i][0] == '.')
+                elen = 0;
+            /* An entry that cannot fit is too long anyway; refusing it here
+             * also keeps the %.*s precision below from narrowing a length past
+             * INT_MAX to a smaller one and naming a truncated candidate.
+             */
+            if (elen >= sizeof(path) - len) {
+                if (r != EACCES)
+                    r = ENAMETOOLONG;
+                continue; /* a later entry may still fit */
+            }
+            n = snprintf(path + len, sizeof(path) - len, "%s%.*s%s%s",
+                         len > 1 ? "/" : "", (int) elen, env_path[i],
+                         elen ? "/" : "", file);
 
             if (n < 0 || (size_t) n >= sizeof(path) - len) {
-                r = ENAMETOOLONG;
-                break;
+                if (r != EACCES)
+                    r = ENAMETOOLONG;
+                continue; /* a later entry may still fit */
             }
         } else {
             int n = snprintf(path, sizeof(path), "%s/%s", env_path[i], file);
 
             if (n < 0 || (size_t) n >= sizeof(path)) {
-                r = ENAMETOOLONG;
-                break;
+                if (r != EACCES)
+                    r = ENAMETOOLONG;
+                continue; /* a later entry may still fit */
             }
         }
 
@@ -111,30 +134,14 @@ int posix_spawnp(pid_t *restrict pid,
              */
             if (r != EACCES)
                 break;
-        } else {
-            r = errno;
+        } else if (r != EACCES) {
+            r = errno; /* keep an earlier EACCES over a later ENOENT */
         }
     }
 
     free(env_path);
     free(envvar_str);
     return r != -1 ? r : ENOENT;
-}
-
-/* find_envvar — return a pointer to the value side of an env entry.
- *   find_envvar(environ, "PATH") on env={"PATH=./:/foo", ...} → "./:/foo"
- */
-static char *find_envvar(char *const envp[], const char *envvar)
-{
-    while (*envp) {
-        char *s1 = *envp;
-        size_t len = strlen(envvar);
-
-        if (strncmp(s1, envvar, len) == 0 && s1[len] == '=')
-            return s1 + len + 1;
-        ++envp;
-    }
-    return NULL;
 }
 
 /* parse_envvar_str — split <str> at <token> in place, returning the count of

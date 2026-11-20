@@ -58,6 +58,12 @@ enum _iomsg_protocols {
 #define _NOTIFY_COND_OUTPUT 0x20000000 /* Room for more output */
 #define _NOTIFY_COND_INPUT 0x10000000  /* Data is available */
 
+/* Not a condition a client asks for: an arm that names no condition (poll with
+ * events == 0) waits for hangup or error alone, and a service keeps it on its
+ * IOSERV_NOTIFY_OBAND list.
+ */
+#define _NOTIFY_COND_OBAND 0x40000000
+
 /* Masks for (io_notify_t).i.event.sigev_value.
  *
  * Requested conditions, extended or non, set in (io_notify_t).i.flags. Returned

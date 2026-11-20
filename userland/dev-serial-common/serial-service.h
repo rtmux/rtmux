@@ -8,8 +8,8 @@
  *   static int tx_break(void);    // assert a line break; EOK or an errno
  *
  * Include exactly once per driver translation unit. The file-scope static state
- * below assumes one dispatch thread: ser_read and rx_notification_handler run
- * serially through the same dispatcher.
+ * below assumes one dispatch thread: ser_read, ser_notify and
+ * rx_notification_handler run serially through the same dispatcher.
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -27,6 +27,7 @@
 #include <sys/types.h>
 #include <sys/iomsg.h>
 #include <sys/ioserv.h>
+#include <sys/ioserv-tty.h>
 #include <sys/dispatch.h>
 #include <sys/rtmux-core.h>
 #include <sys/procmsg.h>
@@ -57,6 +58,13 @@ static unsigned linebuf_len;
 static uint8_t cooked_rxbuf[RTMUX_SERIAL_COOKED_BUF_SIZE];
 static volatile unsigned cooked_head;
 static volatile unsigned cooked_tail;
+
+/* Armed readiness notifications (_IO_NOTIFY), one list per condition. Like the
+ * rings, the lists are only touched by the dispatch thread, which also runs
+ * rx_notification_handler: that serialization is the lock that keeps arming and
+ * the RX edge from racing. Every condition fires on a single byte.
+ */
+static ioserv_notify_t ser_notify_lists[IOSERV_NOTIFY_COUNT];
 
 /* Ask roottask a job control question about a client (see sys/procmsg.h).
  * Returns 0 or an errno; *out is filled for _PROC_JOBCTL_QUERY.
@@ -154,6 +162,7 @@ static void serial_termios_init(void)
     ser_termios.c_iflag = ICRNL | BRKINT;
     ser_termios.c_oflag = OPOST | ONLCR;
     ser_termios.c_cflag = CS8 | CREAD | HUPCL;
+    ser_termios.c_ispeed = ser_termios.c_ospeed = B38400;
     ser_termios.c_lflag = ECHO | ECHOE | ECHOK | ICANON | ISIG;
     ser_termios.c_cc[VEOF] = 0x04;
     ser_termios.c_cc[VEOL] = 0;
@@ -369,6 +378,10 @@ static int ser_read(ioserv_context_t *ctp, io_read_t *msg, void *ocb)
         return EOK;
     }
 
+    if (ioserv_tty_hung_up(&ser_termios)) { /* end of file */
+        _IO_SET_READ_NBYTES(ctp, 0);
+        return EOK;
+    }
     if ((c = ser_jobctl_gate(ctp->info.pid, 0)) != 0)
         return c;
 
@@ -417,6 +430,8 @@ static int ser_write(ioserv_context_t *ctp, io_write_t *msg, void *ocb)
         return ENOSYS;
     }
 
+    if ((err = ioserv_tty_write_err(&ser_termios)) != 0)
+        return err;
     if ((err = ser_jobctl_gate(ctp->info.pid, 1)) != 0)
         return err;
 
@@ -514,9 +529,22 @@ static int ser_devctl(ioserv_context_t *ctp, io_devctl_t *msg, void *ocb)
             (size_t) ctp->size < sizeof(*msg) + sizeof(struct termios))
             return EINVAL;
         memcpy(&ser_termios, data, sizeof(struct termios));
+        ioserv_tty_hangup_wake(ser_notify_lists, &ser_termios);
+
+        /* A reader parked on a line that is now hung up gets end of file. */
+        if (ioserv_tty_hung_up(&ser_termios) && ser_pending_live()) {
+            int rcvid = pending_rcvid;
+
+            ser_cancel_pending(0);
+            (void) msg_reply(rcvid, 0, NULL, 0);
+        }
         break;
     case DEVCTL_TTY_GET_PGRP:
         *(pid_t *) data = ser_pgrp;
+        nbytes = sizeof(pid_t);
+        break;
+    case DEVCTL_TTY_GET_SID:
+        *(pid_t *) data = ser_sid;
         nbytes = sizeof(pid_t);
         break;
     case DEVCTL_TTY_SET_PGRP: {
@@ -545,8 +573,8 @@ static int ser_devctl(ioserv_context_t *ctp, io_devctl_t *msg, void *ocb)
             return EPERM;
         if (msg->i.nbytes < (int32_t) sizeof(pid_t) ||
             (size_t) ctp->size < sizeof(*msg) + sizeof(pid_t) ||
-            *(pid_t *) data <= 0)
-            return EINVAL;
+            *(pid_t *) data < 0)
+            return EINVAL; /* 0 unbinds the terminal */
         ser_sid = ser_pgrp = *(pid_t *) data;
         break;
     case DEVCTL_TTY_FLUSH:
@@ -599,6 +627,52 @@ static int ser_devctl(ioserv_context_t *ctp, io_devctl_t *msg, void *ocb)
     return EOK;
 }
 
+/* Conditions in want satisfied now. Input means a read would return a byte at
+ * once: raw bytes are run through the line discipline first, so a partial
+ * canonical line is not readable and data that arrived before any poller armed
+ * is seen. That pass is what the next read would do anyway, and is bounded by
+ * the raw ring; it is skipped when input is not asked about. Output is
+ * transmitted synchronously by tx_byte(), with no queue to fill, so a write
+ * never parks.
+ */
+static unsigned ser_ready(unsigned want)
+{
+    unsigned sat = _NOTIFY_COND_OUTPUT;
+
+    if (ioserv_tty_hung_up(&ser_termios))
+        return 0; /* POLLHUP, never writable (POSIX 2.10.6) */
+    if ((want & _NOTIFY_COND_INPUT) && cooked_rxbuf_peek() >= 0)
+        sat |= _NOTIFY_COND_INPUT;
+    return sat & want;
+}
+
+/* A poller may be waiting for input: wake it once a byte is readable. Callers
+ * have just run the raw ring through the line discipline.
+ */
+static void ser_notify_input(void)
+{
+    if (!cooked_empty())
+        ioserv_notify_trigger(ser_notify_lists, 1, IOSERV_NOTIFY_INPUT);
+}
+
+/* _IO_NOTIFY for poll() and select(). Readiness is level-sensitive: the reply
+ * carries what is satisfied now, and a notification is armed only when nothing
+ * requested is. A byte that reaches the raw ring after this check raises an RX
+ * pulse that this same dispatch thread handles after the arm is recorded, so
+ * the edge cannot be lost between the check and the arm. A repeated pollfd
+ * entry asking only for conditions a terminal never raises arms only those, and
+ * leaves the arm the descriptor's other entry made.
+ */
+static int ser_notify(ioserv_context_t *ctp, io_notify_t *msg, void *ocb)
+{
+    (void) ocb;
+    return ioserv_notify(
+        ctp, msg, ser_notify_lists,
+        ser_ready(msg->i.flags &
+                  (unsigned) (_NOTIFY_COND_INPUT | _NOTIFY_COND_OUTPUT)),
+        ioserv_tty_hup(&ser_termios), NULL);
+}
+
 static int rx_notification_handler(message_context_t *ctp,
                                    int code,
                                    unsigned flags,
@@ -614,12 +688,15 @@ static int rx_notification_handler(message_context_t *ctp,
     (void) handle;
 
     if (!ser_pending_live()) {
-        /* Nobody is reading, but a job may be running that ^C must reach: run
-         * what arrived through the line discipline now, so a signal character
-         * is seen when typed. The bytes stay queued for the next reader.
+        /* Nobody is reading, but a job may be running that ^C must reach, or a
+         * poller may be waiting: run what arrived through the line discipline
+         * now, so a signal character is seen when typed and a completed line
+         * wakes the poller. The bytes stay queued for the next reader.
          */
-        if (ser_sid)
+        if (ser_sid ||
+            ioserv_notify_armed(ser_notify_lists, IOSERV_NOTIFY_INPUT, 1))
             (void) cooked_rxbuf_peek();
+        ser_notify_input();
         return 0;
     }
 
@@ -639,6 +716,9 @@ static int rx_notification_handler(message_context_t *ctp,
      */
     if (msg_reply(rcvid, 1, &reply, 1) != -1)
         cooked_tail++;
+
+    /* Whatever the reader left is readable by the pollers. */
+    ser_notify_input();
     return 0;
 }
 
@@ -677,6 +757,7 @@ static int ser_close_dup(ioserv_context_t *ctp, io_close_t *msg, void *ocb)
 
         ser_cancel_pending(live ? EINTR : 0);
     }
+    ioserv_notify_remove(ctp, ser_notify_lists);
     return EOK;
 }
 
@@ -703,6 +784,7 @@ static const ioserv_ops_t ser_io_funcs = {
     .write = ser_write,
     .stat = ser_stat,
     .devctl = ser_devctl,
+    .notify = ser_notify,
     .openfd = ser_openfd,
     .unblock = ser_unblock,
     .close_dup = ser_close_dup,

@@ -204,6 +204,7 @@ void kext_exit_destroy_threads(void *arg)
                         thp->next.thread = NULL;
                         thp->prev.thread = NULL;
                         thp->blocked_on = NULL;
+                        IPC_BLK(thp);
 
                         /* Stamp the thread dead in the same lock window that
                          * verified it is REPLY/SEND and unlinked it. A stamp
@@ -293,6 +294,12 @@ void kext_exit_destroy_threads(void *arg)
                     (void) __atomic_sub_fetch(&prp->num_active_threads, 1,
                                               __ATOMIC_ACQ_REL);
                 atomic_or(&thp->flags, RTMUX_FLG_THR_DETACHED);
+
+                /* A thread stamped dead here skips thread_destroy's teardown
+                 * (including its sync cleanup), yet may hold a mutex: hand
+                 * those on now.
+                 */
+                thread_sync_teardown(thp);
             }
             thread_destroy(thp);
         }

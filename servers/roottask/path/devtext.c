@@ -7,14 +7,56 @@
 
 #include "externs.h"
 #include <fcntl.h>
+#include <limits.h>
 #include <stdalign.h>
+#include <sys/poll.h>
 #include <termios.h>
+#include <sys/ioserv-tty.h>
 #include <devctl/common.h>
 #include <devctl/tty.h>
 #include <sys/procmsg.h>
 #include "pinode.h"
 
-static pthread_mutex_t text_mutex = PTHREAD_MUTEX_INITIALIZER;
+/* Both locks inherit priority; devtext_init() sets them up. The watcher thread
+ * runs below the dispatch workers and holds text_mutex again each time its
+ * timed wait ends, so with a plain mutex a preempted watcher stalls every
+ * worker that closes /dev/text, and each blocked worker makes the pool start
+ * another.
+ *
+ * text_mutex guards the typed-ahead ring, the armed notifications and the
+ * termios state. text_out_mutex orders console output only, and no path writes
+ * to the console while holding text_mutex, so a worker that closes or polls the
+ * device never waits for a console write.
+ */
+static pthread_mutex_t text_mutex;
+static pthread_mutex_t text_out_mutex;
+
+/* Lock one of the mutexes above. A priority-inheriting lock can fail with
+ * EAGAIN when the kernel has no turnstile to give it, and the callers could not
+ * proceed without the lock, so retry after a short sleep, which unlike a yield
+ * lets a lower-priority thread run.
+ */
+static void text_lock(pthread_mutex_t *m)
+{
+    int err;
+
+    while ((err = pthread_mutex_lock(m)) == EAGAIN) {
+        struct timespec ts = {.tv_sec = 0, .tv_nsec = 1000000L};
+
+        nanosleep(&ts, NULL);
+    }
+    if (err != EOK)
+        crash();
+}
+
+/* Write to the console in order with every other writer. */
+static void text_console_write(const char *buf, size_t len)
+{
+    text_lock(&text_out_mutex);
+    root_console_write(buf, len);
+    pthread_mutex_unlock(&text_out_mutex);
+}
+
 static dev_t text_devno;
 
 /* Terminal state for /dev/console (minimal termios support for early userland)
@@ -23,9 +65,29 @@ static struct termios text_termios;
 static pid_t text_pgrp;
 static pid_t text_sid; /* leader of the session this is the terminal of, or 0 */
 
+/* A copy of the terminal state, taken under text_mutex: tcsetattr writes the
+ * termios on any thread, so a read of it is made under the same lock. *hangups,
+ * when not NULL, gets the number of times the line was hung up: a reader that
+ * waits sees one that came and went while it slept.
+ */
+static unsigned text_hangups;
+
+static struct termios text_attr(unsigned *hangups)
+{
+    struct termios t;
+
+    text_lock(&text_mutex);
+    t = text_termios;
+    if (hangups)
+        *hangups = text_hangups;
+    pthread_mutex_unlock(&text_mutex);
+    return t;
+}
+
 /* Job control gate for a read (is_write = 0) or a write (is_write = 1) by the
  * caller. Only the caller's controlling terminal is policed, and only for a
- * background process; a write is policed only under TOSTOP.
+ * background process; a write is policed only under TOSTOP, which lflag (the
+ * c_lflag the caller read under the lock) says.
  *
  * A background read gets EIO when its group is orphaned or it blocks/ignores
  * SIGTTIN; otherwise the group is sent SIGTTIN and the read fails with EINTR. A
@@ -34,12 +96,12 @@ static pid_t text_sid; /* leader of the session this is the terminal of, or 0 */
  *
  * Returns EOK to proceed, else the errno to reply.
  */
-static int text_jobctl_gate(ioserv_context_t *ctp, int is_write)
+static int text_jobctl_gate(ioserv_context_t *ctp, int is_write, tcflag_t lflag)
 {
     struct _proc_jobctl_reply q;
     unsigned hold = is_write ? _JOBCTL_HOLD_TTOU : _JOBCTL_HOLD_TTIN;
 
-    if (is_write && !(text_termios.c_lflag & TOSTOP))
+    if (is_write && !(lflag & TOSTOP))
         return EOK;
     if (proc_jobctl_query(ROOTTASK_PID, ctp->info.pid, &q) != EOK ||
         !(q.flags & _JOBCTL_CTTY) || (q.flags & _JOBCTL_FG))
@@ -80,6 +142,15 @@ static int text_signal_char(int c)
 static int text_ahead[TEXT_AHEAD];
 static unsigned text_ahead_head, text_ahead_tail;
 
+/* Armed readiness notifications (_IO_NOTIFY), under text_mutex like the ring.
+ * The console raises no interrupt, so the watcher thread looks for input while
+ * a poller is armed and wakes it once the ring has a character.
+ */
+static ioserv_notify_t text_notify_lists[IOSERV_NOTIFY_COUNT];
+
+/* Signalled when a poller arms, so the watcher starts looking at once. */
+static pthread_cond_t text_watch_cond;
+
 /* Static stack: the watcher is made with __thread_create before the message
  * pool runs, as pthread_create cannot get a stack from a roottask worker.
  */
@@ -98,8 +169,10 @@ static int text_next(int to_ring)
 {
     for (;;) {
         int c, sig = 0;
+        char echo[2];
+        size_t echo_len = 0;
 
-        pthread_mutex_lock(&text_mutex);
+        text_lock(&text_mutex);
         if (!to_ring && text_ahead_head != text_ahead_tail) {
             c = text_ahead[text_ahead_tail++ % TEXT_AHEAD];
             pthread_mutex_unlock(&text_mutex);
@@ -129,26 +202,55 @@ static int text_next(int to_ring)
                 ;
         }
         if ((text_termios.c_lflag & ECHO) && c < ' ') {
-            char echo[2] = {'^', (char) (c + '@')};
-
-            root_console_write(echo, 2);
+            echo[0] = '^';
+            echo[1] = (char) (c + '@');
+            echo_len = sizeof echo;
         }
         pthread_mutex_unlock(&text_mutex);
+        if (echo_len)
+            text_console_write(echo, echo_len);
         if (proc_jobctl_signal_fg(ROOTTASK_PID, text_sid, sig) == ESRCH) {
             text_sid = 0; /* the session is gone: stop claiming the keys */
         }
     }
 }
 
+/* How often the watcher looks at the console: a poller waiting on it is woken
+ * within TEXT_WATCH_ARMED_MS of a key press. The console raises no interrupt.
+ */
+#define TEXT_WATCH_MS 50
+#define TEXT_WATCH_ARMED_MS 10
+
 static void *text_watcher(void *arg)
 {
-    (void) arg;
-    for (;;) {
-        struct timespec ts = {.tv_nsec = 50 * 1000000L};
+    int armed = 0;
 
-        nanosleep(&ts, NULL);
-        if (text_sid)
-            (void) text_next(1);
+    (void) arg;
+    text_lock(&text_mutex);
+    for (;;) {
+        struct timespec until;
+        long ms = armed ? TEXT_WATCH_ARMED_MS : TEXT_WATCH_MS;
+
+        clock_gettime(CLOCK_MONOTONIC, &until);
+        until.tv_nsec += ms * 1000000L;
+        if (until.tv_nsec >= 1000000000L) {
+            until.tv_sec++;
+            until.tv_nsec -= 1000000000L;
+        }
+        (void) pthread_cond_timedwait(&text_watch_cond, &text_mutex, &until);
+        armed = ioserv_notify_armed(text_notify_lists, IOSERV_NOTIFY_INPUT, 1);
+        if (!text_sid && !armed)
+            continue;
+        pthread_mutex_unlock(&text_mutex);
+        (void) text_next(1);
+        text_lock(&text_mutex);
+
+        /* A poller may have armed while the lock was dropped; its signal was
+         * missed, so look again to pick the short interval for it.
+         */
+        armed = ioserv_notify_armed(text_notify_lists, IOSERV_NOTIFY_INPUT, 1);
+        if (armed && text_ahead_head != text_ahead_tail)
+            ioserv_notify_trigger(text_notify_lists, 1, IOSERV_NOTIFY_INPUT);
     }
     return NULL;
 }
@@ -166,6 +268,8 @@ static void *text_watcher(void *arg)
 static int text_read(ioserv_context_t *ctp, io_read_t *msg, void *ocb)
 {
     unsigned ioflag = (unsigned) (uintptr_t) ocb;
+    struct termios t;
+    unsigned hangups, seen;
     int c;
 
     if (!(ioflag & _IO_FLAG_RD)) {
@@ -196,14 +300,23 @@ static int text_read(ioserv_context_t *ctp, io_read_t *msg, void *ocb)
         return EOK;
     }
 
-    if ((c = text_jobctl_gate(ctp, 0)) != EOK) {
+    if ((c = text_jobctl_gate(ctp, 0, 0)) != EOK) {
         return c;
     }
 
+    (void) text_attr(&hangups);
     for (;;) {
         struct _msg_info info;
         uint64_t to;
 
+        /* A line that is hung up, or was since the read began, is at end of
+         * file, for a reader that waits too.
+         */
+        t = text_attr(&seen);
+        if (ioserv_tty_hung_up(&t) || seen != hangups) {
+            _IO_SET_READ_NBYTES(ctp, 0);
+            return EOK;
+        }
         c = text_next(0);
         if (c >= 0) {
             break;
@@ -226,18 +339,18 @@ static int text_read(ioserv_context_t *ctp, io_read_t *msg, void *ocb)
     }
 
     /* ICRNL: convert CR to NL (standard termios input processing) */
-    if ((text_termios.c_iflag & ICRNL) && c == '\r')
+    t = text_attr(NULL);
+    if ((t.c_iflag & ICRNL) && c == '\r')
         c = '\n';
 
     /* ECHO: terminal driver responsibility per POSIX */
-    if (text_termios.c_lflag & ECHO) {
+    if (t.c_lflag & ECHO) {
         char ch = (char) c;
-        pthread_mutex_lock(&text_mutex);
+
         if (ch == '\r' || ch == '\n')
-            root_console_write("\r\n", 2);
+            text_console_write("\r\n", 2);
         else if (ch >= ' ')
-            root_console_write(&ch, 1);
-        pthread_mutex_unlock(&text_mutex);
+            text_console_write(&ch, 1);
     }
 
     *(char *) msg = (char) c;
@@ -256,6 +369,7 @@ static int text_read(ioserv_context_t *ctp, io_read_t *msg, void *ocb)
 static int text_write(ioserv_context_t *ctp, io_write_t *msg, void *ocb)
 {
     unsigned ioflag = (unsigned) (uintptr_t) ocb;
+    struct termios t;
     int err;
 
     if (!(ioflag & _IO_FLAG_WR)) {
@@ -270,7 +384,10 @@ static int text_write(ioserv_context_t *ctp, io_write_t *msg, void *ocb)
         return ENOSYS;
     }
 
-    if ((err = text_jobctl_gate(ctp, 1)) != EOK) {
+    t = text_attr(NULL);
+    if ((err = ioserv_tty_write_err(&t)) != 0)
+        return err;
+    if ((err = text_jobctl_gate(ctp, 1, t.c_lflag)) != EOK) {
         return err;
     }
 
@@ -285,10 +402,8 @@ static int text_write(ioserv_context_t *ctp, io_write_t *msg, void *ocb)
     if (msg->i.nbytes > (int32_t) (ctp->msg_max_size - sizeof msg->i)) {
         msg->i.nbytes = (int32_t) (ctp->msg_max_size - sizeof msg->i);
     }
-    pthread_mutex_lock(&text_mutex);
-    root_console_write((char *) (&msg->i) + sizeof msg->i,
+    text_console_write((char *) (&msg->i) + sizeof msg->i,
                        (size_t) msg->i.nbytes);
-    pthread_mutex_unlock(&text_mutex);
     _IO_SET_WRITE_NBYTES(ctp, msg->i.nbytes);
     return EOK;
 }
@@ -352,7 +467,9 @@ static int text_devctl(ioserv_context_t *ctp, io_devctl_t *msg, void *ocb)
         break;
 
     case DEVCTL_TTY_GET_ATTR:
+        text_lock(&text_mutex);
         memcpy(data, &text_termios, sizeof(struct termios));
+        pthread_mutex_unlock(&text_mutex);
         nbytes = sizeof(struct termios);
         break;
 
@@ -361,11 +478,21 @@ static int text_devctl(ioserv_context_t *ctp, io_devctl_t *msg, void *ocb)
     case DEVCTL_TTY_SET_ATTR_FLUSH:
         if (msg->i.nbytes < (int32_t) sizeof(struct termios))
             return EINVAL;
+        text_lock(&text_mutex);
         memcpy(&text_termios, data, sizeof(struct termios));
+        ioserv_tty_hangup_wake(text_notify_lists, &text_termios);
+        if (ioserv_tty_hung_up(&text_termios))
+            text_hangups++;
+        pthread_mutex_unlock(&text_mutex);
         break;
 
     case DEVCTL_TTY_GET_PGRP:
         *(pid_t *) data = text_pgrp;
+        nbytes = sizeof(pid_t);
+        break;
+
+    case DEVCTL_TTY_GET_SID:
+        *(pid_t *) data = text_sid;
         nbytes = sizeof(pid_t);
         break;
 
@@ -393,8 +520,8 @@ static int text_devctl(ioserv_context_t *ctp, io_devctl_t *msg, void *ocb)
          */
         if (ctp->info.pid != ROOTTASK_PID)
             return EPERM; /* only roottask binds the terminal */
-        if (msg->i.nbytes < (int32_t) sizeof(pid_t) || *(pid_t *) data <= 0)
-            return EINVAL;
+        if (msg->i.nbytes < (int32_t) sizeof(pid_t) || *(pid_t *) data < 0)
+            return EINVAL; /* 0 unbinds the terminal */
         text_sid = text_pgrp = *(pid_t *) data;
         break;
 
@@ -408,7 +535,7 @@ static int text_devctl(ioserv_context_t *ctp, io_devctl_t *msg, void *ocb)
         if (msg->i.nbytes < (int32_t) sizeof data->qsel)
             return EINVAL;
         if (data->qsel == TCIFLUSH || data->qsel == TCIOFLUSH) {
-            pthread_mutex_lock(&text_mutex);
+            text_lock(&text_mutex);
             text_ahead_tail = text_ahead_head;
             while (root_console_getchar() >= 0)
                 ;
@@ -433,19 +560,15 @@ static int text_devctl(ioserv_context_t *ctp, io_devctl_t *msg, void *ocb)
             return EINVAL;
         switch (data->flow) {
         case TCIOFF: {
-            char ch = (char) text_termios.c_cc[VSTOP];
+            char ch = (char) text_attr(NULL).c_cc[VSTOP];
 
-            pthread_mutex_lock(&text_mutex);
-            root_console_write(&ch, 1);
-            pthread_mutex_unlock(&text_mutex);
+            text_console_write(&ch, 1);
             break;
         }
         case TCION: {
-            char ch = (char) text_termios.c_cc[VSTART];
+            char ch = (char) text_attr(NULL).c_cc[VSTART];
 
-            pthread_mutex_lock(&text_mutex);
-            root_console_write(&ch, 1);
-            pthread_mutex_unlock(&text_mutex);
+            text_console_write(&ch, 1);
             break;
         }
         case TCOOFF:
@@ -467,6 +590,46 @@ static int text_devctl(ioserv_context_t *ctp, io_devctl_t *msg, void *ocb)
         msg->o.ret_val = 0;
         return IOSERV_PTR(ctp, &msg->o, sizeof msg->o + nbytes);
     }
+    return EOK;
+}
+
+/* _IO_NOTIFY for poll() and select(). Input is ready once a read would return a
+ * character at once: what the console holds is moved into the ring first, so a
+ * character typed before the poller armed is seen. Output is written
+ * synchronously, so it is always ready. The ring is checked and the arm made
+ * under text_mutex, which the watcher also takes before it wakes pollers, so a
+ * character it queues after the check still finds the arm.
+ */
+static int text_notify(ioserv_context_t *ctp, io_notify_t *msg, void *ocb)
+{
+    unsigned trig = _NOTIFY_COND_OUTPUT;
+    int ret;
+
+    (void) ocb;
+    if ((msg->i.flags & (unsigned) _NOTIFY_COND_INPUT) &&
+        text_ahead_head == text_ahead_tail)
+        (void) text_next(1);
+    text_lock(&text_mutex);
+    if (ioserv_tty_hung_up(&text_termios)) /* POLLHUP, never writable */
+        trig = 0;
+    else if (text_ahead_head != text_ahead_tail)
+        trig |= _NOTIFY_COND_INPUT;
+    ret = ioserv_notify(ctp, msg, text_notify_lists, trig,
+                        ioserv_tty_hup(&text_termios), NULL);
+    if (ret == EAGAIN)
+        pthread_cond_signal(&text_watch_cond);
+    pthread_mutex_unlock(&text_mutex);
+    return ret;
+}
+
+/* A closed open takes its arms with it. */
+static int text_close_dup(ioserv_context_t *ctp, io_close_t *msg, void *ocb)
+{
+    (void) msg;
+    (void) ocb;
+    text_lock(&text_mutex);
+    ioserv_notify_remove(ctp, text_notify_lists);
+    pthread_mutex_unlock(&text_mutex);
     return EOK;
 }
 
@@ -493,7 +656,9 @@ static const ioserv_ops_t text_io_funcs = {
     .write = text_write,
     .stat = text_stat,
     .devctl = text_devctl,
+    .notify = text_notify,
     .openfd = text_openfd,
+    .close_dup = text_close_dup,
 };
 
 /* Open handler for /dev/text — bind the connection with its io flags.
@@ -532,10 +697,14 @@ static const ioserv_connect_ops_t text_connect_funcs = {
  */
 void devtext_init(void)
 {
+    /* Priority inheritance: see the comment at text_mutex. */
+    root_mutex_init_pi(&text_mutex);
+    root_mutex_init_pi(&text_out_mutex);
     /* Sensible terminal defaults so the shell gets ECHO | ICANON */
     text_termios.c_iflag = ICRNL | BRKINT;
     text_termios.c_oflag = OPOST | ONLCR;
     text_termios.c_cflag = CS8 | CREAD | HUPCL;
+    text_termios.c_ispeed = text_termios.c_ospeed = B38400;
     text_termios.c_lflag = ECHO | ECHOE | ECHOK | ICANON | ISIG;
     text_termios.c_cc[VEOF] = 0x04; /* ^D */
     text_termios.c_cc[VEOL] = 0;
@@ -551,7 +720,12 @@ void devtext_init(void)
 
     {
         struct _thread_attr attr;
+        pthread_condattr_t cattr;
 
+        pthread_condattr_init(&cattr);
+        pthread_condattr_setclock(&cattr, CLOCK_MONOTONIC);
+        pthread_cond_init(&text_watch_cond, &cattr);
+        pthread_condattr_destroy(&cattr);
         memset(&attr, 0, sizeof attr);
         attr.stackaddr = text_watcher_stack;
         attr.stacksize = sizeof text_watcher_stack;

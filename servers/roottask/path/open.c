@@ -22,6 +22,8 @@ struct open_entry {
     int rcvid;
     int check_generation;
     int deferred; /* parked behind another op on the node (IOSERV_NOREPLY) */
+    int unlink;   /* an unlink: owns NODE_FLAG_UNLINKING while pending */
+    ioserv_context_t *ctp; /* context of the request this entry stands for */
 };
 
 static soul_t open_souls INITSOUL(-1, struct open_entry, 2, 8, ~0);
@@ -216,19 +218,77 @@ static const ioserv_ops_t node_funcs = {
 };
 
 
-static int complete_open(ioserv_context_t *ctp, struct open_entry *oep, int ret)
+#ifdef CONFIG_DEBUG_INJECT
+/* A node named rtmux-open-stall-MS holds each open of it for MS milliseconds
+ * once the open is registered, so a test can have a second operation arrive
+ * while the first is still in flight, which is otherwise a matter of luck. Only
+ * a CONFIG_DEBUG_INJECT image has this.
+ */
+static void open_debug_stall(const node_t *nop, int subtype)
+{
+    static const char tag[] = "rtmux-open-stall-";
+    unsigned long ms;
+
+    if (subtype == _IO_CONNECT_UNLINK ||
+        strncmp(nop->name, tag, sizeof tag - 1) != 0)
+        return;
+    ms = strtoul(nop->name + sizeof tag - 1, NULL, 10);
+    if (ms > 5000)
+        ms = 5000;
+    (void) nanosleep(
+        &(struct timespec){.tv_nsec = (long) (ms % 1000) * 1000000L,
+                           .tv_sec = (time_t) (ms / 1000)},
+        NULL);
+}
+#else
+#define open_debug_stall(nop, subtype) ((void) 0)
+#endif
+
+/* Operations parked behind a finished one wait on the finished operation's
+ * context, in ctp->post, until its handler has sent the reply: a connect that
+ * carries combined messages (a stat, then a close) runs them after the open
+ * returns, so restarting a parked operation from the open ran it between the
+ * open and its combined messages. Only the thread that owns the context touches
+ * the list, and it needs no allocation, so nothing can fail between taking an
+ * entry off pending_opens and its restart. A restarted operation can park
+ * others in turn; the loop drains those too.
+ */
+void path_open_resume(ioserv_context_t *ctp)
+{
+    struct open_entry *todo;
+
+    while ((todo = ctp->post)) {
+        /* The pool reservation is a latency aid, not a requirement: on failure
+         * (low memory) the parked operations are restarted all the same.
+         * Without one, unrelated operations may wait for this thread if no
+         * other is free.
+         */
+        int reserved = proc_thread_pool_reserve() == 0;
+
+        ctp->post = NULL;
+        while (todo) {
+            struct open_entry *next = todo->next;
+
+            errno = 0;
+            if (ioserv_msg_again(ctp, todo->rcvid) == -1)
+                msg_error(todo->rcvid, errno ? errno : EIO);
+            proc_object_free(&open_souls, todo);
+            todo = next;
+        }
+        if (reserved)
+            proc_thread_pool_reserve_done();
+    }
+}
+
+static int complete_open(struct open_entry *oep, int ret)
 {
     node_t *nop;
     struct open_entry *chk;
     struct open_entry *next;
-    struct open_entry *todo;
-    int reserve_thread_fail = 0;
 
-    todo = NULL;
     nop = oep->node;
     path_node_access(nop);
     LINK2_REM(oep);
-    proc_object_free(&open_souls, oep);
     if (nop->flags & NODE_FLAG_DEFERRED) {
         /* Find all the deferred operations for this node. */
         chk = pending_opens;
@@ -245,61 +305,23 @@ static int complete_open(ioserv_context_t *ctp, struct open_entry *oep, int ret)
              */
             if (chk->node == nop && chk->deferred) {
                 LINK2_REM(chk);
-                chk->next = todo;
-                todo = chk;
+                chk->next = oep->ctp->post;
+                oep->ctp->post = chk;
             }
             chk = next;
         }
         nop->flags &= (uint16_t) ~NODE_FLAG_DEFERRED;
     }
+    /* Only the unlink clears its flag, and in the same hold of path_mutex that
+     * removes its entry: a second unlink starting between the two would have
+     * its flag cleared under it, and an open would then pass the check while
+     * that unlink detaches the node.
+     */
+    if (oep->unlink)
+        nop->flags &= (uint16_t) ~NODE_FLAG_UNLINKING;
+    proc_object_free(&open_souls, oep);
     path_node_complete(nop);
-    path_node_detach_flags(nop, NODE_FLAG_UNLINKING);
-    if (todo) {
-        if (proc_thread_pool_reserve() != 0) {
-            /* ***** NOTE ***** the thrad pool reserve operation failed this
-             * means we are running low on memory but we cannot leave the
-             * pending opens hanging so we continue on here this reservation is
-             * mainly a performance improvement not a necessity. Without this
-             * reservation, other unrelated operations, would have to wait for
-             * this to complete if there were no other threads around.
-             */
-            reserve_thread_fail = 1;
-        }
-
-        /* We're going to be reusing ctp below to restart the deferred
-         * operations, so we need to do the reply for this op first to free up
-         * the message buffer.
-         */
-        switch ((unsigned) ret) {
-        case (unsigned) IOSERV_NOREPLY:
-            break;
-        case (unsigned) IOSERV_DEFAULT:
-            ret = ENOSYS;
-            /* Fall through */
-        default:
-            if (ret <= 0) {
-                (void) msg_replyv(ctp->rcvid, ctp->status, ctp->iov, -ret);
-            } else {
-                msg_error(ctp->rcvid, ret);
-            }
-            break;
-        }
-        ret = IOSERV_NOREPLY;
-        do {
-            next = todo->next;
-            /* Restart the deferred operation on the node */
-            ioserv_msg_again(ctp, todo->rcvid);
-            proc_object_free(&open_souls, todo);
-            todo = next;
-        } while (todo);
-
-        /* if the original thread pool reservation did not fail release the
-         * reservation here
-         */
-        if (!reserve_thread_fail) {
-            proc_thread_pool_reserve_done();
-        }
-    }
+    path_node_detach(nop);
     return ret;
 }
 
@@ -435,7 +457,9 @@ again:
         oep->node = nop;
         oep->entry_generation = nop->entry_generation;
         oep->rcvid = ctp->rcvid;
+        oep->ctp = ctp;
         oep->deferred = 0;
+        oep->unlink = (msg->connect.subtype == _IO_CONNECT_UNLINK);
         oep->check_generation = (msg->connect.subtype != _IO_CONNECT_UNLINK);
         if (msg->connect.subtype == _IO_CONNECT_UNLINK) {
             nop->flags |= NODE_FLAG_UNLINKING;
@@ -460,7 +484,7 @@ again:
         if (ctp->id == link_root_id) {
             if (o && o->hdr.type != OBJECT_PROC_SYMLINK) {
                 path_node_complete(nop);
-                return complete_open(ctp, oep, ENOENT);
+                return complete_open(oep, ENOENT);
             }
         } else {
             /* Only look for non-link entries here */
@@ -473,11 +497,12 @@ again:
              */
             if (!o && result[0] != '\0') {
                 path_node_complete(nop);
-                return complete_open(ctp, oep,
+                return complete_open(oep,
                                      service_error(msg, PATH_SERVICE_OPEN));
             }
         }
         path_node_complete(nop);
+        open_debug_stall(nop, msg->connect.subtype);
 
         if (o) {
             switch (o->hdr.type) {
@@ -485,9 +510,8 @@ again:
                 if (result[0] == '\0') {
                     if (msg->connect.subtype == _IO_CONNECT_READLINK) {
                         return complete_open(
-                            ctp, oep,
-                            reply_symlink(ctp, 0, &msg->link_reply, &o->symlink,
-                                          0, 0));
+                            oep, reply_symlink(ctp, 0, &msg->link_reply,
+                                               &o->symlink, 0, 0));
                     }
                     if (S_ISLNK(msg->connect.mode) &&
                         !(msg->connect.eflag & _IO_CONNECT_EFLAG_DIR)) {
@@ -495,14 +519,14 @@ again:
                     }
                 }
                 return complete_open(
-                    ctp, oep,
+                    oep,
                     reply_symlink(ctp, msg->connect.eflag, &msg->link_reply,
                                   &o->symlink, msg->connect.path, result));
 
             case OBJECT_MEM_SHARED:
                 if ((msg->connect.eflag & _IO_CONNECT_EFLAG_DIR) ||
                     result[0] != '\0') {
-                    return complete_open(ctp, oep, ENOTDIR);
+                    return complete_open(oep, ENOTDIR);
                 }
 
                 if ((msg->connect.subtype != _IO_CONNECT_OPEN) &&
@@ -513,22 +537,22 @@ again:
 
                 if ((msg->connect.ioflag & (O_CREAT | O_EXCL)) ==
                     (O_CREAT | O_EXCL)) {
-                    return complete_open(ctp, oep, EEXIST);
+                    return complete_open(oep, EEXIST);
                 }
 
-                return complete_open(ctp, oep, mem_open(ctp, msg, o, extra));
+                return complete_open(oep, mem_open(ctp, msg, o, extra));
 
             case OBJECT_NAME:
                 if (result[0] == '\0' &&
                     msg->connect.file_type == _FTYPE_NAME) {
                     if (open_entry_stale(oep))
-                        return complete_open(ctp, oep, ESTALE);
-                    return complete_open(ctp, oep, reply_redirect(ctp, msg, o));
+                        return complete_open(oep, ESTALE);
+                    return complete_open(oep, reply_redirect(ctp, msg, o));
                 }
                 if (result[0] == '\0') {
                     break;
                 }
-                return complete_open(ctp, oep, ENOENT);
+                return complete_open(oep, ENOENT);
 
             case OBJECT_SERVER:
                 /* The endpoint itself is not a symlink: a readlink landing on
@@ -539,15 +563,15 @@ again:
                  */
                 if (result[0] == '\0') {
                     if (msg->connect.subtype == _IO_CONNECT_READLINK)
-                        return complete_open(ctp, oep, EINVAL);
+                        return complete_open(oep, EINVAL);
                     if (nop->child)
                         break;
                 }
-                return complete_open(ctp, oep,
+                return complete_open(oep,
                                      service_error(msg, PATH_SERVICE_OPEN));
 
             default:
-                return complete_open(ctp, oep, ENOENT);
+                return complete_open(oep, ENOENT);
             }
         }
         switch (msg->connect.subtype) {
@@ -556,49 +580,49 @@ again:
              * node (one with children) is not a symbolic link, so readlink of
              * it is EINVAL per POSIX rather than ENOSYS.
              */
-            return complete_open(ctp, oep, nop->child ? EINVAL : ENOSYS);
+            return complete_open(oep, nop->child ? EINVAL : ENOSYS);
 
         case _IO_CONNECT_UNLINK:
             if (!o) {
-                return complete_open(ctp, oep, nop->child ? ENOTEMPTY : ENOENT);
+                return complete_open(oep, nop->child ? ENOTEMPTY : ENOENT);
             }
             switch (o->hdr.type) {
             case OBJECT_NAME:
             case OBJECT_SERVER:
                 if (msg->connect.eflag & _IO_CONNECT_EFLAG_DIR) {
                     return complete_open(
-                        ctp, oep,
-                        (o->server.hdr.flags & NAMESPACE_FLAG_DIR) ? ENOSYS
-                                                                   : ENOTDIR);
+                        oep, (o->server.hdr.flags & NAMESPACE_FLAG_DIR)
+                                 ? ENOSYS
+                                 : ENOTDIR);
                 }
                 if (!(o->server.hdr.flags & NAMESPACE_FLAG_STICKY)) {
                     return complete_open(
-                        ctp, oep,
-                        (o->server.hdr.flags & NAMESPACE_FLAG_DIR) ? EBUSY
-                                                                   : ENOSYS);
+                        oep, (o->server.hdr.flags & NAMESPACE_FLAG_DIR)
+                                 ? EBUSY
+                                 : ENOSYS);
                 }
                 path_object_detach(o);
-                return complete_open(ctp, oep, EOK);
+                return complete_open(oep, EOK);
 
             case OBJECT_PROC_SYMLINK:
                 if (!proc_isaccess(0, &ctp->info)) {
-                    return complete_open(ctp, oep, EPERM);
+                    return complete_open(oep, EPERM);
                 }
                 path_object_detach(o);
-                return complete_open(ctp, oep, EOK);
+                return complete_open(oep, EOK);
             case OBJECT_MEM_SHARED:
                 /* @@@ We should really have an object callout for this */
                 if (o->mem.pm.mode &&
                     devmem_check_perm(ctp, o->mem.pm.mode, o->mem.pm.uid,
                                       o->mem.pm.gid, S_ISUID)) {
-                    return complete_open(ctp, oep, EPERM);
+                    return complete_open(oep, EPERM);
                 }
                 path_object_detach(o);
-                return complete_open(ctp, oep, EOK);
+                return complete_open(oep, EOK);
             default:
                 break;
             }
-            return complete_open(ctp, oep, ENOSYS);
+            return complete_open(oep, ENOSYS);
 
         default:
             break;
@@ -611,11 +635,11 @@ again:
          */
         if (!o && nop->child_objects == 0) {
             if (open_entry_stale(oep))
-                return complete_open(ctp, oep, ESTALE);
-            return complete_open(ctp, oep, ENOENT);
+                return complete_open(oep, ESTALE);
+            return complete_open(oep, ENOENT);
         }
         if (service_error(msg, PATH_SERVICE_LS) == ENOSYS) {
-            return complete_open(ctp, oep, ENOSYS);
+            return complete_open(oep, ENOSYS);
         }
 
         /* A namespace directory node has no writable form: it is bound here for
@@ -625,22 +649,22 @@ again:
          * rather than hand back a directory handle that cannot be written.
          */
         if (msg->connect.ioflag & (_IO_FLAG_WR | O_TRUNC)) {
-            return complete_open(ctp, oep, EISDIR);
+            return complete_open(oep, EISDIR);
         }
 
         if (!(ocb = _scalloc(sizeof *ocb))) {
-            return complete_open(ctp, oep, ENOMEM);
+            return complete_open(oep, ENOMEM);
         }
         if (open_entry_stale(oep)) {
             _sfree(ocb, sizeof *ocb);
-            return complete_open(ctp, oep, ESTALE);
+            return complete_open(oep, ESTALE);
         }
         ocb->node = path_node_clone(nop);
         if (ioserv_open_bind(ctp, ocb, &node_funcs) == -1) {
             path_node_detach(ocb->node);
-            return complete_open(ctp, oep, errno);
+            return complete_open(oep, errno);
         }
-        return complete_open(ctp, oep, EOK);
+        return complete_open(oep, EOK);
     }
     /* !nop at this point */
 

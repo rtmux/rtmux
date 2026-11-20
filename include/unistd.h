@@ -202,11 +202,14 @@ extern gid_t getegid(void);
 extern uid_t geteuid(void);
 extern gid_t getgid(void);
 extern int getgroups(int __gidsetsize, gid_t __grouplist[]);
+extern pid_t getpgid(pid_t __pid);
 extern pid_t getpgrp(void);
 extern pid_t getpid(void);
 extern pid_t getppid(void);
+extern pid_t getsid(pid_t __pid);
 extern uid_t getuid(void);
 extern int issetugid(void);
+extern int getpagesize(void); /* legacy; prefer sysconf(_SC_PAGESIZE) */
 extern char *getlogin(void);
 extern int getlogin_r(char *__name, size_t __namesize);
 extern int isatty(int __fildes);

@@ -35,6 +35,7 @@ static unsigned fdmem_open_lock;
 static unsigned fdmem_close_lock;
 static path_object_t *fdmem_zombies = ZOMBIE_END;
 static unsigned fdmem_zombie_gen;
+static unsigned fdmem_zombie_count; /* entries on the list, under fdmem_mutex */
 static unsigned fdmem_cleanup;
 static path_object_t *fdmem_cleaner_object;
 
@@ -142,6 +143,7 @@ int fdmem_done(path_object_t *obp)
             obp->hdr.next = fdmem_zombies;
             fdmem_zombies = obp;
             ++fdmem_zombie_gen;
+            ++fdmem_zombie_count;
             (void) vm_fd_compact();
         }
     } else if (obp->hdr.next) {
@@ -394,6 +396,7 @@ static int mem_map_fd(ioserv_context_t *ctp,
         }
         *owner = chk->hdr.next;
         ++fdmem_zombie_gen;
+        --fdmem_zombie_count;
         obp->hdr.next = NULL;
     }
 
@@ -571,12 +574,14 @@ static int vm_fd_cleanup(message_context_t *ctp,
     if (proc_thread_pool_reserve() == 0) {
         pthread_mutex_lock(&fdmem_mutex);
 
-        /* RUSH3: we used to set force if we had more than
-         * MMAPFD_STALES_HIGHWATER RUSH3: to potentially free, but since we
-         * don't keep track of the RUSH3: number any more, we can't do that. Can
-         * we get away without RUSH3: that?
+        /* Past MMAPFD_STALES_HIGHWATER entries the pass is forced, which makes
+         * new opens wait for it. Without that it waits for a moment with no
+         * open in flight, and a team of threads that spawn without a pause
+         * never leaves one: every exited process then kept its mapping
+         * connections, and the file system serving them ran out of open
+         * handles.
          */
-        force = 0;
+        force = fdmem_zombie_count > MMAPFD_STALES_HIGHWATER;
 
         currtime = time(0);
         gen = fdmem_zombie_gen;
@@ -608,12 +613,14 @@ static int vm_fd_cleanup(message_context_t *ctp,
                 int r;
 
                 *owner = obp->hdr.next;
+                --fdmem_zombie_count;
                 fdmem_cleaner_object = obp;
                 r = object_done(obp);
                 fdmem_cleaner_object = NULL;
                 if (!r) {
                     /* Free failed for some reason, put things back */
                     *owner = obp;
+                    ++fdmem_zombie_count;
                     nexttime = currtime;
                 }
                 if (*owner == ZOMBIE_END)

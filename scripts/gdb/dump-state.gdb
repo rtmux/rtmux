@@ -95,21 +95,64 @@ for t in threads:
     except Exception as e:
         print("  (frame walk failed: %s)" % e)
     for f in ("pc_syscall", "pc_active_prp", "pc_ipicmds", "pc_dispatch",
-              "pc_active_fpu"):
+              "pc_active_fpu", "pc_pending_preempt_prio", "pc_curthread"):
         try:
             print("pcpu_array[%d].%s = %s" %
                   (hart, f, gdb.parse_and_eval("pcpu_array[%d].%s" % (hart, f))))
         except gdb.error as e:
             print("pcpu_array[%d].%s: unavailable (%s)" % (hart, f, e))
 
+# need_to_run is the kernel's request to switch away from the running thread; a
+# thread restarting its call while it stays set never leaves the kernel.
+try:
+    print("need_to_run = %s need_to_run_cpu = %s" %
+          (gdb.parse_and_eval("need_to_run"), gdb.parse_and_eval("need_to_run_cpu")))
+except gdb.error as e:
+    print("need_to_run: unavailable (%s)" % e)
+
 # Every live thread of every process: state, what it is blocked on, flags. All
 # harts idle plus a non-READY thread here names the lost wakeup.
+RUNQ_MAX = 16
+
+def dump_runq(thp):
+    """The run list a READY thread should be on, in dispatch order, and
+    whether the thread is linked into it. Its own try, so a damaged list does
+    not hide the thread's PRIO line."""
+    try:
+        link = thp["link3_link"]
+        prio = int(thp["priority"])
+        head = thp["dpp"]["ready"][prio]["head"]
+        off = int(gdb.parse_and_eval(
+            "(unsigned long) &((thread_t *) 0)->link3_link"))
+        q, order, n = head, [], 0
+        while int(q) != 0 and n < RUNQ_MAX:
+            qt = gdb.Value(int(q) - off).cast(
+                gdb.lookup_type("thread_t").pointer())
+            order.append("%d.%d" % (int(qt["process"]["pid"]), int(qt["tid"])))
+            q = qt["link3_link"]["next"]
+            n += 1
+        more = " (truncated after %d)" % RUNQ_MAX if int(q) != 0 else ""
+        print("  READYQ list at prio %d: %s%s" %
+              (prio, " ".join(order) or "(empty)", more))
+        # prev points at whatever holds the pointer to this node: the list head
+        # or the previous node's next. LINK3_REM leaves prev behind, so a stale
+        # prev proves nothing; the node is linked only if that holder names it.
+        prev = link["prev"]
+        linked = int(prev) != 0 and int(prev.dereference()) == int(link.address)
+        print("  READYQ tid %d: link %s prev %s next %s list head %s linked %d" %
+              (int(thp["tid"]), link.address, prev, link["next"], head,
+               int(linked)))
+    except gdb.error as e:
+        print("  READYQ unavailable: %s" % e)
+
 def kptr(v):
     try:
         return int(v) >= 0xffffffc000000000
     except gdb.error:
         return False
 
+stuck_reply = []
+reply_threads = []
 try:
     pv = gdb.parse_and_eval("process_vector")
     nproc = int(pv["nentries"])
@@ -140,7 +183,29 @@ try:
                           (int(thp["tid"]), int(thp["runcpu"]),
                            int(thp["runmask"]), int(thp["priority"]),
                            thp["dpp"], thp["link3_link"]["next"]))
-                elif st == 5:  # RECEIVE: blocked_on is the channel
+                if st == 2:
+                    dump_runq(thp)
+                if st in (1, 2):  # RUNNING or READY: where it is, and why it has this priority
+                    reg = thp["reg"]
+                    print("  PRIO tid %d: effective %d real %d msg_loan 0x%x "
+                          "pend_loan %d pi_loan %d policy %d rr_ticks %d saved pc=0x%x "
+                          "ra=0x%x sp=0x%x a0=0x%x a1=0x%x a2=0x%x a7=%d" %
+                          (int(thp["tid"]), int(thp["priority"]),
+                           int(thp["real_priority"]), int(thp["msg_loan"]),
+                           int(thp["pend_loan"]), int(thp["pi_loan"]),
+                           int(thp["policy"]),
+                           # rr_ticks shares its storage with the sporadic
+                           # ss_info pointer: only RR (2) and OTHER (3) have it.
+                           int(thp["schedinfo"]["rr_ticks"])
+                           if int(thp["policy"]) in (2, 3) else -1,
+                           int(reg["pc"]) & 0xffffffffffffffff,
+                           int(reg["gpr"][1]) & 0xffffffffffffffff,
+                           int(reg["gpr"][2]) & 0xffffffffffffffff,
+                           int(reg["gpr"][10]) & 0xffffffffffffffff,
+                           int(reg["gpr"][11]) & 0xffffffffffffffff,
+                           int(reg["gpr"][12]) & 0xffffffffffffffff,
+                           int(reg["gpr"][17])))
+                if st == 5:  # RECEIVE: blocked_on is the channel
                     chp = thp["blocked_on"].cast(
                         gdb.lookup_type("channel_t").pointer())
                     print("  RECV chp %s chid %d proc %s send %s rcv %s reply %s "
@@ -164,6 +229,9 @@ try:
                         if int(q) == int(first):
                             break
                 elif st == 6:  # REPLY: blocked_on is the connection
+                    reply_threads.append(thp)
+                    if int(thp["blocked_on"]) == 0:
+                        stuck_reply.append(thp)
                     cop = thp["blocked_on"].cast(
                         gdb.lookup_type("connect_t").pointer())
                     print("  REPLYWAIT thp %s cop %s scoid %d channel %s syscall 0x%x "
@@ -179,5 +247,102 @@ try:
                 print("  (detail failed: %s)" % e)
 except gdb.error as e:
     print("thread walk failed: %s" % e)
+
+# CONFIG_DEBUG_INJECT builds record every IPC write of blocked_on: print the
+# newest events and, for each thread found REPLY-blocked with a NULL blocked_on,
+# every recorded event that touched it.
+try:
+    ring = gdb.parse_and_eval("ipc_blk_ring")
+    nring = int(gdb.parse_and_eval("sizeof(ipc_blk_ring)/sizeof(ipc_blk_ring[0])"))
+    idx = int(gdb.parse_and_eval("ipc_blk_idx"))
+    def ev(e):
+        try:
+            f = e["file"].string().split("/")[-1]
+        except Exception:
+            f = "?"
+        return ("t=%d cpu%d %s:%d thp %s state %d itf 0x%x blocked_on %s" %
+                (int(e["t"]), int(e["cpu"]), f, int(e["line"]), e["thp"],
+                 int(e["state"]), int(e["itf"]), e["blocked_on"]))
+    print("=== ipc blocked_on trace: %d events, newest 40 ===" % idx)
+    for k in range(max(0, idx - 40), idx):
+        print("  #%d %s" % (k, ev(ring[k % nring])))
+    # Read the ring once and index it by thread: one pass per REPLY thread
+    # would cost a full ring of target reads each.
+    want = set(int(pt) for pt in reply_threads) | set(int(pt) for pt in stuck_reply)
+    by_thp = {}
+    if want:
+        for k in range(max(0, idx - nring), idx):
+            e = ring[k % nring]
+            if int(e["thp"]) in want:
+                by_thp.setdefault(int(e["thp"]), []).append((k, e))
+    for pt in stuck_reply:
+        print("=== trace for REPLY thread %s with NULL blocked_on ===" % pt)
+        for k, e in by_thp.get(int(pt), []):
+            print("  #%d %s" % (k, ev(e)))
+    for pt in reply_threads:
+        if pt in stuck_reply:
+            continue
+        print("=== trace for REPLY thread %s ===" % pt)
+        for k, e in by_thp.get(int(pt), []):
+            print("  #%d %s" % (k, ev(e)))
+except gdb.error as e:
+    print("ipc trace unavailable: %s" % e)
+
+# The lifecycle ring of the same threads: readies, dequeues, state changes.
+try:
+    tring = gdb.parse_and_eval("thr_ring")
+    ntr = int(gdb.parse_and_eval("sizeof(thr_ring)/sizeof(thr_ring[0])"))
+    tidx = int(gdb.parse_and_eval("thr_idx"))
+    want = set(int(pt) for pt in reply_threads)
+    by_thp = {}
+    if want:
+        for k in range(max(0, tidx - ntr), tidx):
+            e = tring[k % ntr]
+            if int(e["thp"]) in want:
+                by_thp.setdefault(int(e["thp"]), []).append((k, e))
+    for pt in reply_threads:
+        print("=== lifecycle trace for REPLY thread %s ===" % pt)
+        for k, e in by_thp.get(int(pt), []):
+            try:
+                f = e["file"].string().split("/")[-1]
+            except Exception:
+                f = "?"
+            print("  #%d t=%d cpu%d %s:%d state %d itf 0x%x ra %s" %
+                  (k, int(e["t"]), int(e["cpu"]), f, int(e["line"]),
+                   int(e["state"]), int(e["itf"]), e["ra"]))
+except gdb.error as e:
+    print("thread trace unavailable: %s" % e)
+
+# Every thread on a sync wait chain must wait on a sync object (state MUTEX,
+# CONDVAR or SEM). One that does not left the chain without being unlinked: its
+# next/prev links are reused elsewhere, and a later waker can ready or hand a
+# message to a thread that waits on nothing. A waiter that is still RUNNING
+# while the chain lock is held is between sync_enqueue() and the
+# unready_release() that stamps its state, a normal transition, not a leak.
+try:
+    chains = gdb.parse_and_eval("sync_chains")
+    nch = int(gdb.parse_and_eval("sizeof(sync_chains)/sizeof(sync_chains[0])"))
+    print("=== sync chains ===")
+    for ci in range(nch):
+        try:
+            t = chains[ci]["head"]
+            locked = int(chains[ci]["lock"]["owner_hart"]) != 0xff
+            n = 0
+            while int(t) != 0 and n < 256:
+                tt = t.dereference()
+                st = int(tt["state"])
+                if st not in (13, 14, 17):
+                    what = ("in flight (lock held, still RUNNING)"
+                            if locked and st == 1 else "holds")
+                    print("  chain %d %s thp %s pid %d tid %d state %d "
+                          "wait_key %#x" %
+                          (ci, what, t, int(tt["process"]["pid"]), int(tt["tid"]),
+                           st, int(tt["args"]["mu"]["wait_key"])))
+                t = tt["next"]["thread"]
+                n += 1
+        except gdb.error as e:
+            print("  chain %d walk failed: %s" % (ci, e))
+except gdb.error as e:
+    print("sync chain walk unavailable: %s" % e)
 print("DUMP COMPLETE: %d harts" % len(threads))
 end

@@ -10,6 +10,7 @@
 #ifndef __IOSERV_PRIVATE_H_INCLUDED
 #define __IOSERV_PRIVATE_H_INCLUDED
 
+#include <stddef.h>
 #include <sys/iomsg.h>
 
 typedef struct _notification io_notification_t;
@@ -68,6 +69,7 @@ typedef struct _ioserv_context {
     int status;
     int offset;
     int size;
+    void *post; /* the server's work to do once this request is replied to */
     iov_t iov[1];
 } ioserv_context_t;
 
@@ -109,8 +111,21 @@ typedef struct _ioserv_connect_ops {
 #define IOSERV_OCB_T void
 #endif
 
+/* Flags of ioserv_ops_t. */
+
+/* A lone _IO_NOTIFY (one not combined with another message) is dispatched
+ * without lock_ocb and unlock_ocb. A service whose lock refuses a busy object
+ * with EAGAIN sets it: an _IO_NOTIFY client takes EAGAIN for "armed", so poll
+ * would sleep with nothing armed, or report a busy descriptor as POLLERR, and
+ * waiting for the lock instead would stall a poll behind a blocking read. The
+ * notify handler guards what it reads with a lock of its own. A notify that is
+ * part of a combined message takes the lock as any other.
+ */
+#define IOSERV_OPS_NOTIFY_UNLOCKED 0x1
+
 typedef struct _ioserv_ops {
     unsigned nfuncs;
+    unsigned flags; /* IOSERV_OPS_*; fills the padding before the pointers */
     int (*read)(ioserv_context_t *ctp, io_read_t *msg, IOSERV_OCB_T *ocb);
     int (*write)(ioserv_context_t *ctp, io_write_t *msg, IOSERV_OCB_T *ocb);
     int (*close_ocb)(ioserv_context_t *ctp, void *reserved, IOSERV_OCB_T *ocb);
@@ -145,6 +160,12 @@ typedef struct _ioserv_ops {
 } ioserv_ops_t;
 #define IOSERV_IO_NFUNCS \
     ((sizeof(ioserv_ops_t) - sizeof(unsigned)) / sizeof(void *))
+
+/* The handlers are indexed from read, which must stay at a pointer's offset
+ * with flags in the padding before it, or IOSERV_IO_NFUNCS would count it.
+ */
+_Static_assert(offsetof(ioserv_ops_t, read) == sizeof(void *),
+               "ioserv_ops_t flags must fit in the padding after nfuncs");
 
 #define IOSERV_NOREPLY \
     ((int) (~0u ^       \

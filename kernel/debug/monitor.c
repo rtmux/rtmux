@@ -44,8 +44,11 @@ extern kspinlock_t alloc_slock, sync_slock, global_channel_slock, as_slock,
  * ipi_handler_count, ipicmds, as_prp) lives in pcpu_array[], visible via
  * core/globals.h's <arch/pcpu.h>.
  */
-extern unsigned hart_ids[];
 extern unsigned num_processors;
+/* Architectural hart ID of each logical CPU, for labels only: every per-CPU
+ * array is indexed by the logical CPU, which may differ on sparse-ID systems.
+ */
+extern unsigned hart_ids[];
 extern unsigned in_kcall[CONFIG_PROCESSORS_MAX];
 extern process_t *kernel_threads_prp;
 extern vector_t process_vector;
@@ -498,7 +501,11 @@ static void mon_dump_ghost_running(void)
              */
             bool is_idle = false;
             for (unsigned i = 0; i < num_processors; i++) {
-                if (pcpu_array[hart_ids[i]].pc_idle_thp == thp) {
+                /* Not cpu_online(): init_objects() leaves the idle thread of a
+                 * dropped or not-yet-joined CPU in STATE_RUNNING with no
+                 * pc_curthread, which would read as a ghost.
+                 */
+                if (pcpu_array[i].pc_idle_thp == thp) {
                     is_idle = true;
                     break;
                 }
@@ -509,14 +516,7 @@ static void mon_dump_ghost_running(void)
             /* Which hart (if any) actually has this thp as pc_curthread? -1 if
              * none — that's a real ghost.
              */
-            int owner = -1;
-            for (unsigned i = 0; i < num_processors; i++) {
-                unsigned hart = hart_ids[i];
-                if (pcpu_array[hart].pc_curthread == thp) {
-                    owner = (int) hart;
-                    break;
-                }
-            }
+            int owner = thread_active_hart(thp);
 
             if (!header_printed) {
                 mon_puts("\n  -- RUNNING threads --");
@@ -541,11 +541,11 @@ static void mon_dump_ghost_running(void)
                 mon_puts("NONE *GHOST*");
             else if ((unsigned) owner != thp->runcpu) {
                 mon_putc('h');
-                mon_put_dec((unsigned) owner);
+                mon_put_dec(hart_ids[owner]);
                 mon_puts(" *RUNCPU-MISMATCH*");
             } else {
                 mon_putc('h');
-                mon_put_dec((unsigned) owner);
+                mon_put_dec(hart_ids[owner]);
             }
         }
     }
@@ -776,13 +776,16 @@ void __attribute__((noreturn)) monitor_loop(void)
             mon_putc(' ');
         }
 
-        /* Per-CPU sched locks: one char per active hart in hart_ids[] order (L
-         * = held, u = unlocked).
+        /* Per-CPU sched locks: one char per logical CPU in index order (L =
+         * held, u = unlocked, - = offline).
          */
         mon_puts("sched=");
-        for (unsigned i = 0; i < num_processors; i++) {
-            unsigned hart = hart_ids[i];
-            struct dispatch_entry *dpp = pcpu_array[hart].pc_dispatch;
+        for (unsigned cpu = 0; cpu < num_processors; cpu++) {
+            struct dispatch_entry *dpp = pcpu_array[cpu].pc_dispatch;
+            if (!cpu_online(cpu)) {
+                mon_putc('-');
+                continue;
+            }
             if (!dpp) {
                 mon_putc('?');
                 continue;
@@ -799,10 +802,17 @@ void __attribute__((noreturn)) monitor_loop(void)
          * stuck kernel extension.
          */
         for (unsigned i = 0; i < num_processors; i++) {
-            unsigned hart = hart_ids[i];
-            thread_t *thp = get_active_thread(hart);
+            unsigned hart = i;
+            thread_t *thp;
+
+            if (!cpu_online(hart))
+                continue;
+            thp = get_active_thread(hart);
+            /* The label names the architectural hart; the index stays logical
+             * for every per-CPU access below.
+             */
             mon_puts(" h");
-            mon_put_dec(hart);
+            mon_put_dec(hart_ids[hart]);
             mon_putc(':');
             if (!thp)
                 mon_puts("NULL");

@@ -93,6 +93,15 @@ static int null_devctl(ioserv_context_t *ctp, io_devctl_t *msg, void *ocb)
     return EOK;
 }
 
+/* _IO_NOTIFY: reads and writes never block, so input and output are always
+ * ready. /dev/zero shares this.
+ */
+int devnull_notify(ioserv_context_t *ctp, io_notify_t *msg, void *ocb)
+{
+    (void) ocb;
+    return ioserv_notify_ready(ctp, msg, 0);
+}
+
 static int null_openfd(ioserv_context_t *ctp, io_openfd_t *msg, void *ocb)
 {
     uintptr_t source = (uintptr_t) ocb;
@@ -113,6 +122,7 @@ static const ioserv_ops_t null_io_funcs = {
     .write = null_write,
     .stat = null_stat,
     .devctl = null_devctl,
+    .notify = devnull_notify,
     .openfd = null_openfd,
 };
 

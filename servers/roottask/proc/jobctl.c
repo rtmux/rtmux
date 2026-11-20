@@ -30,19 +30,7 @@
      RTMUX_FLG_PROC_WAITINFO | RTMUX_FLG_PROC_WAITDONE | \
      RTMUX_FLG_PROC_DESTROYALL)
 
-/* A consistent copy of one process's group and session state. */
-struct jc_snap {
-    pid_t pid;
-    pid_t ppid;
-    pid_t pgrp;
-    pid_t sid; /* session leader pid, 0 when there is no session */
-    pid_t fg;  /* foreground group of the session's terminal */
-    int fd;    /* roottask's descriptor to the terminal, or -1 */
-    unsigned flags;
-    channel_t *chp; /* the process's system channel */
-};
-
-static int jc_snapshot(pid_t pid, struct jc_snap *s)
+int proc_snapshot(pid_t pid, struct proc_snap *s)
 {
     root_proc_info_t qinfo;
 
@@ -52,13 +40,13 @@ static int jc_snapshot(pid_t pid, struct jc_snap *s)
         root_proc_unlock(pid);
         return ESRCH;
     }
-    s->pid = pid;
     s->ppid = qinfo.parent_pid;
-    s->pgrp = qinfo.pgrp ? qinfo.pgrp : pid;
-    s->sid = qinfo.session ? qinfo.sess_leader : 0;
+    s->pgrp = qinfo.pgrp;
+    s->sid = qinfo.sess_leader;
     s->fg = qinfo.sess_pgrp;
-    s->fd = qinfo.session ? qinfo.sess_fd : -1;
+    s->fd = qinfo.sess_fd;
     s->flags = qinfo.flags;
+    s->execed = root_proc(pid)->execed;
     s->chp = qinfo.sys_chp;
     root_proc_unlock(pid);
     return EOK;
@@ -82,13 +70,13 @@ static int jc_orphaned(pid_t pgrp, pid_t sid)
 {
     for (unsigned i = 0; i < ROOT_PROCESS_MAX; i++) {
         pid_t pid = root_process[i].pid;
-        struct jc_snap m, p;
+        struct proc_snap m, p;
 
-        if (pid == 0 || jc_snapshot(pid, &m) != EOK)
+        if (pid == 0 || proc_snapshot(pid, &m) != EOK)
             continue;
         if (m.pgrp != pgrp || m.sid != sid || (m.flags & JC_DEAD))
             continue;
-        if (m.ppid > 0 && jc_snapshot(m.ppid, &p) == EOK && p.sid == sid &&
+        if (m.ppid > 0 && proc_snapshot(m.ppid, &p) == EOK && p.sid == sid &&
             p.pgrp != pgrp && !(p.flags & JC_DEAD))
             return 0;
     }
@@ -115,10 +103,10 @@ static int jc_signal_group(pid_t pgrp, pid_t sid, int signo, pid_t sender)
 
     for (unsigned i = 0; i < ROOT_PROCESS_MAX; i++) {
         pid_t pid = root_process[i].pid;
-        struct jc_snap m;
+        struct proc_snap m;
 
         if (pid == 0 || pid == ROOTTASK_PID || root_proc(pid)->system ||
-            jc_snapshot(pid, &m) != EOK)
+            proc_snapshot(pid, &m) != EOK)
             continue;
         if (m.pgrp != pgrp || m.sid != sid || (m.flags & JC_DEAD) || !m.chp)
             continue;
@@ -149,10 +137,10 @@ static int jc_signal_group(pid_t pgrp, pid_t sid, int signo, pid_t sender)
  */
 int proc_jobctl_query(pid_t server, pid_t pid, struct _proc_jobctl_reply *out)
 {
-    struct jc_snap c;
+    struct proc_snap c;
     int rc;
 
-    if ((rc = jc_snapshot(pid, &c)) != EOK)
+    if ((rc = proc_snapshot(pid, &c)) != EOK)
         return rc;
     out->pgrp = c.pgrp;
     out->sid = c.sid;
@@ -177,7 +165,7 @@ int proc_jobctl_query(pid_t server, pid_t pid, struct _proc_jobctl_reply *out)
  */
 int proc_jobctl_signal_fg(pid_t server, pid_t sid, int signo)
 {
-    struct jc_snap l;
+    struct proc_snap l;
     int n;
 
     /* Only what the termios signal characters raise. */
@@ -187,7 +175,7 @@ int proc_jobctl_signal_fg(pid_t server, pid_t sid, int signo)
     for (unsigned i = 0; i < ROOT_PROCESS_MAX; i++) {
         pid_t pid = root_process[i].pid;
 
-        if (pid == 0 || jc_snapshot(pid, &l) != EOK || l.sid != sid ||
+        if (pid == 0 || proc_snapshot(pid, &l) != EOK || l.sid != sid ||
             (l.flags & JC_DEAD) || jc_tty_server(l.fd) != server)
             continue;
 
@@ -229,28 +217,20 @@ int proc_jobctl_signal_bg(pid_t server, pid_t pid, int signo)
 int proc_jobctl_setpgrp(pid_t server, pid_t pid, pid_t pgrp)
 {
     struct _proc_jobctl_reply q;
-    struct jc_snap c;
+    struct proc_snap c;
+    pid_t gsid;
     int rc;
-    int found = 0;
 
     if (pgrp <= 0)
         return EINVAL;
-    if ((rc = jc_snapshot(pid, &c)) != EOK)
+    if ((rc = proc_snapshot(pid, &c)) != EOK)
         return rc;
     if ((rc = proc_jobctl_query(server, pid, &q)) != EOK)
         return rc;
     if (!(q.flags & _JOBCTL_CTTY))
         return ENOTTY;
 
-    for (unsigned i = 0; i < ROOT_PROCESS_MAX && !found; i++) {
-        pid_t m = root_process[i].pid;
-        struct jc_snap g;
-
-        if (m != 0 && jc_snapshot(m, &g) == EOK && g.pgrp == pgrp &&
-            g.sid == q.sid && !(g.flags & JC_DEAD))
-            found = 1;
-    }
-    if (!found)
+    if (proc_pgrp_session(pgrp, &gsid) != EOK || gsid != q.sid)
         return EPERM;
 
     if (!(q.flags & _JOBCTL_FG) && !(c.flags & RTMUX_FLG_PROC_LOADING) &&
@@ -262,19 +242,30 @@ int proc_jobctl_setpgrp(pid_t server, pid_t pid, pid_t pgrp)
     }
 
     /* Record the new foreground group on the session; every member shares it.
-     * Members read it under their own lock, so take the client's.
+     * The group was checked against the session before the signal above could
+     * be sent, and either may have changed since (the group's last member left
+     * for a session of its own, or the client did): check again, and record,
+     * with pgrp_mutex held, which every such change takes. Members read it
+     * under their own lock, so take the client's.
      */
-    if (!root_proc_lock(pid))
+    proc_pgrp_lock();
+    if (!root_proc_lock(pid)) {
+        proc_pgrp_unlock();
         return ESRCH;
+    }
     {
         root_process_t *tmp = root_proc(pid);
 
-        if (tmp->session && tmp->session->fd >= 0)
-            tmp->session->pgrp = pgrp;
-        else
+        if (!tmp->session || tmp->session->fd < 0 ||
+            root_session_leader(tmp) != q.sid)
             rc = ENOTTY;
+        else if (proc_pgrp_session(pgrp, &gsid) != EOK || gsid != q.sid)
+            rc = EPERM;
+        else
+            tmp->session->pgrp = pgrp;
     }
     root_proc_unlock(pid);
+    proc_pgrp_unlock();
     return rc;
 }
 
@@ -286,9 +277,9 @@ int proc_jobctl_tty_busy(pid_t server, pid_t sid)
 {
     for (unsigned i = 0; i < ROOT_PROCESS_MAX; i++) {
         pid_t pid = root_process[i].pid;
-        struct jc_snap m;
+        struct proc_snap m;
 
-        if (pid != 0 && jc_snapshot(pid, &m) == EOK && m.sid != 0 &&
+        if (pid != 0 && proc_snapshot(pid, &m) == EOK && m.sid != 0 &&
             m.sid != sid && !(m.flags & JC_DEAD) && m.fd >= 0 &&
             jc_tty_server(m.fd) == server)
             return 1;
@@ -299,10 +290,10 @@ int proc_jobctl_tty_busy(pid_t server, pid_t sid)
 /* Tell the parent a child stopped or continued: SIGCHLD, as for an exit. */
 static void jc_notify_parent(pid_t pid)
 {
-    struct jc_snap c, p;
+    struct proc_snap c, p;
 
-    if (jc_snapshot(pid, &c) != EOK || c.ppid <= 0 ||
-        jc_snapshot(c.ppid, &p) != EOK || !p.chp || (p.flags & JC_DEAD))
+    if (proc_snapshot(pid, &c) != EOK || c.ppid <= 0 ||
+        proc_snapshot(c.ppid, &p) != EOK || !p.chp || (p.flags & JC_DEAD))
         return;
     if (root_proc_lock(c.ppid)) {
         root_proc_info_t qinfo;
@@ -395,6 +386,11 @@ int proc_msg_jobctl(ioserv_context_t *ctp, proc_jobctl_t *msg)
 
     case _PROC_JOBCTL_SETPGRP:
         return proc_jobctl_setpgrp(caller, pid, arg);
+
+#ifdef CONFIG_DEBUG_INJECT
+    case _PROC_JOBCTL_DEBUG:
+        return proc_pgrp_window_arm((unsigned) arg, (unsigned) arg2);
+#endif
 
     default:
         return ENOSYS;

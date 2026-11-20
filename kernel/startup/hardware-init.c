@@ -6,6 +6,7 @@
  */
 
 #include <startup.h>
+#include <asm/boot-stack.h>
 #include <startup-api.h>
 #include <rtmux-version.h>
 
@@ -103,8 +104,8 @@ int hardware_init(int argc, char **argv, char **envv)
         LOGF_W("kopt.timebase_freq = 0\n");
     }
 
-    /* Claim the RAM used by kernel + startup stack (16KB above _end) */
-    alloc_ram((paddr_t) _start, (paddr_t) (_end - _start) + 0x4000, 1);
+    /* Claim the RAM used by kernel + startup stack (above _end) */
+    alloc_ram((paddr_t) _start, (paddr_t) (_end - _start) + BOOT_STACK_SIZE, 1);
     if (initramfs_phys_start)
         alloc_ram(initramfs_phys_start,
                   initramfs_phys_end - initramfs_phys_start, 1);

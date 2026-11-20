@@ -109,12 +109,14 @@ static size_t synth_kstats(char *buf, size_t cap)
     unsigned live_timeouts = 0;
     uint64_t timer_intr[CONFIG_PROCESSORS_MAX];
     unsigned timer_count = 0;
+    uint64_t prio_reply_overflow = 0;
+    unsigned prio_reply_depth = 0;
     size_t len = 0;
     int n, rc; /* n: snprintf result; rc: soul_stats status */
 
     rc = soul_stats(recs, KSTAT_SOUL_COUNT, &count, &live_threads,
                     &live_timeouts, timer_intr, CONFIG_PROCESSORS_MAX,
-                    &timer_count);
+                    &timer_count, &prio_reply_overflow, &prio_reply_depth);
     if (rc != EOK) {
         /* Say so rather than return a file that looks healthy but has no pool
          * gauges.
@@ -132,16 +134,23 @@ static size_t synth_kstats(char *buf, size_t cap)
         len += (size_t) n;
     }
     if (len < cap) {
-        n = snprintf(buf + len, cap - len, "thread.live=%u\ntimeout.live=%u\n",
-                     live_threads, live_timeouts);
+        n = snprintf(buf + len, cap - len,
+                     "thread.live=%u\ntimeout.live=%u\n"
+                     "prio.reply_depth=%u\nprio.reply_depth_overflow=%llu\n",
+                     live_threads, live_timeouts, prio_reply_depth,
+                     (unsigned long long) prio_reply_overflow);
         if (n > 0 && (size_t) n < cap - len)
             len += (size_t) n;
     }
     if (len < cap) {
+        struct roottask_heap_stats hs;
+
+        roottask_heap_stats(&hs);
         n = snprintf(buf + len, cap - len,
-                     "pa.free_bytes=%llu\nroottask.heap_used=%zu\n",
-                     (unsigned long long) pa_free_size(),
-                     roottask_heap_in_use());
+                     "pa.free_bytes=%llu\nroottask.heap_used=%zu\n"
+                     "roottask.heap_size=%zu\nroottask.heap_largest=%zu\n",
+                     (unsigned long long) pa_free_size(), hs.used, hs.arena,
+                     hs.largest);
         if (n > 0 && (size_t) n < cap - len)
             len += (size_t) n;
     }

@@ -213,15 +213,6 @@
     (((flags) & (PTHREAD_CANCEL_DISABLE | PTHREAD_CANCEL_PENDING)) == \
      PTHREAD_CANCEL_PENDING)
 
-/* Safe TLS flags access: the thread's TLS may be in user address space, which
- * is not accessible from S-mode when the kernel SATP is active. Only
- * dereference TLS if it's in kernel space.
- */
-#define TLS_FLAGS_SAFE(thp)                              \
-    (((uintptr_t) (thp)->un.lcl.tls >= KERNEL_VIRT_BASE) \
-         ? (thp)->un.lcl.tls->__flags                    \
-         : 0)
-
 /* Thread-state bit sets */
 
 #define STATE_CANCEL_BITS                                                \
@@ -510,6 +501,38 @@ static __inline__ void __attribute__((__unused__)) atomic_boundary()
 #define XFER_SRC_FAULT 0x01
 #define XFER_DST_FAULT 0x02
 
+/* Maximum number of iov entries in one message vector */
+#define XFER_IOV_LIMIT ((4 * 1024 * 1024) / 8)
+
+/* Entries xfer_iov_check() examines in one kernel entry */
+#define XFER_IOV_CHECK_STEP 512
+
+/* Work one bounded msg_readv / msg_writev kernel entry may do (xfermsg) before
+ * it saves its cursor and restarts the call: iov entries stepped over, and
+ * bytes copied.
+ */
+#define XFER_STEP_ENTRIES 128
+#define XFER_STEP_BYTES (8 * 1024)
+
+/* Send, receive and reply rescan both vectors before the copy on every restart,
+ * so a message of more entries than this is copied in one piece, as before: the
+ * rescans would cost more than the steps save.
+ */
+#define XFER_STEP_PARTS_MAX 4096
+
+/* xferiov stopped at its work budget; map_xfer stopped skipping iov entries */
+#define XFER_YIELD 0x04
+#define XFER_MAP_YIELD (-2)
+
+/* msg_readv or msg_writev has arranged for the kernel call to run again: the
+ * iov check or the copy used up its step. Returned by the call bodies, and by
+ * xfermsg_bounded() as XFER_RESTART, after the cursor is saved. It must differ
+ * from ENOERROR (-1), which a body returns when the call is over: the wrappers
+ * drop the saved resume state for that and keep it for this.
+ */
+#define XFER_CALL_RESTART (-3)
+#define XFER_RESTART 0x08
+
 #define XFER_SRC_CHECK 0x01
 #define XFER_DST_CHECK 0x02
 
@@ -555,6 +578,14 @@ static __inline__ void __attribute__((__unused__)) atomic_boundary()
  */
 #define RTMUX_ITF_EXIT_READIED 0x200U
 
+/* SchedSet on the caller itself sets DEFER_DISPLACE so adjust_priority only
+ * records the change, sets YIELD_TAIL and posts RTMUX_ATF_SMP_RESCHED;
+ * resched() at kernel_exit switches after the trap handler stores the status.
+ * Both bits are owned by the thread itself.
+ */
+#define RTMUX_ITF_DEFER_DISPLACE 0x400U
+#define RTMUX_ITF_YIELD_TAIL 0x800U
+
 /* internal_flags is a single 32-bit word whose bits are written from MULTIPLE
  * CPUs concurrently. A thread sets/clears its OWN WAIT_PENDING /
  * RCVNOTIFICATION / SPECRET_PENDING bits (e.g. ksys_msg_receivev clearing
@@ -593,7 +624,21 @@ static __inline__ void __attribute__((__unused__)) atomic_boundary()
 
 /* xfer handler accessors */
 
+#ifdef CONFIG_DEBUG_INJECT
+/* Debug builds remember who armed or cleared the handler last, so a handler
+ * left armed when a kcall returns can be named (xfer_handler_check_exit).
+ */
+void xfer_handler_trace(const char *file, int line, const void *handler);
+void xfer_handler_check_exit(void);
+#define SET_XFER_HANDLER(handler)                                         \
+    do {                                                                  \
+        xfer_handler_trace(__FILE__, __LINE__, (const void *) (handler)); \
+        get_pcpu()->pc_xfer_handlers = (handler);                         \
+    } while (0)
+#else
 #define SET_XFER_HANDLER(handler) get_pcpu()->pc_xfer_handlers = handler
+#define xfer_handler_check_exit() ((void) 0)
+#endif
 #define GET_XFER_HANDLER() (get_pcpu()->pc_xfer_handlers)
 
 /* The xfer fault-recovery longjmp target. Like the handler table above, this
@@ -602,9 +647,9 @@ static __inline__ void __attribute__((__unused__)) atomic_boundary()
  * clobbered by a concurrent xfer on another hart, and the faulting hart would
  * longjmp into a foreign/stale stack frame -> XFER kernel crash.
  *
- * Kept as a hart-indexed array (xfer_env[], in core.c) rather than a pcpu
- * field: struct pcpu is held at a power-of-2 size for the AP boot asm and has
- * no spare slot. Same pattern as the per-CPU trace rings.
+ * Kept as a CPU-indexed array (xfer_env[], in core.c) rather than a pcpu field:
+ * struct pcpu is held at a power-of-2 size for the AP boot asm and has no spare
+ * slot. Same pattern as the per-CPU trace rings.
  */
 #define SET_XFER_ENV(env) (xfer_env[get_cpunum()] = (env))
 #define GET_XFER_ENV() (xfer_env[get_cpunum()])

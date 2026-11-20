@@ -37,11 +37,18 @@ int pthread_mutex_init(pthread_mutex_t *mutex, const pthread_mutexattr_t *attr)
      * RECURSIVE mutex recurses like any other recursive mutex.
      */
     long count = mutex->count &
-                 ~(long) (RTMUX_SYNC_NONRECURSIVE | RTMUX_SYNC_NOERRORCHECK);
+                 ~(long) (RTMUX_SYNC_NONRECURSIVE | RTMUX_SYNC_NOERRORCHECK |
+                          RTMUX_SYNC_ROBUST | RTMUX_SYNC_INCONSISTENT);
     if (!(attr && (attr->flags & PTHREAD_RECURSIVE_ENABLE)))
         count |= (long) RTMUX_SYNC_NONRECURSIVE;
     if (attr && (attr->flags & PTHREAD_ERRORCHECK_DISABLE))
         count |= (long) RTMUX_SYNC_NOERRORCHECK;
+
+    /* A robust mutex always enters the kernel to lock and unlock, so that the
+     * kernel knows its holder (see ksys_sync_mutex_lock).
+     */
+    if (attr && (attr->flags & PTHREAD_ROBUST_MASK))
+        count |= (long) RTMUX_SYNC_ROBUST;
     mutex->count = count;
     return EOK;
 }

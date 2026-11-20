@@ -8,9 +8,12 @@ include ../../mk/def.mk
 include ../../mk/recurse.mk
 include ../../userland/lib/common.mk
 
-SRCS = main.c timers.c sync.c printf-test.c setjmp-test.c signals-test.c \
+SRCS = main.c timers.c sync.c prio-loan.c printf-test.c setjmp-test.c signals-test.c time-test.c \
+       strftime-test.c \
        notifications.c vfs.c posix-options.c capgate.c trace-negative.c \
-       user-ptr-negative.c serial-unblock.c leak.c native-io-boundaries.c
+       user-ptr-negative.c serial-unblock.c leak.c native-io-boundaries.c \
+       qsort-test.c report.c getopt-test.c env-test.c sysconf-test.c malloc-stats-test.c \
+       pte-partial.c pgrp-races.c
 OBJS = $(SRCS:%.c=$(OBJDIR)/%.o)
 # Single-file helper programs built by the rules below, outside the main binary.
 PROBE_OBJS = $(addprefix $(OBJDIR)/, crypttest.o setuid-probe.o preload-probe.o \
@@ -115,6 +118,7 @@ INSTALL_BIN = syscall_testing \
               rt-latency/lkl-contain-test \
               rt-latency/lkl-runmask \
               rt-latency/lkl-backpressure-test \
+              rt-latency/lkl-netd-poll-test \
               rt-latency/lkl-iommu-probe \
               rt-latency/rcu-lookup-measure \
               rt-latency/revoke-stress \
@@ -151,6 +155,9 @@ install: all
 	$(Q)cp $(PRELOAD_PROBE) $(INITRAMFS_DIR)/lib/preload-probe.so
 	$(Q)$(STRIP) --strip-unneeded $(INITRAMFS_DIR)/lib/preload-probe.so
 	$(Q)cp sh-posix/test.sh $(INITRAMFS_DIR)/bin/sh-posix-test
+	$(Q)cp sh-posix/quote-run.sh $(INITRAMFS_DIR)/bin/sh-posix-quote-run
+	$(Q)cp sh-posix/quote-cases.dat $(INITRAMFS_DIR)/bin/sh-posix-quote-cases
+	$(Q)cp sh-posix/gaps.sh $(INITRAMFS_DIR)/bin/sh-posix-gaps
 	$(Q)cp toolbox/test.sh $(INITRAMFS_DIR)/bin/toolbox-test
 
 clean: $(RT_LATENCY_CLEAN) $(LOCK_RANK_STRESS_CLEAN) $(NAMESPACE_ROUNDTRIP_CLEAN)

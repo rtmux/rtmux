@@ -13,7 +13,7 @@
  *
  *     get_pcpu()       =  mv  reg, tp                  (0 loads)
  *     get_curthread()  =  ld  reg, 0(tp)               (1 load, offset 0)
- *     get_cpunum()     =  lw  reg, PC_HART(tp)         (1 load)
+ *     get_cpunum()     =  lw  reg, PC_CPU(tp)          (1 load)
  *
  * Compare to the old TLS chain "tp -> TLS.__reserved2[0] -> cpupage->cpu",
  * which costs 2 loads per get_cpunum(). More importantly, the TLS chain stamps
@@ -24,22 +24,26 @@
  * Field-order contract:
  *   "pc_curthread" MUST be at offset 0 so code that does "ld reg, 0(tp)" to
  *   get the current thread remains one instruction.
- *   "pc_hart" is read by get_cpunum() — its offset is exposed via the
- *   PC_HART macro for use in inline asm.
+ *   "pc_cpu" is read by get_cpunum() — its offset is exposed via the PC_CPU
+ *   macro for use in inline asm.
  *
- * Hart-ID namespace: pc_hart is the architectural hart ID (the value
- * platform/SBI assigns to this CPU). Per CLAUDE.md "CPU identification — hart
- * IDs everywhere", RTMux does NOT use a separate contiguous CPU index; pc_hart
- * IS the canonical identifier and equals get_cpunum().
+ * CPU namespace: pc_cpu is the logical CPU number, a dense index in
+ * 0..num_processors-1 with the boot hart at 0. Every per-CPU array, mask and
+ * runmask bit is indexed by it. The architectural hart ID (the value the
+ * platform and SBI use) is hart_ids[cpu], read-only after boot; only SBI calls,
+ * the PLIC context table and the FDT need it. A hart ID can be
+ * sparse or large (an FU740 boots on hart 1..4; a board may number harts in
+ * the thousands), so nothing is indexed by it.
  *
- * Cross-hart access: a hart looking at another hart's per-CPU state uses
- * "pcpu_array[remote_hart].field". Self-hart access dereferences tp directly.
+ * Cross-hart access: a hart looking at another CPU's per-CPU state uses
+ * "pcpu_array[cpu].field". Self access dereferences tp directly.
  *
  * Storage: one "struct pcpu" per slot in "pcpu_array[PROCESSORS_MAX]", defined
- * in kernel/core/globals.c. The boot CPU writes its pc_hart at startup_entry;
- * each AP writes its pc_hart at AP bootstrap; from then on the struct is
- * hart-local except for the cross-hart fields (pc_ipicmds, pc_alive) which are
- * written by remote senders.
+ * in kernel/core/globals.c. startup_entry stamps slot 0 for the boot hart and
+ * syspage_init the others before any AP starts; from then on the struct is
+ * CPU-local except for the cross-CPU fields: pc_ipicmds and
+ * pc_ipi_refused are written by remote senders, and pc_alive is published by
+ * the CPU it describes (cpu_idle) and read by its peers.
  *
  * Required prior includes:
  *   <inttypes.h>           (uint32_t, uint64_t, uintptr_t)
@@ -66,7 +70,7 @@
  * compile time.
  */
 #define PC_CURTHREAD 0
-#define PC_HART 8
+#define PC_CPU 8
 
 #ifndef __ASSEMBLY__
 
@@ -86,7 +90,7 @@ struct pcpu {
      * pc_curthread MUST be offset 0. Don't reorder.
      */
     struct thread_entry *pc_curthread; /* offset 0  — current thread */
-    unsigned pc_hart;                  /* offset 8  — get_cpunum() */
+    unsigned pc_cpu;                   /* offset 8  — get_cpunum() */
     unsigned pc_in_kcall;            /* offset 12 — was in_kcall[] */
     unsigned pc_reserved16;            /* offset 16, reserved (was preempt_count,
                                           primitive removed; kept as a slot so the
@@ -152,14 +156,15 @@ struct pcpu {
      * by one tick. Cross-hart rule: single writer, any reader.
      */
     atomic_ulong pc_timer_progress;
-    uint8_t pc_pad[72];         /* keep sizeof(struct pcpu) power-of-two */
+    atomic_uint pc_ipi_refused; /* IPIs sent to this CPU after it was dropped */
+    uint8_t pc_pad[68];         /* keep sizeof(struct pcpu) power-of-two */
 };
 
 #ifndef __cplusplus
 _Static_assert(offsetof(struct pcpu, pc_curthread) == PC_CURTHREAD,
                "pc_curthread must be at offset 0");
-_Static_assert(offsetof(struct pcpu, pc_hart) == PC_HART,
-               "pc_hart offset mismatch — update PC_HART macro");
+_Static_assert(offsetof(struct pcpu, pc_cpu) == PC_CPU,
+               "pc_cpu offset mismatch — update PC_CPU macro");
 _Static_assert(offsetof(struct pcpu, pc_rcu_qs) >= 64,
                "RCU-sched fields must not share the first pcpu cache line");
 _Static_assert(offsetof(struct pcpu, pc_rcu_waiting) < 128,
@@ -173,13 +178,13 @@ _Static_assert((sizeof(struct pcpu) & (sizeof(struct pcpu) - 1)) == 0,
                "sizeof(struct pcpu) must be a power of 2 for AP boot asm");
 #endif
 
-/* Storage: one slot per hart, indexed by hart ID. Definition lives in
+/* Storage: one slot per logical CPU, indexed by get_cpunum(). Definition lives in
  * kernel/core/globals.c. Allocated with PROCESSORS_MAX slots even though only
  * num_processors are live — the unused slots are zero (BSS) and unreferenced.
  *
  * Use:
  *   - self-hart:   get_pcpu()               (reads tp, no chain)
- *   - cross-hart:  &pcpu_array[remote_hart]
+ *   - cross-hart:  &pcpu_array[remote_cpu]  (logical CPU, not hart_ids[])
  *
  * The get_pcpu() accessor is defined in <arch/runtime.h>.
  */

@@ -44,7 +44,7 @@ LKL_EXT4_IMG = $(IMAGE_DIR)/lkl-ext4.img
 .PHONY: check-boot-manifest check-loader-negative verify
 .PHONY: check-evidence-claims check-fault-recovery check-platform-boundary-contracts
 .PHONY: check-fu740-smoke-scripts check-make-target-names check-ci-coverage check-lkl-scripts
-.PHONY: check-header-deps check-gap-anchors check-rt-extra check-irq-modes check-hart-watchdog
+.PHONY: check-header-deps check-gap-anchors check-rt-extra check-irq-modes check-hart-watchdog check-smp-bringup
 .PHONY: check-guest-misc check-trace-modes check-leak-gate check-version-skew check-spawn-storm
 .PHONY: footprint-report check-lkl check-lkl-containment check-lkl-iommu-preflight check-lkl-iommu-live check-lkl-qemu check-lkl-differential check-lkl-trace check-trace-export check-trace-overhead
 .PHONY: check-qemu-deps check-lkl-differential-deps check-map-phys-inventory check-rcu-sched driver-gate indent check-indent check-style-deps
@@ -261,6 +261,8 @@ LKL_QEMU_MODES = \
     lkl-netd-crash:180 \
     lkl-netd-revoke:180 \
     lkl-netd-stale:180 \
+    lkl-netd-poll:300 \
+    lkl-netd-poll-spent:300 \
     lkl-netd-http:300 \
     lkl-fsd-restart:180 \
     lkl-fsd-tree-split:180 \
@@ -309,7 +311,7 @@ check: check-posix-matrix-options check-pse51 check-posix-profile-header
 check: check-posix-profile-config check-posix-profile-surface check-lkl-profile
 check: check-syscall-abi check-libc-abi check-make-target-names check-trace-export check-rt-budgets check-irq-contract
 check: check-platform-boundary-contracts
-check: check-lock-rank check-preempt-inventory check-loader-negative check-fu740-smoke-scripts
+check: check-lock-rank check-prio-writes check-preempt-inventory check-loader-negative check-fu740-smoke-scripts
 check: driver-gate $(LKL_CHECK_DEP) check-emu-headless check-rt check-qemu-deps
 check: $(AUTOCONF_H) $(VER_FILE) startup initramfs
 ifeq ($(CONFIG_LKL_SERVERS),y)
@@ -739,9 +741,13 @@ check-rt: check-rcu-sched check-rt-budgets check-qemu-deps $(AUTOCONF_H) $(VER_F
 RT_EXTRA_MODES = ipc-priority-donation ipc-roundtrip logger-restart monotonic-time \
                  mutex-uncontended mutex-wake rr-fairness sporadic-budget tickless-idle \
                  preempt-latency ipc-contention rcu-lookup-measure revoke-stress
-IRQ_MODES = irq-notify irq-notify-suppress fdt-cpu-status
+IRQ_MODES = irq-notify irq-notify-suppress fdt-cpu-status fdt-reserved-memory
 HART_WATCHDOG_MODES = debug-inject hart-watchdog hart-watchdog-console \
                       hart-watchdog-idle roottask-wait-watch
+# Secondary-hart bring-up: a failed or late start, sparse hart IDs, and more
+# harts than PROCESSORS_MAX.
+SMP_BRINGUP_MODES = smp-hart-start-fail smp-hart-start-late smp-ap-crash-early \
+                    smp-sparse-harts smp-too-many-harts
 GUEST_MISC_MODES = posix-cap-boundary sh-posix serial-unblock trace-negative syslog-wrap \
                    shutdown-sync-wedge
 # Each rebuilds the kernel with instrumentation, so they are slower than the others.
@@ -768,6 +774,10 @@ check-hart-watchdog: check-qemu-deps $(AUTOCONF_H) $(VER_FILE) startup initramfs
 	$(msg) CHECK "stall detector and hart watchdog modes"
 	$(call run-qemu-modes,$(HART_WATCHDOG_MODES),$(QEMU_BOOT_TIMEOUT))
 
+check-smp-bringup: check-qemu-deps $(AUTOCONF_H) $(VER_FILE) startup initramfs
+	$(msg) CHECK "secondary-hart bring-up modes"
+	$(call run-qemu-modes,$(SMP_BRINGUP_MODES),$(QEMU_BOOT_TIMEOUT))
+
 check-guest-misc: check-qemu-deps $(AUTOCONF_H) $(VER_FILE) startup initramfs
 	$(msg) CHECK "capability, shell, serial and trace guest modes"
 	$(call run-qemu-modes,$(GUEST_MISC_MODES),$(QEMU_BOOT_TIMEOUT))
@@ -779,13 +789,20 @@ check-trace-modes: check-qemu-deps $(AUTOCONF_H) $(VER_FILE) startup initramfs
 # 8 threads x 100 concurrent posix_spawn, on 4 harts and on 2. This storm exposed two
 # SMP defects (ready-queue corruption and an exit-path hang). Each
 # boot takes about 100 s on 4 harts and over 200 s on 2 on a loaded host.
+# SPAWN_STORM_PROCS=N keeps N idle processes alive across the storm on an
+# instrumented kernel and prints the per-boot teardown cost (pshut) and longest
+# interrupts-off window (irqoff), so teardown can be compared across N.
 SPAWN_STORM_REPEAT ?= 5
+SPAWN_STORM_PROCS ?=
+SPAWN_STORM_ARGS = $(if $(SPAWN_STORM_PROCS),--procs $(SPAWN_STORM_PROCS))
 check-spawn-storm: check-qemu-deps $(AUTOCONF_H) $(VER_FILE) startup initramfs
 	$(msg) CHECK "concurrent spawn storm ($(SPAWN_STORM_REPEAT) boots on 4 harts, 2 on 2)"
 	$(Q)rc=0; \
 	CPUS=4 ./scripts/qemu-regress.sh --mode spawn-storm --repeat $(SPAWN_STORM_REPEAT) \
+	    $(SPAWN_STORM_ARGS) \
 	    --timeout 600 || { echo "  FAILED   spawn-storm (4 harts)"; rc=1; }; \
 	CPUS=2 ./scripts/qemu-regress.sh --mode spawn-storm --repeat 2 --timeout 600 \
+	    $(SPAWN_STORM_ARGS) \
 	    || { echo "  FAILED   spawn-storm (2 harts)"; rc=1; }; \
 	exit $$rc
 
@@ -890,6 +907,7 @@ check-libc-abi: libc
 	$(msg) CHECK "libc.so export surface"
 	$(Q)$(PYTHON) scripts/check-libc-abi.py --self-test
 	$(Q)$(PYTHON) scripts/check-libc-abi.py --readelf "$(READELF)" --so "$(LIBC_SO)"
+	$(Q)$(PYTHON) scripts/check-sysconf-names.py
 
 check-rt-budgets:
 	$(msg) CHECK docs/rt-budgets.md
@@ -920,6 +938,13 @@ check-lock-rank:
 	$(msg) CHECK static lock-rank acquisition order
 	$(Q)$(PYTHON) scripts/check-lock-rank.py
 .PHONY: check-lock-rank
+
+# Base vs lent priority: only kernel/include/thread-prio.h writes a thread's
+# base (real_priority) or its loans. Static text check, no build needed.
+check-prio-writes:
+	$(msg) CHECK base and loan priority writes go through the accessors
+	$(Q)scripts/check-prio-writes.sh
+.PHONY: check-prio-writes
 
 # Preemption-checkpoint inventory: every long or unbounded loop in the
 # scheduling-critical kernel subsystems must be classified in

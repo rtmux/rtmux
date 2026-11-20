@@ -83,22 +83,13 @@ int xfer_probe(void *loc, unsigned words, int write)
     return 0;
 }
 
-/* Fault-safe atomic fetch-and-OR on a user word.
- *
- * The same recovery as xfer_probe, but the write is a single atomic RMW. A
- * plain read-back-write would clobber a concurrent owner/count update from
- * another hart (see kernel/sync/core.c), so sync_t probes must use this form,
- * and a caller that needs the word's old value gets it from the same access.
- * OR-ing 0 probes writability without changing the word. Unlike xfer_probe this
- * cannot rely on the platform to emulate a misaligned access: an AMO to a
- * misaligned address traps and is not recovered, so a misaligned address is
- * refused here. Parameters:
- *   uaddr : user address of the word
- *   bits  : bits to OR in
- *   oldp  : receives the value before the OR; may be NULL
- * Return value: 0 on success, otherwise the fault status (EFAULT)
+/* Fault-safe access to one user word: an atomic fetch-and-OR (rmw != 0) or an
+ * atomic load (rmw == 0, bits ignored). See xfer_fetch_or_user.
  */
-int xfer_fetch_or_user(volatile unsigned *uaddr, unsigned bits, unsigned *oldp)
+static int xfer_user_word(volatile unsigned *uaddr,
+                          unsigned bits,
+                          unsigned *oldp,
+                          int rmw)
 {
     void *old_handler;
     jmp_buf *old_env = NULL;
@@ -120,7 +111,8 @@ int xfer_fetch_or_user(volatile unsigned *uaddr, unsigned bits, unsigned *oldp)
         SET_XFER_HANDLER(&xfer_src_handlers);
     }
 
-    old = __atomic_fetch_or(uaddr, bits, __ATOMIC_SEQ_CST);
+    old = rmw ? __atomic_fetch_or(uaddr, bits, __ATOMIC_SEQ_CST)
+              : __atomic_load_n(uaddr, __ATOMIC_ACQUIRE);
 
     SET_XFER_HANDLER(old_handler);
     if (!old_handler)
@@ -128,6 +120,48 @@ int xfer_fetch_or_user(volatile unsigned *uaddr, unsigned bits, unsigned *oldp)
     if (oldp)
         *oldp = old;
     return 0;
+}
+
+/* Fault-safe atomic fetch-and-OR on a user word.
+ *
+ * The same recovery as xfer_probe, but the write is a single atomic RMW. A
+ * plain read-back-write would clobber a concurrent owner/count update from
+ * another hart (see kernel/sync/core.c), so sync_t probes must use this form,
+ * and a caller that needs the word's old value gets it from the same access.
+ * OR-ing 0 probes writability without changing the word. Unlike xfer_probe this
+ * cannot rely on the platform to emulate a misaligned access: an AMO to a
+ * misaligned address traps and is not recovered, so a misaligned address is
+ * refused here. Parameters:
+ *   uaddr : user address of the word
+ *   bits  : bits to OR in
+ *   oldp  : receives the value before the OR; may be NULL
+ * Return value: 0 on success, otherwise the fault status (EFAULT)
+ */
+int xfer_fetch_or_user(volatile unsigned *uaddr, unsigned bits, unsigned *oldp)
+{
+    return xfer_user_word(uaddr, bits, oldp, 1);
+}
+
+/* The thread's TLS flags word (the PTHREAD_CANCEL_* bits), or 0 when it has no
+ * TLS or the word cannot be read. A user thread's TLS is user memory: the old
+ * macro read only a TLS that sat in kernel space and so reported no pending
+ * cancel for any user thread, and a cancel that arrived while the target ran
+ * (not yet at a blocking call) was lost when it then blocked. The read is an
+ * atomic load under the fault handler, with no write to the line. thp must be
+ * the running thread, whose address space is the one in force.
+ */
+unsigned tls_flags_load(thread_t *thp)
+{
+    struct _thread_local_storage *tls = thp->un.lcl.tls;
+    unsigned flags = 0;
+
+    if (!tls)
+        return 0;
+    if ((uintptr_t) tls >= KERNEL_VIRT_BASE)
+        return tls->__flags;
+    if (xfer_user_word((volatile unsigned *) &tls->__flags, 0, &flags, 0) != 0)
+        return 0;
+    return flags;
 }
 
 int xfer_atomic_or_user(volatile unsigned *uaddr, unsigned bits)
@@ -267,6 +301,67 @@ int xfer_cpy_diov(thread_t *thpd,
         }
     }
 
+    SET_XFER_HANDLER(0);
+    return 0;
+}
+
+/* xfer_cpy_diov for a vector of many entries, a step of entries at a time: copy
+ * slen bytes of a kernel buffer into the vector at dst, from entry *idx on,
+ * with *copied bytes already placed. A vector of entries that are empty is
+ * walked by the step too, so no length of it holds the kernel for longer than
+ * XFER_STEP_ENTRIES entries. Each entry is read once, under the fault handlers.
+ *
+ * Returns 0 with *copied the bytes placed (less than slen when the vector is
+ * short), XFER_YIELD with *idx and *copied at the position to resume from, or a
+ * fault.
+ */
+int xfer_cpy_diov_step(thread_t *thpd,
+                       iov_t *dst,
+                       int dparts,
+                       const uint8_t *saddr,
+                       size_t slen,
+                       unsigned *idx,
+                       size_t *copied)
+{
+    jmp_buf env;
+    unsigned i = *idx, ents = 0;
+    size_t done = *copied;
+    int status;
+
+    SET_XFER_ENV(&env);
+    if ((status = xfer_setjmp(*GET_XFER_ENV()))) {
+        SET_XFER_HANDLER(0);
+        return status;
+    }
+    while (done < slen && i < (unsigned) dparts) {
+        char *daddr;
+        size_t dlen;
+
+        SET_XFER_HANDLER(&xfer_dst_handlers);
+        daddr = (char *) GETIOVBASE(&dst[i]);
+        dlen = GETIOVLEN(&dst[i]);
+        i++;
+        if (dlen) {
+            size_t n = min_size(dlen, slen - done);
+
+            if (!WR_PROBE_PTR(thpd, daddr, n)) {
+                SET_XFER_HANDLER(0);
+                return XFER_DST_FAULT;
+            }
+            SET_XFER_HANDLER(&xfer_src_handlers);
+            xfer_memcpy(daddr, saddr + done, n);
+            done += n;
+        }
+        if (++ents >= XFER_STEP_ENTRIES && done < slen &&
+            i < (unsigned) dparts) {
+            *idx = i;
+            *copied = done;
+            SET_XFER_HANDLER(0);
+            return XFER_YIELD;
+        }
+    }
+    *idx = i;
+    *copied = done;
     SET_XFER_HANDLER(0);
     return 0;
 }

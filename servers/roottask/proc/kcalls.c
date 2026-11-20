@@ -39,16 +39,20 @@ int process_bind(pid_t pid)
 }
 
 struct reparent_args {
-    process_t *prp;
+    pid_t pid;
 };
 
 /* process_reparent — reparent a process to pid 1 ("stay resident"). Parameters:
- *   prp : opaque kernel-VA pointer to the process being reparented
+ *   pid : the process, generation included
+ * Return value: EOK, or ESRCH when the process is gone, is being destroyed, or
+ *               is already being reparented by another call.
  */
-void process_reparent(process_t *prp)
+int process_reparent(pid_t pid)
 {
-    struct reparent_args args = {.prp = prp};
-    syscall_priv(__KSYS_PRIV_REPARENT, &args);
+    struct reparent_args args = {.pid = pid};
+    int rc = (int) syscall_priv(__KSYS_PRIV_REPARENT, &args);
+
+    return rc < 0 ? -rc : rc;
 }
 
 struct kext_destroy_args {
@@ -181,17 +185,6 @@ static process_t *process_create_locked(pid_t parent_pid,
         root_process_t *parent_tmp = root_proc(parent_pid);
         root_process_t *child_tmp = root_proc(new_pid);
         child_tmp->umask = parent_tmp->umask;
-
-        /* POSIX: a child starts in its parent's process group and session. A
-         * parent that never joined a group is its own group (pgrp 0 is unset),
-         * so its children are in group parent_pid. Each member holds one link
-         * on the session; root_process_fini drops it.
-         */
-        child_tmp->pgrp = parent_tmp->pgrp ? parent_tmp->pgrp : parent_pid;
-        if (parent_tmp->session) {
-            child_tmp->session = parent_tmp->session;
-            (void) atomic_add_value(&child_tmp->session->links, 1);
-        }
     }
 
     /* Kernel mm_mcreate has set up adp + cpu pgdir. Fill in the roottask-half
@@ -222,6 +215,10 @@ static process_t *process_create_locked(pid_t parent_pid,
 process_t *process_create(pid_t parent_pid, void *lcp, pid_t *out_pid)
 {
     process_t *prp;
+    pid_t pid = 0;
+
+    if (!out_pid)
+        out_pid = &pid;
 
     /* Held across creation so a failed as_mcreate_pid can shut the new address
      * space down; the lock is not recursive, so callers must not hold it.
@@ -229,6 +226,26 @@ process_t *process_create(pid_t parent_pid, void *lcp, pid_t *out_pid)
     proc_wlock_adp(ROOTTASK_PID);
     prp = process_create_locked(parent_pid, lcp, out_pid);
     proc_unlock_adp(ROOTTASK_PID);
+    if (prp == (void *) -1 || !prp)
+        return prp;
+
+    /* A child starts in its parent's process group and session (a process with
+     * no parent, in a group of its own): see proc_pgrp_inherit. Not under the
+     * address space lock, which a holder of pgrp_mutex or a slot lock can wait
+     * for in turn; the child's first thread is not created yet, so nothing runs
+     * in it before this is done.
+     */
+    if (proc_pgrp_inherit(*out_pid, parent_pid) != EOK) {
+        proc_wlock_adp(ROOTTASK_PID);
+        (void) process_destroy_all(*out_pid);
+        while (process_shutdown(prp, 0) == -1 && errno == EAGAIN)
+            ;
+        (void) process_destroy_call(*out_pid);
+        proc_unlock_adp(ROOTTASK_PID);
+        *out_pid = 0;
+        errno = EAGAIN;
+        return (process_t *) -1;
+    }
     return prp;
 }
 
