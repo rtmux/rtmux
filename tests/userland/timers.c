@@ -1314,11 +1314,14 @@ static void test_rlimit_as(void)
           detail);
 }
 
-/* Two threads map concurrently against one limit. Both are created (stacks
- * mapped) and parked before the usage probe, so the probe counts them and the
- * limit leaves room for exactly RLM_N chunks in total.
+/* Two threads map concurrently against one limit. A thread's stack is mapped
+ * when it first runs and unmapped after it exits, so the probe waits until
+ * both have checked in, and neither exits until both fills are over: the
+ * probe then counts both stacks, and the limit leaves room for exactly RLM_N
+ * chunks in total.
  */
 static _Atomic int rlm_start; /* 1 = limit set, go; -1 = abort */
+static _Atomic int rlm_ready, rlm_done, rlm_racers;
 
 struct rlm_racer {
     void *v[RLM_N + 1];
@@ -1330,10 +1333,14 @@ static void *rlm_race(void *arg)
     struct rlm_racer *r = arg;
     int go;
 
+    atomic_fetch_add(&rlm_ready, 1);
     while ((go = atomic_load(&rlm_start)) == 0)
         sched_yield();
     if (go > 0)
         r->n = rlm_fill(r->v, RLM_N + 1, &r->err);
+    atomic_fetch_add(&rlm_done, 1);
+    while (atomic_load(&rlm_done) < atomic_load(&rlm_racers))
+        sched_yield();
     return NULL;
 }
 
@@ -1347,8 +1354,13 @@ static void test_rlimit_as_concurrent(void)
 
     memset(r, 0, sizeof r);
     atomic_store(&rlm_start, 0);
+    atomic_store(&rlm_ready, 0);
+    atomic_store(&rlm_done, 0);
     while (made < 2 && pthread_create(&t[made], NULL, rlm_race, &r[made]) == 0)
         made++;
+    atomic_store(&rlm_racers, made);
+    while (atomic_load(&rlm_ready) < made)
+        sched_yield();
     if (made == 2)
         use = rlm_usage(RLIMIT_AS);
     if (use != RLM_FAILED && rlm_set(RLIMIT_AS, use + RLM_N * RLM_CHUNK) != 0)
