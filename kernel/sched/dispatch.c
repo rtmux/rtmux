@@ -1993,6 +1993,55 @@ static inline void ready_enqueue_client(kdispatch_t *dpp,
     LINK3_END(DISPATCH_LST(dpp, prio), &thp->link3_link, thread_t);
 }
 
+#if CONFIG_PROCESSORS_MAX > 1
+/* Make thp READY on another hart's dispatch instance. Called with no dispatch
+ * lock held: the local one is dropped first, so the hand-off never holds two
+ * and cannot deadlock against a peer doing the reverse. With kick, an idle
+ * legal hart is woken when target is busy, since a busy hart only picks from
+ * its own queue and may outrank thp.
+ */
+static void ready_on_hart(thread_t *thp,
+                          unsigned target,
+                          uint8_t prio,
+                          bool was_sendvnc,
+                          bool kick)
+{
+    kdispatch_t *target_dpp = pcpu_array[target].pc_dispatch;
+
+    SCHED_LOCK(target_dpp);
+    thp->dpp = target_dpp;
+    thp->state = STATE_READY;
+    _TRACE_TH_EMIT_STATE(thp, READY);
+    ready_enqueue_client(target_dpp, thp, prio, was_sendvnc);
+    DISPATCH_SET(target_dpp, thp);
+    SENDIPI(target, IPI_RESCHED);
+
+    /* A legal hart that has not joined yet still shows its idle thread but
+     * cannot take the IPI, so it counts as busy here.
+     */
+    if (kick && (!cpu_online(target) ||
+                 get_active_thread(target) != pcpu_array[target].pc_idle_thp))
+        kick_idle_hart(thp);
+    SCHED_UNLOCK(target_dpp);
+}
+
+/* The lowest hart thp may run on when its runmask bans this one, else -1. A
+ * thread queued on a banned hart is never picked up: idle_pick_thread and
+ * select_thread both skip it.
+ */
+static int banned_here_target(const thread_t *thp)
+{
+    unsigned legal = (unsigned) (~thp->runmask & LEGAL_CPU_BITMASK);
+    unsigned target = 0;
+
+    if (!(thp->runmask & (1u << get_cpunum())) || !legal)
+        return -1;
+    while (!(legal & (1u << target)))
+        target++;
+    return (int) target;
+}
+#endif
+
 /* ready_default takes the per-CPU dispatch lock internally around the
  * dispatch-list mutation; all callers funnel through the same lock.
  *
@@ -2056,12 +2105,21 @@ static void rdecl ready_default(thread_t *thp)
     /* If new thread is higher priority we make it active */
     act = get_active_thread(get_cpunum());
     if (!act) {
-        /* No active thread on this CPU. Enqueue as READY on MY CPU's per-CPU
-         * dispatch — I'm the idle path that'll pick it up next. If thp's
-         * runmask excludes my CPU, idle_pick_thread still finds it via the
-         * steal scan over all per-CPU dpps. One idle hart thp may run on is
-         * kicked so it can steal thp too.
+        /* Only idle harts steal from another dispatch queue, so a busy legal
+         * hart must be handed thp directly.
          */
+#if CONFIG_PROCESSORS_MAX > 1
+        {
+            int target = banned_here_target(thp);
+
+            if (target >= 0) {
+                SCHED_UNLOCK_LOCAL();
+                ready_on_hart(thp, (unsigned) target, prio, was_sendvnc, true);
+                return;
+            }
+        }
+#endif
+        /* No active thread on this CPU; its idle path can pick thp up. */
         thp->state = STATE_READY;
         _TRACE_TH_EMIT_STATE(thp, READY);
         thp->dpp = pcpu_array[get_cpunum()].pc_dispatch;
@@ -2091,37 +2149,13 @@ static void rdecl ready_default(thread_t *thp)
         /* Set the activation time, clear the consumed */
         SS_MARK_ACTIVATION(thp);
 
-        /* thp's runmask may restrict it to a subset of harts that does NOT
-         * include this CPU. Without the cross-CPU re-target below, the
-         * fall-through enqueue would use this CPU's dispatch — but a thread
-         * with this-CPU banned in its runmask can never be picked up from this
-         * CPU's queue (idle_pick_thread and select_thread both skip it),
-         * stranding it.
-         *
-         * Mirrors the cross-CPU branch below (which runs only when select_cpu
-         * finds a preemption target); this one fires whenever the readying CPU
-         * is banned, regardless of select_cpu's outcome. Pick the lowest legal
-         * hart.
+        /* Fires whenever the readying CPU is banned, regardless of what
+         * select_cpu below would pick.
          */
-        if ((thp->runmask & (1u << get_cpunum())) != 0) {
-            unsigned legal_mask =
-                (unsigned) (~thp->runmask & LEGAL_CPU_BITMASK);
-            if (legal_mask != 0) {
-                int target_cpu = 0;
-                while (((1U << target_cpu) & legal_mask) == 0)
-                    target_cpu++;
-                kdispatch_t *target_dpp = pcpu_array[target_cpu].pc_dispatch;
-                SCHED_UNLOCK_LOCAL();
-                SCHED_LOCK(target_dpp);
-                thp->dpp = target_dpp;
-                thp->state = STATE_READY;
-                _TRACE_TH_EMIT_STATE(thp, READY);
-                ready_enqueue_client(target_dpp, thp, prio, was_sendvnc);
-                DISPATCH_SET(target_dpp, thp);
-                SENDIPI((unsigned) target_cpu, IPI_RESCHED);
-                SCHED_UNLOCK(target_dpp);
-                return;
-            }
+        if ((cpu = banned_here_target(thp)) >= 0) {
+            SCHED_UNLOCK_LOCAL();
+            ready_on_hart(thp, (unsigned) cpu, prio, was_sendvnc, true);
+            return;
         }
 
         if (STATE_LAZY_RESCHED(thp) && (prio <= act->priority) &&
@@ -2162,17 +2196,8 @@ static void rdecl ready_default(thread_t *thp)
                  * there is no need to hold both, which avoids ABBA between any
                  * pair of harts.
                  */
-                kdispatch_t *target_dpp = pcpu_array[cpu].pc_dispatch;
                 SCHED_UNLOCK_LOCAL();
-                SCHED_LOCK(target_dpp);
-                thp->dpp = target_dpp;
-                thp->state = STATE_READY;
-                _TRACE_TH_EMIT_STATE(thp, READY);
-                ready_enqueue_client(target_dpp, thp, prio, was_sendvnc);
-                DISPATCH_SET(target_dpp, thp);
-
-                SENDIPI((unsigned) cpu, IPI_RESCHED);
-                SCHED_UNLOCK(target_dpp);
+                ready_on_hart(thp, (unsigned) cpu, prio, was_sendvnc, false);
                 return;
             }
 
