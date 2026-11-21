@@ -75,6 +75,7 @@ struct cpiofs_ocb {
     off_t pos;           /* current read position */
     char *prefix;        /* directory path for readdir, NULL otherwise */
     int prefix_len;
+    bool mapping; /* bound to a VM mapping connection, not a client open */
 };
 
 /* One OCB per open file or mapping, taken from the roottask heap as demand
@@ -87,15 +88,29 @@ struct cpiofs_ocb {
 #define CPIOFS_MAX_OCBS 2048
 
 static unsigned ocb_live;
+static unsigned ocb_mappings; /* of ocb_live, the ones behind VM mappings */
 static unsigned ocb_failures;
 
 static void ocb_fail_note(const char *what)
 {
     unsigned n = __atomic_add_fetch(&ocb_failures, 1, __ATOMIC_RELAXED);
 
-    if ((n & (n - 1)) == 0)
-        root_warn("cpiofs: %s (%u OCBs live, failure %u)\n", what,
-                  __atomic_load_n(&ocb_live, __ATOMIC_RELAXED), n);
+    /* Split mappings from client opens, and give the mapped-file zombie count
+     * and the cleaner's state, so the log says what holds the OCBs and, if it
+     * is zombies, why the cleaner did not free them.
+     */
+    if ((n & (n - 1)) == 0) {
+        char cleaner[160];
+
+        vm_fd_describe(cleaner, sizeof cleaner);
+        root_warn(
+            "cpiofs: %s (%u OCBs live, %u for mappings, %u mapped-file "
+            "zombies, failure %u)\n",
+            what, __atomic_load_n(&ocb_live, __ATOMIC_RELAXED),
+            __atomic_load_n(&ocb_mappings, __ATOMIC_RELAXED),
+            vm_fd_zombie_count(), n);
+        root_warn("cpiofs: mapped-file cleaner: %s\n", cleaner);
+    }
 }
 
 static struct cpiofs_ocb *ocb_alloc(void)
@@ -117,6 +132,8 @@ static struct cpiofs_ocb *ocb_alloc(void)
 
 static void ocb_free(struct cpiofs_ocb *ocb)
 {
+    if (ocb->mapping)
+        __atomic_sub_fetch(&ocb_mappings, 1, __ATOMIC_RELAXED);
     free(ocb->prefix);
     free(ocb);
     __atomic_sub_fetch(&ocb_live, 1, __ATOMIC_RELAXED);
@@ -593,6 +610,8 @@ static int cpiofs_mmap(ioserv_context_t *ctp, io_mmap_t *msg, void *handle)
     ocb->size = oldocb->size;
     ocb->mode = oldocb->mode;
     ocb->pos = 0;
+    ocb->mapping = true;
+    __atomic_add_fetch(&ocb_mappings, 1, __ATOMIC_RELAXED);
 
     if (ioserv_open_bind(ctp, ocb, 0) == -1) {
         ocb_free(ocb);
