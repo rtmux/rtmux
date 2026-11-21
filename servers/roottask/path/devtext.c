@@ -354,8 +354,11 @@ static void text_echo(const struct termios *t, int c, unsigned erased, int kill)
     } else if (t->c_lflag & ECHOE) {
         while (erased--)
             text_console_write("\b \b", 3);
-    } else if (kill && (t->c_lflag & ECHOK)) {
-        text_console_write("\r\n", 2);
+    } else if (kill) {
+        if (t->c_lflag & ECHOK)
+            text_console_write("\r\n", 2);
+    } else if (erased) {
+        text_console_write("\b", 1);
     }
 }
 
