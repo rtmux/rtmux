@@ -525,12 +525,13 @@ again:
     return 0;
 }
 
-/* Cleaner activity, for the diagnostics below: requests sent, requests folded
- * into one already queued or running, handler calls, calls that found a pass
+/* Cleaner activity, for the diagnostics below: requests sent, requests sent
+ * again past the highwater mark although one was queued, requests folded into
+ * one already queued or running, handler calls, calls that found a pass
  * running, passes that got a worker, and objects freed.
  */
-static unsigned vm_fd_sent, vm_fd_folded, vm_fd_calls, vm_fd_busy, vm_fd_passes,
-    vm_fd_freed;
+static unsigned vm_fd_sent, vm_fd_resent, vm_fd_folded, vm_fd_calls, vm_fd_busy,
+    vm_fd_passes, vm_fd_freed;
 
 /* Where the running cleanup call is, so a call that never returns shows which
  * step it is stuck in.
@@ -565,15 +566,15 @@ unsigned vm_fd_zombie_count(void)
  */
 void vm_fd_describe(char *buf, size_t len)
 {
-    snprintf(
-        buf, len,
-        "cleanup %#x stage %u open %u close %#x sent %u folded %u calls %u "
-        "busy %u passes %u freed %u",
-        VM_FD_READ(fdmem_cleanup), VM_FD_READ(vm_fd_stage),
-        VM_FD_READ(fdmem_open_lock), VM_FD_READ(fdmem_close_lock),
-        VM_FD_READ(vm_fd_sent), VM_FD_READ(vm_fd_folded),
-        VM_FD_READ(vm_fd_calls), VM_FD_READ(vm_fd_busy),
-        VM_FD_READ(vm_fd_passes), VM_FD_READ(vm_fd_freed));
+    snprintf(buf, len,
+             "cleanup %#x stage %u open %u close %#x sent %u resent %u folded "
+             "%u calls %u busy %u passes %u freed %u",
+             VM_FD_READ(fdmem_cleanup), VM_FD_READ(vm_fd_stage),
+             VM_FD_READ(fdmem_open_lock), VM_FD_READ(fdmem_close_lock),
+             VM_FD_READ(vm_fd_sent), VM_FD_READ(vm_fd_resent),
+             VM_FD_READ(vm_fd_folded), VM_FD_READ(vm_fd_calls),
+             VM_FD_READ(vm_fd_busy), VM_FD_READ(vm_fd_passes),
+             VM_FD_READ(vm_fd_freed));
 }
 
 /* Schedule a pass to clean up stale mapped-file entries.
@@ -584,10 +585,27 @@ void vm_fd_describe(char *buf, size_t len)
  */
 int vm_fd_compact(void)
 {
-    if (!(atomic_or_value(&fdmem_cleanup, MMAPFD_CLEANUP_QUEUED) &
-          (MMAPFD_CLEANUP_QUEUED | MMAPFD_CLEANUP_INPROGRESS))) {
+    unsigned old = atomic_or_value(&fdmem_cleanup, MMAPFD_CLEANUP_QUEUED);
+    int resend = 0;
+
+    /* Only the handler clears the queued flag, so a request whose notification
+     * never reached it (its sender stalled between setting the flag and
+     * sending, or the delivery was lost) used to fold every later request into
+     * nothing: under a spawn storm the list then grew until the file systems
+     * behind the mappings ran out of open handles. Past the highwater mark the
+     * cleaner is behind whatever the flag says, so send again; a pass there is
+     * forced and empties the list, which ends the extra sends.
+     */
+    if ((old & MMAPFD_CLEANUP_QUEUED) && !(old & MMAPFD_CLEANUP_INPROGRESS) &&
+        vm_fd_zombie_count() > MMAPFD_STALES_HIGHWATER)
+        resend = 1;
+    if (!(old & (MMAPFD_CLEANUP_QUEUED | MMAPFD_CLEANUP_INPROGRESS)) ||
+        resend) {
         if (msg_send_notification(ROOTTASK_COID, -1, vm_fd_code, 0) != 0) {
-            atomic_clr(&fdmem_cleanup, MMAPFD_CLEANUP_QUEUED);
+            if (!resend)
+                atomic_clr(&fdmem_cleanup, MMAPFD_CLEANUP_QUEUED);
+        } else if (resend) {
+            VM_FD_TALLY(vm_fd_resent);
         } else {
             VM_FD_TALLY(vm_fd_sent);
         }
