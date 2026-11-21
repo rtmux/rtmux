@@ -163,6 +163,15 @@ static void text_line_reset(void)
     text_line_done = 0;
 }
 
+/* Discard all pending input. Under text_input_mutex and text_mutex. */
+static void text_input_flush(void)
+{
+    text_ahead_tail = text_ahead_head;
+    text_line_reset();
+    while (root_console_getchar() >= 0)
+        ;
+}
+
 /* Armed readiness notifications (_IO_NOTIFY), under text_mutex like the ring.
  * The console raises no interrupt, so the watcher thread looks for input while
  * a poller is armed and wakes it once the ring has a character.
@@ -217,12 +226,8 @@ static int text_next(int to_ring)
             pthread_mutex_unlock(&text_mutex);
             return c;
         }
-        if (!(text_termios.c_lflag & NOFLSH)) {
-            text_ahead_tail = text_ahead_head;
-            text_line_reset();
-            while (root_console_getchar() >= 0)
-                ;
-        }
+        if (!(text_termios.c_lflag & NOFLSH))
+            text_input_flush();
         if ((text_termios.c_lflag & ECHO) && c < ' ') {
             echo[0] = '^';
             echo[1] = (char) (c + '@');
@@ -586,12 +591,18 @@ static int text_devctl(ioserv_context_t *ctp, io_devctl_t *msg, void *ocb)
     case DEVCTL_TTY_SET_ATTR_FLUSH:
         if (msg->i.nbytes < (int32_t) sizeof(struct termios))
             return EINVAL;
+        text_lock(&text_input_mutex);
         text_lock(&text_mutex);
         memcpy(&text_termios, data, sizeof(struct termios));
         ioserv_tty_hangup_wake(text_notify_lists, &text_termios);
-        if (ioserv_tty_hung_up(&text_termios))
+        if (ioserv_tty_hung_up(&text_termios)) {
             text_hangups++;
+            text_input_flush();
+        } else if ((unsigned) msg->i.devctl_cmd == DEVCTL_TTY_SET_ATTR_FLUSH) {
+            text_input_flush();
+        }
         pthread_mutex_unlock(&text_mutex);
+        pthread_mutex_unlock(&text_input_mutex);
         break;
 
     case DEVCTL_TTY_GET_PGRP:
@@ -645,10 +656,7 @@ static int text_devctl(ioserv_context_t *ctp, io_devctl_t *msg, void *ocb)
         if (data->qsel == TCIFLUSH || data->qsel == TCIOFLUSH) {
             text_lock(&text_input_mutex);
             text_lock(&text_mutex);
-            text_ahead_tail = text_ahead_head;
-            text_line_reset();
-            while (root_console_getchar() >= 0)
-                ;
+            text_input_flush();
             pthread_mutex_unlock(&text_mutex);
             pthread_mutex_unlock(&text_input_mutex);
         }
