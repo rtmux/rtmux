@@ -172,9 +172,30 @@ static void text_input_flush(void)
         ;
 }
 
+/* Whether a read would return at once: under ICANON only once a line is done
+ * or the ring holds its end (a full ring counts, or the line could never end),
+ * otherwise once anything is pending. Under text_mutex.
+ */
+static int text_input_ready(void)
+{
+    if (text_line_done)
+        return 1;
+    if (!(text_termios.c_lflag & ICANON))
+        return text_ahead_head != text_ahead_tail || text_line_len;
+    if (text_ahead_head - text_ahead_tail >= TEXT_AHEAD)
+        return 1;
+    for (unsigned i = text_ahead_tail; i != text_ahead_head; i++) {
+        int c = text_ahead[i % TEXT_AHEAD];
+
+        if (c == '\n' || (c == '\r' && (text_termios.c_iflag & ICRNL)))
+            return 1;
+    }
+    return 0;
+}
+
 /* Armed readiness notifications (_IO_NOTIFY), under text_mutex like the ring.
  * The console raises no interrupt, so the watcher thread looks for input while
- * a poller is armed and wakes it once the ring has a character.
+ * a poller is armed and wakes it once a read would return.
  */
 static ioserv_notify_t text_notify_lists[IOSERV_NOTIFY_COUNT];
 
@@ -278,7 +299,7 @@ static void *text_watcher(void *arg)
          * missed, so look again to pick the short interval for it.
          */
         armed = ioserv_notify_armed(text_notify_lists, IOSERV_NOTIFY_INPUT, 1);
-        if (armed && text_ahead_head != text_ahead_tail)
+        if (armed && text_input_ready())
             ioserv_notify_trigger(text_notify_lists, 1, IOSERV_NOTIFY_INPUT);
     }
     return NULL;
@@ -729,7 +750,6 @@ static int text_notify(ioserv_context_t *ctp, io_notify_t *msg, void *ocb)
 
     (void) ocb;
     if ((msg->i.flags & (unsigned) _NOTIFY_COND_INPUT) &&
-        text_ahead_head == text_ahead_tail &&
         pthread_mutex_trylock(&text_input_mutex) == EOK) {
         (void) text_next(1);
         pthread_mutex_unlock(&text_input_mutex);
@@ -737,7 +757,7 @@ static int text_notify(ioserv_context_t *ctp, io_notify_t *msg, void *ocb)
     text_lock(&text_mutex);
     if (ioserv_tty_hung_up(&text_termios)) /* POLLHUP, never writable */
         trig = 0;
-    else if (text_ahead_head != text_ahead_tail || text_line_done)
+    else if (text_input_ready())
         trig |= _NOTIFY_COND_INPUT;
     ret = ioserv_notify(ctp, msg, text_notify_lists, trig,
                         ioserv_tty_hup(&text_termios), NULL);
