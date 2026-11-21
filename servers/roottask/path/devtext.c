@@ -458,7 +458,7 @@ static int text_read(ioserv_context_t *ctp, io_read_t *msg, void *ocb)
         to = 100 * 1000000ULL;
         (void) __timer_timeout_r(CLOCK_REALTIME, RTMUX_TIMEOUT_NANOSLEEP, 0,
                                  &to, NULL);
-        if (msg_info(ctp->rcvid, &info) != -1 &&
+        if (msg_info(ctp->rcvid, &info) == -1 ||
             (info.flags & RTMUX_MI_UNBLOCK_REQ))
             return EINTR;
     }
