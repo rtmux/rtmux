@@ -284,8 +284,8 @@ static void *text_watcher(void *arg)
     return NULL;
 }
 
-/* Copy up to max bytes of the finished line out and return the count. Only
- * while text_line_done, under text_mutex.
+/* Copy up to max bytes of the line out and return the count: a finished line,
+ * or in raw mode whatever canonical input was left. Under text_mutex.
  */
 static unsigned text_buf_copy(char *buf, unsigned max)
 {
@@ -429,7 +429,7 @@ static int text_read(ioserv_context_t *ctp, io_read_t *msg, void *ocb)
             break;
         text_lock(&text_input_mutex);
         text_lock(&text_mutex);
-        if (text_line_done) {
+        if (text_line_done || (!(t.c_lflag & ICANON) && text_line_len)) {
             n = text_buf_copy((char *) msg, max);
             pthread_mutex_unlock(&text_mutex);
             pthread_mutex_unlock(&text_input_mutex);
