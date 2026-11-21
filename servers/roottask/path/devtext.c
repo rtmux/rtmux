@@ -143,14 +143,19 @@ static int text_ahead[TEXT_AHEAD];
 static unsigned text_ahead_head, text_ahead_tail;
 
 /* Canonical input: the line being edited and, once a newline ends it, what
- * readers have not taken of it yet. Under text_mutex. text_read_mutex lets one
- * reader at a time edit, so a character is never added to a finished line.
+ * readers have not taken of it yet. Under text_mutex.
+ *
+ * text_input_mutex makes taking a character, checking and editing the line,
+ * and echoing it one step that no flush or other reader can split, so input
+ * reaches the line and the screen in the order it was typed. Every text_next
+ * caller and every input flush takes it before text_mutex; a poller only tries
+ * it, as the holder may be writing to the console.
  */
 #define TEXT_LINE 256
 static char text_line[TEXT_LINE];
 static unsigned text_line_len, text_line_off;
 static int text_line_done;
-static pthread_mutex_t text_read_mutex;
+static pthread_mutex_t text_input_mutex;
 
 static void text_line_reset(void)
 {
@@ -259,7 +264,9 @@ static void *text_watcher(void *arg)
         if (!text_sid && !armed)
             continue;
         pthread_mutex_unlock(&text_mutex);
+        text_lock(&text_input_mutex);
         (void) text_next(1);
+        pthread_mutex_unlock(&text_input_mutex);
         text_lock(&text_mutex);
 
         /* A poller may have armed while the lock was dropped; its signal was
@@ -363,7 +370,7 @@ static int text_read(ioserv_context_t *ctp, io_read_t *msg, void *ocb)
     unsigned ioflag = (unsigned) (uintptr_t) ocb;
     struct termios t;
     unsigned hangups, seen, max, n = 0;
-    int c, err, held = 0;
+    int c;
 
     if (!(ioflag & _IO_FLAG_RD)) {
         return EBADF;
@@ -412,59 +419,51 @@ static int text_read(ioserv_context_t *ctp, io_read_t *msg, void *ocb)
         t = text_attr(&seen);
         if (ioserv_tty_hung_up(&t) || seen != hangups)
             break;
-        /* A reader that cannot edit waits like one with no input, so it still
-         * sees its unblock request.
-         */
-        if ((t.c_lflag & ICANON) && !held)
-            held = pthread_mutex_trylock(&text_read_mutex) == EOK;
-        if (held || !(t.c_lflag & ICANON)) {
-            text_lock(&text_mutex);
-            if (text_line_done) {
-                n = text_buf_copy((char *) msg, max);
-                pthread_mutex_unlock(&text_mutex);
-                break;
-            }
+        text_lock(&text_input_mutex);
+        text_lock(&text_mutex);
+        if (text_line_done) {
+            n = text_buf_copy((char *) msg, max);
             pthread_mutex_unlock(&text_mutex);
-            c = text_next(0);
-            if (c > 0xff) /* Non-ascii so return EOF */
-                break;
-            if (c >= 0) {
-                /* ICRNL: convert CR to NL */
-                if ((t.c_iflag & ICRNL) && c == '\r')
-                    c = '\n';
-                if (t.c_lflag & ICANON) {
-                    unsigned erased;
-                    int kill;
+            pthread_mutex_unlock(&text_input_mutex);
+            break;
+        }
+        pthread_mutex_unlock(&text_mutex);
+        c = text_next(0);
+        if (c > 0xff) { /* Non-ascii so return EOF */
+            pthread_mutex_unlock(&text_input_mutex);
+            break;
+        }
+        if (c >= 0) {
+            /* ICRNL: convert CR to NL */
+            if ((t.c_iflag & ICRNL) && c == '\r')
+                c = '\n';
+            if (t.c_lflag & ICANON) {
+                unsigned erased;
+                int kill;
 
-                    c = text_buf_edit(&t, c, &erased, &kill);
-                    text_echo(&t, c, erased, kill);
-                    continue;
-                }
-                text_echo(&t, c, 0, 0);
-                *(char *) msg = (char) c;
-                n = 1;
-                break;
+                c = text_buf_edit(&t, c, &erased, &kill);
+                text_echo(&t, c, erased, kill);
+                pthread_mutex_unlock(&text_input_mutex);
+                continue;
             }
+            text_echo(&t, c, 0, 0);
+            pthread_mutex_unlock(&text_input_mutex);
+            *(char *) msg = (char) c;
+            n = 1;
+            break;
         }
-        if (ioflag & O_NONBLOCK) {
-            err = EAGAIN;
-            goto out;
-        }
+        pthread_mutex_unlock(&text_input_mutex);
+        if (ioflag & O_NONBLOCK)
+            return EAGAIN;
         to = 100 * 1000000ULL;
         (void) __timer_timeout_r(CLOCK_REALTIME, RTMUX_TIMEOUT_NANOSLEEP, 0,
                                  &to, NULL);
         if (msg_info(ctp->rcvid, &info) != -1 &&
-            (info.flags & RTMUX_MI_UNBLOCK_REQ)) {
-            err = EINTR;
-            goto out;
-        }
+            (info.flags & RTMUX_MI_UNBLOCK_REQ))
+            return EINTR;
     }
     _IO_SET_READ_NBYTES(ctp, n);
-    err = n ? IOSERV_PTR(ctp, msg, n) : EOK;
-out:
-    if (held)
-        pthread_mutex_unlock(&text_read_mutex);
-    return err;
+    return n ? IOSERV_PTR(ctp, msg, n) : EOK;
 }
 
 /* Write handler for /dev/text — emit bytes to the console.
@@ -644,12 +643,14 @@ static int text_devctl(ioserv_context_t *ctp, io_devctl_t *msg, void *ocb)
         if (msg->i.nbytes < (int32_t) sizeof data->qsel)
             return EINVAL;
         if (data->qsel == TCIFLUSH || data->qsel == TCIOFLUSH) {
+            text_lock(&text_input_mutex);
             text_lock(&text_mutex);
             text_ahead_tail = text_ahead_head;
             text_line_reset();
             while (root_console_getchar() >= 0)
                 ;
             pthread_mutex_unlock(&text_mutex);
+            pthread_mutex_unlock(&text_input_mutex);
         }
         break;
 
@@ -717,8 +718,11 @@ static int text_notify(ioserv_context_t *ctp, io_notify_t *msg, void *ocb)
 
     (void) ocb;
     if ((msg->i.flags & (unsigned) _NOTIFY_COND_INPUT) &&
-        text_ahead_head == text_ahead_tail)
+        text_ahead_head == text_ahead_tail &&
+        pthread_mutex_trylock(&text_input_mutex) == EOK) {
         (void) text_next(1);
+        pthread_mutex_unlock(&text_input_mutex);
+    }
     text_lock(&text_mutex);
     if (ioserv_tty_hung_up(&text_termios)) /* POLLHUP, never writable */
         trig = 0;
@@ -810,7 +814,7 @@ void devtext_init(void)
     /* Priority inheritance: see the comment at text_mutex. */
     root_mutex_init_pi(&text_mutex);
     root_mutex_init_pi(&text_out_mutex);
-    root_mutex_init_pi(&text_read_mutex);
+    root_mutex_init_pi(&text_input_mutex);
     /* Sensible terminal defaults so the shell gets ECHO | ICANON */
     text_termios.c_iflag = ICRNL | BRKINT;
     text_termios.c_oflag = OPOST | ONLCR;
