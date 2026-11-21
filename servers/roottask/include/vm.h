@@ -65,6 +65,8 @@ int vm_open_fd(ioserv_context_t *ctp,
                mem_map_t *msg,
                path_object_t **obp);
 int vm_fd_compact(void);
+unsigned vm_fd_zombie_count(void);
+void vm_fd_describe(char *buf, size_t len);
 int vm_fd_setname(path_object_t *obp, char *name);
 
 /* vm-support.c — adp lock state migrated to root_process_t; signatures take

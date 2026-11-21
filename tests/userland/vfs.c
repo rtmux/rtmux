@@ -37,6 +37,7 @@
 #include <sys/path-registry.h>
 #include <sys/poll.h>
 #include <sys/procfs.h>
+#include <sys/states.h>
 #include <sys/procmsg.h>
 #include <sys/select.h>
 #include <sys/resource.h>
@@ -1123,17 +1124,17 @@ static void test_sys_kstats(void)
     }
     (void) pthread_barrier_destroy(&bar);
     (void) close(fd);
+    snprintf(key, sizeof key, "base %ld during %ld after %ld", base, during, after);
     check(base >= 0 && during == base + 1 && after == base,
-          "sys_kstats_thread_delta soul.thread.used +1 then baseline",
-          "thread pool gauge did not track a live thread");
+          "sys_kstats_thread_delta soul.thread.used +1 then baseline", key);
 
     /* thread.live follows the process thread vectors, so a created thread shows
      * in both gauges and the leak gate's difference (souls no process owns)
      * stays put.
      */
+    snprintf(key, sizeof key, "live base %ld during %ld", live_base, live_during);
     check(live_base > 0 && live_during == live_base + 1 && during - live_during == base - live_base,
-          "sys_kstats_thread_live +1 with the live thread",
-          "thread.live did not track a live thread");
+          "sys_kstats_thread_live +1 with the live thread", key);
 
     /* The new thread slept once, so it owns a timeout timer: both gauges rise
      * by one and the leak gate's difference (timers nobody owns) stays put.
@@ -10573,13 +10574,14 @@ struct spawn_worker {
     pthread_barrier_t *bar;
     int idx;
     int bad_spawn, bad_report, bad_exit;
-    int spawn_err; /* first posix_spawn error, for the failure detail */
-    /* The first bad report: its round, whether the read itself failed, and
-     * what was read, printed when the check fails.
+    int spawn_err;   /* first posix_spawn error, for the failure detail */
+    int spawn_round; /* and the round it failed in */
+    /* The first bad report: its round, whether the read itself failed, and what
+     * was read or why the read failed, printed when the check fails.
      */
     int bad_round;
     bool bad_read;
-    char bad_line[48];
+    char bad_line[64];
     /* Progress, read by the joining thread to name a stalled worker. */
     _Atomic int round, phase, done;
     pid_t pids[SPAWN_ROUNDS];
@@ -10598,6 +10600,9 @@ int spawn_echo_child(const char *tag)
                                                        : EXIT_FAILURE;
 }
 
+/* Read one report line. On failure buf holds why instead: which call failed,
+ * with what, and how many bytes had arrived.
+ */
 static bool spawn_read_report(int fd, char *buf, size_t sz)
 {
     size_t len = 0;
@@ -10605,12 +10610,19 @@ static bool spawn_read_report(int fd, char *buf, size_t sz)
     while (len + 1 < sz) {
         struct pollfd pfd = {.fd = fd, .events = POLLIN};
         ssize_t n;
+        int pr = poll(&pfd, 1, 2000);
 
-        if (poll(&pfd, 1, 2000) != 1)
+        if (pr != 1) {
+            snprintf(buf, sz, "poll %d (%s) after %zu bytes", pr,
+                     pr ? strerror(errno) : "timeout", len);
             return false;
+        }
         n = read(fd, buf + len, sz - 1 - len);
-        if (n <= 0)
+        if (n <= 0) {
+            snprintf(buf, sz, "read %zd (%s) revents %#x after %zu bytes", n,
+                     n ? strerror(errno) : "EOF", (unsigned) pfd.revents, len);
             return false;
+        }
         len += (size_t) n;
         if (buf[len - 1] == '\n')
             break;
@@ -10650,8 +10662,10 @@ static void *spawn_worker_body(void *arg)
         }
         if (rc) {
             w->bad_spawn++;
-            if (!w->spawn_err)
+            if (!w->spawn_err) {
                 w->spawn_err = rc;
+                w->spawn_round = r;
+            }
             continue;
         }
         __atomic_store_n(&w->pids[r], pid, __ATOMIC_RELAXED);
@@ -10673,8 +10687,7 @@ static void *spawn_worker_body(void *arg)
             if (!w->bad_report++) {
                 w->bad_round = r;
                 w->bad_read = !read_ok;
-                snprintf(w->bad_line, sizeof w->bad_line, "%s",
-                         read_ok ? line : "");
+                snprintf(w->bad_line, sizeof w->bad_line, "%s", line);
                 w->bad_line[strcspn(w->bad_line, "\n")] = '\0';
             }
         }
@@ -10685,10 +10698,12 @@ static void *spawn_worker_body(void *arg)
 
 enum { SPAWN_STALL_S = 30 }; /* seconds without progress that count as a stall */
 
-/* Print every thread of pid with its kernel state, the sync object it waits on,
- * its last hart and how long it has been blocked. Run on a stall only.
+/* Print every thread of pid with its kernel state, priority and policy, the
+ * sync object it waits on, its last hart and how long it has been blocked. With
+ * busy_only, skip threads waiting for a message, so a server's dump shows only
+ * the threads doing or waiting on something. Run on a stall or failure only.
  */
-static void spawn_dump_threads(pid_t pid)
+static void spawn_dump_threads(pid_t pid, bool busy_only)
 {
     char path[32];
     procfs_info info;
@@ -10712,9 +10727,13 @@ static void spawn_dump_threads(pid_t pid)
             (int) st.tid < tid)
             break;
         tid = (int) st.tid;
-        printf("  pid %d tid %d state %u sync %#lx cpu %u blocked %llu ms\n",
-               (int) pid, tid, st.state, (unsigned long) st.blocked.sync.sync,
-               st.last_cpu, (unsigned long long) (st.nsec_since_block / 1000000));
+        if (busy_only && st.state == STATE_RECEIVE)
+            continue;
+        printf("  pid %d tid %d state %u prio %u/%u pol %u sync %#lx cpu %u "
+               "blocked %llu ms\n",
+               (int) pid, tid, st.state, st.priority, st.real_priority, st.policy,
+               (unsigned long) st.blocked.sync.sync, st.last_cpu,
+               (unsigned long long) (st.nsec_since_block / 1000000));
     }
     (void) close(fd);
 }
@@ -10747,14 +10766,14 @@ static void spawn_dump_stall(const struct spawn_worker *w)
            (unsigned long) __atomic_load_n(&b->cond.owner, __ATOMIC_RELAXED),
            __atomic_load_n(&b->waiting, __ATOMIC_RELAXED),
            __atomic_load_n(&b->generation, __ATOMIC_RELAXED));
-    spawn_dump_threads(getpid());
+    spawn_dump_threads(getpid(), false);
     for (int i = 0; i < SPAWN_WORKERS; i++) {
         pid_t pid = spawn_cur_pid(&w[i]); /* read once: the worker moves on */
 
         if (!w[i].done && pid > 0)
-            spawn_dump_threads(pid);
+            spawn_dump_threads(pid, false);
     }
-    spawn_dump_threads(ROOTTASK_PID);
+    spawn_dump_threads(ROOTTASK_PID, false);
 }
 
 /* Join the team, naming every worker's round and phase when none has moved for
@@ -10815,6 +10834,23 @@ static int spawn_count_dup_pids(const struct spawn_worker *w)
     return dup;
 }
 
+/* Print roottask's heap use and the free physical memory after a failed run, so
+ * an ENOMEM spawn shows which of the two ran short.
+ */
+static void spawn_concurrent_report_memory(void)
+{
+    char snap[4096];
+    int fd = open("/sys/kstats", O_RDONLY);
+
+    if (fd < 0)
+        return;
+    if (kstats_read(fd, snap, sizeof snap) > 0)
+        printf("spawn_concurrent: roottask.heap_used=%ld pa.free_bytes=%ld\n",
+               kstats_get(snap, "roottask.heap_used"),
+               kstats_get(snap, "pa.free_bytes"));
+    (void) close(fd);
+}
+
 void test_spawn_concurrent(void)
 {
     static struct spawn_worker w[SPAWN_WORKERS];
@@ -10868,6 +10904,14 @@ void test_spawn_concurrent(void)
                  "spawn=%d (%s) report=%d exit=%d dup_pid=%d fds %u->%u", bad_spawn,
                  spawn_err ? strerror(spawn_err) : "-", bad_report, bad_exit, dup_pid,
                  fds_before, fds_after);
+        for (int i = 0; i < piped && bad_spawn; i++)
+            if (w[i].bad_spawn)
+                printf("spawn_concurrent: w%d %d failed spawn(s), first in round "
+                       "%d: %s\n",
+                       i, w[i].bad_spawn, w[i].spawn_round,
+                       strerror(w[i].spawn_err));
+        if (bad_spawn || bad_report || bad_exit)
+            spawn_concurrent_report_memory();
         for (int i = 0; i < piped && bad_report; i++)
             if (w[i].bad_report)
                 printf("spawn_concurrent: w%d %d bad report(s), first in round "
@@ -10879,6 +10923,13 @@ void test_spawn_concurrent(void)
                   fds_before == fds_after,
               "spawn_concurrent 8x100 exact argv/envp, unique pids, no fd leak",
               detail);
+
+        /* After the verdict, so the worker detail above stays next to it: the
+         * roottask threads not idle in receive, which shows a stuck cleaner and
+         * whatever it waits on.
+         */
+        if (bad_spawn || bad_report || bad_exit)
+            spawn_dump_threads(ROOTTASK_PID, true);
     }
 }
 

@@ -129,7 +129,8 @@ static int mem_read_write(ioserv_context_t *ctp,
     skip = writing ? sizeof(msg->write.i) : sizeof(msg->read.i);
     if (ctp->size < 0 || (size_t) ctp->size < skip ||
         (uintptr_t) msg % (writing ? _Alignof(struct _io_write)
-                                   : _Alignof(struct _io_read)) != 0)
+                                   : _Alignof(struct _io_read)) !=
+            0)
         return EBADMSG;
     combined = (msg->combine.combine_len & _IO_COMBINE_FLAG) != 0;
     if (writing) {
@@ -157,8 +158,9 @@ static int mem_read_write(ioserv_context_t *ctp,
 
         skip = writing ? sizeof(io_pwrite_t) : sizeof(io_pread_t);
         if ((size_t) ctp->size < skip ||
-            (uintptr_t) msg % (writing ? _Alignof(io_pwrite_t)
-                                       : _Alignof(io_pread_t)) != 0)
+            (uintptr_t) msg %
+                    (writing ? _Alignof(io_pwrite_t) : _Alignof(io_pread_t)) !=
+                0)
             return EBADMSG;
         requested_offset = writing ? ((io_pwrite_t *) msg)->offset.offset
                                    : ((io_pread_t *) msg)->offset.offset;
@@ -172,14 +174,14 @@ static int mem_read_write(ioserv_context_t *ctp,
         return ENOSYS;
     }
 
-    if (writing && (ctp->offset < 0 ||
-                    (size_t) ctp->offset > ctp->info.srcmsglen ||
-                    skip > ctp->info.srcmsglen - (size_t) ctp->offset ||
-                    nbytes > ctp->info.srcmsglen - (size_t) ctp->offset - skip))
+    if (writing &&
+        (ctp->offset < 0 || (size_t) ctp->offset > ctp->info.srcmsglen ||
+         skip > ctp->info.srcmsglen - (size_t) ctp->offset ||
+         nbytes > ctp->info.srcmsglen - (size_t) ctp->offset - skip))
         return EBADMSG;
     if (combined) {
-        size_t frame_size = (unsigned) msg->combine.combine_len &
-                            ~(unsigned) _IO_COMBINE_FLAG;
+        size_t frame_size =
+            (unsigned) msg->combine.combine_len & ~(unsigned) _IO_COMBINE_FLAG;
 
         if (frame_size > (size_t) ctp->size || skip > frame_size ||
             (writing && nbytes > frame_size - skip))

@@ -102,6 +102,20 @@ for t in threads:
         except gdb.error as e:
             print("pcpu_array[%d].%s: unavailable (%s)" % (hart, f, e))
 
+# Use a hart with a kernel address space for the kernel-wide walk. A hart in
+# user mode can have page tables that do not expose kernel virtual addresses.
+kernel_view = False
+for t in threads:
+    t.switch()
+    try:
+        int(gdb.parse_and_eval("pcpu_array[0].pc_curthread"))
+        kernel_view = True
+        break
+    except gdb.error:
+        pass
+if not kernel_view:
+    print("kernel view: no hart maps kernel memory; the walk below is partial")
+
 # need_to_run is the kernel's request to switch away from the running thread; a
 # thread restarting its call while it stays set never leaves the kernel.
 try:
@@ -344,5 +358,8 @@ try:
             print("  chain %d walk failed: %s" % (ci, e))
 except gdb.error as e:
     print("sync chain walk unavailable: %s" % e)
-print("DUMP COMPLETE: %d harts" % len(threads))
+if kernel_view:
+    print("DUMP COMPLETE: %d harts" % len(threads))
+else:
+    print("DUMP INCOMPLETE: %d harts, no kernel view" % len(threads))
 end

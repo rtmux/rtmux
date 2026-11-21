@@ -284,9 +284,8 @@ int rdecl notification_deliver(channel_t *chp,
          * channel left, as notification_lend does. thp is on no queue until
          * ready() below.
          */
-        thread_lend_msg(thp,
-                        (chp->flags & RTMUX_FLG_CHF_FIXED_PRIORITY) ? 0 : prio,
-                        false);
+        thread_lend_msg(
+            thp, (chp->flags & RTMUX_FLG_CHF_FIXED_PRIORITY) ? 0 : prio, false);
         thread_prio_settle(thp);
 
         if ((unsigned) priority & _NOTIFICATION_PRIO_VTID) {

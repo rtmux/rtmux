@@ -79,6 +79,7 @@ bool inject_should_fail_sched_set(thread_t *act, bool lowered)
     } while (!atomic_compare_exchange_weak_explicit(
         &sched_left, &left, left - 1, memory_order_acq_rel,
         memory_order_relaxed));
+
     /* One pending mark: failures injected from two threads at once overwrite
      * it, and the displaced count then falls short. The tests that count
      * displaced switches inject from one thread.

@@ -831,7 +831,7 @@ void xfer_handler_check_exit(void);
         do {                                                       \
             _adj = qtimeptr->nsec_tod_adjust;                      \
             (tsp) = arch_timer_now_ns(qtimeptr);                   \
-            if ((tsp) == (uint64_t) - 1) {                         \
+            if ((tsp) == (uint64_t) -1) {                          \
                 snap_time_wakeup();                                \
             }                                                      \
         } while ((incl_tod) && _adj != qtimeptr->nsec_tod_adjust); \

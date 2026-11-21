@@ -24,11 +24,11 @@
  *
  * bytes_peak is exact while one thread allocates, and approximate otherwise:
  * small blocks and separately mapped large blocks are counted apart, without a
- * common lock, and each raises the peak from its own total plus the other's
- * as last seen. A small and a mapped allocation that race can both miss the
- * other, so the peak can stay below the sum they reached, and so below a
- * later bytes_in_use, until another allocation raises it. Making it exact
- * would put a fence or a shared lock on every allocation.
+ * common lock, and each raises the peak from its own total plus the other's as
+ * last seen. A small and a mapped allocation that race can both miss the other,
+ * so the peak can stay below the sum they reached, and so below a later
+ * bytes_in_use, until another allocation raises it. Making it exact would put a
+ * fence or a shared lock on every allocation.
  */
 struct __rtmux_mallocstats {
     unsigned long long allocs;

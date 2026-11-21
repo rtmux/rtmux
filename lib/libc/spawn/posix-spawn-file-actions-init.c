@@ -113,7 +113,7 @@ int posix_spawn_file_actions_addclose(posix_spawn_file_actions_t *fact_p,
     ret = file_action_reserve(fact_p, &fact);
     if (ret != EOK)
         return ret;
-    fact->action[fact->num_entries - 1] = (posix_spawn_file_actions_list_t){
+    fact->action[fact->num_entries - 1] = (posix_spawn_file_actions_list_t) {
         .type = posix_file_action_type_CLOSE,
         ._type.close.fd = fd,
     };
@@ -133,7 +133,7 @@ int posix_spawn_file_actions_adddup2(posix_spawn_file_actions_t *fact_p,
     ret = file_action_reserve(fact_p, &fact);
     if (ret != EOK)
         return ret;
-    fact->action[fact->num_entries - 1] = (posix_spawn_file_actions_list_t){
+    fact->action[fact->num_entries - 1] = (posix_spawn_file_actions_list_t) {
         .type = posix_file_action_type_DUP,
         ._type.dup.fd = fd,
         ._type.dup.new_fd = new_fd,
@@ -163,7 +163,7 @@ int posix_spawn_file_actions_addopen(
     open_action = malloc(size);
     if (!open_action)
         return ENOMEM;
-    *open_action = (_posix_spawn_file_actions_open_t){
+    *open_action = (_posix_spawn_file_actions_open_t) {
         .size = (uint32_t) size,
         .mode = (uint32_t) omode,
         .flags = (uint32_t) oflags,
@@ -176,7 +176,7 @@ int posix_spawn_file_actions_addopen(
         free(open_action);
         return ret;
     }
-    fact->action[fact->num_entries - 1] = (posix_spawn_file_actions_list_t){
+    fact->action[fact->num_entries - 1] = (posix_spawn_file_actions_list_t) {
         .type = posix_file_action_type_OPEN,
         ._type.open = open_action,
     };
@@ -206,7 +206,7 @@ int posix_spawn_file_actions_addchdir(
         free(copy);
         return ret;
     }
-    fact->action[fact->num_entries - 1] = (posix_spawn_file_actions_list_t){
+    fact->action[fact->num_entries - 1] = (posix_spawn_file_actions_list_t) {
         .type = posix_file_action_type_CHDIR,
         ._type.chdir_path = copy,
     };
@@ -226,7 +226,7 @@ int posix_spawn_file_actions_addfchdir(posix_spawn_file_actions_t *fact_p,
     ret = file_action_reserve(fact_p, &fact);
     if (ret != EOK)
         return ret;
-    fact->action[fact->num_entries - 1] = (posix_spawn_file_actions_list_t){
+    fact->action[fact->num_entries - 1] = (posix_spawn_file_actions_list_t) {
         .type = posix_file_action_type_FCHDIR,
         ._type.fchdir_fd = fd,
     };

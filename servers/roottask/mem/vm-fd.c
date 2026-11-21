@@ -6,6 +6,7 @@
  */
 
 #include <fcntl.h>
+#include <stdio.h>
 #include <sys/elf.h>
 #include "externs.h"
 #include <sys/ioserv.h>
@@ -35,7 +36,11 @@ static unsigned fdmem_open_lock;
 static unsigned fdmem_close_lock;
 static path_object_t *fdmem_zombies = ZOMBIE_END;
 static unsigned fdmem_zombie_gen;
-static unsigned fdmem_zombie_count; /* entries on the list, under fdmem_mutex */
+
+/* Entries on the list, changed under fdmem_mutex; the updates are atomic too
+ * because vm_fd_zombie_count() reads it without the lock.
+ */
+static unsigned fdmem_zombie_count;
 static unsigned fdmem_cleanup;
 static path_object_t *fdmem_cleaner_object;
 
@@ -143,7 +148,10 @@ int fdmem_done(path_object_t *obp)
             obp->hdr.next = fdmem_zombies;
             fdmem_zombies = obp;
             ++fdmem_zombie_gen;
-            ++fdmem_zombie_count;
+            __atomic_add_fetch(&fdmem_zombie_count, 1, __ATOMIC_RELAXED);
+            /* Wake a cleaner waiting on opens once, as it turns forced. */
+            if (fdmem_zombie_count == MMAPFD_STALES_HIGHWATER + 1)
+                pthread_cond_broadcast(&fdmem_condvar);
             (void) vm_fd_compact();
         }
     } else if (obp->hdr.next) {
@@ -396,7 +404,7 @@ static int mem_map_fd(ioserv_context_t *ctp,
         }
         *owner = chk->hdr.next;
         ++fdmem_zombie_gen;
-        --fdmem_zombie_count;
+        __atomic_sub_fetch(&fdmem_zombie_count, 1, __ATOMIC_RELAXED);
         obp->hdr.next = NULL;
     }
 
@@ -517,6 +525,58 @@ again:
     return 0;
 }
 
+/* Cleaner activity, for the diagnostics below: requests sent, requests sent
+ * again past the highwater mark although one was queued, requests folded into
+ * one already queued or running, handler calls, calls that found a pass
+ * running, passes that got a worker, and objects freed.
+ */
+static unsigned vm_fd_sent, vm_fd_resent, vm_fd_folded, vm_fd_calls, vm_fd_busy,
+    vm_fd_passes, vm_fd_freed;
+
+/* Where the running cleanup call is, so a call that never returns shows which
+ * step it is stuck in.
+ */
+enum {
+    VM_FD_IDLE,
+    VM_FD_RESERVING, /* in proc_thread_pool_reserve() */
+    VM_FD_LOCKING,   /* waiting for fdmem_mutex */
+    VM_FD_WALKING,   /* walking the zombie list under fdmem_mutex */
+    VM_FD_WAITING,   /* waiting for opens in flight to finish */
+    VM_FD_FREEING,   /* in object_done() for one zombie */
+    VM_FD_FINISHING, /* unlocking the list and releasing the worker */
+};
+static unsigned vm_fd_stage;
+
+#define VM_FD_STAGE(s) __atomic_store_n(&vm_fd_stage, (s), __ATOMIC_RELAXED)
+
+#define VM_FD_TALLY(c) ((void) __atomic_add_fetch(&(c), 1, __ATOMIC_RELAXED))
+#define VM_FD_READ(c) __atomic_load_n(&(c), __ATOMIC_RELAXED)
+
+/* Mapped-file objects waiting on the zombie list, for diagnostics; read without
+ * the lock, so the value may be a moment old.
+ */
+unsigned vm_fd_zombie_count(void)
+{
+    return __atomic_load_n(&fdmem_zombie_count, __ATOMIC_RELAXED);
+}
+
+/* Describe the cleaner's state in buf, for a log line that has to say why
+ * zombies were not freed. Read without the lock, so the values may be a moment
+ * old.
+ */
+void vm_fd_describe(char *buf, size_t len)
+{
+    snprintf(buf, len,
+             "cleanup %#x stage %u open %u close %#x sent %u resent %u folded "
+             "%u calls %u busy %u passes %u freed %u",
+             VM_FD_READ(fdmem_cleanup), VM_FD_READ(vm_fd_stage),
+             VM_FD_READ(fdmem_open_lock), VM_FD_READ(fdmem_close_lock),
+             VM_FD_READ(vm_fd_sent), VM_FD_READ(vm_fd_resent),
+             VM_FD_READ(vm_fd_folded), VM_FD_READ(vm_fd_calls),
+             VM_FD_READ(vm_fd_busy), VM_FD_READ(vm_fd_passes),
+             VM_FD_READ(vm_fd_freed));
+}
+
 /* Schedule a pass to clean up stale mapped-file entries.
  *
  * Queues a cleanup by sending a notification to the cleanup handler unless one
@@ -525,11 +585,32 @@ again:
  */
 int vm_fd_compact(void)
 {
-    if (!(atomic_or_value(&fdmem_cleanup, MMAPFD_CLEANUP_QUEUED) &
-          (MMAPFD_CLEANUP_QUEUED | MMAPFD_CLEANUP_INPROGRESS))) {
+    unsigned old = atomic_or_value(&fdmem_cleanup, MMAPFD_CLEANUP_QUEUED);
+    int resend = 0;
+
+    /* Only the handler clears the queued flag, so a request whose notification
+     * never reached it (its sender stalled between setting the flag and
+     * sending, or the delivery was lost) used to fold every later request into
+     * nothing: under a spawn storm the list then grew until the file systems
+     * behind the mappings ran out of open handles. Past the highwater mark the
+     * cleaner is behind whatever the flag says, so send again; a pass there is
+     * forced and empties the list, which ends the extra sends.
+     */
+    if ((old & MMAPFD_CLEANUP_QUEUED) && !(old & MMAPFD_CLEANUP_INPROGRESS) &&
+        vm_fd_zombie_count() > MMAPFD_STALES_HIGHWATER)
+        resend = 1;
+    if (!(old & (MMAPFD_CLEANUP_QUEUED | MMAPFD_CLEANUP_INPROGRESS)) ||
+        resend) {
         if (msg_send_notification(ROOTTASK_COID, -1, vm_fd_code, 0) != 0) {
-            atomic_clr(&fdmem_cleanup, MMAPFD_CLEANUP_QUEUED);
+            if (!resend)
+                atomic_clr(&fdmem_cleanup, MMAPFD_CLEANUP_QUEUED);
+        } else if (resend) {
+            VM_FD_TALLY(vm_fd_resent);
+        } else {
+            VM_FD_TALLY(vm_fd_sent);
         }
+    } else {
+        VM_FD_TALLY(vm_fd_folded);
     }
 
     return EOK;
@@ -564,15 +645,21 @@ static int vm_fd_cleanup(message_context_t *ctp,
 #define TIME_INFINITY (~(time_t) 0)
 
     nexttime = TIME_INFINITY;
+    VM_FD_TALLY(vm_fd_calls);
 
     if (atomic_or_value(&fdmem_cleanup, MMAPFD_CLEANUP_INPROGRESS) &
         MMAPFD_CLEANUP_INPROGRESS) {
         /* Somebody's already in here */
+        VM_FD_TALLY(vm_fd_busy);
         return EOK;
     }
 
+    VM_FD_STAGE(VM_FD_RESERVING);
     if (proc_thread_pool_reserve() == 0) {
+        VM_FD_TALLY(vm_fd_passes);
+        VM_FD_STAGE(VM_FD_LOCKING);
         pthread_mutex_lock(&fdmem_mutex);
+        VM_FD_STAGE(VM_FD_WALKING);
 
         /* Past MMAPFD_STALES_HIGHWATER entries the pass is forced, which makes
          * new opens wait for it. Without that it waits for a moment with no
@@ -593,12 +680,22 @@ static int vm_fd_cleanup(message_context_t *ctp,
                 break;
             if (pa_free_size() < MIN_MEM_FREE_SIZE)
                 force = 1;
-            if (force) {
-                atomic_or(&fdmem_close_lock, MMAPFD_CLOSE_WAIT);
-            }
-            while (fdmem_open_lock) {
-                /* opening operation is still on, need to wait */
+            for (;;) {
+                /* Checked before every wait, so fdmem_done only has to wake us
+                 * when the count crosses the mark while we sleep.
+                 */
+                force |= fdmem_zombie_count > MMAPFD_STALES_HIGHWATER;
+                if (force)
+                    atomic_or(&fdmem_close_lock, MMAPFD_CLOSE_WAIT);
+                if (!fdmem_open_lock)
+                    break;
+
+                /* opening operation is still on, need to wait; fdmem_done wakes
+                 * us when the list passes the highwater mark.
+                 */
+                VM_FD_STAGE(VM_FD_WAITING);
                 pthread_cond_wait(&fdmem_condvar, &fdmem_mutex);
+                VM_FD_STAGE(VM_FD_WALKING);
             }
             atomic_clr(&fdmem_close_lock, MMAPFD_CLOSE_WAIT);
             if (gen != fdmem_zombie_gen) {
@@ -613,18 +710,21 @@ static int vm_fd_cleanup(message_context_t *ctp,
                 int r;
 
                 *owner = obp->hdr.next;
-                --fdmem_zombie_count;
+                __atomic_sub_fetch(&fdmem_zombie_count, 1, __ATOMIC_RELAXED);
                 fdmem_cleaner_object = obp;
+                VM_FD_STAGE(VM_FD_FREEING);
                 r = object_done(obp);
+                VM_FD_STAGE(VM_FD_WALKING);
                 fdmem_cleaner_object = NULL;
-                if (!r) {
-                    /* Free failed for some reason, put things back */
-                    *owner = obp;
-                    ++fdmem_zombie_count;
-                    nexttime = currtime;
+                if (r) {
+                    VM_FD_TALLY(vm_fd_freed);
+                    /* owner already points at the next entry. */
+                    continue;
                 }
-                if (*owner == ZOMBIE_END)
-                    break;
+                /* Free failed for some reason, put things back */
+                *owner = obp;
+                __atomic_add_fetch(&fdmem_zombie_count, 1, __ATOMIC_RELAXED);
+                nexttime = currtime;
             } else if (mtime < nexttime) {
                 if (mtime == 0)
                     crash();
@@ -632,11 +732,14 @@ static int vm_fd_cleanup(message_context_t *ctp,
             }
             owner = &(*owner)->hdr.next;
         }
+        VM_FD_STAGE(VM_FD_FINISHING);
         pthread_mutex_unlock(&fdmem_mutex);
 
         proc_thread_pool_reserve_done();
     }
 
+    /* Before the flags clear, so it cannot overwrite the next call's stage. */
+    VM_FD_STAGE(VM_FD_IDLE);
     fdmem_cleanup = 0;
 
     /* wake up opener if any */

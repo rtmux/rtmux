@@ -236,8 +236,8 @@ static void open_debug_stall(const node_t *nop, int subtype)
     if (ms > 5000)
         ms = 5000;
     (void) nanosleep(
-        &(struct timespec){.tv_nsec = (long) (ms % 1000) * 1000000L,
-                           .tv_sec = (time_t) (ms / 1000)},
+        &(struct timespec) {.tv_nsec = (long) (ms % 1000) * 1000000L,
+                            .tv_sec = (time_t) (ms / 1000)},
         NULL);
 }
 #else
@@ -312,6 +312,7 @@ static int complete_open(struct open_entry *oep, int ret)
         }
         nop->flags &= (uint16_t) ~NODE_FLAG_DEFERRED;
     }
+
     /* Only the unlink clears its flag, and in the same hold of path_mutex that
      * removes its entry: a second unlink starting between the two would have
      * its flag cleared under it, and an open would then pass the check while

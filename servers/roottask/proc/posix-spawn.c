@@ -108,6 +108,7 @@ static int fill_struct_inheritance(struct inheritance *inherit,
     if ((r = posix_spawnattr_getflags(attrp, &flags)) != EOK) {
         return r;
     }
+
     /* The flags come from the client's message: zero extend them, so a set top
      * bit cannot turn into the high bits above the field.
      */

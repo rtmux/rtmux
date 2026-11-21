@@ -45,6 +45,7 @@ extern kspinlock_t alloc_slock, sync_slock, global_channel_slock, as_slock,
  * core/globals.h's <arch/pcpu.h>.
  */
 extern unsigned num_processors;
+
 /* Architectural hart ID of each logical CPU, for labels only: every per-CPU
  * array is indexed by the logical CPU, which may differ on sparse-ID systems.
  */
@@ -808,6 +809,7 @@ void __attribute__((noreturn)) monitor_loop(void)
             if (!cpu_online(hart))
                 continue;
             thp = get_active_thread(hart);
+
             /* The label names the architectural hart; the index stays logical
              * for every per-CPU access below.
              */
