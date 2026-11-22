@@ -2936,8 +2936,9 @@ out:
 /* poll() and select() readiness on the console (/dev/text). Run by the
  * serial-unblock mode before the serial driver starts, so the bytes the harness
  * writes for console_inject() reach the console. Covers an idle console timing
- * out, output always ready, a poller and a select waking on a typed character,
- * and a typed character being reported at once until it is read.
+ * out, output always ready, a partial line staying unreadable, a poller and a
+ * select waking once the line is ended, and the line being reported at once
+ * until it is read.
  */
 /* A reader that waits on the console when the line is hung up and the speed is
  * set again at once, before the reader looks again, still gets end of file:
@@ -2992,6 +2993,8 @@ void test_console_poll(void)
     struct serial_poller a = {0}, b = {0};
     struct pollfd pfd;
     pthread_t ta, tb;
+    char buf[8];
+    ssize_t n;
     int fd, rc, ready;
 
     printf("[console-poll]\n");
@@ -3027,19 +3030,26 @@ void test_console_poll(void)
     check(!atomic_load(&a.done) && !atomic_load(&b.done),
           "console_poll pollers wait on an idle console",
           "a poller returned before anything was typed");
+    /* The console is canonical: 'k' alone is a partial line. */
     console_inject('k');
+    sleep_ms(3000);
+    check(!atomic_load(&a.done) && !atomic_load(&b.done),
+          "console_poll pollers wait on a partial line",
+          "a poller returned before the line was ended");
+    console_inject('\n');
     (void) pthread_join(ta, NULL);
     (void) pthread_join(tb, NULL);
-    check(a.rc == 1 && a.ready == 1, "console_poll poll wakes on typed byte",
-          "poll({/dev/text, POLLIN}) must return 1 once a byte is typed");
-    check(b.rc == 1 && b.ready == 1, "console_poll select wakes on typed byte",
-          "select must report the console readable once a byte is typed");
+    check(a.rc == 1 && a.ready == 1, "console_poll poll wakes on a line",
+          "poll({/dev/text, POLLIN}) must return 1 once a line is ended");
+    check(b.rc == 1 && b.ready == 1, "console_poll select wakes on a line",
+          "select must report the console readable once a line is ended");
 
     rc = serial_poll_once(fd, SERIAL_WAIT_POLL, 50, &ready);
-    check(rc == 1 && ready == 1, "console_poll typed byte polls readable",
-          "a byte typed before poll must be reported");
-    check(serial_poll_read_ready(fd) == 'k', "console_poll read typed byte",
-          "wrong byte, or no byte to read");
+    check(rc == 1 && ready == 1, "console_poll ended line polls readable",
+          "a line ended before poll must be reported");
+    n = rc == 1 ? read(fd, buf, sizeof buf) : -1;
+    check(n == 2 && !memcmp(buf, "k\n", 2), "console_poll read ended line",
+          "the line must read back as \"k\\n\"");
     rc = serial_poll_once(fd, SERIAL_WAIT_POLL, 50, &ready);
     check(rc == 0, "console_poll drained console idle again",
           "a drained console must not poll readable");
