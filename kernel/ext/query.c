@@ -928,6 +928,7 @@ extern struct pa_quantum *pa_alloc(paddr_t size,
                                    unsigned *status_p,
                                    struct pa_restrict *restriction,
                                    paddr_t resv_size);
+extern void pa_free(struct pa_quantum *paq, size_t num, paddr_t resv_size);
 extern paddr_t pa_quantum_to_paddr(struct pa_quantum *pq);
 extern struct pa_restrict *restrict_user;
 
@@ -1109,7 +1110,10 @@ void kext_root_mmap_anon_user(void *data)
     if (va_lo + size_aligned < va_lo ||
         va_lo + size_aligned > RTMUX_ROOTTASK_UADDR_END) {
         kspinlock_unlock(&as_slock);
-        /* Leak pq — bootstrap path, fatal anyway. */
+        /* Nothing is mapped yet. Roottask asks again for each spawn that
+         * needs a new loader context, so keeping pq would leak it each time.
+         */
+        pa_free(pq, LEN_TO_NQUANTUM(size_aligned), 0);
         kap->ret = EINVAL;
         SETKSTATUS(act, EINVAL);
         return;
@@ -1128,16 +1132,31 @@ void kext_root_mmap_anon_user(void *data)
     manip.shmem_flags = 0;
     manip.tlb_flush_pending = 0;
     r = cpu_pte_manipulate(&manip);
-    {
-        unsigned flush_pending = manip.tlb_flush_pending;
-        if (r == EOK)
-            root_phys_map_va = va_hi + 1;
-        kspinlock_unlock(&as_slock);
-        if (flush_pending)
-            cpu_tlb_flush_complete();
+    if (r == EOK) {
+        root_phys_map_va = va_hi + 1;
+    } else if (manip.start > va_lo) {
+        /* The MAP stopped part of the way, at manip.start (a page table could
+         * not be had): take back the pages it mapped before freeing the run
+         * they map. Roottask asks again for the next loader context it needs,
+         * at the same address, so a run kept here would leak each time. The
+         * UNMAP walks only tables the MAP just used, and allocates none.
+         */
+        struct mm_pte_manipulate undo = manip;
+
+        undo.end = undo.start;
+        undo.start = va_lo;
+        undo.op = PTE_OP_UNMAP;
+        undo.tlb_flush_pending = 0;
+        if (cpu_pte_manipulate(&undo) != EOK)
+            crash("cannot unmap a failed roottask anon map");
+        manip.tlb_flush_pending |= undo.tlb_flush_pending;
     }
+    kspinlock_unlock(&as_slock);
+    if (manip.tlb_flush_pending)
+        cpu_tlb_flush_complete();
     if (r != EOK) {
-        /* Leak pq on failure — bootstrap path, fatal anyway. */
+        /* Nothing of the run is mapped any more, and no TLB holds it. */
+        pa_free(pq, LEN_TO_NQUANTUM(size_aligned), 0);
         kap->ret = r;
         SETKSTATUS(act, r);
         return;

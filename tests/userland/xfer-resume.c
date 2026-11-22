@@ -96,11 +96,7 @@ int test_xfer_resume(void)
     snprintf(pid, sizeof pid, "%d", (int) getpid());
     for (int i = 0; i < XR_BYTES; i++)
         xr_out[i] = (unsigned char) (i * 13 + 5);
-    chid = channel_create(0);
-    snd.coid = chid == -1
-                   ? -1
-                   : connect_attach(0, getpid(), chid, RTMUX_SIDE_CHANNEL, 0);
-    if (snd.coid == -1 ||
+    if (!test_chan_open(0, &chid, &snd.coid) ||
         pthread_create(&ts, NULL, xr_sender_main, &snd) != 0) {
         test_fail(name, "channel or sender setup failed");
         return 0;
@@ -144,9 +140,7 @@ int test_xfer_resume(void)
     us = xr_now_us() - t0;
     yields = xr_stat(INJECT_XFER_YIELDS);
     budgets = xr_stat(INJECT_XFER_BUDGETS);
-    for (int i = 0; i < XR_WAIT_MS && !atomic_load(&snd.done); i++)
-        sleep_ms(1);
-    if (!atomic_load(&snd.done)) {
+    if (!test_wait_flag(&snd.done, 1, XR_WAIT_MS)) {
         test_fail("xfer_resume reply", "the sender stayed blocked");
         return 0;
     }

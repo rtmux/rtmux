@@ -2019,6 +2019,15 @@ static void test_reply_timeout_armed_on_claim(void)
     (void) channel_destroy(chid);
 }
 
+static void test_posix_named_sem_timedwait(void);
+
+/* --named-sem-timedwait N: the named-semaphore timeout checks alone, N times. */
+void named_sem_timedwait_loop(int n)
+{
+    while (n-- > 0)
+        test_posix_named_sem_timedwait();
+}
+
 static void test_posix_named_sem_timedwait(void)
 {
     sem_t *sem;
@@ -4764,6 +4773,133 @@ out:
     return 0;
 }
 
+/* wait_rewait: a cancel or an interrupt reads its target's wait without a lock
+ * and acts on it later, by when the target may have been woken and blocked
+ * again on the same semaphore. That later wait is not the one it saw and must
+ * run its course. The fixture stalls the interrupt between its read and the
+ * wait chain lock (stall-force-ready) and the cancel between its read and the
+ * cancel it posts (stall-cancel), posts the semaphore once meanwhile, and lets
+ * either go once the target waits again. The canceled target has disabled
+ * cancellation before its second wait: the cancel stays pending until it
+ * enables cancellation again. Needs /bin/inject and two harts.
+ */
+struct rewait {
+    sem_t sem;
+    pthread_t target;
+    atomic_int woken;  /* the first wait has returned */
+    atomic_int passed; /* the second wait has returned */
+    int first_rc, second_rc, second_errno;
+};
+
+static void *rewait_target(void *arg)
+{
+    struct rewait *r = arg;
+
+    r->first_rc = sem_wait(&r->sem);
+    (void) pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+    atomic_store(&r->woken, 1);
+    r->second_rc = sem_wait(&r->sem);
+    r->second_errno = r->second_rc ? errno : 0;
+    atomic_store(&r->passed, 1);
+    (void) pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
+    pthread_testcancel();
+    return NULL;
+}
+
+static void *rewait_cancel(void *arg)
+{
+    struct rewait *r = arg;
+
+    (void) test_pin_mask(2U);
+    return (void *) (intptr_t) pthread_cancel(r->target);
+}
+
+static void *rewait_interrupt(void *arg)
+{
+    struct rewait *r = arg;
+
+    (void) test_pin_mask(2U);
+    return (void *) (intptr_t) thread_ctl(RTMUX_TCTL_INTERRUPT,
+                                          (void *) (long) r->target);
+}
+
+static void wait_rewait_case(bool cancel)
+{
+    const char *name = cancel ? "cancel" : "interrupt";
+    struct stall_watch watch = {.pid = -1};
+    struct rewait r = {.first_rc = -1, .second_rc = -1};
+    pthread_t waker;
+    bool started = false, entered = false, rewaited = false, held = false;
+    void *waker_rc = (void *) -1, *target_rc = NULL;
+    char pid[16], what[96], d[96];
+
+    snprintf(pid, sizeof pid, "%d", (int) getpid());
+    if (sem_init(&r.sem, 0, 0) ||
+        pthread_create(&r.target, NULL, rewait_target, &r)) {
+        test_fail("wait rewait fixture", "cannot create the target");
+        return;
+    }
+    if (wait_thread_state(r.target, STATE_SEM) &&
+        !inject_run(cancel ? "stall-cancel" : "stall-force-ready", pid,
+                    "10000") &&
+        !stall_watch_start(&watch, cancel ? "cancel" : "force-ready") &&
+        !pthread_create(&waker, NULL, cancel ? rewait_cancel : rewait_interrupt,
+                        &r)) {
+        started = true;
+        entered = stall_watch_entered(&watch);
+    }
+    snprintf(what, sizeof what, "%s stalls on the first semaphore wait", name);
+    check(entered, what, "the stall was not reached");
+    (void) sem_post(&r.sem);
+    if (entered) {
+        for (int i = 0; i < 300 && !atomic_load(&r.woken); i++)
+            sleep_ms(10);
+        rewaited =
+            atomic_load(&r.woken) && wait_thread_state(r.target, STATE_SEM);
+        snprintf(what, sizeof what, "target waits again before the %s resumes",
+                 name);
+        check(rewaited, what, "the second wait was not observed");
+    }
+    if (watch.pid > 0)
+        stall_watch_release(&watch);
+    if (started)
+        (void) pthread_join(waker, &waker_rc);
+    if (rewaited) {
+        sleep_ms(200);
+        held = wait_thread_state(r.target, STATE_SEM);
+    }
+    (void) sem_post(&r.sem);
+    (void) pthread_join(r.target, &target_rc);
+    stall_watch_finish(&watch);
+    (void) sem_destroy(&r.sem);
+    if (!rewaited)
+        return;
+    snprintf(what, sizeof what, "a stale %s leaves the new wait intact", name);
+    snprintf(d, sizeof d, "%s rc %d, second wait %s rc %d errno %d", name,
+             (int) (intptr_t) waker_rc, held ? "held" : "ended", r.second_rc,
+             r.second_errno);
+    check(
+        (intptr_t) waker_rc == 0 && r.first_rc == 0 && held && r.second_rc == 0,
+        what, d);
+    if (cancel)
+        check(atomic_load(&r.passed) && target_rc == PTHREAD_CANCELED,
+              "the cancel waits for the target to enable cancellation",
+              atomic_load(&r.passed) ? "the target did not exit canceled"
+                                     : "canceled with cancellation disabled");
+}
+
+int wait_rewait(void)
+{
+    if (sysconf(_SC_NPROCESSORS_ONLN) < 2 ||
+        inject_run("alloc-status", NULL, NULL) != 0)
+        return TC_EXIT_SKIP;
+    (void) test_pin_mask(1U);
+    wait_rewait_case(false);
+    wait_rewait_case(true);
+    (void) test_pin_mask(~0U);
+    return 0;
+}
+
 static void *sync_kill_waiter(void *arg)
 {
     (void) sem_wait(arg);
@@ -5358,6 +5494,129 @@ static void dw_yield_switch(void)
     check(armed && taken, what, "fixture: yielder not held at the switch");
 }
 
+/* boot_tick_catch_up: only the boot hart expires timers, and not inside a
+ * kernel call: a tick or a timer reprogram taken there leaves an overdue timer
+ * to a later tick. A timer due during the call must fire when the call
+ * returns, not a tick after it. The fixture holds the boot hart in one kernel
+ * call (an interrupt stalled at stall-force-ready for BTC_CALL_MS) while a
+ * thread on hart 1 sleeps across the middle of it, and compares the sleeper's
+ * wake time with the call's return. The phase of the call against the tick
+ * varies over BTC_ROUNDS. Timing is only meaningful with QEMU's
+ * instruction-count clock (EMU_ICOUNT=1), so the case is opt-in
+ * (--boot-tick-catch-up). Needs /bin/inject, the boot hart as hart 0, and two
+ * harts.
+ */
+enum { BTC_ROUNDS = 6, BTC_CALL_MS = 12, BTC_SLACK_US = 200 };
+
+struct btc {
+    sem_t sem;
+    pthread_t waiter;
+    atomic_int calling; /* the stalled call is about to start */
+    atomic_int stop;
+    long call_us, exit_us; /* when the call was made and when it returned */
+};
+
+static long btc_now_us(void)
+{
+    struct timespec ts;
+
+    (void) clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000000L + ts.tv_nsec / 1000L;
+}
+
+static void *btc_waiter(void *raw)
+{
+    struct btc *b = raw;
+
+    while (!atomic_load(&b->stop))
+        (void) sem_wait(&b->sem); /* each round's interrupt ends one */
+    return NULL;
+}
+
+static void *btc_caller(void *raw)
+{
+    struct btc *b = raw;
+
+    (void) test_pin_mask(1U); /* the boot hart */
+    b->call_us = btc_now_us();
+    atomic_store(&b->calling, 1);
+    (void) thread_ctl(RTMUX_TCTL_INTERRUPT, (void *) (long) b->waiter);
+    b->exit_us = btc_now_us();
+    return NULL;
+}
+
+int boot_tick_catch_up(void)
+{
+    static struct btc b;
+    char pid[16], ms[16], d[128];
+    long worst = -1000000L;
+    int rounds = 0, outside = 0;
+
+    if (sysconf(_SC_NPROCESSORS_ONLN) < 2 ||
+        inject_run("alloc-status", NULL, NULL) != 0)
+        return TC_EXIT_SKIP;
+    b = (struct btc) {0};
+    snprintf(pid, sizeof pid, "%d", (int) getpid());
+    snprintf(ms, sizeof ms, "%d", BTC_CALL_MS);
+    (void) test_pin_mask(2U);
+    if (sem_init(&b.sem, 0, 0) ||
+        pthread_create(&b.waiter, NULL, btc_waiter, &b)) {
+        test_fail("boot tick catch-up fixture", "cannot start the waiter");
+        goto out;
+    }
+    for (int i = 0; i < BTC_ROUNDS; i++) {
+        pthread_t caller;
+        long t0, due, woke, late;
+
+        if (!wait_thread_state(b.waiter, STATE_SEM) ||
+            inject_run("stall-force-ready", pid, ms) != 0)
+            break;
+        atomic_store(&b.calling, 0);
+        if (pthread_create(&caller, NULL, btc_caller, &b))
+            break;
+        while (!atomic_load(&b.calling))
+            ;
+        /* Let the call get under way. Not a sleep: that would itself be a
+         * timer due during the call.
+         */
+        dw_spin_ms(1);
+        t0 = btc_now_us();
+        /* Due in the middle of the call, at a phase that moves each round. */
+        due = t0 + 3000L + 370L * i;
+        (void) nanosleep(&(struct timespec) {.tv_nsec = (due - t0) * 1000L},
+                         NULL);
+        woke = btc_now_us();
+        (void) pthread_join(caller, NULL);
+        /* The round counts only if the call was held and the timer fell due
+         * inside it.
+         */
+        if (b.exit_us - b.call_us < (BTC_CALL_MS - 1) * 1000L ||
+            due <= b.call_us || due >= b.exit_us)
+            outside++;
+        late = woke - b.exit_us;
+        if (late > worst)
+            worst = late;
+        printf(
+            "boot-tick-catch-up: round %d call %ld us, due %ld us into it, "
+            "woke %ld us after it\n",
+            i, b.exit_us - b.call_us, due - b.call_us, late);
+        rounds++;
+    }
+    atomic_store(&b.stop, 1);
+    (void) sem_post(&b.sem);
+    (void) thread_ctl(RTMUX_TCTL_INTERRUPT, (void *) (long) b.waiter);
+    (void) pthread_join(b.waiter, NULL);
+    snprintf(d, sizeof d,
+             "%d/%d rounds, %d not due in a held call, worst %ld us after the "
+             "call's return",
+             rounds, BTC_ROUNDS, outside, worst);
+    check(rounds == BTC_ROUNDS && !outside && worst <= BTC_SLACK_US,
+          "a timer due in a boot-hart kernel call fires at its return", d);
+out:
+    (void) test_pin_mask(~0U);
+    return 0;
+}
+
 int dispatch_window(void)
 {
     if (sysconf(_SC_NPROCESSORS_ONLN) < 3 ||
@@ -5541,6 +5800,65 @@ static bool kw_frozen(struct kw *w, long ms)
     return atomic_load(&w->count) == c0;
 }
 
+/* A stop that lands while adjust_priority moves a READY thread to a new
+ * priority, held there by STALL_REPRIO: the stopped thread must not run. The
+ * change is made from hart 2, not the boot hart: the helper's own waits need
+ * the boot hart's timer expiry.
+ */
+static void *kw_reprio_call(void *raw)
+{
+    struct kw *w = raw;
+
+    (void) kw_pin(1U << 2, 1U << 2);
+    (void) pthread_setschedprio(w->t, KW_LOW + 1);
+    return NULL;
+}
+
+static void kw_reprio_stop(struct kw_serve *k)
+{
+    static struct kw w;
+    const char *what = "stop during a priority change of a READY thread";
+    pthread_t s1, call;
+    bool ready = false, armed = false, stopped = false, frozen = false;
+
+    w = (struct kw) {.t_mask = 1U << 1};
+    if (kw_make(&s1, KW_HIGH, kw_s1, &w) != EOK) {
+        test_fail(what, "spinner");
+        return;
+    }
+    for (int i = 0; i < 300 && !w.t_made; i++)
+        sleep_ms(10);
+    ready = w.t_made == 1 && wait_thread_state(w.t, STATE_READY);
+    armed = ready && kw_cmd(k, "stall-reprio %d %d %d", (int) getpid(),
+                            (int) w.t, KW_HOLD_MS) == 0;
+    if (armed) {
+        /* The helper stops the thread while this call is held in the window. */
+        char line[64];
+
+        snprintf(line, sizeof line, "site-wait reprio\npoke %d %d stop\n",
+                 (int) getpid(), (int) w.t);
+        kw_send(k, line);
+        if (pthread_create(&call, NULL, kw_reprio_call, &w) == EOK)
+            (void) pthread_join(call, NULL);
+        stopped = kw_line(k, line, sizeof line) &&
+                  kw_line(k, line, sizeof line) && atoi(line) == 0;
+        atomic_store(&w.stop_s1,
+                     1); /* hart 1 is free: the thread runs unless stopped */
+        frozen = kw_frozen(&w, 300);
+    }
+    check(armed && stopped, what,
+          "fixture: priority change not held or stop refused");
+    check(frozen, what,
+          "the stopped thread ran: the requeue did not see the stop");
+    atomic_store(&w.stop_s1, 1);
+    atomic_store(&w.stop_t, 1);
+    if (w.t_made == 1) {
+        (void) kw_cmd(k, "poke %d %d ready", (int) getpid(), (int) w.t);
+        (void) pthread_join(w.t, NULL);
+    }
+    (void) pthread_join(s1, NULL);
+}
+
 /* A steal held between its two dispatch locks (STALL_STEAL), and a stop in
  * that window: the stealer must not run a thread stopped in transit.
  */
@@ -5632,6 +5950,7 @@ int k65_windows(void)
     }
     (void) kw_pin(1U, ~0U); /* stay off harts 1 and 2 */
     kw_empty_peek(&k);
+    kw_reprio_stop(&k);
     kw_steal(&k, true);
     (void) kw_pin(~0U, ~0U);
     kw_serve_stop(&k);

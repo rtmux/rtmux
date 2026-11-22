@@ -8,6 +8,8 @@
 # One mode per line.
 boot    # waived: the same ^login: and /usr-before-login checks run through pci-nvme-smoke
 boot-manifest
+crash-inject    # waived: needs a gdb stub and a deliberately crashed guest (--gdb-on-timeout); run on demand, like hang-inject
+crash-inject-shutdown    # waived: as crash-inject, for a guest that crashes and powers off
 debug-inject
 fault-recovery
 fdt-cpu-status

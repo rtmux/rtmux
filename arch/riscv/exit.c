@@ -259,6 +259,11 @@ void __attribute__((noreturn)) kernel_exit(void)
                 pcpu_array[cpu].pc_kspin_depth--;
             }
         }
+        /* A timer that fell due while the boot hart was in a kernel call is
+         * expired here (clock_catch_up), not a tick later.
+         */
+        if (clock_catch_up_due(cpu))
+            clock_catch_up();
         thp = get_active_thread(cpu);
         if (!thp) {
             /* A hart about to idle settles its stale servers first. Interrupts
@@ -467,8 +472,16 @@ void __attribute__((noreturn)) kernel_exit(void)
             interrupt_enable();
             if (aflags & RTMUX_ATF_CANCEL) {
                 /* A cancel posted by another hart. Turn it into the owner-side
-                 * special return that redirects to the cancel stub. */
-                atomic_or(&thp->flags, RTMUX_FLG_THR_CANCELSELF);
+                 * special return that redirects to the cancel stub, unless the
+                 * thread has disabled cancellation since the canceller read it:
+                 * something else woke it first and it went on to disable. The
+                 * cancel stays pending in its TLS for the enable to act on.
+                 * The address space is the thread's by now (tls_flags_load),
+                 * unless it is bound to another process's: then deliver.
+                 */
+                if ((thp->as_prp && thp->as_prp != thp->process) ||
+                    !(tls_flags_load(thp) & PTHREAD_CANCEL_DISABLE))
+                    atomic_or(&thp->flags, RTMUX_FLG_THR_CANCELSELF);
                 /* Re-post the other bits we consumed (TIMESLICE/SMP_RESCHED
                  * ride the same IPI) so the next pass still reschedules. */
                 aflags &= ~(unsigned) RTMUX_ATF_CANCEL;

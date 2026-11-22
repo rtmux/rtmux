@@ -25,6 +25,7 @@
 #include <devctl/common.h>
 
 #include "bootstrap-manifest.h"
+#include "loader-end.h"
 #include "externs.h"
 #include "root-process.h"
 #include "root-log.h"
@@ -91,30 +92,36 @@ extern void *_mmap2(void *addr,
         _exit(code);                   \
     } while (0)
 
-/* A spawn fails after its loader started. Say why when the spawner is told
- * ENOMEM or the loader was killed, since neither names a cause: the loader
- * exits with the errno of whatever step failed (a cpiofs open or mapping at its
- * OCB limit, the stack mapping, ...), and a loader that faulted is reported as
- * ENOMEM too. Other errors (ENOENT, EACCES, ...) are ordinary and are not
- * logged. Rate limited.
+/* A spawn fails after its loader started. Say why when the reason is not an
+ * ordinary one (ENOENT, EACCES, ...), which the spawner's errno tells well
+ * enough: ENOMEM and EINVAL, where the loader exits with the errno of whatever
+ * step failed (a cpiofs open or mapping at its OCB limit, the stack mapping, a
+ * malformed argument block, ...) and only the line says which, and a loader
+ * that was killed. A client can provoke EINVAL at will with a raw request, so
+ * it has a rate limit of its own and cannot use up the other's.
  */
 static void loader_exit_note(const struct loader_context *lcp, pid_t pid,
                              int signo, int error)
 {
-    static atomic_uint nfail;
+    static atomic_uint nfail, ninval;
     unsigned n;
 
-    if ((signo == SIGCHLD && error != ENOMEM) || !(n = root_warn_due(&nfail)))
+    if (signo) {
+        if ((n = root_warn_due(&nfail)))
+            root_warn("spawn: loader of pid %d (parent %d) %s %d (failure "
+                      "%u): reported as %s\n",
+                      (int) pid, (int) lcp->ctx.ppid,
+                      signo > 0 ? "died of signal" : "left no exit record,",
+                      signo, n, strerror(error));
         return;
-    if (signo == SIGCHLD)
-        root_warn("spawn: loader of pid %d (parent %d) gave up at "
-                  "proc-loader.c:%d (failure %u): %s\n",
-                  (int) pid, (int) lcp->ctx.ppid, lcp->ctx.exit_line, n,
-                  strerror(error));
-    else
-        root_warn("spawn: loader of pid %d (parent %d) died of signal %d "
-                  "(failure %u): reported as %s\n",
-                  (int) pid, (int) lcp->ctx.ppid, signo, n, strerror(error));
+    }
+    if ((error != ENOMEM && error != EINVAL) ||
+        !(n = root_warn_due(error == EINVAL ? &ninval : &nfail)))
+        return;
+    root_warn("spawn: loader of pid %d (parent %d) gave up at "
+              "proc-loader.c:%d (failure %u): %s\n",
+              (int) pid, (int) lcp->ctx.ppid, lcp->ctx.exit_line, n,
+              strerror(error));
 }
 
 /* loader_exit — runs when a child died during loading (failed to exec, fault,
@@ -131,7 +138,6 @@ int loader_exit(ioserv_context_t *ctp, union proc_msg_union *msg, pid_t pid)
 {
     struct loader_context *lcp;
     root_proc_info_t qinfo;
-    root_process_t *tmp = root_proc(pid);
     int r, replied = 0;
 
     (void) ctp;
@@ -144,21 +150,12 @@ int loader_exit(ioserv_context_t *ctp, union proc_msg_union *msg, pid_t pid)
         return 0;
 
     if (lcp->ctx.rcvid != -1) {
-        /* siginfo lives in root_process_t now (POSIX policy moved out of the
-         * kernel-half process_t).
+        /* qinfo.siginfo is roottask's record of an exit when there is one
+         * (root_process_t), else the fault the kernel recorded.
          */
-        switch (tmp->siginfo.si_signo) {
-        case SIGCHLD:
-            r = tmp->siginfo.si_status;
-            break;
-        case SIGBUS:
-            r = (lcp->ctx.fault_errno != EOK) ? lcp->ctx.fault_errno : ENOMEM;
-            break;
-        default:
-            r = EINTR;
-            break;
-        }
-        loader_exit_note(lcp, pid, tmp->siginfo.si_signo, r);
+        int signo = loader_end(&qinfo.siginfo, &r);
+
+        loader_exit_note(lcp, pid, signo, r);
         msg_error(lcp->ctx.rcvid, r);
         replied = 1;
     }
@@ -597,7 +594,7 @@ static void loader_args(struct loader_context *lcp,
         root_process_t *tmp = root_proc(lcp->ctx.pid);
 
         /* not a full path, tack the CWD at the front */
-        cwd_len = path_node_fullpath(tmp->cwd, NULL, 0);
+        cwd_len = tmp->cwd ? path_node_fullpath(tmp->cwd, NULL, 0) : 0;
         if (cwd_len > 0) {
             int real_len;
 
@@ -686,10 +683,7 @@ static void loader_args(struct loader_context *lcp,
                            ~(STACK_ALIGNMENT - 1));
     lcp->ctx.start.start_sp = (uintptr_t) arg;
     if ((*(unsigned long *) arg = lcp->msg.spawn.i.nargv) == 0) {
-        do {
-            root_log("loader EINVAL @ %s:%d\n", __FILE__, __LINE__);
-            _exit(EINVAL);
-        } while (0);
+        LOADER_EXIT(EINVAL);
     }
 
     /* account for the interpreter and its arg if they are present */
@@ -734,17 +728,11 @@ static void loader_args(struct loader_context *lcp,
     redo:
         while (*p++ != '\0') {
             if (p > aux_exefile) {
-                do {
-                    root_log("loader EINVAL @ %s:%d\n", __FILE__, __LINE__);
-                    _exit(EINVAL);
-                } while (0);
+                LOADER_EXIT(EINVAL);
             }
         }
         if ((char *) arg > strings) {
-            do {
-                root_log("loader EINVAL @ %s:%d\n", __FILE__, __LINE__);
-                _exit(EINVAL);
-            } while (0);
+            LOADER_EXIT(EINVAL);
         }
         if (skip_arg0) { /* this makes us skip over two strings */
             skip_arg0 = 0;
@@ -849,6 +837,23 @@ static int try_hash_bang(int fd,
 
     return EOK;
 }
+
+#ifdef CONFIG_DEBUG_INJECT
+/* A spawn of a path that ends in rtmux-loader-fault makes its loader store
+ * through a null pointer, so a test can see what a faulting loader reports
+ * to the spawner. Only a CONFIG_DEBUG_INJECT image has this.
+ */
+static void loader_debug_fault(const char *path)
+{
+    static const char tag[] = "rtmux-loader-fault";
+    size_t len = strlen(path);
+
+    if (len >= sizeof tag - 1 && !strcmp(path + len - (sizeof tag - 1), tag))
+        *(volatile int *) (uintptr_t) 16 = 0;
+}
+#else
+#define loader_debug_fault(path) ((void) 0)
+#endif
 
 /* Open an executable for loading and stat it.
  *
@@ -1116,6 +1121,7 @@ void *loader_load(void *parm)
     (void) setreuid(geteuid(), 0);
     (void) setregid(getegid(), getgid());
 
+    loader_debug_fault(p);
     if (lcp->msg.spawn.i.parms.flags & SPAWN_SEARCH_PATH) {
         if (searchpath(p, search, buffer, sizeof buffer) == -1) {
             LOADER_EXIT(errno);

@@ -138,6 +138,7 @@ PATH_OBJECTS = \
 	path/cpiofs.o \
 	path/capfs.o \
 	path/sysfs.o \
+	path/sysfs-ocb.o \
 	path/namedsem.o
 
 # --- namesrv/ objects ---

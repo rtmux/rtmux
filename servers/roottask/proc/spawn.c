@@ -335,12 +335,15 @@ int proc_spawn_with_actions(ioserv_context_t *ctp, void *vmsg,
             return status;
         if (bytes > UINT_MAX - msgsize || bitmap > UINT_MAX - msgsize - bytes)
             return E2BIG;
-        if (!(lcp = loader_context_alloc(
-                  msgsize + bytes + bitmap,
-                  LC_SPAWN | (((ctp->info.flags & RTMUX_MI_ENDIAN_DIFF))
-                                  ? LC_CROSS_ENDIAN
-                                  : 0))))
-            return ENOMEM; /* loader_context_alloc logged the cause */
+        /* EAGAIN when no context can be had; the cause is logged there. */
+        status = loader_context_alloc(
+            ctp->info.pid, msgsize + bytes + bitmap,
+            LC_SPAWN | ((ctp->info.flags & RTMUX_MI_ENDIAN_DIFF)
+                            ? LC_CROSS_ENDIAN
+                            : 0),
+            &lcp);
+        if (status != EOK)
+            return status;
 
         if (bytes) {
             unsigned char *copy = (unsigned char *) &lcp->msg + msgsize;
@@ -387,11 +390,16 @@ int proc_spawn_with_actions(ioserv_context_t *ctp, void *vmsg,
 
             /* Signal default/ignore inheritance removed — signals eliminated */
 
+            /* A parent that ended meanwhile has no namespace to inherit; the
+             * child's loader then finds none and fails.
+             */
             if ((prp = root_proc_lock(ppid))) {
                 root_process_t *parent_tmp = root_proc(ppid);
                 root_process_t *child_tmp = root_proc(new_pid);
-                child_tmp->root = path_node_clone(parent_tmp->root);
-                child_tmp->cwd = path_node_clone(parent_tmp->cwd);
+                if (parent_tmp->root) {
+                    child_tmp->root = path_node_clone(parent_tmp->root);
+                    child_tmp->cwd = path_node_clone(parent_tmp->cwd);
+                }
 
                 root_proc_unlock(ppid);
             }
@@ -615,6 +623,12 @@ int proc_spawn_with_actions(ioserv_context_t *ctp, void *vmsg,
         if (!lcp || (uintptr_t) lcp >= (uintptr_t) -256L) {
             break;
         }
+
+        /* The start is committed and the loader has handed over: a SIGKILL
+         * kept meanwhile acts now. Not after a failed commit, when the thread
+         * is still the loader.
+         */
+        signal_loaded(ctp->info.pid);
         /* SignalProcmask removed - signals eliminated */
         if (lcp->ctx.flags & SPAWN_PROC_CAP) {
             rtmux_cap_t pcap = 0;

@@ -233,6 +233,9 @@
         ioserv_detach;
         ioserv_devino;
         ioserv_handler;
+        ioserv_ldisc_feed;
+        ioserv_ldisc_read;
+        ioserv_ldisc_set;
         ioserv_msg_again;
         ioserv_msgread;
         ioserv_msgreadv;
@@ -242,9 +245,6 @@
         ioserv_notify_init;
         ioserv_notify_ready;
         ioserv_notify_remove;
-        ioserv_ldisc_feed;
-        ioserv_ldisc_read;
-        ioserv_ldisc_set;
         ioserv_notify_trigger;
         ioserv_ocb;
         ioserv_open_bind;

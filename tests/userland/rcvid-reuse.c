@@ -93,10 +93,8 @@ static void *rr_server_main(void *raw)
     struct _notification n;
     struct _msg_info info;
     char req, rep = 'L'; /* the late answer */
-    uint64_t ns = RR_WAIT_MS * 1000000ULL;
 
-    (void) __timer_timeout(CLOCK_MONOTONIC, RTMUX_TIMEOUT_RECEIVE, NULL, &ns,
-                           NULL);
+    test_receive_within(RR_WAIT_MS * 1000000ULL);
     if (s->notification) {
         s->rcvid = msg_receive_notification(s->chid, &n, sizeof n, NULL) == 0 &&
                            n.code == _NOTIFICATION_CODE_UNBLOCK
@@ -119,30 +117,12 @@ static void *rr_server_main(void *raw)
     return NULL;
 }
 
-static bool rr_wait(atomic_int *flag, int want)
-{
-    for (int i = 0; i < RR_WAIT_MS && atomic_load(flag) < want; i++)
-        sleep_ms(1);
-    return atomic_load(flag) >= want;
-}
-
 static int rr_receive(int chid)
 {
     char req;
-    uint64_t ns = RR_WAIT_MS * 1000000ULL;
 
-    (void) __timer_timeout(CLOCK_MONOTONIC, RTMUX_TIMEOUT_RECEIVE, NULL, &ns,
-                           NULL);
+    test_receive_within(RR_WAIT_MS * 1000000ULL);
     return msg_receive(chid, &req, 1, NULL);
-}
-
-static bool rr_open(unsigned flags, int *chid, int *coid)
-{
-    *coid = -1;
-    *chid = channel_create(flags);
-    if (*chid != -1)
-        *coid = connect_attach(0, getpid(), *chid, RTMUX_SIDE_CHANNEL, 0);
-    return *coid != -1;
 }
 
 /* One case. The late thread is given the id of the client's first request:
@@ -179,8 +159,8 @@ static void rr_case(enum rr_mode mode)
     int chid, coid, first = -1, second = -1;
     bool refused, started_late = false;
 
-    if (!rr_open(mode == RR_UNBLOCK ? RTMUX_FLG_CHF_UNBLOCK : 0, &chid,
-                 &coid)) {
+    if (!test_chan_open(mode == RR_UNBLOCK ? RTMUX_FLG_CHF_UNBLOCK : 0, &chid,
+                        &coid)) {
         test_fail(name, "channel setup failed");
         return;
     }
@@ -214,7 +194,7 @@ static void rr_case(enum rr_mode mode)
             test_fail(name, "the late server did not wait");
         atomic_store(&client->go, 1);
     }
-    if (!rr_wait(&late->taken, 1) || late->rcvid == -1 ||
+    if (!test_wait_flag(&late->taken, 1, RR_WAIT_MS) || late->rcvid == -1 ||
         (mode == RR_UNBLOCK && late->rcvid != first)) {
         snprintf(detail, sizeof detail, "request=%d, the late server got %d",
                  first, late->rcvid);
@@ -228,7 +208,7 @@ static void rr_case(enum rr_mode mode)
      */
     if (mode != RR_TIMEOUT)
         (void) msg_reply(first, 0, &one, 1);
-    if (!rr_wait(&client->sent, 1)) {
+    if (!test_wait_flag(&client->sent, 1, RR_WAIT_MS)) {
         test_fail(name, "the first send did not return");
         goto out;
     }
@@ -246,7 +226,7 @@ static void rr_case(enum rr_mode mode)
 
     /* Now the late thread acts on what it was given. */
     atomic_store(&late->act, 1);
-    if (!rr_wait(&late->acted, 1)) {
+    if (!test_wait_flag(&late->acted, 1, RR_WAIT_MS)) {
         test_fail(name, "the late server did not return");
         goto out;
     }
@@ -268,7 +248,7 @@ static void rr_case(enum rr_mode mode)
      */
     if (second != -1 && mode != RR_HANDED_ON)
         (void) msg_reply(second, 0, &two, 1);
-    if (rr_wait(&client->sent, 2)) {
+    if (test_wait_flag(&client->sent, 2, RR_WAIT_MS)) {
         snprintf(detail, sizeof detail, "second send rc=%d errno=%d answer=%d",
                  client->rc[1], client->rc[1] == -1 ? client->err[1] : 0,
                  client->answer[1]);

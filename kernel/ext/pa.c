@@ -1955,12 +1955,60 @@ struct kcall_args_pa_sizes {
     memsize_t free_unreserved;
     memsize_t reserved;
     memsize_t total;
+    memsize_t largest_free_run;
+    unsigned flags; /* in: PA_SIZES_LARGEST_RUN to have largest_free_run */
 };
+#define PA_SIZES_LARGEST_RUN 1U
+
+/* pa_largest_free_run — bytes of the longest run of free quanta, which is the
+ * largest contiguous allocation that can succeed now. A free run is on a queue
+ * of its block: runs shorter than PA_FREE_QUEUES quanta on the queue of their
+ * length, all others on the default queue (PA_DEFAULT_QUEUE, 0). The walk is
+ * under pa_slock, with interrupts off, and anyone may cause it by reading
+ * /sys/kstats, so it visits at most PA_LARGEST_RUN_VISITS default-queue runs
+ * in all. It passes over a block whose cached max_free_run (an upper bound:
+ * enqueue_run raises it, a carve does not lower it) cannot beat the best so
+ * far, and stops in a block at a run that meets the bound; enqueue_run puts a
+ * run that raises the bound first. So the result is exact unless memory is
+ * fragmented into more large free runs than that, and then a lower bound that
+ * has seen the runs most recently freed at the largest size.
+ */
+#define PA_LARGEST_RUN_VISITS 256
+_Static_assert(PA_DEFAULT_QUEUE == 0,
+               "pa_largest_free_run scans queues 1 .. PA_FREE_QUEUES - 1");
+static memsize_t pa_largest_free_run(void)
+{
+    struct block_head **rover, *bh;
+    size_t best = 0;
+    unsigned visits = PA_LARGEST_RUN_VISITS;
+
+    kspinlock_lock(&pa_slock);
+    for (rover = blk_head; (bh = *rover); rover++) {
+        struct pa_quantum *qp;
+
+        if (bh->max_free_run <= best)
+            continue;
+        for (qp = bh->free[PA_DEFAULT_QUEUE].next;
+             qp != FREE_LIST_END(bh, PA_DEFAULT_QUEUE) &&
+             best < bh->max_free_run && visits;
+             qp = qp->u.flink.next, visits--)
+            if (qp->run > 0 && (size_t) qp->run > best)
+                best = (size_t) qp->run;
+        for (size_t q = PA_FREE_QUEUES - 1; q > best; q--)
+            if (!FREE_LIST_EMPTY(bh, q)) {
+                best = q;
+                break;
+            }
+    }
+    kspinlock_unlock(&pa_slock);
+    return NQUANTUM_TO_LEN((memsize_t) best);
+}
 
 
 /* kext_pa_get_sizes — report memory totals to roottask. Parameters:
  *   data : struct kcall_args_pa_sizes * (used, free_unreserved, reserved,
- *          total written)
+ *          total written; largest_free_run too when flags asks for it, since
+ *          only a kstats read wants the walk it takes, else 0)
  */
 void kext_pa_get_sizes(void *data)
 {
@@ -1968,5 +2016,7 @@ void kext_pa_get_sizes(void *data)
     pa_get_sizes(&kap->used, &kap->free_unreserved);
     kap->reserved = mem_reserved_size;
     kap->total = sysram_attr.size;
+    kap->largest_free_run =
+        (kap->flags & PA_SIZES_LARGEST_RUN) ? pa_largest_free_run() : 0;
     kext_status(NULL, 0);
 }

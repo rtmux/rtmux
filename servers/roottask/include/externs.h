@@ -183,7 +183,10 @@ extern const char os_version_string[];
  */
 void signal_kill(channel_t *chp, int signo, pid_t sender_pid);
 void signal_post_locked(pid_t pid, channel_t *chp, int signo, pid_t sender);
-void signal_flush_early_locked(pid_t pid);
+int signal_flush_early_locked(pid_t pid);
+void signal_loaded(pid_t pid);
+int proc_exit_begin_locked(pid_t pid, int status, int by_signal);
+void proc_exit_finish(pid_t pid);
 
 /* DBGOUT — now in <kernel/log.h> */
 #include <log.h>

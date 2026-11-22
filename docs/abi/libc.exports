@@ -232,6 +232,9 @@ ioserv_context_free	FUNC	GLOBAL	DEFAULT	-
 ioserv_detach	FUNC	GLOBAL	DEFAULT	-
 ioserv_devino	FUNC	GLOBAL	DEFAULT	-
 ioserv_handler	FUNC	GLOBAL	DEFAULT	-
+ioserv_ldisc_feed	FUNC	GLOBAL	DEFAULT	-
+ioserv_ldisc_read	FUNC	GLOBAL	DEFAULT	-
+ioserv_ldisc_set	FUNC	GLOBAL	DEFAULT	-
 ioserv_msg_again	FUNC	GLOBAL	DEFAULT	-
 ioserv_msgread	FUNC	GLOBAL	DEFAULT	-
 ioserv_msgreadv	FUNC	GLOBAL	DEFAULT	-

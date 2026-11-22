@@ -186,6 +186,8 @@ static struct {
     [STALL_SYNC_WAKER] = {.pid = -1},
     [STALL_BLOCK] = {.pid = -1},
     [STALL_STEAL] = {.pid = -1},
+    [STALL_CANCEL] = {.pid = -1},
+    [STALL_REPRIO] = {.pid = -1},
     [STALL_REPLY_CLAIM] = {.pid = -1},
     [STALL_REPLY_UNBLOCK] = {.pid = -1},
     [STALL_CLAIM_HELD] = {.pid = -1},
@@ -194,6 +196,8 @@ static struct {
     [STALL_READY] = {.pid = -1},
     [STALL_SWITCH] = {.pid = -1},
     [STALL_SEND_PICK] = {.pid = -1},
+    [STALL_UNBLOCK_FORCE] = {.pid = -1},
+    [STALL_UNBLOCK_REPLY] = {.pid = -1},
 };
 
 static _Atomic(thread_t *) stalled_waiter;
@@ -203,6 +207,7 @@ static atomic_int intr_after_select_pid;
 static atomic_int intr_select_seen;
 static atomic_uint stall_block_tid; /* pthread_t the STALL_BLOCK site waits for */
 static atomic_uint stall_steal_tid; /* and the STALL_STEAL site */
+static atomic_uint stall_reprio_tid;  /* and the STALL_REPRIO site */
 atomic_uint inject_empty_steal_locks; /* SCHED_STATS 0 */
 
 /* POKE: find thread tid (pthread_t) of pid, pinned, and wake or stop it. */
@@ -268,14 +273,12 @@ void inject_intr_after_select(thread_t *thp, const thread_t *chosen)
  *
  * Returns whether the stall was taken.
  */
-static bool inject_stall_until(enum inject_site site,
+static bool inject_stall_claim(enum inject_site site,
                                const process_t *prp,
-                               thread_t *waiter,
-                               void *const volatile *watch)
+                               uint64_t *end)
 {
     int pid = atomic_load_explicit(&stall_site[site].pid, memory_order_acquire);
     uint64_t ms;
-    uint64_t end;
 
     if (pid < 0 || !prp || prp->pid != pid)
         return false;
@@ -285,7 +288,19 @@ static bool inject_stall_until(enum inject_site site,
                                                  -1, memory_order_acq_rel,
                                                  memory_order_relaxed))
         return false;
-    end = r_time() + ms * (qtimeptr->cycles_per_sec / 1000);
+    *end = r_time() + ms * (qtimeptr->cycles_per_sec / 1000);
+    return true;
+}
+
+static bool inject_stall_until(enum inject_site site,
+                               const process_t *prp,
+                               thread_t *waiter,
+                               void *const volatile *watch)
+{
+    uint64_t end;
+
+    if (!inject_stall_claim(site, prp, &end))
+        return false;
     if (waiter) {
         atomic_store_explicit(&wake_claims, 0, memory_order_relaxed);
         atomic_store_explicit(&stalled_waiter, waiter, memory_order_release);
@@ -356,6 +371,14 @@ void inject_force_ready_stall(thread_t *thp)
     inject_stall_once(STALL_FORCE_READY, thp->process, NULL);
 }
 
+/* Called from ksys_thread_cancel between its read of a foreign target's wait
+ * and the cancel it posts.
+ */
+void inject_cancel_stall(thread_t *thp)
+{
+    inject_stall_once(STALL_CANCEL, thp->process, NULL);
+}
+
 void inject_sync_waker_stall(thread_t *thp)
 {
     inject_stall_once(STALL_SYNC_WAKER, thp->process, thp);
@@ -372,6 +395,16 @@ void inject_steal_stall(thread_t *thp)
     if (thp->tid + 1 ==
         atomic_load_explicit(&stall_steal_tid, memory_order_acquire))
         inject_stall_once(STALL_STEAL, thp->process, NULL);
+}
+
+/* Called by adjust_priority with a READY thp requeued at its new priority and
+ * that run queue locked.
+ */
+void inject_reprio_stall(thread_t *thp)
+{
+    if (thp->tid + 1 ==
+        atomic_load_explicit(&stall_reprio_tid, memory_order_acquire))
+        inject_stall_once(STALL_REPRIO, thp->process, NULL);
 }
 
 void inject_block_stall(thread_t *thp)
@@ -432,6 +465,26 @@ void inject_claim_held(void)
         (void) inject_stall_until(STALL_CLAIM_HELD, act->process, NULL, NULL);
 }
 
+/* HOLD_EXIT_DESTROY: the process whose thread destruction is held, and until
+ * when (r_time).
+ */
+static atomic_int exit_hold_pid = -1;
+static _Atomic uint64_t exit_hold_end;
+
+/* Whether kext_exit_destroy_threads must ask for another pass for prp. */
+bool inject_exit_destroy_held(const process_t *prp)
+{
+    int pid = atomic_load_explicit(&exit_hold_pid, memory_order_acquire);
+
+    if (pid < 0 || prp->pid != pid)
+        return false;
+    if (r_time() < atomic_load_explicit(&exit_hold_end, memory_order_relaxed))
+        return true;
+    (void) atomic_compare_exchange_strong_explicit(
+        &exit_hold_pid, &pid, -1, memory_order_acq_rel, memory_order_relaxed);
+    return false;
+}
+
 /* Called by force_ready when it finds thp claimed, before it hands its wake
  * over: let the claimer that inject_claim_held() holds go, and give it time
  * to release the claim.
@@ -459,6 +512,51 @@ void inject_force_ready_claimed(thread_t *thp)
     while ((thp->internal_flags & RTMUX_ITF_MSG_DELIVERY) && r_time() < end)
         __asm__ volatile("" ::: "memory");
     inject_spin_end();
+}
+
+/* Claim the one-shot stall armed at site for prp and spin until thp has one
+ * of the internal flags in bits set, the site is released, or its time
+ * passes.
+ */
+static void inject_stall_for_flags(enum inject_site site,
+                                   const process_t *prp,
+                                   const thread_t *thp,
+                                   unsigned bits)
+{
+    uint64_t end;
+
+    if (!inject_stall_claim(site, prp, &end))
+        return;
+    atomic_store_explicit(&stall_site[site].taken, true, memory_order_release);
+    inject_spin_begin();
+    while (!(__atomic_load_n(&thp->internal_flags, __ATOMIC_ACQUIRE) & bits) &&
+           !atomic_load_explicit(&stall_site[site].release,
+                                 memory_order_acquire) &&
+           r_time() < end)
+        __asm__ volatile("" ::: "memory");
+    inject_spin_end();
+}
+
+/* Called by force_ready on a reply-blocked thp before it takes the channel
+ * lock to test the claim and decide on thp's unblock notification: wait for a
+ * reply to claim thp (at once, if one already has).
+ */
+void inject_unblock_force_window(thread_t *thp)
+{
+    inject_stall_for_flags(STALL_UNBLOCK_FORCE, thp->process, thp,
+                           RTMUX_ITF_MSG_DELIVERY);
+}
+
+/* Called by a reply or an error that has claimed client and looked for its
+ * unblock notification: wait for a timeout to mark one queued.
+ */
+void inject_unblock_reply_window(const thread_t *client)
+{
+    thread_t *act = get_active_thread(get_cpunum());
+
+    if (act)
+        inject_stall_for_flags(STALL_UNBLOCK_REPLY, act->process, client,
+                               RTMUX_ITF_UNBLOCK_QUEUED);
 }
 
 /* Whether the reply that just removed an unblock notification restarts as if
@@ -747,6 +845,9 @@ void kext_debug_inject(void *data)
     case INJECT_OP_STALL_FORCE_READY:
         ret = inject_stall_arm(STALL_FORCE_READY, kap->arg0, kap->arg1);
         break;
+    case INJECT_OP_STALL_CANCEL:
+        ret = inject_stall_arm(STALL_CANCEL, kap->arg0, kap->arg1);
+        break;
     case INJECT_OP_INTR_SELECT_SEEN:
         ret = atomic_exchange_explicit(&intr_select_seen, 0,
                                        memory_order_acq_rel);
@@ -768,16 +869,14 @@ void kext_debug_inject(void *data)
         break;
     case INJECT_OP_CRASH:
         if (kap->arg0 == INJECT_CRASH_SHUTDOWN) {
-            /* A register block of this kernel frame, not the caller's user
-             * context: shutdown() reads the bytes at its pc and sp.
+            /* The power-off a roottask crash ends in (root_crash, through
+             * __KSYS_PRIV_REBOOT): report, then the abnormal reboot, which
+             * shuts the machine down through the SBI.
              */
-            CPU_REGISTERS regs;
-
-            memset(&regs, 0, sizeof regs);
-            REGIP(&regs) = (uintptr_t) kext_debug_inject;
-            REGSP(&regs) = (uintptr_t) __builtin_frame_address(0);
-            shutdown(SIGCODE_FATAL | MAKE_SIGCODE(SIGSEGV, SEGV_MAPERR, 0),
-                     &regs);
+            kprintf("FATAL: power-off crash requested by debug-inject on "
+                    "hart %u\n",
+                    self);
+            system_reboot(1);
         } else if (kap->arg0 != 0) {
             ret = EINVAL;
             break;
@@ -787,6 +886,20 @@ void kext_debug_inject(void *data)
         break;
     case INJECT_OP_POKE:
         ret = inject_poke(kap->arg0, kap->arg1);
+        break;
+    case INJECT_OP_HOLD_EXIT_DESTROY:
+        if (kap->arg0 > INT32_MAX || kap->arg1 == 0 ||
+            kap->arg1 > INJECT_SPIN_MAX_MS) {
+            ret = EINVAL;
+            break;
+        }
+        atomic_store_explicit(&exit_hold_end,
+                              r_time() + kap->arg1 *
+                                             (qtimeptr->cycles_per_sec / 1000),
+                              memory_order_relaxed);
+        atomic_store_explicit(&exit_hold_pid, (int) kap->arg0,
+                              memory_order_release);
+        ret = EOK;
         break;
     case INJECT_OP_SCHED_STATS:
         ret = kap->arg0 == 0
@@ -798,6 +911,11 @@ void kext_debug_inject(void *data)
         atomic_store_explicit(&stall_steal_tid, (unsigned) (kap->arg1 >> 32),
                               memory_order_release);
         ret = inject_stall_arm(STALL_STEAL, kap->arg0, (uint32_t) kap->arg1);
+        break;
+    case INJECT_OP_STALL_REPRIO:
+        atomic_store_explicit(&stall_reprio_tid, (unsigned) (kap->arg1 >> 32),
+                              memory_order_release);
+        ret = inject_stall_arm(STALL_REPRIO, kap->arg0, (uint32_t) kap->arg1);
         break;
     case INJECT_OP_STALL_BLOCK:
         atomic_store_explicit(&stall_block_tid, (unsigned) (kap->arg1 >> 32),
@@ -857,6 +975,11 @@ void kext_debug_inject(void *data)
         atomic_store_explicit(&reply_claim_detached, false,
                               memory_order_relaxed);
         ret = inject_stall_arm(STALL_REPLY_CLAIM, kap->arg0, kap->arg1);
+        break;
+    case INJECT_OP_STALL_UNBLOCK_RACE:
+        ret = inject_stall_arm(STALL_UNBLOCK_FORCE, kap->arg0, kap->arg1);
+        if (ret == EOK)
+            ret = inject_stall_arm(STALL_UNBLOCK_REPLY, kap->arg0, kap->arg1);
         break;
     case INJECT_OP_PREEMPT_REPLY_UNBLOCK:
         ret = inject_stall_arm(STALL_REPLY_UNBLOCK, kap->arg0, 1);

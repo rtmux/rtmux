@@ -781,10 +781,22 @@ static uint64_t msg_request_seq;
 
 /* One counter for all harts: an identity must differ from every other one a
  * server can still hold, whichever thread object or hart it came from.
+ *
+ * The unblock state of the last request goes with it. Only a reply or an
+ * error removes a queued unblock notification and its mark; a request that
+ * ends any other way (a channel destroy drain, a ConnectDetach, a server that
+ * is terminating) leaves them set, and a mark left set makes force_ready send
+ * no notification for the next request. A force_ready still at work on
+ * the last request checks the identity under the channel lock before it
+ * marks, so the new identity is published first.
  */
 void msg_request_begin(thread_t *sender)
 {
-    sender->req_gen = __atomic_add_fetch(&msg_request_seq, 1, __ATOMIC_RELAXED);
+    __atomic_store_n(&sender->req_gen,
+                     __atomic_add_fetch(&msg_request_seq, 1, __ATOMIC_RELAXED),
+                     __ATOMIC_RELEASE);
+    ITF_CLR(sender, RTMUX_ITF_UNBLOCK_QUEUED);
+    atomic_clr(&sender->flags, RTMUX_FLG_THR_UNBLOCK_REQ);
 }
 
 static int msg_request_rcvid(const thread_t *client, const connect_t *cop)

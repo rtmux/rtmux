@@ -160,7 +160,9 @@ static inline pte_t *sv39_walk_slot(pagetable_t pgdir,
  * PROT never create a table: a missing one holds nothing to change, so it is
  * skipped, but EEXIST over a superpage is reported, since neither can act on
  * part of one. PROT keeps the PPN and the attribute bits above it (Svpbmt,
- * Svnapot) and replaces bits 0..9 with bits.
+ * Svnapot) and replaces bits 0..9 with bits. BAD creates tables like MAP and
+ * writes the invalid PTE_SW_BUS mark over whatever each slot held; UNMAP clears
+ * that mark too, and PROT leaves it as it is.
  *
  * Progress is kept in the caller's variables after each level-zero table run: *startp is the
  * first page not done and, for MAP, *paddrp the frame it gets, so on an error
@@ -176,7 +178,7 @@ static inline int sv39_manip_pages(pagetable_t pgdir,
                                    sv39_alloc_fn alloc,
                                    int *changedp)
 {
-    int create = op == PTE_OP_MAP || op == PTE_OP_PREALLOC;
+    int create = op == PTE_OP_MAP || op == PTE_OP_BAD || op == PTE_OP_PREALLOC;
 
     uintptr_t va = *startp;
     while (va < end) {
@@ -194,8 +196,17 @@ static inline int sv39_manip_pages(pagetable_t pgdir,
                 if (op == PTE_OP_MAP) {
                     pte[i] = PA2PTE(*paddrp) | bits;
                     *paddrp += PGSIZE;
+                } else if (op == PTE_OP_BAD || op == PTE_OP_UNMAP) {
+                    /* Rewriting an invalid entry needs no TLB flush: no
+                     * hart can hold a translation for it.
+                     */
+                    pte_t old = pte[i];
+
+                    pte[i] = op == PTE_OP_BAD ? PTE_SW_BUS : 0;
+                    if (!(old & PTE_V))
+                        continue;
                 } else if (pte[i] & PTE_V) {
-                    pte[i] = op == PTE_OP_UNMAP ? 0 : (pte[i] & ~PTE_FLAG_BITS) | bits;
+                    pte[i] = (pte[i] & ~PTE_FLAG_BITS) | bits;
                 } else {
                     continue;
                 }
@@ -206,6 +217,18 @@ static inline int sv39_manip_pages(pagetable_t pgdir,
         *startp = va;
     }
     return 0;
+}
+
+/* sv39_past_end — whether va lies on a page marked PTE_SW_BUS: part of a
+ * mapping, but past the end of the object it maps. Only an invalid level-zero
+ * entry carries the mark, so a superpage or a missing table on the way says
+ * no.
+ */
+static inline int sv39_past_end(pagetable_t pgdir, uintptr_t va)
+{
+    pte_t *pte = sv39_walk_slot(pgdir, va, NULL, NULL);
+
+    return pte && (*pte & (PTE_V | PTE_SW_BUS)) == PTE_SW_BUS;
 }
 
 /* Kernel entry point for sv39_lookup_leaf (arch/riscv/cpu-pte.c). */

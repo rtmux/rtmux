@@ -169,6 +169,12 @@ typedef struct root_process_entry {
      */
     unsigned char execed;
 
+    /* proc_exit_begin_locked has started this process's exit: the status
+     * wait() reports is decided and nobody starts a second one. Under
+     * root_proc_lock(pid).
+     */
+    unsigned char exit_begun;
+
     /* Job control: which of SIGTTIN/SIGTTOU the process blocks or ignores
      * (_JOBCTL_HOLD_* bits), as its libc reports through _PROC_JOBCTL_STATE. A
      * terminal server reads it to choose between EIO and a stop signal.

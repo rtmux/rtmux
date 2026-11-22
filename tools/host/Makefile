@@ -35,12 +35,13 @@ PROGS = $(BUILD_BASE)/mkasmoff $(BUILD_BASE)/mkromfs $(BUILD_BASE)/treeromfs \
         $(BUILD_BASE)/bootstrap-manifest-test $(BUILD_BASE)/elf-range-test \
         $(BUILD_BASE)/ldso-hash-test $(BUILD_BASE)/ldso-page-test \
         $(BUILD_BASE)/ldso-parse-test $(BUILD_BASE)/ldso-path-test \
-        $(BUILD_BASE)/ticket-lock-test $(BUILD_BASE)/tty-ldisc-test $(BUILD_BASE)/spawn-search-test $(BUILD_BASE)/cpio-parser-test $(BUILD_BASE)/spawn-fd-policy-test \
+        $(BUILD_BASE)/ticket-lock-test $(BUILD_BASE)/tty-ldisc-test $(BUILD_BASE)/spawn-search-test $(BUILD_BASE)/cpio-parser-test $(BUILD_BASE)/spawn-fd-policy-test $(BUILD_BASE)/loader-end-test \
         $(BUILD_BASE)/serial-reply-test $(BUILD_BASE)/open-bind-test $(BUILD_BASE)/outcomes-test \
         $(BUILD_BASE)/sv39-lookup-test $(BUILD_BASE)/sv39-manip-test \
         $(BUILD_BASE)/strftime-test $(BUILD_BASE)/sh-scan-test $(BUILD_BASE)/tz-test \
         $(BUILD_BASE)/malloc-stats-test $(BUILD_BASE)/pci-args-test \
         $(BUILD_BASE)/libc-algorithms-test $(BUILD_BASE)/pgrp-table-test $(BUILD_BASE)/process-slot-test \
+        $(BUILD_BASE)/sysfs-ocb-test \
         $(BUILD_BASE)/heap-arena-test $(BUILD_BASE)/kernel-alloc-test $(BUILD_BASE)/iodir-test
 
 # Each tool compiles and links its sources in one command, so -MMD cannot give a
@@ -86,6 +87,12 @@ $(BUILD_BASE)/spawn-fd-policy-test: $(TEST_DIR)/test-spawn-fd-policy.c \
 	$(Q)$(HOST_CC) $(HOST_CPPFLAGS) -I../../internal/include -I../../include $(HOST_CFLAGS) -o $@ \
 	    $(TEST_DIR)/test-spawn-fd-policy.c
 
+$(BUILD_BASE)/loader-end-test: $(TEST_DIR)/test-loader-end.c \
+                               ../../servers/roottask/include/loader-end.h
+	@mkdir -p $(@D)
+	$(msg) HOSTCC $(notdir $@)
+	$(Q)$(HOST_CC) -I../../servers/roottask/include $(HOST_CFLAGS) -o $@ $(TEST_DIR)/test-loader-end.c
+
 $(BUILD_BASE)/pgrp-table-test: $(TEST_DIR)/test-pgrp-table.c \
                                ../../servers/roottask/proc/pgrp-table.c \
                                ../../servers/roottask/include/pgrp-table.h
@@ -98,6 +105,17 @@ $(BUILD_BASE)/process-slot-test: $(TEST_DIR)/test-process-slot.c ../../servers/r
 	@mkdir -p $(@D)
 	$(msg) HOSTCC $(notdir $@)
 	$(Q)$(HOST_CC) -I../../servers/roottask/include $(HOST_CFLAGS) -pthread -o $@ $<
+
+# roottask's /sys OCB pool, from several threads at once.
+$(BUILD_BASE)/sysfs-ocb-test: $(TEST_DIR)/test-sysfs-ocb.c ../../servers/roottask/path/sysfs-ocb.c \
+                              ../../servers/roottask/include/root-mutex.h \
+                              ../../servers/roottask/path/sysfs-ocb.h
+	@mkdir -p $(@D)
+	$(msg) HOSTCC $(notdir $@)
+	$(Q)$(HOST_CC) -I../../servers/roottask/path -I../../servers/roottask/include \
+	    -idirafter ../../internal/include \
+	    -DCONFIG_SERVER_POOL_CANARY $(HOST_CFLAGS) -pthread -o $@ \
+	    $(TEST_DIR)/test-sysfs-ocb.c ../../servers/roottask/path/sysfs-ocb.c
 
 # Outcome accounting (pass/fail/gap/skip) shared with the guest suite.
 $(BUILD_BASE)/outcomes-test: $(TEST_DIR)/test-outcomes.c
@@ -433,7 +451,7 @@ host-tests: $(BUILD_BASE)/path-normalize-test $(BUILD_BASE)/cap-table-test \
             $(BUILD_BASE)/bootstrap-manifest-test $(BUILD_BASE)/elf-range-test \
             $(BUILD_BASE)/ldso-hash-test $(BUILD_BASE)/ldso-page-test \
             $(BUILD_BASE)/ldso-parse-test $(BUILD_BASE)/ldso-path-test \
-            $(BUILD_BASE)/ticket-lock-test $(BUILD_BASE)/tty-ldisc-test $(BUILD_BASE)/spawn-search-test $(BUILD_BASE)/cpio-parser-test $(BUILD_BASE)/spawn-fd-policy-test \
+            $(BUILD_BASE)/ticket-lock-test $(BUILD_BASE)/tty-ldisc-test $(BUILD_BASE)/spawn-search-test $(BUILD_BASE)/cpio-parser-test $(BUILD_BASE)/spawn-fd-policy-test $(BUILD_BASE)/loader-end-test \
             $(BUILD_BASE)/serial-reply-test $(BUILD_BASE)/open-bind-test $(BUILD_BASE)/outcomes-test \
             $(BUILD_BASE)/sv39-lookup-test $(BUILD_BASE)/sv39-manip-test \
             $(BUILD_BASE)/strftime-test $(BUILD_BASE)/strftime-asan-test \
@@ -441,7 +459,7 @@ host-tests: $(BUILD_BASE)/path-normalize-test $(BUILD_BASE)/cap-table-test \
             $(BUILD_BASE)/tz-test $(BUILD_BASE)/tz-asan-test $(TZ_ZONES)/.stamp \
             $(BUILD_BASE)/malloc-stats-test $(BUILD_BASE)/pci-args-test \
             $(BUILD_BASE)/pgrp-table-test $(BUILD_BASE)/process-slot-test $(BUILD_BASE)/heap-arena-test $(BUILD_BASE)/kernel-alloc-test \
-            $(BUILD_BASE)/sh-host $(BUILD_BASE)/iodir-test
+            $(BUILD_BASE)/sysfs-ocb-test $(BUILD_BASE)/sh-host $(BUILD_BASE)/iodir-test
 	$(Q)$<
 	$(Q)$(BUILD_BASE)/iodir-test
 	$(Q)$(BUILD_BASE)/cap-table-test
@@ -456,8 +474,10 @@ host-tests: $(BUILD_BASE)/path-normalize-test $(BUILD_BASE)/cap-table-test \
 	$(Q)$(BUILD_BASE)/spawn-search-test
 	$(Q)$(BUILD_BASE)/ticket-lock-test
 	$(Q)$(BUILD_BASE)/spawn-fd-policy-test
+	$(Q)$(BUILD_BASE)/loader-end-test
 	$(Q)$(BUILD_BASE)/pgrp-table-test
 	$(Q)$(BUILD_BASE)/process-slot-test
+	$(Q)$(BUILD_BASE)/sysfs-ocb-test
 	$(Q)$(BUILD_BASE)/serial-reply-test
 	$(Q)$(BUILD_BASE)/open-bind-test
 	$(Q)$(BUILD_BASE)/outcomes-test >/dev/null

@@ -152,13 +152,16 @@ static const struct toolbox_applet applets[] = {
      "fail-sched-set PID COUNT | sched-set-status | "
      "sched-set-displaced MIN | stall-lock PID MS | "
      "stall-lock-early PID MS | stall-lock-propagated PID MS | "
-     "stall-force-ready PID MS | stall-sync-waker PID MS | sync-wake-claims | "
+     "stall-force-ready PID MS | stall-cancel PID MS | "
+     "stall-sync-waker PID MS | sync-wake-claims | "
      "intr-before-switch PID | intr-after-select PID | intr-select-seen [TID] "
      "| "
      "stall-block PID TID [MS] | stall-ready PID TID MS | stall-steal PID TID MS | "
-     "poke PID TID ready|stop | sched-stats | serve | "
+     "stall-reprio PID TID MS | "
+     "poke PID TID ready|stop | sched-stats | serve | hold-exit-destroy PID MS | "
      "stall-switch PID TID MS | crash [shutdown] | stall-reply-claim PID MS | "
-     "preempt-reply-unblock PID | xfer-trace PID | xfer-stats N | "
+     "preempt-reply-unblock PID | stall-unblock-race PID MS | "
+     "xfer-trace PID | xfer-stats N | "
      "stall-claim-held PID MS | stall-force-claimed PID MS | "
      "stall-cap-peek PID TID | stall-send-pick PID TID | grant-ipc-cap PID | "
      "pte-superpage PID VA | "
@@ -3192,6 +3195,10 @@ static int applet_inject(int argc, char **argv)
             [STALL_CAP_PEEK] = "cap-peek",
             [STALL_SEND_PICK] = "send-pick",
             [STALL_STEAL] = "steal",
+            [STALL_CANCEL] = "cancel",
+            [STALL_REPRIO] = "reprio",
+            [STALL_UNBLOCK_FORCE] = "unblock-force",
+            [STALL_UNBLOCK_REPLY] = "unblock-reply",
             [INJECT_SITE_TURNSTILE] = "turnstile",
             [INJECT_SITE_REPLY_DETACHED] = "reply-detached",
         };
@@ -3263,8 +3270,11 @@ static int applet_inject(int argc, char **argv)
     } else if (argc == 3 && !strcmp(argv[1], "crash") &&
                !strcmp(argv[2], "shutdown")) {
         rc = inject_call(INJECT_OP_CRASH, INJECT_CRASH_SHUTDOWN, 0);
-    } else if (argc == 5 && !strcmp(argv[1], "stall-steal")) {
-        rc = inject_call(INJECT_OP_STALL_STEAL, strtoul(argv[2], NULL, 0),
+    } else if (argc == 5 && (!strcmp(argv[1], "stall-steal") ||
+                             !strcmp(argv[1], "stall-reprio"))) {
+        rc = inject_call(!strcmp(argv[1], "stall-steal") ? INJECT_OP_STALL_STEAL
+                                                         : INJECT_OP_STALL_REPRIO,
+                         strtoul(argv[2], NULL, 0),
                          strtoul(argv[3], NULL, 0) << 32 |
                              strtoul(argv[4], NULL, 0));
     } else if ((argc == 4 || argc == 5) && !strcmp(argv[1], "stall-block")) {
@@ -3284,6 +3294,9 @@ static int applet_inject(int argc, char **argv)
         rc = inject_call(argv[1][6] == 'c' ? INJECT_OP_STALL_CLAIM_HELD
                                            : INJECT_OP_STALL_FORCE_CLAIMED,
                          strtoul(argv[2], NULL, 0), strtoul(argv[3], NULL, 0));
+    } else if (argc == 4 && !strcmp(argv[1], "hold-exit-destroy")) {
+        rc = inject_call(INJECT_OP_HOLD_EXIT_DESTROY, strtoul(argv[2], NULL, 0),
+                         strtoul(argv[3], NULL, 0));
     } else if (argc == 5 && !strcmp(argv[1], "poke")) {
         rc = inject_call(INJECT_OP_POKE, strtoul(argv[2], NULL, 0),
                          strtoul(argv[3], NULL, 0) << 8 |
@@ -3323,12 +3336,18 @@ static int applet_inject(int argc, char **argv)
     } else if (argc == 4 && !strcmp(argv[1], "stall-reply-claim")) {
         rc = inject_call(INJECT_OP_STALL_REPLY_CLAIM, strtoul(argv[2], NULL, 0),
                          strtoul(argv[3], NULL, 0));
+    } else if (argc == 4 && !strcmp(argv[1], "stall-unblock-race")) {
+        rc = inject_call(INJECT_OP_STALL_UNBLOCK_RACE, strtoul(argv[2], NULL, 0),
+                         strtoul(argv[3], NULL, 0));
     } else if (argc == 3 && !strcmp(argv[1], "preempt-reply-unblock")) {
         rc = inject_call(INJECT_OP_PREEMPT_REPLY_UNBLOCK,
                          strtoul(argv[2], NULL, 0), 0);
-    } else if (argc == 4 && !strcmp(argv[1], "stall-force-ready")) {
-        rc = inject_call(INJECT_OP_STALL_FORCE_READY, strtoul(argv[2], NULL, 0),
-                         strtoul(argv[3], NULL, 0));
+    } else if (argc == 4 && (!strcmp(argv[1], "stall-force-ready") ||
+                             !strcmp(argv[1], "stall-cancel"))) {
+        rc = inject_call(!strcmp(argv[1], "stall-cancel")
+                             ? INJECT_OP_STALL_CANCEL
+                             : INJECT_OP_STALL_FORCE_READY,
+                         strtoul(argv[2], NULL, 0), strtoul(argv[3], NULL, 0));
     } else if (argc == 3 && (!strcmp(argv[1], "prio-settle-thread") ||
                              !strcmp(argv[1], "prio-settle-idle"))) {
         /* Exit 0 when at least MIN deferred priority settles ran in thread
@@ -3391,9 +3410,11 @@ static int applet_inject(int argc, char **argv)
                 "alloc-status [consumed] | fail-sched-set PID COUNT | "
                 "sched-set-status | "
                 "sched-set-displaced MIN | stall-lock PID MS | "
-                "stall-force-ready PID MS | stall-sync-waker PID MS | sync-wake-claims | intr-before-switch PID | intr-after-select PID | intr-select-seen [TID] | "
+                "stall-force-ready PID MS | stall-cancel PID MS | stall-sync-waker PID MS | sync-wake-claims | intr-before-switch PID | intr-after-select PID | intr-select-seen [TID] | "
                 "stall-block PID TID [MS] | stall-ready PID TID MS | "
-                "stall-steal PID TID MS | poke PID TID ready|stop | "
+                "stall-steal PID TID MS | stall-reprio PID TID MS | "
+                "poke PID TID ready|stop | "
+                "hold-exit-destroy PID MS | "
                 "sched-stats | serve | "
                 "stall-switch PID TID MS | crash [shutdown] | pte-superpage PID VA | "
                 "pte-clear-superpage PID VA | pte-probe PID VA | "

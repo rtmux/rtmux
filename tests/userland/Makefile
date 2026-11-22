@@ -13,11 +13,11 @@ SRCS = main.c timers.c sync.c prio-loan.c printf-test.c setjmp-test.c signals-te
        notifications.c vfs.c posix-options.c capgate.c trace-negative.c \
        user-ptr-negative.c serial-unblock.c leak.c native-io-boundaries.c \
        qsort-test.c report.c getopt-test.c env-test.c sysconf-test.c malloc-stats-test.c \
-       pte-partial.c pgrp-races.c exec-swap.c kill-busy.c reply-claim.c xfer-resume.c cap-step.c rcvid-reuse.c remote-ipc.c
+       pte-partial.c pgrp-races.c exec-swap.c kill-busy.c kill-slow-reap.c reply-claim.c xfer-resume.c cap-step.c rcvid-reuse.c remote-ipc.c reply-fault.c shm-past-end.c
 OBJS = $(SRCS:%.c=$(OBJDIR)/%.o)
 # Single-file helper programs built by the rules below, outside the main binary.
 PROBE_OBJS = $(addprefix $(OBJDIR)/, crypttest.o setuid-probe.o preload-probe.o \
-                                     sync-ignore.o slow-server.o)
+                                     sync-ignore.o slow-server.o no-syschan.o)
 PROG = $(BUILD_BASE)/syscall_testing
 CRYPTTEST = $(BUILD_BASE)/crypttest
 
@@ -42,6 +42,7 @@ endif
 
 SYNC_IGNORE = $(BUILD_BASE)/sync-ignore
 SLOW_SERVER = $(BUILD_BASE)/slow-server
+NO_SYSCHAN = $(BUILD_BASE)/no-syschan
 
 PROBE = $(BUILD_BASE)/setuid-probe
 PROBE_PLAIN = $(BUILD_BASE)/setuid-probe-plain
@@ -49,7 +50,7 @@ PROBE_SETGID = $(BUILD_BASE)/setgid-probe
 PRELOAD_PROBE = $(BUILD_BASE)/preload-probe.so
 
 all: $(PROG) $(CRYPTTEST) $(PROBE) $(PROBE_PLAIN) $(PROBE_SETGID) $(PRELOAD_PROBE) \
-     $(SYNC_IGNORE) $(SLOW_SERVER) \
+     $(SYNC_IGNORE) $(SLOW_SERVER) $(NO_SYSCHAN) \
      $(RT_LATENCY_TARGETS) \
      $(LOCK_RANK_STRESS_TARGETS) $(NAMESPACE_ROUNDTRIP_TARGETS)
 
@@ -97,6 +98,12 @@ $(SLOW_SERVER): $(OBJDIR)/slow-server.o $(CRT0_O) $(LIBC_SO)
 	$(msg) LD $@
 	$(Q)$(LD) -nostdlib -o $@ $(CRT0_O) $(OBJDIR)/slow-server.o $(LIBC_SO)
 
+# No crt0: the program has its own _start and never runs libc's start-up.
+$(NO_SYSCHAN): $(OBJDIR)/no-syschan.o $(LIBC_SO)
+	@mkdir -p $(@D)
+	$(msg) LD $@
+	$(Q)$(LD) -nostdlib -o $@ $(OBJDIR)/no-syschan.o $(LIBC_SO)
+
 # Each entry is a path under $(BUILD_BASE) to a built binary; the install dst in
 # $(INITRAMFS_DIR)/bin/ is just the basename. crypttest is built but not shipped.
 INSTALL_BIN = syscall_testing \
@@ -105,6 +112,7 @@ INSTALL_BIN = syscall_testing \
               setgid-probe \
               sync-ignore \
               slow-server \
+              no-syschan \
               rt-latency/rt-latency \
               rt-latency/timer-jitter \
               rt-latency/pi-inversion-xfail \

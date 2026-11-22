@@ -1244,6 +1244,13 @@ static void arch_timer_program_next(struct qtime_entry *qtp, int idle)
          */
         if (next != ~(uint64_t) 0 && next > now && next - now < delta_ns)
             delta_ns = next - now;
+        /* An overdue deadline met inside a kernel call (a tick or an
+         * IPI_CLOCK_LOAD taken there) is expired at the call's exit
+         * (clock_catch_up), not a tick later.
+         */
+        if (next != ~(uint64_t) 0 && next <= now && in_kernel_context() &&
+            qtp->timer_scale == -9)
+            __atomic_store_n(&clock_boot_missed, 1, __ATOMIC_RELEASE);
         /* A backlog from the fire cap: come back in TIMER_BACKLOG_DELTA_NS to
          * drain the rest, rather than waiting a full tick. Bounded, so no
          * re-entry livelock if this fires mid-kernel-call.

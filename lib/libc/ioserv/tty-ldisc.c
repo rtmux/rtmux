@@ -2,6 +2,7 @@
 #include <sys/ioserv-ldisc.h>
 #include <errno.h>
 #include <string.h>
+#include <minmax.h>
 
 #define TTY_END 256
 #define TTY_EOF 512
@@ -10,6 +11,24 @@ static void append(struct ioserv_ldisc *ld, unsigned value)
 {
     if (ld->head - ld->tail < TTY_QUEUE)
         ld->queue[ld->head++ % TTY_QUEUE] = (uint16_t) value;
+}
+
+/* Queue the line being edited. A canonical read returns at most one line (POSIX
+ * XBD 11.1.6), so the line keeps its end mark even when the queue cannot take
+ * all of it: past {MAX_INPUT} the bytes kept are implementation-defined, and
+ * here the first ones are, with the last byte in place of the rest when it is
+ * the delimiter; a line ended by EOF has none and keeps its first bytes in
+ * order. With no room at all the line is dropped.
+ */
+static void commit_line(struct ioserv_ldisc *ld, int delimited)
+{
+    unsigned room = TTY_QUEUE - (ld->head - ld->tail);
+    unsigned keep = min_uint(ld->editing, room);
+
+    for (unsigned i = 0; i + 1 < keep; i++)
+        append(ld, ld->line[i]);
+    if (keep)
+        append(ld, ld->line[delimited ? ld->editing - 1 : keep - 1] | TTY_END);
 }
 
 void ioserv_ldisc_set(struct ioserv_ldisc *ld,
@@ -56,8 +75,7 @@ void ioserv_ldisc_feed(struct ioserv_ldisc *ld,
         if (!ld->editing)
             append(ld, TTY_EOF);
         else
-            for (unsigned i = 0; i < ld->editing; i++)
-                append(ld, ld->line[i] | (i + 1 == ld->editing ? TTY_END : 0));
+            commit_line(ld, !eof);
         ld->editing = 0;
     } else if (canon) {
         if (ld->editing == TTY_LINE - 1)
@@ -99,8 +117,16 @@ int ioserv_ldisc_read(const struct ioserv_ldisc *ld,
         if (!avail)
             return -EAGAIN;
     } else {
-        if (interval && (!min || avail) &&
-            (!clock->deadline || (min && clock->available != avail)))
+        /* POSIX XBD 11.1.7: with TIME=0 (cases B and D) there is no timer,
+         * and with MIN>0 (case A) TIME is an inter-byte timer that runs only
+         * once a byte is there and restarts with each new one. With MIN=0
+         * (case C) it is a read timer, started once. Whatever this read ran
+         * before (another termios, bytes another reader took) is dropped
+         * rather than left to end the read early.
+         */
+        if (!interval || (min && !avail))
+            clock->deadline = 0;
+        else if (!clock->deadline || (min && clock->available != avail))
             clock->deadline = now + interval;
         clock->available = avail;
         if (avail < (min ? min : !!interval) &&

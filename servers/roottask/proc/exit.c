@@ -15,6 +15,78 @@
 #include "root-process.h"
 #include "as.h"
 
+/* proc_exit_begin_locked — start the exit of process pid, once.
+ *
+ * Records the status wait() will report, marks the process terminating and
+ * steers every one of its threads to self-reap; the last thread out raises the
+ * notification on which proc_terminate frees the process's resources. The
+ * status goes into root_process_t.siginfo because kext_proc_exit_mark ignores
+ * the value it is given and proc_terminate would otherwise report 0. It needs
+ * nothing from the process itself, so it serves a process that asked to exit
+ * (proc_exit), one roottask ends without asking it (SIGKILL, signal.c), one
+ * whose exec failed, and exec's loader shell. The first caller decides the
+ * status: a process already on its way out is left as it is, so an _exit that
+ * was queued behind a SIGKILL, or the reverse, cannot change what wait()
+ * reports. Called with root_proc_lock(pid) held.
+ *
+ * Only the marking happens here. Destroying the threads can take a while: a
+ * pass is made again for as long as a thread is held by a message transfer or
+ * is on its way into a stop. That is proc_exit_finish's job, which the caller
+ * runs after it has dropped the lock, so that other requests about the process
+ * are not kept waiting meanwhile. Parameters:
+ *   pid       : the process
+ *   status    : the exit code, or the signal number when by_signal
+ *   by_signal : nonzero if the process is ended by a signal
+ * Return value: 1 if this call started the exit, and the caller must run
+ * proc_exit_finish(pid); 0 if the exit had started already.
+ */
+int proc_exit_begin_locked(pid_t pid, int status, int by_signal)
+{
+    root_process_t *tmp = root_proc(pid);
+
+    if (tmp->exit_begun)
+        return 0;
+    tmp->exit_begun = 1;
+    tmp->siginfo.si_signo = SIGCHLD;
+    tmp->siginfo.si_code = by_signal ? CLD_KILLED : CLD_EXITED;
+    tmp->siginfo.si_status = status;
+    tmp->siginfo.si_pid = pid;
+    (void) ProcessExitMark(pid, status);
+    return 1;
+}
+
+/* proc_exit_finish — destroy the threads of a process whose exit
+ * proc_exit_begin_locked started, without holding its lock.
+ *
+ * Each pass takes the process lock, which keeps the kernel's process alive for
+ * the call, and drops it before the 1 ms pause that a pass asking to be made
+ * again is followed by. The passes end when every thread is gone or the process
+ * is: nothing outside the process holds a thread up for longer than one message
+ * transfer. Parameters:
+ *   pid : the process
+ */
+void proc_exit_finish(pid_t pid)
+{
+    static const struct timespec ts = {.tv_sec = 0, .tv_nsec = 1000000};
+
+    for (unsigned tries = 1;; tries++) {
+        process_t *prp = root_proc_lock(pid);
+        int rc;
+
+        if (!prp)
+            return;
+        rc = process_threads_destroy(prp);
+        root_proc_unlock(pid);
+        if (rc != EAGAIN)
+            return;
+        if (tries % 1000 == 0)
+            root_warn("exit: pid %d: threads still being destroyed after %u "
+                      "passes\n",
+                      (int) pid, tries);
+        (void) nanosleep(&ts, NULL);
+    }
+}
+
 /* proc_exit — handle a _PROC_EXIT message from a dying process.
  *
  * Runs the full teardown sequence directly on the pool thread: mark
@@ -33,6 +105,7 @@ int proc_exit(ioserv_context_t *ctp, union proc_msg_union *msg)
     struct _proc_exit *ep = (struct _proc_exit *) (void *) &msg->type;
     pid_t pid = ctp->info.pid;
     process_t *prp;
+    int started;
 
     if (ctp->info.msglen < (int) sizeof(*ep) || ep->by_signal > 1 ||
         (ep->by_signal && (ep->status < 1 || ep->status > MAXSIG)))
@@ -60,24 +133,12 @@ int proc_exit(ioserv_context_t *ctp, union proc_msg_union *msg)
      * still reaping, papered over by the IPI_TLB_SAFE spin-drain in
      * process_shutdown. Now resources are freed strictly after every thread is
      * gone — by causality, not hopeful sequencing.
-     *
-     * Record the exit status into root_process_t.siginfo now (roottask-side
-     * memory): kext_proc_exit_mark ignores the status value, and proc_terminate
-     * would otherwise default si_signo==0 to status 0 and lose the real exit
-     * code that waitpid() must return.
      */
-    {
-        root_process_t *tmp = root_proc(pid);
-        tmp->siginfo.si_signo = SIGCHLD;
-        tmp->siginfo.si_code = ep->by_signal ? CLD_KILLED : CLD_EXITED;
-        tmp->siginfo.si_status = ep->status;
-        tmp->siginfo.si_pid = pid;
-    }
-    (void) ProcessExitMark(pid, ep->status);
-
-    process_threads_destroy(prp);
+    started = proc_exit_begin_locked(pid, ep->status, ep->by_signal);
 
     root_proc_unlock(pid);
+    if (started)
+        proc_exit_finish(pid);
     return IOSERV_NOREPLY;
 }
 
@@ -186,6 +247,10 @@ int proc_terminate(message_context_t *ctp,
             fault_info.siginfo.si_signo != 0) {
             tmp->siginfo = fault_info.siginfo;
             tmp->siginfo.si_pid = pid;
+            /* The kernel's record keeps the fault address where the status
+             * goes; this copy is read as an exit record.
+             */
+            tmp->siginfo.si_status = tmp->siginfo.si_signo;
         }
         if (!tmp->siginfo.si_signo) {
             tmp->siginfo.si_signo = SIGCHLD;
@@ -242,17 +307,26 @@ int proc_terminate(message_context_t *ctp,
     while (process_shutdown(prp, 0) == -1 && errno == EAGAIN)
         ;
 
-    /* Detach namespace nodes */
+    /* Detach namespace nodes. A request the process sent before it died can
+     * still be on its way through roottask, and reads root and cwd under the
+     * process lock: clear them under it too, so that it finds both or neither.
+     */
     {
         root_process_t *tmp = root_proc(pid);
-        if (tmp->root) {
-            path_node_detach(tmp->root);
+        node_t *root = NULL, *cwd = NULL;
+
+        /* A failed lock means the slot is no longer this process's. */
+        if (root_proc_lock(pid)) {
+            root = tmp->root;
+            cwd = tmp->cwd;
             tmp->root = NULL;
-        }
-        if (tmp->cwd) {
-            path_node_detach(tmp->cwd);
             tmp->cwd = NULL;
+            root_proc_unlock(pid);
         }
+        if (root)
+            path_node_detach(root);
+        if (cwd)
+            path_node_detach(cwd);
     }
     /* Notify parent */
     {

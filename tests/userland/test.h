@@ -11,6 +11,8 @@
 #define _RTMUX_TEST_H
 
 #include <pthread.h>
+#include <stdatomic.h>
+#include <stdint.h>
 #include "outcome.h"
 
 struct pshared_region {
@@ -44,6 +46,7 @@ int rlimit_cpu_child(void);
 int rlimit_inherit_child(void);
 int rlimit_inherit_grandchild(void);
 void test_mutex_owner_death(void);
+void named_sem_timedwait_loop(int n);
 void sync_path_cost(void);
 void test_sync(void);
 void test_pi_owned_turnstiles(void);
@@ -94,11 +97,17 @@ void stall_watch_finish(struct stall_watch *);
 int stall_watch_entered(struct stall_watch *);
 int inject_run(const char *a1, const char *a2, const char *a3);
 int test_thread_blocked(pthread_t tid, int state);
+int test_chan_open(unsigned flags, int *chid, int *coid);
+int test_wait_flag(atomic_int *flag, int want, int ms);
+void test_receive_within(uint64_t ns);
 int test_reply_claim(void);
+int test_kill_slow_reap(void);
+int slow_reap_child(void);
 int test_xfer_resume(void);
 int test_cap_step(void);
 int test_rcvid_reuse(void);
 int test_remote_ipc(void);
+void test_reply_fault(void);
 int test_pin_mask(unsigned mask);
 int condloan_create(pthread_t *tid, int prio, void *(*fn)(void *), void *arg);
 int sched_set_error_after_lowering(void);
@@ -109,16 +118,23 @@ int mutex_waiting_republish(void);
 int mutex_handoff_loan(void);
 int mutex_waiting_withdrawn(void);
 int condvar_interrupt_stale(void);
+int wait_rewait(void);
 int sync_kill_handoff(void);
 int block_request_race(void);
 int dispatch_window(void);
 int k65_windows(void);
+int boot_tick_catch_up(void);
 int ns_open_deferral(void);
 int ns_stat_unlink(void);
 int ns_open_detach(void);
 void test_ioserv_lost_reply_binding(void);
 int test_ioserv_lost_reply_unblock(void);
 int pte_partial_map(void);
+void test_shm_past_end(void);
+int shm_past_end_child(const char *what);
+int anon_map_failure(void);
+int loader_share_child(void);
+void test_loader_context_share(void);
 long kstats_value(const char *key);
 int pgrp_races(void);
 int pgrp_debug_access(void);
@@ -164,6 +180,11 @@ void *test_unmapped_user_addr(void);
 void test_trace_negative(void);
 void test_spawn_concurrent(void);
 void test_spawn_contract(void);
+void test_sysfs_open_stress(void);
+void test_loader_fault(void);
+void test_spawn_loader_einval_log(void);
+void test_spawn_concurrent_arg_max(void);
+void test_spawn_heap_gate(void);
 void test_spawn_arg_max(void);
 int exec_arg_max_child(void);
 void test_spawn_actions(void);
@@ -172,6 +193,8 @@ int orphan_exit_mid(void);
 void test_spawn_storm(unsigned residents);
 void test_kill_busy(void);
 int kill_busy_child(void);
+int kill_resolve_child(void);
+int kill_stuck_handler_child(void);
 void test_user_ptr_negative(void);
 int capgate_child_connect(const char *chid_arg);
 int capgate_child_dup_attack(int argc, char **argv);

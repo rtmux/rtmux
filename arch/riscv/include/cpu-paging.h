@@ -32,6 +32,13 @@
  */
 #define PTE_SW_PA (1UL << 8)
 
+/* Software bit (RSW) on an invalid level-zero PTE, one with PTE_V clear, which
+ * the hardware ignores: the page belongs to a mapping but lies past the end of
+ * the object it maps. PTE_OP_BAD writes it, PTE_OP_UNMAP clears it, and a user
+ * page fault on it is SIGBUS, which POSIX mmap specifies for such a page.
+ */
+#define PTE_SW_BUS (1UL << 9)
+
 /* shift a physical address to the right place for a PTE. */
 #define PA2PTE(pa) ((((uint64_t) pa) >> 12) << 10)
 

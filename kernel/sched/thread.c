@@ -606,6 +606,11 @@ int kdecl ksys_thread_cancel(thread_t *act,
             ITF_CLR(thp, RTMUX_ITF_CANCEL_POSTED);
     }
 
+    /* The wait read as cancelable below; force_ready_wait ends that one only,
+     * not a later wait the target is in by the time this hart gets there.
+     */
+    uint32_t wake_seq = thread_wake_seq(thp);
+
     /* If cancelation is enabled and we are blocked, force thread ready at
      * address of cancelation handler. We also make thread birth a cancellation
      * point.
@@ -617,9 +622,10 @@ int kdecl ksys_thread_cancel(thread_t *act,
             force_ready(thp, EINTR);
             thread_cancel(thp);
         } else {
+            inject_cancel_stall(thp);
             atomic_fetch_or_explicit(&thp->async_flags, RTMUX_ATF_CANCEL,
                                      memory_order_release);
-            force_ready(thp, EINTR);
+            force_ready_wait(thp, EINTR, wake_seq);
             if (thp->state == STATE_RUNNING)
                 SENDIPI(thp->runcpu, IPI_RESCHED);
         }
@@ -749,8 +755,10 @@ static int thread_interrupt(thread_t *act, int tid)
     if (!thp)
         return ESRCH;
 
+    uint32_t wake_seq = thread_wake_seq(thp);
+
     if (STATE_INTERRUPTIBLE(thp)) {
-        force_ready(thp, EINTR);
+        force_ready_wait(thp, EINTR, wake_seq); /* only the wait seen here */
         r = EOK;
     }
     tthread_unpin(thp);

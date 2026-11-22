@@ -456,6 +456,18 @@ static void test_timer_create_signal_event_rejected(void)
              strerror(errno));
     check(tid == -1 && errno == EINVAL,
           "__timer_create(SIGEV_SIGNAL_THREAD) -> EINVAL", detail);
+
+    /* SIGEV_INTR — not an event kind the kernel delivers */
+    memset(&ev, 0, sizeof ev);
+    ev.sigev_notify = SIGEV_INTR;
+    errno = 0;
+    tid = __timer_create(CLOCK_REALTIME, &ev);
+    snprintf(detail, sizeof detail, "tid=%d errno=%d (%s)", tid, errno,
+             strerror(errno));
+    check(tid == -1 && errno == EINVAL, "__timer_create(SIGEV_INTR) -> EINVAL",
+          detail);
+    if (tid != -1)
+        (void) destroy_timer(tid);
 }
 
 static void test_timer_create_notification_bad_coid(void)

@@ -92,13 +92,6 @@ static void *cs_sender(void *raw)
     return NULL;
 }
 
-static bool cs_wait(atomic_int *flag)
-{
-    for (int i = 0; i < CS_WAIT_MS && !atomic_load(flag); i++)
-        sleep_ms(1);
-    return atomic_load(flag) != 0;
-}
-
 static void cs_fill(uint64_t cap)
 {
     struct _io_native_hdr hdr;
@@ -155,7 +148,7 @@ static void cap_long_stepped(int chid, int coid, uint64_t cap, const char *pid)
           name, detail);
     if (rcvid != -1)
         (void) msg_reply(rcvid, 0, NULL, 0);
-    (void) cs_wait(&snd.done);
+    (void) test_wait_flag(&snd.done, 1, CS_WAIT_MS);
     (void) pthread_join(ts, NULL);
 }
 
@@ -184,7 +177,7 @@ static void cap_header_snapshot(int chid, int coid, const char *pid)
     if (test_pin_mask(1) != 0 ||
         pthread_create(&tr, NULL, cs_receiver, &rcv) != 0 ||
         pthread_create(&ts, NULL, cs_sender, &snd) != 0 ||
-        !cs_wait(&snd.started)) {
+        !test_wait_flag(&snd.started, 1, CS_WAIT_MS)) {
         test_fail(name, "pin or thread setup failed");
         return;
     }
@@ -205,7 +198,7 @@ static void cap_header_snapshot(int chid, int coid, const char *pid)
     stall_watch_finish(&watch);
     check(entered, "cap_header_snapshot window taken",
           "the send never reached the injected window");
-    if (!cs_wait(&rcv.done)) {
+    if (!test_wait_flag(&rcv.done, 1, CS_WAIT_MS)) {
         test_fail(name, "the receive did not return");
         return;
     }
@@ -214,7 +207,7 @@ static void cap_header_snapshot(int chid, int coid, const char *pid)
     check(rcv.rcvid != -1 && got->nxfers == 0, name, detail);
     if (rcv.rcvid != -1)
         (void) msg_reply(rcv.rcvid, 0, NULL, 0);
-    (void) cs_wait(&snd.done);
+    (void) test_wait_flag(&snd.done, 1, CS_WAIT_MS);
     (void) pthread_join(ts, NULL);
     (void) pthread_join(tr, NULL);
     (void) test_pin_mask(~0U);
@@ -249,12 +242,9 @@ static void cap_header_sparse(int chid, int coid)
             /* With no receiver waiting the send would queue: give it one,
              * with a timeout, and expect the send to fail instead.
              */
-            uint64_t ns = 500000000ULL;
-
-            (void) __timer_timeout(CLOCK_MONOTONIC, RTMUX_TIMEOUT_RECEIVE, NULL,
-                                   &ns, NULL);
+            test_receive_within(500000000ULL);
             rcvid = msg_receive(chid, cs_in, 4096, NULL);
-            (void) cs_wait(&snd.done);
+            (void) test_wait_flag(&snd.done, 1, CS_WAIT_MS);
             snprintf(detail, sizeof detail, "receive=%d send rc=%d errno=%d",
                      rcvid, snd.rc, snd.err);
             check(rcvid == -1 && snd.rc == -1 && snd.err == EINVAL,
@@ -268,17 +258,10 @@ static void cap_header_sparse(int chid, int coid)
                   detail);
             if (rcvid != -1)
                 (void) msg_reply(rcvid, 0, NULL, 0);
-            (void) cs_wait(&snd.done);
+            (void) test_wait_flag(&snd.done, 1, CS_WAIT_MS);
         }
         (void) pthread_join(ts, NULL);
     }
-}
-
-/* Arm a timeout for the calling thread's next receive. */
-static void cs_receive_within(uint64_t ns)
-{
-    (void) __timer_timeout(CLOCK_MONOTONIC, RTMUX_TIMEOUT_RECEIVE, NULL, &ns,
-                           NULL);
 }
 
 struct cs_sparse {
@@ -294,7 +277,7 @@ static void *cs_sparse_receiver(void *raw)
 {
     struct cs_sparse *r = raw;
 
-    cs_receive_within(8000000000ULL);
+    test_receive_within(8000000000ULL);
     atomic_store(&r->started, 1);
     r->rc = msg_receivev(r->chid, r->iov, r->parts, NULL);
     r->err = errno;
@@ -324,7 +307,7 @@ static void *cs_sparse_client(void *raw)
  */
 static void cs_reap(pthread_t t, atomic_int *done, const char *who)
 {
-    if (cs_wait(done))
+    if (test_wait_flag(done, 1, CS_WAIT_MS))
         (void) pthread_join(t, NULL);
     else
         test_fail("cap_receiver_sparse peer did not return", who);
@@ -364,7 +347,7 @@ static void cap_receiver_sparse(int chid, int coid)
         }
         if (!test_thread_blocked(t, STATE_SEND))
             test_fail("cap_receiver_sparse", "the sender did not queue");
-        cs_receive_within(2000000000ULL);
+        test_receive_within(2000000000ULL);
         rcvid = msg_receivev(chid, iov, lead + 1, NULL);
         err = errno;
         snprintf(detail, sizeof detail, "lead=%d receive=%d errno=%d", lead,
@@ -373,7 +356,7 @@ static void cap_receiver_sparse(int chid, int coid)
             check(rcvid == -1 && err == EINVAL,
                   "cap_receiver_sparse receive refused", detail);
             if (rcvid == -1) {
-                cs_receive_within(2000000000ULL);
+                test_receive_within(2000000000ULL);
                 rcvid = msg_receive(chid, cs_in, 4096, NULL);
             }
             check(rcvid != -1 && memcmp(cs_in, cs_out, 4096) == 0,
@@ -420,7 +403,7 @@ static void cap_receiver_sparse(int chid, int coid)
         if (peer.rc != -1) {
             (void) msg_reply(peer.rc, 0, NULL, 0);
         } else {
-            cs_receive_within(2000000000ULL);
+            test_receive_within(2000000000ULL);
             rcvid = msg_receive(chid, cs_in, 4096, NULL);
             check(rcvid != -1, "cap_receiver_sparse sender queues after it",
                   "receive of the retried send");
@@ -442,7 +425,7 @@ static void cap_receiver_sparse(int chid, int coid)
     {
         char req;
 
-        cs_receive_within(2000000000ULL);
+        test_receive_within(2000000000ULL);
         rcvid = msg_receive(chid, &req, 1, NULL);
     }
     if (rcvid == -1) {
@@ -470,12 +453,9 @@ int test_cap_step(void)
     int chid, coid;
     bool inject = inject_run("alloc-status", NULL, NULL) == 0;
 
-    chid = channel_create(0);
-    coid = chid == -1
-               ? -1
-               : connect_attach(0, getpid(), chid, RTMUX_SIDE_CHANNEL, 0);
     memset(&info, 0, sizeof info);
-    if (coid == -1 || connect_server_info(0, (uint64_t) coid, &info) != coid ||
+    if (!test_chan_open(0, &chid, &coid) ||
+        connect_server_info(0, (uint64_t) coid, &info) != coid ||
         info.endpoint_cap == 0) {
         test_fail("cap_step setup", "channel, connection or endpoint cap");
         return 0;

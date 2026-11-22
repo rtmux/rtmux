@@ -1304,6 +1304,30 @@ static void test_stream_pool(void)
     }
 }
 
+/* Print every strerror() message in the log. The harness must not take errno
+ * text for a crash: it once ended a run on "Bad file descriptor" printed by a
+ * failing check's detail (scripts/crash-signatures.sh).
+ */
+static void test_strerror_text(void)
+{
+    char unknown[32];
+    int shown = 0, empty = 0;
+
+    for (int e = -1; e <= 300; e++) {
+        const char *msg = strerror(e);
+
+        snprintf(unknown, sizeof unknown, "Unknown error %d", e);
+        if (!msg || !*msg)
+            empty++;
+        else if (e < 0 || strcmp(msg, unknown)) {
+            printf("    strerror %d: %s\n", e, msg);
+            shown++;
+        }
+    }
+    snprintf(unknown, sizeof unknown, "%d shown, %d empty", shown, empty);
+    check(shown > 30 && !empty, "strerror text printed for every errno", unknown);
+}
+
 void test_printf(void)
 {
     char buf[128];
@@ -1374,4 +1398,5 @@ void test_printf(void)
     test_stdio_locked_ops();
     test_setvbuf_failure(0);
     test_setvbuf_failure(1);
+    test_strerror_text();
 }

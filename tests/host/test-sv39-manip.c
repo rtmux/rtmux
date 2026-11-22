@@ -258,6 +258,57 @@ static void check_unmap_prot(void)
     CHECK(r.err == EEXIST && r.start == leaf && !r.changed);
 }
 
+/* BAD marks pages past the end of their object: it writes the invalid
+ * PTE_SW_BUS mark over an empty slot or a valid leaf, creating tables like MAP.
+ * sv39_past_end sees only that mark; PROT leaves it as it is, UNMAP and a later
+ * MAP replace it.
+ */
+static void check_bad_mark(void)
+{
+    pagetable_t root = new_root();
+    uintptr_t va = 0x20000000UL;
+    struct run r;
+
+    alloc_budget = 8;
+    r = manip(root, PTE_OP_MAP, va, va + PGSIZE, 0x80000000UL, USER_RW);
+    CHECK(r.err == 0);
+    CHECK(!sv39_past_end(root, va) && !sv39_past_end(root, va + PGSIZE));
+
+    /* Over the mapped page and the empty one after it. */
+    r = manip(root, PTE_OP_BAD, va, va + 2 * PGSIZE, 0, 0);
+    CHECK(r.err == 0 && r.changed && r.start == va + 2 * PGSIZE);
+    CHECK(*slot(root, va) == PTE_SW_BUS && *slot(root, va + PGSIZE) == PTE_SW_BUS);
+    CHECK(sv39_past_end(root, va) && sv39_past_end(root, va + PGSIZE + 8));
+    CHECK(!sv39_lookup_leaf(root, va, NULL, NULL));
+    CHECK(!sv39_past_end(root, va + 2 * PGSIZE)); /* empty slot */
+    CHECK(!sv39_past_end(root, 0x60000000UL));    /* no table */
+
+    /* PROT does not make a marked page valid. */
+    r = manip(root, PTE_OP_PROT, va, va + 2 * PGSIZE, 0, USER_RW);
+    CHECK(r.err == 0 && !r.changed && *slot(root, va) == PTE_SW_BUS);
+
+    /* MAP over the mark: an ordinary page again. */
+    r = manip(root, PTE_OP_MAP, va + PGSIZE, va + 2 * PGSIZE, 0x90000000UL, USER_RW);
+    CHECK(r.err == 0 && *slot(root, va + PGSIZE) == (PA2PTE(0x90000000UL) | USER_RW));
+    CHECK(!sv39_past_end(root, va + PGSIZE));
+
+    /* UNMAP clears the mark: an unmapped page is SIGSEGV, not SIGBUS. */
+    r = manip(root, PTE_OP_UNMAP, va, va + 2 * PGSIZE, 0, 0);
+    CHECK(r.err == 0 && r.changed && !*slot(root, va) && !*slot(root, va + PGSIZE));
+    CHECK(!sv39_past_end(root, va));
+
+    /* Marking or clearing an invalid slot changes no translation: no flush. */
+    r = manip(root, PTE_OP_BAD, va, va + PGSIZE, 0, 0);
+    CHECK(r.err == 0 && !r.changed && sv39_past_end(root, va));
+    r = manip(root, PTE_OP_UNMAP, va, va + PGSIZE, 0, 0);
+    CHECK(r.err == 0 && !r.changed && !*slot(root, va));
+
+    /* With no table, BAD has to make one, and reports ENOMEM if it cannot. */
+    alloc_budget = 0;
+    r = manip(root, PTE_OP_BAD, 0x50000000UL, 0x50001000UL, 0, 0);
+    CHECK(r.err == ENOMEM && !r.changed);
+}
+
 int main(void)
 {
     check_map_ok();
@@ -266,6 +317,7 @@ int main(void)
     check_map_enomem_midway();
     check_prealloc();
     check_unmap_prot();
+    check_bad_mark();
     puts("sv39-manip: PASS");
     return 0;
 }

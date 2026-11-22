@@ -203,7 +203,7 @@ extern int pte_prot(address_t *,
                     unsigned,
                     path_object_t *);
 extern int pte_unmap(address_t *, uintptr_t, uintptr_t, path_object_t *);
-extern int pte_bad(address_t *, uintptr_t);
+extern int pte_bad(address_t *, uintptr_t, uintptr_t);
 extern int pte_prealloc(address_t *, uintptr_t, uintptr_t);
 extern int pte_temp_map(address_t *,
                         uintptr_t,

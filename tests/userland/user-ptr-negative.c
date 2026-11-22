@@ -798,4 +798,5 @@ void test_user_ptr_negative(void)
     thread_slice_cases(gone);
     sync_unmapped_cases();
     test_cancel_unmapped_tls();
+    test_reply_fault();
 }

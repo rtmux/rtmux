@@ -82,6 +82,7 @@ void *nano_query(unsigned type,
                  void *objbuf,
                  size_t objsize);
 int rdecl force_ready(thread_t *thp, unsigned err);
+int rdecl force_ready_wait(thread_t *thp, unsigned err, uint32_t wake_seq);
 void prio_defer_init(void);
 void specialret_attr specialret(thread_t *thp);
 void rdecl deliver_fault(thread_t *thp, siginfo_t *info);
@@ -228,8 +229,6 @@ void _sfree(void *data, size_t size);
 int purger_register(int (*purge)(size_t), unsigned prio);
 int purger_invoke(size_t amount);
 
-void shutdown(unsigned sigcode, const CPU_REGISTERS *reg);
-
 process_t *rdecl lookup_pid(pid_t pid);
 process_t *rdecl
 lookup_pid_rcu(pid_t pid); /* opens RCU-sched section; caller unlocks */
@@ -248,7 +247,7 @@ ksync_t *rdecl sync_create(process_t *bill_prp, sync_t *sync, unsigned flags);
 int rdecl sync_destroy(process_t *prp, sync_t *sync);
 ksync_t *rdecl sync_lookup(sync_t *sync, unsigned create);
 void rdecl sync_wakeup(ksync_t *syp, int all);
-bool rdecl sync_chain_force_ready(thread_t *thp);
+bool rdecl sync_chain_force_ready(thread_t *thp, const uint32_t *wake_seq);
 
 notification_t *rdecl notification_add(process_t *prp,
                                        pril_head_t *queue,
@@ -298,6 +297,15 @@ int rdecl sched_thread(thread_t *thp, int policy, struct sched_param *param);
 void rdecl timeout_start(thread_t *thp);
 void rdecl timeout_start_deferred(thread_t *thp);
 void rdecl timeout_deferred_fire(void);
+extern atomic_int clock_boot_missed; /* time/clock-core.c */
+void rdecl clock_catch_up(void);
+
+/* Whether a timer that fell due in a boot-hart kernel call waits for
+ * clock_catch_up on cpu (only the boot hart sets the flag).
+ */
+#define clock_catch_up_due(cpu) \
+    ((cpu) == boot_cpunum &&    \
+     __atomic_load_n(&clock_boot_missed, __ATOMIC_RELAXED))
 void rdecl timeout_stop(thread_t *thp);
 
 /* reserved != 0 routes a SIGEV_NOTIFICATION through the allocation-free reserve
@@ -345,8 +353,6 @@ int rdecl debug_stop(process_t *prp);
 int rdecl debug_run(process_t *prp, debug_run_t *drp);
 int rdecl debug_break(process_t *pid, debug_break_t *dbp);
 int rdecl debug_break_list(process_t *pid, debug_breaklist_t *dbp);
-
-unsigned kdebug_enter(process_t *prp, unsigned sigcode, CPU_REGISTERS *reg);
 
 void rdecl send_ipi(unsigned cpu, int cmd);
 void rdecl smp_flush_tlb(void);

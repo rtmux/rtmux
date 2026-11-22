@@ -218,21 +218,24 @@ int pte_prealloc(address_t *adp, uintptr_t start, uintptr_t end)
 }
 
 
-/* Mark the page containing vaddr as bad/inaccessible.
+/* Mark a virtual address range past the end of the object it maps.
  *
- * Parameters:
+ * The pages get an invalid PTE with the PTE_SW_BUS mark, so an access faults
+ * with SIGBUS instead of SIGSEGV (POSIX mmap, for whole pages following the
+ * end of an object), until a growth of the object maps them or an unmap
+ * clears the mark. Parameters:
  *   adp   : address space
- *   vaddr : virtual address within the page to mark
+ *   start : range start VA (page aligned)
+ *   end   : range end VA (inclusive)
  * Return value: EOK on success, else an error code
  */
-int pte_bad(address_t *adp, uintptr_t vaddr)
+int pte_bad(address_t *adp, uintptr_t start, uintptr_t end)
 {
     struct pte_manip manip;
 
     manip.data.adp = adp;
-    vaddr = ADDR_PAGE(vaddr);
-    manip.data.start = vaddr;
-    manip.data.end = vaddr | (__PAGESIZE - 1);
+    manip.data.start = start;
+    manip.data.end = end;
     manip.data.op = PTE_OP_BAD;
     manip.data.prot = 0;
     manip.data.shmem_flags = 0;

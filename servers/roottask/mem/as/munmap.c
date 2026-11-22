@@ -249,10 +249,13 @@ int ms_unmap(pid_t pid,
 
             {
                 /* If none of the quantums has the PAQ_FLAG_INITIALIZED bit on
-                 * (from clean_pmem), we know that we can't have set up any page
-                 * table entries, and can skip the unmapping
+                 * (from clean_pmem), we can't have mapped any page, and can
+                 * skip the unmapping, unless pages past the object's end may
+                 * carry the PTE_SW_BUS mark (MM_MEM_HAS_BAD_PAGE): the unmap
+                 * clears it, or a later fault there would be SIGBUS.
                  */
-                if (data.flags & PAQ_FLAG_INITIALIZED) {
+                if ((data.flags & PAQ_FLAG_INITIALIZED) ||
+                    (obp->mem.mm.flags & MM_MEM_HAS_BAD_PAGE)) {
                     pte_unmap(adp, mm->start, mm->end, obp);
                 }
             }

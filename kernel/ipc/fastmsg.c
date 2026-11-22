@@ -1266,6 +1266,10 @@ static int sendv_body(thread_t *act,
              * hart's active thread) up to the timestamp just taken above.
              */
             sched_account_current(sender->timestamp_last_block);
+            /* A wakeup like block_and_ready's: end the RECEIVE wait for
+             * force_ready_wait.
+             */
+            thread_note_wakeup(thp);
             set_active_thread(get_cpunum(), thp);
             thp->state = STATE_RUNNING;
 
@@ -2558,6 +2562,7 @@ static int msg_replyv_body(thread_t *act,
             return ENOERROR;
         }
     }
+    inject_unblock_reply_window(thp);
 
     atomic_clr(&thp->flags, (RTMUX_FLG_THR_BUFF_MSG | RTMUX_FLG_THR_SHORT_MSG));
 
@@ -2847,7 +2852,7 @@ static int msg_error_body(thread_t *act,
     if (thp->internal_flags & RTMUX_ITF_UNBLOCK_QUEUED) {
         remove_unblock(thp, cop, kap->rcvid);
     }
-
+    inject_unblock_reply_window(thp);
 
     msg_request_answered(act, thp, cop);
     if (thp->args.ms.server != 0) {

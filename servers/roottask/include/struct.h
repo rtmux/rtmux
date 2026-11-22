@@ -80,6 +80,7 @@ struct loader_context_base {
     siginfo_t info;
     pid_t pid;
     pid_t ppid;
+    pid_t owner;  /* the spawner whose share of its class this counts against */
     int fds_done; /* fd inheritance closed: no more _PROC_SPAWN_FD keys */
     int tid;
     unsigned long flags;
@@ -88,7 +89,6 @@ struct loader_context_base {
     unsigned action_source_bytes;
     int state;
     struct loader_startup start;
-    int fault_errno;
     /* The proc-loader.c line of the LOADER_EXIT that gave the load up, so the
      * log can say which step failed (see loader_exit).
      */

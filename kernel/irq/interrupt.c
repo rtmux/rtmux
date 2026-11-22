@@ -114,8 +114,9 @@ ksys_interrupt_attach_thread(thread_t *act,
  * thread on each IRQ via interrupt_wait, the kernel delivers a COPY of "*event"
  * inline from trap context via sigevent_deliver_inline() — no intrevent_add /
  * drain round-trip. Suitable sigev_notify values: SIGEV_NOTIFICATION,
- * SIGEV_INTR, SIGEV_UNBLOCK, SIGEV_NONE. SIGEV_THREAD is rejected at
- * registration (thread_create is unsafe in trap context).
+ * SIGEV_UNBLOCK, SIGEV_NONE. SIGEV_THREAD is rejected at registration
+ * (thread_create is unsafe in trap context), and so is SIGEV_INTR: an IST
+ * attaches with interrupt_attach_thread.
  *
  * The calling thread's process is recorded as the owner so per-process cleanup
  * on exit works identically to interrupt_attach_thread.
@@ -241,8 +242,8 @@ int kdecl ksys_interrupt_unmask(thread_t *act,
 }
 
 
-/* #58 interrupt_wait — IST blocks here until SIGEV_INTR delivers an interrupt
- * event to act->flags |= RTMUX_FLG_THR_INTR_PENDING.
+/* #58 interrupt_wait — IST blocks here until the trap handler's inline wake
+ * delivers an interrupt (act->flags |= RTMUX_FLG_THR_INTR_PENDING).
  *
  * The PENDING-clear is atomic_clr; the wait path uses unready+block
  * (sched_slock-internal in dispatch.c). No additional locking needed in the
@@ -296,10 +297,10 @@ int kdecl ksys_interrupt_wait(thread_t *act,
     }
 
     if (act->flags & RTMUX_FLG_THR_INTR_PENDING) {
-        /* Atomic clear — paired with atomic_or in event.c SIGEV_INTR delivery.
-         * Preserves cross-CPU ordering against other paths that
-         * read-modify-write act->flags (force_ready KILLSELF set, exec
-         * KCALL_ERR_SET set, etc.).
+        /* Atomic clear — paired with the atomic_or of the trap handler's
+         * INTR_KIND_THREAD wake. Preserves cross-CPU ordering against other
+         * paths that read-modify-write act->flags (force_ready KILLSELF set,
+         * exec KCALL_ERR_SET set, etc.).
          */
         atomic_clr((volatile unsigned *) &act->flags,
                    RTMUX_FLG_THR_INTR_PENDING);

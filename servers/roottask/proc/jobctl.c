@@ -25,10 +25,7 @@
 #include "root-process.h"
 #include <sys/procmsg.h>
 
-#define JC_DEAD                                          \
-    (RTMUX_FLG_PROC_TERMING | RTMUX_FLG_PROC_ZOMBIE |    \
-     RTMUX_FLG_PROC_WAITINFO | RTMUX_FLG_PROC_WAITDONE | \
-     RTMUX_FLG_PROC_DESTROYALL)
+#define JC_DEAD PROC_DEAD_FLAGS
 
 int proc_snapshot(pid_t pid, struct proc_snap *s)
 {

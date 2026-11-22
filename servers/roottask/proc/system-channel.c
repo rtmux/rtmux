@@ -40,7 +40,8 @@ struct kcall_args_proc_register_syschan {
 int proc_syschan(ioserv_context_t *ctp, proc_syschan_t *msg)
 {
     struct kcall_args_proc_register_syschan args;
-    int r;
+    process_t *prp;
+    int r, killed = 0;
 
     args.pid = ctp->info.pid;
     args.chid = msg->i.chid;
@@ -49,12 +50,14 @@ int proc_syschan(ioserv_context_t *ctp, proc_syschan_t *msg)
      * lock, the one signal_one posts under: a signal either finds the channel
      * or is kept and flushed here, never neither.
      */
-    if (!root_proc_lock(ctp->info.pid))
+    if (!(prp = root_proc_lock(ctp->info.pid)))
         return ESRCH;
     r = (int) syscall_priv(__KSYS_PRIV_PROC_REGISTER_SYSCHAN, &args);
     if (r == EOK)
-        signal_flush_early_locked(ctp->info.pid);
+        killed = signal_flush_early_locked(ctp->info.pid);
     root_proc_unlock(ctp->info.pid);
+    if (killed)
+        proc_exit_finish(ctp->info.pid);
     if (r != EOK) {
         root_log("proc_syschan: pid %d chid %d not found (r=%d)\n",
                  ctp->info.pid, msg->i.chid, r);

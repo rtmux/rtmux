@@ -40,6 +40,14 @@ static inline int spawn_add_size(size_t *sum, size_t add)
  * they are only a reading at one moment: a caller that needs them to hold
  * across a decision takes pgrp_mutex, as setpgid does.
  */
+/* A process that is ending or has ended: it takes no signal and starts no
+ * second exit.
+ */
+#define PROC_DEAD_FLAGS                                  \
+    (RTMUX_FLG_PROC_TERMING | RTMUX_FLG_PROC_ZOMBIE |    \
+     RTMUX_FLG_PROC_WAITINFO | RTMUX_FLG_PROC_WAITDONE | \
+     RTMUX_FLG_PROC_DESTROYALL)
+
 struct proc_snap {
     pid_t ppid;
     pid_t pgrp;

@@ -1,5 +1,6 @@
 #!/bin/sh
 set -eu
+. "$(dirname -- "$0")/crash-signatures.sh"
 
 log=build/fu740-logs/gpio-latency.log
 runner=${FU740_RUNNER:-}
@@ -35,7 +36,7 @@ require()
 
 reject_bad_log()
 {
-    bad_re='FAULT|FATAL|CRASH|Kernel panic|panic:|FREED-ACTIVE|__kernel_restore bad ptr|/usr unavailable|Undefined symbol|No such file or directory|Bad file descriptor'
+    bad_re=$RTMUX_BAD_RE
 
     if grep -Eq 'RTMux gpio-latency: FAIL|gpio-latency: UNSUPPORTED' "$log"; then
         echo "fu740-gpio-latency: board log did not run supported GPIO path" >&2

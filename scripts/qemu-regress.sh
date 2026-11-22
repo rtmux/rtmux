@@ -6,6 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TOP_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$TOP_DIR" || exit 1
 . "$SCRIPT_DIR/qemu-headless.sh"
+. "$SCRIPT_DIR/crash-signatures.sh"
 AUTOCONF_H=internal/include/generated/autoconf.h
 
 MODE=syscall-testing
@@ -600,8 +601,8 @@ Options:
                     passes on a complete per-hart dump),
                     crash-inject (crash the kernel; needs --gdb-on-timeout,
                     passes on a complete per-hart dump taken after the crash),
-                    crash-inject-shutdown (as crash-inject, through the
-                    Shutdown[...] banner and SBI shutdown; needs
+                    crash-inject-shutdown (a crash report, then the SBI
+                    power-off a roottask crash ends in; needs
                     --gdb-on-timeout, passes on a complete dump of the
                     stopped guest),
                     tickless-idle (quiet-hart tick drop + one-shot deadline),
@@ -1686,9 +1687,9 @@ case "$MODE" in
         ;;
     crash-inject|crash-inject-shutdown)
 
-        # Crashes the kernel: crash-inject through its crash path, which reports
-        # and parks every hart; crash-inject-shutdown through shutdown(), which
-        # prints the Shutdown[...] banner and powers off through the SBI. Only
+        # Crashes the kernel: crash-inject through the crash path a kernel fault
+        # takes, which reports and parks every hart; crash-inject-shutdown
+        # reports and powers off through the SBI, as a roottask crash does. Only
         # meaningful with --gdb-on-timeout: the pass condition is a complete
         # dump, taken after the crash (of the guest -no-shutdown kept stopped,
         # for the second), with a block for every hart.
@@ -2049,18 +2050,11 @@ if [ "$MODE" = "smp-invariants" ] && [ -z "${CPUS:-}" ]; then
     export CPUS
 fi
 
-BAD_RE='FAULT|FATAL|CRASH|Kernel panic|panic:|lkl-host: panic|FREED-ACTIVE|__kernel_restore bad ptr|/usr unavailable|Undefined symbol|No such file or directory|Bad file descriptor'
-if [ "$MODE" = "lkl-fsd-crash" ] || [ "$MODE" = "lkl-netd-crash" ] ||
-   [ "$MODE" = "lkl-netd-direct-denied" ] ||
-   [ "$MODE" = "lkl-netd-revoke" ] || [ "$MODE" = "lkl-multi-crash" ] ||
-   [ "$MODE" = "lkl-netd-restart" ] || [ "$MODE" = "lkl-netd-stale" ] ||
-   [ "$MODE" = "lkl-fsd-restart" ]; then
-    BAD_RE='FATAL|CRASH|Kernel panic|panic:|lkl-host: panic|FREED-ACTIVE|__kernel_restore bad ptr|/usr unavailable|Undefined symbol|No such file or directory|Bad file descriptor'
-fi
+BAD_RE="$RTMUX_BAD_RE"
 
 # smp-ap-crash-early crashes on purpose and checks the dump itself.
 if [ "$MODE" = "smp-ap-crash-early" ]; then
-    BAD_RE='FATAL|Kernel panic|panic:|FREED-ACTIVE|__kernel_restore bad ptr|/usr unavailable|Undefined symbol'
+    BAD_RE="$RTMUX_FATAL_RE|$RTMUX_SETUP_RE"
 fi
 
 # spawn-storm --procs measures teardown cost, which only an instrumented kernel
@@ -2625,16 +2619,30 @@ check_roottask_wait_reports()
 }
 
 # log_has_crash LOG: whether LOG holds one of this mode's fatal markers that
-# names a crash (not, say, a missing file).
+# names a crash (not, say, a missing /usr).
 log_has_crash()
 {
-    awk -v bad="$BAD_RE" '$0 ~ bad && /FAULT|FATAL|CRASH|panic|FREED-ACTIVE|__kernel_restore bad ptr/ { found=1; exit } END { exit !found }' "$1"
+    awk -v bad="$BAD_RE" -v crash="$RTMUX_CRASH_RE" '$0 ~ bad && $0 ~ crash { found=1; exit } END { exit !found }' "$1"
+}
+
+# injected_crash_seen LOG KIND: whether the crash in LOG is the one the
+# crash-inject modes asked for: the kernel's "FATAL: KIND requested by
+# debug-inject" line,
+# after the mode's begin marker, with no other signature of BAD_RE before it.
+# Any other crash or setup failure, during boot say, fails them.
+injected_crash_seen()
+{
+    awk -v begin="$BEGIN_MARKER" -v report="FATAL: $2 requested by debug-inject" -v bad="$BAD_RE" '
+        started && index($0, report) { found = 1; exit }
+        $0 ~ bad { exit }
+        index($0, begin) { started = 1 }
+        END { exit !found }' "$1"
 }
 
 # guest_shut_down SOCK: whether the QEMU listening for QMP on SOCK holds a guest
 # that has shut down. Under --gdb-on-timeout QEMU runs with -no-shutdown, so a
-# guest that powers off (a kernel crash ending in Shutdown[...], or the end of a
-# run) leaves QEMU stopped rather than gone, and the gdb stub still answers.
+# guest that powers off (a roottask crash, crash-inject-shutdown, or the end of
+# a run) leaves QEMU stopped rather than gone, and the gdb stub still answers.
 guest_shut_down()
 {
     [ -S "$1" ] || return 1
@@ -2736,7 +2744,7 @@ run_one()
     fi
     local wrap_timeout="$TIMEOUT"
     local gdb_port='' qmp_sock='' qmp_opts='' log_size='' last_size=-1
-    local start_s="$SECONDS" hung=0 hang_ok=0 crash_ok=0 shutdown_crash=0
+    local start_s="$SECONDS" hung=0 hang_ok=0 crash_ok=0 signature=
     local live_dumps=0 live_bad=0
     if [ "$GDB_ON_TIMEOUT" -eq 1 ]; then
 
@@ -2785,14 +2793,20 @@ run_one()
     local runner=$!
     local terminal=0
     while kill -0 "$runner" 2>/dev/null; do
+        # crash-inject-shutdown's crash report comes before its power-off:
+        # once it is in the log, leave it to the shutdown check below, which
+        # dumps the stopped guest. Any signature before it ends the run here.
         if grep -Fq -e "$FAIL_MARKER" -e "RTMux ${MODE}: SKIP" "$log" ||
-           grep -Eq "$BAD_RE" "$log"; then
+           { { [ "$MODE" != "crash-inject-shutdown" ] ||
+               ! grep -aFq "FATAL: power-off crash requested by debug-inject" "$log"; } &&
+             grep -Eq "$BAD_RE" "$log"; }; then
             # Only markers already fatal to this mode count. Some fixtures
             # deliberately fault or crash and check the guest's own report.
             if [ "$GDB_ON_TIMEOUT" -eq 1 ] &&
                log_has_crash "$log"; then
                 dump_guest_state "$log" "$gdb_port" "unexpected crash"
                 if [ "$MODE" = "crash-inject" ] &&
+                   injected_crash_seen "$log" "crash" &&
                    check_hang_inject_dump "${log%.log}.dump"; then
                     crash_ok=1
                 fi
@@ -2820,14 +2834,10 @@ run_one()
         if [ -n "$qmp_sock" ]; then
             log_size="$(wc -c <"$log")"
             if [ "$log_size" = "$last_size" ] && guest_shut_down "$qmp_sock"; then
-                if grep -aEq 'Shutdown\[[0-9]+\]' "$log"; then
-                    shutdown_crash=1
-                fi
-                if [ "$shutdown_crash" -eq 1 ] ||
-                   log_has_crash "$log"; then
+                if log_has_crash "$log"; then
                     dump_guest_state "$log" "$gdb_port" "guest shutdown after a crash"
                     if [ "$MODE" = "crash-inject-shutdown" ] &&
-                       [ "$shutdown_crash" -eq 1 ] &&
+                       injected_crash_seen "$log" "power-off crash" &&
                        check_hang_inject_dump "${log%.log}.dump"; then
                         crash_ok=1
                     fi
@@ -2945,25 +2955,18 @@ run_one()
              "($(cat "${log%.log}".live-*.dump | grep -c 'hart in firmware') harts caught in firmware)"
     fi
 
-    # The Shutdown[...] banner of a fatal kernel fault is not in BAD_RE, and
-    # the guest may have printed its pass marker before the fault, with or
-    # without --gdb-on-timeout.
-    if [ "$crash_ok" -ne 1 ] && grep -aEq 'Shutdown\[[0-9]+\]' "$log"; then
-        echo "  FAIL     ${MODE} guest shut down after a kernel fault (Shutdown[...])"
+    # Before the begin marker: a crash during boot names its line too.
+    if [ "$crash_ok" -ne 1 ] &&
+       signature="$(crash_signature_report "$log" "$BAD_RE")"; then
+        echo "  FAIL     ${MODE} boot log contains crash/fault signature"
         tail -n 160 "$log"
+        echo "$signature"
         return 1
     fi
 
     if ! grep -Fq "$BEGIN_MARKER" "$log"; then
         echo "  FAIL     ${MODE} missing begin marker: ${BEGIN_MARKER}"
         tail -n 120 "$log"
-        return 1
-    fi
-
-    if [ "$crash_ok" -ne 1 ] && grep -Eq "$BAD_RE" "$log"; then
-        echo "  FAIL     ${MODE} boot log contains crash/fault signature"
-        grep -En "$BAD_RE" "$log" | tail -n 20
-        tail -n 160 "$log"
         return 1
     fi
 
@@ -3164,6 +3167,10 @@ run_one()
             '^  PASS  fault-recovery readonly_write_fault[[:space:]]*$' || return 1
         require_log_patterns "$log" "fault recovery readonly event" \
             '^fault-event event_id=user-page-fault severity=thread-fatal subject=self cause=--fault-mprotect-ro action=reported-signal authority_delta=none[[:space:]]*$' || return 1
+        # --fault-sigsegv stores to address 1: the report names that address,
+        # not the signal number.
+        require_log_patterns "$log" "fault address" \
+            'user fault: pid=[0-9]+ tid=0 signo=11 code=1 fltno=11 addr=0000000000000001 ' || return 1
         require_log_patterns_in_order "$log" "fault recovery report floods" \
             '^  PASS  fault-recovery bad_syscall_enosys[[:space:]]*$' \
             '^fault-event event_id=illegal-syscall severity=deny subject=self cause=out-of-range-call action=return-ENOSYS authority_delta=none[[:space:]]*$' \

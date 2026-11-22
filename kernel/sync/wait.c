@@ -1177,8 +1177,13 @@ static thread_t *sync_dequeue_head(struct sync_chain *c, sync_key_t key)
 
 /* Claim the wait under its owning lock. A zero key means the waker
  * already owns the transition to READY. The key lives outside the kcall
- * argument union and cannot be overwritten by a subsequent message. */
-bool rdecl sync_chain_force_ready(thread_t *thp)
+ * argument union and cannot be overwritten by a subsequent message. A woken
+ * waiter that waits on the same object again has the same key, so a caller
+ * that names one wait passes its wake count (force_ready_wait): the wait is
+ * that one only if the count is unchanged under the chain lock, as a waker
+ * dequeues under it before ready() counts the wakeup. NULL claims any wait.
+ */
+bool rdecl sync_chain_force_ready(thread_t *thp, const uint32_t *wake_seq)
 {
     sync_key_t key = atomic_load_explicit(&thp->sync_wait_key, memory_order_acquire);
     struct sync_chain *c;
@@ -1190,7 +1195,8 @@ bool rdecl sync_chain_force_ready(thread_t *thp)
 
     c = sync_chain_of(key);
     kspinlock_lock(&c->lock);
-    if (!prio_on_sync_chain(thp) || sync_queued_key(thp) != key) {
+    if (!prio_on_sync_chain(thp) || sync_queued_key(thp) != key ||
+        (wake_seq && thread_wake_seq(thp) != *wake_seq)) {
         kspinlock_unlock(&c->lock);
         return false;
     }

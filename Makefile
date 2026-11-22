@@ -43,7 +43,7 @@ LKL_EXT4_IMG = $(IMAGE_DIR)/lkl-ext4.img
 .PHONY: check-memory-safety-inventory check-assumptions
 .PHONY: check-boot-manifest check-loader-negative verify
 .PHONY: check-evidence-claims check-fault-recovery check-platform-boundary-contracts
-.PHONY: check-fu740-smoke-scripts check-make-target-names check-ci-coverage check-lkl-scripts
+.PHONY: check-fu740-smoke-scripts check-crash-signatures check-make-target-names check-ci-coverage check-lkl-scripts
 .PHONY: check-header-deps check-gap-anchors check-rt-extra check-irq-modes check-hart-watchdog check-smp-bringup
 .PHONY: check-guest-misc check-trace-modes check-leak-gate check-version-skew check-spawn-storm
 .PHONY: footprint-report check-lkl check-lkl-containment check-lkl-iommu-preflight check-lkl-iommu-live check-lkl-qemu check-lkl-differential check-lkl-trace check-trace-export check-trace-overhead
@@ -311,7 +311,7 @@ check: check-posix-matrix-options check-pse51 check-posix-profile-header
 check: check-posix-profile-config check-posix-profile-surface check-lkl-profile
 check: check-syscall-abi check-libc-abi check-make-target-names check-trace-export check-rt-budgets check-irq-contract
 check: check-platform-boundary-contracts
-check: check-serial-priority check-lock-rank check-driver-priorities check-prio-writes check-preempt-inventory check-loader-negative check-fu740-smoke-scripts
+check: check-serial-priority check-lock-rank check-driver-priorities check-prio-writes check-preempt-inventory check-loader-negative check-fu740-smoke-scripts check-crash-signatures
 check: driver-gate $(LKL_CHECK_DEP) check-emu-headless check-rt check-qemu-deps
 check: $(AUTOCONF_H) $(VER_FILE) startup initramfs
 ifeq ($(CONFIG_LKL_SERVERS),y)
@@ -441,6 +441,10 @@ check-fault-recovery: check-qemu-deps $(AUTOCONF_H) $(VER_FILE) startup initramf
 check-fu740-smoke-scripts:
 	$(msg) CHECK "FU740 smoke script parsers"
 	$(Q)scripts/fu740-smoke-test.sh
+
+check-crash-signatures:
+	$(msg) CHECK "run-ending log signatures"
+	$(Q)scripts/check-crash-signatures.sh
 
 check-formal-claims:
 	$(msg) CHECK "formal claim schema"

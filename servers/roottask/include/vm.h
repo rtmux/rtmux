@@ -15,6 +15,11 @@ void vm_init(void);
 int vm_resize(path_object_t *obp, size_t size);
 extern const struct object_funcs mem_funcs;
 
+/* mem/as/resize.c: grow an object and map what the growth made reachable in
+ * existing mappings; called with no object or address-space lock held.
+ */
+int vm_grow(path_object_t *obp, size_t size, uint64_t *oldp);
+
 /* vm-map.c */
 int vm_find_object(ioserv_context_t *ctp,
                    pid_t prp_pid,

@@ -199,7 +199,6 @@ connect_t *rdecl lookup_rcvid(kcall_args_t *kap, int rcvid, thread_t **thpp)
             switch (SIGEV_GET_TYPE(kap->msg_deliver_event.event)) {
             case SIGEV_SIGNAL_THREAD:
             case SIGEV_UNBLOCK:
-            case SIGEV_INTR:
                 break;
 
             default:

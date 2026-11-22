@@ -1,5 +1,6 @@
 #!/bin/sh
 set -eu
+. "$(dirname -- "$0")/crash-signatures.sh"
 
 log=build/fu740-logs/lkl-fsd-tree.log
 runner=${FU740_RUNNER:-}
@@ -36,7 +37,7 @@ require()
 
 reject_bad_log()
 {
-    bad_re='FAULT|FATAL|CRASH|Kernel panic|panic:|lkl-host: panic|FREED-ACTIVE|__kernel_restore bad ptr|/usr unavailable|Undefined symbol|No such file or directory|Bad file descriptor'
+    bad_re=$RTMUX_BAD_RE
 
     if grep -Eq 'RTMux lkl-fsd-tree: FAIL' "$log"; then
         echo "fu740-fsd-smoke: board log contains lkl-fsd-tree FAIL marker" >&2

@@ -1,5 +1,6 @@
 #!/bin/sh
 set -eu
+. "$(dirname -- "$0")/crash-signatures.sh"
 
 budget_ns=${FU740_IRQOFF_BUDGET_NS:-}
 log=build/fu740-logs/irqoff-budget.log
@@ -54,7 +55,7 @@ lock_class_id()
 
 reject_bad_log()
 {
-    bad_re='FAULT|FATAL|CRASH|Kernel panic|panic:|FREED-ACTIVE|__kernel_restore bad ptr|/usr unavailable|Undefined symbol|No such file or directory|Bad file descriptor'
+    bad_re=$RTMUX_BAD_RE
 
     if grep -Eq 'RTMux rt-check: FAIL' "$log"; then
         echo "fu740-irqoff-budget: board log contains rt-check FAIL marker" >&2

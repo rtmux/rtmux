@@ -10,17 +10,17 @@
 
 
 /* The identity of the request an unblock notification is being made for
- * (force_ready names the client for the length of its notification_deliver
- * call), or 0 for any other notification. An unblock notification names an
+ * (force_ready names it for the length of its notification_deliver call), or
+ * 0 for any other notification. An unblock notification names an
  * rcvid, which the client's next request has too: the identity goes with the
  * notification to the server thread that takes it, and two notifications for
  * different requests are not folded into one.
  */
 static uint64_t notification_request(int code)
 {
-    const thread_t *client = pcpu_array[get_cpunum()].pc_unblock_client;
-
-    return code == _NOTIFICATION_CODE_UNBLOCK && client ? client->req_gen : 0;
+    return code == _NOTIFICATION_CODE_UNBLOCK
+               ? pcpu_array[get_cpunum()].pc_unblock_gen
+               : 0;
 }
 
 /* The send queue contains both threads and notifications. A kernel terminal

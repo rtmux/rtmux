@@ -26,7 +26,10 @@ an oversized request from a client that skips the check. The arguments are
 placed on the new program's stack, which is enlarged by their size, so they do
 not reduce the stack the program asked for. A spawn within the limit can still
 fail with `ENOMEM`: roottask copies a `posix_spawn` request into its fixed heap
-while it starts the child, and several large requests at once can exhaust it.
+while it starts the child. Large requests are admitted in turn against half of
+that heap, and may wait there or fail with `EAGAIN` when too many queue, but
+the heap is shared with everything else roottask allocates, so a request can
+still meet a heap the rest of roottask has filled.
 
 ## Shell command lists
 

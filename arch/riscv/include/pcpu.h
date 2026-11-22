@@ -164,12 +164,14 @@ struct pcpu {
      */
     struct thread_entry *pc_block_recheck;
 
-    /* The client force_ready is making an unblock notification for, for the
-     * length of that notification_deliver call: a server that is waiting gets
-     * the notification at once, and is told whose request it is about
-     * (msg_unblock_received). Owner hart only.
+    /* The identity (req_gen) of the request force_ready is making an unblock
+     * notification for, for the length of that notification_deliver call, or
+     * 0: a server that is waiting gets the notification at once, and is told
+     * which request it is about (msg_unblock_received). Checked under the
+     * channel lock with the request still blocked, not read at the delivery, by
+     * which time the client may be in its next request. Owner hart only.
      */
-    const struct thread_entry *pc_unblock_client;
+    uint64_t pc_unblock_gen;
 
     /* Dispatch locks this hart holds (SCHED_LOCK nesting), and the CPUs whose
      * reschedule IPIs it queued meanwhile: send_ipi posts the command bits at

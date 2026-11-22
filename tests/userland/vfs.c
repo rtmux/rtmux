@@ -970,6 +970,104 @@ int nvme_raw_child(void)
     return 0;
 }
 
+/* Two clients open, read and close /sys files at once. Roottask keeps
+ * the open files of /sys in a pool of 16 slots, and serves the two clients on
+ * different threads: without a lock on the pool two opens can take the same
+ * slot, so that one client reads the other's file or position and the slot's
+ * buffer is freed twice. Each client checks every byte it reads against a
+ * copy taken beforehand; afterwards all 16 slots must still be there.
+ */
+#define SYSFS_STRESS_ROUNDS 1000
+#define SYSFS_STRESS_SLOTS 16 /* SYSFS_MAX_OCBS in servers/roottask */
+
+struct sysfs_stress {
+    const char *path[2]; /* files with fixed content */
+    char want[2][256];
+    ssize_t len[2];
+    atomic_int go;
+    int bad[2];   /* per client: wrong bytes, short reads, failed opens */
+    int first[2]; /* per client: round of its first failure */
+    atomic_int which;
+};
+
+static void *sysfs_stress_client(void *arg)
+{
+    struct sysfs_stress *st = arg;
+    int me = atomic_fetch_add(&st->which, 1);
+    char got[256], dyn[64];
+
+    while (!atomic_load(&st->go))
+        sched_yield();
+    for (int r = 0; r < SYSFS_STRESS_ROUNDS; r++) {
+        /* its own fixed file, and every fourth round one with a buffer */
+        int fd = open(st->path[me], O_RDONLY);
+        ssize_t n = fd < 0 ? -1 : read(fd, got, sizeof got);
+        bool ok = n == st->len[me] && !memcmp(got, st->want[me], (size_t) n) &&
+                  read(fd, got, sizeof got) == 0;
+
+        if (fd >= 0 && close(fd) != 0)
+            ok = false;
+        if (ok && r % 4 == me) {
+            fd = open("/sys/namespace-stats", O_RDONLY);
+            ok = fd >= 0 && read(fd, dyn, sizeof dyn) > 6 &&
+                 !memcmp(dyn, "total ", 6);
+            if (fd >= 0 && close(fd) != 0)
+                ok = false;
+        }
+        if (!ok && !st->bad[me]++)
+            st->first[me] = r;
+    }
+    return NULL;
+}
+
+void test_sysfs_open_stress(void)
+{
+    struct sysfs_stress st = {.path = {"/sys/version", "/sys/kernelversion"}};
+    pthread_t th[2];
+    int fds[SYSFS_STRESS_SLOTS + 1], nopen = 0, started = 0;
+    char detail[96];
+
+    for (int i = 0; i < 2; i++) {
+        int fd = open(st.path[i], O_RDONLY);
+
+        st.len[i] = fd < 0 ? -1 : read(fd, st.want[i], sizeof st.want[i]);
+        if (fd >= 0)
+            (void) close(fd);
+        if (st.len[i] <= 0 || st.len[i] == (ssize_t) sizeof st.want[i]) {
+            test_fail("sysfs open stress fixture", st.path[i]);
+            return;
+        }
+    }
+    if (st.len[0] == st.len[1] &&
+        !memcmp(st.want[0], st.want[1], (size_t) st.len[0])) {
+        test_fail("sysfs open stress fixture", "the two files are equal");
+        return;
+    }
+    for (; started < 2; started++)
+        if (pthread_create(&th[started], NULL, sysfs_stress_client, &st))
+            break;
+    atomic_store(&st.go, 1);
+    for (int i = 0; i < started; i++)
+        (void) pthread_join(th[i], NULL);
+    snprintf(detail, sizeof detail,
+             "clients=%d bad=%d/%d first at round %d/%d of %d", started,
+             st.bad[0], st.bad[1], st.first[0], st.first[1],
+             SYSFS_STRESS_ROUNDS);
+    check(started == 2 && !st.bad[0] && !st.bad[1],
+          "sysfs two clients each read their own file", detail);
+
+    /* A slot taken twice is freed twice or never: count what is left. */
+    while (nopen <= SYSFS_STRESS_SLOTS &&
+           (fds[nopen] = open("/sys/version", O_RDONLY)) >= 0)
+        nopen++;
+    snprintf(detail, sizeof detail, "%d opens succeeded, errno %d", nopen,
+             errno);
+    check(nopen == SYSFS_STRESS_SLOTS,
+          "sysfs pool holds all its slots after the stress", detail);
+    while (nopen > 0)
+        (void) close(fds[--nopen]);
+}
+
 /* /sys/kstats: every line is key=value, each documented key appears exactly
  * once, and soul.thread.used moves by exactly one while a thread is alive.
  */
@@ -1083,6 +1181,9 @@ static void test_sys_kstats(void)
               kstats_get(snap, "roottask.heap_used") > 0 &&
               kstats_get(snap, "roottask.heap_size") > 0 &&
               kstats_get(snap, "roottask.heap_largest") >= 0 &&
+              kstats_get(snap, "pa.largest_free_run") >= 4096 &&
+              kstats_get(snap, "pa.largest_free_run") % 4096 == 0 &&
+              kstats_get(snap, "roottask.loader_context_bytes") >= 20480 &&
               kstats_get(snap, "vm.rollback_pages") >= 0 &&
               kstats_get(snap, "ioserv.disconnects") >= 0 &&
               kstats_get(snap, "thread.live") > 0 &&
@@ -1091,7 +1192,7 @@ static void test_sys_kstats(void)
               kstats_get(snap, "timeout.live") <= kstats_get(snap, "thread.live") &&
               kstats_get(snap, "prio.reply_depth") > 0 &&
               kstats_get(snap, "prio.reply_depth_overflow") >= 0 &&
-              lines == (int) (3 * (sizeof pools / sizeof pools[0]) + 10 + (size_t) harts),
+              lines == (int) (3 * (sizeof pools / sizeof pools[0]) + 12 + (size_t) harts),
           "sys_kstats_format documented keys appear exactly once",
           "a documented key is missing, duplicated, or extra");
 
@@ -2209,23 +2310,82 @@ out:
 #define LOST_REPLY_PATH "/lost-reply-test"
 #define LOST_REPLY_HOLD_MS 300
 
-static atomic_int lost_reply_hold; /* the next open waits before it binds */
+/* The next open waits before it binds: 1 for LOST_REPLY_HOLD_MS, 2 until
+ * lost_reply_gate is cleared (5 s at most). Cleared when the open takes it.
+ */
+static atomic_int lost_reply_hold;
+static atomic_int lost_reply_gate;
 static atomic_int lost_reply_bad_iov; /* the next stat replies with a bad iov */
 static atomic_int lost_reply_held_bound; /* the held open bound and returned */
 static atomic_int lost_reply_bound, lost_reply_closed;
+
+static int lost_reply_nap_chid = -1; /* nothing is ever sent on it */
+
+/* Wait in a call that libc does not register as interruptible: a signal
+ * delivery breaks one registered waiter, the lowest thread, and a case about
+ * who is interrupted cannot have its bystanders in sleep_ms().
+ */
+static void lost_reply_nap(unsigned ms)
+{
+    char byte;
+
+    if (lost_reply_nap_chid == -1) {
+        sleep_ms(ms);
+        return;
+    }
+    test_receive_within(ms * 1000000ULL);
+    (void) msg_receive(lost_reply_nap_chid, &byte, 1, NULL);
+}
+
+/* Nap until *flag is not "unset", for ms milliseconds at most, and return
+ * it. Not test_wait_flag(): its sleep_ms() is a wait a signal can break.
+ */
+static int lost_reply_await(atomic_int *flag, int unset, int ms)
+{
+    for (int i = 0; i < ms / 10 && atomic_load(flag) == unset; i++)
+        lost_reply_nap(10);
+    return atomic_load(flag);
+}
+
+static int lost_reply_redirect_chid = -1; /* where an open of "redirect" goes */
+
+/* Answer the open as /dev/tty's is answered: go to another server, and send
+ * it the message that follows the server's address (here an _IO_STAT).
+ */
+static int lost_reply_redirect(ioserv_context_t *ctp, io_open_t *msg)
+{
+    struct _io_connect_link_reply *linkp = (void *) msg;
+    struct _server_info *info = (void *) (linkp + 1);
+    struct _io_stat *next = (void *) (info + 1);
+    const size_t len = sizeof *linkp + sizeof *info + sizeof *next;
+    uint8_t eflag = msg->connect.eflag;
+
+    _IO_SET_CONNECT_RET(ctp, _IO_CONNECT_RET_MSG);
+    memset(linkp, 0, len);
+    linkp->eflag = eflag;
+    linkp->path_len = sizeof *next;
+    info->pid = getpid();
+    info->chid = lost_reply_redirect_chid;
+    next->type = _IO_STAT;
+    next->combine_len = sizeof *next;
+    return IOSERV_PTR(ctp, msg, len);
+}
 
 static int lost_reply_open(ioserv_context_t *ctp, io_open_t *msg, void *handle,
                            void *extra)
 {
     int *ocb;
 
-    (void) msg;
     (void) handle;
     (void) extra;
+    if (lost_reply_redirect_chid != -1 && !strcmp(msg->connect.path, "redirect"))
+        return lost_reply_redirect(ctp, msg);
     int held = atomic_exchange(&lost_reply_hold, 0);
 
-    if (held)
-        sleep_ms(LOST_REPLY_HOLD_MS);
+    if (held == 1)
+        lost_reply_nap(LOST_REPLY_HOLD_MS);
+    if (held == 2)
+        (void) lost_reply_await(&lost_reply_gate, 1, 5000);
     if (!(ocb = calloc(1, sizeof *ocb)))
         return ENOMEM;
     if (ioserv_open_bind(ctp, ocb, NULL) == -1) {
@@ -2323,16 +2483,24 @@ static int lost_reply_timed_open(int chid, int id, bool combine)
     return err;
 }
 
-static void *lost_reply_open_path(void *arg)
+/* Open and close LOST_REPLY_PATH/leaf; returns open's errno, 0 if it opened. */
+static int lost_reply_try_open(const char *leaf)
 {
-    int *err = arg;
+    char path[64];
     int fd;
 
+    snprintf(path, sizeof path, LOST_REPLY_PATH "/%s", leaf);
     errno = 0;
-    fd = open(LOST_REPLY_PATH "/node", O_RDONLY);
-    *err = fd == -1 ? errno : 0;
-    if (fd != -1)
-        (void) close(fd);
+    fd = open(path, O_RDONLY);
+    if (fd == -1)
+        return errno;
+    (void) close(fd);
+    return 0;
+}
+
+static void *lost_reply_open_path(void *arg)
+{
+    *(int *) arg = lost_reply_try_open("node");
     return NULL;
 }
 
@@ -2469,8 +2637,8 @@ static void lost_reply_rounds(struct lost_reply_fx *fx, const char *tag, bool fa
         if (pthread_create(&th, NULL, lost_reply_open_path, &thread_err) == 0)
             (void) pthread_join(th, NULL);
         snprintf(name, sizeof name, "%s %s id reusable", tag, what);
-        snprintf(why, sizeof why, "open: %s here, %s in a new thread", strerror(main_err),
-                 strerror(thread_err));
+        snprintf(why, sizeof why, "open: errno %d here, errno %d in a new thread", main_err,
+                 thread_err);
         check(!main_err && !thread_err, name, why);
 
         snprintf(name, sizeof name, "%s %s leaves no binding", tag, what);
@@ -2517,7 +2685,10 @@ static void lost_reply_bad_reply(void)
     for (int i = 0; i < 400 && atomic_load(&lost_reply_stat_err) == -1; i++)
         sleep_ms(5);
     err = atomic_load(&lost_reply_stat_err);
-    snprintf(why, sizeof why, "access: %s", err == -1 ? "never answered" : strerror(err));
+    if (err == -1)
+        snprintf(why, sizeof why, "access: never answered");
+    else
+        snprintf(why, sizeof why, "access: errno %d (want EFAULT %d)", err, EFAULT);
     check(err == EFAULT, "lost reply bad iov answers the client with an error", why);
 
     /* The access was a combined open and stat with no close: the open bound
@@ -2537,6 +2708,213 @@ static void lost_reply_bad_reply(void)
         (void) pthread_join(th, NULL);
 }
 
+/* -1 until the open has returned. Not lost_reply_stat_err: the access a
+ * failed case left behind may still write that one.
+ */
+static atomic_int lost_reply_call_err;
+static atomic_int lost_reply_handled; /* SIGUSR1 handler runs */
+
+static void lost_reply_sigusr1(int sig)
+{
+    (void) sig;
+    atomic_fetch_add(&lost_reply_handled, 1);
+}
+
+static void *lost_reply_open_err_path(void *arg)
+{
+    atomic_store(&lost_reply_call_err, lost_reply_try_open(arg));
+    return NULL;
+}
+
+/* An open of LOST_REPLY_PATH/leaf that a server holds until lost_reply_gate
+ * is cleared, with SIGUSR1 sent while it is held, to a handler installed with
+ * sa_flags. *held moves off held_unset once the server holds the open. Sets
+ * *early to the open's result while it is held (-1: none yet) and returns its
+ * result once let go (-1: none, the thread is left detached; -2: the case
+ * could not be set up).
+ */
+static int lost_reply_signal_open(const char *name, const char *leaf, int sa_flags,
+                                  atomic_int *held, int held_unset, int *early)
+{
+    struct sigaction sa, old;
+    pthread_t th;
+    int late;
+
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = lost_reply_sigusr1;
+    sa.sa_flags = sa_flags;
+    atomic_store(&lost_reply_call_err, -1);
+    atomic_store(&lost_reply_handled, 0);
+    atomic_store(&lost_reply_gate, 1);
+    if (sigaction(SIGUSR1, &sa, &old) != 0) {
+        test_fail(name, "sigaction failed");
+        atomic_store(&lost_reply_gate, 0);
+        return -2;
+    }
+    if (pthread_create(&th, NULL, lost_reply_open_err_path, (void *) leaf) != 0) {
+        test_fail(name, "pthread_create failed");
+        atomic_store(&lost_reply_gate, 0);
+        (void) sigaction(SIGUSR1, &old, NULL);
+        return -2;
+    }
+    if (lost_reply_await(held, held_unset, 2000) == held_unset ||
+        !test_thread_blocked(th, STATE_REPLY))
+        test_fail(name, "the open did not block in the server");
+    (void) kill(getpid(), SIGUSR1);
+    if (!lost_reply_await(&lost_reply_handled, 0, 2000))
+        test_fail(name, "the signal was not handled");
+    if (sa_flags & SA_RESTART) {
+        /* A second signal is delivered once the first one's delivery,
+         * interrupt attempt included, is over: when its handler has run, the
+         * open has seen everything the first could do to it.
+         */
+        (void) kill(getpid(), SIGUSR1);
+        if (lost_reply_await(&lost_reply_handled, 1, 2000) != 2)
+            test_fail(name, "the second signal was not handled");
+        *early = atomic_load(&lost_reply_call_err);
+    } else {
+        /* Still held: an EINTR comes now or not at all. */
+        *early = lost_reply_await(&lost_reply_call_err, -1, 2000);
+    }
+    atomic_store(&lost_reply_gate, 0);
+    late = lost_reply_await(&lost_reply_call_err, -1, 2000);
+    (void) sigaction(SIGUSR1, &old, NULL);
+    if (late == -1)
+        (void) pthread_detach(th); /* ends with the server */
+    else
+        (void) pthread_join(th, NULL);
+    return late;
+}
+
+static atomic_int lost_reply_redirect_held; /* the redirected message is held */
+static atomic_int lost_reply_redirect_stop;
+
+/* The server an open of "redirect" is sent on to, on a channel of its own:
+ * it holds the message it is sent there until lost_reply_gate is cleared,
+ * then fails it, and answers anything else (a close) at once.
+ */
+static void *lost_reply_redirect_server(void *arg)
+{
+    union {
+        uint16_t type;
+        char bytes[64];
+    } m;
+
+    (void) arg;
+    while (!atomic_load(&lost_reply_redirect_stop)) {
+        int rcvid;
+
+        test_receive_within(20 * 1000000ULL);
+        if ((rcvid = msg_receive(lost_reply_redirect_chid, &m, sizeof m, NULL)) <= 0)
+            continue;
+        if (m.type == _IO_STAT) {
+            atomic_store(&lost_reply_redirect_held, 1);
+            (void) lost_reply_await(&lost_reply_gate, 1, 5000);
+            (void) msg_error(rcvid, ENOSYS);
+        } else {
+            (void) msg_reply(rcvid, EOK, NULL, 0);
+        }
+    }
+    return NULL;
+}
+
+/* The same with the open sent on to another server, which holds it: the
+ * open ends with EINTR while that server still holds it, and does not wait
+ * there to send a close first.
+ */
+static void lost_reply_open_redirect_signal(void)
+{
+    static const char name[] = "open redirected by a service, signal without SA_RESTART";
+    pthread_t server;
+    char why[96];
+    int early, late;
+
+    if ((lost_reply_redirect_chid = channel_create(0)) == -1) {
+        test_fail(name, "channel_create failed");
+        return;
+    }
+    atomic_store(&lost_reply_redirect_stop, 0);
+    atomic_store(&lost_reply_redirect_held, 0);
+    if (pthread_create(&server, NULL, lost_reply_redirect_server, NULL) != 0) {
+        test_fail(name, "pthread_create failed");
+    } else {
+        late = lost_reply_signal_open(name, "redirect", 0, &lost_reply_redirect_held, 0, &early);
+        if (late != -2) {
+            snprintf(why, sizeof why, "while held: %d, in the end: %d (-1: no result yet)",
+                     early, late);
+            check(early == EINTR, name, why);
+        }
+        atomic_store(&lost_reply_redirect_stop, 1);
+        (void) pthread_join(server, NULL);
+    }
+    (void) channel_destroy(lost_reply_redirect_chid);
+    lost_reply_redirect_chid = -1;
+}
+
+/* open() of a path whose service holds the open until it is let go, on a
+ * channel that does not ask for unblock notices, with a signal sent
+ * meanwhile. A handler installed without SA_RESTART ends the open with EINTR
+ * while the service still holds it; one installed with it leaves the open to
+ * finish once the service lets it. Nobody else in the process is in a wait a
+ * signal can break: the service and this thread nap in lost_reply_nap().
+ */
+static void lost_reply_open_signal(void)
+{
+    char why[96], name[64];
+    bool settled = false; /* both cases ran, and no open is left running */
+
+    if ((lost_reply_nap_chid = channel_create(0)) == -1) {
+        test_fail("open held by a service", "channel_create failed");
+        return;
+    }
+    /* Without SA_RESTART last: the binding check after the loop is about
+     * the open it interrupted.
+     */
+    for (int restart = 1; restart >= 0; restart--) {
+        int early, late;
+
+        snprintf(name, sizeof name, "open held by a service, signal %s SA_RESTART",
+                 restart ? "with" : "without");
+        atomic_store(&lost_reply_bound, 0);
+        atomic_store(&lost_reply_closed, 0);
+        atomic_store(&lost_reply_held_bound, 0);
+        atomic_store(&lost_reply_hold, 2);
+        late = lost_reply_signal_open(name, "node", restart ? SA_RESTART : 0, &lost_reply_hold,
+                                      2, &early);
+        /* An open that never reached the service leaves the hold armed:
+         * take it back, or the next open of "node" waits for a gate.
+         */
+        atomic_store(&lost_reply_hold, 0);
+        if (late == -2)
+            break;
+        snprintf(why, sizeof why, "while held: %d, in the end: %d (-1: no result yet)", early,
+                 late);
+        check(restart ? early == -1 && late == 0 : early == EINTR, name, why);
+        if (late == -1)
+            break; /* its open, still running, would write over the next case */
+        settled = !restart;
+    }
+
+    /* The cases below share the open's result and the gate with an open that
+     * is still running, and the binding check is about the open without
+     * SA_RESTART: none of them runs after a case that stopped the loop.
+     */
+    if (settled) {
+        /* The service, let go, finishes the open that was interrupted: it
+         * binds, finds its reply lost, and closes the binding.
+         */
+        (void) lost_reply_await(&lost_reply_held_bound, 0, 600);
+        (void) lost_reply_await(&lost_reply_closed, 0, 200);
+        snprintf(why, sizeof why, "%d bound, %d closed", atomic_load(&lost_reply_bound),
+                 atomic_load(&lost_reply_closed));
+        check(atomic_load(&lost_reply_bound) == 1 && atomic_load(&lost_reply_closed) == 1,
+              "open held by a service, interrupted open leaves no binding", why);
+        lost_reply_open_redirect_signal();
+    }
+    (void) channel_destroy(lost_reply_nap_chid);
+    lost_reply_nap_chid = -1;
+}
+
 void test_ioserv_lost_reply_binding(void)
 {
     struct lost_reply_fx fx;
@@ -2548,6 +2926,7 @@ void test_ioserv_lost_reply_binding(void)
         return;
     lost_reply_rounds(&fx, "lost reply", false);
     lost_reply_bad_reply();
+    lost_reply_open_signal();
     lost_reply_stop(&fx);
 }
 
@@ -8086,6 +8465,118 @@ void test_sys_log_wrap(void)
     (void) close(fd);
 }
 
+/* A spawn whose loader faults: a CONFIG_DEBUG_INJECT roottask makes the
+ * loader of a path ending in rtmux-loader-fault store through a null pointer.
+ * The spawner must be told EFAULT; it used to be told ENOMEM, or the signal
+ * number as if it were an errno. Run by the debug-inject mode only.
+ */
+void test_loader_fault(void)
+{
+    char *argv[] = {"rtmux-loader-fault", NULL};
+    char *envp[] = {NULL};
+    char detail[48];
+    pid_t pid = -1;
+    int rc = posix_spawn(&pid, "/bin/rtmux-loader-fault", NULL, NULL, argv,
+                         envp);
+
+    /* Errno numbers, not their text: the harness takes some of it for a
+     * crash report.
+     */
+    if (rc == EOK)
+        (void) waitpid(pid, NULL, 0);
+    snprintf(detail, sizeof detail, "errno %d, want %d", rc, EFAULT);
+    check(rc == EFAULT, "posix_spawn with a faulting loader is a bad address",
+          detail);
+    errno = 0;
+    pid = rtmux_spawn("/bin/rtmux-loader-fault", 0, NULL, NULL, argv, envp);
+    rc = pid == -1 ? errno : EOK;
+    if (pid > 0)
+        (void) waitpid(pid, NULL, 0);
+    snprintf(detail, sizeof detail, "errno %d, want %d", rc, EFAULT);
+    check(rc == EFAULT, "native spawn with a faulting loader is a bad address",
+          detail);
+    /* the next spawn is unaffected */
+    argv[0] = "true";
+    rc = posix_spawn(&pid, "/bin/true", NULL, NULL, argv, envp);
+    snprintf(detail, sizeof detail, "errno %d", rc);
+    check(rc == EOK && waitpid(pid, NULL, 0) == pid,
+          "a spawn after the faulting loaders succeeds", detail);
+}
+
+/* Count the lines of /sys/log after the last line that holds `mark` that
+ * hold `what`. Returns -1 if the log cannot be read or the mark is not in it.
+ */
+static int sys_log_count_after(const char *mark, const char *what)
+{
+    static char line[512], chunk[4096]; /* the most one /sys/log read gives */
+    size_t used = 0;
+    int fd = open("/sys/log", O_RDONLY), count = -1;
+    ssize_t n;
+
+    if (fd < 0) {
+        printf("sys_log_count_after: open: errno %d\n", errno);
+        return -1;
+    }
+    while ((n = read(fd, chunk, sizeof chunk)) > 0) {
+        for (ssize_t i = 0; i < n; i++) {
+            if (chunk[i] != '\n') {
+                if (used < sizeof line - 1)
+                    line[used++] = chunk[i];
+                continue;
+            }
+            line[used] = '\0';
+            used = 0;
+            if (strstr(line, mark))
+                count = 0;
+            else if (count >= 0 && strstr(line, what))
+                count++;
+        }
+    }
+    if (n < 0)
+        printf("sys_log_count_after: read: errno %d\n", errno);
+    else if (count < 0)
+        printf("sys_log_count_after: no line holds \"%s\"\n", mark);
+    (void) close(fd);
+    return n < 0 ? -1 : count;
+}
+
+/* A raw spawn request with no arguments gets as far as the loader, which
+ * refuses it with EINVAL. Roottask logged every one of them; a client could
+ * fill the log ring that way. The log is rate limited now: 64 requests
+ * leave between one line and nine. (Not more requests: roottask traces every
+ * spawn into the same ring, and the mark must still be in it.)
+ */
+void test_spawn_loader_einval_log(void)
+{
+    static const char path[] = "/bin/true";
+    static const char mark[] = "loader-einval-flood-mark";
+    struct {
+        struct _proc_spawn i;
+        char data[16];
+    } raw = {.i = {.type = _PROC_SPAWN, .subtype = _PROC_SPAWN_START}};
+    char detail[64];
+    int bad = 0, lines;
+
+    raw.i.pathlen = sizeof path;
+    memcpy(raw.data, path, sizeof path);
+    if (send_log_mark(mark, sizeof mark - 1) != EOK) {
+        test_fail("spawn loader EINVAL log fixture", "no log mark");
+        return;
+    }
+    for (int i = 0; i < 64; i++)
+        if (roottask_errno_status(
+                msg_sendnc_r(ROOTTASK_COID, &raw, sizeof raw.i + sizeof path,
+                             NULL, 0)) != EINVAL)
+            bad++;
+    snprintf(detail, sizeof detail, "%d of 64 were not EINVAL", bad);
+    check(bad == 0, "a spawn with no arguments is EINVAL", detail);
+    lines = sys_log_count_after(mark, "proc-loader.c");
+    /* The first one is logged: none at all would mean the count missed it. */
+    snprintf(detail, sizeof detail, "%d log lines for 64 requests", lines);
+    check(lines >= 1 && lines <= 9,
+          "the loader's EINVAL log is rate limited", detail);
+}
+
 static void test_spawn_malformed_messages_fail_closed(void)
 {
     proc_spawn_t spawn_msg;
@@ -9227,6 +9718,370 @@ void test_spawn_arg_max(void)
     check(rc == EINVAL, "spawn rejects more arguments than strings",
           strerror(rc));
     free(buf);
+}
+
+/* Sixteen threads spawn /bin/true at once, each with ARG_MAX of arguments and
+ * 60000 bytes of file actions (dup2 of stdout onto itself), twice over.
+ * Roottask copies a posix_spawn request into its fixed heap (buffers of about
+ * 160 and 100 KiB here) and gives each spawn a loader context, 320 KiB of
+ * contiguous memory that is never returned. Unbounded, eight such
+ * requests exhausted the heap and the rest failed with ENOMEM, and every
+ * spawn in flight mapped a context of its own. Now the requests queue
+ * for a heap budget and for the contexts their size class may have: all
+ * succeed, roottask logs no `nomem:` line, and the contexts mapped since boot
+ * grow by no more than the two their class may have.
+ */
+#define SPAWN_ARGMAX_THREADS 16
+#define SPAWN_ARGMAX_ROUNDS 2
+#define SPAWN_ARGMAX_CONTEXTS (2L * 327680L) /* limit x size of the class */
+
+#define SPAWN_ARGMAX_ACTIONS 2500 /* 24 bytes each on the wire: 60000 */
+
+struct spawn_argmax_job {
+    pthread_barrier_t *start;
+    const char *path;
+    const posix_spawn_file_actions_t *actions;
+    char **argv, **envp;
+    int failed, first_rc;
+};
+
+static void *spawn_argmax_thread(void *arg)
+{
+    struct spawn_argmax_job *job = arg;
+
+    (void) pthread_barrier_wait(job->start);
+    for (int r = 0; r < SPAWN_ARGMAX_ROUNDS; r++) {
+        int code = -1;
+        int rc = spawn_wait_code(job->path, job->actions, NULL, job->argv,
+                                 job->envp, NULL, &code);
+
+        if ((rc != EOK || code != 0) && !job->failed++)
+            job->first_rc = rc;
+    }
+    return NULL;
+}
+
+/* `held`: the debug-inject variant. A CONFIG_DEBUG_INJECT roottask holds every
+ * request whose path starts with "/./" for 300 ms inside its handler, buffers
+ * allocated, so all sixteen are in the handler together: without the budget
+ * they need about 3 MiB of roottask's heap, more than it has
+ * (CONFIG_ROOTTASK_HEAP_SIZE, 2 MiB by default), and most fail with ENOMEM. File actions are
+ * left out, so that the loaders are quick and the handlers are what overlaps.
+ */
+static void spawn_concurrent_arg_max(bool held)
+{
+    static const char mark[] = "spawn-concurrent-arg-max-mark";
+    static struct spawn_argmax_job job[SPAWN_ARGMAX_THREADS];
+    char *argv[] = {"true", NULL, NULL};
+    char *env[] = {"CHECK=1", NULL};
+    size_t len = ARG_MAX - sizeof argv - sizeof env - sizeof "true" -
+                 sizeof "CHECK=1";
+    pthread_t th[SPAWN_ARGMAX_THREADS];
+    pthread_barrier_t start;
+    char detail[96];
+    posix_spawn_file_actions_t fa;
+    char *buf = malloc(len);
+    long before, after;
+    int started = 0, failed = 0, first_rc = 0, nomem, rc;
+
+    if (!buf || posix_spawn_file_actions_init(&fa)) {
+        test_fail("spawn concurrent ARG_MAX fixture", "no memory");
+        free(buf);
+        return;
+    }
+    rc = pthread_barrier_init(&start, NULL, SPAWN_ARGMAX_THREADS);
+    for (int i = 0; !rc && !held && i < SPAWN_ARGMAX_ACTIONS; i++)
+        rc = posix_spawn_file_actions_adddup2(&fa, STDOUT_FILENO,
+                                              STDOUT_FILENO);
+    if (rc || send_log_mark(mark, sizeof mark - 1) != EOK) {
+        test_fail("spawn concurrent ARG_MAX fixture", "setup failed");
+        (void) posix_spawn_file_actions_destroy(&fa);
+        free(buf);
+        return;
+    }
+    memset(buf, 'a', len);
+    buf[len - 1] = '\0';
+    argv[1] = buf;
+    before = kstats_value("roottask.loader_context_bytes");
+    for (; started < SPAWN_ARGMAX_THREADS; started++) {
+        job[started] = (struct spawn_argmax_job) {
+            .start = &start,
+            .path = held ? "/./bin/true" : "/bin/true",
+            .actions = held ? NULL : &fa,
+            .argv = argv,
+            .envp = env};
+        if (pthread_create(&th[started], NULL, spawn_argmax_thread,
+                           &job[started]))
+            break;
+    }
+    if (started < SPAWN_ARGMAX_THREADS) {
+        /* The barrier would never open: nothing useful can be said. */
+        test_fail("spawn concurrent ARG_MAX fixture", "thread creation");
+        _exit(1);
+    }
+    for (int i = 0; i < started; i++) {
+        (void) pthread_join(th[i], NULL);
+        if (job[i].failed && !failed)
+            first_rc = job[i].first_rc;
+        failed += job[i].failed;
+    }
+    after = kstats_value("roottask.loader_context_bytes");
+    nomem = sys_log_count_after(mark, "nomem:");
+    snprintf(detail, sizeof detail, "%d of %d failed, first errno %d", failed,
+             SPAWN_ARGMAX_THREADS * SPAWN_ARGMAX_ROUNDS, first_rc);
+    check(failed == 0, "16 concurrent spawns with ARG_MAX arguments succeed",
+          detail);
+    snprintf(detail, sizeof detail, "%d nomem lines", nomem);
+    check(nomem == 0, "concurrent ARG_MAX spawns leave no nomem line", detail);
+    snprintf(detail, sizeof detail, "loader contexts grew %ld to %ld bytes",
+             before, after);
+    check(before >= 0 && after >= before &&
+              after - before <= SPAWN_ARGMAX_CONTEXTS,
+          "concurrent large spawns map at most their class's contexts",
+          detail);
+    (void) pthread_barrier_destroy(&start);
+    (void) posix_spawn_file_actions_destroy(&fa);
+    free(buf);
+}
+
+/* One client's stuck spawns must not fail another's. Each of
+ * LOADER_SHARE_THREADS spawns here has a file action that opens a path this
+ * process serves and never answers, so its loader blocks holding a standard
+ * loader context; there are 64 of those in all. A child started before them,
+ * a different spawner, then spawns /bin/true: with a per-spawner share it gets
+ * a context at once, without one it waits out the 30 s timeout behind the
+ * stuck loaders and fails with EAGAIN.
+ */
+#define LOADER_SHARE_PATH "/loader-share-hold"
+#define LOADER_SHARE_THREADS 66
+#define LOADER_SHARE_WAIT_MS 10000
+
+static void *loader_share_stuck(void *arg)
+{
+    char *argv[] = {"true", NULL};
+    char *envp[] = {NULL};
+    posix_spawn_file_actions_t fa;
+    pid_t pid;
+
+    (void) arg;
+    if (posix_spawn_file_actions_init(&fa))
+        return NULL;
+    if (!posix_spawn_file_actions_addopen(&fa, 3, LOADER_SHARE_PATH "/x", O_RDONLY, 0) &&
+        !posix_spawn(&pid, "/bin/true", &fa, NULL, argv, envp))
+        (void) waitpid(pid, NULL, 0);
+    (void) posix_spawn_file_actions_destroy(&fa);
+    return NULL;
+}
+
+/* --loader-share-child: once stdin has a byte, spawn /bin/true; exit with the
+ * spawn's error, 0 when it ran and exited 0.
+ */
+int loader_share_child(void)
+{
+    char *argv[] = {"true", NULL};
+    char *envp[] = {NULL};
+    char c;
+    int rc, code;
+
+    if (read(STDIN_FILENO, &c, 1) != 1)
+        return 120;
+    rc = spawn_wait_code("/bin/true", NULL, NULL, argv, envp, NULL, &code);
+    return rc ? rc : code ? 121 : 0;
+}
+
+void test_loader_context_share(void)
+{
+    char *argv[] = {"syscall_testing", "--loader-share-child", NULL};
+    pthread_t th[LOADER_SHARE_THREADS];
+    posix_spawn_file_actions_t fa;
+    struct timespec t0;
+    char detail[128];
+    dispatch_t *dpp;
+    int go[2], started = 0, id, st = 0, done = 0;
+    pid_t helper = -1;
+    long ms;
+
+    /* The other spawner first: its own spawn must not wait behind the stuck
+     * ones below.
+     */
+    if (pipe(go)) {
+        test_fail("loader context share fixture", strerror(errno));
+        return;
+    }
+    (void) fcntl(go[1], F_SETFD, FD_CLOEXEC);
+    (void) posix_spawn_file_actions_init(&fa);
+    (void) posix_spawn_file_actions_adddup2(&fa, go[0], STDIN_FILENO);
+    (void) posix_spawn_file_actions_addclose(&fa, go[0]);
+    if (posix_spawn(&helper, "/bin/syscall_testing", &fa, NULL, argv, NULL))
+        helper = -1;
+    (void) posix_spawn_file_actions_destroy(&fa);
+    (void) close(go[0]);
+    if (helper == -1) {
+        test_fail("loader context share fixture", "helper spawn");
+        (void) close(go[1]);
+        return;
+    }
+
+    /* A service nobody receives on: every open of it blocks. */
+    if (!(dpp = dispatch_create())) {
+        test_fail("loader context share fixture", strerror(errno));
+        goto out_helper;
+    }
+    id = ioserv_attach(dpp, NULL, LOADER_SHARE_PATH, _FTYPE_ANY, IOSERV_FLAG_DIR,
+                       &lost_reply_connect_ops, &lost_reply_io_ops, NULL);
+    if (id == -1) {
+        test_skip("loader context share", "cannot attach a test path");
+        (void) dispatch_destroy(dpp);
+        goto out_helper;
+    }
+    for (; started < LOADER_SHARE_THREADS; started++)
+        if (pthread_create(&th[started], NULL, loader_share_stuck, NULL))
+            break;
+    sleep_ms(3000); /* the loaders reach the open and block in it */
+
+    (void) clock_gettime(CLOCK_MONOTONIC, &t0);
+    if (write(go[1], "g", 1) == 1) {
+        for (int i = 0; i < LOADER_SHARE_WAIT_MS / 20 && !done; i++) {
+            done = waitpid(helper, &st, WNOHANG) == helper;
+            if (!done)
+                sleep_ms(20);
+        }
+    }
+    ms = nsd_ms_since(&t0);
+    snprintf(detail, sizeof detail, "%d stuck spawns; other spawner %s %d after %ld ms",
+             started, done ? "exited" : "still waiting", done ? WEXITSTATUS(st) : -1, ms);
+    printf("  note  loader context share: %s\n", detail);
+    check(started == LOADER_SHARE_THREADS && done && WIFEXITED(st) && !WEXITSTATUS(st),
+          "stuck spawns of one client leave loader contexts for another", detail);
+
+    /* Let the stuck loaders go: their opens fail once the channel is gone. */
+    (void) ioserv_detach(dpp, id, 0);
+    (void) dispatch_destroy(dpp);
+    for (int i = 0; i < started; i++)
+        (void) pthread_join(th[i], NULL);
+out_helper:
+    (void) close(go[1]);
+    if (!done)
+        (void) waitpid(helper, &st, 0);
+}
+
+void test_spawn_concurrent_arg_max(void)
+{
+    spawn_concurrent_arg_max(false);
+}
+
+/* The heap gate admits in arrival order: a stream of medium requests, three
+ * of which fill its budget, must not keep out a large one that needs all but
+ * one of them gone. Without the order, a medium waiter takes each place that
+ * frees and the large request waits out its 30 s timeout (EAGAIN). Uses the
+ * same 300 ms hold as spawn_concurrent_arg_max (CONFIG_DEBUG_INJECT).
+ */
+#define GATE_ORDER_THREADS 14 /* enough that some always wait at the gate */
+#define GATE_ORDER_ROUNDS 3
+#define GATE_ORDER_MEDIUM (70 * 1024) /* charged about twice: three fit */
+#define GATE_ORDER_WAIT_MS 10000
+
+struct gate_order {
+    atomic_int stop;
+    atomic_int done, failed, first_rc;
+    char *arg;
+};
+
+static void *gate_order_medium(void *arg)
+{
+    struct gate_order *g = arg;
+    char *argv[] = {"true", g->arg, NULL};
+    char *envp[] = {NULL};
+
+    while (!atomic_load(&g->stop)) {
+        int code, rc = spawn_wait_code("/./bin/true", NULL, NULL, argv, envp, NULL, &code);
+
+        if (rc != EOK || code != 0) {
+            int none = 0;
+
+            atomic_compare_exchange_strong(&g->first_rc, &none, rc ? rc : -1);
+            atomic_fetch_add(&g->failed, 1);
+        }
+        atomic_fetch_add(&g->done, 1);
+    }
+    return NULL;
+}
+
+static void spawn_heap_gate_order(void)
+{
+    struct gate_order g = {0};
+    char *argv[] = {"true", NULL, NULL};
+    char *envp[] = {NULL};
+    size_t big = ARG_MAX - 4096;
+    pthread_t th[GATE_ORDER_THREADS];
+    posix_spawn_file_actions_t fa;
+    struct timespec t0;
+    char detail[128];
+    int started = 0, rc, code = -1, during;
+    long ms;
+
+    g.arg = malloc(GATE_ORDER_MEDIUM);
+    argv[1] = malloc(big);
+    if (!g.arg || !argv[1] || posix_spawn_file_actions_init(&fa)) {
+        test_fail("spawn heap gate order fixture", "no memory");
+        free(g.arg);
+        free(argv[1]);
+        return;
+    }
+    memset(g.arg, 'm', GATE_ORDER_MEDIUM - 1);
+    g.arg[GATE_ORDER_MEDIUM - 1] = '\0';
+    memset(argv[1], 'l', big - 1);
+    argv[1][big - 1] = '\0';
+    /* 60000 bytes of actions on top of ARG_MAX: about 300 KiB charged. */
+    rc = 0;
+    for (int i = 0; i < SPAWN_ARGMAX_ACTIONS && !rc; i++)
+        rc = posix_spawn_file_actions_adddup2(&fa, STDOUT_FILENO, STDOUT_FILENO);
+    for (; !rc && started < GATE_ORDER_THREADS; started++)
+        if (pthread_create(&th[started], NULL, gate_order_medium, &g))
+            break;
+    if (rc || started < GATE_ORDER_THREADS) {
+        test_fail("spawn heap gate order fixture", "setup failed");
+        goto out;
+    }
+
+    /* The stream is in the gate and queued at it before the large one comes.
+     * Several rounds: without the order, a large one now and then finds a
+     * moment with the stream thin enough, but not round after round.
+     */
+    sleep_ms(1500);
+    for (int round = 0; round < GATE_ORDER_ROUNDS && !rc; round++) {
+        during = atomic_load(&g.done);
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        rc = spawn_wait_code("/./bin/true", &fa, NULL, argv, envp, NULL, &code);
+        ms = nsd_ms_since(&t0);
+        during = atomic_load(&g.done) - during;
+        snprintf(detail, sizeof detail,
+                 "round %d: errno %d, exit %d after %ld ms, %d medium spawns meanwhile", round,
+                 rc, code, ms, during);
+        printf("  note  heap gate order: %s\n", detail);
+        if (!rc && (code != 0 || ms >= GATE_ORDER_WAIT_MS))
+            rc = -1;
+    }
+    check(rc == EOK, "a large spawn passes a stream of medium ones at the heap gate", detail);
+out:
+    atomic_store(&g.stop, 1);
+    for (int i = 0; i < started; i++)
+        (void) pthread_join(th[i], NULL);
+    if (started == GATE_ORDER_THREADS) {
+        snprintf(detail, sizeof detail, "%d of %d failed, first errno %d",
+                 atomic_load(&g.failed), atomic_load(&g.done), atomic_load(&g.first_rc));
+        check(atomic_load(&g.failed) == 0 && atomic_load(&g.done) > 0,
+              "the medium spawns of the stream succeed", detail);
+    }
+    (void) posix_spawn_file_actions_destroy(&fa);
+    free(g.arg);
+    free(argv[1]);
+}
+
+void test_spawn_heap_gate(void)
+{
+    spawn_concurrent_arg_max(true);
+    spawn_heap_gate_order();
 }
 
 static void test_spawn_large_arguments(void)
@@ -12340,6 +13195,7 @@ void test_vfs(void)
     test_nvme_raw_perm();
     test_sys_kstats();
     test_sys_log_read();
+    test_sysfs_open_stress();
     test_spawn_concurrent();
     test_orphan_exit();
     test_malloc_growth();
@@ -12414,6 +13270,7 @@ void test_vfs(void)
     test_memobj_readonly_shared_write_denied();
     test_posix_msync_contract();
     test_memobj_stale_mapping_faults_after_munmap();
+    test_shm_past_end();
     test_ioserv_reply_status_taxonomy();
     test_ioserv_accounting_sysfs();
     test_ioserv_accounting_create_destroy();
@@ -12445,6 +13302,9 @@ void test_vfs(void)
     test_spawn_file_actions_chdir();
     test_spawn_large_arguments();
     test_spawn_arg_max();
+    test_spawn_loader_einval_log();
+    test_spawn_concurrent_arg_max();
+    test_loader_context_share();
     test_getsid_cases();
     test_pgrp_model();
     test_proc_lifecycle_burst_wait();

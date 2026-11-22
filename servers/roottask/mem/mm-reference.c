@@ -727,15 +727,25 @@ int memory_reference(struct mm_map **mmp,
     data.off_end = mm->offset + (off64_t) (end - mm->start);
     data.off_start = mm->offset + (off64_t) (start - mm->start);
     if (flags & MR_TRUNC) {
-        /* truncate reference to the limit of the object */
-        if (data.off_start >= obp->mem.mm.size) {
-            /* first reference is past end of object - user will fault if he
-             * ends up touching this location
-             */
-            return EOK;
-        }
+        /* Truncate the reference to the limit of the object. The pages past
+         * it are marked so that touching one is SIGBUS; as_map_grown maps them
+         * if the object grows to cover them.
+         */
         if (data.off_end >= obp->mem.mm.size) {
-            data.off_end = (obp->mem.mm.size - 1) | (off64_t) (__PAGESIZE - 1);
+            uintptr_t past = start;
+
+            if (data.off_start < obp->mem.mm.size) {
+                data.off_end = (obp->mem.mm.size - 1) | (off64_t) (__PAGESIZE - 1);
+                past += (uintptr_t) (data.off_end + 1 - data.off_start);
+            }
+            if (past <= end) {
+                r = pte_bad(or->adp, past, end);
+                if (r != EOK)
+                    return r;
+                obp->mem.mm.flags |= MM_MEM_HAS_BAD_PAGE;
+            }
+            if (past == start)
+                return EOK;
         }
     }
 

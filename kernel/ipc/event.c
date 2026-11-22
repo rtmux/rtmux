@@ -58,8 +58,8 @@ void intrevent_preemption(unsigned prio)
 /* sigevent_deliver_inline — helper for the direct-from-trap notification
  * delivery model. Called from:
  *   - arch/riscv/trap-handler.c PLIC branch (per attached
- *     interrupt_t, for INTR_KIND_THREAD via a synthetic SIGEV_INTR
- *     and for INTR_KIND_EVENT via the registered itp->event).
+ *     interrupt_t of INTR_KIND_EVENT, via the registered itp->event;
+ *     an INTR_KIND_THREAD wake is inlined there).
  *   - arch/riscv/trap-handler.c STIMER branch (via
  *     timer-core.c::timer_fire).
  *   - kernel/time/timer-core.c::timer_activate (kernel extension context —
@@ -67,7 +67,6 @@ void intrevent_preemption(unsigned prio)
  *
  * Calls sigevent_exe(evp, target, 1) directly — sigevent_exe handles every
  * sigev_notify kind correctly:
- *   - SIGEV_INTR  → ready() or atomic_or INTR_PENDING.
  *   - SIGEV_UNBLOCK → ready() or force_ready(ETIMEDOUT).
  *   - SIGEV_NOTIFICATION → notification_deliver() (channel_slock).
  *   - SIGEV_NONE  → no-op (or timer_pending() for the idle thread).
@@ -168,7 +167,9 @@ void intrevent_flush(void)
 /* sigevent_exe — execute a sigevent against a target thread.
  *
  * Dispatches on sigev_notify kind (SIGEV_NONE / SIGEV_THREAD /
- * SIGEV_NOTIFICATION / SIGEV_UNBLOCK / SIGEV_INTR; signal kinds are rejected),
+ * SIGEV_NOTIFICATION / SIGEV_UNBLOCK; signal kinds and SIGEV_INTR are
+ * rejected: an interrupt thread is woken by interrupt_attach_thread's inline
+ * wake in the trap handler, and nothing sends it SIGEV_INTR as an event),
  * either delivering the event or just validating it. May be called directly
  * from an interrupt handler. Parameters:
  *   evp      : the sigevent to execute
@@ -306,26 +307,6 @@ int rdecl sigevent_exe(const struct sigevent *evp,
                 ready(thp);
             } else {
                 force_ready(thp, ETIMEDOUT);
-            }
-        }
-        break;
-
-    case SIGEV_INTR:
-        if (deliver) {
-            if (thp->state == STATE_INTR) {
-                if (evp->sigev_notify & SIGEV_FLAG_CRITICAL)
-                    CRITICAL_MARK_THREAD(thp);
-                ready(thp);
-            } else {
-                /* Atomic OR — paired with atomic_clr in ksys_interrupt_wait
-                 * (kernel/irq/interrupt.c). The atomic + atomic pairing lets
-                 * ksys_interrupt_wait run BKL-less without losing cross-CPU
-                 * INTR_PENDING set/clear ordering against other paths that
-                 * read-modify-write thp->flags (force_ready KILLSELF set, exec
-                 * KCALL_ERR_SET set, etc.).
-                 */
-                atomic_or((volatile unsigned *) &thp->flags,
-                          RTMUX_FLG_THR_INTR_PENDING);
             }
         }
         break;

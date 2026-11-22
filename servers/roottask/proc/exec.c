@@ -84,39 +84,31 @@ static int exec_step(unsigned op,
 static void exec_retire_shell(pid_t shell_pid)
 {
     process_t *prp;
-    root_process_t *tmp;
+    int started;
 
     if (!(prp = root_proc_lock(shell_pid)))
         return;
     process_reparent(shell_pid);
-    tmp = root_proc(shell_pid);
-    tmp->siginfo.si_signo = SIGCHLD;
-    tmp->siginfo.si_code = CLD_EXITED;
-    tmp->siginfo.si_status = 0;
-    tmp->siginfo.si_pid = shell_pid;
-    (void) ProcessExitMark(shell_pid, 0);
-    process_threads_destroy(prp);
+    started = proc_exit_begin_locked(shell_pid, 0, 0);
     root_proc_unlock(shell_pid);
+    if (started)
+        proc_exit_finish(shell_pid);
 }
 
-/* The exec is given up after the old image was touched: the process dies, as
- * if killed. Its caller thread is among those destroyed.
+/* The exec is given up after the old image was touched: the process dies, as if
+ * killed. Its caller thread is among those destroyed.
  */
 static void exec_kill_process(pid_t pid)
 {
     process_t *prp;
-    root_process_t *tmp;
+    int started;
 
     if (!(prp = root_proc_lock(pid)))
         return;
-    tmp = root_proc(pid);
-    tmp->siginfo.si_signo = SIGKILL;
-    tmp->siginfo.si_code = CLD_KILLED;
-    tmp->siginfo.si_status = SIGKILL;
-    tmp->siginfo.si_pid = pid;
-    (void) ProcessExitMark(pid, SIGKILL);
-    process_threads_destroy(prp);
+    started = proc_exit_begin_locked(pid, SIGKILL, 1);
     root_proc_unlock(pid);
+    if (started)
+        proc_exit_finish(pid);
 }
 
 /* Close the descriptors of the old image that are marked close-on-exec. */
@@ -155,7 +147,9 @@ static void exec_release_old_image(process_t *prp, pid_t pid)
 
 /* Unmap the old image and shut its address space down, as the end of a process
  * does. The process keeps a thread, which has no address space until the
- * commit. Returns EOK, or an errno when the process has gone.
+ * commit.
+ *
+ * Returns EOK, or an errno when the process has gone.
  */
 static int exec_drop_old_address_space(process_t *prp, pid_t pid)
 {
@@ -225,8 +219,9 @@ static void exec_adopt_address_space(pid_t pid, pid_t shell)
     src->debug_name = NULL;
 }
 
-/* exec's last step for a process that survived to it. Returns EOK, or an errno
- * for the caller to kill the process with.
+/* exec's last step for a process that survived to it.
+ *
+ * Returns EOK, or an errno for the caller to kill the process with.
  */
 static int exec_install(struct loader_context *lcp,
                         pid_t pid,
@@ -256,9 +251,9 @@ static int exec_install(struct loader_context *lcp,
     if (rc == EOK) {
         exec_adopt_address_space(pid, shell);
 
-        /* What the old image told terminal servers about SIGTTIN and SIGTTOU
-         * is its own; the new image reports its own state when it starts, from
-         * the signals it inherits.
+        /* What the old image told terminal servers about SIGTTIN and SIGTTOU is
+         * its own; the new image reports its own state when it starts, from the
+         * signals it inherits.
          */
         root_proc(pid)->tty_hold = 0;
     }
@@ -297,7 +292,8 @@ int proc_exec_swap(ioserv_context_t *ctp, struct loader_context *lcp)
     }
 
     /* BEGIN has made the change irreversible. Serialize the exec mark with
-     * setpgid before the kernel makes the new image runnable. */
+     * setpgid before the kernel makes the new image runnable.
+     */
     proc_pgrp_lock();
     root_proc(pid)->execed = 1;
     proc_pgrp_unlock();
@@ -309,6 +305,24 @@ int proc_exec_swap(ioserv_context_t *ctp, struct loader_context *lcp)
     if (!(prp = root_proc_lock(pid))) {
         exec_retire_shell(shell);
         return IOSERV_NOREPLY;
+    }
+
+    /* The process may have begun to end between the first step and the lock (a
+     * SIGKILL through signal_one, or a fault): its threads are then being
+     * destroyed, so there is no image left to replace.
+     */
+    {
+        root_proc_info_t qinfo;
+
+        if (root_proc(pid)->exit_begun ||
+            process_query_info(pid, &qinfo) != EOK ||
+            (qinfo.flags &
+             (RTMUX_FLG_PROC_TERMING | RTMUX_FLG_PROC_DESTROYALL))) {
+            root_proc_unlock(pid);
+            lcp->ctx.rcvid = -1;
+            exec_retire_shell(shell);
+            return IOSERV_NOREPLY;
+        }
     }
     exec_release_old_image(prp, pid);
     if ((rc = exec_drop_old_address_space(prp, pid)) == EOK)

@@ -297,6 +297,35 @@ int test_thread_blocked(pthread_t tid, int state)
     return found;
 }
 
+/* A channel of this process and a side-channel connection to it. Returns
+ * nonzero when both exist.
+ */
+int test_chan_open(unsigned flags, int *chid, int *coid)
+{
+    *coid = -1;
+    *chid = channel_create(flags);
+    if (*chid != -1)
+        *coid = connect_attach(0, getpid(), *chid, RTMUX_SIDE_CHANNEL, 0);
+    return *coid != -1;
+}
+
+/* Wait, for ms milliseconds at most, until *flag is at least want. Returns
+ * nonzero when it is.
+ */
+int test_wait_flag(atomic_int *flag, int want, int ms)
+{
+    for (int i = 0; i < ms && atomic_load(flag) < want; i++)
+        sleep_ms(1);
+    return atomic_load(flag) >= want;
+}
+
+/* Arm a timeout for the calling thread's next receive. */
+void test_receive_within(uint64_t ns)
+{
+    (void) __timer_timeout(CLOCK_MONOTONIC, RTMUX_TIMEOUT_RECEIVE, NULL, &ns,
+                           NULL);
+}
+
 /* Keep the observer process alive through the injected window. Reaping an
  * inject helper here can wait for an RCU grace period on the stalled hart. */
 

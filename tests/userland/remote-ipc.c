@@ -32,7 +32,6 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
-#include <time.h>
 #include <unistd.h>
 #include <sys/rtmux-core.h>
 
@@ -87,7 +86,6 @@ int test_remote_ipc(void)
     struct _server_info sinfo;
     struct _msg_info info;
     pthread_t ts;
-    uint64_t ns = 2000000000ULL;
     char pid[16], detail[160], buf = 0, rep = 'k';
     int svc, again, ncoid, coid, rcvid, nrcvid, err[3], serr, plain;
 
@@ -170,8 +168,7 @@ int test_remote_ipc(void)
         return 0;
     }
     memset(&info, 0, sizeof info);
-    (void) __timer_timeout(CLOCK_MONOTONIC, RTMUX_TIMEOUT_RECEIVE, NULL, &ns,
-                           NULL);
+    test_receive_within(2000000000ULL);
     rcvid = msg_receive(svc, &buf, 1, &info);
     snprintf(detail, sizeof detail, "rcvid=%d byte=%d info pid=%d chid=%d",
              rcvid, buf, (int) info.pid, info.chid);
@@ -179,9 +176,7 @@ int test_remote_ipc(void)
           "remote_ipc receive info of the service's own send", detail);
     if (rcvid > 0)
         (void) msg_reply(rcvid, 0, &rep, 1);
-    for (int i = 0; i < 2000 && !atomic_load(&snd.done); i++)
-        sleep_ms(1);
-    if (!atomic_load(&snd.done))
+    if (!test_wait_flag(&snd.done, 1, 2000))
         test_fail("remote_ipc sender", "the send did not return");
 
     /* The service channel goes, under both connections. The registration

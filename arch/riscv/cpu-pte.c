@@ -142,13 +142,14 @@ static pte_t sv39_new_table(void)
 
 /* cpu_pte_manipulate — create, modify, or remove Sv39 page table entries.
  *
- * Handles PTE_OP_MAP, PTE_OP_UNMAP, PTE_OP_PROT and PTE_OP_PREALLOC operations.
- * For MAP: creates PTEs mapping [start, end) to paddr with given prot. For
- * UNMAP: clears PTEs in [start, end). For PROT: changes protection bits on
- * existing PTEs. end is the last byte of the range (as pte_map passes it) or
- * one past it (as the kernel's own callers pass it): every page that starts
- * below end is processed, so a page-aligned end names no page. See
- * sv39_manip_pages for the errors each can return.
+ * Handles PTE_OP_MAP, PTE_OP_BAD, PTE_OP_UNMAP, PTE_OP_PROT and PTE_OP_PREALLOC
+ * operations. For MAP: creates PTEs mapping [start, end) to paddr with given
+ * prot. For BAD: marks the pages of [start, end) PTE_SW_BUS, past the end of
+ * their object. For UNMAP: clears PTEs in [start, end). For PROT: changes
+ * protection bits on existing PTEs. end is the last byte of the range (as
+ * pte_map passes it) or one past it (as the kernel's own callers pass it):
+ * every page that starts below end is processed, so a page-aligned end names
+ * no page. See sv39_manip_pages for the errors each can return.
  *
  * Intermediate page table pages are allocated via pa_alloc() and accessed
  * through PA_TO_VA() — never assumes PA == VA.
@@ -163,7 +164,7 @@ int cpu_pte_manipulate(struct mm_pte_manipulate *data)
     address_t *adp = data->adp;
     pagetable_t pgdir = adp ? adp->cpu.pgdir : pgtbl_list->pgdir;
     unsigned op = data->op;
-    uint64_t bits = (op & PTE_OP_BAD) ? 0 : prot_to_pte_bits(data->prot);
+    uint64_t bits = prot_to_pte_bits(data->prot);
     uint64_t paddr = 0; /* only a MAP supplies one */
     uintptr_t start = data->start;
     uintptr_t end = data->end;
@@ -172,10 +173,12 @@ int cpu_pte_manipulate(struct mm_pte_manipulate *data)
     bool cut = false;
     int r;
 
-    if (op & (PTE_OP_MAP | PTE_OP_BAD)) {
+    if (op & PTE_OP_MAP) {
         mop = PTE_OP_MAP;
         paddr = data->paddr;
     }
+    else if (op & PTE_OP_BAD)
+        mop = PTE_OP_BAD;
     else if (op & PTE_OP_UNMAP)
         mop = PTE_OP_UNMAP;
     else if (op & PTE_OP_PROT)

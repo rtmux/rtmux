@@ -134,16 +134,33 @@ echo "check-header-deps: lint ok"
 
 # behavioural check
 
-# Objects `make -n` would compile, one absolute path per line.
+# Objects `make -n` would compile, one absolute path per line. Extra arguments
+# go to make (-B: every object the current config builds).
 compiles() {
     local out
-    out=$(env -u MAKEFLAGS make -C "$ROOT" -n 2>&1) || fail "make -n failed:
+    out=$(env -u MAKEFLAGS make -C "$ROOT" -n "$@" 2>&1) || fail "make -n $* failed:
 $(tail -5 <<<"$out")"
     grep -E ' -c ' <<<"$out" | grep -oE -- ' -o [^ ]+\.o' | sed 's/^ -o //' | sort -u
 }
 
 stale=$(compiles | wc -l)
 [ "$stale" -eq 0 ] || fail "$stale objects are stale before the test; build the tree first (make)"
+
+# The objects the current config builds. An object another config left in the
+# same tree (kernel/debug/inject.o after a CONFIG_DEBUG_INJECT=y build) is in no
+# dep-include call of this one and is never rebuilt, so it is not checked.
+if ! graph=$(compiles -B); then
+    echo "$graph" # the failure compiles printed
+    exit 1
+fi
+[ -n "$graph" ] || fail "make -n -B plans no compiles"
+
+# built LIST: the objects of LIST (one per line) that exist and that the current
+# config builds.
+built() {
+    local o
+    for o in $1; do [ -e "$o" ] && echo "$o"; done | sort -u | comm -12 - <(echo "$graph")
+}
 
 # header | text to find in .d files | build dir that must NOT rebuild (optional)
 #        | minimum dependents (optional, default 3)
@@ -198,7 +215,7 @@ rc=0
 for c in "${CASES[@]}"; do
     IFS='|' read -r h needle forbid min <<<"$c"
     want=$(grep -rlF --include='*.d' -- "$needle" "${BUILD_DIRS[@]}" | sed 's/\.d$/.o/' | sort -u)
-    want=$(for o in $want; do [ -e "$o" ] && echo "$o"; done)
+    want=$(built "$want")
     n=$(grep -c . <<<"$want")
     [ "$n" -ge "${min:-3}" ] || fail "only $n built objects depend on $h (missing .d files? build first)"
 
@@ -256,8 +273,15 @@ done <"$saved/list"
 tr '\n' '\0' <"$saved/list" | xargs -0 touch
 got=$(compiles)
 restore_stamps
-all=$(find "${BUILD_DIRS[@]}" -name '*.d' | sed 's/\.d$/.o/' | sort)
-all=$(for o in $all; do [ -e "$o" ] && echo "$o"; done)
+all=$(for o in $(find "${BUILD_DIRS[@]}" -name '*.d' | sed 's/\.d$/.o/'); do
+    [ -e "$o" ] && echo "$o"
+done | sort -u)
+others=$(comm -23 <(echo "$all") <(echo "$graph"))
+all=$(comm -12 <(echo "$all") <(echo "$graph"))
+if [ -n "$others" ]; then
+    echo "check-header-deps: skipping $(grep -c . <<<"$others") objects the current config does not build, e.g.:"
+    head -3 <<<"$others" | sed "s|$ROOT/||; s/^/    /"
+fi
 miss=$(comm -13 <(echo "$got") <(echo "$all"))
 if [ -n "$miss" ]; then
     echo "check-header-deps: FAIL: $(grep -c . <<<"$miss") built objects are not in any dep-include call, e.g.:"

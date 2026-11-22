@@ -210,8 +210,7 @@ static int mem_read_write(ioserv_context_t *ctp,
         if (obp && msg->type == _IO_WRITE) {
             int status;
 
-            grown_from = (uint64_t) OBJECT_SIZE(obp);
-            status = root_vm_ops.resize(obp, *pos + nbytes);
+            status = vm_grow(obp, *pos + nbytes, &grown_from);
             if (status != EOK) {
                 if (client_locked)
                     proc_unlock_adp(ctp->info.pid);
@@ -590,7 +589,10 @@ static int mem_space(ioserv_context_t *ctp, io_space_t *msg, void *vocb)
     switch (msg->i.subtype) {
     case F_ALLOCSP:
         if (end > (uint64_t) OBJECT_SIZE(obj)) {
-            status = vm_resize(obj, end);
+            /* vm_resize's rule: a special object keeps its size. */
+            if (obj->mem.mm.flags & MM_SHMEM_SPECIAL)
+                return EINVAL;
+            status = vm_grow(obj, end, NULL);
             if (status != EOK) {
                 return status;
             }

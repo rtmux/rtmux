@@ -26,10 +26,14 @@
  */
 
 #include <errno.h>
+#include <spawn.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/rtmux-core.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "test.h"
@@ -216,5 +220,140 @@ int pte_partial_map(void)
         (void) munmap(m, len);
     }
     ptp_enomem_midway();
+    return 0;
+}
+
+/* anon_map_failure: a loader context whose mapping fails part of the way
+ * gives its physical memory back.
+ *
+ * roottask maps each new loader context with kext_root_mmap_anon_user, which
+ * takes a contiguous run of physical memory and maps it at the next address of
+ * a grow-only window. fail-pte-map on roottask makes that MAP stop after one
+ * page, as if a page table could not be had: the spawn fails with EAGAIN, and
+ * roottask asks again, at the same address, for the next spawn of that size.
+ * Each failure must leave pa.free_bytes where it was (it used to keep the run,
+ * and the page it had mapped). Other memory moves as processes come and go,
+ * either way, so the test allows a drop smaller than one argument's bytes: a
+ * leaked run is a whole context, larger than its argument, each round, so the
+ * leaking kernel lost AMF_ROUNDS of them (655360 bytes in 8 rounds of 24 KiB
+ * spawns, an 80 KiB class).
+ */
+#define AMF_ROUNDS 8
+
+/* Spawn /bin/true with one argument of `bytes` bytes, which sets the size class
+ * of its loader context. Returns posix_spawn's error, or 0 once it has exited.
+ */
+static int amf_spawn(size_t bytes)
+{
+    char *argv[] = {"true", NULL, NULL};
+    char *envp[] = {NULL};
+    pid_t pid;
+    int rc;
+
+    if (!(argv[1] = malloc(bytes)))
+        return ENOMEM;
+    memset(argv[1], 'a', bytes - 1);
+    argv[1][bytes - 1] = '\0';
+    rc = posix_spawn(&pid, "/bin/true", NULL, NULL, argv, envp);
+    free(argv[1]);
+    if (rc == 0 && waitpid(pid, NULL, 0) != pid)
+        rc = ECHILD;
+    return rc;
+}
+
+/* Arm the failure for roottask's next MAP of more than one page. */
+static int amf_arm(void)
+{
+    char pid[16];
+
+    snprintf(pid, sizeof pid, "%d", ROOTTASK_PID);
+    return inject_run("fail-pte-map", pid, "1");
+}
+
+/* Move an arm that was not taken off roottask: one for this process, for a MAP
+ * at a page it never maps.
+ */
+static void amf_disarm(void)
+{
+    (void) ptp_inject("fail-pte-map", 0x1001);
+}
+
+/* One spawn of `bytes` with the failure armed: 1 if its loader context map
+ * took it and the spawn failed, 0 if the spawn did not map a context (it had a
+ * free one), -1 on anything else.
+ */
+static int amf_fail_once(size_t bytes, int *errp)
+{
+    int rc;
+
+    if (amf_arm() != 0)
+        return -1;
+    rc = amf_spawn(bytes);
+    *errp = rc;
+    if (inject_run("alloc-status", "consumed", NULL) != 0) {
+        amf_disarm();
+        return rc == 0 ? 0 : -1;
+    }
+    return rc == EAGAIN ? 1 : -1;
+}
+
+int anon_map_failure(void)
+{
+    /* One argument for each of the size classes past the standard one. */
+    static const size_t sizes[] = {24 * 1024, 56 * 1024, 88 * 1024};
+    char why[192];
+    size_t bytes = 0;
+    long before, after = -1;
+    int err = 0;
+
+    if (inject_run("alloc-status", NULL, NULL) != 0)
+        return TC_EXIT_SKIP;
+    snprintf(ptp_pid, sizeof ptp_pid, "%d", (int) getpid());
+
+    /* A class that has no free context: its spawn maps one and takes the arm.
+     * The first failure there is the warm-up: it may make the page tables of
+     * the window, which stay.
+     */
+    for (size_t i = 0; i < sizeof sizes / sizeof sizes[0] && !bytes; i++) {
+        int got = amf_fail_once(sizes[i], &err);
+
+        if (got < 0) {
+            snprintf(why, sizeof why, "spawn of %zu bytes: errno %d", sizes[i], err);
+            test_fail("anon map failure fixture", why);
+            return 0;
+        }
+        if (got)
+            bytes = sizes[i];
+    }
+    if (!bytes) {
+        test_fail("anon map failure fixture", "every size class had a free loader context");
+        return 0;
+    }
+
+    before = kstats_value("pa.free_bytes");
+    for (int r = 0; r < AMF_ROUNDS; r++) {
+        int got = amf_fail_once(bytes, &err);
+
+        if (got != 1) {
+            snprintf(why, sizeof why, "round %d: %s, errno %d", r,
+                     got ? "spawn did not fail as armed" : "a context was free", err);
+            test_fail("anon map failure rounds", why);
+            return 0;
+        }
+    }
+    /* Give memory a moment to come back from processes that are ending. */
+    for (int i = 0; i < 40 && (after = kstats_value("pa.free_bytes")) <= before - (long) bytes; i++)
+        sleep_ms(50);
+    snprintf(why, sizeof why,
+             "pa.free_bytes %ld before, %ld after %d failed maps of %zu-byte spawns (a drop of "
+             "%zu or more is a leak)",
+             before, after, AMF_ROUNDS, bytes, bytes);
+    check(before > 0 && after > before - (long) bytes, "a failed loader context map frees its memory",
+          why);
+
+    /* The failure is gone: the same spawn works. */
+    err = amf_spawn(bytes);
+    snprintf(why, sizeof why, "errno %d", err);
+    check(err == 0, "the spawn works after its context map failed", why);
     return 0;
 }

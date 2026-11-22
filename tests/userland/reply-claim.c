@@ -15,6 +15,11 @@
  *   not claim, and that receiver is woken before the send looks at it again.
  *   The send must queue; it used to take the thread for a receiver it had
  *   claimed and deliver to it, and make it ready, a second time.
+ * - A client's REPLY timeout finds it unclaimed and goes on to queue its
+ *   unblock notification while a reply claims it and looks for one. The
+ *   client must leave with no notification marked queued: a stale mark kept
+ *   the kernel from asking for the unblock of the client's next request, which
+ *   a server that parks requests then held for good.
  *
  * These windows are a few instructions wide, so the cases hold them open with
  * the debug fault-injection call (/bin/inject, CONFIG_DEBUG_INJECT kernels
@@ -40,6 +45,8 @@
 #define STALL_MS "3000" /* the stall's own limit, if no destroy ends it */
 #define UNBLOCK_MS 20
 #define REPLY_STATUS 77
+#define HOLD_MS "3000" /* reply_unblock_race's hold on each side */
+#define SPIN_MS 500    /* and when its reply goes out */
 
 struct call {
     int id;              /* the coid to send on, or the rcvid to reply to */
@@ -82,18 +89,7 @@ static void *replier_main(void *raw)
 
 static bool wait_done(struct call *c)
 {
-    for (int i = 0; i < WAIT_MS && !atomic_load(&c->done); i++)
-        sleep_ms(1);
-    return atomic_load(&c->done) != 0;
-}
-
-static bool chan_open(unsigned flags, int *chid, int *coid)
-{
-    *coid = -1;
-    *chid = channel_create(flags);
-    if (*chid != -1)
-        *coid = connect_attach(0, getpid(), *chid, RTMUX_SIDE_CHANNEL, 0);
-    return *coid != -1;
+    return test_wait_flag(&c->done, 1, WAIT_MS);
 }
 
 static void reply_detached_connection(const char *pid)
@@ -111,7 +107,7 @@ static void reply_detached_connection(const char *pid)
         test_skip(name, "needs two harts");
         return;
     }
-    if (test_pin_mask(1) != 0 || !chan_open(0, &chid, &coid)) {
+    if (test_pin_mask(1) != 0 || !test_chan_open(0, &chid, &coid)) {
         test_fail(name, "pin or channel setup failed");
         return;
     }
@@ -163,7 +159,7 @@ static void reply_unblock_restart(const char *pid)
     int chid, coid, rcvid;
     char buf[1], detail[96];
 
-    if (!chan_open(RTMUX_FLG_CHF_UNBLOCK, &chid, &coid)) {
+    if (!test_chan_open(RTMUX_FLG_CHF_UNBLOCK, &chid, &coid)) {
         test_fail(name, "channel setup failed");
         return;
     }
@@ -242,7 +238,7 @@ static void claim_release_keeps_wake(const char *pid)
         test_skip(name, "needs two harts");
         return;
     }
-    if (test_pin_mask(1) != 0 || !chan_open(0, &chid, &coid)) {
+    if (test_pin_mask(1) != 0 || !test_chan_open(0, &chid, &coid)) {
         test_fail(name, "pin or channel setup failed");
         return;
     }
@@ -315,13 +311,6 @@ static void *pick_sender(void *raw)
     return NULL;
 }
 
-static bool pick_wait(atomic_int *flag)
-{
-    for (int i = 0; i < WAIT_MS && !atomic_load(flag); i++)
-        sleep_ms(1);
-    return atomic_load(flag) != 0;
-}
-
 /* The only waiting receiver takes notifications only. A send sees it, may not
  * claim it, and is held right after it dropped the channel lock; a
  * notification then wakes the receiver. Let go, the send must queue for a
@@ -333,7 +322,6 @@ static void send_skips_woken_notification_receiver(const char *pid)
     static struct pick drain, sender; /* a peer left behind still uses them */
     struct stall_watch watch = {.pid = -1};
     pthread_t td, ts;
-    uint64_t ns = 2000000000ULL;
     char tid[24], buf = 0, detail[128];
     int chid, coid, rcvid, entered;
 
@@ -341,7 +329,7 @@ static void send_skips_woken_notification_receiver(const char *pid)
         test_skip(name, "needs two harts");
         return;
     }
-    if (test_pin_mask(1) != 0 || !chan_open(0, &chid, &coid)) {
+    if (test_pin_mask(1) != 0 || !test_chan_open(0, &chid, &coid)) {
         test_fail(name, "pin or channel setup failed");
         return;
     }
@@ -373,15 +361,14 @@ static void send_skips_woken_notification_receiver(const char *pid)
 
     /* The send has seen the drain. Wake the drain behind its back. */
     (void) msg_send_notification(coid, 10, _NOTIFICATION_CODE_MINAVAIL, 7);
-    check(pick_wait(&drain.done) && drain.rc == 0 &&
+    check(test_wait_flag(&drain.done, 1, WAIT_MS) && drain.rc == 0 &&
               drain.got.value.sival_int == 7,
           "send_skips_woken_notification_receiver drain woken",
           "the notification did not reach the drain");
     stall_watch_finish(&watch);
 
     /* The message is for a receiver that takes messages, and waits for one. */
-    (void) __timer_timeout(CLOCK_MONOTONIC, RTMUX_TIMEOUT_RECEIVE, NULL, &ns,
-                           NULL);
+    test_receive_within(2000000000ULL);
     rcvid = msg_receive(chid, &buf, 1, NULL);
     snprintf(detail, sizeof detail, "receive=%d byte=%d, drain value=%d", rcvid,
              buf, drain.got.value.sival_int);
@@ -389,7 +376,7 @@ static void send_skips_woken_notification_receiver(const char *pid)
           detail);
     if (rcvid > 0)
         (void) msg_reply(rcvid, 0, &buf, 1);
-    if (pick_wait(&sender.done)) {
+    if (test_wait_flag(&sender.done, 1, WAIT_MS)) {
         snprintf(detail, sizeof detail, "send rc=%d errno=%d", sender.rc,
                  sender.rc == -1 ? sender.err : 0);
         check(sender.rc == 0, "send_skips_woken_notification_receiver replied",
@@ -410,6 +397,146 @@ out:
     (void) test_pin_mask(~0U);
 }
 
+struct two_sends {
+    int coid;
+    atomic_int stage; /* 0, 2: send now; 1, 3: that send returned */
+    int rc[2], err[2];
+};
+
+static void *two_sends_main(void *raw)
+{
+    struct two_sends *t = raw;
+
+    for (int i = 0; i < 2; i++) {
+        uint64_t ns = UNBLOCK_MS * 1000000ULL;
+        char req = (char) i, rep[REPLY_STATUS];
+
+        (void) test_wait_flag(&t->stage, 2 * i, WAIT_MS);
+        (void) __timer_timeout(CLOCK_MONOTONIC, RTMUX_TIMEOUT_REPLY, NULL, &ns,
+                               NULL);
+        t->rc[i] = msg_send(t->coid, &req, 1, rep, sizeof rep);
+        t->err[i] = errno;
+        atomic_store(&t->stage, 2 * i + 1);
+    }
+    return NULL;
+}
+
+/* Receive on chid for ms milliseconds at most: the rcvid, 0 for a
+ * notification (in *n), or -1.
+ */
+static int receive_ms(int chid, unsigned ms, struct _notification *n)
+{
+    test_receive_within(ms * 1000000ULL);
+    return msg_receive(chid, n, sizeof *n, NULL);
+}
+
+/* A REPLY timeout that found its client unclaimed is held until a reply
+ * claims the client; the reply, past its look for a queued unblock
+ * notification, is held until the timeout has marked one queued (or 3 s).
+ * Whatever the timeout does in that window must not outlive the exchange: the
+ * client's next request must still get its unblock notification when its own
+ * timeout fires.
+ */
+static void reply_unblock_race(const char *pid)
+{
+    static const char name[] = "reply_unblock_race";
+    static struct two_sends client; /* a client left behind still uses it */
+    struct _notification n;
+    pthread_t tc;
+    struct timespec t0, t1;
+    int chid, coid, rcvid, stale = 0, unblocked = 0;
+    long reply_ms;
+    char rep = 0, detail[160];
+
+    if (sysconf(_SC_NPROCESSORS_ONLN) < 3) {
+        test_skip(name, "needs three harts");
+        return;
+    }
+    /* The client, and so the hart its timeout fires on, is hart 1; the
+     * replier is hart 2.
+     */
+    if (test_pin_mask(2) != 0 ||
+        !test_chan_open(RTMUX_FLG_CHF_UNBLOCK, &chid, &coid)) {
+        test_fail(name, "pin or channel setup failed");
+        return;
+    }
+    client = (struct two_sends) {.coid = coid};
+    if (inject_run("stall-unblock-race", pid, HOLD_MS) != 0 ||
+        pthread_create(&tc, NULL, two_sends_main, &client) != 0) {
+        test_fail(name, "arm or client thread failed");
+        goto out;
+    }
+    (void) test_pin_mask(4);
+    rcvid = receive_ms(chid, WAIT_MS, &n);
+    if (rcvid <= 0) {
+        test_fail(name, "no first request");
+        goto out;
+    }
+    /* Reply once the timeout is held in its window: SPIN_MS after the request,
+     * far past its 20 ms deadline and well inside the hold. A spawn of
+     * /bin/inject to ask first would take longer than the hold under TCG, and
+     * the replier spins instead of sleeping because an idle hart may run the
+     * timer expiry, and the hold would then keep it off its hart.
+     */
+    (void) clock_gettime(CLOCK_MONOTONIC, &t0);
+    do
+        (void) clock_gettime(CLOCK_MONOTONIC, &t1);
+    while ((t1.tv_sec - t0.tv_sec) * 1000 +
+               (t1.tv_nsec - t0.tv_nsec) / 1000000 <
+           SPIN_MS);
+    (void) clock_gettime(CLOCK_MONOTONIC, &t0);
+    (void) msg_reply(rcvid, REPLY_STATUS, &rep, 1);
+    (void) clock_gettime(CLOCK_MONOTONIC, &t1);
+    reply_ms = (t1.tv_sec - t0.tv_sec) * 1000 +
+               (t1.tv_nsec - t0.tv_nsec) / 1000000;
+    check(inject_run("site-wait", "unblock-force", NULL) == 0,
+          "reply_unblock_race timeout held in the window",
+          "the client's timeout never reached the injected window");
+    (void) test_wait_flag(&client.stage, 1, WAIT_MS);
+    snprintf(detail, sizeof detail, "first send rc=%d errno=%d", client.rc[0],
+             client.rc[0] == -1 ? client.err[0] : 0);
+    check(client.rc[0] == REPLY_STATUS, "reply_unblock_race reply delivered",
+          detail);
+    check(inject_run("site-wait", "unblock-reply", NULL) == 0,
+          "reply_unblock_race reply held in the window",
+          "the reply never reached the injected window");
+
+    /* A notification for the answered request is harmless; count it. */
+    while (receive_ms(chid, 50, &n) == 0)
+        if (n.code == _NOTIFICATION_CODE_UNBLOCK)
+            stale++;
+
+    atomic_store(&client.stage, 2);
+    /* A stale notification that came after the drain above is not the
+     * second request; count it and keep receiving.
+     */
+    while ((rcvid = receive_ms(chid, WAIT_MS, &n)) == 0)
+        if (n.code == _NOTIFICATION_CODE_UNBLOCK)
+            stale++;
+    if (rcvid < 0) {
+        test_fail(name, "no second request");
+        goto out;
+    }
+    while (!unblocked && receive_ms(chid, 10 * UNBLOCK_MS + 500, &n) == 0)
+        unblocked = n.code == _NOTIFICATION_CODE_UNBLOCK &&
+                    n.value.sival_int == rcvid;
+    (void) msg_error(rcvid, EINTR);
+    (void) test_wait_flag(&client.stage, 3, WAIT_MS);
+    snprintf(detail, sizeof detail,
+             "second request unblocked=%d, stale notifications=%d, second "
+             "send rc=%d errno=%d, first reply took %ld ms",
+             unblocked, stale, client.rc[1], client.err[1], reply_ms);
+    printf("reply_unblock_race: %s\n", detail);
+    check(unblocked && client.rc[1] == -1 && client.err[1] == EINTR, name,
+          detail);
+    if (atomic_load(&client.stage) == 3)
+        (void) pthread_join(tc, NULL);
+out:
+    (void) __connect_detach((uint64_t) coid);
+    (void) channel_destroy(chid);
+    (void) test_pin_mask(~0U);
+}
+
 int test_reply_claim(void)
 {
     char pid[16];
@@ -421,5 +548,6 @@ int test_reply_claim(void)
     reply_detached_connection(pid);
     claim_release_keeps_wake(pid);
     send_skips_woken_notification_receiver(pid);
+    reply_unblock_race(pid);
     return 0;
 }

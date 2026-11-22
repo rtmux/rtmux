@@ -22,6 +22,13 @@
  */
 #define PSPAWN_MSG_MAX (256U * 1024U)
 
+/* Most file-action bytes in a _PROC_POSIX_SPAWN (packed records, or the legacy
+ * object with its open entries): about 2700 dup2 or close actions. libc
+ * refuses more with E2BIG before sending and roottask refuses them again, so
+ * the part of the request a client sizes freely has a bound of its own.
+ */
+#define PSPAWN_ACTIONS_MAX (64U * 1024U)
+
 /* Largest _PROC_SPAWN: the arguments after a descriptor map, a search path, a
  * working directory and a path, each as long as its 16-bit count allows.
  */
@@ -37,6 +44,10 @@ _Static_assert(sizeof(struct _proc_posix_spawn) + PATH_MAX + 1 + ARG_MAX <
                    PSPAWN_MSG_MAX,
                "_PROC_POSIX_SPAWN: header, path and ARG_MAX of arguments must "
                "fit PSPAWN_MSG_MAX with room for attributes and file actions");
+_Static_assert(sizeof(struct _proc_posix_spawn) + PATH_MAX + 1 + ARG_MAX +
+                       PSPAWN_ACTIONS_MAX <
+                   PSPAWN_MSG_MAX,
+               "_PROC_POSIX_SPAWN: a full file-action budget must fit too");
 /* Every counted entry costs a pointer and a NUL, so both counts fit 16 bits. */
 _Static_assert(ARG_MAX / (sizeof(char *) + 1) <= UINT16_MAX,
                "ARG_MAX admits more strings than the wire counts hold");

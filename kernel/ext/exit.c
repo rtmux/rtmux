@@ -331,7 +331,8 @@ void kext_exit_destroy_threads(void *arg)
      * sees a blocked thread. Retry from roottask until every sibling has
      * self-reaped, including one that just joined a receive or sync queue. */
     if (prp->pid != ROOTTASK_PID && (int) KSTATUS(act) == EOK &&
-        __atomic_load_n(&prp->num_active_threads, __ATOMIC_ACQUIRE) != 0)
+        (__atomic_load_n(&prp->num_active_threads, __ATOMIC_ACQUIRE) != 0 ||
+         inject_exit_destroy_held(prp)))
         kcall_err(act, EAGAIN);
 }
 

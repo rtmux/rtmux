@@ -328,12 +328,27 @@ struct kcall_args_pa_sizes {
     memsize_t free_unreserved;
     memsize_t reserved;
     memsize_t total;
+    memsize_t largest_free_run;
+    unsigned flags; /* in: PA_SIZES_LARGEST_RUN to have largest_free_run */
 };
+#define PA_SIZES_LARGEST_RUN 1U
 
 memsize_t pa_free_size(void)
 {
-    struct kcall_args_pa_sizes s;
+    return pa_free_sizes(NULL);
+}
+
+/* Free physical memory, and with it, unless largest_run is NULL, the longest
+ * contiguous free run, which the kernel finds by a walk of its free runs.
+ */
+memsize_t pa_free_sizes(memsize_t *largest_run)
+{
+    struct kcall_args_pa_sizes s = {
+        .flags = largest_run ? PA_SIZES_LARGEST_RUN : 0};
+
     syscall_priv(__KSYS_PRIV_PA_GET_SIZES, &s);
+    if (largest_run)
+        *largest_run = s.largest_free_run;
     return s.free_unreserved;
 }
 

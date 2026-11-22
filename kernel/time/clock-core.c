@@ -24,6 +24,54 @@ volatile uint64_t *nssptr = &stable;
  */
 _Atomic uint64_t stimer_intr_count[CONFIG_PROCESSORS_MAX];
 
+/* Set when the boot hart reprograms its timer inside a kernel call (a tick
+ * taken there, which skips the clock advance and timer_expiry, or an
+ * IPI_CLOCK_LOAD) and finds a timer overdue; cleared by clock_catch_up.
+ */
+atomic_int clock_boot_missed;
+
+/* Clock time clock_catch_up added without a tick to bill it. Boot hart only,
+ * with interrupts off on both sides, so plain accesses do.
+ */
+static uint64_t clock_boot_unbilled;
+
+/* The boot hart's part of a tick for a timer that fell due inside a kernel
+ * call: advance the clock and expire the timers that are due. The reprogram
+ * there pushes an overdue timer out by a whole tick (arch_timer_program_next),
+ * so without this the timer fires up to a tick after the call. Called from
+ * kernel_exit on the boot hart, outside any lock. Dynamic-tick mode only:
+ * there the advance is the real time passed, so the next tick bills nothing
+ * twice; with fixed ticks the advance belongs to the next tick.
+ */
+void rdecl clock_catch_up(void)
+{
+    systime_t *qtp = qtimeptr;
+    unsigned long sie;
+
+    if (!__atomic_exchange_n(&clock_boot_missed, 0, __ATOMIC_ACQ_REL))
+        return;
+    sie = interrupt_save();
+    {
+        uint64_t now_nsec = arch_timer_now_ns(qtp);
+
+        if (now_nsec > qtp->nsec) {
+            clock_boot_unbilled += now_nsec - qtp->nsec;
+            qtp->nsec = now_nsec;
+            MEM_BARRIER_WR();
+            *nssptr = qtp->nsec;
+        }
+    }
+    /* Interrupts stay off throughout, as in the tick: hold the nesting depth
+     * so the wakeups' own lock pairs do not turn them back on (kernel_exit
+     * may have no active thread for a nested trap to run on).
+     */
+    get_pcpu()->pc_kspin_depth++;
+    timer_expiry(qtp);
+    (void) arch_timer_reload(qtp);
+    get_pcpu()->pc_kspin_depth--;
+    interrupt_restore(sie);
+}
+
 /* Per-tick clock interrupt handler.
  *
  * Runs the stall detector, accounts running/system time to this CPU's active
@@ -69,6 +117,17 @@ const struct sigevent *clock_handler(void *dummy, int id)
         uint64_t now_nsec = arch_timer_now_ns(qtp);
         elapsed_nsec = now_nsec > qtp->nsec ? now_nsec - qtp->nsec : 0;
     }
+    /* What clock_catch_up advanced the clock by is billed with this tick:
+     * the thread that ran meanwhile is charged for it (rr_ticks, system
+     * time), but the clock is not advanced twice.
+     */
+    uint64_t carried = 0;
+
+    if (get_cpunum() == boot_cpunum && !in_kernel_context()) {
+        carried = clock_boot_unbilled;
+        clock_boot_unbilled = 0;
+        elapsed_nsec += carried;
+    }
     if (!arch_timer_reload(qtp))
         return NULL;
 
@@ -95,7 +154,9 @@ const struct sigevent *clock_handler(void *dummy, int id)
 #endif
 
     reschedl = 0;
-    if (ss_replenish_list && ss_replenish_time <= (qtp->nsec + elapsed_nsec)) {
+    /* qtp->nsec already includes what clock_catch_up carried. */
+    if (ss_replenish_list &&
+        ss_replenish_time <= (qtp->nsec + elapsed_nsec - carried)) {
         reschedl |= RESCHED_SCHEDULE;
     }
 
@@ -270,7 +331,7 @@ const struct sigevent *clock_handler(void *dummy, int id)
 
     /* Global time update — only on boot CPU to avoid double-counting */
     if (my_cpu == boot_cpunum) {
-        qtp->nsec += elapsed_nsec;
+        qtp->nsec += elapsed_nsec - carried;
         MEM_BARRIER_WR();
 
         if (qtp->adjust.tick_count) {

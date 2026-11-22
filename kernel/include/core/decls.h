@@ -409,12 +409,16 @@ void inject_mutex_lock_stall(process_t *prp);
 void inject_mutex_lock_early(process_t *prp);
 void inject_mutex_lock_propagated(process_t *prp);
 void inject_force_ready_stall(thread_t *thp);
+void inject_cancel_stall(thread_t *thp);
 void inject_sync_waker_stall(thread_t *thp);
 void inject_reply_claim_stall(const connect_t *received);
 void inject_claim_held(void);
+bool inject_exit_destroy_held(const process_t *prp);
 void inject_cap_peek_window(const thread_t *act);
 void inject_send_pick_window(const thread_t *act);
 void inject_force_ready_claimed(thread_t *thp);
+void inject_unblock_force_window(thread_t *thp);
+void inject_unblock_reply_window(const thread_t *client);
 bool inject_reply_unblock_preempt(void);
 void inject_xfer_start(const thread_t *act);
 void inject_xfer_yield(const thread_t *act);
@@ -424,6 +428,7 @@ void inject_intr_before_switch(thread_t *thp);
 void inject_intr_after_select(thread_t *thp, const thread_t *chosen);
 void inject_block_stall(thread_t *thp);
 void inject_steal_stall(thread_t *thp);
+void inject_reprio_stall(thread_t *thp);
 extern atomic_uint inject_empty_steal_locks;
 #define inject_note_empty_steal_lock(dpp)                                     \
     do {                                                                      \
@@ -477,6 +482,10 @@ static inline void inject_steal_stall(thread_t *thp)
 {
     (void) thp;
 }
+static inline void inject_reprio_stall(thread_t *thp)
+{
+    (void) thp;
+}
 #define inject_note_empty_steal_lock(dpp) ((void) 0)
 static inline void inject_ready_stall(thread_t *thp)
 {
@@ -494,11 +503,20 @@ static inline void inject_force_ready_stall(thread_t *thp)
 {
     (void) thp;
 }
+static inline void inject_cancel_stall(thread_t *thp)
+{
+    (void) thp;
+}
 static inline void inject_reply_claim_stall(const connect_t *received)
 {
     (void) received;
 }
 static inline void inject_claim_held(void) {}
+static inline bool inject_exit_destroy_held(const process_t *prp)
+{
+    (void) prp;
+    return false;
+}
 static inline void inject_cap_peek_window(const thread_t *act)
 {
     (void) act;
@@ -510,6 +528,14 @@ static inline void inject_send_pick_window(const thread_t *act)
 static inline void inject_force_ready_claimed(thread_t *thp)
 {
     (void) thp;
+}
+static inline void inject_unblock_force_window(thread_t *thp)
+{
+    (void) thp;
+}
+static inline void inject_unblock_reply_window(const thread_t *client)
+{
+    (void) client;
 }
 static inline bool inject_reply_unblock_preempt(void)
 {

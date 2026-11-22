@@ -19,6 +19,7 @@
 #include "externs.h"
 #include "root-process.h"
 #include <private/root-proc-info.h>
+#include "private.h"
 
 /* chp is an opaque kernel-VA pointer (the target's prp->sys_chp); roottask
  * never dereferences it, just passes it through to the kext.
@@ -61,9 +62,9 @@ static int proc_may_signal(const struct _cred_info *s,
  * appears. Like libc's own pending set, the kept set holds one instance of a
  * signal, and one sender, the last, for all of them. A process that never
  * registers a channel (it is not linked with this libc, or its start-up failed)
- * is not ended by a kept SIGKILL: ending a process without its cooperation is a
- * separate mechanism that does not exist yet. Called with root_proc_lock(pid)
- * held. Parameters:
+ * never gets them; a SIGKILL is kept only while the process is loading
+ * (signal_one ends the process itself otherwise, and signal_loaded does when
+ * loading is over). Called with root_proc_lock(pid) held. Parameters:
  *   pid    : the target
  *   chp    : its system channel from a process_query_info taken under the
  *            same lock, or NULL if it has none yet
@@ -80,28 +81,75 @@ void signal_post_locked(pid_t pid, channel_t *chp, int signo, pid_t sender)
     }
 }
 
+/* Carry out a kept SIGKILL, if there is one: the process is ended, not sent a
+ * notification, and its other kept signals no longer matter.
+ *
+ * Returns 1 if this started the process's exit: the caller runs
+ * proc_exit_finish after dropping the lock. Called with root_proc_lock(pid)
+ * held.
+ */
+static int signal_take_kept_kill_locked(pid_t pid)
+{
+    root_process_t *slot = root_proc(pid);
+
+    if (!(slot->early_sigs & (1ULL << SIGKILL)))
+        return 0;
+    slot->early_sigs = 0;
+    return proc_exit_begin_locked(pid, SIGKILL, 1);
+}
+
 /* signal_flush_early_locked — deliver what signal_post_locked kept.
  *
  * Called by proc_syschan once the system channel is registered, with
  * root_proc_lock(pid) held across the registration and this call, so no signal
  * is kept after the flush or delivered ahead of an earlier one. A kept SIGKILL
- * is delivered alone: nothing else matters once it is pending.
+ * (the process registered before signal_loaded got to it) is not delivered but
+ * carried out, as everywhere else. Parameters:
+ *   pid : the process
+ * Return value: 1 if a kept SIGKILL started the process's exit, and the caller
+ * must run proc_exit_finish(pid) after dropping the lock; else 0.
  */
-void signal_flush_early_locked(pid_t pid)
+int signal_flush_early_locked(pid_t pid)
 {
     root_process_t *slot = root_proc(pid);
     uint64_t sigs = slot->early_sigs;
     root_proc_info_t qinfo;
 
+    if (sigs & (1ULL << SIGKILL))
+        return signal_take_kept_kill_locked(pid);
+
     /* Kept until there is a channel to deliver them on. */
     if (!sigs || process_query_info(pid, &qinfo) != EOK || !qinfo.sys_chp)
-        return;
+        return 0;
     slot->early_sigs = 0;
-    if (sigs & (1ULL << SIGKILL))
-        sigs = 1ULL << SIGKILL;
     for (int signo = 1; signo < NSIG; signo++)
         if (sigs & (1ULL << signo))
             signal_kill(qinfo.sys_chp, signo, slot->early_sender);
+    return 0;
+}
+
+/* signal_loaded — the loader has started process pid: carry out a SIGKILL that
+ * arrived while it was loading.
+ *
+ * A SIGKILL ends its target without asking it (signal_one), except while the
+ * target's one thread is the loader, which runs roottask's code with roottask's
+ * locks; then it is kept like any early signal. This is called by the spawn
+ * handler right after the start commit and does not wait for the process to
+ * register a system channel, which one without this libc never does. The lock
+ * is taken even when nothing looks kept: signal_one decides under it, so a look
+ * without it could miss a SIGKILL being kept just now.
+ */
+void signal_loaded(pid_t pid)
+{
+    process_t *prp;
+    int killed;
+
+    if (!(prp = root_proc_lock(pid)))
+        return;
+    killed = signal_take_kept_kill_locked(pid);
+    root_proc_unlock(pid);
+    if (killed)
+        proc_exit_finish(pid);
 }
 
 /* Which processes a kill() pid argument selects. */
@@ -122,15 +170,12 @@ static int signal_one(const struct signal_sender *snd,
                       pid_t pgrp,
                       int signo)
 {
-    static const unsigned dead =
-        RTMUX_FLG_PROC_TERMING | RTMUX_FLG_PROC_ZOMBIE |
-        RTMUX_FLG_PROC_WAITINFO | RTMUX_FLG_PROC_WAITDONE |
-        RTMUX_FLG_PROC_DESTROYALL;
     root_proc_info_t qinfo;
     struct _cred_info tcred;
-    int rc;
+    process_t *prp;
+    int rc, killed = 0;
 
-    if (!root_proc_lock(target_pid))
+    if (!(prp = root_proc_lock(target_pid)))
         return ESRCH;
 
     /* Only the existence probe treats a dying or zombie target as gone; real
@@ -140,7 +185,7 @@ static int signal_one(const struct signal_sender *snd,
      * for good.
      */
     if (process_query_info(target_pid, &qinfo) != EOK ||
-        ((qinfo.flags & dead) && (signo == 0 || !qinfo.sys_chp))) {
+        ((qinfo.flags & PROC_DEAD_FLAGS) && (signo == 0 || !qinfo.sys_chp))) {
         rc = ESRCH;
     } else if ((scope == KILL_PGRP && qinfo.pgrp != pgrp) ||
                (scope == KILL_ALL &&
@@ -151,12 +196,25 @@ static int signal_one(const struct signal_sender *snd,
         if (!proc_may_signal(&snd->cred, &tcred, signo, snd->sid,
                              qinfo.sess_leader)) {
             rc = EPERM;
+        } else if (signo == SIGKILL && target_pid != ROOTTASK_PID &&
+                   !(qinfo.flags & RTMUX_FLG_PROC_LOADING)) {
+            /* SIGKILL is not delivered: roottask ends the process itself, at
+             * once, because it may not depend on what the target's libc is
+             * doing or whether it has one. A process still loading is the
+             * exception (its one thread is roottask's loader): that branch is
+             * skipped and the SIGKILL is kept for signal_loaded.
+             */
+            if (!(qinfo.flags & PROC_DEAD_FLAGS))
+                killed =
+                    proc_exit_begin_locked(target_pid, SIGKILL, 1);
         } else if (signo != 0) {
             signal_post_locked(target_pid, qinfo.sys_chp, signo, snd->pid);
         }
     }
 
     root_proc_unlock(target_pid);
+    if (killed)
+        proc_exit_finish(target_pid);
     return rc;
 }
 

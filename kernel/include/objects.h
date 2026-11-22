@@ -892,6 +892,13 @@ typedef struct thread_entry { /* Also used for vthread_entry */
         bool armed;
     } xcur;
 
+    /* Wakeups of this thread so far: every path that ends a wait counts one
+     * (thread_note_wakeup). A waker that reads it while the thread waits names
+     * that wait (force_ready_wait): the same value later means the thread has
+     * not been woken since. Appended at the tail.
+     */
+    uint32_t wake_seq;
+
 #ifdef CONFIG_DEBUG_DISPATCH_OWNER
     /* Dispatch-owner tripwire (kernel/debug/dispatch-owner.c): 1 + the hart
      * whose pc_curthread this is, or 0, claimed and released with a
@@ -912,6 +919,17 @@ typedef struct thread_entry { /* Also used for vthread_entry */
     } dbg_owner;
 #endif
 } thread_t;
+
+/* Read and count thp->wake_seq. */
+static inline uint32_t thread_wake_seq(const thread_t *thp)
+{
+    return __atomic_load_n(&thp->wake_seq, __ATOMIC_ACQUIRE);
+}
+
+static inline void thread_note_wakeup(thread_t *thp)
+{
+    __atomic_fetch_add(&thp->wake_seq, 1, __ATOMIC_RELEASE);
+}
 
 /* Map a dispatch-list LINK3_NODE pointer back to its enclosing thread_t. The
  * dispatch ready queue (kdispatch_t.ready[pri].head/tail) stores LINK3_NODE*
@@ -1013,13 +1031,13 @@ struct interrupt_level {
  * dispatch delivery correctly:
  *
  *   INTR_KIND_THREAD  — interrupt_attach_thread().  Trap delivers a
- *                       synthetic SIGEV_INTR to "thread" inline:
+ *                       wake to "thread" inline:
  *                       ready() if STATE_INTR, atomic_or otherwise.
  *
  *   INTR_KIND_EVENT   — __interrupt_attach_event().  Trap calls
  *                       sigevent_deliver_inline(&event, NULL) which
  *                       dispatches on event.sigev_notify
- *                       (SIGEV_NOTIFICATION/SIGEV_INTR/SIGEV_UNBLOCK/...).
+ *                       (SIGEV_NOTIFICATION/SIGEV_UNBLOCK/...).
  *
  *   INTR_KIND_HANDLER — internal-only attach with a function-
  *                       pointer callback that runs in trap context.

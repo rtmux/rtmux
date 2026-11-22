@@ -87,13 +87,19 @@ static int teardown_call(int op, void *arg, const char *what)
     return rc;
 }
 
-/* process_threads_destroy — destroy all threads of a process. Parameters:
- *   prp : opaque kernel-VA pointer to the target process
+/* process_threads_destroy — one pass at destroying every thread of a process.
+ * Parameters:
+ *   prp : opaque kernel-VA pointer to the target process, valid under
+ *         root_proc_lock
+ * Return value: EOK, or EAGAIN when a thread could not be destroyed yet (see
+ * teardown_call) and the pass must be made again later; proc_exit_finish
+ * makes it, without the process lock.
  */
-void process_threads_destroy(process_t *prp)
+int process_threads_destroy(process_t *prp)
 {
-    (void) teardown_call(__KSYS_PRIV_EXIT_DESTROY_THREADS, prp,
-                         "process_threads_destroy");
+    int rc = (int) syscall_priv(__KSYS_PRIV_EXIT_DESTROY_THREADS, prp);
+
+    return rc < 0 ? -rc : rc;
 }
 
 /* process_timer_destroy — destroy one timer of a process. Parameters:

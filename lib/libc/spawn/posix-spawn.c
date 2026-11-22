@@ -60,8 +60,8 @@ static int pack_actions(const _posix_spawn_file_actions_t *fact,
                 return EINVAL;
             }
             size_t len = path ? strlen(path) + 1 : 0;
-            if (len > PSPAWN_MSG_MAX - sizeof(r) ||
-                used > PSPAWN_MSG_MAX - sizeof(r) - len)
+            if (len > PSPAWN_ACTIONS_MAX - sizeof(r) ||
+                used > PSPAWN_ACTIONS_MAX - sizeof(r) - len)
                 return E2BIG;
             r.pathlen = (uint32_t) len;
             if (pass) {

@@ -128,6 +128,7 @@ paddr_t pa_quantum_to_paddr(struct pa_quantum *pq);
 struct pa_quantum *pa_paddr_to_quantum(paddr_t paddr);
 
 memsize_t pa_free_size(void);
+memsize_t pa_free_sizes(memsize_t *largest_run);
 unsigned long pte_rollback_pages(void);
 
 extern int shmem_create(path_object_t *, void *);
@@ -164,6 +165,9 @@ extern void rdecl memobj_unlock(path_object_t *);
 
 #define MM_MEM_SKIPLOCKCHECK 0x20000000
 #define MM_MEM_RDB 0x08000000
+/* A mapping of the object has had pages marked past its end (PTE_SW_BUS), so a
+ * growth must look for them (as_map_grown). A one-way hint: never cleared.
+ */
 #define MM_MEM_HAS_BAD_PAGE 0x04000000
 
 /* Shared memory flags reuse SHMCTL_FLAG_* bits */

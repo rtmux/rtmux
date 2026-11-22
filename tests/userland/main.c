@@ -1079,6 +1079,11 @@ int main(int argc, char *argv[])
             test_skip("disconnect_under_alloc_failure", "fault injection unavailable");
         return finish(1);
     }
+    if (argc == 2 && !strcmp(argv[1], "--reply-fault")) {
+        printf("[reply_fault]\n");
+        test_reply_fault();
+        return finish(1);
+    }
     if (argc == 2 && !strcmp(argv[1], "--remote-ipc")) {
         printf("[remote_ipc]\n");
         if (test_remote_ipc() == TC_EXIT_SKIP)
@@ -1101,6 +1106,14 @@ int main(int argc, char *argv[])
             test_skip("xfer_resume", "fault injection unavailable");
         return finish(1);
     }
+    if (argc == 2 && !strcmp(argv[1], "--slow-reap-kill")) {
+        printf("[kill_slow_reap]\n");
+        if (test_kill_slow_reap() == TC_EXIT_SKIP)
+            test_skip("kill_slow_reap", "fault injection unavailable");
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--slow-reap-child"))
+        return slow_reap_child();
     if (argc == 2 && !strcmp(argv[1], "--reply-claim")) {
         printf("[reply_claim]\n");
         if (test_reply_claim() == TC_EXIT_SKIP)
@@ -1133,6 +1146,28 @@ int main(int argc, char *argv[])
     }
     if (argc == 2 && !strcmp(argv[1], "--exec-arg-max-child"))
         return exec_arg_max_child();
+    if (argc == 2 && !strcmp(argv[1], "--loader-fault")) {
+        printf("=== RTMux Loader Fault Test ===\n\n[loader_fault]\n");
+        test_loader_fault();
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--spawn-concurrent-arg-max")) {
+        test_spawn_concurrent_arg_max();
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--spawn-heap-gate")) {
+        printf("=== RTMux Spawn Heap Gate Test ===\n\n[spawn_heap_gate]\n");
+        test_spawn_heap_gate();
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--loader-einval-log")) {
+        test_spawn_loader_einval_log();
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--sysfs-open-stress")) {
+        test_sysfs_open_stress();
+        return finish(1);
+    }
     if (argc == 2 && !strcmp(argv[1], "--spawn-arg-max")) {
         test_spawn_arg_max();
         return finish(1);
@@ -1178,6 +1213,11 @@ int main(int argc, char *argv[])
         sync_path_cost();
         return finish(1);
     }
+    if (argc == 3 && !strcmp(argv[1], "--named-sem-timedwait")) {
+        printf("[named_sem_timedwait]\n");
+        named_sem_timedwait_loop(atoi(argv[2]));
+        return finish(1);
+    }
     if (argc == 2 && !strcmp(argv[1], "--mutex-owner-death")) {
         test_mutex_owner_death();
         return finish(1);
@@ -1199,6 +1239,13 @@ int main(int argc, char *argv[])
     if (argc == 2 && !strcmp(argv[1], "--k65-windows")) {
         if (k65_windows() == TC_EXIT_SKIP)
             test_skip("k65 windows", "four harts and fault injection required");
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--boot-tick-catch-up")) { /* opt-in */
+        printf("[boot_tick_catch_up]\n");
+        if (boot_tick_catch_up() == TC_EXIT_SKIP)
+            test_skip("boot tick catch-up",
+                      "two harts and fault injection required");
         return finish(1);
     }
     if (argc == 2 && !strcmp(argv[1], "--dispatch-window")) {
@@ -1279,6 +1326,12 @@ int main(int argc, char *argv[])
             test_skip("sync kill handoff", "three harts and fault injection required");
         return finish(1);
     }
+    if (argc == 2 && !strcmp(argv[1], "--wait-rewait")) {
+        printf("[wait_rewait]\n");
+        if (wait_rewait() == TC_EXIT_SKIP)
+            test_skip("wait_rewait", "two harts and fault injection required");
+        return finish(1);
+    }
     if (argc == 2 && !strcmp(argv[1], "--condvar-interrupt-stale")) {
         printf("[condvar_interrupt_stale]\n");
         if (condvar_interrupt_stale() == TC_EXIT_SKIP)
@@ -1313,12 +1366,25 @@ int main(int argc, char *argv[])
         test_nanosleep_1ns_storm();
         return finish(1);
     }
+    if (argc == 2 && !strcmp(argv[1], "--anon-map-failure")) {
+        printf("[anon_map_failure]\n");
+        if (anon_map_failure() == TC_EXIT_SKIP)
+            test_skip("anon_map_failure", "fault injection unavailable");
+        return finish(1);
+    }
     if (argc == 2 && !strcmp(argv[1], "--pte-partial-map")) {
         printf("[pte_partial_map]\n");
         if (pte_partial_map() == TC_EXIT_SKIP)
             test_skip("pte_partial_map", "fault injection unavailable");
         return finish(1);
     }
+    if (argc == 2 && !strcmp(argv[1], "--shm-past-end")) {
+        printf("[shm_past_end]\n");
+        test_shm_past_end();
+        return finish(1);
+    }
+    if (argc == 3 && !strcmp(argv[1], "--shm-past-end-child"))
+        return shm_past_end_child(argv[2]);
     if (argc == 2 && !strcmp(argv[1], "--pgrp-tty-other"))
         return pgrp_tty_other();
     if (argc == 2 && !strcmp(argv[1], "--pgrp-debug-access"))
@@ -1652,6 +1718,13 @@ int main(int argc, char *argv[])
             ;
         return EXIT_SUCCESS;
     }
+    if (argc == 2 && !strcmp(argv[1], "--loader-share-child"))
+        return loader_share_child();
+    if (argc == 2 && !strcmp(argv[1], "--loader-context-share")) {
+        printf("[loader_context_share]\n");
+        test_loader_context_share();
+        return finish(1);
+    }
     if (argc == 2 && !strcmp(argv[1], "--getsid-hold")) {
         /* Say it is running, then stay alive until stdin reaches EOF. */
         char c;
@@ -1813,8 +1886,12 @@ int main(int argc, char *argv[])
         test_kill_busy();
         return finish(1);
     }
+    if (argc == 2 && !strcmp(argv[1], "--stuck-handler-child"))
+        return kill_stuck_handler_child();
     if (argc == 2 && !strcmp(argv[1], "--busy-map-child"))
         return kill_busy_child();
+    if (argc == 2 && !strcmp(argv[1], "--resolve-loop-child"))
+        return kill_resolve_child();
     if (argc == 2 && !strcmp(argv[1], "--gauges")) { /* opt-in: just the gauge regressions */
         printf("=== RTMux gauge regressions ===\n\n[gauges]\n");
         test_gauges();

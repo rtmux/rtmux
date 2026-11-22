@@ -145,10 +145,10 @@
 #define INJECT_OP_STALL_BLOCK 25
 
 /* CRASH(how): the calling hart reports a fatal error and takes the kernel's
- * crash path, as an assertion failure does (how 0), or the shutdown() path a
- * fatal kernel fault takes, which prints the Shutdown[...] banner and powers
- * the machine off through the SBI (how INJECT_CRASH_SHUTDOWN). For the
- * harness's crash dump.
+ * crash path, as a kernel fault or a failed assertion does: the crash
+ * rendezvous, which prints every hart's report and halts (how 0). Or it
+ * reports and powers the machine off through the SBI, as a roottask crash
+ * does (how INJECT_CRASH_SHUTDOWN). For the harness's crash dump.
  */
 #define INJECT_OP_CRASH 26
 #define INJECT_CRASH_SHUTDOWN 1
@@ -267,6 +267,39 @@ enum {
  */
 #define INJECT_OP_SCHED_STATS 42
 
+/* STALL_CANCEL(pid, ms): the next cancel of a thread of pid by another thread
+ * stalls for ms milliseconds after it read the target's wait as cancelable and
+ * before it posts the cancel and ends that wait: the target can be woken
+ * meanwhile, disable cancellation and wait again.
+ */
+#define INJECT_OP_STALL_CANCEL 43
+
+/* STALL_REPRIO(pid, tid << 32 | ms): the next priority change of thread tid
+ * (as pthread_t) of pid while it is READY holds the changing hart for ms
+ * milliseconds once it has moved the thread to its new priority, before it
+ * returns: a stop meanwhile must still keep the thread from running.
+ */
+#define INJECT_OP_STALL_REPRIO 44
+
+/* HOLD_EXIT_DESTROY(pid, ms): for ms from now, roottask's pass at destroying
+ * the threads of that process (kext_exit_destroy_threads) asks to be made
+ * again (EAGAIN) after doing its work, as it does while a thread is held by a
+ * message transfer. One process at a time; the hold ends by itself.
+ */
+#define INJECT_OP_HOLD_EXIT_DESTROY 45
+
+/* STALL_UNBLOCK_RACE(pid, ms): hold open the window between a REPLY timeout's
+ * look for a claim on its client and its unblock notification, against a
+ * reply to that client. The next force_ready of a reply-blocked thread of pid
+ * on a channel that wants unblock notifications, before it tests the client's
+ * claim under the channel lock, waits for a claim on the client or ms
+ * milliseconds (STALL_UNBLOCK_FORCE). The next reply or error by a thread of
+ * pid, once it has looked for a queued unblock notification, waits for one to
+ * be marked queued or ms milliseconds (STALL_UNBLOCK_REPLY). SITE_STATUS
+ * reports each.
+ */
+#define INJECT_OP_STALL_UNBLOCK_RACE 46
+
 enum inject_site {
     STALL_LOCK,
     STALL_LOCK_EARLY,
@@ -283,6 +316,10 @@ enum inject_site {
     STALL_SWITCH,
     STALL_SEND_PICK,
     STALL_STEAL,
+    STALL_CANCEL,
+    STALL_REPRIO,
+    STALL_UNBLOCK_FORCE,
+    STALL_UNBLOCK_REPLY,
     STALL_SITES,
     INJECT_SITE_TURNSTILE = STALL_SITES,
     INJECT_SITE_REPLY_DETACHED

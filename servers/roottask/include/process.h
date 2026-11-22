@@ -32,7 +32,9 @@ int proc_getsetid(ioserv_context_t *ctp, proc_getsetid_t *msg);
 void proc_dispatch_init(void);
 
 /* loader-context.c */
-struct loader_context *loader_context_alloc(unsigned msgsize, int state);
+int loader_context_alloc(pid_t owner, unsigned msgsize, int state,
+                         struct loader_context **lcpp);
+size_t loader_context_bytes(void);
 void loader_context_free(struct loader_context *lcp);
 void loader_thread_attr(struct _thread_attr *attr,
                         struct loader_context *lcp,

@@ -65,6 +65,21 @@ static const char *scause_name(uint64_t cause)
     }
 }
 
+/* user_fault_past_end — whether a U-mode page fault at va hit a page that is
+ * mapped but past the end of the object it maps (PTE_SW_BUS), which POSIX mmap
+ * makes SIGBUS rather than SIGSEGV. satp still names the faulting process's
+ * page table, whose tables are freed only with the process, so the read-only
+ * walk is safe without the as lock; a mark that changes under it decides only
+ * which of the two signals a fault that has already happened gets.
+ */
+static int user_fault_past_end(uintptr_t va)
+{
+    pagetable_t pgdir =
+        (pagetable_t) PA_TO_VA((r_satp() & PTE_PPN_MASK) << PGSHIFT);
+
+    return va < MAXVA && sv39_past_end(pgdir, va);
+}
+
 /* ===================================================================== *
  * Verbose U-mode fault report — gated on CONFIG_UMODE_VERBOSE_FAULT_REPORT.
  *
@@ -561,8 +576,8 @@ void strap_handler_c(CPU_REGISTERS *regs)
 
         /* Interrupt — increment nesting depth (byte 0 of inkernel). Matches
          * MIPS ADJUST_INKERNEL(k0,k1,k1,1,1) at interrupt entry. Read by
-         * INKERNEL_INTRMASK consumers in ipc/event.c, trace/core.c, ext/page.c,
-         * init/shutdown.c to detect interrupt context.
+         * INKERNEL_INTRMASK consumers in ipc/event.c, trace/core.c and
+         * ext/page.c to detect interrupt context.
          */
         atomic_add(&inkernel, 1);
 
@@ -682,9 +697,8 @@ void strap_handler_c(CPU_REGISTERS *regs)
                          * this trap context — there is no deferred-event queue.
                          */
                         if (itp->kind == INTR_KIND_THREAD && itp->thread) {
-                            /* Synthetic SIGEV_INTR to the IST. Inlined to avoid
-                             * building/copying a struct sigevent for the hot
-                             * path.
+                            /* Wake the IST inline; no sigevent is built (the
+                             * event kind SIGEV_INTR is not delivered).
                              */
                             thread_t *target = itp->thread;
 
@@ -1112,6 +1126,14 @@ void strap_handler_c(CPU_REGISTERS *regs)
             displaced || (act->internal_flags & RTMUX_ITF_YIELD_TAIL) != 0;
 
         inject_note_sched_return(act, switch_pending);
+
+        /* A timer fell due on the boot hart during this call: kernel_exit
+         * catches the clock up and expires the timers due (clock_catch_up),
+         * and dispatches a thread they woke that outranks this one. U-mode
+         * only, where act->reg is the frame kernel_exit resumes.
+         */
+        if (!from_smode && clock_catch_up_due(get_cpunum()))
+            switch_pending = true;
         if (switch_pending) {
             kernel_exit();
             /* NOTREACHED — same as above. */
@@ -1207,8 +1229,13 @@ void strap_handler_c(CPU_REGISTERS *regs)
             case RISCV_EXC_INSN_PAGE_FAULT:
             case RISCV_EXC_LOAD_PAGE_FAULT:
             case RISCV_EXC_STORE_PAGE_FAULT:
-                signo = SIGSEGV;
-                code = SEGV_MAPERR;
+                if (user_fault_past_end(r_stval())) {
+                    signo = SIGBUS;
+                    code = BUS_ADRERR;
+                } else {
+                    signo = SIGSEGV;
+                    code = SEGV_MAPERR;
+                }
                 break;
             default:
                 signo = SIGILL;

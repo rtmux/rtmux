@@ -4,7 +4,6 @@
 #
 
 KER_SRC = init/objects init/entry init/setup init/roottask \
-          init/shutdown \
           printk/kprintf \
           core/priv core/globals core/idle \
           core/sys \

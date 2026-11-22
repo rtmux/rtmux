@@ -252,8 +252,9 @@ int rdecl interrupt_attach(unsigned level,
  * Companion to interrupt_attach() above (the direct threaded-IRQ wake model).
  * When the IRQ fires, the trap handler delivers a COPY of "*event" inline via
  * sigevent_deliver_inline(); there is no softirq/workqueue handoff. Supports
- * SIGEV_INTR, SIGEV_NOTIFICATION and SIGEV_UNBLOCK; SIGEV_THREAD is rejected at
- * attach time because thread_create is unsafe from trap context.
+ * SIGEV_NOTIFICATION and SIGEV_UNBLOCK; SIGEV_THREAD is rejected at attach time
+ * because thread_create is unsafe from trap context, and SIGEV_INTR because
+ * sigevent_exe does not deliver it (an IST attaches with interrupt_attach).
  *
  * The calling thread's process owns the attach (used for cleanup on process
  * exit, identical to interrupt_attach). Caller (the ksys_interrupt_attach_event
@@ -277,9 +278,11 @@ int rdecl interrupt_attach_event(unsigned level,
     }
 
     /* The direct-delivery model cannot run thread_create from trap context, so
-     * reject SIGEV_THREAD at attach time.
+     * reject SIGEV_THREAD at attach time, and SIGEV_INTR, which sigevent_exe
+     * does not deliver.
      */
-    if (SIGEV_GET_TYPE(event) == SIGEV_THREAD) {
+    if (SIGEV_GET_TYPE(event) == SIGEV_THREAD ||
+        SIGEV_GET_TYPE(event) == SIGEV_INTR) {
         kcall_err(act, EINVAL);
         return -1;
     }
@@ -316,7 +319,7 @@ int rdecl interrupt_attach_event(unsigned level,
 
     /* Reserve one notification soul so SIGEV_NOTIFICATION delivery from the
      * trap handler is allocation-free (§15). Only this event kind queues a
-     * notification; SIGEV_INTR/SIGEV_UNBLOCK do not. Fail the attach rather
+     * notification; SIGEV_UNBLOCK does not. Fail the attach rather
      * than risk a dropped wakeup under memory pressure later.
      */
     itp->nresv = 0;
