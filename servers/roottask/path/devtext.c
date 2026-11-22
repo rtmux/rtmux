@@ -142,9 +142,60 @@ static int text_signal_char(int c)
 static int text_ahead[TEXT_AHEAD];
 static unsigned text_ahead_head, text_ahead_tail;
 
+/* Canonical input: the line being edited and, once a newline ends it, what
+ * readers have not taken of it yet. Under text_mutex.
+ *
+ * text_input_mutex makes taking a character, checking and editing the line,
+ * and echoing it one step that no flush or other reader can split, so input
+ * reaches the line and the screen in the order it was typed. Every text_next
+ * caller and every input flush takes it before text_mutex; a poller only tries
+ * it, as the holder may be writing to the console.
+ */
+#define TEXT_LINE 256
+static char text_line[TEXT_LINE];
+static unsigned text_line_len, text_line_off;
+static int text_line_done;
+static pthread_mutex_t text_input_mutex;
+
+static void text_line_reset(void)
+{
+    text_line_len = text_line_off = 0;
+    text_line_done = 0;
+}
+
+/* Discard all pending input. Under text_input_mutex and text_mutex. */
+static void text_input_flush(void)
+{
+    text_ahead_tail = text_ahead_head;
+    text_line_reset();
+    while (root_console_getchar() >= 0)
+        ;
+}
+
+/* Whether a read would return at once: under ICANON only once a line is done
+ * or the ring holds its end (a full ring counts, or the line could never end),
+ * otherwise once anything is pending. Under text_mutex.
+ */
+static int text_input_ready(void)
+{
+    if (text_line_done)
+        return 1;
+    if (!(text_termios.c_lflag & ICANON))
+        return text_ahead_head != text_ahead_tail || text_line_len;
+    if (text_ahead_head - text_ahead_tail >= TEXT_AHEAD)
+        return 1;
+    for (unsigned i = text_ahead_tail; i != text_ahead_head; i++) {
+        int c = text_ahead[i % TEXT_AHEAD];
+
+        if (c == '\n' || (c == '\r' && (text_termios.c_iflag & ICRNL)))
+            return 1;
+    }
+    return 0;
+}
+
 /* Armed readiness notifications (_IO_NOTIFY), under text_mutex like the ring.
  * The console raises no interrupt, so the watcher thread looks for input while
- * a poller is armed and wakes it once the ring has a character.
+ * a poller is armed and wakes it once a read would return.
  */
 static ioserv_notify_t text_notify_lists[IOSERV_NOTIFY_COUNT];
 
@@ -196,11 +247,8 @@ static int text_next(int to_ring)
             pthread_mutex_unlock(&text_mutex);
             return c;
         }
-        if (!(text_termios.c_lflag & NOFLSH)) {
-            text_ahead_tail = text_ahead_head;
-            while (root_console_getchar() >= 0)
-                ;
-        }
+        if (!(text_termios.c_lflag & NOFLSH))
+            text_input_flush();
         if ((text_termios.c_lflag & ECHO) && c < ' ') {
             echo[0] = '^';
             echo[1] = (char) (c + '@');
@@ -242,24 +290,105 @@ static void *text_watcher(void *arg)
         if (!text_sid && !armed)
             continue;
         pthread_mutex_unlock(&text_mutex);
+        text_lock(&text_input_mutex);
         (void) text_next(1);
+        pthread_mutex_unlock(&text_input_mutex);
         text_lock(&text_mutex);
 
         /* A poller may have armed while the lock was dropped; its signal was
          * missed, so look again to pick the short interval for it.
          */
         armed = ioserv_notify_armed(text_notify_lists, IOSERV_NOTIFY_INPUT, 1);
-        if (armed && text_ahead_head != text_ahead_tail)
+        if (armed && text_input_ready())
             ioserv_notify_trigger(text_notify_lists, 1, IOSERV_NOTIFY_INPUT);
     }
     return NULL;
 }
 
-/* Read handler for /dev/text — return one character from the console.
+/* Copy up to max bytes of the line out and return the count: a finished line,
+ * or in raw mode whatever canonical input was left. Under text_mutex.
+ */
+static unsigned text_buf_copy(char *buf, unsigned max)
+{
+    unsigned n;
+
+    n = text_line_len - text_line_off;
+    if (n > max)
+        n = max;
+    memcpy(buf, text_line + text_line_off, n);
+    text_line_off += n;
+    if (text_line_off == text_line_len)
+        text_line_reset();
+    return n;
+}
+
+/* Apply one input character to the line under the termios t. Returns the
+ * character to echo, or -1 with *erased set to how many were removed and *kill
+ * set for VKILL. VERASE, ^H and DEL all erase, as terminals differ in which one
+ * they send.
+ */
+static int text_buf_edit(const struct termios *t,
+                         int c,
+                         unsigned *erased,
+                         int *kill)
+{
+    *erased = 0;
+    *kill = 0;
+    text_lock(&text_mutex);
+    if ((c == t->c_cc[VERASE] && c != _POSIX_VDISABLE) || c == '\b' ||
+        c == 0x7f) {
+        if (text_line_len > text_line_off) {
+            text_line_len--;
+            *erased = 1;
+        }
+        c = -1;
+    } else if (c == t->c_cc[VKILL] && c != _POSIX_VDISABLE) {
+        *erased = text_line_len - text_line_off;
+        text_line_len = text_line_off;
+        *kill = 1;
+        c = -1;
+    } else if (c == '\n') {
+        text_line[text_line_len++] = '\n';
+        text_line_done = 1;
+    } else if (text_line_len < TEXT_LINE - 1) {
+        text_line[text_line_len++] = (char) c;
+    } else {
+        c = -1;
+    }
+    pthread_mutex_unlock(&text_mutex);
+    return c;
+}
+
+/* Echo an input character, or the erase of a line edit, if ECHO is set. Must
+ * not be called under text_mutex.
+ */
+static void text_echo(const struct termios *t, int c, unsigned erased, int kill)
+{
+    char ch = (char) c;
+
+    if (!(t->c_lflag & ECHO))
+        return;
+    if (c == '\r' || c == '\n') {
+        text_console_write("\r\n", 2);
+    } else if (c >= ' ' && c != 0x7f) {
+        text_console_write(&ch, 1);
+    } else if (t->c_lflag & ECHOE) {
+        while (erased--)
+            text_console_write("\b \b", 3);
+    } else if (kill) {
+        if (t->c_lflag & ECHOK)
+            text_console_write("\r\n", 2);
+    } else if (erased) {
+        text_console_write("\b", 1);
+    }
+}
+
+/* Read handler for /dev/text.
  *
- * Blocks (or returns EAGAIN in non-blocking mode) until a character is
- * available, applies ICRNL and ECHO termios processing, and replies with at
- * most one byte. Parameters:
+ * Blocks (or returns EAGAIN in non-blocking mode) until input is available and
+ * applies ICRNL and ECHO. Under ICANON it edits a line (erase, kill) and
+ * replies with it once a newline ends it; otherwise with one byte.
+ * Parameters:
  *   ctp : I/O service context
  *   msg : the io_read request / reply buffer
  *   ocb : open control block holding the io flags
@@ -269,7 +398,7 @@ static int text_read(ioserv_context_t *ctp, io_read_t *msg, void *ocb)
 {
     unsigned ioflag = (unsigned) (uintptr_t) ocb;
     struct termios t;
-    unsigned hangups, seen;
+    unsigned hangups, seen, max, n = 0;
     int c;
 
     if (!(ioflag & _IO_FLAG_RD)) {
@@ -304,6 +433,10 @@ static int text_read(ioserv_context_t *ctp, io_read_t *msg, void *ocb)
         return c;
     }
 
+    max = ctp->msg_max_size - (unsigned) ctp->offset;
+    if (max > msg->i.nbytes)
+        max = (unsigned) msg->i.nbytes;
+
     (void) text_attr(&hangups);
     for (;;) {
         struct _msg_info info;
@@ -312,50 +445,56 @@ static int text_read(ioserv_context_t *ctp, io_read_t *msg, void *ocb)
         /* A line that is hung up, or was since the read began, is at end of
          * file, for a reader that waits too.
          */
+        text_lock(&text_input_mutex);
         t = text_attr(&seen);
         if (ioserv_tty_hung_up(&t) || seen != hangups) {
-            _IO_SET_READ_NBYTES(ctp, 0);
-            return EOK;
-        }
-        c = text_next(0);
-        if (c >= 0) {
+            pthread_mutex_unlock(&text_input_mutex);
             break;
         }
-        if (ioflag & O_NONBLOCK) {
-            return EAGAIN;
+        text_lock(&text_mutex);
+        if (text_line_done || (!(t.c_lflag & ICANON) && text_line_len)) {
+            n = text_buf_copy((char *) msg, max);
+            pthread_mutex_unlock(&text_mutex);
+            pthread_mutex_unlock(&text_input_mutex);
+            break;
         }
+        pthread_mutex_unlock(&text_mutex);
+        c = text_next(0);
+        if (c > 0xff) { /* Non-ascii so return EOF */
+            pthread_mutex_unlock(&text_input_mutex);
+            break;
+        }
+        if (c >= 0) {
+            /* ICRNL: convert CR to NL */
+            if ((t.c_iflag & ICRNL) && c == '\r')
+                c = '\n';
+            if (t.c_lflag & ICANON) {
+                unsigned erased;
+                int kill;
+
+                c = text_buf_edit(&t, c, &erased, &kill);
+                text_echo(&t, c, erased, kill);
+                pthread_mutex_unlock(&text_input_mutex);
+                continue;
+            }
+            text_echo(&t, c, 0, 0);
+            pthread_mutex_unlock(&text_input_mutex);
+            *(char *) msg = (char) c;
+            n = 1;
+            break;
+        }
+        pthread_mutex_unlock(&text_input_mutex);
+        if (ioflag & O_NONBLOCK)
+            return EAGAIN;
         to = 100 * 1000000ULL;
         (void) __timer_timeout_r(CLOCK_REALTIME, RTMUX_TIMEOUT_NANOSLEEP, 0,
                                  &to, NULL);
-        if (msg_info(ctp->rcvid, &info) != -1 &&
-            (info.flags & RTMUX_MI_UNBLOCK_REQ)) {
+        if (msg_info(ctp->rcvid, &info) == -1 ||
+            (info.flags & RTMUX_MI_UNBLOCK_REQ))
             return EINTR;
-        }
     }
-    if (c > 0xff) {
-        /* Non-ascii so return EOF */
-        _IO_SET_READ_NBYTES(ctp, 0);
-        return EOK;
-    }
-
-    /* ICRNL: convert CR to NL (standard termios input processing) */
-    t = text_attr(NULL);
-    if ((t.c_iflag & ICRNL) && c == '\r')
-        c = '\n';
-
-    /* ECHO: terminal driver responsibility per POSIX */
-    if (t.c_lflag & ECHO) {
-        char ch = (char) c;
-
-        if (ch == '\r' || ch == '\n')
-            text_console_write("\r\n", 2);
-        else if (ch >= ' ')
-            text_console_write(&ch, 1);
-    }
-
-    *(char *) msg = (char) c;
-    _IO_SET_READ_NBYTES(ctp, 1);
-    return IOSERV_PTR(ctp, msg, 1);
+    _IO_SET_READ_NBYTES(ctp, n);
+    return n ? IOSERV_PTR(ctp, msg, n) : EOK;
 }
 
 /* Write handler for /dev/text — emit bytes to the console.
@@ -478,12 +617,18 @@ static int text_devctl(ioserv_context_t *ctp, io_devctl_t *msg, void *ocb)
     case DEVCTL_TTY_SET_ATTR_FLUSH:
         if (msg->i.nbytes < (int32_t) sizeof(struct termios))
             return EINVAL;
+        text_lock(&text_input_mutex);
         text_lock(&text_mutex);
         memcpy(&text_termios, data, sizeof(struct termios));
         ioserv_tty_hangup_wake(text_notify_lists, &text_termios);
-        if (ioserv_tty_hung_up(&text_termios))
+        if (ioserv_tty_hung_up(&text_termios)) {
             text_hangups++;
+            text_input_flush();
+        } else if ((unsigned) msg->i.devctl_cmd == DEVCTL_TTY_SET_ATTR_FLUSH) {
+            text_input_flush();
+        }
         pthread_mutex_unlock(&text_mutex);
+        pthread_mutex_unlock(&text_input_mutex);
         break;
 
     case DEVCTL_TTY_GET_PGRP:
@@ -535,11 +680,11 @@ static int text_devctl(ioserv_context_t *ctp, io_devctl_t *msg, void *ocb)
         if (msg->i.nbytes < (int32_t) sizeof data->qsel)
             return EINVAL;
         if (data->qsel == TCIFLUSH || data->qsel == TCIOFLUSH) {
+            text_lock(&text_input_mutex);
             text_lock(&text_mutex);
-            text_ahead_tail = text_ahead_head;
-            while (root_console_getchar() >= 0)
-                ;
+            text_input_flush();
             pthread_mutex_unlock(&text_mutex);
+            pthread_mutex_unlock(&text_input_mutex);
         }
         break;
 
@@ -607,12 +752,14 @@ static int text_notify(ioserv_context_t *ctp, io_notify_t *msg, void *ocb)
 
     (void) ocb;
     if ((msg->i.flags & (unsigned) _NOTIFY_COND_INPUT) &&
-        text_ahead_head == text_ahead_tail)
+        pthread_mutex_trylock(&text_input_mutex) == EOK) {
         (void) text_next(1);
+        pthread_mutex_unlock(&text_input_mutex);
+    }
     text_lock(&text_mutex);
     if (ioserv_tty_hung_up(&text_termios)) /* POLLHUP, never writable */
         trig = 0;
-    else if (text_ahead_head != text_ahead_tail)
+    else if (text_input_ready())
         trig |= _NOTIFY_COND_INPUT;
     ret = ioserv_notify(ctp, msg, text_notify_lists, trig,
                         ioserv_tty_hup(&text_termios), NULL);
@@ -700,6 +847,7 @@ void devtext_init(void)
     /* Priority inheritance: see the comment at text_mutex. */
     root_mutex_init_pi(&text_mutex);
     root_mutex_init_pi(&text_out_mutex);
+    root_mutex_init_pi(&text_input_mutex);
     /* Sensible terminal defaults so the shell gets ECHO | ICANON */
     text_termios.c_iflag = ICRNL | BRKINT;
     text_termios.c_oflag = OPOST | ONLCR;
