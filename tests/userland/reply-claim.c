@@ -11,8 +11,12 @@
  * - A reply that removes a queued unblock notification and is then preempted
  *   restarts. The restart must give the claim up, or the restarted call finds
  *   its own stale claim and reports the client gone.
+ * - A send finds only a receiver that waits for notifications, which it may
+ *   not claim, and that receiver is woken before the send looks at it again.
+ *   The send must queue; it used to take the thread for a receiver it had
+ *   claimed and deliver to it, and make it ready, a second time.
  *
- * Both windows are a few instructions wide, so the cases hold them open with
+ * These windows are a few instructions wide, so the cases hold them open with
  * the debug fault-injection call (/bin/inject, CONFIG_DEBUG_INJECT kernels
  * only) and are skipped without it.
  *
@@ -28,6 +32,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/rtmux-core.h>
+#include <sys/states.h>
 
 #include "test.h"
 
@@ -275,6 +280,136 @@ static void claim_release_keeps_wake(const char *pid)
     (void) test_pin_mask(~0U);
 }
 
+struct pick {
+    int chid, coid;
+    atomic_int go, done, stop;
+    int rc, err;
+    struct _notification got;
+};
+
+/* Waits for a notification and nothing else, then stays out of the way. */
+static void *pick_drain(void *raw)
+{
+    struct pick *p = raw;
+
+    (void) test_pin_mask(1);
+    p->rc = msg_receive_notification(p->chid, &p->got, sizeof p->got, NULL);
+    p->err = errno;
+    atomic_store(&p->done, 1);
+    while (!atomic_load(&p->stop)) /* awake, as a thread taken twice is */
+        sleep_ms(1);
+    return NULL;
+}
+
+static void *pick_sender(void *raw)
+{
+    struct pick *p = raw;
+    char req = 'm', rep = 0;
+
+    (void) test_pin_mask(2); /* the stall keeps this hart */
+    while (!atomic_load(&p->go))
+        sleep_ms(1);
+    p->rc = msg_send(p->coid, &req, 1, &rep, 1);
+    p->err = errno;
+    atomic_store(&p->done, 1);
+    return NULL;
+}
+
+static bool pick_wait(atomic_int *flag)
+{
+    for (int i = 0; i < WAIT_MS && !atomic_load(flag); i++)
+        sleep_ms(1);
+    return atomic_load(flag) != 0;
+}
+
+/* The only waiting receiver takes notifications only. A send sees it, may not
+ * claim it, and is held right after it dropped the channel lock; a
+ * notification then wakes the receiver. Let go, the send must queue for a
+ * real receive and not deliver to the thread it saw.
+ */
+static void send_skips_woken_notification_receiver(const char *pid)
+{
+    static const char name[] = "send_skips_woken_notification_receiver";
+    static struct pick drain, sender; /* a peer left behind still uses them */
+    struct stall_watch watch = {.pid = -1};
+    pthread_t td, ts;
+    uint64_t ns = 2000000000ULL;
+    char tid[24], buf = 0, detail[128];
+    int chid, coid, rcvid, entered;
+
+    if (sysconf(_SC_NPROCESSORS_ONLN) < 2) {
+        test_skip(name, "needs two harts");
+        return;
+    }
+    if (test_pin_mask(1) != 0 || !chan_open(0, &chid, &coid)) {
+        test_fail(name, "pin or channel setup failed");
+        return;
+    }
+    drain = (struct pick) {.chid = chid};
+    sender = (struct pick) {.coid = coid};
+    if (pthread_create(&td, NULL, pick_drain, &drain) != 0) {
+        test_fail(name, "thread setup failed");
+        goto out;
+    }
+    if (pthread_create(&ts, NULL, pick_sender, &sender) != 0) {
+        test_fail(name, "thread setup failed");
+        goto out_drain;
+    }
+    snprintf(tid, sizeof tid, "%u", (unsigned) ts);
+    if (!test_thread_blocked(td, STATE_RECEIVE) ||
+        inject_run("stall-send-pick", pid, tid) != 0 ||
+        stall_watch_start(&watch, "send-pick") != 0) {
+        test_fail(name, "the drain did not wait, or inject refused to arm");
+        /* Neither peer is joined: the destroy ends the drain's wait and
+         * fails the send.
+         */
+        atomic_store(&sender.go, 1);
+        goto out_drain;
+    }
+    atomic_store(&sender.go, 1);
+    entered = stall_watch_entered(&watch);
+    check(entered, "send_skips_woken_notification_receiver window taken",
+          "the send never reached the injected window");
+
+    /* The send has seen the drain. Wake the drain behind its back. */
+    (void) msg_send_notification(coid, 10, _NOTIFICATION_CODE_MINAVAIL, 7);
+    check(pick_wait(&drain.done) && drain.rc == 0 &&
+              drain.got.value.sival_int == 7,
+          "send_skips_woken_notification_receiver drain woken",
+          "the notification did not reach the drain");
+    stall_watch_finish(&watch);
+
+    /* The message is for a receiver that takes messages, and waits for one. */
+    (void) __timer_timeout(CLOCK_MONOTONIC, RTMUX_TIMEOUT_RECEIVE, NULL, &ns,
+                           NULL);
+    rcvid = msg_receive(chid, &buf, 1, NULL);
+    snprintf(detail, sizeof detail, "receive=%d byte=%d, drain value=%d", rcvid,
+             buf, drain.got.value.sival_int);
+    check(rcvid > 0 && buf == 'm' && drain.got.value.sival_int == 7, name,
+          detail);
+    if (rcvid > 0)
+        (void) msg_reply(rcvid, 0, &buf, 1);
+    if (pick_wait(&sender.done)) {
+        snprintf(detail, sizeof detail, "send rc=%d errno=%d", sender.rc,
+                 sender.rc == -1 ? sender.err : 0);
+        check(sender.rc == 0, "send_skips_woken_notification_receiver replied",
+              detail);
+        (void) pthread_join(ts, NULL);
+    } else {
+        test_fail(name, "the send did not return");
+    }
+    if (atomic_load(&drain.done)) {
+        atomic_store(&drain.stop, 1);
+        (void) pthread_join(td, NULL);
+    }
+out_drain:
+    atomic_store(&drain.stop, 1);
+out:
+    (void) __connect_detach((uint64_t) coid);
+    (void) channel_destroy(chid);
+    (void) test_pin_mask(~0U);
+}
+
 int test_reply_claim(void)
 {
     char pid[16];
@@ -285,5 +420,6 @@ int test_reply_claim(void)
     reply_unblock_restart(pid);
     reply_detached_connection(pid);
     claim_release_keeps_wake(pid);
+    send_skips_woken_notification_receiver(pid);
     return 0;
 }

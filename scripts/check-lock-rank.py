@@ -40,6 +40,7 @@ Exit status: non-zero on any rank inversion OR any unresolved acquire site.
 import os
 import re
 import sys
+import tempfile
 
 KERNEL = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                       "kernel")
@@ -55,6 +56,16 @@ ANNOTATIONS = {
     # its dpp are kdispatch_t, whose lock is a SCHED lock.
     "LOCAL_DPP->lock": "LOCK_CLASS_SCHED",
     "dpp->lock": "LOCK_CLASS_SCHED",
+}
+
+# As ANNOTATIONS, for an acquire target inside one function only: a bare
+# parameter name means that lock there and nothing elsewhere.
+# (function, expr) -> LOCK_CLASS_* name.
+FUNC_ANNOTATIONS = {
+    # sched_lock()/sched_unlock() (kernel/include/core/globals.h) are the
+    # bodies of the SCHED_LOCK* wrappers: their parameter is a dispatch lock.
+    ("sched_lock", "l"): "LOCK_CLASS_SCHED",
+    ("sched_unlock", "l"): "LOCK_CLASS_SCHED",
 }
 
 # Lock primitive / runtime checker itself — not lock consumers.  Excluded from
@@ -83,8 +94,8 @@ MACRO_RE = re.compile(r'\b(' + '|'.join(
     sorted(MACRO_LOCKS, key=len, reverse=True)) + r')\s*\(([^;)]*)\)')
 
 
-def c_files():
-    for root, _dirs, files in os.walk(KERNEL):
+def c_files(kernel):
+    for root, _dirs, files in os.walk(kernel):
         for f in files:
             if f.endswith((".c", ".h")):
                 yield os.path.join(root, f)
@@ -107,9 +118,9 @@ def strip_comments(text):
     return text
 
 
-def parse_ranks():
+def parse_ranks(kernel):
     """LOCK_CLASS_* enum declaration order -> integer rank."""
-    text = strip_comments(read(os.path.join(KERNEL, "include", "lock.h")))
+    text = strip_comments(read(os.path.join(kernel, "include", "lock.h")))
     m = re.search(r'enum\s+lock_class\s*\{(.*?)\}', text, re.S)
     if not m:
         sys.exit("check-lock-rank: cannot find enum lock_class")
@@ -268,12 +279,13 @@ def normalize(expr):
     return expr.strip().lstrip('&').strip()
 
 
-def main():
-    ranks = parse_ranks()
-    files_text = {p: strip_comments(read(p)) for p in c_files()}
+def analyze(kernel):
+    """Walk the tree at kernel: (inversions, warnings, same_class)."""
+    ranks = parse_ranks(kernel)
+    files_text = {p: strip_comments(read(p)) for p in c_files(kernel)}
     struct_fields, aliases = parse_struct_fields(files_text)
     scan = {p: t for p, t in files_text.items()
-            if os.path.relpath(p, KERNEL) not in SKIP}
+            if os.path.relpath(p, kernel) not in SKIP}
 
     # class maps
     global_class = {}          # bare-ident lock -> LOCK_CLASS_*
@@ -300,8 +312,10 @@ def main():
                     if t:
                         type_field_class[(t, field)] = cls
 
-    def classify(expr, scope, res, alias):
+    def classify(expr, scope, res, alias, func):
         expr = normalize(expr)
+        if (func, expr) in FUNC_ANNOTATIONS:
+            return FUNC_ANNOTATIONS[(func, expr)]
         if expr in ANNOTATIONS:
             return ANNOTATIONS[expr]
         if re.fullmatch(r'[A-Za-z_]\w*', expr):
@@ -331,15 +345,15 @@ def main():
     for path, text in scan.items():
         res = Resolver(struct_fields, aliases, file_globals[path])
         line_at = lambda off: text.count('\n', 0, off) + 1
-        rel = os.path.relpath(path, os.path.dirname(KERNEL))
-        for _n, start, _end, scope, body in parse_functions(text):
+        rel = os.path.relpath(path, os.path.dirname(kernel))
+        for func, start, _end, scope, body in parse_functions(text):
             # local kspinlock_t* aliases: var = &something
             alias = {}
             for am in re.finditer(r'\b([A-Za-z_]\w*)\s*=\s*([^;]+;)', body):
                 v = am.group(1)
                 if v in scope and scope[v] == "kspinlock_t":
                     tgts = re.findall(r'&\s*([A-Za-z_][\w.\->\[\]]*)', am.group(2))
-                    classes = {classify(t, scope, res, {}) for t in tgts}
+                    classes = {classify(t, scope, res, {}, func) for t in tgts}
                     classes.discard(None)
                     if len(classes) == 1:
                         alias[v] = classes.pop()
@@ -350,10 +364,10 @@ def main():
             events = []
             for m in ACQUIRE_RE.finditer(body):
                 e = normalize(m.group(1))
-                events.append((m.start(), "acq", classify(e, scope, res, alias), e))
+                events.append((m.start(), "acq", classify(e, scope, res, alias, func), e))
             for m in RELEASE_RE.finditer(body):
                 e = normalize(m.group(1))
-                events.append((m.start(), "rel", classify(e, scope, res, alias), e))
+                events.append((m.start(), "rel", classify(e, scope, res, alias, func), e))
             for m in MACRO_RE.finditer(body):
                 kind, cls, fixed = MACRO_LOCKS[m.group(1)]
                 inst = fixed or normalize(m.group(2)).strip('()')
@@ -394,6 +408,62 @@ def main():
                             f"under '{hexpr}' ({rel}:{hline})")
                 held.append((rank, cls, expr, line))
 
+    return inversions, warnings, same_class
+
+
+# Self-test tree: sched_lock() takes its parameter l, which FUNC_ANNOTATIONS
+# makes a SCHED lock, and inverted() takes a TURNSTILE lock through a local
+# also named l while holding a SCHED lock. The annotation must not reach the
+# second l, or the inversion is hidden as a same-class nest.
+SELF_TEST = {
+    "include/lock.h": "enum lock_class {\n"
+                      "    LOCK_CLASS_UNCLASSIFIED = 0,\n"
+                      "    LOCK_CLASS_TURNSTILE,\n"
+                      "    LOCK_CLASS_SCHED,\n"
+                      "    LOCK_CLASS_NR\n"
+                      "};\n",
+    "core/fixture.c": "static kspinlock_t t_lock, s_lock;\n"
+                      "void fixture_init(void) {\n"
+                      "    kspinlock_init(&t_lock, LOCK_CLASS_TURNSTILE, \"t\");\n"
+                      "    kspinlock_init(&s_lock, LOCK_CLASS_SCHED, \"s\");\n"
+                      "}\n"
+                      "static inline void sched_lock(kspinlock_t *l) {\n"
+                      "    kspinlock_lock(l);\n"
+                      "}\n"
+                      "void inverted(void) {\n"
+                      "    kspinlock_t *l = &t_lock;\n"
+                      "    kspinlock_lock(&s_lock);\n"
+                      "    kspinlock_lock(l);\n"
+                      "    kspinlock_unlock(l);\n"
+                      "    kspinlock_unlock(&s_lock);\n"
+                      "}\n",
+}
+
+
+def self_test():
+    with tempfile.TemporaryDirectory() as tmp:
+        kernel = os.path.join(tmp, "kernel")
+        for name, text in SELF_TEST.items():
+            path = os.path.join(kernel, name)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(text)
+        inversions, warnings, _same = analyze(kernel)
+    want = ["kernel/core/fixture.c:12: rank inversion: acquire "
+            "LOCK_CLASS_TURNSTILE(1) 'l' while holding LOCK_CLASS_SCHED(2) "
+            "'s_lock' taken at kernel/core/fixture.c:11"]
+    if sorted(set(inversions)) != want or warnings:
+        print("check-lock-rank: self-test failed:")
+        for s in sorted(set(inversions)) + sorted(set(warnings)):
+            print("  " + s)
+        return False
+    return True
+
+
+def main():
+    if not self_test():
+        return 1
+    inversions, warnings, same_class = analyze(KERNEL)
     verbose = "-v" in sys.argv or "--verbose" in sys.argv
     if same_class and verbose:
         print("Same-class distinct-instance nests (allowlist — reviewed, "

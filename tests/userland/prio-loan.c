@@ -183,6 +183,7 @@ struct client {
     int prio;
     pthread_mutex_t *hold; /* NULL: hold nothing */
     long reply_timeout_ms; /* 0: none */
+    long send_timeout_ms;  /* 0: none; leaves the send queue when it expires */
     atomic_int done;
     int rc, err;
 };
@@ -199,6 +200,11 @@ static void *client_main(void *raw)
         uint64_t ns = (uint64_t) c->reply_timeout_ms * 1000000ULL;
 
         (void) __timer_timeout(CLOCK_MONOTONIC, RTMUX_TIMEOUT_REPLY, NULL, &ns,
+                               NULL);
+    } else if (c->send_timeout_ms) {
+        uint64_t ns = (uint64_t) c->send_timeout_ms * 1000000ULL;
+
+        (void) __timer_timeout(CLOCK_MONOTONIC, RTMUX_TIMEOUT_SEND, NULL, &ns,
                                NULL);
     }
     c->rc = msg_send(c->coid, &req, 1, &rep, 1);
@@ -878,6 +884,73 @@ static void test_loan_ends_for_blocked_server(void)
     run_loan_ends_for_blocked_server(false);
 }
 
+/* Case 10: a send queued behind the request a server is serving lends its
+ * priority to that server (the pending-send loan). The loan is dropped lazily:
+ * a sender that leaves the queue by timeout does not take it back at once, and
+ * the server keeps it until its next reply or receive reads the queue head
+ * again (docs/pi-pc-design.md "Not followed"). This pins that bound: the loan
+ * is there while the send is queued, and it is gone once the server has
+ * replied to the request it held. The priority seen between the timeout and
+ * the reply is reported, not checked.
+ */
+#define C10_BASE 5
+#define C10_QUEUED_MS 1000 /* long enough to see the loan on a loaded host */
+
+static void test_pending_loan_after_sender_timeout(void)
+{
+    static struct server k;
+    struct client held = {.prio = 10};
+    struct client queued = {.prio = 40, .send_timeout_ms = C10_QUEUED_MS};
+    pthread_t ts, th, tq;
+    int coid = -1, lent = -1, stale = -1;
+    char detail[224];
+
+    memset(&k, 0, sizeof k);
+    if (chan_open(&k.chid, &coid) != 0) {
+        test_fail("prio loan: queued sender timeout setup", strerror(errno));
+        return;
+    }
+    k.base = C10_BASE;
+    held.coid = coid;
+    queued.coid = coid;
+    if (!spawn(&ts, server_main, &k, "prio loan: queued sender server"))
+        return;
+    (void) wait_flag(&k.ready);
+    if (!spawn(&th, client_main, &held, "prio loan: queued sender held client")) {
+        set_flag(&k.go);
+        return;
+    }
+    if (!wait_flag(&k.received)) {
+        test_fail("prio loan: queued sender setup",
+                  "the server did not receive the held request");
+    } else if (spawn(&tq, client_main, &queued,
+                     "prio loan: queued sender client")) {
+        lent = wait_prio_n(ts, 40, C10_QUEUED_MS - 100);
+        (void) wait_flag(&queued.done);
+        stale = wait_prio_n(ts, 10, 5);
+        (void) pthread_join(tq, NULL);
+    }
+    set_flag(&k.go);
+    (void) pthread_join(ts, NULL);
+    (void) pthread_join(th, NULL);
+    snprintf(detail, sizeof detail,
+             "received at %d (want 10); with the send queued %d (want 40); "
+             "sender rc %d errno %d (want ETIMEDOUT); %d within 5 ms of the "
+             "timeout (10 if dropped at once); after the reply %d base %d "
+             "(want %d)",
+             k.prio_recv, lent, queued.rc, queued.err, stale, k.prio_after,
+             k.base_after, C10_BASE);
+    printf("prio loan: pending-send loan %d ms after its sender timed out: %d\n",
+           5, stale);
+    check(k.prio_recv == 10 && lent == 40 && queued.rc == -1 &&
+              queued.err == ETIMEDOUT && k.reply_rc == 0 &&
+              k.prio_after == C10_BASE &&
+              k.base_after == C10_BASE,
+          "prio loan: a timed-out queued send lends no later than the reply",
+          detail);
+    chan_close(k.chid, coid);
+}
+
 /* Measure the fence used by thread_end_orphan_loan against the same loop
  * with only a compiler barrier. Batching amortizes both timer reads. */
 static uint64_t loan_fence_batch(bool fence)
@@ -1331,5 +1404,6 @@ void test_prio_loan(void)
     test_loan_ends_at_msg_current_zero();
     test_loan_ends_for_blocked_server();
     test_loan_ends_at_failed_msg_current();
+    test_pending_loan_after_sender_timeout();
     (void) __sched_set(0, 0, policy, &saved);
 }

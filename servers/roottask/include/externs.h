@@ -182,6 +182,8 @@ extern const char os_version_string[];
  * internal and unreachable from roottask.
  */
 void signal_kill(channel_t *chp, int signo, pid_t sender_pid);
+void signal_post_locked(pid_t pid, channel_t *chp, int signo, pid_t sender);
+void signal_flush_early_locked(pid_t pid);
 
 /* DBGOUT — now in <kernel/log.h> */
 #include <log.h>

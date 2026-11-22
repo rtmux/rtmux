@@ -217,6 +217,10 @@ static void fastmsg_native_cap_rollback(thread_t *receiver,
  */
 #define NATIVE_HDR_ENTRIES_MAX 64
 
+/* fastmsg_write_own_head() leaves the count to xfer_cpy_diov_step(). */
+_Static_assert(XFER_STEP_ENTRIES == NATIVE_HDR_ENTRIES_MAX,
+               "one step of a vector is the header's entry bound");
+
 /* Read up to want bytes from the head of the active sender's own message
  * into a kernel buffer.
  *
@@ -330,14 +334,46 @@ static void fastmsg_own_as(thread_t *active)
         vm_ops->as(own, &pcpu_array[cpu].pc_as_prp);
 }
 
+/* Write len bytes over the head of the active receiver's own buffers, whose
+ * address space is current.
+ *
+ * Returns 0, XFER_DST_FAULT, or XFER_YIELD when the bytes do not fit within
+ * the first NATIVE_HDR_ENTRIES_MAX entries of its vector.
+ */
+static int fastmsg_write_own_head(thread_t *receiver,
+                                  const void *buf,
+                                  size_t len)
+{
+    iov_t *rmsg = receiver->args.ms.rmsg;
+    int parts = receiver->args.ms.rparts;
+    unsigned idx = 0;
+    size_t placed = 0;
+    int ret;
+
+    if (parts <= 0) /* one buffer, or none: nothing to walk */
+        return xfer_cpy_diov(receiver, rmsg, (uint8_t *) (uintptr_t) buf, parts,
+                             len);
+    ret = xfer_cpy_diov_step(receiver, rmsg, parts, buf, len, &idx, &placed);
+    if (!ret && placed != len)
+        ret = XFER_DST_FAULT; /* its vector changed under the copy */
+    return ret;
+}
+
 /* What fastmsg_native_cap_finish_long() found wrong: a fault on one side
  * (XFER_SRC_FAULT, XFER_DST_FAULT), or an errno for a message that is refused
  * with nothing at fault (a bad header, a capability that cannot be
- * transferred, a header spread too wide).
+ * transferred, a header spread too wide in the sender's vector).
+ *
+ * With XFER_DST_FAULT, rcv_err is the receiver's errno: EFAULT for memory it
+ * cannot be written through, EINVAL for a vector whose head lies behind more
+ * entries than the kernel walks. That one names no bad address, so it is the
+ * error a sender gets for the same shape and not the one that sends its
+ * owner looking for a wild pointer.
  */
 struct native_cap_status {
     int fault;
     int err;
+    int rcv_err;
 };
 
 /* The last step of a long message's delivery, once its bytes are in the
@@ -377,6 +413,7 @@ static bool fastmsg_native_cap_finish_long(thread_t *sender,
     tx->hdr = NULL;
     tx->nxfers = 0;
     st->fault = st->err = 0;
+    st->rcv_err = EFAULT;
 
     /* The first bytes say whether this is a native message at all; only one
      * that is has a header worth reading whole. Any other message is held to
@@ -450,8 +487,7 @@ static bool fastmsg_native_cap_finish_long(thread_t *sender,
         copied = delivered;
     if (active == receiver) {
         fastmsg_own_as(active);
-        ret = xfer_cpy_diov(receiver, receiver->args.ms.rmsg, (uint8_t *) &hdr,
-                            receiver->args.ms.rparts, copied);
+        ret = fastmsg_write_own_head(receiver, &hdr, copied);
     } else {
         ret = fastmsg_head_xfer(sender, receiver, &hdr, copied, true, &written);
         if (!ret && written != copied)
@@ -460,6 +496,8 @@ static bool fastmsg_native_cap_finish_long(thread_t *sender,
     if (ret) {
         fastmsg_native_cap_rollback(receiver, tx);
         st->fault = XFER_DST_FAULT;
+        if (ret == XFER_YIELD)
+            st->rcv_err = EINVAL; /* the head is too far into its vector */
         return false;
     }
     return true;
@@ -718,6 +756,7 @@ static int sendv_body(thread_t *act,
     unsigned th_flags = 0;
     uint32_t remote_srcmsglen = -1U;
     fastmsg_native_cap_tx_t captx;
+    int rcv_errno = EFAULT; /* what a receiver failed at rcv_fault is told */
 
     /* These are the usual incoming checks
      * - validate connection
@@ -784,9 +823,16 @@ static int sendv_body(thread_t *act,
     *heldp = cop;
 
     sender = act;
+    msg_request_begin(sender);
 
     /* Store incoming args */
     if (cop->flags & COF_NETCON) {
+        /* Nothing creates a virtual thread yet, so this lookup fails and the
+         * send ends here with EINVAL. What follows for sender != act has
+         * never run: it checks the caller's addresses against the virtual
+         * thread's process, and the long message's header would be read
+         * through it too. That is to be settled with whatever adds them.
+         */
         RD_PROBE_INT(act, kap->rmsg, sizeof(struct _vtid_info) / sizeof(int));
         sender = (thread_t *) (void *) remote_ipc_vthread(
             (unsigned) kap->rparts, (struct _vtid_info *) (void *) kap->rmsg);
@@ -945,11 +991,25 @@ static int sendv_body(thread_t *act,
     while ((thp) && (thp->internal_flags & RTMUX_ITF_MSG_DELIVERY)) {
         thp = thp->next.thread;
     }
-    if (thp && !(thp->internal_flags & RTMUX_ITF_RCVNOTIFICATION)) {
+#endif
+
+    /* Whether thp takes this message is settled here, under the lock, and
+     * thp is not looked at again unless it is claimed. A receiver that waits
+     * for notifications only is not claimed, and whoever wakes it (a
+     * notification, its timeout) clears RTMUX_ITF_RCVNOTIFICATION as it does:
+     * a second look at the flag once the lock is dropped took such a thread,
+     * by then running or waiting on something else, for a receiver this send
+     * had claimed, copied the message into its buffers, unlinked it again and
+     * made it ready a second time.
+     */
+    if (thp && (thp->internal_flags & RTMUX_ITF_RCVNOTIFICATION))
+        thp = NULL;
+#if CONFIG_PROCESSORS_MAX > 1 && defined(CONFIG_SMP_MSGOPT)
+    if (thp)
         ITF_SET(thp, RTMUX_ITF_MSG_DELIVERY);
-    }
 #endif
     kspinlock_unlock(&chp->lock);
+    inject_send_pick_window(act);
 
     if (thp) {
         unsigned __wp_spins = 0;
@@ -966,7 +1026,7 @@ static int sendv_body(thread_t *act,
         }
         cpu_smp_mb();
     }
-    if ((thp) && !(thp->internal_flags & RTMUX_ITF_RCVNOTIFICATION)) {
+    if (thp) {
         int xferstat;
         /* If an immediate timeout was specified we return immediately. */
         if (IMTO(act, STATE_REPLY)) {
@@ -1054,8 +1114,10 @@ static int sendv_body(thread_t *act,
                                                 &capst)) {
                 if (capst.fault & XFER_SRC_FAULT)
                     goto send_fault;
-                if (capst.fault)
+                if (capst.fault) {
+                    rcv_errno = capst.rcv_err;
                     goto rcv_fault;
+                }
                 /* The receiver stays queued for another sender; a wake that
                  * was deferred to this claim meanwhile is delivered.
                  */
@@ -1149,6 +1211,7 @@ static int sendv_body(thread_t *act,
         ITF_SET(sender, RTMUX_ITF_WAIT_PENDING);
         kspinlock_lock(&chp->lock);
         LINKPRIL_REM(thp);
+        RECEIVER_TAKEN(thp);
         sender->state = STATE_REPLY;
         LINKPRIL_BEG(chp->reply_queue, sender, thread_t);
 
@@ -1159,6 +1222,8 @@ static int sendv_body(thread_t *act,
          * leave its error where the rcvid belongs.
          */
         SETKSTATUS(thp, (sender->tid << 16) | cop->scoid);
+        if (sender == act)
+            msg_request_received(thp, sender, cop);
         ITF_CLR(thp, RTMUX_ITF_MSG_DELIVERY | RTMUX_ITF_MSG_FORCE_RDY);
         kspinlock_unlock(&chp->lock);
 
@@ -1482,7 +1547,7 @@ rcv_fault:
      */
     fastmsg_native_cap_rollback(thp, &captx);
     atomic_clr(&sender->flags, RTMUX_FLG_THR_BUFF_MSG);
-    kcall_err(thp, EFAULT);
+    kcall_err(thp, rcv_errno);
 
     /* LINKPRIL_REM under chp->lock; clear MSG_DELIVERY claim INSIDE the lock
      * (after LINKPRIL_REM) so the same race window that bites the success path
@@ -1490,6 +1555,7 @@ rcv_fault:
      */
     kspinlock_lock(&chp->lock);
     LINKPRIL_REM(thp);
+    RECEIVER_TAKEN(thp);
 #if CONFIG_PROCESSORS_MAX > 1 && defined(CONFIG_SMP_MSGOPT)
     ITF_CLR(thp, RTMUX_ITF_MSG_DELIVERY);
 #endif
@@ -1678,7 +1744,8 @@ int kdecl ksys_msg_sendnotification(thread_t *act,
 #endif
         kspinlock_unlock(&chp->lock);
 
-        if (thp) {
+        /* Only a claimed receiver is looked at with the lock dropped. */
+        if (short_circuit) {
             while (thp->internal_flags & RTMUX_ITF_WAIT_PENDING)
                 __asm__ volatile("" ::: "memory");
             cpu_smp_mb();
@@ -1690,7 +1757,6 @@ int kdecl ksys_msg_sendnotification(thread_t *act,
 
             ITF_CLR(thp, RTMUX_ITF_RCVNOTIFICATION);
             thp->restart = NULL;
-
             /* Yes. Transfer the data. */
             status =
                 xfernotification(thp, thp->args.ri.rmsg, thp->args.ri.rparts,
@@ -1714,15 +1780,17 @@ int kdecl ksys_msg_sendnotification(thread_t *act,
 
             SETKSTATUS(thp, 0);
 
-            if (status) {
+            if (status)
                 kcall_err(thp, EFAULT);
-            }
+            else
+                msg_notification_received(thp, 0, 0, 0); /* no rcvid in it */
 
             /* Unlink receive thread from the receive queue and ready it. Queue
              * mutation under chp->lock
              */
             kspinlock_lock(&chp->lock);
             LINKPRIL_REM(thp);
+            RECEIVER_TAKEN(thp);
 #if CONFIG_PROCESSORS_MAX > 1 && defined(CONFIG_SMP_MSGOPT)
             atomic_clr((volatile unsigned *) &thp->internal_flags,
                        RTMUX_ITF_MSG_DELIVERY);
@@ -1903,6 +1971,7 @@ restart:
     int notification_code = 0;
     uintptr_t notification_value = 0;
     intptr_t notification_id = 0;
+    uint64_t notification_gen = 0;
     unsigned notification_priority = 0;
     thread_t *vnotification_origin = NULL;
     int imto_bounce = 0;
@@ -1921,6 +1990,7 @@ restart_recv:
             notification_code = pup->code;
             notification_value = pup->value;
             notification_id = (intptr_t) pup->id;
+            notification_gen = pup->gen;
             notification_priority = pup->priority;
             if (pup->terminal_signal)
                 notification_priority |= _NOTIFICATION_PRIO_SIGNAL;
@@ -1998,6 +2068,12 @@ restart_recv:
         if (xferstat)
             kcall_err(act, EFAULT);
         else {
+            /* What act holds now is this notification: the request an
+             * unblock notification was made for, and no rcvid otherwise.
+             */
+            msg_notification_received(act, notification_code,
+                                      (int) notification_value,
+                                      notification_gen);
             _TRACE_COMM_IPC_RET(act);
             SETKSTATUS(act, EOK);
         }
@@ -2015,6 +2091,7 @@ restart_recv:
         fastmsg_native_cap_tx_t captx;
         struct native_cap_status capst;
         int capstat = EOK;
+        int rcv_errno = EFAULT;
         int xferstat;
         bool deferred;
         unsigned deferred_status = 0;
@@ -2086,6 +2163,7 @@ restart_recv:
                                                              &captx, &capst)) {
                 xferstat = capst.fault;
                 capstat = capst.err;
+                rcv_errno = capst.rcv_err;
             }
         }
 
@@ -2103,8 +2181,9 @@ restart_recv:
 
             /* Drop our claim — both fault-recovery branches below leave thp on
              * send_queue (the send-fault branch will force_ready it; the
-             * dst-fault branch returns EFAULT to the receiver while the sender
-             * stays send-blocked).
+             * dst-fault branch fails the receiver, with EFAULT or with EINVAL
+             * for a vector too sparse at its head, while the sender stays
+             * send-blocked).
              */
             kspinlock_lock(&chp->lock);
             END_SMP_XFER(act, thp);
@@ -2123,7 +2202,7 @@ restart_recv:
 
             /* Let receiver and sender know reason for fault. */
             act->timeout_flags = 0;
-            return EFAULT;
+            return rcv_errno;
         }
         if (TYPE_MASK(thp->type) == TYPE_VTHREAD) {
             tid = thp->args.ri.rparts;
@@ -2194,6 +2273,8 @@ restart_recv:
             snap_time(&thp->timestamp_last_block, 0);
             _TRACE_TH_EMIT_STATE(thp, REPLY);
             SETKSTATUS(act, (tid << 16) | cop->scoid);
+            if (TYPE_MASK(thp->type) != TYPE_VTHREAD)
+                msg_request_received(act, thp, cop);
         } else {
             thp->state = STATE_NET_REPLY;
             _TRACE_TH_EMIT_STATE(thp, NET_REPLY);
@@ -2428,6 +2509,7 @@ static int msg_replyv_body(thread_t *act,
     thread_t *thp;
     channel_t *chp; /* the channel thp is reply-blocked on, for chp->lock */
     int xferstat, status, scan_rc = EOK;
+    int client_errno = EFAULT; /* what a client failed at xfer_err is told */
     size_t vector_bytes = 0;
     unsigned flags = 0;
 
@@ -2598,8 +2680,12 @@ static int msg_replyv_body(thread_t *act,
              * A reply the kernel cannot vouch for fails as a bad source does.
              */
             if (!xferstat && native_reply &&
-                !fastmsg_native_cap_finish_long(act, thp, true, &captx, &capst))
+                !fastmsg_native_cap_finish_long(act, thp, true, &captx,
+                                                &capst)) {
                 xferstat = capst.fault ? capst.fault : XFER_SRC_FAULT;
+                if (capst.fault)
+                    client_errno = capst.rcv_err;
+            }
         } else {
             /* Short message. We only do something if there is no target as --
              * reply to proc case. Else, this is handled in specret.
@@ -2637,6 +2723,7 @@ static int msg_replyv_body(thread_t *act,
 
     atomic_clr(&thp->flags, RTMUX_FLG_THR_UNBLOCK_REQ);
 
+    msg_request_answered(act, thp, cop);
     if (thp->args.ms.server != 0) {
         thp->args.ms.server->client = 0;
         thp->args.ms.server = 0;
@@ -2701,8 +2788,9 @@ xfer_err:
     /* Fault -- determine if this is sender or replyer. If replier faulted let
      * him know and abort the operation and wakup the sender with an error.
      */
-    status = (xferstat & XFER_SRC_FAULT) ? EFAULT : EFAULT;
-    kcall_err(thp, status);
+    status = EFAULT;
+    kcall_err(thp, client_errno);
+    msg_request_answered(act, thp, cop); /* the request ends here too */
 
     /* Same LINKPRIL_REM + claim/flag clear under chp->lock as the success path.
      */
@@ -2761,6 +2849,7 @@ static int msg_error_body(thread_t *act,
     }
 
 
+    msg_request_answered(act, thp, cop);
     if (thp->args.ms.server != 0) {
         thp->args.ms.server->client = 0;
         thp->args.ms.server = 0;

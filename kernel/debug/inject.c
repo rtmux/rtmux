@@ -35,7 +35,8 @@ static thread_t * _Atomic sched_failed_thr; /* the caller just failed */
 
 static inline bool inject_op_is_status(unsigned op)
 {
-    return op == INJECT_OP_SYNC_WAKE_CLAIMS || op == INJECT_OP_SITE_STATUS ||
+    return op == INJECT_OP_SCHED_STATS ||
+           op == INJECT_OP_SYNC_WAKE_CLAIMS || op == INJECT_OP_SITE_STATUS ||
            op == INJECT_OP_INTR_SELECT_SEEN ||
            op == INJECT_OP_ALLOC_STATUS || op == INJECT_OP_SCHED_SET_STATUS ||
            op == INJECT_OP_SCHED_SET_DISPLACED || op == INJECT_OP_PTE_PROBE ||
@@ -184,11 +185,15 @@ static struct {
     [STALL_FORCE_READY] = {.pid = -1},
     [STALL_SYNC_WAKER] = {.pid = -1},
     [STALL_BLOCK] = {.pid = -1},
+    [STALL_STEAL] = {.pid = -1},
     [STALL_REPLY_CLAIM] = {.pid = -1},
     [STALL_REPLY_UNBLOCK] = {.pid = -1},
     [STALL_CLAIM_HELD] = {.pid = -1},
     [STALL_FORCE_CLAIMED] = {.pid = -1},
     [STALL_CAP_PEEK] = {.pid = -1},
+    [STALL_READY] = {.pid = -1},
+    [STALL_SWITCH] = {.pid = -1},
+    [STALL_SEND_PICK] = {.pid = -1},
 };
 
 static _Atomic(thread_t *) stalled_waiter;
@@ -197,6 +202,36 @@ static atomic_int intr_before_switch_pid;
 static atomic_int intr_after_select_pid;
 static atomic_int intr_select_seen;
 static atomic_uint stall_block_tid; /* pthread_t the STALL_BLOCK site waits for */
+static atomic_uint stall_steal_tid; /* and the STALL_STEAL site */
+atomic_uint inject_empty_steal_locks; /* SCHED_STATS 0 */
+
+/* POKE: find thread tid (pthread_t) of pid, pinned, and wake or stop it. */
+static int inject_poke(uint64_t pid, uint64_t arg)
+{
+    unsigned tid = (unsigned) (arg >> 8), action = (unsigned) (arg & 0xff);
+    process_t *prp;
+    thread_t *thp = NULL;
+
+    if (pid > INT32_MAX || tid == 0)
+        return EINVAL;
+    prp = lookup_pid_rcu((pid_t) pid);
+    if (prp) {
+        thp = vector_lookup(&prp->threads, tid - 1);
+        if (thp && (thp->tid != tid - 1 || tthread_pin(thp) != EOK))
+            thp = NULL;
+    }
+    rcu_sched_read_unlock();
+    if (!thp)
+        return ESRCH;
+    if (action == INJECT_POKE_STOP)
+        unready(thp, STATE_STOPPED);
+    else
+        ready(thp);
+    tthread_unpin(thp);
+    return EOK;
+}
+static atomic_uint stall_ready_tid;  /* and the STALL_READY site */
+static atomic_uint stall_switch_tid; /* and the STALL_SWITCH site */
 
 /* Stand in for the PLIC handler finding thp as its hart's active thread: set
  * PENDING once for the process armed in *armed. Returns whether it did.
@@ -329,6 +364,16 @@ void inject_sync_waker_stall(thread_t *thp)
 /* Called by a thread about to publish a blocked state, after the pending
  * checks of its kernel call. Callers may hold a sync chain lock.
  */
+/* Called by a hart that has taken thp off another hart's run queue, between
+ * the two dispatch locks. Holds no lock.
+ */
+void inject_steal_stall(thread_t *thp)
+{
+    if (thp->tid + 1 ==
+        atomic_load_explicit(&stall_steal_tid, memory_order_acquire))
+        inject_stall_once(STALL_STEAL, thp->process, NULL);
+}
+
 void inject_block_stall(thread_t *thp)
 {
     if (thp->tid + 1 ==
@@ -355,6 +400,17 @@ void inject_reply_claim_stall(const connect_t *received)
             &reply_claim_detached,
             !__atomic_load_n(&received->channel, __ATOMIC_ACQUIRE),
             memory_order_release);
+}
+
+static atomic_uint
+    stall_send_pick_tid; /* pthread_t STALL_SEND_PICK waits for */
+
+/* Called by a send that has looked for a receiver and dropped the lock. */
+void inject_send_pick_window(const thread_t *act)
+{
+    if (act->tid + 1 ==
+        atomic_load_explicit(&stall_send_pick_tid, memory_order_acquire))
+        (void) inject_stall_until(STALL_SEND_PICK, act->process, NULL, NULL);
 }
 
 static atomic_uint stall_cap_peek_tid; /* pthread_t STALL_CAP_PEEK waits for */
@@ -446,6 +502,24 @@ void inject_xfer_peek(const thread_t *act)
 void inject_xfer_budget(const thread_t *act)
 {
     inject_xfer_note(act, INJECT_XFER_BUDGETS);
+}
+
+/* Called at the start of ready_default, before it looks at the thread. */
+void inject_ready_stall(thread_t *thp)
+{
+    if (thp->tid + 1 ==
+        atomic_load_explicit(&stall_ready_tid, memory_order_acquire))
+        inject_stall_once(STALL_READY, thp->process, NULL);
+}
+
+/* Called on the hart of thp, still its current thread, before the hart
+ * switches away from it. Callers may hold the dispatch lock; thp may be NULL.
+ */
+void inject_switch_stall(thread_t *thp)
+{
+    if (thp && thp->tid + 1 ==
+        atomic_load_explicit(&stall_switch_tid, memory_order_acquire))
+        inject_stall_once(STALL_SWITCH, thp->process, NULL);
 }
 
 /* Called from object_alloc before it touches the free list. Ordinary allocation
@@ -711,10 +785,34 @@ void kext_debug_inject(void *data)
         kprintf("FATAL: crash requested by debug-inject on hart %u\n", self);
         crash();
         break;
+    case INJECT_OP_POKE:
+        ret = inject_poke(kap->arg0, kap->arg1);
+        break;
+    case INJECT_OP_SCHED_STATS:
+        ret = kap->arg0 == 0
+                  ? (int) atomic_load_explicit(&inject_empty_steal_locks,
+                                               memory_order_relaxed)
+                  : -EINVAL;
+        break;
+    case INJECT_OP_STALL_STEAL:
+        atomic_store_explicit(&stall_steal_tid, (unsigned) (kap->arg1 >> 32),
+                              memory_order_release);
+        ret = inject_stall_arm(STALL_STEAL, kap->arg0, (uint32_t) kap->arg1);
+        break;
     case INJECT_OP_STALL_BLOCK:
         atomic_store_explicit(&stall_block_tid, (unsigned) (kap->arg1 >> 32),
                               memory_order_release);
         ret = inject_stall_arm(STALL_BLOCK, kap->arg0, (uint32_t) kap->arg1);
+        break;
+    case INJECT_OP_STALL_READY:
+        atomic_store_explicit(&stall_ready_tid, (unsigned) (kap->arg1 >> 32),
+                              memory_order_release);
+        ret = inject_stall_arm(STALL_READY, kap->arg0, (uint32_t) kap->arg1);
+        break;
+    case INJECT_OP_STALL_SWITCH:
+        atomic_store_explicit(&stall_switch_tid, (unsigned) (kap->arg1 >> 32),
+                              memory_order_release);
+        ret = inject_stall_arm(STALL_SWITCH, kap->arg0, (uint32_t) kap->arg1);
         break;
     case INJECT_OP_SYNC_WAKE_CLAIMS:
         ret = atomic_load_explicit(&wake_claims, memory_order_acquire);
@@ -735,6 +833,13 @@ void kext_debug_inject(void *data)
         atomic_store_explicit(&stall_cap_peek_tid, (unsigned) (kap->arg1 >> 32),
                               memory_order_release);
         ret = inject_stall_arm(STALL_CAP_PEEK, kap->arg0, (uint32_t) kap->arg1);
+        break;
+    case INJECT_OP_STALL_SEND_PICK:
+        atomic_store_explicit(&stall_send_pick_tid,
+                              (unsigned) (kap->arg1 >> 32),
+                              memory_order_release);
+        ret =
+            inject_stall_arm(STALL_SEND_PICK, kap->arg0, (uint32_t) kap->arg1);
         break;
     case INJECT_OP_STALL_CLAIM_HELD:
         ret = inject_stall_arm(STALL_CLAIM_HELD, kap->arg0, kap->arg1);
@@ -845,6 +950,23 @@ void kext_debug_inject(void *data)
             atomic_store_explicit(&armed_map_pid, (int) kap->arg0,
                                   memory_order_release);
         }
+        rcu_sched_read_unlock();
+        break;
+    }
+    case INJECT_OP_GRANT_IPC_CAP: {
+        process_t *prp;
+
+        if (kap->arg0 > INT32_MAX) {
+            ret = EINVAL;
+            break;
+        }
+        prp = lookup_pid_rcu((pid_t) kap->arg0);
+        if (!prp)
+            ret = ESRCH;
+        else if (prp->flags & RTMUX_FLG_PROC_LOADING)
+            ret = EBUSY; /* its start sets the capabilities, over this one */
+        else
+            prp->priv_caps |= RTMUX_PRIV_CAP_IPC;
         rcu_sched_read_unlock();
         break;
     }

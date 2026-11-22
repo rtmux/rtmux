@@ -784,10 +784,7 @@ stepped either. The head of a message the receive peeks at goes through
 gives them back. The short message branch of msg_readv copies into a
 destination of many entries a step at a time (`xfer_cpy_diov_step`), so a
 vector of empty entries is not walked to its end; a destination of one entry
-or none keeps the one shot copy. `xfer_preempt` closes every level of the
-rcvid lookup window (`lookup_rcvid_release_all`) and not only the outermost's
-one, which left the RCU sections open across the restart of a call that had
-looked up twice. The offsets and the cursor are `size_t`, as is the offset
+or none keeps the one shot copy. The offsets and the cursor are `size_t`, as is the offset
 `vm_ops->map_xfer` takes; the byte count of a message stays 32 bit, as the ABI
 reports it. msg_sendv checks that its send and reply arrays lie inside the
 caller's boundary and are no longer than XFER_IOV_LIMIT entries, as
@@ -4024,3 +4021,55 @@ The four-hart `--mutex-handoff-loan` fixture holds a waiter at each of
 these transitions. Its observer starts before contention and stays alive
 until it releases the stall. Separate injected faults cover wait-bit
 withdrawal and turnstile allocation failure.
+
+### Sync wait and exit path cost
+
+`syscall_testing --sync-path-cost` times three kernel paths on one hart under
+`-icount shift=1,sleep=off -accel tcg,thread=single`, where the monotonic
+clock advances 2 ns per guest instruction and host load does not enter the
+result. Each kernel ran the same test binary twice in one boot; the two passes
+are shown where they differ. Values are ns per operation.
+
+| Kernel | thread create+join | semaphore handoff round | raw mutex lock+unlock |
+| --- | --- | --- | --- |
+| bcef2f6 (before) | 2920253 / 2924539 | 11143 / 11134 | 3538 |
+| b812a27 (exit skips the chain scan) | 2890242 / 2894466 | 11135 / 11126 | 3538 |
+| a265932 (one SCHED lock per untimed block) | 2891301 / 2894467 | 10969 / 10977 | 3538 |
+| one probe per sync call | 2890344 / 2894316 | 10316 / 10315 | 3208 |
+| no PI lock for unbound waiters | 2890242 / 2894425 | 10168 / 10159 | 3208 |
+
+Read as instructions: an exiting thread that never owned kernel-visible sync
+state saves about 15000 (the 128 chain locks it no longer takes); a blocking
+wait saves about 40 (one SCHED lock round trip); each sync kernel call saves
+about 82 (the second fault-armed probe); each wake of a waiter bound to no
+turnstile saves about 38 (one `sync_pi_slock` round trip). The create+join
+figure is dominated by the RCU grace period the reap waits for, so its 1%
+understates the share of the exit path itself.
+
+The rows above were measured before the series was rebased onto bf98048,
+which added the K65a dispatch changes. Measured again on that base, with one
+test binary under three kernels:
+
+| Kernel | thread create+join | semaphore handoff round | raw mutex lock+unlock |
+| --- | --- | --- | --- |
+| dev bf98048 (before) | 2999908 / 3001132 | 11346 / 11347 | 3643 / 3640 |
+| this series without the PI lock change | 2999453 / 3001089 | 10693 / 10693 | 3309 / 3309 |
+| this series | 2999458 / 3001089 | 10537 / 10546 | 3309 / 3309 |
+
+The savings match in instructions: about 83 per sync call (167 per lock and
+unlock pair) for the probe, and about 78 per handoff round (two wakes) for the
+PI lock.
+
+```perf-evidence
+claim: a sync kernel call arms one fault-safe probe instead of two, and a wake, timeout or signal of a waiter bound to no PI turnstile no longer takes sync_pi_slock
+metric: instruction-clock time per operation of syscall_testing --sync-path-cost (2 ns per guest instruction): raw mutex lock+unlock (two sync calls), semaphore handoff round (four sync calls, two wakes)
+command: EMU_QEMU_OPTS="-icount shift=1,sleep=off -accel tcg,thread=single" CPUS=1 scripts/qemu-regress.sh --mode syscall-testing, on an image whose init runs syscall_testing --sync-path-cost twice
+config: local host (48 cores, saturated by other guests; the instruction clock keeps host load out of the figures), CPUS=1, QEMU 11 TCG virt, bundled OpenSBI, one test binary under each kernel
+baseline: dev bf98048: raw mutex 3643 and 3640 ns, semaphore handoff 11346 and 11347 ns per round
+result: without the PI lock change: raw mutex 3309 ns, semaphore handoff 10693 ns; with it: raw mutex 3309 ns, semaphore handoff 10537 and 10546 ns
+rollback-threshold: a raw mutex figure at or above the baseline 3640 ns, or a semaphore handoff figure at or above 11250 ns, on the same instruction-clock run withdraws the claim
+```
+
+The lock windows these paths keep are in `scripts/preempt-inventory.txt`
+(`kernel/sync/wait.c`); the PI loan update bound, 512 list steps under
+`sync_pi_slock`, is derived in `docs/pi-pc-design.md` "Exit Paths".

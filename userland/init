@@ -185,6 +185,8 @@ if test "$rtmux_run" = "debug-inject"; then
         if /bin/syscall_testing --condvar-interrupt-stale &&
             /bin/syscall_testing --sync-kill-handoff &&
             /bin/syscall_testing --block-request-race &&
+            /bin/syscall_testing --dispatch-window &&
+            /bin/syscall_testing --k65-windows &&
             /bin/syscall_testing --intr-before-switch &&
             /bin/syscall_testing --intr-after-select; then
             ok=6
@@ -270,7 +272,29 @@ if test "$rtmux_run" = "debug-inject"; then
             ok=16
         fi
     fi
+    # A server thread that acts late on a receive id must not reach the
+    # request that is blocked under the same id by then.
     if test "$ok" = 16; then
+        if /bin/syscall_testing --rcvid-reuse; then
+            ok=17
+        fi
+    fi
+    # A service's reply is lost when its client leaves by the unblock path
+    # with the kernel unable to tell the service: the binding it made for
+    # that client must be closed.
+    if test "$ok" = 17; then
+        if /bin/syscall_testing --ioserv-lost-reply-unblock; then
+            ok=18
+        fi
+    fi
+    # A process that registers as the remote IPC service reaches the
+    # kernel's remote IPC paths, with and without its service channel.
+    if test "$ok" = 18; then
+        if /bin/syscall_testing --remote-ipc; then
+            ok=19
+        fi
+    fi
+    if test "$ok" = 19; then
         echo "RTMux debug-inject: PASS"
     else
         echo "RTMux debug-inject: FAIL"

@@ -86,6 +86,8 @@ static void thread_recycle_reset(thread_t *thp)
     thp->debug_sync_mutex = 0;
     thp->last_chid = -1;
     thp->status = NULL;
+    thp->req_gen = 0;
+    thp->rcv_key = 0;
     thp->timeout = NULL;
     thp->join = NULL;
     thp->start_time = 0;

@@ -218,7 +218,12 @@ static void timer_note_deadline(ktimer_t *tip)
      * sleeping until its stale, later deadline. On a UP build SENDIPI compiles
      * away.
      */
-    if (get_cpunum() == boot_cpunum)
+    /* Under a dispatch lock (an unready's timeout_start) the boot hart makes
+     * no SBI call: it sends itself the IPI, which goes out after the unlock.
+     * A single hart has nobody to hold up, and send_ipi sends it nothing.
+     */
+    if (get_cpunum() == boot_cpunum &&
+        (num_processors <= 1 || !get_pcpu()->pc_sched_depth))
         (void) arch_timer_reload(qtimeptr);
     else
         SENDIPI(boot_cpunum, IPI_CLOCK_LOAD);

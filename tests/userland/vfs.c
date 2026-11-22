@@ -2210,6 +2210,7 @@ out:
 #define LOST_REPLY_HOLD_MS 300
 
 static atomic_int lost_reply_hold; /* the next open waits before it binds */
+static atomic_int lost_reply_bad_iov; /* the next stat replies with a bad iov */
 static atomic_int lost_reply_held_bound; /* the held open bound and returned */
 static atomic_int lost_reply_bound, lost_reply_closed;
 
@@ -2258,6 +2259,17 @@ static int lost_reply_stat(ioserv_context_t *ctp, io_stat_t *msg, void *ocb)
     (void) ocb;
     memset(&msg->o, 0, sizeof msg->o);
     msg->o.st_mode = S_IFREG | 0444;
+    if (atomic_exchange(&lost_reply_bad_iov, 0)) {
+        /* A reply the kernel refuses when it copies it: in range, unmapped. */
+        void *bad = test_unmapped_user_addr();
+
+        /* With no such address the case cannot run: fail it by an error the
+         * client reports, not by a good reply that reads as "Success".
+         */
+        if (!bad)
+            return ENOMEM;
+        return IOSERV_PTR(ctp, bad, sizeof msg->o);
+    }
     return IOSERV_PTR(ctp, &msg->o, sizeof msg->o);
 }
 
@@ -2324,60 +2336,113 @@ static void *lost_reply_open_path(void *arg)
     return NULL;
 }
 
-void test_ioserv_lost_reply_binding(void)
-{
-    char why[128];
+struct lost_reply_fx {
     dispatch_t *dpp;
-    pthread_t server, th;
-    int chid, id, err, main_err, thread_err, keeper;
+    pthread_t server;
+    int chid, id, keeper;
+};
 
-    /* No RTMUX_FLG_CHF_UNBLOCK: the reply timeout ends the client's REPLY at
-     * once, while the service still runs the open.
-     */
-    if ((chid = channel_create(RTMUX_FLG_CHF_DISCONNECT)) == -1) {
+static void lost_reply_stop(struct lost_reply_fx *fx)
+{
+    if (fx->keeper != -1)
+        (void) __connect_detach((uint64_t) fx->keeper);
+    (void) ioserv_detach(fx->dpp, fx->id, 0);
+    (void) pthread_cancel(fx->server);
+    (void) pthread_join(fx->server, NULL);
+    (void) dispatch_destroy(fx->dpp);
+}
+
+/* The service, on a channel with chflags, with one thread serving it. */
+static bool lost_reply_start(struct lost_reply_fx *fx, unsigned chflags)
+{
+    fx->keeper = -1;
+    if ((fx->chid = channel_create(chflags)) == -1) {
         test_fail("lost reply channel", strerror(errno));
-        return;
+        return false;
     }
-    if (!(dpp = dispatch_create_channel(chid, 0))) {
+    if (!(fx->dpp = dispatch_create_channel(fx->chid, 0))) {
         test_fail("lost reply dispatch", strerror(errno));
-        (void) channel_destroy(chid);
-        return;
+        (void) channel_destroy(fx->chid);
+        return false;
     }
     /* SELF: see test_posix_poll_service_faults. */
-    id = ioserv_attach(dpp, NULL, LOST_REPLY_PATH, _FTYPE_ANY,
-                       IOSERV_FLAG_DIR | IOSERV_FLAG_SELF, &lost_reply_connect_ops,
-                       &lost_reply_io_ops, NULL);
-    if (id == -1) {
+    fx->id = ioserv_attach(fx->dpp, NULL, LOST_REPLY_PATH, _FTYPE_ANY,
+                           IOSERV_FLAG_DIR | IOSERV_FLAG_SELF, &lost_reply_connect_ops,
+                           &lost_reply_io_ops, NULL);
+    if (fx->id == -1) {
         test_skip("lost reply service", "cannot attach a test path");
-        (void) dispatch_destroy(dpp);
-        return;
+        (void) dispatch_destroy(fx->dpp);
+        return false;
     }
-    if (pthread_create(&server, NULL, poll_fault_server, dpp) != 0) {
+    if (pthread_create(&fx->server, NULL, poll_fault_server, fx->dpp) != 0) {
         test_fail("lost reply service thread", "pthread_create failed");
-        (void) ioserv_detach(dpp, id, 0);
-        (void) dispatch_destroy(dpp);
-        return;
+        (void) ioserv_detach(fx->dpp, fx->id, 0);
+        (void) dispatch_destroy(fx->dpp);
+        return false;
     }
 
     /* A connection held open across the case, as a client's other descriptors
      * to the service would be: with none, the detach of the timed-out one is
      * the client's last, and the server's disconnect handling closes every
-     * binding the client had, the lost one too.
+     * binding the client had, the lost one too. Close-on-exec: it has no
+     * binding of its own for a spawn (of /bin/inject) to duplicate.
      */
-    if ((keeper = connect_attach(0, getpid(), chid, 0, 0)) == -1) {
+    if ((fx->keeper = connect_attach(0, getpid(), fx->chid, 0, RTMUX_FLG_COF_CLOEXEC)) == -1) {
         test_fail("lost reply keeper", strerror(errno));
-        goto out;
+        lost_reply_stop(fx);
+        return false;
     }
+    return true;
+}
+
+/* Two rounds of a client that leaves while the service holds its open: a
+ * combined open and stat, then a plain open. tag names the way it leaves;
+ * fail_notice makes the kernel unable to tell the service (the next
+ * notification allocation billed to this process fails).
+ */
+static void lost_reply_rounds(struct lost_reply_fx *fx, const char *tag, bool fail_notice)
+{
+    char why[128];
+    pthread_t th;
+    int err, main_err, thread_err;
+
     for (int round = 0; round < 2; round++) {
         bool combine = round == 0; /* what access() sends, then a plain open */
         const char *what = combine ? "combined stat" : "open";
-        char name[64];
+        char name[80];
 
         atomic_store(&lost_reply_bound, 0);
         atomic_store(&lost_reply_closed, 0);
         atomic_store(&lost_reply_held_bound, 0);
         atomic_store(&lost_reply_hold, 1);
-        err = lost_reply_timed_open(chid, id, combine);
+        if (fail_notice) {
+            char pid[16];
+            int rc;
+
+            snprintf(pid, sizeof pid, "%d", (int) getpid());
+            rc = inject_run("fail-alloc", "notification", pid);
+            if (rc != 0) {
+                snprintf(why, sizeof why, "inject refused to arm: rc=%d errno=%d", rc, errno);
+                test_fail(tag, why);
+                return;
+            }
+        }
+        err = lost_reply_timed_open(fx->chid, fx->id, combine);
+        if (fail_notice) {
+            /* The client left because the notice could not be made, if the
+             * failure that was armed is spent by now. (Had some other
+             * notification used it up, the notice would have been queued
+             * behind the held open, the client kept until the open was
+             * answered, and the send would have reported success, not
+             * ETIMEDOUT.) Leave none armed against this process.
+             */
+            bool used = inject_run("alloc-status", "consumed", NULL) == 0;
+
+            snprintf(name, sizeof name, "%s %s notice could not be sent", tag, what);
+            check(used, name, "the armed allocation failure was not used");
+            if (!used) /* a failure that fired is disarmed already */
+                (void) inject_run("fail-alloc", "notification", "2147483647");
+        }
         /* The timed request is the held one: the server took the hold, bound
          * its OCB and replied to a client that had left. Its binding is closed
          * by now unless it was kept; wait a moment for that close.
@@ -2386,13 +2451,13 @@ void test_ioserv_lost_reply_binding(void)
             sleep_ms(5);
         for (int i = 0; i < 40 && atomic_load(&lost_reply_closed) == 0; i++)
             sleep_ms(5);
-        snprintf(name, sizeof name, "lost reply %s client times out", what);
+        snprintf(name, sizeof name, "%s %s client times out", tag, what);
         snprintf(why, sizeof why, "send errno %d (want ETIMEDOUT), held open %s bound", err,
                  atomic_load(&lost_reply_held_bound) ? "was" : "not");
         check(err == ETIMEDOUT && atomic_load(&lost_reply_held_bound) &&
                   atomic_load(&lost_reply_bound) == 1,
               name, why);
-        snprintf(name, sizeof name, "lost reply %s binding closed", what);
+        snprintf(name, sizeof name, "%s %s binding closed", tag, what);
         snprintf(why, sizeof why, "%d closed of 1", atomic_load(&lost_reply_closed));
         check(atomic_load(&lost_reply_closed) == 1, name, why);
 
@@ -2403,24 +2468,104 @@ void test_ioserv_lost_reply_binding(void)
         thread_err = EAGAIN;
         if (pthread_create(&th, NULL, lost_reply_open_path, &thread_err) == 0)
             (void) pthread_join(th, NULL);
-        snprintf(name, sizeof name, "lost reply %s id reusable", what);
+        snprintf(name, sizeof name, "%s %s id reusable", tag, what);
         snprintf(why, sizeof why, "open: %s here, %s in a new thread", strerror(main_err),
                  strerror(thread_err));
         check(!main_err && !thread_err, name, why);
 
-        snprintf(name, sizeof name, "lost reply %s leaves no binding", what);
+        snprintf(name, sizeof name, "%s %s leaves no binding", tag, what);
         snprintf(why, sizeof why, "%d bound, %d closed", atomic_load(&lost_reply_bound),
                  atomic_load(&lost_reply_closed));
         check(atomic_load(&lost_reply_bound) == atomic_load(&lost_reply_closed), name, why);
         if (main_err || thread_err)
             break; /* the id is spoiled for the next round */
     }
-    (void) __connect_detach((uint64_t) keeper);
-out:
-    (void) ioserv_detach(dpp, id, 0);
-    (void) pthread_cancel(server);
-    (void) pthread_join(server, NULL);
-    (void) dispatch_destroy(dpp);
+}
+
+static atomic_int lost_reply_stat_err; /* -1 until the access has returned */
+
+/* access(), not stat(): its combined open and stat has no close, so the
+ * binding the open made is still there when the reply is refused. stat()
+ * sends the close in the same message, and the binding is gone by the reply.
+ */
+static void *lost_reply_stat_path(void *arg)
+{
+    (void) arg;
+    atomic_store(&lost_reply_stat_err, access(LOST_REPLY_PATH "/node", F_OK) == -1 ? errno : 0);
+    return NULL;
+}
+
+/* A service whose reply the kernel refuses (a bad iov) must still answer its
+ * client: with an error, since the reply cannot be sent. The service is
+ * running: the caller started it and stops it.
+ */
+static void lost_reply_bad_reply(void)
+{
+    pthread_t th;
+    char why[96];
+    int err;
+
+    atomic_store(&lost_reply_stat_err, -1);
+    atomic_store(&lost_reply_bound, 0);
+    atomic_store(&lost_reply_closed, 0);
+    atomic_store(&lost_reply_bad_iov, 1);
+    if (pthread_create(&th, NULL, lost_reply_stat_path, NULL) != 0) {
+        test_fail("lost reply bad iov", "pthread_create failed");
+        atomic_store(&lost_reply_bad_iov, 0);
+        return;
+    }
+    for (int i = 0; i < 400 && atomic_load(&lost_reply_stat_err) == -1; i++)
+        sleep_ms(5);
+    err = atomic_load(&lost_reply_stat_err);
+    snprintf(why, sizeof why, "access: %s", err == -1 ? "never answered" : strerror(err));
+    check(err == EFAULT, "lost reply bad iov answers the client with an error", why);
+
+    /* The access was a combined open and stat with no close: the open bound
+     * an OCB, and the reply that was refused is as lost as one to a client
+     * that left.
+     */
+    for (int i = 0; i < 40 && atomic_load(&lost_reply_closed) == 0; i++)
+        sleep_ms(5);
+    snprintf(why, sizeof why, "%d bound, %d closed", atomic_load(&lost_reply_bound),
+             atomic_load(&lost_reply_closed));
+    check(atomic_load(&lost_reply_bound) == 1 && atomic_load(&lost_reply_closed) == 1,
+          "lost reply bad iov binding closed", why);
+    atomic_store(&lost_reply_bad_iov, 0);
+    if (err == -1) /* its access ends with the service; the caller stops that next */
+        (void) pthread_detach(th);
+    else
+        (void) pthread_join(th, NULL);
+}
+
+void test_ioserv_lost_reply_binding(void)
+{
+    struct lost_reply_fx fx;
+
+    /* No RTMUX_FLG_CHF_UNBLOCK: the reply timeout ends the client's REPLY at
+     * once, while the service still runs the open.
+     */
+    if (!lost_reply_start(&fx, RTMUX_FLG_CHF_DISCONNECT))
+        return;
+    lost_reply_rounds(&fx, "lost reply", false);
+    lost_reply_bad_reply();
+    lost_reply_stop(&fx);
+}
+
+/* The same on a channel that asks for unblock notices, with the kernel unable
+ * to send one: the client leaves by the unblock path, at once, and the
+ * service is not told. Returns TC_EXIT_SKIP without fault injection.
+ */
+int test_ioserv_lost_reply_unblock(void)
+{
+    struct lost_reply_fx fx;
+
+    if (inject_run("alloc-status", NULL, NULL) != 0)
+        return TC_EXIT_SKIP;
+    if (lost_reply_start(&fx, RTMUX_FLG_CHF_DISCONNECT | RTMUX_FLG_CHF_UNBLOCK)) {
+        lost_reply_rounds(&fx, "lost reply by unblock", true);
+        lost_reply_stop(&fx);
+    }
+    return 0;
 }
 
 /* A service in this process that answers _IO_NOTIFY with the real

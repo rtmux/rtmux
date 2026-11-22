@@ -247,25 +247,6 @@ void rdecl lookup_rcvid_release(void)
 }
 
 
-/* lookup_rcvid_release_all — close every rcvid lookup window this CPU has open,
- * for a call that leaves the kernel without returning through the trap handler
- * (xfer_preempt), whatever number of lookups it made: one release only closes
- * one level, and the sections stay open, holding off grace periods, until some
- * later call's release finds the count at zero.
- */
-void rdecl lookup_rcvid_release_all(void)
-{
-    /* The nesting count is the state: the outermost release is the one that
-     * closes the sections, and zeroing the count makes this that release.
-     */
-    if (__atomic_exchange_n(&rcvid_rcu_nesting[get_cpunum()], 0,
-                            __ATOMIC_RELEASE)) {
-        rcu_sched_read_unlock();
-        rcu_sched_read_unlock();
-    }
-}
-
-
 /* Look up the resource-limits record for a user. Parameters:
  *   uid : user id to match
  * Return value: the matching limits_t, or NULL if none.

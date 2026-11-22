@@ -736,6 +736,151 @@ void rdecl remove_unblock(thread_t *thp, connect_t *cop, int rcvid)
                RTMUX_ITF_UNBLOCK_QUEUED);
 }
 
+/* Request identity.
+ *
+ * An rcvid is the client's thread number and the slot of its connection in
+ * the server's table. Both are reused, by the client's next request at once,
+ * so a server thread that acts late on an rcvid (a reply for a client that
+ * was killed meanwhile, an unblock notification handled after the request was
+ * answered) would reach whatever request is blocked under the same number by
+ * then. No bit of the rcvid is free to tell them apart, so the identity is
+ * kept beside it:
+ *
+ * - every send takes a new identity (req_gen);
+ * - a server thread's receive records the rcvid it returned together with the
+ *   identity of the request behind it (rcv_key). An unblock notification
+ *   carries the identity of the request it was made for and is recorded the
+ *   same way; any other notification leaves the thread holding no rcvid.
+ *   MsgCurrent records the request it adopts;
+ * - a reply, error, read, write or info call by a thread on the rcvid it
+ *   holds, for a request other than the one blocked under it now, is refused
+ *   while another thread is serving that request (reply_client_lock).
+ *
+ * A thread is held to its own last receive and to nothing else; one that was
+ * handed an rcvid by another thread is not checked. And the refusal has to
+ * leave room for servers that park a request and answer it from whichever
+ * thread comes by: the kernel cannot tell a thread acting late on the request
+ * it once received from one that was handed the next request under the same
+ * rcvid. So a thread whose request was answered by another thread is taken
+ * to have handed it on and is released from its record, and a stale holder
+ * is refused only while the present request still has a server of its own
+ * (the client's server link, which that server's next receive clears). What
+ * stays refused is what the bug was: the late use of an rcvid, by the thread
+ * that received it or its unblock notification, while another thread is at
+ * work on the request that took its place.
+ *
+ * The record is one word, the rcvid in the low 31 bits and the identity
+ * above. That is 33 bits of it: a thread that held a record across 2^33
+ * sends, days of all harts doing nothing else, could meet a request with
+ * the same word, and would then not be refused. One word is so that the
+ * thread's own receive, a sender on another hart delivering to it while it
+ * waits, and another thread's reply releasing it each make one atomic store or
+ * exchange. 0 is no rcvid: a connection slot is never 0.
+ */
+static uint64_t msg_request_seq;
+
+/* One counter for all harts: an identity must differ from every other one a
+ * server can still hold, whichever thread object or hart it came from.
+ */
+void msg_request_begin(thread_t *sender)
+{
+    sender->req_gen = __atomic_add_fetch(&msg_request_seq, 1, __ATOMIC_RELAXED);
+}
+
+static int msg_request_rcvid(const thread_t *client, const connect_t *cop)
+{
+    return (int) ((client->tid << 16) | cop->scoid);
+}
+
+static uint64_t msg_key(int rcvid, uint64_t gen)
+{
+    return gen << 31 | (uint32_t) rcvid;
+}
+
+static int msg_key_rcvid(uint64_t key)
+{
+    return (int) (key & 0x7fffffffU);
+}
+
+/* server is given client's request, blocked on cop, with its rcvid. */
+void msg_request_received(thread_t *server,
+                          const thread_t *client,
+                          const connect_t *cop)
+{
+    if (TYPE_MASK(client->type) == TYPE_VTHREAD || (cop->flags & COF_NETCON))
+        return; /* numbered otherwise, and not checked */
+    __atomic_store_n(&server->rcv_key,
+                     msg_key(msg_request_rcvid(client, cop), client->req_gen),
+                     __ATOMIC_RELEASE);
+}
+
+/* server is given a notification. An unblock notification names rcvid and
+ * was made for the request gen; any other one names no request.
+ */
+void msg_notification_received(thread_t *server,
+                               int code,
+                               int rcvid,
+                               uint64_t gen)
+{
+    __atomic_store_n(
+        &server->rcv_key,
+        code == _NOTIFICATION_CODE_UNBLOCK && gen ? msg_key(rcvid, gen) : 0,
+        __ATOMIC_RELEASE);
+}
+
+/* replier has answered client's request (a reply or an error), with client
+ * claimed. What replier held of it is spent. If another thread is down as
+ * its server, that one handed it on: release it too, if this request is
+ * still what it holds.
+ */
+void msg_request_answered(thread_t *replier,
+                          const thread_t *client,
+                          const connect_t *cop)
+{
+    uint64_t key, expect;
+    thread_t *server;
+
+    if (TYPE_MASK(client->type) == TYPE_VTHREAD || (cop->flags & COF_NETCON))
+        return;
+    key = msg_key(msg_request_rcvid(client, cop), client->req_gen);
+    expect = key;
+    (void) __atomic_compare_exchange_n(&replier->rcv_key, &expect, 0, false,
+                                       __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
+
+    /* The link is cleared by the server's teardown; the guard keeps a thread
+     * read from it allocated, as in thread_disown_client().
+     */
+    rcu_read_lock(&tthread_rcu);
+    server = __atomic_load_n(&client->args.ms.server, __ATOMIC_ACQUIRE);
+    if (server && server != replier) {
+        expect = key;
+        (void) __atomic_compare_exchange_n(&server->rcv_key, &expect, 0, false,
+                                           __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
+    }
+    rcu_read_unlock(&tthread_rcu);
+}
+
+/* Whether the active thread may act on client's request under its rcvid:
+ * not when it holds that rcvid for another request and somebody else is
+ * serving this one.
+ */
+static bool msg_request_current(const thread_t *client, const connect_t *bound)
+{
+    const thread_t *act = get_active_thread(get_cpunum());
+    const thread_t *server;
+    uint64_t key;
+    int rcvid;
+
+    if (TYPE_MASK(client->type) == TYPE_VTHREAD || (bound->flags & COF_NETCON))
+        return true;
+    rcvid = msg_request_rcvid(client, bound);
+    key = __atomic_load_n(&act->rcv_key, __ATOMIC_ACQUIRE);
+    if (msg_key_rcvid(key) != rcvid || key == msg_key(rcvid, client->req_gen))
+        return true;
+    server = __atomic_load_n(&client->args.ms.server, __ATOMIC_ACQUIRE);
+    return !server || server == act;
+}
+
 /* Lock the channel that serves the reply-blocked client an rcvid named.
  *
  * Returns the connection the client is blocked on, with *chpp locked, or NULL
@@ -775,7 +920,8 @@ connect_t *reply_client_lock(connect_t *received,
     kspinlock_lock(&chp->lock);
     if ((client->state == STATE_REPLY || client->state == STATE_NET_REPLY) &&
         !(client->internal_flags & RTMUX_ITF_SPECRET_PENDING) &&
-        (bound = reply_client_connection(client, received)) != NULL) {
+        (bound = reply_client_connection(client, received)) != NULL &&
+        msg_request_current(client, bound)) {
         *chpp = chp;
         return bound;
     }
@@ -936,8 +1082,7 @@ int rdecl remote_ipc_msg(thread_t *act, connect_t *cop, unsigned prio)
         }
         /* Unlink receive thread from the receive queue. */
         LINKPRIL_REM(thp);
-        thp->blocked_on = NULL;
-        IPC_BLK(thp);
+        RECEIVER_TAKEN(thp);
         kspinlock_unlock(&chp->lock);
 
         /* By default the receiver runs with message driven priority: the remote

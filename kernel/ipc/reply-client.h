@@ -28,6 +28,23 @@ int reply_client_claim(thread_t *act,
                        channel_t **chpp);
 void msg_claim_release(channel_t *chp, thread_t *peer);
 
+/* Request identity: an rcvid is a thread number and a connection slot, and
+ * both are reused, so it names whichever request is blocked under it now. The
+ * kernel remembers which request a server thread's last receive gave it the
+ * rcvid for and refuses that thread's later use of the rcvid on another one.
+ */
+void msg_request_begin(thread_t *sender);
+void msg_request_received(thread_t *server,
+                          const thread_t *client,
+                          const connect_t *cop);
+void msg_notification_received(thread_t *server,
+                               int code,
+                               int rcvid,
+                               uint64_t gen);
+void msg_request_answered(thread_t *replier,
+                          const thread_t *client,
+                          const connect_t *cop);
+
 /* Called after publishing the new client and dropping the channel/connection
  * lock. Each caller applies the critical-thread policy for its receive path. */
 static inline void reply_client_priority(thread_t *server,

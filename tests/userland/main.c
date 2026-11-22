@@ -70,6 +70,7 @@ static const struct test_suite test_suites[] = {
     TEST_SUITE_NAMED("posix-options", posix_options),
     TEST_SUITE(sysconf),
     TEST_SUITE(gauges),
+    TEST_SUITE_NAMED("kill-busy", kill_busy),
 #undef TEST_SUITE_NAMED
 #undef TEST_SUITE
 };
@@ -1078,6 +1079,17 @@ int main(int argc, char *argv[])
             test_skip("disconnect_under_alloc_failure", "fault injection unavailable");
         return finish(1);
     }
+    if (argc == 2 && !strcmp(argv[1], "--remote-ipc")) {
+        printf("[remote_ipc]\n");
+        if (test_remote_ipc() == TC_EXIT_SKIP)
+            test_skip("remote_ipc", "fault injection unavailable");
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--rcvid-reuse")) {
+        printf("[rcvid_reuse]\n");
+        (void) test_rcvid_reuse();
+        return finish(1);
+    }
     if (argc == 2 && !strcmp(argv[1], "--cap-step")) {
         printf("[cap_step]\n");
         (void) test_cap_step();
@@ -1133,6 +1145,18 @@ int main(int argc, char *argv[])
         test_spawn_contract();
         return finish(1);
     }
+    /* --suite NAME: run one suite of test_suites[] alone, for a focused run. */
+    if (argc == 3 && !strcmp(argv[1], "--suite")) {
+        for (size_t s = 0; s < sizeof test_suites / sizeof test_suites[0]; s++) {
+            if (strcmp(argv[2], test_suites[s].name))
+                continue;
+            printf("[%s]\n", test_suites[s].name);
+            test_suites[s].run();
+            return finish(1);
+        }
+        fprintf(stderr, "syscall_testing: no suite named %s\n", argv[2]);
+        return EXIT_FAILURE;
+    }
     if (argc == 2 && !strcmp(argv[1], "--prio-loan-context")) {
         printf("[loan_settle_context]\n");
         (void) loan_settle_context();
@@ -1148,6 +1172,10 @@ int main(int argc, char *argv[])
         printf("[condvar_reacquire_alloc_failure]\n");
         if (condvar_reacquire_alloc_failure() == TC_EXIT_SKIP)
             test_skip("condvar_reacquire_alloc_failure", "fault injection unavailable");
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--sync-path-cost")) {
+        sync_path_cost();
         return finish(1);
     }
     if (argc == 2 && !strcmp(argv[1], "--mutex-owner-death")) {
@@ -1166,6 +1194,16 @@ int main(int argc, char *argv[])
     }
     if (argc == 2 && !strcmp(argv[1], "--block-kill-cancel")) {
         test_block_kill_cancel();
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--k65-windows")) {
+        if (k65_windows() == TC_EXIT_SKIP)
+            test_skip("k65 windows", "four harts and fault injection required");
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--dispatch-window")) {
+        if (dispatch_window() == TC_EXIT_SKIP)
+            test_skip("dispatch window", "three harts and fault injection required");
         return finish(1);
     }
     if (argc == 2 && !strcmp(argv[1], "--block-request-race")) {
@@ -1245,6 +1283,12 @@ int main(int argc, char *argv[])
         printf("[condvar_interrupt_stale]\n");
         if (condvar_interrupt_stale() == TC_EXIT_SKIP)
             test_skip("condvar_interrupt_stale", "fault injection unavailable");
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--ioserv-lost-reply-unblock")) {
+        printf("[ioserv_lost_reply_unblock]\n");
+        if (test_ioserv_lost_reply_unblock() == TC_EXIT_SKIP)
+            test_skip("ioserv_lost_reply_unblock", "fault injection unavailable");
         return finish(1);
     }
     if (argc == 2 && !strcmp(argv[1], "--ioserv-lost-reply")) {
@@ -1763,9 +1807,22 @@ int main(int argc, char *argv[])
         (void) munmap(r, sizeof *r);
         return rc;
     }
+    if (argc == 2 && !strcmp(argv[1], "--pte-kill-under-spawn")) {
+        /* a SIGKILL while roottask works for the victim */
+        printf("=== RTMux kill of a busy process ===\n\n[kill-busy]\n");
+        test_kill_busy();
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--busy-map-child"))
+        return kill_busy_child();
     if (argc == 2 && !strcmp(argv[1], "--gauges")) { /* opt-in: just the gauge regressions */
         printf("=== RTMux gauge regressions ===\n\n[gauges]\n");
         test_gauges();
+        return finish(1);
+    }
+    if (argc == 3 && !strcmp(argv[1], "--detach-race") && atoi(argv[2]) > 0) { /* opt-in */
+        printf("=== RTMux detach-race reproducer ===\n\n[gauges]\n");
+        test_detach_race_laps(atoi(argv[2]));
         return finish(1);
     }
     if (argc == 2 && !strcmp(argv[1], "--orphan-send")) { /* opt-in reproducer, see leak.c */

@@ -16,6 +16,7 @@
  */
 
 #include <errno.h>
+#include <stdarg.h>
 #include <devctl.h>
 #include <devctl/proc.h>
 #include <sys/procfs.h>
@@ -3759,6 +3760,73 @@ static void test_nonrobust_owner_thread_death(void)
         (void) thread_join(w[i], NULL);
 }
 
+/* A thread that takes a mutex with __sync_mutex_revive owns it without ever
+ * locking it, so nothing but the revive tells the kernel it is an owner. A
+ * locker that queued on the stale word before the revive must still be failed
+ * when that owner dies: exit only looks for waiters of a thread registered as
+ * an owner.
+ */
+struct revive_args {
+    pthread_mutex_t *mutex;
+    atomic_int rc; /* errno of the revive, -1 until it ran */
+};
+
+static void *revive_and_die(void *raw)
+{
+    struct revive_args *arg = raw;
+    int rc = __sync_mutex_revive((sync_t *) arg->mutex) == -1 ? errno : EOK;
+
+    atomic_store_explicit(&arg->rc, rc, memory_order_release);
+    return NULL; /* exits owning the mutex */
+}
+
+static void test_nonrobust_revived_owner_death(void)
+{
+    static pthread_mutex_t m;
+    static struct revive_args rarg;
+    pthread_t waiter, owner;
+    atomic_int queued, res;
+    struct dead_owner_waiter_args warg = {
+        .mutex = &m, .queued = &queued, .result = &res};
+    struct timespec ms = {.tv_sec = 0, .tv_nsec = 1000000};
+    char detail[96];
+
+    if (plain_mutex_init(&m, PTHREAD_PROCESS_PRIVATE) != EOK) {
+        test_fail("revived owner death prerequisite", "init failed");
+        return;
+    }
+    m.owner = RTMUX_SYNC_DEAD; /* stale: this mutex is not robust */
+    rarg.mutex = &m;
+    atomic_init(&rarg.rc, -1);
+    atomic_init(&queued, 0);
+    atomic_init(&res, -1);
+    if (pthread_create(&waiter, NULL, dead_owner_waiter, &warg) != EOK) {
+        test_fail("revived owner death prerequisite", "waiter create failed");
+        return;
+    }
+    /* No waiting bit shows on a special word, so give the waiter time to
+     * queue; one that is late finds the reviver as owner, alive or dead, and
+     * must fail the same way.
+     */
+    for (int i = 0; i < 2000 && !atomic_load(&queued); i++)
+        (void) nanosleep(&ms, NULL);
+    for (int i = 0; i < 50; i++)
+        (void) nanosleep(&ms, NULL);
+    if (pthread_create(&owner, NULL, revive_and_die, &rarg) != EOK) {
+        test_fail("revived owner death prerequisite", "owner create failed");
+    } else {
+        (void) thread_join(owner, NULL);
+        (void) dead_owner_results_in(&res, 1);
+    }
+    snprintf(detail, sizeof detail, "revive %d (want 0), waiter %d (want %d)",
+             atomic_load(&rarg.rc), atomic_load(&res), ENOTRECOVERABLE);
+    check(atomic_load(&rarg.rc) == EOK &&
+              atomic_load(&res) == ENOTRECOVERABLE,
+          "non-robust waiter returns ENOTRECOVERABLE when a revived owner dies",
+          detail);
+    (void) thread_join(waiter, NULL);
+}
+
 static void test_nonrobust_owner_process_death(void)
 {
     struct pshared_region *r;
@@ -3846,6 +3914,105 @@ static void test_robust_held_limit(void)
 }
 
 
+/* --sync-path-cost: time three kernel paths that the sync and scheduler
+ * efficiency work changes, for a before/after comparison of two kernels under
+ * the same binary. It reports numbers and checks only that the paths work. Run
+ * it on one hart under QEMU -icount, where the monotonic clock advances with
+ * the instructions executed and host load does not enter the result:
+ *
+ *   thread-exit : create and join a thread that never touched a contended
+ *                 mutex (the exit path with nothing to hand on);
+ *   sem-handoff : two threads hand a pair of semaphores back and forth, so
+ *                 every step is a blocking wait and a wake;
+ *   raw-mutex   : kernel lock and unlock of a free mutex (two kernel calls
+ *                 that each probe the user sync_t).
+ */
+struct path_cost_pair {
+    sem_t ping, pong;
+    unsigned rounds;
+};
+
+static void *path_cost_nop(void *arg)
+{
+    return arg;
+}
+
+static void *path_cost_peer(void *raw)
+{
+    struct path_cost_pair *p = raw;
+
+    for (unsigned i = 0; i < p->rounds; i++) {
+        if (sem_wait(&p->ping) != 0 || sem_post(&p->pong) != 0)
+            break;
+    }
+    return NULL;
+}
+
+static uint64_t path_cost_now(void)
+{
+    struct timespec ts;
+
+    (void) clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t) ts.tv_sec * 1000000000ULL + (uint64_t) ts.tv_nsec;
+}
+
+void sync_path_cost(void)
+{
+    enum { EXITS = 400, ROUNDS = 2000, LOCKS = 20000 };
+    static struct path_cost_pair pair;
+    pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;
+    pthread_t t;
+    uint64_t t0, t1;
+    unsigned done = 0;
+    int bad = 0;
+
+    t0 = path_cost_now();
+    for (unsigned i = 0; i < EXITS; i++) {
+        if (pthread_create(&t, NULL, path_cost_nop, NULL) != EOK ||
+            pthread_join(t, NULL) != EOK)
+            break;
+        done++;
+    }
+    t1 = path_cost_now();
+    printf("sync-path-cost: thread-exit n=%u total_ns=%llu per_ns=%llu\n", done,
+           (unsigned long long) (t1 - t0),
+           (unsigned long long) (done ? (t1 - t0) / done : 0));
+    check(done == EXITS, "sync-path-cost thread create and join",
+          "pthread_create or pthread_join failed");
+
+    pair.rounds = ROUNDS;
+    if (sem_init(&pair.ping, 0, 0) != 0 || sem_init(&pair.pong, 0, 0) != 0 ||
+        pthread_create(&t, NULL, path_cost_peer, &pair) != EOK) {
+        test_fail("sync-path-cost semaphore handoff", "setup failed");
+    } else {
+        t0 = path_cost_now();
+        for (unsigned i = 0; i < ROUNDS && !bad; i++)
+            bad = sem_post(&pair.ping) != 0 || sem_wait(&pair.pong) != 0;
+        t1 = path_cost_now();
+        if (bad) /* the peer may still wait for a post that failed */
+            (void) pthread_cancel(t);
+        (void) pthread_join(t, NULL);
+        printf("sync-path-cost: sem-handoff n=%u total_ns=%llu per_ns=%llu\n",
+               (unsigned) ROUNDS, (unsigned long long) (t1 - t0),
+               (unsigned long long) ((t1 - t0) / ROUNDS));
+        check(bad == 0, "sync-path-cost semaphore handoff",
+              "sem_post or sem_wait failed");
+    }
+
+    bad = 0;
+    t0 = path_cost_now();
+    for (unsigned i = 0; i < LOCKS; i++) {
+        bad |= __sync_mutex_lock((sync_t *) &m);
+        bad |= __sync_mutex_unlock((sync_t *) &m);
+    }
+    t1 = path_cost_now();
+    printf("sync-path-cost: raw-mutex n=%u total_ns=%llu per_ns=%llu\n",
+           (unsigned) LOCKS, (unsigned long long) (t1 - t0),
+           (unsigned long long) ((t1 - t0) / LOCKS));
+    check(bad == 0 && m.owner == 0, "sync-path-cost raw mutex lock and unlock",
+          "kernel lock or unlock of a free mutex failed");
+}
+
 void test_mutex_owner_death(void)
 {
     test_robust_mutexattr();
@@ -3858,6 +4025,7 @@ void test_mutex_owner_death(void)
     test_robust_owner_process_death();
     test_robust_handoff_owner_death();
     test_nonrobust_owner_thread_death();
+    test_nonrobust_revived_owner_death();
     test_nonrobust_owner_process_death();
 }
 
@@ -4894,6 +5062,579 @@ int block_request_race(void)
             blk_case(kind, true, true);
     }
     (void) test_pin_mask(~0U);
+    return 0;
+}
+
+/* One thread must never be current on two harts. Each case holds a hart in a
+ * window where a wakeup or a steal used to find the thread still current there
+ * (STALL_READY, STALL_SWITCH); the other harts then had it run a second time.
+ * A kernel built with CONFIG_DEBUG_DISPATCH_OWNER crashes at that dispatch; the
+ * notification case also shows without it, as a lost notification.
+ */
+enum {
+    DW_RECV_HART = 2,     /* receiver and sleeper: not the boot hart (0), */
+    DW_SEND_HART = 1,     /* which runs the timer expiry */
+    DW_TIMEOUT_MS = 300,  /* the receive timeout, inside the stall */
+    DW_STALL_MS = 800,    /* how long the waker or the switch is held */
+    DW_SPIN_MS = 1200,    /* the woken receiver stays running past the stall */
+    DW_SLEEP_MS = 20,     /* the nanosleep, inside the stall */
+    DW_DEADLINE_MS = 200, /* the absolute one: after the call, inside the stall */
+    DW_YIELD_PRIO = 12,
+    DW_CODE = 42
+};
+
+/* Any hart but the boot hart (0), which runs the timer expiry: the others may
+ * steal the thread.
+ */
+#define DW_AWAY_FROM_BOOT (~1U)
+
+static int dw_inject(const char *op, pthread_t tid, int ms)
+{
+    char pid[16], t[16], m[16];
+    char *argv[] = {"inject", (char *) op, pid, t, m, NULL};
+    pid_t child;
+    int st;
+
+    snprintf(pid, sizeof pid, "%d", (int) getpid());
+    snprintf(t, sizeof t, "%d", (int) tid);
+    snprintf(m, sizeof m, "%d", ms);
+    if (posix_spawn(&child, "/bin/inject", NULL, NULL, argv, NULL) != 0 ||
+        waitpid(child, &st, 0) != child || !WIFEXITED(st))
+        return -1;
+    return WEXITSTATUS(st);
+}
+
+static void dw_spin_ms(long ms)
+{
+    struct timespec t0, t1;
+
+    (void) clock_gettime(CLOCK_MONOTONIC, &t0);
+    do
+        (void) clock_gettime(CLOCK_MONOTONIC, &t1);
+    while ((t1.tv_sec - t0.tv_sec) * 1000L + (t1.tv_nsec - t0.tv_nsec) / 1000000L < ms);
+}
+
+struct dw_recv {
+    int chid;
+    atomic_int go, done;
+    int rc, err;
+    struct _notification n;
+};
+
+static void *dw_receiver(void *raw)
+{
+    struct dw_recv *r = raw;
+    uint64_t ns = DW_TIMEOUT_MS * 1000000ULL;
+
+    (void) test_pin_mask(1U << DW_RECV_HART);
+    while (!atomic_load(&r->go))
+        (void) sched_yield();
+    (void) __timer_timeout(CLOCK_MONOTONIC, RTMUX_TIMEOUT_RECEIVE, NULL, &ns, NULL);
+    r->rc = msg_receive_notification(r->chid, &r->n, sizeof r->n, NULL);
+    r->err = errno;
+    atomic_store(&r->done, 1);
+
+    /* Stay current: a second wakeup now finds this thread running. */
+    dw_spin_ms(DW_SPIN_MS);
+    return NULL;
+}
+
+/* A notification claims the receiver and is held (STALL_READY) before it
+ * readies it; the receive timeout expires meanwhile. The timeout used to read
+ * the claimed receiver as still waiting, unlink it a second time and ready it
+ * with ETIMEDOUT; the held notification then queued the running receiver once
+ * more.
+ */
+static void dw_notify_timeout(void)
+{
+    static struct dw_recv r;
+    const char *what = "notification claimed as the receive timeout fires";
+    pthread_t th;
+    int coid = -1;
+    bool armed = false, held = false, taken = false, made = false;
+
+    r = (struct dw_recv) {.chid = channel_create(0)};
+    if (r.chid != -1)
+        coid = connect_attach(0, getpid(), r.chid, RTMUX_SIDE_CHANNEL, 0);
+    if (coid != -1)
+        made = pthread_create(&th, NULL, dw_receiver, &r) == EOK;
+    if (made) {
+        (void) test_pin_mask(1U << DW_SEND_HART);
+        sleep_ms(10); /* the receiver has pinned itself and spins on go */
+        armed = dw_inject("stall-ready", th, DW_STALL_MS) == 0;
+        atomic_store(&r.go, 1);
+        held = armed && wait_thread_state(th, STATE_RECEIVE);
+        if (held)
+            (void) msg_send_notification(coid, 10, DW_CODE, 0);
+        taken = held && inject_run("site-wait", "ready", NULL) == 0;
+        (void) test_pin_mask(~0U);
+        (void) pthread_join(th, NULL);
+    }
+    check(armed && held && taken, what, "fixture: receiver not held at the wakeup");
+    if (taken)
+        check(r.rc == 0 && r.n.code == DW_CODE, what,
+              r.rc == 0 ? "wrong notification" : "the notification was lost to the timeout");
+    if (coid != -1)
+        (void) __connect_detach((uint64_t) coid);
+    if (r.chid != -1)
+        (void) channel_destroy(r.chid);
+}
+
+struct dw_sleep {
+    sem_t go;
+    int rc;
+};
+
+static void *dw_sleeper(void *raw)
+{
+    struct dw_sleep *z = raw;
+
+    (void) test_pin_mask(DW_AWAY_FROM_BOOT);
+
+    /* Blocked while the stall is armed, so the next switch away from this
+     * thread is the nanosleep's.
+     */
+    (void) sem_wait(&z->go);
+    z->rc = nanosleep(&(struct timespec) {.tv_nsec = DW_SLEEP_MS * 1000000L}, NULL);
+    return NULL;
+}
+
+/* The sleeper's hart is held (STALL_SWITCH) in block()'s steal scan, after
+ * nanosleep has armed the timer and before it switches away; the timer expires
+ * on the boot hart. Its wakeup used to queue the sleeper while it was still
+ * current here, and a third hart then ran it.
+ */
+static void dw_sleep_switch(void)
+{
+    static struct dw_sleep z;
+    const char *what = "nanosleep that expires before its hart switches";
+    pthread_t th;
+    bool armed = false, taken = false;
+
+    z = (struct dw_sleep) {.rc = -1};
+    if (sem_init(&z.go, 0, 0) != 0) {
+        test_fail(what, "sem_init");
+        return;
+    }
+    if (pthread_create(&th, NULL, dw_sleeper, &z) == EOK) {
+        armed = wait_thread_state(th, STATE_SEM) &&
+                dw_inject("stall-switch", th, DW_STALL_MS) == 0;
+        (void) sem_post(&z.go);
+        taken = armed && inject_run("site-wait", "switch", NULL) == 0;
+        (void) pthread_join(th, NULL);
+    }
+    (void) sem_destroy(&z.go);
+    check(armed && taken, what, "fixture: sleeper not held at the switch");
+    check(z.rc == 0, what, "nanosleep failed");
+}
+
+struct dw_past {
+    atomic_int go;
+    struct timespec until;
+    int rc;
+};
+
+static void *dw_past_sleeper(void *raw)
+{
+    struct dw_past *z = raw;
+
+    (void) test_pin_mask(DW_AWAY_FROM_BOOT);
+    while (!atomic_load(&z->go))
+        (void) sched_yield();
+    z->rc = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &z->until, NULL);
+    return NULL;
+}
+
+/* An absolute nanosleep is held (STALL_BLOCK) after its deadline check, until
+ * the deadline (DW_DEADLINE_MS on) has passed: arming the timer then fires it at once, on the
+ * sleeper's own hart. That wakeup used to queue the sleeper before its hart
+ * switched away from it.
+ */
+static void dw_sleep_past(void)
+{
+    static struct dw_past z;
+    const char *what = "absolute nanosleep whose deadline passes while it blocks";
+    pthread_t th;
+    bool held = false;
+
+    z = (struct dw_past) {.rc = -1};
+    (void) test_pin_mask(1U); /* the stall holds a hart: keep this one apart */
+    if (pthread_create(&th, NULL, dw_past_sleeper, &z) == EOK) {
+        sleep_ms(10);
+        held = dw_inject("stall-block", th, DW_STALL_MS) == 0;
+        (void) clock_gettime(CLOCK_MONOTONIC, &z.until);
+        cvr_ts_add_ms(&z.until, DW_DEADLINE_MS);
+        atomic_store(&z.go, 1);
+
+        /* No helper process while the hart is held: reaping one waits for a
+         * grace period that the held hart holds up.
+         */
+        (void) pthread_join(th, NULL);
+        held = held && inject_run("site-wait", "block", NULL) == 0;
+    }
+    (void) test_pin_mask(~0U);
+    check(held, what, "fixture: sleeper not held at the block");
+    check(z.rc == 0, what, "clock_nanosleep failed");
+}
+
+struct dw_yield {
+    atomic_int ready;
+    sem_t go, peer_go;
+    pthread_t peer;
+    bool made;
+};
+
+static void *dw_peer(void *raw)
+{
+    struct dw_yield *y = raw;
+
+    (void) sem_wait(&y->peer_go);
+    return NULL;
+}
+
+/* A FIFO thread yields to a peer queued on its hart and is held
+ * (STALL_SWITCH) once it is queued READY itself, before the hart switches to
+ * the peer. An idle hart used to steal it in that window.
+ */
+static void *dw_yielder(void *raw)
+{
+    struct dw_yield *y = raw;
+    pthread_attr_t attr;
+    struct sched_param sp = {.sched_priority = DW_YIELD_PRIO};
+
+    if (set_fifo_prio(DW_YIELD_PRIO) != EOK ||
+        test_pin_mask(1U << DW_RECV_HART) != EOK) {
+        atomic_store(&y->ready, -1);
+        return NULL;
+    }
+    /* The peer inherits the hart and takes the same priority. */
+    y->made = pthread_attr_init(&attr) == 0 &&
+              pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED) == 0 &&
+              pthread_attr_setschedpolicy(&attr, SCHED_FIFO) == 0 &&
+              pthread_attr_setschedparam(&attr, &sp) == 0 &&
+              pthread_create(&y->peer, &attr, dw_peer, y) == EOK;
+    (void) pthread_attr_destroy(&attr);
+    atomic_store(&y->ready, y->made ? 1 : -1);
+    if (!y->made)
+        return NULL;
+
+    /* Blocked while the stall is armed, so the next switch away from this
+     * thread is the yield below.
+     */
+    (void) sem_wait(&y->go);
+    (void) test_pin_mask(~0U); /* now any hart may take this thread */
+    (void) sem_post(&y->peer_go); /* queued on this hart, behind us */
+    (void) sched_yield();
+    return NULL;
+}
+
+static void dw_yield_switch(void)
+{
+    static struct dw_yield y;
+    const char *what = "FIFO yield held before its hart switches";
+    pthread_t th;
+    bool armed = false, taken = false;
+
+    y = (struct dw_yield) {0};
+    if (sem_init(&y.go, 0, 0) != 0 || sem_init(&y.peer_go, 0, 0) != 0) {
+        test_fail(what, "sem_init");
+        return;
+    }
+    if (pthread_create(&th, NULL, dw_yielder, &y) == EOK) {
+        for (int i = 0; i < 300 && !atomic_load(&y.ready); i++)
+            sleep_ms(10);
+        armed = atomic_load(&y.ready) == 1 && wait_thread_state(th, STATE_SEM) &&
+                dw_inject("stall-switch", th, DW_STALL_MS) == 0;
+        (void) sem_post(&y.go);
+        taken = armed && inject_run("site-wait", "switch", NULL) == 0;
+        if (atomic_load(&y.ready) != 1)
+            (void) sem_post(&y.peer_go);
+        (void) pthread_join(th, NULL);
+        if (y.made)
+            (void) pthread_join(y.peer, NULL);
+    }
+    (void) sem_destroy(&y.go);
+    (void) sem_destroy(&y.peer_go);
+    check(armed && taken, what, "fixture: yielder not held at the switch");
+}
+
+int dispatch_window(void)
+{
+    if (sysconf(_SC_NPROCESSORS_ONLN) < 3 ||
+        inject_run("alloc-status", NULL, NULL))
+        return TC_EXIT_SKIP;
+    dw_notify_timeout();
+    dw_sleep_switch();
+    dw_sleep_past();
+    dw_yield_switch();
+    return 0;
+}
+
+/* Scheduler windows, each held open with fault injection while a second
+ * party acts on the thread through POKE (a stray wakeup, or a stop as a
+ * teardown makes it). A persistent "inject serve" helper takes the commands:
+ * no process can be spawned while a hart is held in the kernel.
+ */
+struct kw_serve {
+    pid_t pid;
+    int to, from;
+};
+
+static int kw_serve_start(struct kw_serve *k)
+{
+    int in[2], out[2];
+    posix_spawn_file_actions_t fa;
+    char *argv[] = {"inject", "serve", NULL};
+    int rc;
+
+    if (pipe(in) || pipe(out))
+        return -2;
+    (void) fcntl(in[1], F_SETFD, FD_CLOEXEC);
+    (void) fcntl(out[0], F_SETFD, FD_CLOEXEC);
+    rc = posix_spawn_file_actions_init(&fa);
+    if (!rc)
+        rc = posix_spawn_file_actions_adddup2(&fa, in[0], 0);
+    if (!rc)
+        rc = posix_spawn_file_actions_adddup2(&fa, out[1], 1);
+    if (!rc)
+        rc = posix_spawn(&k->pid, "/bin/inject", &fa, NULL, argv, NULL);
+    posix_spawn_file_actions_destroy(&fa);
+    close(in[0]);
+    close(out[1]);
+    k->to = in[1];
+    k->from = out[0];
+    return rc ? rc : 0;
+}
+
+/* Send one line to the helper. */
+static void kw_send(struct kw_serve *k, const char *line)
+{
+    (void) write(k->to, line, strlen(line));
+}
+
+/* Read one reply line from the helper into buf. */
+static bool kw_line(struct kw_serve *k, char *buf, size_t n)
+{
+    size_t i = 0;
+    char c;
+
+    while (i + 1 < n && read(k->from, &c, 1) == 1) {
+        if (c == '\n') {
+            buf[i] = '\0';
+            return true;
+        }
+        buf[i++] = c;
+    }
+    buf[i] = '\0';
+    return false;
+}
+
+/* Run one inject command line in the helper; its exit status. */
+static int kw_cmd(struct kw_serve *k, const char *fmt, ...)
+{
+    char line[160];
+    va_list ap;
+
+    va_start(ap, fmt);
+    vsnprintf(line, sizeof line - 1, fmt, ap);
+    va_end(ap);
+    strcat(line, "\n");
+    kw_send(k, line);
+    return kw_line(k, line, sizeof line) ? atoi(line) : -1;
+}
+
+static void kw_serve_stop(struct kw_serve *k)
+{
+    close(k->to);
+    close(k->from);
+    if (k->pid > 0)
+        (void) waitpid(k->pid, NULL, 0);
+}
+
+/* Run on exactly the harts in run; threads created from here may run anywhere
+ * in inherit.
+ */
+static int kw_pin(unsigned run, unsigned inherit)
+{
+    size_t bytes = sizeof(struct _thread_runmask) + 2U * sizeof(unsigned);
+    struct _thread_runmask *m = calloc(1U, bytes);
+    int rc;
+
+    if (!m)
+        return -1;
+    m->size = 1U;
+    ((unsigned *) (m + 1))[0] = run;
+    ((unsigned *) (m + 1))[1] = inherit;
+    rc = thread_ctl(RTMUX_TCTL_RUNMASK_GET_AND_SET_INHERIT, m);
+    free(m);
+    return rc;
+}
+
+enum { KW_LOW = 10, KW_HIGH = 20, KW_HOLD_MS = 400 };
+
+struct kw {
+    atomic_int stop_s1, stop_s2, stop_t, s2_sleep;
+    atomic_long count;
+    pthread_t t;
+    int t_made;
+    unsigned t_mask;
+};
+
+static void *kw_target(void *raw)
+{
+    struct kw *w = raw;
+
+    while (!atomic_load(&w->stop_t))
+        atomic_fetch_add(&w->count, 1);
+    return NULL;
+}
+
+static int kw_make(pthread_t *th, int prio, void *(*fn)(void *), void *arg)
+{
+    pthread_attr_t attr;
+    struct sched_param sp = {.sched_priority = prio};
+    int rc;
+
+    pthread_attr_init(&attr);
+    pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED);
+    pthread_attr_setschedpolicy(&attr, SCHED_FIFO);
+    pthread_attr_setschedparam(&attr, &sp);
+    rc = pthread_create(th, &attr, fn, arg);
+    pthread_attr_destroy(&attr);
+    return rc;
+}
+
+/* Hart 1's high spinner: creates the target there (so it waits READY on hart
+ * 1's queue), then spins until told to stop.
+ */
+static void *kw_s1(void *raw)
+{
+    struct kw *w = raw;
+
+    (void) kw_pin(1U << 1, w->t_mask);
+    w->t_made = kw_make(&w->t, KW_LOW, kw_target, w) == EOK ? 1 : -1;
+    while (!atomic_load(&w->stop_s1))
+        ;
+    return NULL;
+}
+
+/* Hart 2's high spinner: blocks on request, so that hart steals. */
+static void *kw_s2(void *raw)
+{
+    struct kw *w = raw;
+
+    (void) kw_pin(1U << 2, 1U << 2);
+    while (!atomic_load(&w->stop_s2)) {
+        if (atomic_load(&w->s2_sleep)) {
+            atomic_store(&w->s2_sleep, 0);
+            sleep_ms(2 * KW_HOLD_MS);
+        }
+    }
+    return NULL;
+}
+
+static bool kw_frozen(struct kw *w, long ms)
+{
+    long c0 = atomic_load(&w->count);
+
+    sleep_ms(ms);
+    return atomic_load(&w->count) == c0;
+}
+
+/* A steal held between its two dispatch locks (STALL_STEAL), and a stop in
+ * that window: the stealer must not run a thread stopped in transit.
+ */
+static void kw_steal(struct kw_serve *k, bool stop)
+{
+    static struct kw w;
+    const char *what = stop ? "stop of a thread a steal holds in transit"
+                            : "second wakeup of a thread a steal holds in transit";
+    pthread_t s1, s2;
+    bool ready = false, armed = false, taken = false, poked = false, ok = true;
+
+    w = (struct kw) {.t_mask = (1U << 1) | (1U << 2)};
+    if (kw_make(&s2, KW_HIGH, kw_s2, &w) != EOK || kw_make(&s1, KW_HIGH, kw_s1, &w) != EOK) {
+        test_fail(what, "spinners");
+        return;
+    }
+    for (int i = 0; i < 300 && !w.t_made; i++)
+        sleep_ms(10);
+    ready = w.t_made == 1 && wait_thread_state(w.t, STATE_READY);
+    armed = ready && kw_cmd(k, "stall-steal %d %d %d", (int) getpid(), (int) w.t,
+                            KW_HOLD_MS) == 0;
+    if (armed) {
+        atomic_store(&w.s2_sleep, 1); /* hart 2 blocks and steals the thread */
+        taken = kw_cmd(k, "site-wait steal") == 0;
+        poked = taken && kw_cmd(k, "poke %d %d %s", (int) getpid(), (int) w.t,
+                                stop ? "stop" : "ready") == 0;
+        if (stop && poked) {
+            sleep_ms(KW_HOLD_MS); /* past the hold */
+            ok = kw_frozen(&w, 300);
+        } else {
+            sleep_ms(KW_HOLD_MS + 100);
+            ok = !kw_frozen(&w, 100); /* it runs, once */
+        }
+    }
+    check(armed && taken && poked, what, "fixture: steal not held");
+    check(ok, what, stop ? "the stealer ran a stopped thread" : "the thread stopped running");
+    atomic_store(&w.stop_t, 1);
+    atomic_store(&w.stop_s1, 1);
+    atomic_store(&w.stop_s2, 1);
+    if (w.t_made == 1) {
+        (void) kw_cmd(k, "poke %d %d ready", (int) getpid(), (int) w.t);
+        (void) pthread_join(w.t, NULL);
+    }
+    (void) pthread_join(s1, NULL);
+    (void) pthread_join(s2, NULL);
+}
+
+/* SCHED_STATS 0 through the helper, or -1. */
+static int kw_steal_locks(struct kw_serve *k)
+{
+    static const char key[] = "empty-steal-locks=";
+    char line[64];
+    int n = -1;
+
+    kw_send(k, "sched-stats\n");
+    if (kw_line(k, line, sizeof line) && !strncmp(line, key, sizeof key - 1))
+        n = atoi(line + sizeof key - 1);
+    (void) kw_line(k, line, sizeof line); /* the status line */
+    return n;
+}
+
+/* An idle system: the harts' steal scans take no lock of an empty queue. */
+static void kw_empty_peek(struct kw_serve *k)
+{
+    int c0 = kw_steal_locks(k), c1;
+
+    sleep_ms(500);
+    c1 = kw_steal_locks(k);
+    printf("k65-windows: empty-queue steal locks over 500 ms idle: %d\n", c1 - c0);
+    /* A queue emptied between the peek and the lock still counts: a few. */
+    check(c0 >= 0 && c1 >= 0 && c1 - c0 <= 4, "idle steal scans skip empty queues",
+          "remote dispatch locks taken on empty queues");
+}
+
+int k65_windows(void)
+{
+    struct kw_serve k = {.to = -1, .from = -1};
+
+    if (sysconf(_SC_NPROCESSORS_ONLN) < 4 || inject_run("alloc-status", NULL, NULL))
+        return TC_EXIT_SKIP;
+    int src = kw_serve_start(&k);
+
+    if (src) {
+        char d[48];
+
+        snprintf(d, sizeof d, "inject serve: %d errno %d", src, errno);
+        test_fail("k65 windows", d);
+        return 0;
+    }
+    (void) kw_pin(1U, ~0U); /* stay off harts 1 and 2 */
+    kw_empty_peek(&k);
+    kw_steal(&k, true);
+    (void) kw_pin(~0U, ~0U);
+    kw_serve_stop(&k);
     return 0;
 }
 

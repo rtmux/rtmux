@@ -230,7 +230,6 @@ struct xfer_walk {
 
 int(xferiov)(thread_t *sthp, struct xfer_walk *w);
 
-int(xfermsg)(thread_t *dthp, thread_t *sthp, size_t doff, size_t soff);
 int xfermsg_bounded(thread_t *dthp, thread_t *sthp, size_t doff, size_t soff);
 int xfermsg_peek(thread_t *dthp, thread_t *sthp, unsigned max_entries);
 int(xfernotification)(thread_t *dthp,
@@ -389,6 +388,20 @@ void smp_inject_ap_crash(unsigned cpu);
 void plic_init(void);
 void plic_inithart(void);
 void cpu_force_fpu_save(thread_t *thp);
+#ifdef CONFIG_DEBUG_DISPATCH_OWNER
+/* debug/dispatch-owner.c */
+void dispatch_owner_run_site(void *ra);
+void dispatch_owner_claim(unsigned cpu, thread_t *old, thread_t *new, void *ra);
+void dispatch_owner_release(unsigned cpu, thread_t *old, thread_t *new);
+void dispatch_owner_ready(thread_t *thp, void *ra);
+void dispatch_owner_pick(thread_t *thp, void *ra);
+#else
+#define dispatch_owner_run_site(ra) ((void) 0)
+#define dispatch_owner_claim(cpu, old, new, ra) ((void) (old))
+#define dispatch_owner_release(cpu, old, new) ((void) (old))
+#define dispatch_owner_ready(thp, ra) ((void) 0)
+#define dispatch_owner_pick(thp, ra) ((void) 0)
+#endif
 #ifdef CONFIG_DEBUG_INJECT
 int inject_should_fail_alloc(process_t *prp,
                              soul_t *soulp); /* debug/inject.c */
@@ -400,6 +413,7 @@ void inject_sync_waker_stall(thread_t *thp);
 void inject_reply_claim_stall(const connect_t *received);
 void inject_claim_held(void);
 void inject_cap_peek_window(const thread_t *act);
+void inject_send_pick_window(const thread_t *act);
 void inject_force_ready_claimed(thread_t *thp);
 bool inject_reply_unblock_preempt(void);
 void inject_xfer_start(const thread_t *act);
@@ -409,6 +423,16 @@ void inject_xfer_budget(const thread_t *act);
 void inject_intr_before_switch(thread_t *thp);
 void inject_intr_after_select(thread_t *thp, const thread_t *chosen);
 void inject_block_stall(thread_t *thp);
+void inject_steal_stall(thread_t *thp);
+extern atomic_uint inject_empty_steal_locks;
+#define inject_note_empty_steal_lock(dpp)                                     \
+    do {                                                                      \
+        if (!DISPATCH_ANY(dpp))                                               \
+            atomic_fetch_add_explicit(&inject_empty_steal_locks, 1,           \
+                                      memory_order_relaxed);                  \
+    } while (0)
+void inject_ready_stall(thread_t *thp);
+void inject_switch_stall(thread_t *thp);
 void ipc_blk_trace(const char *file, int line, thread_t *thp);
 #define IPC_BLK(thp) ipc_blk_trace(__FILE__, __LINE__, (thp))
 void thr_trace(const char *file, int line, thread_t *thp, void *ra);
@@ -449,6 +473,19 @@ static inline void inject_block_stall(thread_t *thp)
 {
     (void) thp;
 }
+static inline void inject_steal_stall(thread_t *thp)
+{
+    (void) thp;
+}
+#define inject_note_empty_steal_lock(dpp) ((void) 0)
+static inline void inject_ready_stall(thread_t *thp)
+{
+    (void) thp;
+}
+static inline void inject_switch_stall(thread_t *thp)
+{
+    (void) thp;
+}
 static inline void inject_sync_waker_stall(thread_t *thp)
 {
     (void) thp;
@@ -463,6 +500,10 @@ static inline void inject_reply_claim_stall(const connect_t *received)
 }
 static inline void inject_claim_held(void) {}
 static inline void inject_cap_peek_window(const thread_t *act)
+{
+    (void) act;
+}
+static inline void inject_send_pick_window(const thread_t *act)
 {
     (void) act;
 }

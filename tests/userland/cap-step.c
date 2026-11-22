@@ -16,6 +16,10 @@
  *   must see the header the kernel examined, not the one that was copied.
  * - cap_header_sparse: a message whose head lies behind a long run of empty
  *   iov entries is refused, since the kernel will not walk them to look.
+ * - cap_receiver_sparse: the same run at the front of the vector a long
+ *   message is received into, or replied into, fails its owner with EINVAL
+ *   and nobody else: the kernel writes the head back and will not walk them
+ *   to do it.
  *
  * The first two need the debug fault-injection call (/bin/inject,
  * CONFIG_DEBUG_INJECT kernels only).
@@ -32,6 +36,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/iomsg.h>
+#include <sys/states.h>
 #include <sys/rtmux-core.h>
 
 #include "../../kernel/include/private/inject.h"
@@ -269,6 +274,195 @@ static void cap_header_sparse(int chid, int coid)
     }
 }
 
+/* Arm a timeout for the calling thread's next receive. */
+static void cs_receive_within(uint64_t ns)
+{
+    (void) __timer_timeout(CLOCK_MONOTONIC, RTMUX_TIMEOUT_RECEIVE, NULL, &ns,
+                           NULL);
+}
+
+struct cs_sparse {
+    int chid, coid;
+    iov_t *iov;
+    int parts;
+    atomic_int started, done;
+    int rc, err;
+};
+
+/* A receiver that waits, for a while at most, with the vector it is given. */
+static void *cs_sparse_receiver(void *raw)
+{
+    struct cs_sparse *r = raw;
+
+    cs_receive_within(8000000000ULL);
+    atomic_store(&r->started, 1);
+    r->rc = msg_receivev(r->chid, r->iov, r->parts, NULL);
+    r->err = errno;
+    atomic_store(&r->done, 1);
+    return NULL;
+}
+
+/* A client that takes its reply, parsed as a native one, into the vector. */
+static void *cs_sparse_client(void *raw)
+{
+    struct cs_sparse *c = raw;
+    char req = 1;
+    iov_t siov;
+
+    SETIOV(&siov, &req, 1);
+    (void) thread_ctl(RTMUX_TCTL_NATIVE_REPLY, (void *) 1);
+    atomic_store(&c->started, 1);
+    c->rc = msg_sendv(c->coid, &siov, 1, c->iov, c->parts);
+    c->err = errno;
+    (void) thread_ctl(RTMUX_TCTL_NATIVE_REPLY, (void *) 0);
+    atomic_store(&c->done, 1);
+    return NULL;
+}
+
+/* Join a peer that has finished. One that has not is blocked in the kernel on
+ * the channel, which the end of the test destroys: say so and leave it.
+ */
+static void cs_reap(pthread_t t, atomic_int *done, const char *who)
+{
+    if (cs_wait(done))
+        (void) pthread_join(t, NULL);
+    else
+        test_fail("cap_receiver_sparse peer did not return", who);
+}
+
+/* The entry bound on the head, as the kernel has it (NATIVE_HDR_ENTRIES_MAX):
+ * a head that starts in entry 63 is within it, one in entry 64 is not.
+ */
+#define CS_HEAD_ENTRIES 64
+
+static void cap_receiver_sparse(int chid, int coid)
+{
+    static iov_t iov[CS_SPARSE + 1];
+    static struct cs_sparse peer;
+    pthread_t t;
+    char detail[128];
+    int rcvid, rc, err;
+
+    peer = (struct cs_sparse) {.chid = chid, .coid = coid, .iov = iov};
+    for (int i = 0; i < CS_BYTES; i++)
+        cs_out[i] = (unsigned char) (i * 5 + 3);
+
+    /* The receive of a sender that is already queued. Refused, the sender
+     * stays queued for a receive that can take it.
+     */
+    for (int lead = CS_HEAD_ENTRIES; lead >= CS_HEAD_ENTRIES - 1; lead--) {
+        static struct cs_send snd; /* a peer left behind still uses it */
+
+        snd = (struct cs_send) {.coid = coid, .len = 4096};
+        for (int i = 0; i < lead; i++)
+            SETIOV(&iov[i], cs_in, 0);
+        SETIOV(&iov[lead], cs_in, 4096);
+        memset(cs_in, 0, 4096);
+        if (pthread_create(&t, NULL, cs_sender, &snd) != 0) {
+            test_fail("cap_receiver_sparse", "sender thread");
+            return;
+        }
+        if (!test_thread_blocked(t, STATE_SEND))
+            test_fail("cap_receiver_sparse", "the sender did not queue");
+        cs_receive_within(2000000000ULL);
+        rcvid = msg_receivev(chid, iov, lead + 1, NULL);
+        err = errno;
+        snprintf(detail, sizeof detail, "lead=%d receive=%d errno=%d", lead,
+                 rcvid, rcvid == -1 ? err : 0);
+        if (lead == CS_HEAD_ENTRIES) {
+            check(rcvid == -1 && err == EINVAL,
+                  "cap_receiver_sparse receive refused", detail);
+            if (rcvid == -1) {
+                cs_receive_within(2000000000ULL);
+                rcvid = msg_receive(chid, cs_in, 4096, NULL);
+            }
+            check(rcvid != -1 && memcmp(cs_in, cs_out, 4096) == 0,
+                  "cap_receiver_sparse sender stays queued", detail);
+        } else {
+            check(rcvid != -1 && memcmp(cs_in, cs_out, 4096) == 0,
+                  "cap_receiver_sparse within the bound", detail);
+        }
+        if (rcvid != -1)
+            (void) msg_reply(rcvid, 0, NULL, 0);
+        cs_reap(t, &snd.done, "queued sender");
+    }
+
+    for (int i = 0; i < CS_SPARSE; i++)
+        SETIOV(&iov[i], cs_in, 0);
+    SETIOV(&iov[CS_SPARSE], cs_in, 4096);
+    peer.parts = CS_SPARSE + 1;
+
+    /* A receiver that waits with such a vector: the sender's call does the
+     * copy, fails the receiver and goes on to queue.
+     */
+    {
+        static struct cs_send snd;
+        pthread_t ts;
+
+        snd = (struct cs_send) {.coid = coid, .len = 4096};
+
+        if (pthread_create(&t, NULL, cs_sparse_receiver, &peer) != 0) {
+            test_fail("cap_receiver_sparse", "receiver thread");
+            return;
+        }
+        if (!test_thread_blocked(t, STATE_RECEIVE))
+            test_fail("cap_receiver_sparse", "the receiver did not wait");
+        if (pthread_create(&ts, NULL, cs_sender, &snd) != 0) {
+            test_fail("cap_receiver_sparse", "sender thread");
+            (void) pthread_join(t, NULL);
+            return;
+        }
+        cs_reap(t, &peer.done, "waiting receiver");
+        snprintf(detail, sizeof detail, "receive=%d errno=%d", peer.rc,
+                 peer.rc == -1 ? peer.err : 0);
+        check(peer.rc == -1 && peer.err == EINVAL,
+              "cap_receiver_sparse waiting receiver refused", detail);
+        if (peer.rc != -1) {
+            (void) msg_reply(peer.rc, 0, NULL, 0);
+        } else {
+            cs_receive_within(2000000000ULL);
+            rcvid = msg_receive(chid, cs_in, 4096, NULL);
+            check(rcvid != -1, "cap_receiver_sparse sender queues after it",
+                  "receive of the retried send");
+            if (rcvid != -1)
+                (void) msg_reply(rcvid, 0, NULL, 0);
+        }
+        cs_reap(ts, &snd.done, "sender to the waiting receiver");
+    }
+
+    /* A long reply into such a vector, for a client that asked for native
+     * replies (the only replies whose head the kernel looks at).
+     */
+    atomic_store(&peer.started, 0);
+    atomic_store(&peer.done, 0);
+    if (pthread_create(&t, NULL, cs_sparse_client, &peer) != 0) {
+        test_fail("cap_receiver_sparse", "client thread");
+        return;
+    }
+    {
+        char req;
+
+        cs_receive_within(2000000000ULL);
+        rcvid = msg_receive(chid, &req, 1, NULL);
+    }
+    if (rcvid == -1) {
+        test_fail("cap_receiver_sparse", "client's request not received");
+        cs_reap(t, &peer.done, "client");
+        return;
+    }
+    rc = msg_reply(rcvid, 0, cs_out, 4096);
+    err = errno;
+    cs_reap(t, &peer.done, "client");
+    snprintf(detail, sizeof detail,
+             "client rc=%d errno=%d, reply rc=%d errno=%d", peer.rc,
+             peer.rc == -1 ? peer.err : 0, rc, rc == -1 ? err : 0);
+    check(peer.rc == -1 && peer.err == EINVAL,
+          "cap_receiver_sparse reply refused", detail);
+    /* The replier is told what it is told for any reply it could not place. */
+    check(rc == -1 && err == EFAULT, "cap_receiver_sparse replier told",
+          detail);
+}
+
 int test_cap_step(void)
 {
     struct _server_info info;
@@ -288,6 +482,7 @@ int test_cap_step(void)
     }
     snprintf(pid, sizeof pid, "%d", (int) getpid());
     cap_header_sparse(chid, coid);
+    cap_receiver_sparse(chid, coid);
     if (inject) {
         cap_long_stepped(chid, coid, info.endpoint_cap, pid);
         cap_header_snapshot(chid, coid, pid);

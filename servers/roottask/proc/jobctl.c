@@ -46,7 +46,6 @@ int proc_snapshot(pid_t pid, struct proc_snap *s)
     s->fg = qinfo.sess_pgrp;
     s->fd = qinfo.sess_fd;
     s->flags = qinfo.flags;
-    s->chp = qinfo.sys_chp;
     root_proc_unlock(pid);
     return EOK;
 }
@@ -107,7 +106,7 @@ static int jc_signal_group(pid_t pgrp, pid_t sid, int signo, pid_t sender)
         if (pid == 0 || pid == ROOTTASK_PID || root_proc(pid)->system ||
             proc_snapshot(pid, &m) != EOK)
             continue;
-        if (m.pgrp != pgrp || m.sid != sid || (m.flags & JC_DEAD) || !m.chp)
+        if (m.pgrp != pgrp || m.sid != sid || (m.flags & JC_DEAD))
             continue;
 
         /* Post under the lock so the channel cannot go away with the process.
@@ -115,9 +114,15 @@ static int jc_signal_group(pid_t pgrp, pid_t sid, int signo, pid_t sender)
         if (root_proc_lock(pid)) {
             root_proc_info_t qinfo;
 
-            if (process_query_info(pid, &qinfo) == EOK && qinfo.sys_chp &&
-                !(qinfo.flags & JC_DEAD)) {
-                signal_kill(qinfo.sys_chp, signo, sender);
+            /* Still a member, now that the lock is held: a signal may be kept
+             * for a process that has not registered its system channel yet
+             * (signal_post_locked), so one that left the group meanwhile must
+             * not get it.
+             */
+            if (process_query_info(pid, &qinfo) == EOK &&
+                !(qinfo.flags & JC_DEAD) && qinfo.pgrp == pgrp &&
+                qinfo.sess_leader == sid) {
+                signal_post_locked(pid, qinfo.sys_chp, signo, sender);
                 n++;
             }
             root_proc_unlock(pid);
@@ -274,13 +279,17 @@ static void jc_notify_parent(pid_t pid)
     struct proc_snap c, p;
 
     if (proc_snapshot(pid, &c) != EOK || c.ppid <= 0 ||
-        proc_snapshot(c.ppid, &p) != EOK || !p.chp || (p.flags & JC_DEAD))
+        proc_snapshot(c.ppid, &p) != EOK || (p.flags & JC_DEAD))
         return;
     if (root_proc_lock(c.ppid)) {
         root_proc_info_t qinfo;
 
-        if (process_query_info(c.ppid, &qinfo) == EOK && qinfo.sys_chp)
-            signal_kill(qinfo.sys_chp, SIGCHLD, pid);
+        /* A parent between images, with no system channel for the moment, gets
+         * it when it registers one (signal_post_locked).
+         */
+        if (process_query_info(c.ppid, &qinfo) == EOK &&
+            !(qinfo.flags & JC_DEAD))
+            signal_post_locked(c.ppid, qinfo.sys_chp, SIGCHLD, pid);
         root_proc_unlock(c.ppid);
     }
 }

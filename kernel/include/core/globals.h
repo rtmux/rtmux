@@ -277,6 +277,46 @@ thread_t *get_active_thread(unsigned cpu);
 thread_t *get_active_thread_chk(unsigned cpu);
 void set_active_thread(unsigned cpu, thread_t *thp);
 
+void send_ipi_deferred(uint64_t cpus); /* arch: the SBI calls send_ipi queued */
+
+static inline void sched_lock(kspinlock_t *l)
+{
+    kspinlock_lock(l);
+    get_pcpu()->pc_sched_depth++;
+}
+
+/* The outermost dispatch unlock sends the IPIs queued under it, once the
+ * lock is free: a target that takes the IPI at once finds the queue unlocked.
+ */
+static inline void sched_unlock(kspinlock_t *l)
+{
+    struct pcpu *pc = get_pcpu();
+    uint64_t defer = 0;
+
+    if (--pc->pc_sched_depth == 0 && pc->pc_ipi_defer) {
+        defer = pc->pc_ipi_defer;
+        pc->pc_ipi_defer = 0;
+    }
+    kspinlock_unlock(l);
+    if (defer)
+        send_ipi_deferred(defer);
+}
+
+/* Whether thp is still the current thread of a hart other than cpu. A thread
+ * is current on one hart at a time: the pickers leave such a thread queued
+ * until that hart has switched away from it (dispatch_unlink_ready,
+ * idle_unlink_ready; docs/smp-contract.md).
+ * runcpu names the only hart it can be current on.
+ */
+static inline bool thread_current_elsewhere(const thread_t *thp, unsigned cpu)
+{
+    unsigned owner = thp->runcpu;
+
+    return owner != cpu && owner < CONFIG_PROCESSORS_MAX &&
+           __atomic_load_n(&pcpu_array[owner].pc_curthread, __ATOMIC_ACQUIRE) ==
+               thp;
+}
+
 EXT int inspecret;
 
 /* actives_prp[] now lives at pcpu_array[hart].pc_active_prp as_prp[] now lives

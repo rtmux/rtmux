@@ -144,6 +144,32 @@ Updating a loan skips equal-priority groups, so insertion visits at most
 The `--pi-owner-loans` guest test releases three contended mutexes out of
 priority order and checks the effective priority after each handoff.
 
+Worst case under `sync_pi_slock`, interrupts off: a loan update is one
+`pril_rem` and one `pril_add` on the owner's list. Each steps once per distinct
+priority level on that list, and turnstile loans carry no notification boost
+bit, so a list has at most `NUM_PRI` = 256 levels and an update takes at most
+512 list steps however many mutexes the owner holds. Reading the owner's
+inherited priority (`sync_pi_target_locked`) takes constant time.
+
+Thread exit keeps the rule that whichever of the dying owner and a contender
+comes second sees the other, but pays for it only when there is something to
+see. `thread_t.sync_owner_flags` has a TRACKED bit, set (with an atomic OR)
+whenever the kernel records the thread as an owner: a contender naming it in a
+lock word, a turnstile taking it as owner, a robust record filed on it, or the
+thread itself queueing on a mutex it may be handed. Exit sets CLOSED with the
+same atomic OR. One of the two ORs comes first: if TRACKED was already set,
+exit scans the 128 chains as before; if CLOSED came first, the registration
+sees it and treats the thread as a dead owner, and exit returns without
+taking a chain lock. The bit is sticky until the thread is recycled, so a
+thread that ever contended a kernel-visible mutex pays the scan at exit.
+
+`thread_t.blocked_on_turnstile` is written only under the chain lock of the
+key its thread queues under, and cleared under `sync_pi_slock` as well. A
+holder of that chain lock may therefore read it without the PI lock; a reader
+that holds only `sync_pi_slock` may read it and take a turnstile reference.
+Waiters bound to no turnstile (semaphores, condition variables, mutexes
+without `PRIO_INHERIT`) leave their chain without touching `sync_pi_slock`.
+
 When a non-winning waiter leaves the queue, recompute the owner's boost from
 remaining waiters.  Clearing the boost simply because one waiter left is wrong
 when another higher-than-base waiter remains.

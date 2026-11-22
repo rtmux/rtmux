@@ -38,14 +38,19 @@
  * lock_debug doesn't enforce ordering across same-class locks.
  */
 #define LOCAL_DPP (get_pcpu()->pc_dispatch)
-#define SCHED_LOCK_LOCAL() kspinlock_lock(&LOCAL_DPP->lock)
-#define SCHED_UNLOCK_LOCAL() kspinlock_unlock(&LOCAL_DPP->lock)
-#define SCHED_LOCK(dpp) kspinlock_lock(&(dpp)->lock)
-#define SCHED_UNLOCK(dpp) kspinlock_unlock(&(dpp)->lock)
+/* Dispatch locks. sched_lock/sched_unlock (core/globals.h) also count the
+ * nesting, so IPIs sent under a dispatch lock reach SBI after the outermost
+ * unlock (send_ipi).
+ */
+#define SCHED_LOCK_LOCAL() sched_lock(&LOCAL_DPP->lock)
+#define SCHED_UNLOCK_LOCAL() sched_unlock(&LOCAL_DPP->lock)
+#define SCHED_LOCK(dpp) sched_lock(&(dpp)->lock)
+#define SCHED_UNLOCK(dpp) sched_unlock(&(dpp)->lock)
 
 #if NUM_PRI <= 8
 
 #define DISPATCH_HIGHEST_PRI(dpp) (byte_log2[(dpp)->lo])
+#define DISPATCH_ANY(dpp) __atomic_load_n(&(dpp)->lo, __ATOMIC_RELAXED)
 #define DISPATCH_ISSET(dpp, pri) ((dpp)->lo & (1 << pri))
 #define DISPATCH_SET(dpp, thp)             \
     {                                      \
@@ -61,6 +66,7 @@
 #define DISPATCH_HI(dpp) byte_log2[(dpp)->hi]
 #define DISPATCH_LO(dpp) byte_log2[(dpp)->lo[DISPATCH_HI(dpp)]]
 #define DISPATCH_HIGHEST_PRI(dpp) ((DISPATCH_HI(dpp) << 3) | DISPATCH_LO(dpp))
+#define DISPATCH_ANY(dpp) __atomic_load_n(&(dpp)->hi, __ATOMIC_RELAXED)
 #define DISPATCH_ISSET(dpp, pri) ((dpp)->lo[pri >> 3] & (1 << (pri & 7)))
 
 #define DISPATCH_SET(dpp, thp)                       \
@@ -85,6 +91,11 @@
     byte_log2[(dpp)->lo[DISPATCH_HI(dpp)][DISPATCH_MID(dpp)]]
 #define DISPATCH_HIGHEST_PRI(dpp) \
     ((DISPATCH_HI(dpp) << 6) | (DISPATCH_MID(dpp) << 3) | DISPATCH_LO(dpp))
+/* Lock-free: whether anything is queued at all, for a stealer to skip an empty
+ * remote queue without taking its lock. Racy by design: a thread queued just
+ * after the peek is found by the kick that queueing sends, or the next scan.
+ */
+#define DISPATCH_ANY(dpp) __atomic_load_n(&(dpp)->hi, __ATOMIC_RELAXED)
 #define DISPATCH_ISSET(dpp, pri) \
     ((dpp)->lo[pri >> 6][(pri >> 3) & 7] & (1 << (pri & 7)))
 
@@ -564,6 +575,20 @@ static __inline__ void __attribute__((__unused__)) atomic_boundary()
 
 #define RTMUX_ITF_MSG_DELIVERY 0x01U
 #define RTMUX_ITF_MSG_FORCE_RDY 0x02U
+
+/* A deliverer (a send, a notification) that has just unlinked receiver thp
+ * from its channel's receive queue, under the channel lock, says so here:
+ * from then until the deliverer readies it, with the lock dropped, thp is
+ * still in STATE_RECEIVE but on no queue. force_ready takes a receiver's
+ * blocked_on for the channel whose queue it is on, so it must stop naming
+ * one in the step that unlinks it.
+ */
+#define RECEIVER_TAKEN(thp)                                           \
+    do {                                                              \
+        __atomic_store_n(&(thp)->blocked_on, NULL, __ATOMIC_RELEASE); \
+        IPC_BLK(thp);                                                 \
+    } while (0)
+
 #define RTMUX_ITF_NET_UNBLOCK 0x04U /* for vthread only */
 #define RTMUX_ITF_SSTEP_SUSPEND 0x08U
 

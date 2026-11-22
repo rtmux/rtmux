@@ -108,11 +108,18 @@ struct idle_stack {
  * the priority bit when the level empties. Caller holds the dpp lock.
  *
  * Returns 1 if the thread was unlinked, 0 if it was no longer at the expected
- * queue position (lost a race).
+ * queue position (lost a race) or is still current on another hart.
  */
-static int idle_unlink_ready(kdispatch_t *dpp, thread_t *thp)
+static int idle_unlink_ready(kdispatch_t *dpp, thread_t *thp, unsigned cpu)
 {
     LINK3_HDR *queue = &DISPATCH_LST(dpp, thp->priority);
+
+    /* Leave a thread another hart still has current (thread_current_elsewhere):
+     * that hart has not switched away from it yet.
+     */
+    if (thread_current_elsewhere(thp, cpu))
+        return 0;
+    dispatch_owner_pick(thp, __builtin_return_address(0));
 
     if (!thp->link3_link.prev) {
         if (queue->head != &thp->link3_link)
@@ -178,7 +185,7 @@ thread_t *idle_pick_thread(unsigned cpu)
              thp = link3_to_thread(thp->link3_link.next)) {
             if (thp->state == STATE_READY &&
                 (thp->runmask & (1u << cpu)) == 0) {
-                if (!idle_unlink_ready(dpp, thp))
+                if (!idle_unlink_ready(dpp, thp, cpu))
                     continue;
                 thp->state = STATE_RUNNING;
                 thp->runcpu = cpu;
@@ -201,9 +208,10 @@ thread_t *idle_pick_thread(unsigned cpu)
         if (src_cpu == cpu)
             continue;
         dpp = pcpu_array[src_cpu].pc_dispatch;
-        if (!dpp)
-            continue;
+        if (!dpp || !DISPATCH_ANY(dpp))
+            continue; /* empty: not worth its lock (DISPATCH_ANY) */
         sie = kspinlock_lock_irqsave(&dpp->lock);
+        inject_note_empty_steal_lock(dpp);
         for (int pri = NUM_PRI - 1; pri >= 0; pri--) {
             if (!DISPATCH_ISSET(dpp, pri))
                 continue;
@@ -211,7 +219,7 @@ thread_t *idle_pick_thread(unsigned cpu)
                  thp = link3_to_thread(thp->link3_link.next)) {
                 if (thp->state == STATE_READY &&
                     (thp->runmask & (1u << cpu)) == 0) {
-                    if (!idle_unlink_ready(dpp, thp))
+                    if (!idle_unlink_ready(dpp, thp, cpu))
                         continue;
                     /* Migrate ownership to this CPU's instance. */
                     thp->dpp = pcpu_array[cpu].pc_dispatch;
@@ -230,7 +238,8 @@ thread_t *idle_pick_thread(unsigned cpu)
     for (int t = 0; t < kernel_threads_prp->threads.nentries; t++) {
         thp = vector_lookup(&kernel_threads_prp->threads, (unsigned) t);
         if (thp && thp->state == STATE_READY &&
-            (thp->runmask & (1u << cpu)) == 0) {
+            (thp->runmask & (1u << cpu)) == 0 &&
+            !thread_current_elsewhere(thp, cpu)) {
             thp->dpp = pcpu_array[cpu].pc_dispatch;
             thp->state = STATE_RUNNING;
             thp->runcpu = cpu;

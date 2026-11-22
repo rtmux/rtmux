@@ -52,6 +52,58 @@ static int proc_may_signal(const struct _cred_info *s,
     return signo == SIGCONT && s_sid != 0 && s_sid == t_sid;
 }
 
+/* signal_post_locked — deliver signo to process pid, or keep it for later.
+ *
+ * A signal is a notification on the target's system channel, which its libc
+ * registers early in crt0. A process can be named by kill from the moment its
+ * spawn returns, which is before that, so a signal for a live process with no
+ * channel yet is kept in its slot and proc_syschan delivers it when the channel
+ * appears. Like libc's own pending set, the kept set holds one instance of a
+ * signal, and one sender, the last, for all of them. A process that never
+ * registers a channel (it is not linked with this libc, or its start-up failed)
+ * is not ended by a kept SIGKILL: ending a process without its cooperation is a
+ * separate mechanism that does not exist yet. Called with root_proc_lock(pid)
+ * held. Parameters:
+ *   pid    : the target
+ *   chp    : its system channel from a process_query_info taken under the
+ *            same lock, or NULL if it has none yet
+ *   signo  : the signal, 1 .. NSIG-1
+ *   sender : pid reported to the handler
+ */
+void signal_post_locked(pid_t pid, channel_t *chp, int signo, pid_t sender)
+{
+    if (chp) {
+        signal_kill(chp, signo, sender);
+    } else {
+        root_proc(pid)->early_sigs |= 1ULL << signo;
+        root_proc(pid)->early_sender = sender;
+    }
+}
+
+/* signal_flush_early_locked — deliver what signal_post_locked kept.
+ *
+ * Called by proc_syschan once the system channel is registered, with
+ * root_proc_lock(pid) held across the registration and this call, so no signal
+ * is kept after the flush or delivered ahead of an earlier one. A kept SIGKILL
+ * is delivered alone: nothing else matters once it is pending.
+ */
+void signal_flush_early_locked(pid_t pid)
+{
+    root_process_t *slot = root_proc(pid);
+    uint64_t sigs = slot->early_sigs;
+    root_proc_info_t qinfo;
+
+    /* Kept until there is a channel to deliver them on. */
+    if (!sigs || process_query_info(pid, &qinfo) != EOK || !qinfo.sys_chp)
+        return;
+    slot->early_sigs = 0;
+    if (sigs & (1ULL << SIGKILL))
+        sigs = 1ULL << SIGKILL;
+    for (int signo = 1; signo < NSIG; signo++)
+        if (sigs & (1ULL << signo))
+            signal_kill(qinfo.sys_chp, signo, slot->early_sender);
+}
+
 /* Which processes a kill() pid argument selects. */
 enum kill_scope { KILL_ONE, KILL_PGRP, KILL_ALL };
 
@@ -82,10 +134,13 @@ static int signal_one(const struct signal_sender *snd,
         return ESRCH;
 
     /* Only the existence probe treats a dying or zombie target as gone; real
-     * signals are still delivered to it, as before.
+     * signals are still delivered to it, as before. A target with no system
+     * channel is one that has not registered it yet (it is signalled through
+     * signal_post_locked) unless it is on its way out, when the channel is gone
+     * for good.
      */
-    if (process_query_info(target_pid, &qinfo) != EOK || !qinfo.sys_chp ||
-        (signo == 0 && (qinfo.flags & dead))) {
+    if (process_query_info(target_pid, &qinfo) != EOK ||
+        ((qinfo.flags & dead) && (signo == 0 || !qinfo.sys_chp))) {
         rc = ESRCH;
     } else if ((scope == KILL_PGRP && qinfo.pgrp != pgrp) ||
                (scope == KILL_ALL &&
@@ -97,7 +152,7 @@ static int signal_one(const struct signal_sender *snd,
                              qinfo.sess_leader)) {
             rc = EPERM;
         } else if (signo != 0) {
-            signal_kill(qinfo.sys_chp, signo, snd->pid);
+            signal_post_locked(target_pid, qinfo.sys_chp, signo, snd->pid);
         }
     }
 

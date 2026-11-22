@@ -867,6 +867,20 @@ static void test_reap_races(int fd)
     gauge_check(fd, "detached (NOZOMBIE) children", "soul.process.used", process0);
 }
 
+/* Opt-in reproducer: just the detach race, laps times over. */
+void test_detach_race_laps(int laps)
+{
+    int fd = open("/sys/kstats", O_RDONLY);
+
+    if (fd < 0) {
+        test_fail("detach-race open /sys/kstats", strerror(errno));
+        return;
+    }
+    for (int i = 0; i < laps; i++)
+        test_detach_race(fd);
+    (void) close(fd);
+}
+
 void test_gauges(void)
 {
     int fd = open("/sys/kstats", O_RDONLY);

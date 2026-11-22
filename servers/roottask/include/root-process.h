@@ -175,6 +175,15 @@ typedef struct root_process_entry {
      */
     uint32_t tty_hold;
 
+    /* Signals sent to the process before its libc registered the system
+     * channel they are delivered on (_PROC_SYSCHAN, early in crt0): bit signo
+     * of early_sigs is set, and early_sender is the last sender. proc_syschan
+     * delivers them once the channel exists. Under root_proc_lock(pid).
+     * early_sender comes first so that it shares a word with tty_hold.
+     */
+    pid_t early_sender;
+    uint64_t early_sigs;
+
     /* Executable path saved at _PROC_SPAWN_DEBUG time. Read by:
      *   - servers/roottask/path/procfs.c (DEVCTL_PROC_MAPDEBUG_BASE,
      * /proc/PID/name)

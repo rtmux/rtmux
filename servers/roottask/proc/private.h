@@ -47,7 +47,6 @@ struct proc_snap {
     pid_t fg;  /* foreground group of the session's terminal */
     int fd;    /* roottask's descriptor to the terminal, or -1 */
     unsigned flags;
-    channel_t *chp;       /* the process's system channel */
 };
 
 int proc_snapshot(pid_t pid, struct proc_snap *s);

@@ -163,7 +163,22 @@ struct pcpu {
      * anything (thread_block_recheck). Owner hart only.
      */
     struct thread_entry *pc_block_recheck;
-    uint8_t pc_pad[56]; /* keep sizeof(struct pcpu) power-of-two */
+
+    /* The client force_ready is making an unblock notification for, for the
+     * length of that notification_deliver call: a server that is waiting gets
+     * the notification at once, and is told whose request it is about
+     * (msg_unblock_received). Owner hart only.
+     */
+    const struct thread_entry *pc_unblock_client;
+
+    /* Dispatch locks this hart holds (SCHED_LOCK nesting), and the CPUs whose
+     * reschedule IPIs it queued meanwhile: send_ipi posts the command bits at
+     * once but leaves the SBI call to the outermost SCHED_UNLOCK, so no SBI
+     * call is made with a dispatch lock held. Owner hart only.
+     */
+    uint64_t pc_ipi_defer;
+    uint8_t pc_sched_depth;
+    uint8_t pc_pad[39]; /* keep sizeof(struct pcpu) power-of-two */
 };
 
 #ifndef __cplusplus

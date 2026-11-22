@@ -38,6 +38,10 @@ ifdef CONFIG_DEBUG_INJECT
 KER_SRC += debug/inject
 endif
 
+ifdef CONFIG_DEBUG_DISPATCH_OWNER
+KER_SRC += debug/dispatch-owner
+endif
+
 # RCU lookup lifetime support lives in sync/rcu.
 # Note: calls is arch-specific (RISC-V __kcall_dispatch).
 # It's built as part of ARCH_SRC in arch/riscv/Makefile.

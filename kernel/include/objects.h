@@ -487,6 +487,7 @@ typedef struct notification_entry {
     intptr_t id; /* scoid if TYPE_NOTIFICATION */
 
     unsigned count;
+    uint64_t gen; /* an unblock notification's request; see req_gen */
 } notification_t;
 
 /* Entries for the sporadic scheduling policy */
@@ -720,6 +721,13 @@ typedef struct thread_entry { /* Also used for vthread_entry */
     uintptr_t debug_sync_mutex;
     int32_t last_chid;
     void *status;
+
+    /* Request identity (kernel/ipc/message-core.c). req_gen names the request
+     * this thread last sent. rcv_key is what this thread last received as a
+     * server: an rcvid and the request behind it, in one word.
+     */
+    uint64_t req_gen;
+    uint64_t rcv_key;
 #define SIZEOF_VTHREAD offsetof(struct thread_entry, timeout)
     /* Items below are not needed for type=vthread_t */
     ktimer_t *timeout;
@@ -883,6 +891,26 @@ typedef struct thread_entry { /* Also used for vthread_entry */
         size_t soff, doff;
         bool armed;
     } xcur;
+
+#ifdef CONFIG_DEBUG_DISPATCH_OWNER
+    /* Dispatch-owner tripwire (kernel/debug/dispatch-owner.c): 1 + the hart
+     * whose pc_curthread this is, or 0, claimed and released with a
+     * compare-and-swap by that hart; and the thread's last dispatch and last
+     * wakeup, for the report. Real threads only: a vthread soul ends before
+     * these fields.
+     */
+    struct {
+        uint32_t oncpu;
+        uint8_t run_cpu;
+        void *run_ra;
+        uint64_t run_t;
+        struct {
+            uint8_t cpu, state;
+            void *ra;
+            uint64_t t;
+        } wake[2]; /* the last two wakeups, newest first */
+    } dbg_owner;
+#endif
 } thread_t;
 
 /* Map a dispatch-list LINK3_NODE pointer back to its enclosing thread_t. The

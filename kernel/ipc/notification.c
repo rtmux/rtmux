@@ -6,7 +6,22 @@
  */
 
 #include <core/globals.h>
+#include "reply-client.h"
 
+
+/* The identity of the request an unblock notification is being made for
+ * (force_ready names the client for the length of its notification_deliver
+ * call), or 0 for any other notification. An unblock notification names an
+ * rcvid, which the client's next request has too: the identity goes with the
+ * notification to the server thread that takes it, and two notifications for
+ * different requests are not folded into one.
+ */
+static uint64_t notification_request(int code)
+{
+    const thread_t *client = pcpu_array[get_cpunum()].pc_unblock_client;
+
+    return code == _NOTIFICATION_CODE_UNBLOCK && client ? client->req_gen : 0;
+}
 
 /* The send queue contains both threads and notifications. A kernel terminal
  * signal carries a priority loan that ordinary notifications cannot borrow.
@@ -53,6 +68,7 @@ notification_t *rdecl notification_add(process_t *prp,
         while ((pup) && (pup->priority == (uint8_t) priority)) {
             if (notification_matches(pup, terminal_signal, code, id)) {
                 pup->value = value;
+                pup->gen = notification_request(code);
                 overrun = 1;
                 return pup;
             }
@@ -61,7 +77,8 @@ notification_t *rdecl notification_add(process_t *prp,
     } else {
         pup = pril_find_insertion(queue, (unsigned) priority);
         if (notification_matches(pup, terminal_signal, code, id) &&
-            (pup->value == value) && (pup->count < _NOTIFICATION_COUNT_MAX)) {
+            (pup->value == value) && pup->gen == notification_request(code) &&
+            (pup->count < _NOTIFICATION_COUNT_MAX)) {
             /* We can compress this notification */
             ++pup->count;
             return pup;
@@ -88,6 +105,7 @@ notification_t *rdecl notification_add(process_t *prp,
     pup->code = (int8_t) code;
     pup->value = value;
     pup->id = id;
+    pup->gen = notification_request(code);
 
     /* Enqueue it. */
 
@@ -140,7 +158,7 @@ notification_t *rdecl notification_add_reserved(process_t *prp,
 
     for (pup = pril_first(queue); pup; pup = pril_next(pup)) {
         if (notification_matches(pup, terminal_signal, code, id) &&
-            pup->value == value) {
+            pup->value == value && pup->gen == notification_request(code)) {
             if (pup->priority != (uint8_t) priority) {
                 pril_rem(queue, pup);
                 pup->priority = (uint8_t) priority;
@@ -167,6 +185,7 @@ notification_t *rdecl notification_add_reserved(process_t *prp,
     pup->code = (int8_t) code;
     pup->value = value;
     pup->id = id;
+    pup->gen = notification_request(code);
     pril_add(queue, pup);
     return pup;
 }
@@ -258,7 +277,6 @@ int rdecl notification_deliver(channel_t *chp,
 
         ITF_CLR(thp, RTMUX_ITF_RCVNOTIFICATION);
         thp->restart = NULL;
-
         /* Yes. Transfer the data. */
         if (((get_inkernel() & (INKERNEL_LOCK | INKERNEL_NOW)) ==
              INKERNEL_NOW) &&
@@ -278,6 +296,13 @@ int rdecl notification_deliver(channel_t *chp,
 
         if (status) {
             kcall_err(thp, EFAULT);
+        } else {
+            /* What thp holds now is this notification, unless the copy
+             * failed and its receive with it. (A copy put off to its
+             * special return is taken as made.)
+             */
+            msg_notification_received(thp, code, (int) value,
+                                      notification_request(code));
         }
 
         /* Unlink receive thread from the receive queue and ready it.
@@ -288,6 +313,7 @@ int rdecl notification_deliver(channel_t *chp,
          */
         kspinlock_lock(&chp->lock);
         LINKPRIL_REM(thp);
+        RECEIVER_TAKEN(thp);
 #if CONFIG_PROCESSORS_MAX > 1 && defined(CONFIG_SMP_MSGOPT)
         atomic_clr((volatile unsigned *) &thp->internal_flags,
                    RTMUX_ITF_MSG_DELIVERY);

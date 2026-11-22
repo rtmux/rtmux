@@ -61,13 +61,14 @@ if ! awk '
     in_unready_release && /thp != get_active_thread\(get_cpunum\(\)\)/ {
         saw_guard = NR
     }
-    in_unready_release && /SCHED_LOCK_LOCAL\(\);/ {
-        saw_lock = NR
+    in_unready_release && /block_release\(newstate, to_release\);/ {
+        saw_block = NR
     }
     in_unready_release && /^}/ { in_unready_release = 0 }
-    END { exit !(saw_guard && saw_lock && saw_guard < saw_lock) }
+    END { exit !(saw_guard && saw_block && saw_guard < saw_block) }
 ' kernel/sched/dispatch.c; then
     echo "RCU-sched: unready_release must fail before blocking a non-active thread" >&2
+    echo "RCU detail: unready guard" >&2
     exit 1
 fi
 
@@ -2003,9 +2004,22 @@ if ! awk '
     in_gate && /while \(state == STATE_DEAD && active_remote\)/ {
         saw_dead_loop = NR
     }
+    # The first reload after the loop header is the one inside the loop; the
+    # recheck after KILLSELF is published reads the state again later.
     in_gate && /state = thread_state_load_acquire\(thp\)/ {
-        if (saw_dead_loop)
+        if (saw_dead_loop && !saw_reload)
             saw_reload = NR
+    }
+    # After KILLSELF is published the gate must read the state again, with an
+    # acquire load, before it picks how to steer the thread.
+    in_gate && /RTMUX_FLG_THR_KILLSELF/ { saw_killself = NR }
+    in_gate && saw_killself && !saw_recheck &&
+        /state = thread_state_load_acquire\(thp\)/ {
+        saw_recheck = NR
+    }
+    in_gate && /(^|[^_[:alnum:]])state = / &&
+        !/state = thread_state_load_acquire\(thp\)/ {
+        saw_plain = NR
     }
     in_gate && /state != STATE_DEAD/ {
         if (!saw_not_dead)
@@ -2018,14 +2032,17 @@ if ! awk '
     }
     in_destroy && /FPU buffer should be freed already/ { in_destroy = 0 }
     END {
-        exit !(saw_helper && saw_initial && saw_dead_loop && saw_reload &&
+        exit !(!saw_plain &&
+               saw_helper && saw_initial && saw_dead_loop && saw_reload &&
                saw_not_dead && saw_running && saw_final &&
                saw_helper < saw_initial && saw_initial < saw_dead_loop &&
                saw_dead_loop < saw_reload && saw_reload < saw_not_dead &&
-               saw_not_dead < saw_running && saw_running < saw_final)
+               saw_not_dead < saw_killself && saw_killself < saw_recheck &&
+               saw_recheck < saw_running && saw_running < saw_final)
     }
 ' kernel/thread/lifecycle.c; then
     echo "RCU-sched: thread_destroy quiescence gate must use acquire state loads" >&2
+    echo "RCU detail: destroy acquire" >&2
     exit 1
 fi
 

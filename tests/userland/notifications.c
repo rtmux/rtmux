@@ -7,6 +7,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <devctl.h>
+#include <devctl/proc.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -23,6 +25,7 @@
 #include <sched.h>
 #include <stdalign.h>
 #include <unistd.h>
+#include <sys/procfs.h>
 #include <sys/rtmux-core.h>
 
 #include "test.h"
@@ -266,6 +269,32 @@ int inject_run(const char *a1, const char *a2, const char *a3)
         waitpid(pid, &st, 0) != pid || !WIFEXITED(st))
         return -1;
     return WEXITSTATUS(st);
+}
+
+/* Wait, for three seconds at most, until thread tid of this process is blocked
+ * in state: the way to know which side of an exchange is already waiting.
+ */
+int test_thread_blocked(pthread_t tid, int state)
+{
+    char path[32];
+    int found = 0, fd;
+
+    snprintf(path, sizeof path, "/proc/%d", (int) getpid());
+    fd = open(path, O_RDONLY);
+    if (fd < 0)
+        return 0;
+    for (int i = 0; i < 300 && !found; i++) {
+        procfs_status st = {.tid = tid};
+
+        if (devctl(fd, DEVCTL_PROC_TIDSTATUS, &st, sizeof st, NULL) != EOK ||
+            st.tid != tid)
+            break;
+        found = st.state == state;
+        if (!found)
+            sleep_ms(10);
+    }
+    close(fd);
+    return found;
 }
 
 /* Keep the observer process alive through the injected window. Reaping an

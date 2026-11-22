@@ -380,6 +380,21 @@ void halt(void)
     }
 }
 
+/* No SBI call is made with a dispatch lock held: the call traps to the
+ * firmware, and a hart spinning on the lock waits for it. The debug build
+ * checks it at the calls the scheduler makes.
+ */
+#ifdef CONFIG_DEBUG_DISPATCH_OWNER
+#define SBI_NO_DISPATCH_LOCK()                                               \
+    do {                                                                     \
+        if (get_pcpu()->pc_sched_depth)                                      \
+            crash_halt("sbi call on cpu %u with a dispatch lock held",       \
+                       get_cpunum());                                        \
+    } while (0)
+#else
+#define SBI_NO_DISPATCH_LOCK() ((void) 0)
+#endif
+
 /* send_ipi — send an inter-processor interrupt.
  *
  * OR the command bits into the target hart's pending-IPI word and call
@@ -420,7 +435,30 @@ void rdecl send_ipi(unsigned cpu, int cmd)
         atomic_fetch_or_explicit(&pcpu_array[cpu].pc_ipicmds, (unsigned) cmd,
                                  memory_order_release);
     }
+
+    /* Under a dispatch lock, leave the SBI call to the outermost unlock
+     * (sched_unlock): it traps to the firmware and can take long, and the
+     * target would only spin on the lock this hart holds. The command bits are
+     * already posted, so a target that runs ipi_handler for another reason
+     * meanwhile acts on them; the later call is then a spurious interrupt.
+     */
+    if (get_pcpu()->pc_sched_depth) {
+        get_pcpu()->pc_ipi_defer |= 1ULL << cpu;
+        return;
+    }
+    SBI_NO_DISPATCH_LOCK();
     sbi_send_ipi(1UL, hart_ids[cpu]);
+}
+
+/* Make the SBI calls send_ipi queued while this hart held a dispatch lock. */
+void rdecl send_ipi_deferred(uint64_t cpus)
+{
+    extern unsigned hart_ids[];
+
+    SBI_NO_DISPATCH_LOCK();
+    for (unsigned cpu = 0; cpus; cpu++, cpus >>= 1)
+        if (cpus & 1)
+            sbi_send_ipi(1UL, hart_ids[cpu]);
 }
 
 /* cpu_icache_sync_all — make freshly-written instructions visible to
@@ -467,6 +505,25 @@ void cpu_icache_sync_all(void)
 void rdecl smp_flush_tlb(void)
 {
     __asm__ volatile("sfence.vma" ::: "memory");
+}
+
+/* Make idle_pick_thread's thread this hart's current thread, if it still is
+ * ours to run. The pick left it RUNNING with thp->dpp naming this hart's queue,
+ * and an unready() since (a stop, a teardown) gives it a wait state under that
+ * queue's lock: test and publish under the same lock. A thread given up is
+ * left to its next wakeup, which queues it again.
+ */
+static bool idle_claim(unsigned cpu, thread_t *thp)
+{
+    unsigned long sie = kspinlock_lock_irqsave(&LOCAL_DPP->lock);
+    bool ours = thp->state == STATE_RUNNING;
+
+    if (ours) {
+        sched_account_restart(); /* idle time is billed to nobody */
+        set_active_thread(cpu, thp);
+    }
+    kspinlock_unlock_irqrestore(&LOCAL_DPP->lock, sie);
+    return ours;
 }
 
 /* cpu_idle — per-CPU idle loop (all CPUs are treated equally). Timer interrupts
@@ -576,19 +633,19 @@ void cpu_idle(unsigned cpu)
                     cpu, (void *) thp, thp->tid);
                 crash();
             }
-            /* Idle is about to be displaced by a real thread. Flip its state to
-             * READY so /proc readers show it in the runqueue-visible ready
-             * bucket.
-             */
-            if (pcpu_array[cpu].pc_idle_thp)
-                pcpu_array[cpu].pc_idle_thp->state = STATE_READY;
-
             /* thp->state and thp->runcpu were set under sched_slock inside
              * idle_pick_thread() — don't re-write here. The per-CPU slots below
              * are single-writer (this CPU only).
              */
-            sched_account_restart(); /* idle time is billed to nobody */
-            set_active_thread(cpu, thp);
+            if (!idle_claim(cpu, thp))
+                continue; /* stopped or torn down since the pick */
+
+            /* Idle is displaced by a real thread now that the claim held. Flip
+             * its state to READY so /proc readers show it in the
+             * runqueue-visible ready bucket.
+             */
+            if (pcpu_array[cpu].pc_idle_thp)
+                pcpu_array[cpu].pc_idle_thp->state = STATE_READY;
             pcpu_array[cpu].pc_active_prp = thp->process;
 
             if (!kopt.disable_timer)
@@ -698,10 +755,10 @@ void cpu_idle(unsigned cpu)
                 if (late) {
                     if (!late->process)
                         crash();
+                    if (!idle_claim(cpu, late))
+                        continue;
                     if (pcpu_array[cpu].pc_idle_thp)
                         pcpu_array[cpu].pc_idle_thp->state = STATE_READY;
-                    sched_account_restart();
-                    set_active_thread(cpu, late);
                     pcpu_array[cpu].pc_active_prp = late->process;
                     if (!kopt.disable_timer)
                         arch_timer_reload(qtimeptr);
@@ -1166,6 +1223,7 @@ static void arch_timer_program_next(struct qtime_entry *qtp, int idle)
          */
         delta_ns = next > now ? next - now : TIMER_BACKLOG_DELTA_NS;
         atomic_or_64(&qtp->flags, QTIME_FLAG_TICKLESS);
+        SBI_NO_DISPATCH_LOCK();
         sbi_set_timer(r_time() + timer_delta_cycles(qtp, delta_ns));
         return;
     }
@@ -1199,6 +1257,7 @@ static void arch_timer_program_next(struct qtime_entry *qtp, int idle)
      * unrelated flag bits.
      */
     atomic_clr_64(&qtp->flags, QTIME_FLAG_TICKLESS);
+    SBI_NO_DISPATCH_LOCK();
     sbi_set_timer(r_time() + timer_delta_cycles(qtp, delta_ns));
 }
 

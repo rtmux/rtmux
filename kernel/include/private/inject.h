@@ -217,6 +217,56 @@ enum {
  */
 #define INJECT_OP_INTR_SELECT_SEEN 32
 
+/* STALL_READY(pid, tid << 32 | ms): the next wakeup of thread tid (as
+ * pthread_t) of pid stalls for ms milliseconds at the start of ready(), when
+ * its waker has claimed the wait and the thread still reads as waiting. A
+ * second waker that claims the same wait meanwhile readies it twice.
+ */
+#define INJECT_OP_STALL_READY 36
+
+/* STALL_SWITCH(pid, tid << 32 | ms): thread tid of pid holds its hart for ms
+ * milliseconds the next time that hart is about to switch away from it: while
+ * block() looks at the other harts for a thread to steal, with the dispatch
+ * lock dropped, or after a reschedule has queued it READY. A wakeup or a steal
+ * in that window finds it still the hart's current thread.
+ */
+#define INJECT_OP_STALL_SWITCH 37
+
+/* STALL_SEND_PICK(pid, tid << 32 | ms): thread tid (as pthread_t) of pid
+ * stalls in its next msg_sendv right after it has looked for a waiting
+ * receiver and dropped the channel lock: the window in which the receiver it
+ * saw, if it did not claim it, is woken by somebody else.
+ */
+#define INJECT_OP_STALL_SEND_PICK 38
+
+/* GRANT_IPC_CAP(pid): give pid RTMUX_PRIV_CAP_IPC, which a started process
+ * never holds, so that a test can register as the remote IPC service and
+ * reach the kernel's remote IPC paths. EBUSY for a process still loading:
+ * its start sets its capabilities and would drop the grant.
+ */
+#define INJECT_OP_GRANT_IPC_CAP 39
+
+/* STALL_STEAL(pid, tid << 32 | ms): the next steal of thread tid of pid from
+ * another hart's run queue holds the stealing hart for ms milliseconds between
+ * the two dispatch locks, with the thread off every queue and not yet current:
+ * an unready() meanwhile finds it in transit.
+ */
+#define INJECT_OP_STALL_STEAL 40
+
+/* POKE(pid, tid << 8 | action): act on thread tid (as pthread_t) of pid as a
+ * stray waker or a teardown would: INJECT_POKE_READY calls ready() on it,
+ * INJECT_POKE_STOP unready()s it into STATE_STOPPED. For tests that hold a
+ * scheduler window open and need a second party in it. ret is EOK or ESRCH.
+ */
+#define INJECT_OP_POKE 41
+#define INJECT_POKE_READY 0
+#define INJECT_POKE_STOP 1
+
+/* SCHED_STATS(what): what 0, ret is how many remote dispatch locks a steal
+ * scan took on a queue it then found empty, since boot.
+ */
+#define INJECT_OP_SCHED_STATS 42
+
 enum inject_site {
     STALL_LOCK,
     STALL_LOCK_EARLY,
@@ -229,6 +279,10 @@ enum inject_site {
     STALL_CLAIM_HELD,
     STALL_FORCE_CLAIMED,
     STALL_CAP_PEEK,
+    STALL_READY,
+    STALL_SWITCH,
+    STALL_SEND_PICK,
+    STALL_STEAL,
     STALL_SITES,
     INJECT_SITE_TURNSTILE = STALL_SITES,
     INJECT_SITE_REPLY_DETACHED

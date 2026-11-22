@@ -896,23 +896,34 @@ static void sync_turnstile_bound_remove_locked(turnstile_t *ts, thread_t *thp)
     }
 }
 
+/* Caller holds c->lock, the chain thp is queued on or bound to.
+ *
+ * thp->blocked_on_turnstile is written only under that chain lock (the bind
+ * above and the clear here; a turnstile hashes to the chain of the key its
+ * waiters queue under), so it cannot change while the lock is held and a NULL
+ * read needs no other lock. That keeps the global PI lock off every wake,
+ * timeout and signal of a waiter that inherits nothing: a semaphore, a
+ * condition variable, a mutex without PRIO_INHERIT. The clear itself stays
+ * under sync_pi_slock, which is what lets sync_thread_blocked_ts_ref() read the
+ * pointer and take its reference without the chain lock.
+ */
 static void sync_turnstile_unbind_waiter_locked(struct sync_chain *c,
                                                 thread_t *thp)
 {
-    turnstile_t *ts;
+    turnstile_t *ts = thp->blocked_on_turnstile;
+
+    if (!ts)
+        return;
 
     kspinlock_lock(&sync_pi_slock);
-    ts = thp->blocked_on_turnstile;
     thp->blocked_on_turnstile = NULL;
     kspinlock_unlock(&sync_pi_slock);
 
-    if (ts) {
-        if (ts->contenders == 0)
-            crash();
-        ts->contenders--;
-        sync_turnstile_bound_remove_locked(ts, thp);
-        sync_turnstile_update_max_locked(c, ts);
-    }
+    if (ts->contenders == 0)
+        crash();
+    ts->contenders--;
+    sync_turnstile_bound_remove_locked(ts, thp);
+    sync_turnstile_update_max_locked(c, ts);
 }
 
 static void sync_turnstile_free_idle_locked(struct sync_chain *c,
@@ -1183,23 +1194,32 @@ bool rdecl sync_chain_force_ready(thread_t *thp)
         kspinlock_unlock(&c->lock);
         return false;
     }
-    kspinlock_lock(&sync_pi_slock);
+    /* Stable under the chain lock; see sync_turnstile_unbind_waiter_locked().
+     * A waiter bound to no turnstile lends nothing and has no owner to
+     * recompute, so it leaves without touching the PI lock.
+     */
     ts = thp->blocked_on_turnstile;
-    owner = sync_turnstile_owner_pin_locked(ts);
-    kspinlock_unlock(&sync_pi_slock);
+    owner = ts ? sync_turnstile_owner_pin(ts) : NULL;
     sync_dequeue(c, thp);
-    if (thp->state == STATE_MUTEX && !sync_has_waiter(c, key)) {
-        if (ts)
-            sync_turnstile_free_idle_locked(c, ts);
-    }
+    if (ts && thp->state == STATE_MUTEX && !sync_has_waiter(c, key))
+        sync_turnstile_free_idle_locked(c, ts);
     kspinlock_unlock(&c->lock);
-    sync_pi_recompute_owner(owner);
-    if (owner)
+    if (owner) {
+        sync_pi_recompute_owner(owner);
         tthread_unpin(owner);
+    }
     return true;
 }
 
 /* User sync_t probing and validation. */
+
+/* Whether the sync_t at va crosses a page boundary: its two words then lie
+ * behind two mappings, and it has no single physical alias.
+ */
+static inline bool sync_straddles_page(uintptr_t va)
+{
+    return (va & (__PAGESIZE - 1)) > __PAGESIZE - sizeof(sync_t);
+}
 
 /* Validate the user pointer and fault-in the sync_t.
  *
@@ -1219,7 +1239,16 @@ static int sync_probe(thread_t *act, sync_t *sync)
         return EFAULT;
     }
     /* SMP-safe, fault-safe touch: OR-ing 0 probes without changing the word. */
-    if (xfer_atomic_or_user((volatile unsigned *) &sync->count, 0) ||
+    if (xfer_atomic_or_user((volatile unsigned *) &sync->count, 0))
+        return EFAULT;
+
+    /* count and owner are two aligned words, so they share a page, its
+     * mapping and its access rights unless the object straddles a page
+     * boundary: the write probe of count then answers for owner too. Only a
+     * straddling object, which the alignment check above still admits, needs
+     * the second probe.
+     */
+    if (sync_straddles_page((uintptr_t) sync) &&
         xfer_atomic_or_user((volatile unsigned *) &sync->owner, 0))
         return EFAULT;
     return 0;
@@ -1738,10 +1767,10 @@ static sync_t *robust_word_locked(process_t *prp, sync_t *uva, sync_key_t key)
     uintptr_t va = (uintptr_t) uva;
     paddr_t pa;
 
-    /* A sync_t is 16-byte aligned by ABI, but sync_probe() only checks 4 bytes;
-     * one that straddles a page has no single physical alias.
+    /* sync_probe() admits a sync_t aligned for its words only, so one can
+     * straddle a page.
      */
-    if (!prp || !uva || (va & (__PAGESIZE - 1)) > __PAGESIZE - sizeof(sync_t))
+    if (!prp || !uva || sync_straddles_page(va))
         return NULL;
     if (!(vm_ops->vaddrinfo(prp->pid, prp, va, &pa, NULL, VI_NORMAL) &
           PROT_WRITE) ||
@@ -3185,6 +3214,11 @@ int kdecl ksys_sync_mutex_revive(thread_t *act,
     if (sync->owner == RTMUX_SYNC_DEAD ||
         sync->owner == RTMUX_SYNC_MUTEX_FREE ||
         sync->owner == RTMUX_SYNC_INITIALIZER) {
+        /* The word may already have waiters (a stale DEAD word reads as an
+         * owner to a locker, which queues): register the new owner, so that
+         * its death finds them.
+         */
+        (void) sync_track_owner(act);
         sync->owner = SYNC_OWNER(act);
         sync->count = 0;
         return ENOERROR;

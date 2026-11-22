@@ -573,6 +573,7 @@ more than one dispatch lock is needed.
 | `STATE_RECEIVE`, `STATE_REPLY`, `STATE_SEND`, `STATE_INTR` | blocking wait states | Exact wake source is RTMux IPC/interrupt state, not Linux wait queues. |
 | `STATE_NANOSLEEP` | timed interruptible sleep analogue | Timeout path must preserve bridge-bit and scheduler ordering. |
 | `SCHED_FIFO`, `SCHED_RR`, `SCHED_OTHER`, `SCHED_SPORADIC` | POSIX scheduler policies | Names are already POSIX; RTMux policy enums stay unchanged. |
+| `pc_curthread` (current thread) | `rq->curr`, `p->on_cpu` | A thread is current on at most one hart. Only the owning hart writes its slot, through `set_active_thread`. A thread becomes current from `STATE_READY` only by being unlinked from a dispatch queue under that queue's `LOCK_CLASS_SCHED` lock, or from a wait state when its waker hands it the waker's own hart (`block_and_ready`). A hart that queues its current thread READY (`resched`, `yield`, `adjust_priority`) switches away from it before it drops that lock. A wait has one waker: it claims the wait under the wait's own lock (a receiver: by unlinking it from the channel's receive queue under `chp->lock`; `force_ready` leaves an unlinked receiver to the claimer) and readies the thread once. `ready()` first waits until the thread's hart has switched away from it, and ignores a thread that is current and runnable; a past-deadline timeout armed by `block()` is delivered after the switch. `CONFIG_DEBUG_DISPATCH_OWNER` crashes on a second claim of a current thread or on queueing one. |
 
 ## Turnstile Prerequisite
 

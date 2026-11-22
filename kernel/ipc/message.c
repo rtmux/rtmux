@@ -137,6 +137,11 @@ static int msg_current_take(thread_t *act, struct kcall_args_msg_current *kap)
     thp->args.ms.server = act;
     act->client = thp;
 
+    /* act says the request under this rcvid is its to answer, whatever it
+     * received the rcvid for before.
+     */
+    msg_request_received(act, thp, cop);
+
     /* Snapshot the PI inputs while holding cop->lock; cop->lock must be dropped
      * before adjust_priority() because adjust_priority acquires sched_slock
      * (SCHED), and SCHED < CONNECT — the rank rule forbids holding cop->lock

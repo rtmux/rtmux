@@ -587,6 +587,59 @@ static void sync_unmapped_cases(void)
                          i == 1 ? (long) pg : cases[i].arg1, 0, 0, 0, 0);
         check(rc == -EFAULT, cases[i].name, "expected EFAULT, no kernel fault");
     }
+
+    /* A sync_t is aligned for its two words only, so one can straddle a page
+     * boundary with count on a mapped page and owner on the next. The kernel
+     * probes count for both words when they share a page; a straddling object
+     * must still have its owner word probed. With owner on an inaccessible
+     * page every sync call is EFAULT; with both pages writable the object
+     * works as any other.
+     */
+    {
+        char *hole = test_unmapped_user_addr();
+        char *two = mmap(NULL, (size_t) 2 * PAGE, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANON, NOFD, 0);
+
+        if (!hole) {
+            test_skip("sync_straddle_owner_unmapped", "no guard mapping");
+        } else {
+            sync_t *sy = (sync_t *) (hole - sizeof(long));
+
+            sy->count = 0; /* the mapped half; owner lies on the guard page */
+            for (unsigned i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+                char name[64];
+                long rc = test_kcall6(cases[i].call, (long) sy,
+                                      i == 1 ? (long) sy : cases[i].arg1, 0, 0,
+                                      0, 0);
+
+                snprintf(name, sizeof name, "straddling %s", cases[i].name);
+                check(rc == -EFAULT, name,
+                      "expected EFAULT for an owner word on an unmapped page");
+            }
+            check(test_kcall6(__KSYS_SYNC_MUTEX_UNLOCK, (long) sy, 0, 0, 0, 0,
+                              0) == -EFAULT,
+                  "straddling mutex unlock, owner unmapped",
+                  "expected EFAULT for an owner word on an unmapped page");
+        }
+        if (two == MAP_FAILED) {
+            test_skip("sync_straddle_mapped", "mmap failed");
+        } else {
+            pthread_mutex_t *m = (pthread_mutex_t *) (two + PAGE - sizeof(long));
+            int init = pthread_mutex_init(m, NULL);
+            long lock = test_kcall6(__KSYS_SYNC_MUTEX_LOCK, (long) m, 0, 0, 0, 0,
+                                    0);
+            unsigned long held = m->owner;
+            long unlock = test_kcall6(__KSYS_SYNC_MUTEX_UNLOCK, (long) m, 0, 0,
+                                      0, 0, 0);
+            unsigned long freed = m->owner;
+
+            check(init == EOK && lock == 0 && held != 0 && unlock == 0 &&
+                      freed == 0,
+                  "mutex straddling two mapped pages locks and unlocks",
+                  "a kernel lock of a page-straddling mutex must succeed");
+            (void) munmap(two, (size_t) 2 * PAGE);
+        }
+    }
 }
 
 /* A thread whose stack and TLS live in a region another thread unmaps. The
