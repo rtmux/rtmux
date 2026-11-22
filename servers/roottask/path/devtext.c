@@ -445,10 +445,12 @@ static int text_read(ioserv_context_t *ctp, io_read_t *msg, void *ocb)
         /* A line that is hung up, or was since the read began, is at end of
          * file, for a reader that waits too.
          */
-        t = text_attr(&seen);
-        if (ioserv_tty_hung_up(&t) || seen != hangups)
-            break;
         text_lock(&text_input_mutex);
+        t = text_attr(&seen);
+        if (ioserv_tty_hung_up(&t) || seen != hangups) {
+            pthread_mutex_unlock(&text_input_mutex);
+            break;
+        }
         text_lock(&text_mutex);
         if (text_line_done || (!(t.c_lflag & ICANON) && text_line_len)) {
             n = text_buf_copy((char *) msg, max);
