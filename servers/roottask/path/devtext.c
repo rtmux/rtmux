@@ -434,7 +434,7 @@ static int text_read(ioserv_context_t *ctp, io_read_t *msg, void *ocb)
     }
 
     max = ctp->msg_max_size - (unsigned) ctp->offset;
-    if (max > (unsigned) msg->i.nbytes)
+    if (max > msg->i.nbytes)
         max = (unsigned) msg->i.nbytes;
 
     (void) text_attr(&hangups);
