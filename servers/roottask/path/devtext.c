@@ -337,14 +337,14 @@ static int text_buf_edit(const struct termios *t,
     text_lock(&text_mutex);
     if ((c == t->c_cc[VERASE] && c != _POSIX_VDISABLE) || c == '\b' ||
         c == 0x7f) {
-        if (text_line_len > 0) {
+        if (text_line_len > text_line_off) {
             text_line_len--;
             *erased = 1;
         }
         c = -1;
     } else if (c == t->c_cc[VKILL] && c != _POSIX_VDISABLE) {
-        *erased = text_line_len;
-        text_line_len = 0;
+        *erased = text_line_len - text_line_off;
+        text_line_len = text_line_off;
         *kill = 1;
         c = -1;
     } else if (c == '\n') {
