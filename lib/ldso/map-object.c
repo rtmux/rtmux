@@ -438,7 +438,7 @@ static Elf_Ehdr *get_elf_header(int fd,
 
     hdr = mmap(NULL, page_size, PROT_READ, MAP_PRIVATE, fd, 0);
     if (hdr == MAP_FAILED) {
-        _ldso_error("%s: read error: %s", path, ldso_strerror(errno));
+        _ldso_error("%s: cannot map ELF header (errno %d)", path, errno);
         return (NULL);
     }
 

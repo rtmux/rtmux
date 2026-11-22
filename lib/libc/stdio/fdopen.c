@@ -7,6 +7,7 @@
 
 #include <stdio.h>
 #include <errno.h>
+#include <limits.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include "local.h"
@@ -28,6 +29,10 @@ FILE *fdopen(int fd, const char *mode)
         return NULL;
     }
 
+    if (fd > SHRT_MAX) {
+        errno = EMFILE;
+        return NULL;
+    }
     if (!(fp = __sfp()))
         return NULL;
     fp->_flags = (unsigned short) flags;
@@ -43,5 +48,6 @@ FILE *fdopen(int fd, const char *mode)
     fp->_write = __swrite;
     fp->_seek = __sseek;
     fp->_close = __sclose;
+    FUNLOCKFILE(fp);
     return fp;
 }

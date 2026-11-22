@@ -29,6 +29,7 @@
 #include <generated/autoconf.h>
 #endif
 #include "heap-stats.h"
+#include "root-mutex.h"
 
 #define ROOTTASK_HEAP_PAGE 4096
 
@@ -79,7 +80,7 @@ void __crt_lesscore(void *p, size_t n);
 
 static void ext_acquire(void)
 {
-    (void) pthread_mutex_lock(&ext_mutex);
+    root_mutex_lock(&ext_mutex);
 }
 
 static void ext_release(void)

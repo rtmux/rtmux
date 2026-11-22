@@ -109,9 +109,12 @@ static void ptp_enomem_midway(void)
         test_fail("pte_partial_map fixture", "fail-pte-map refused");
         return;
     }
+    long before = kstats_value("vm.rollback_pages");
     errno = 0;
     m = mmap(at, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     err = errno;
+    check(before >= 0 && kstats_value("vm.rollback_pages") == before + 2,
+          "pte_map rolled back exactly two pages", "successful rollback count");
     check(m == MAP_FAILED && err == ENOMEM, "pte_partial_map ENOMEM midway fails",
           "a MAP that runs dry must fail with ENOMEM");
     check(inject_run("alloc-status", NULL, NULL) == 0,

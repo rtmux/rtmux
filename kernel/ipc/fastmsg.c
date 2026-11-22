@@ -1539,7 +1539,9 @@ static void notification_lend(thread_t *thp, channel_t *chp, unsigned prio)
 {
     bool fixed = (chp->flags & RTMUX_FLG_CHF_FIXED_PRIORITY) != 0;
 
-    thread_lend_msg(thp, fixed ? 0 : prio, false);
+    thread_lend_msg(
+        thp, fixed && !(prio & _NOTIFICATION_PRIO_SIGNAL) ? 0 : (uint8_t) prio,
+        false);
     if (!thread_prio_update_dpp(thp, thp->process->default_dpp, 1) &&
         thp->dpp != thp->process->default_dpp)
         adjust_priority(thp, thp->priority, thp->process->default_dpp, 1);
@@ -1894,7 +1896,7 @@ restart:
     int notification_code = 0;
     uintptr_t notification_value = 0;
     intptr_t notification_id = 0;
-    uint8_t notification_priority = 0;
+    unsigned notification_priority = 0;
     thread_t *vnotification_origin = NULL;
     int imto_bounce = 0;
 
@@ -1913,6 +1915,8 @@ restart_recv:
             notification_value = pup->value;
             notification_id = (intptr_t) pup->id;
             notification_priority = pup->priority;
+            if (pup->terminal_signal)
+                notification_priority |= _NOTIFICATION_PRIO_SIGNAL;
             if (type == TYPE_VNOTIFICATION)
                 vnotification_origin = (thread_t *) pup->id;
 
@@ -1970,23 +1974,14 @@ restart_recv:
          * so a REPLY propagation from that client sees the new generation
          * (thread_lend_msg).
          */
-        if ((thp = act->client) != 0) {
-            /* need to clear client's server field */
-            act->client = 0;
-            thp->args.ms.server = 0;
+        (void) thread_disown_client(act);
+        if (xferstat)
+            kcall_err(act, EFAULT);
+        else {
+            _TRACE_COMM_IPC_RET(act);
+            SETKSTATUS(act, EOK);
         }
         notification_lend(act, chp, notification_priority);
-
-        /* The lend can lower act and switch it out here, and the trap path
-         * writes a returned status only while act still runs: publish it.
-         */
-        if (xferstat) {
-            kcall_err(act, EFAULT);
-            return ENOERROR;
-        }
-        _TRACE_COMM_IPC_RET(act);
-
-        SETKSTATUS(act, EOK);
         return ENOERROR;
     }
 
@@ -2101,11 +2096,8 @@ restart_recv:
                 goto restart;
             }
 
-            if ((thp = act->client) != 0) {
-                /* need to clear client's server field */
-                act->client = 0;
-                thp->args.ms.server = 0;
-            }
+            if (thread_disown_client(act))
+                thread_prio_defer_settle(act);
 
             /* Let receiver and sender know reason for fault. */
             act->timeout_flags = 0;
@@ -2149,10 +2141,7 @@ restart_recv:
          */
         thp->restart = NULL;
 
-        if (act->client != 0) {
-            /* need to clear client's server field */
-            act->client->args.ms.server = 0;
-        }
+        (void) thread_disown_client(act);
         thp->args.ms.server = act;
         act->client = thp;
 
@@ -2239,11 +2228,8 @@ restart_recv:
      */
     _TRACE_COMM_IPC_RET(act);
 
-    if ((thp = act->client) != 0) {
-        /* need to clear client's server field */
-        act->client = 0;
-        thp->args.ms.server = 0;
-    }
+    if (thread_disown_client(act))
+        thread_prio_defer_settle(act);
 
     if (IMTO(act, STATE_RECEIVE)) {
         return ETIMEDOUT;
@@ -2681,8 +2667,7 @@ static int msg_replyv_body(thread_t *act,
                                   thp->args.ri.rparts, thp->args.msbuff.msglen);
             } else {
                 xferstat = 0;
-                thp->blocked_on = thp;
-                IPC_BLK(thp);
+                thp->short_msg_source = thp;
                 atomic_or(&thp->flags,
                           (RTMUX_FLG_THR_BUFF_MSG | RTMUX_FLG_THR_SHORT_MSG));
             }
@@ -2733,9 +2718,7 @@ static int msg_replyv_body(thread_t *act,
 
     /* Completed under the lock: a force_ready (ConnectDetach's EBADF sweep)
      * that wins the lock after our release sees blocked_on != cop and leaves
-     * thp, and its link, alone; thp stays STATE_REPLY until ready() below. (The
-     * short-reply copy above already set blocked_on to thp itself, which the
-     * client's special return needs.)
+     * thp, and its link, alone. thp stays STATE_REPLY until ready() below.
      */
     if (thp->blocked_on == cop) {
         thp->blocked_on = NULL;

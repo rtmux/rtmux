@@ -27,6 +27,10 @@ struct slogdev {
     int *get;     /* Points into buf for getting data */
     int *beg;     /* Pointer to begining of buf */
     int *end;     /* Pointer to end of buf + 1 */
+    struct {
+        dev_t device;
+        ino_t inode;
+    } identity[2]; /* slog, console */
     int id;       /* Contains id of /dev/slog */
 };
 

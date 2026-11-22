@@ -780,10 +780,11 @@ void __attribute__((noreturn)) monitor_loop(void)
         /* Per-CPU sched locks: one char per logical CPU in index order (L =
          * held, u = unlocked, - = offline).
          */
+        uint64_t online = cpu_online_snapshot();
         mon_puts("sched=");
         for (unsigned cpu = 0; cpu < num_processors; cpu++) {
             struct dispatch_entry *dpp = pcpu_array[cpu].pc_dispatch;
-            if (!cpu_online(cpu)) {
+            if (!cpu_in_mask(online, cpu)) {
                 mon_putc('-');
                 continue;
             }
@@ -806,7 +807,7 @@ void __attribute__((noreturn)) monitor_loop(void)
             unsigned hart = i;
             thread_t *thp;
 
-            if (!cpu_online(hart))
+            if (!cpu_in_mask(online, hart))
                 continue;
             thp = get_active_thread(hart);
 

@@ -65,6 +65,7 @@ static const struct test_suite test_suites[] = {
     TEST_SUITE_NAMED("trace-negative", trace_negative),
     TEST_SUITE_NAMED("user-ptr-negative", user_ptr_negative),
     TEST_SUITE(vfs),
+    TEST_SUITE(exec),
     TEST_SUITE_NAMED("posix-options", posix_options),
     TEST_SUITE(sysconf),
     TEST_SUITE(gauges),
@@ -1034,6 +1035,15 @@ int main(int argc, char *argv[])
             test_skip("sched_set_error_after_lowering", "fault injection unavailable");
         return finish(1);
     }
+    if (argc == 2 && !strcmp(argv[1], "--execvp-path")) {
+        char *args[] = {"true", NULL};
+        execvp("true", args);
+        return errno;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--spawn-contract")) {
+        test_spawn_contract();
+        return finish(1);
+    }
     if (argc == 2 && !strcmp(argv[1], "--prio-loan-context")) {
         printf("[loan_settle_context]\n");
         (void) loan_settle_context();
@@ -1087,12 +1097,22 @@ int main(int argc, char *argv[])
             test_skip("pte_partial_map", "fault injection unavailable");
         return finish(1);
     }
+    if (argc == 2 && !strcmp(argv[1], "--pgrp-tty-other"))
+        return pgrp_tty_other();
+    if (argc == 2 && !strcmp(argv[1], "--pgrp-debug-access"))
+        return pgrp_debug_access();
     if (argc == 2 && !strcmp(argv[1], "--pgrp-races")) {
         printf("[pgrp_races]\n");
         if (pgrp_races() == TC_EXIT_SKIP)
             test_skip("pgrp_races", "debug window unavailable");
         return finish(1);
     }
+    if (argc == 3 && !strcmp(argv[1], "--exec-child"))
+        return exec_swap_child(argv[2]);
+    if (argc == 3 && !strcmp(argv[1], "--exec-chain"))
+        return exec_swap_chain(argv[2]);
+    if (argc == 3 && !strcmp(argv[1], "--exec-report"))
+        return exec_swap_report(argv[2]);
     if (argc == 2 && !strcmp(argv[1], "--pgrp-exec-hold"))
         return pgrp_exec_hold();
     if (argc == 2 && !strcmp(argv[1], "--pgrp-tty-bind"))
@@ -1101,11 +1121,27 @@ int main(int argc, char *argv[])
         return pgrp_tty_child(1);
     if (argc == 3 && !strcmp(argv[1], "--serial-unblock-child"))
         return serial_unblock_child(!strcmp(argv[2], "announce"));
+    if (argc == 2 && !strcmp(argv[1], "--ttyname")) {
+        char *name = ttyname(STDIN_FILENO);
+        if (name)
+            puts(name);
+        return name ? 0 : 1;
+    }
+    if ((argc == 2 || argc == 3) && !strcmp(argv[1], "--device-identity")) {
+        test_device_identity(argc == 3 ? argv[2] : NULL);
+        return finish(1);
+    }
     if (argc == 2 && !strcmp(argv[1], "--console-poll")) {
         printf("=== RTMux Console Poll Test ===\n\n");
         test_console_poll();
         return finish(1);
     }
+    if (argc == 2 && !strcmp(argv[1], "--signal-priority")) {
+        test_sigthread_prio_stable();
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--serial-priority-spinner"))
+        return serial_priority_spinner();
     if (argc == 2 && !strcmp(argv[1], "--serial-unblock")) {
         printf("=== RTMux Serial Unblock Test ===\n\n");
         test_serial_unblock();

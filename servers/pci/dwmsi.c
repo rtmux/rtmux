@@ -27,6 +27,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <sys/priority-bands.h>
 #include "globals.h"
 #include <pthread.h>
 #include <sched.h>
@@ -70,7 +71,7 @@ static void *dwmsi_ist_thread(void *arg)
 
     {
         /* one above driver ISTs */
-        struct sched_param sp = {.sched_priority = 22};
+        struct sched_param sp = {.sched_priority = RTMUX_PRIO_IRQ_DEMUX};
         (void) __sched_set(0, 0, SCHED_RR, &sp);
     }
     thread_ctl(RTMUX_TCTL_IO, 0);

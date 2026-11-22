@@ -26,6 +26,8 @@
 #include <time.h>
 #include <unistd.h>
 
+static const char *sh_value(const char *name);
+
 static char **sh_environ(void)
 {
     return environ;
@@ -206,10 +208,7 @@ static int run_function(struct sh *sh,
 /* In the fds of a command, a descriptor that `>&-` closes (-1 is "not set"). */
 #define SH_FD_CLOSED (-2)
 
-static int unit_arith(struct sh *sh,
-                      const struct sh_unit *u,
-                      bool diag,
-                      char *nb);
+static int unit_arith(struct sh *sh, const struct sh_unit *u, char *nb);
 static int unit_cmdsub(struct sh *sh,
                        const struct sh_unit *u,
                        bool dq,
@@ -277,6 +276,9 @@ static int sh_enable_raw(struct termios *saved)
     raw.c_oflag &= (tcflag_t) ~(OPOST);
     raw.c_cflag |= CS8;
     raw.c_lflag &= (tcflag_t) ~(ECHO | ICANON | IEXTEN);
+    /* The editor consumes VINTR itself while it owns the terminal. Restore
+     * normal signal generation before executing a command. */
+    raw.c_cc[VINTR] = _POSIX_VDISABLE;
     raw.c_cc[VMIN] = 1;
     raw.c_cc[VTIME] = 0;
     return tcsetattr(STDIN_FILENO, TCSANOW, &raw);
@@ -285,7 +287,8 @@ static int sh_enable_raw(struct termios *saved)
 static int sh_read_key(void)
 {
     char c;
-    char seq[3];
+    unsigned char first = 0;
+    size_t params = 0;
     ssize_t r = read(STDIN_FILENO, &c, 1);
 
     if (r < 0 && errno == EINTR)
@@ -294,17 +297,25 @@ static int sh_read_key(void)
         return SH_KEY_NULL;
     if (c != '\033')
         return (unsigned char) c;
-    if (read(STDIN_FILENO, &seq[0], 1) != 1)
+    if (read(STDIN_FILENO, &c, 1) != 1 || (c != '[' && c != 'O'))
         return SH_KEY_ESC;
-    if (read(STDIN_FILENO, &seq[1], 1) != 1)
-        return SH_KEY_ESC;
-    if (seq[0] != '[')
-        return SH_KEY_ESC;
-    if (seq[1] >= '0' && seq[1] <= '9') {
-        if (read(STDIN_FILENO, &seq[2], 1) != 1)
+    /* CSI and SS3 end with a byte in 0x40..0x7e. Consume parameter and
+     * intermediate bytes even when this editor has no binding for them. */
+    for (;;) {
+        r = read(STDIN_FILENO, &c, 1);
+        if (r != 1)
+            return r < 0 && errno == EINTR ? SH_KEY_INTR : SH_KEY_ESC;
+        if (c < 0x20 || c > 0x7e)
             return SH_KEY_ESC;
-        if (seq[2] == '~') {
-            switch (seq[1]) {
+        if (c >= 0x40)
+            break;
+        if (!params)
+            first = (unsigned char) c;
+        params++;
+    }
+    if (params) {
+        if (params == 1 && c == '~') {
+            switch (first) {
             case '1':
             case '7':
                 return SH_KEY_HOME;
@@ -313,13 +324,11 @@ static int sh_read_key(void)
             case '4':
             case '8':
                 return SH_KEY_END;
-            default:
-                break;
             }
         }
         return SH_KEY_ESC;
     }
-    switch (seq[1]) {
+    switch (c) {
     case 'A':
         return SH_KEY_ARROW_UP;
     case 'B':
@@ -381,7 +390,7 @@ static int sh_complete_word(const char *prefix, char matches[][PATH_MAX])
     for (const struct toolbox_applet *ap = toolbox_applets(); ap->name; ap++)
         count = sh_match_add(matches, count, ap->name, prefix);
 
-    path = strdup(getenv("PATH") ? getenv("PATH") : "/bin:/sbin");
+    path = strdup(sh_value("PATH") ? sh_value("PATH") : "/bin:/sbin");
     if (!path)
         return count;
     for (dir = strtok_r(path, ":", &save); dir;
@@ -665,7 +674,18 @@ static int sh_read_line_body(struct sh *sh,
             sh_refresh_line(prompt, buf, pos);
             continue;
         }
-        if (c == SH_KEY_NULL || c == 4) {
+        if (saved.c_cc[VINTR] != _POSIX_VDISABLE && c == saved.c_cc[VINTR]) {
+            sh_write_all("^C\r\n");
+            tcsetattr(STDIN_FILENO, TCSANOW, &saved);
+            /* An installed INT trap receives the same signal as during a job. */
+            raise(SIGINT);
+            sh->last_status = 128 + SIGINT;
+            return 1;
+        }
+        if (saved.c_cc[VEOF] != _POSIX_VDISABLE && c == saved.c_cc[VEOF])
+            c = len ? SH_KEY_DELETE : SH_KEY_NULL;
+        if (c == SH_KEY_NULL) {
+            sh_write_all("\r\n");
             tcsetattr(STDIN_FILENO, TCSANOW, &saved);
             return -1;
         }
@@ -760,6 +780,88 @@ static int words_add(struct sh_words *w, const char *s)
         return -1;
     w->n++;
     return 0;
+}
+
+/* Entries are unexported NAME=value pairs. A bare NAME records an export
+ * declaration made before the variable was assigned. Exported values live in
+ * environ, which can be passed straight through to an external command. */
+static struct sh_words sh_locals;
+
+static int local_index(const char *name)
+{
+    size_t n = strlen(name);
+    for (int i = 0; i < sh_locals.n; ++i) {
+        const char *entry = sh_locals.v[i];
+        if (!strncmp(entry, name, n) && (entry[n] == '=' || !entry[n]))
+            return i;
+    }
+    return -1;
+}
+
+static void local_remove(int index)
+{
+    if (index >= 0) {
+        free(sh_locals.v[index]);
+        sh_locals.v[index] = sh_locals.v[--sh_locals.n];
+    }
+}
+
+static const char *sh_value(const char *name)
+{
+    const char *v = getenv(name);
+    if (v)
+        return v;
+    int i = local_index(name);
+    const char *eq = i < 0 ? NULL : strchr(sh_locals.v[i], '=');
+    return eq ? eq + 1 : NULL;
+}
+
+static int sh_set(const char *name, const char *value)
+{
+    int i = local_index(name);
+    if (getenv(name) || (i >= 0 && !strchr(sh_locals.v[i], '=')))
+        return setenv(name, value, 1);
+    size_t size = strlen(name) + strlen(value) + 2;
+    char *entry = malloc(size);
+    if (!entry)
+        return -1;
+    snprintf(entry, size, "%s=%s", name, value);
+    if (i >= 0) {
+        free(sh_locals.v[i]);
+        sh_locals.v[i] = entry;
+        return 0;
+    }
+    int rc = words_add(&sh_locals, entry);
+    free(entry);
+    return rc;
+}
+
+static int sh_export(const char *word)
+{
+    const char *eq = strchr(word, '=');
+    char *name = eq ? dup_range(word, (size_t) (eq - word)) : strdup(word);
+    if (!name)
+        return -1;
+    if (!*name || (!isalpha((unsigned char) *name) && *name != '_')) {
+        free(name);
+        return -1;
+    }
+    for (char *c = name + 1; *c; ++c)
+        if (!isalnum((unsigned char) *c) && *c != '_') {
+            free(name);
+            return -1;
+        }
+    const char *v = eq ? eq + 1 : sh_value(name);
+    int i = local_index(name), rc = 0;
+    if (v) {
+        rc = setenv(name, v, 1);
+        if (!rc)
+            local_remove(i);
+    } else if (i < 0) {
+        rc = words_add(&sh_locals, name);
+    }
+    free(name);
+    return rc;
 }
 
 static void trim(char *s)
@@ -881,7 +983,7 @@ static const char *sh_scalar_param(struct sh *sh, const char *name)
             return sh->params[idx - 1];
         return NULL;
     }
-    return getenv(name);
+    return sh_value(name);
 }
 
 /* A POSIX variable name: nonempty, does not start with a digit, all name chars.
@@ -901,7 +1003,7 @@ static bool is_valid_varname(const char *s)
  */
 static const char *ifs_value(void)
 {
-    const char *v = getenv("IFS");
+    const char *v = sh_value("IFS");
 
     return v ? v : " \t\n";
 }
@@ -1185,7 +1287,7 @@ static char *expand_braced(struct sh *sh, const char **pp, int xf)
                 result = NULL;
             else if (!is_valid_varname(name))
                 result = braced_fail(sh, name, "cannot assign in this way");
-            else if (setenv(name, wplain, 1) != 0)
+            else if (sh_set(name, wplain) != 0)
                 result = braced_fail(sh, name, "assignment failed");
             else
                 result = strdup(wplain);
@@ -1385,6 +1487,13 @@ static int read_all(int fd, char **out, size_t *lenp)
     return -1;
 }
 
+static int sh_child_status(int status)
+{
+    if (WIFEXITED(status))
+        return WEXITSTATUS(status);
+    return WIFSIGNALED(status) ? 128 + WTERMSIG(status) : 128;
+}
+
 /* Run `inner` as a command substitution and capture its stdout into *out
  * (malloc'd, trailing newlines stripped). Runs it in a child shell that gets
  * this shell's state (sh_spawn_sub), and drains the pipe concurrently, so there
@@ -1430,10 +1539,7 @@ static int capture_command(struct sh *sh, const char *inner, char **out)
     close(pfd[0]);
     while ((reaped = waitpid(pid, &ws, 0)) < 0 && errno == EINTR)
         ;
-    sh->subst_status = reaped < 0        ? 1
-                       : WIFEXITED(ws)   ? WEXITSTATUS(ws)
-                       : WIFSIGNALED(ws) ? 128 + WTERMSIG(ws)
-                                         : 1;
+    sh->subst_status = reaped < 0 ? 1 : sh_child_status(ws);
     if (status != 0)
         return -1;
     while (len > 0 && buf[len - 1] == '\n')
@@ -1877,15 +1983,10 @@ static long arith_lor(struct arith_ctx *a)
     return v;
 }
 
-/* Evaluate the $(( ... )) unit u into nb (32 bytes). A malformed expression is
- * 0, with a diagnostic when diag is set.
- *
- * Returns 0, or -1 on allocation failure.
+/* Evaluate $(( ... )) into nb (32 bytes). On an arithmetic error, abort the
+ * expansion and set the command status. Return -1 on error.
  */
-static int unit_arith(struct sh *sh,
-                      const struct sh_unit *u,
-                      bool diag,
-                      char *nb)
+static int unit_arith(struct sh *sh, const struct sh_unit *u, char *nb)
 {
     char *expr = dup_range(u->body, u->body_len);
     struct arith_ctx a;
@@ -1901,9 +2002,13 @@ static int unit_arith(struct sh *sh,
     val = arith_lor(&a);
     arith_skip(&a);
     if (!u->closed || a.err || *a.p != '\0') {
-        if (diag)
-            fprintf(stderr, "sh: arithmetic error: %s\n", expr);
-        val = 0;
+        fprintf(stderr, "sh: arithmetic error: %s\n", expr);
+        sh->last_status = 2;
+        sh->expand_abort = true;
+        if (!sh->interactive)
+            sh->exit_requested = true;
+        free(expr);
+        return -1;
     }
     free(expr);
     snprintf(nb, 32, "%ld", val);
@@ -1991,7 +2096,7 @@ static char *expand_word(struct sh *sh, const char *s, bool pattern, int xf)
             t = nb;
             break;
         case SH_U_ARITH:
-            rc = unit_arith(sh, &u, true, nb);
+            rc = unit_arith(sh, &u, nb);
             t = nb;
             break;
         case SH_U_PAREN:
@@ -2405,7 +2510,7 @@ static int tokenize(struct sh *sh, const char *line, struct sh_token *tok)
             if (at_word_start && quote == 0 && *p == '~' &&
                 (p[1] == '\0' || p[1] == '/' ||
                  strchr(" \t;&|<>", p[1]) != NULL)) {
-                const char *home = getenv("HOME");
+                const char *home = sh_value("HOME");
 
                 at_word_start = 0;
                 if (home) {
@@ -2462,7 +2567,7 @@ static int tokenize(struct sh *sh, const char *line, struct sh_token *tok)
                 char nb[32];
 
                 p += u.len;
-                if (unit_arith(sh, &u, true, nb) != 0) {
+                if (unit_arith(sh, &u, nb) != 0) {
                     free(buf);
                     goto fail;
                 }
@@ -2633,24 +2738,6 @@ static bool is_assignment(const char *s)
     return true;
 }
 
-static void sh_unsetenv(const char *name)
-{
-    char **p;
-    char **q;
-    size_t len;
-
-    if (!name || *name == '\0' || strchr(name, '=') || !sh_environ())
-        return;
-
-    len = strlen(name);
-    for (p = q = sh_environ(); *p; p++) {
-        if (strncmp(*p, name, len) == 0 && (*p)[len] == '=')
-            continue;
-        *q++ = *p;
-    }
-    *q = NULL;
-}
-
 static int builtin_test(int argc, char **argv)
 {
     int off = 0;
@@ -2818,7 +2905,7 @@ static int builtin_read(char **argv, int in_fd)
         }
         save = field[fl];
         field[fl] = '\0';
-        rc = setenv(argv[varidx + vi], field, 1);
+        rc = sh_set(argv[varidx + vi], field);
         field[fl] = save;
         if (rc != 0)
             return 1;
@@ -2928,8 +3015,8 @@ static bool find_in_path(const char *name, char *out, size_t outsz)
     if (strchr(name, '/'))
         return path_is_exec(name) &&
                (size_t) snprintf(out, outsz, "%s", name) < outsz;
-    path = getenv("PATH");
-    if (!path || !*path)
+    path = sh_value("PATH");
+    if (!path)
         path = "/bin:/sbin:/usr/bin:/usr/sbin";
     for (p = path;;) {
         const char *colon = strchr(p, ':');
@@ -3060,7 +3147,7 @@ static int sh_wait_fg(pid_t pid, pid_t pgid, const char *cmd, bool *stopped)
         if (!WIFSTOPPED(st)) {
             if ((j = sh_job_find(pid)))
                 j->pid = 0;
-            return WIFEXITED(st) ? WEXITSTATUS(st) : 128;
+            return sh_child_status(st);
         }
 
         /* A job that read or wrote before it was handed the terminal was
@@ -3304,7 +3391,7 @@ static int run_builtin(struct sh *sh,
     if (argc == 0)
         return 0;
     if (!strcmp(argv[0], "cd")) {
-        const char *dir = argv[1] ? argv[1] : getenv("HOME");
+        const char *dir = argv[1] ? argv[1] : sh_value("HOME");
         if (!dir)
             dir = "/";
         if (chdir(dir) != 0) {
@@ -3326,13 +3413,15 @@ static int run_builtin(struct sh *sh,
             return 0;
         }
         for (int i = 1; argv[i]; i++)
-            if (is_assignment(argv[i]) && sh_assign(argv[i], NULL) != 0)
+            if (sh_export(argv[i]) != 0)
                 return 1;
         return 0;
     }
     if (!strcmp(argv[0], "unset")) {
-        for (int i = 1; argv[i]; i++)
-            sh_unsetenv(argv[i]);
+        for (int i = 1; argv[i]; i++) {
+            local_remove(local_index(argv[i]));
+            unsetenv(argv[i]);
+        }
         return 0;
     }
     if (!strcmp(argv[0], "pwd")) {
@@ -3466,6 +3555,9 @@ static int run_builtin(struct sh *sh,
 
             for (int k = 0; envp && envp[k]; k++)
                 puts(envp[k]);
+            for (int k = 0; k < sh_locals.n; k++)
+                if (strchr(sh_locals.v[k], '='))
+                    puts(sh_locals.v[k]);
         }
         return 0;
     }
@@ -3549,7 +3641,8 @@ static void sh_reap_zombies(void)
  * earlier stage of a background pipeline, which belongs to the job its last
  * stage starts. close_fd, when not -1, is an fd the child must not inherit.
  */
-static int run_external(char **argv,
+static int run_external(struct sh *sh,
+                        char **argv,
                         int in_fd,
                         int out_fd,
                         int err_fd,
@@ -3627,7 +3720,15 @@ static int run_external(char **argv,
     /* Output the shell buffered so far must not land after the child's. */
     fflush(stdout);
     fflush(stderr);
-    err = posix_spawnp(&pid, argv[0], actions_p, attr_p, argv, sh_environ());
+    char resolved[PATH_MAX];
+    if (!strchr(argv[0], '/') && !getenv("PATH") && sh_value("PATH"))
+        err = find_in_path(argv[0], resolved, sizeof(resolved))
+                  ? posix_spawn(&pid, resolved, actions_p, attr_p, argv,
+                                sh_environ())
+                  : ENOENT;
+    else
+        err =
+            posix_spawnp(&pid, argv[0], actions_p, attr_p, argv, sh_environ());
     posix_spawn_file_actions_destroy(&actions);
     if (attr_p)
         posix_spawnattr_destroy(attr_p);
@@ -3653,10 +3754,12 @@ static int run_external(char **argv,
             sh_job_add(sh_jc ? sh_jc_pgid : pid, pid, label, false);
 
         sh_last_bg = pid;
-        if (j)
-            fprintf(stderr, "[%d] %d\n", sh_job_number(j), pid);
-        else
-            fprintf(stderr, "%d\n", pid);
+        if (sh->interactive) {
+            if (j)
+                fprintf(stderr, "[%d] %d\n", sh_job_number(j), pid);
+            else
+                fprintf(stderr, "%d\n", pid);
+        }
         return 0;
     }
     if (pid_out) {
@@ -3665,9 +3768,7 @@ static int run_external(char **argv,
     }
     if (waitpid(pid, &status, 0) < 0)
         return 1;
-    if (WIFEXITED(status))
-        return WEXITSTATUS(status);
-    return 128;
+    return sh_child_status(status);
 
 fail:
     if (actions_p)
@@ -3722,7 +3823,15 @@ static int builtin_exec(char **argv, int in_fd, int out_fd, int err_fd)
     exec_hide_fd(err_fd);
     for (int k = 0; k < 3; k++)
         exec_hide_fd(saved[k]);
-    execvp(argv[1], &argv[1]);
+    char resolved[PATH_MAX];
+    if (!strchr(argv[1], '/') && !getenv("PATH") && sh_value("PATH")) {
+        if (find_in_path(argv[1], resolved, sizeof(resolved)))
+            execvp(resolved, &argv[1]);
+        else
+            errno = ENOENT;
+    } else {
+        execvp(argv[1], &argv[1]);
+    }
     err = errno;
     sh_redir_restore(saved);
     fprintf(stderr, "%s: %s\n", argv[1], strerror(err));
@@ -3738,11 +3847,11 @@ static int builtin_exec(char **argv, int in_fd, int out_fd, int err_fd)
  * sh_state_run() reads back in the same order. Values are never quoted, so a
  * value cannot be mistaken for a field boundary or for shell syntax.
  *
- * Variables are not in it: every shell variable lives in environ (setenv),
+ * Local variables travel in the state blob. Exported variables live in environ,
  * which the child inherits. The traps are: `trap` lists them in the child, but
  * it never runs them (sh_state_run).
  */
-#define SH_STATE_MAGIC "sh-state-1"
+#define SH_STATE_MAGIC "sh-state-2"
 
 /* The shell a subshell runs: never looked up in PATH, which the script may have
  * pointed elsewhere.
@@ -3829,6 +3938,7 @@ static char *sh_state_blob(struct sh *sh,
     blob_putn(&w, sh_last_bg);
     blob_put(&w, sh->arg0 ? sh->arg0 : "sh");
     blob_put_lines(&w, sh->params, sh->nparams);
+    blob_put_lines(&w, sh_locals.v, sh_locals.n);
     blob_putn(&w, sh->nfuncs);
     for (int i = 0; i < sh->nfuncs; i++) {
         blob_put(&w, sh->funcs[i].name);
@@ -3956,8 +4066,8 @@ static int sh_spawn_sub(struct sh *sh,
         return 1;
     }
     snprintf(fdarg, sizeof fdarg, "%d", pfd[0]);
-    rc = run_external(argv, in_fd, out_fd, err_fd, background, pid_out, label,
-                      pfd[1]);
+    rc = run_external(sh, argv, in_fd, out_fd, err_fd, background, pid_out,
+                      label, pfd[1]);
     close(pfd[0]);
     if (rc == 0) {
         /* A child that died before reading its state must not take the shell
@@ -4078,7 +4188,7 @@ static int sh_assign(const char *word, char **saved)
         }
         snprintf(*saved, len, "%s%s%s", name, old ? "=" : "", old ? old : "");
     }
-    rc = setenv(name, word + n + 1, 1);
+    rc = saved ? setenv(name, word + n + 1, 1) : sh_set(name, word + n + 1);
     free(name);
     if (rc != 0 && saved) {
         free(*saved);
@@ -4096,7 +4206,7 @@ static void sh_unassign(char *saved)
         *eq = '\0';
         setenv(saved, eq + 1, 1);
     } else {
-        sh_unsetenv(saved);
+        unsetenv(saved);
     }
     free(saved);
 }
@@ -4263,7 +4373,9 @@ static int command_from_tokens(struct sh *sh,
      * are in its environment only, except for a special builtin, where they
      * stay (POSIX 2.9.1.2).
      */
-    keep = nassign == argc || is_special_builtin(argv[nassign]);
+    keep = nassign == argc ||
+           (is_special_builtin(argv[nassign]) &&
+            (strcmp(argv[nassign], "exec") || nassign + 1 == argc));
     for (int i = 0; i < nassign; i++) {
         if (sh_assign(argv[i], keep ? NULL : &saved[i]) != 0) {
             nassign = i;
@@ -4322,7 +4434,7 @@ static int command_from_tokens(struct sh *sh,
         sh_redir_restore(saved);
     }
     if (!handled)
-        rc = run_external(argv, in_fd, out_fd, err_fd, background, pid_out,
+        rc = run_external(sh, argv, in_fd, out_fd, err_fd, background, pid_out,
                           NULL, -1);
 done:
     for (int i = nassign - 1; !keep && i >= 0; i--) /* X=1 X=2: last first */
@@ -4432,8 +4544,8 @@ wait_and_return:
             sh_take_terminal();
         } else {
             int st = 0;
-            if (waitpid(last_pid, &st, 0) == last_pid && WIFEXITED(st))
-                last_status = WEXITSTATUS(st);
+            if (waitpid(last_pid, &st, 0) == last_pid)
+                last_status = sh_child_status(st);
             else
                 last_status = 128;
         }
@@ -4638,7 +4750,8 @@ static int run_list(struct sh *sh, const char *line, enum sh_op prev, int rc)
             ntok = tokenize(sh, stmt[i].text, tok);
 
             if (ntok < 0) {
-                fprintf(stderr, "sh: parse error\n");
+                if (!sh->expand_abort)
+                    fprintf(stderr, "sh: parse error\n");
                 rc = 2;
             } else if (sh->exit_requested || sh->expand_abort) {
                 /* A ${x:?}/${x:=} or `set -u` expansion failure: abort this
@@ -5395,7 +5508,7 @@ static int run_for(struct sh *sh, struct sh_script *sc, int at, int done_i)
     }
     sh->loop_depth++;
     for (int i = 0; i < vals.n && !sh->exit_requested; i++) {
-        if (setenv(var, vals.v[i], 1) != 0) {
+        if (sh_set(var, vals.v[i]) != 0) {
             fprintf(stderr, "sh: %s: %s\n", var, strerror(errno));
             rc = 1;
             break;
@@ -5656,7 +5769,7 @@ static char *expand_string(struct sh *sh, const char *s)
             char nb[32];
 
             p += u.len;
-            if (unit_arith(sh, &u, false, nb) != 0 ||
+            if (unit_arith(sh, &u, nb) != 0 ||
                 append_str(&buf, &len, &cap, nb) != 0)
                 goto oom;
         } else if (u.kind == SH_U_PAREN || u.kind == SH_U_BQ) {
@@ -5766,6 +5879,7 @@ static int run_heredoc(struct sh *sh,
         free(cmd);
         return 2;
     }
+    *ip = i < to ? i : to - 1;
     if (!quoted) {
         char *ex = expand_string(sh, body);
 
@@ -6591,8 +6705,13 @@ static int run_interactive(struct sh *sh)
     while (!sh->exit_requested) {
         sh_reap_zombies();
         prompt = geteuid() == 0 ? "# " : "$ ";
-        if (sh_read_line(sh, prompt, line, sizeof(line)) != 0)
+        int input = sh_read_line(sh, prompt, line, sizeof(line));
+        if (input < 0)
             break;
+        if (input > 0) {
+            rc = sh->last_status;
+            continue;
+        }
         sh_chomp(line);
 
         /* A quote or substitution still open goes on at a secondary prompt. */
@@ -6600,9 +6719,16 @@ static int run_interactive(struct sh *sh)
             char more[SH_LINE_MAX];
             bool blank;
 
-            if (!line_open_join(line, &cut, &blank) ||
-                sh_read_line(sh, "> ", more, sizeof(more)) != 0)
+            if (!line_open_join(line, &cut, &blank))
                 break;
+            input = sh_read_line(sh, "> ", more, sizeof(more));
+            if (input != 0) {
+                if (input > 0) {
+                    line[0] = '\0';
+                    rc = sh->last_status;
+                }
+                break;
+            }
             sh_chomp(more);
             if (cut + blank + strlen(more) >= sizeof(line))
                 break;
@@ -6727,6 +6853,13 @@ static int sh_state_run(struct sh *sh, int fd)
     script_free(&sc);
     n = blob_getn(&b, 0, INT_MAX);
     for (long i = 0; i < n && !b.bad; i++) {
+        const char *v = blob_get(&b);
+        if (!v || words_add(&sh_locals, v))
+            goto out;
+    }
+
+    n = blob_getn(&b, 0, INT_MAX);
+    for (long i = 0; i < n && !b.bad; i++) {
         const char *name = blob_get(&b);
 
         if (blob_get_lines(&b, &sc) != 0 ||
@@ -6804,7 +6937,7 @@ int toolbox_sh_main(int argc, char **argv)
             return 2;
         }
     }
-    if (!getenv("PATH"))
+    if (state_fd < 0 && !getenv("PATH"))
         setenv("PATH", "/bin:/sbin:/usr/bin:/usr/sbin", 1);
     if (state_fd >= 0) {
         opt = sh_state_run(&sh, state_fd);
@@ -6829,6 +6962,7 @@ int toolbox_sh_main(int argc, char **argv)
     opt = sh_exit_trap(&sh, opt);
     for (int i = 0; i < SH_NTRAPS; i++)
         free(sh.traps[i]);
+    words_free(&sh_locals);
     sh_free_history(&sh);
     sh_free_funcs(&sh);
     for (int i = 0; i < sh.nparams; i++)

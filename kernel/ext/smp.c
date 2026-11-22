@@ -66,25 +66,26 @@ bool smp_inject(unsigned cpu, const char *opt)
     return smp_inject_at(cpu, num_processors - 1, opt);
 }
 
-/* smp_inject_ap_crash — "rtmux.inject=ap-crash-early" crashes the CPU before
- * the last one at the point where it has committed to joining but is not online
- * yet, once CPU 1 is online, so the crash has an online sibling to quiesce and
- * a CPU (the dropped last one) that never joins. Called with interrupts off.
- */
+/* CPUs 3 and 4 enter crash handling after committing to join and before
+ * publishing pc_alive. CPU 2 has accepted PARKIT and the last hart is absent.
+ * Both crashers must know the other's join has committed before either
+ * takes the first rendezvous snapshot. */
 void smp_inject_ap_crash(unsigned cpu)
 {
-    uint64_t t0, ticks;
-
-    if (num_processors < 4 ||
-        !smp_inject_at(cpu, num_processors - 2, "rtmux.inject=ap-crash-early"))
+    if ((cpu != 3 && cpu != 4) || num_processors != 6 ||
+        !smp_cmdline_has("rtmux.inject=ap-crash-early"))
         return;
-    t0 = cpu_clock_ticks();
-    ticks = qtimeptr->cycles_per_sec / 1000 * SMP_START_WAIT_MS;
-    while (!cpu_online(1) && cpu_clock_ticks() - t0 < ticks)
+    unsigned peer = 7 - cpu;
+    uint64_t start = cpu_clock_ticks();
+    uint64_t ticks = qtimeptr->cycles_per_sec / 1000 * SMP_START_WAIT_MS;
+    while (!cpu_online(1) ||
+           cpu_in_mask(__atomic_load_n(&legal_cpu_bitmask, __ATOMIC_ACQUIRE), 2) ||
+           __atomic_load_n(&smp_slot[peer], __ATOMIC_ACQUIRE) != SMP_SLOT_JOINED) {
+        if (cpu_clock_ticks() - start >= ticks)
+            crash("early crash fixture missing online cpu 1, parked cpu 2 or committed peer");
         MEM_BARRIER_RW();
-    if (!cpu_online(1))
-        kprintf("smp: inject: cpu 1 never came online, crashing anyway\n");
-    crash("injected crash on cpu %u before it joined", cpu);
+    }
+    crash("injected crash on cpu %u before online", cpu);
 }
 #endif
 
@@ -203,6 +204,12 @@ void kext_smp_bringup(void *unused)
                       hart_ids[cpu], cpu);
             MEM_BARRIER_RW();
         }
+#ifdef CONFIG_DEBUG_INJECT
+        if (cpu == 2 && num_processors == 6 && smp_cmdline_has("rtmux.inject=ap-crash-early")) {
+            SENDIPI(cpu, IPI_PARKIT);
+            continue;
+        }
+#endif
         SENDIPI(cpu, IPI_RESCHED);
         online++;
     }

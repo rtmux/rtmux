@@ -17,7 +17,7 @@ int fclose(FILE *fp)
     /* Lock the teardown so it does not race a concurrent op, and re-check the
      * open flag under the lock: two threads racing fclose(fp) must not both
      * tear down (which would double-close the fd). The per-FILE mutex itself is
-     * left attached to the (bounded pool) slot for reuse, not destroyed --
+     * left attached to the slot for reuse --
      * using a closed FILE is undefined, so there is nothing to unblock.
      */
     FLOCKFILE(fp);
@@ -37,6 +37,7 @@ int fclose(FILE *fp)
     fp->_file = -1;
     fp->_r = fp->_w = 0;
     fp->_flags = 0;
+    __sfp_release(fp);
     FUNLOCKFILE(fp);
     return r;
 }

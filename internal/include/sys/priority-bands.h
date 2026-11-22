@@ -1,0 +1,12 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+#ifndef RTMUX_PRIORITY_BANDS_H
+#define RTMUX_PRIORITY_BANDS_H
+
+enum {
+    RTMUX_PRIO_SERVER = 10,
+    RTMUX_PRIO_DEVICE_IST = 21,
+    RTMUX_PRIO_IRQ_DEMUX = 22,
+    RTMUX_PRIO_USER_MAX_DEFAULT = 63
+};
+
+#endif

@@ -45,6 +45,7 @@ struct server_object {
     int chid;
     unsigned handle;
     unsigned file_type;
+    dev_t devno;
 };
 
 struct symlink_object {

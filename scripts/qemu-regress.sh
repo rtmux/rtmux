@@ -1062,10 +1062,11 @@ check_smp_bringup()
             'smp: 3 harts online[[:space:]]*$' || return 1
         ;;
     smp-ap-crash-early)
-        require_log_patterns "$log" "crash before join" \
-            'cpu_start_others: hart [0-9]+ \(cpu 3\) failed' \
-            'injected crash on cpu 2 before it joined' \
-            'crash rendezvous: 3 arrived, 3 expected' || return 1
+        require_log_patterns "$log" "crash before online" \
+            'cpu_start_others: hart [0-9]+ \(cpu 5\) failed' \
+            'injected crash on cpu 3 before online' \
+            'injected crash on cpu 4 before online' \
+            'crash rendezvous: 4 arrived, 4 expected' || return 1
         ;;
     smp-hart-start-late)
         require_log_patterns "$log" "late hart" \
@@ -1686,16 +1687,14 @@ case "$MODE" in
         ;;
     smp-ap-crash-early)
 
-        # K32: the last of 4 harts fails to start and cpu 2 crashes after it
-        # committed to joining but before it is online, with cpu 1 online. The
-        # crash dump must complete, and its rendezvous must have waited for
-        # the exact set: cpu 0, cpu 1 and the crashing cpu 2.
+        # CPU 5 fails to start, CPU 2 parks, and CPUs 3 and 4 crash before
+        # going online. The two crashers and online CPUs 0 and 1 must arrive.
         BEGIN_MARKER='Boot command line:'
         PASS_MARKER='=== END CRASH DUMP ==='
         FAIL_MARKER='*** /usr unavailable'
         MODE_ARG="rtmux.inject=hart-start-fail rtmux.inject=ap-crash-early"
         NEEDS_DEBUG_INJECT=1
-        CPUS=4
+        CPUS=6
         export CPUS
         ;;
     smp-sparse-harts|smp-too-many-harts)
@@ -2721,6 +2720,18 @@ run_one()
     if ! grep -q "$PASS_GREP" "$PASS_MARKER" "$log"; then
         echo "  FAIL     ${MODE} missing pass marker: ${PASS_MARKER}"
         tail -n 160 "$log"
+        return 1
+    fi
+
+    if [ "$MODE" = "serial-unblock" ] && ! awk '
+        /getty B0 begin/ { active = 1 }
+        /getty B0 end/ { active = 0 }
+        active && /^RTMux\r?$/ { banners++ }
+        active && /getty: end of file/ { hangups++ }
+        /getty: Device or resource busy/ { busy++ }
+        END { exit !(banners == 1 && hangups == 1 && busy == 1) }
+    ' "$log"; then
+        echo "  FAIL     unexpected getty banner or diagnostic count"
         return 1
     fi
 

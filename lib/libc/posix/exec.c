@@ -12,7 +12,16 @@
 #include <unistd.h>
 #include <sys/procmsg.h>
 
-/* A NULL envp passes environ, which the spawn path then reads under the
+#include "signal-state.h"
+
+/* A successful exec does not return: roottask loads the new image, destroys
+ * every other thread of this process, and replies to this thread by starting
+ * the new image in it, in the same process (same pid, same descriptors but the
+ * close-on-exec ones). Only a failure comes back, with the process as it was,
+ * and the request carries no descriptor map because none is inherited: the
+ * process keeps its own.
+ *
+ * A NULL envp passes environ, which the spawn path then reads under the
  * environment lock.
  */
 static int exec_spawn(const char *path,
@@ -21,19 +30,22 @@ static int exec_spawn(const char *path,
                       int search)
 {
     struct inheritance inherit = {
-        .flags = SPAWN_EXEC,
-    };
-    int fd_map[] = {
-        [0] = STDIN_FILENO,
-        [1] = STDOUT_FILENO,
-        [2] = STDERR_FILENO,
+        .flags = SPAWN_EXEC | SPAWN_SETSIGMASK | SPAWN_SETSIGIGN,
     };
     pid_t pid;
 
-    pid = search ? rtmux_spawnp(path, 3, fd_map, &inherit, argv, envp)
-                 : rtmux_spawn(path, 3, fd_map, &inherit, argv, envp);
+    /* The new image keeps what is ignored and what is blocked; a caught signal
+     * goes back to its default, so only the two sets are sent.
+     */
+    __libc_signal_exec_state(&inherit.sigignore, &inherit.sigmask);
+    pid = search ? rtmux_spawnp(path, 0, NULL, &inherit, argv, envp)
+                 : rtmux_spawn(path, 0, NULL, &inherit, argv, envp);
     if (pid == -1)
         return -1;
+
+    /* A reply that carries a pid is a spawn, not an exec: roottask never sends
+     * one for SPAWN_EXEC.
+     */
     errno = EIO;
     return -1;
 }

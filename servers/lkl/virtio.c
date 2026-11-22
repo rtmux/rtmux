@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <sys/priority-bands.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -1088,7 +1089,7 @@ static void *virtio_irq_thread(void *arg)
 {
     struct rtmux_virtio_mmio *vio = arg;
     struct rtmux_virtio_irq *irq = &vio->irq;
-    struct sched_param sp = {.sched_priority = RTMUX_LKL_IST_PRIORITY};
+    struct sched_param sp = {.sched_priority = RTMUX_PRIO_DEVICE_IST};
     int error = 0;
     int sched_rc;
 
@@ -1112,7 +1113,7 @@ static void *virtio_irq_thread(void *arg)
      */
     if (sched_rc == 0)
         fprintf(stderr, "lkl: IST SCHED_RR/%d, dispatch worker receive-PI\n",
-                RTMUX_LKL_IST_PRIORITY);
+                RTMUX_PRIO_DEVICE_IST);
     else
         fprintf(
             stderr,

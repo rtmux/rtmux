@@ -124,8 +124,8 @@
 /* PRIO_SETTLE_STATS(what): what 0, ret is how many deferred priority settles
  * (K29) ran in thread context since the last reset; 1, how many priority
  * recomputations ran inside force_ready's client departure, which must be none:
- * force_ready runs in timer and event context under caller locks; 2 resets both
- * counts.
+ * force_ready runs in timer and event context under caller locks; 2 resets the counters and 3 reads
+ * the subset of deferred settles run on idle harts with interrupts off.
  */
 #define INJECT_OP_PRIO_SETTLE_STATS 19
 

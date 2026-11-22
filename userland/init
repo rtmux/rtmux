@@ -499,7 +499,8 @@ if test "$rtmux_run" = "serial-unblock"; then
     /sbin/virtio-mmio --register-boot
     echo "RTMux serial-unblock: BEGIN"
     serial_fail=0
-    /bin/syscall_testing --console-poll || serial_fail=1
+    /bin/pipe &
+    waitfor /dev/pipe 10 && /bin/syscall_testing --console-poll || serial_fail=1
     /bin/dev-serial-8250 &
     waitfor /dev/ser1 5 && /bin/syscall_testing --serial-unblock || serial_fail=1
     if test "$serial_fail" = "0"; then
@@ -787,9 +788,9 @@ run_lkl_regress() {
         lkl-netd-iommu-fail-closed) run_lkl_selftest lkl-netd-iommu-fail-closed '/bin/not /sbin/lkl-netd --serve-net' ;;
         tracelogger) run_lkl_selftest tracelogger '/bin/tracelogger' ;;
         tracelogger-kcall) run_lkl_selftest tracelogger-kcall '/bin/tracelogger 0 0 kcall' ;;
-        tracelogger-lkl-fsd) run_lkl_selftest tracelogger-lkl-fsd 'lkl_start_fsd && /bin/cat /fs/root/hello.txt; rc=$?; test "$rc" = "0" && /bin/tracelogger 0 700 windowed & sleep 1 && test "$rc" = "0" && /bin/lkl-measure fs 3 trace split && /bin/lkl-measure fs-rt 5 trace split; rc=$?; sleep 15; test "$rc" = "0"' ;;
-        tracelogger-lkl-netd) run_lkl_selftest tracelogger-lkl-netd 'lkl_start_net && /bin/verify-lkl-net --helpers; rc=$?; test "$rc" = "0" && /bin/tracelogger 0 700 windowed & sleep 1 && test "$rc" = "0" && /bin/lkl-measure net 3 trace split && /bin/lkl-measure net-rt 5 trace split; rc=$?; sleep 15; test "$rc" = "0"' ;;
-        tracelogger-lkl-netd-default) run_lkl_selftest tracelogger-lkl-netd-default 'lkl_start_net && /bin/verify-lkl-net --helpers; rc=$?; test "$rc" = "0" && /bin/tracelogger 0 3000 windowed 1000000 & sleep 1 && test "$rc" = "0" && /bin/lkl-measure net 10 trace && /bin/lkl-measure net-rt 100 trace; rc=$?; sleep 3; test "$rc" = "0"' ;;
+        tracelogger-lkl-fsd) run_lkl_selftest tracelogger-lkl-fsd 'lkl_start_pipe && lkl_start_fsd && /bin/cat /fs/root/hello.txt; rc=$?; test "$rc" = "0" && /bin/tracelogger 0 700 windowed & sleep 1 && test "$rc" = "0" && /bin/lkl-measure fs 3 trace split && /bin/lkl-measure fs-rt 5 trace split; rc=$?; sleep 15; test "$rc" = "0"' ;;
+        tracelogger-lkl-netd) run_lkl_selftest tracelogger-lkl-netd 'lkl_start_pipe && lkl_start_net && /bin/verify-lkl-net --helpers; rc=$?; test "$rc" = "0" && /bin/tracelogger 0 700 windowed & sleep 1 && test "$rc" = "0" && /bin/lkl-measure net 3 trace split && /bin/lkl-measure net-rt 5 trace split; rc=$?; sleep 15; test "$rc" = "0"' ;;
+        tracelogger-lkl-netd-default) run_lkl_selftest tracelogger-lkl-netd-default 'lkl_start_pipe && lkl_start_net && /bin/verify-lkl-net --helpers; rc=$?; test "$rc" = "0" && /bin/tracelogger 0 3000 windowed 1000000 & sleep 1 && test "$rc" = "0" && /bin/lkl-measure net 10 trace && /bin/lkl-measure net-rt 100 trace; rc=$?; sleep 3; test "$rc" = "0"' ;;
     esac
 }
 
@@ -854,6 +855,11 @@ fi
 # Hand off. On success: /usr/sbin/sysinit/level1.sh takes over. On failure:
 # rescue shell straight from the cpio.
 if test "$mount_ok" = "1"; then
+    if test "$rtmux_run" = "serial-priority"; then
+        /bin/dev-serial-8250 &
+        waitfor /dev/ser1 5 && /sbin/getty /dev/ser1
+        exit 1
+    fi
     if test "$rtmux_run" = "rt-check"; then
         echo
         echo "RTMux rt-check: BEGIN"
@@ -1225,12 +1231,21 @@ if test "$mount_ok" = "1"; then
         sleep 1
         exec /bin/sh -i
     fi
-    echo "Sysinit: level1 running."
-    echo
-    /sbin/getty
+    /bin/pipe &
+    if waitfor /dev/pipe 10; then
+        if test -r /usr/sbin/sysinit/level1.sh; then
+            /bin/sh /usr/sbin/sysinit/level1.sh
+        else
+            echo "Missing /usr/sbin/sysinit/level1.sh, starting getty."
+            /sbin/getty
+        fi
+    else
+        echo "Pipe service unavailable."
+    fi
+else
+    echo "*** /usr unavailable — dropping to rescue shell ***"
 fi
 
-echo "*** /usr unavailable — dropping to rescue shell ***"
 echo "Use 'shutdown' to power off."
 echo
 exec /bin/sh -i

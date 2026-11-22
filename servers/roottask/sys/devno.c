@@ -60,13 +60,20 @@ int _rsrc_minor(const char *name, int *major, int *minor_request, int flags)
         }
 
         /* Pre-allocate with 8 entries if nothing there already */
-        g_devno_table[eindex].name = strdup(name);
+        char *major_name = strdup(name);
+        if (!major_name)
+            return ENOMEM;
         if (!g_devno_table[eindex].minors) {
             g_devno_table[eindex].minors =
                 _scalloc(sizeof(struct _devno_minors));
+            if (!g_devno_table[eindex].minors) {
+                free(major_name);
+                return ENOMEM;
+            }
             g_devno_table[eindex].minors->count = 1;
         }
 
+        g_devno_table[eindex].name = major_name;
         head = &g_devno_table[eindex];
     }
 

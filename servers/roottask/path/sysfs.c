@@ -147,9 +147,9 @@ static size_t synth_kstats(char *buf, size_t cap)
 
         roottask_heap_stats(&hs);
         n = snprintf(buf + len, cap - len,
-                     "pa.free_bytes=%llu\nroottask.heap_used=%zu\n"
+                     "vm.rollback_pages=%lu\npa.free_bytes=%llu\nroottask.heap_used=%zu\n"
                      "roottask.heap_size=%zu\nroottask.heap_largest=%zu\n",
-                     (unsigned long long) pa_free_size(), hs.used, hs.arena,
+                     pte_rollback_pages(), (unsigned long long) pa_free_size(), hs.used, hs.arena,
                      hs.largest);
         if (n > 0 && (size_t) n < cap - len)
             len += (size_t) n;
@@ -409,7 +409,7 @@ static int sysfs_readdir(ioserv_context_t *ctp, io_read_t *msg, void *handle)
             break;
 
         struct dirent *de = (struct dirent *) ((char *) dp + used);
-        de->d_ino = (ino_t) (ocb->pos + 1);
+        de->d_ino = (ino_t) (ocb->pos + 2);
         de->d_reclen = (uint16_t) reclen;
         de->d_namelen = (uint16_t) nlen;
         memcpy(de->d_name, name, nlen + 1);
@@ -494,8 +494,8 @@ static int sysfs_stat(ioserv_context_t *ctp, io_stat_t *msg, void *handle)
     msg->o.st_mode = ocb->mode;
     msg->o.st_size = (off_t) ocb->size;
     msg->o.st_nlink = 1;
-    msg->o.st_dev = (ctp->info.srcnd << RTMUX_NODE_BITS) | path_devno;
-    msg->o.st_rdev = (ctp->info.srcnd << RTMUX_NODE_BITS) | sysfs_devno;
+    msg->o.st_dev = (ctp->info.srcnd << RTMUX_NODE_BITS) | sysfs_devno;
+    msg->o.st_ino = (ino_t) (ocb->idx + 2);
     return IOSERV_PTR(ctp, &msg->o, sizeof(msg->o));
 }
 

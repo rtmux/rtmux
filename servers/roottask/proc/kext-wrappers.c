@@ -483,8 +483,8 @@ int kernel_icache_sync_all(void)
  * inheritance, kernel-side.
  *
  * Pre-publishes initial_ip / initial_sp on a child's prp before the loader
- * sends SPAWN_DONE, and applies the SPAWN_EXEC / SPAWN_NOZOMBIE inheritance
- * rules.
+ * sends SPAWN_DONE, and applies the SPAWN_NOZOMBIE rule (the child of an exec
+ * keeps NOZOMBIE).
  *
  * Returns the (possibly-augmented) caller-side spawn flags via
  * *spawn_flags_inout so the loader can keep its lcp->ctx.flags in sync with the
@@ -1084,7 +1084,7 @@ struct _thread_local_storage *thread_tls(struct _thread_local_storage *tls,
  *
  * "roottask_buf" MUST be a kernel-direct-map VA (>= KERNEL_VIRT_BASE); a U-mode
  * roottask buffer would not survive the satp swap. Most callers obtain such a
- * VA via pte_temp_map() which returns paddr + CPU_1TO1_VADDR_BIAS.
+ * VA via pte_temp_map() which returns PA_TO_VA(paddr).
  *
  * Returns EOK / EFAULT / ESRCH / EINVAL.
  */

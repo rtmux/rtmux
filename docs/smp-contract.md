@@ -299,6 +299,16 @@ departing client cannot replace the fence: a notification lend or a REPLY
 propagation bumps the generation too, so a loan install failing on it could not
 tell a departed client from a busy server.
 
+The debug-inject loan-context test times out clients on a two-server reply
+chain eight times. It counts settles on idle harts and checks that interrupts
+are disabled there. Both four-hart parallel TCG and instruction-clock TCG
+passed with lock debugging enabled. Across five alternating paired loops of
+one million iterations, the full RISC-V departure fence added 1.93 to
+2.07 ns per iteration in the instruction-clock model (shift 1). This measures
+the additional instruction in that model. Parallel TCG showed host scheduling
+noise, including a negative paired delta. Hardware latency requires a board
+measurement.
+
 The priority settle and the chain walk do not run here.  `force_ready` only
 queues the server on its hart's list (`thread_prio_defer_settle`, under the leaf
 lock `LOCK_CLASS_PRIO_DEFER`); `kernel_exit` settles that list before the hart
@@ -467,8 +477,8 @@ IPI bits are defined in `kernel/include/smpswitch.h` and handled in
 | `IPI_TLB_FLUSH` | `sfence.vma`, then completion-counter release | Sender must publish page-table changes before the IPI and wait for the counter when freeing/reusing storage. |
 | `IPI_TLB_SAFE` | acknowledge safe TLB point | Used as a round trip; caller waits for bit clearance. |
 | `IPI_CLOCK_LOAD` | reload local timer | Timer state must be visible before send. |
-| `IPI_PARKIT` | park/quiesce receiver | Crash/shutdown-only paths. |
-| `IPI_CRASH` | enter crash rendezvous | No normal locks may be acquired. |
+| `IPI_PARKIT` | permanently park receiver | Clears the online and scheduling masks before parking. |
+| `IPI_CRASH` | enter crash rendezvous | The first crasher signals online CPUs and APs committed to join. The rendezvous includes CPUs already in crash handling and excludes parked CPUs. |
 | `IPI_CONTEXT_SAVE`, `IPI_CHECK_INTR`, `IPI_INTR_MASK`, `IPI_INTR_UNMASK` | reserved or not-yet-implemented | New users must document the receiver side first. |
 
 `send_ipi()` ORs the command into the target pending word and sends an SBI IPI.
@@ -639,3 +649,13 @@ checks (state, generation, rights) remain the last data-dependent branches
 before the validated object is read.  A new or reordered branch in either window
 is a gate failure that a reviewer must justify here before regenerating the
 golden with the script's --emit mode.
+
+The six-hart early-crash regression requires four participants. CPUs 3 and 4
+crash after committing to join, CPU 2 parks, and CPU 5 never joins. Three
+successive boots reported the exact count. In three alternating four-hart
+rt-check pairs with single-threaded TCG and an instruction clock (shift 1),
+scheduler p99 was 41.6, 4654.2 and 19.0 microseconds on the baseline and
+19.0, 16.2 and 41.6 microseconds with the direct running-CPU lookup. All six
+checks passed. Parallel TCG on the loaded host showed millisecond-scale
+variation on both revisions. These measurements establish no hardware
+worst-case bound.

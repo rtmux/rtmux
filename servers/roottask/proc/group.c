@@ -55,8 +55,12 @@ void proc_pgrp_unlock(void)
 static atomic_uint pgrp_window_where;
 static atomic_uint pgrp_window_ms;
 
+static _Atomic unsigned pgrp_window_active;
+
 int proc_pgrp_window_arm(unsigned where, unsigned ms)
 {
+    if (where == PGRP_WINDOW_ACTIVE)
+        return ms && atomic_load(&pgrp_window_active) == ms ? EOK : EAGAIN;
     if (where > PGRP_WINDOW_DETACH || ms > 5000)
         return EINVAL;
     atomic_store(&pgrp_window_ms, ms);
@@ -72,10 +76,12 @@ void proc_pgrp_window(unsigned where)
         atomic_exchange(&pgrp_window_where, PGRP_WINDOW_NONE) != where)
         return;
     ms = atomic_load(&pgrp_window_ms);
+    atomic_store(&pgrp_window_active, where);
     (void) nanosleep(
         &(struct timespec) {.tv_sec = ms / 1000,
                             .tv_nsec = (long) (ms % 1000) * 1000000L},
         NULL);
+    atomic_store(&pgrp_window_active, PGRP_WINDOW_NONE);
 }
 #endif
 
@@ -243,7 +249,7 @@ static int setpgid_locked(pid_t caller, pid_t target, pid_t pgid)
          * to move. A spawned child that has not is: RTMux spawns rather than
          * forks, so it is movable until it execs or exits.
          */
-        if (tgt.execed)
+        if (root_proc(target)->execed)
             return EACCES;
     }
 

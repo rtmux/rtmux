@@ -116,6 +116,7 @@
         connect_flags_r;
         connect_server_info;
         connect_server_info_r;
+        cpuid;
         creat;
         crypt;
         ctime;
@@ -241,6 +242,9 @@
         ioserv_notify_init;
         ioserv_notify_ready;
         ioserv_notify_remove;
+        ioserv_ldisc_feed;
+        ioserv_ldisc_read;
+        ioserv_ldisc_set;
         ioserv_notify_trigger;
         ioserv_ocb;
         ioserv_open_bind;
@@ -515,6 +519,7 @@
         readlink;
         readlinkat;
         realloc;
+        rewind;
         rewinddir;
         roottask_console_set;
         rtmux_delegate_device;
@@ -553,6 +558,7 @@
         seteuid;
         setgid;
         setgrent;
+        setjmp;
         setpgid;
         setpwent;
         setregid;
@@ -572,6 +578,7 @@
         siglongjmp;
         signal;
         sigprocmask;
+        sigsetjmp;
         sleep;
         snprintf;
         sprintf;
@@ -669,6 +676,7 @@
         vfprintf;
         vprintf;
         vsnprintf;
+        vsprintf;
         wait;
         waitid;
         waitpid;

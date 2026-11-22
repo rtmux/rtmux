@@ -17,13 +17,77 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <errno.h>
 #include <limits.h>
+#include <fcntl.h>
+#include <pthread.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/mallocstats.h>
+#include <sys/resource.h>
 #include <unistd.h>
 #include "test.h"
+
+/* Deny the direct mapping for a large buffer to exercise a real malloc
+ * failure without exhausting the guest. Warm the FILE lock before measuring
+ * since the pool keeps its lock after fclose.
+ */
+static void test_setvbuf_failure(unsigned deny_alloc)
+{
+    const char *name = deny_alloc ? "setvbuf allocation failure" :
+                                    "setvbuf invalid arguments";
+    int fds[2];
+    struct __rtmux_mallocstats before, after;
+    struct rlimit saved, limit;
+    char output[3] = {0};
+    int ok = 0;
+
+    if (pipe(fds) != 0) {
+        test_fail(name, "pipe failed");
+        return;
+    }
+    FILE *fp = fdopen(fds[1], "w");
+    if (!fp) {
+        close(fds[1]);
+        close(fds[0]);
+        test_fail(name, "fdopen failed");
+        return;
+    }
+    flockfile(fp);
+    funlockfile(fp);
+    __rtmux_mallocstats(&before);
+    if (setvbuf(fp, NULL, _IOFBF, 64) == 0 && fputs("a", fp) >= 0) {
+        if (!deny_alloc) {
+            ok = setvbuf(fp, NULL, 99, 0) != 0 &&
+                 setvbuf(fp, NULL, _IOFBF, (size_t) INT_MAX + 1) != 0 &&
+                 setvbuf(fp, NULL, _IONBF, (size_t) INT_MAX + 1) == 0;
+        } else if (getrlimit(RLIMIT_AS, &saved) == 0) {
+            limit = saved;
+            limit.rlim_cur = 0;
+            if (setrlimit(RLIMIT_AS, &limit) == 0) {
+                ok = setvbuf(fp, NULL, _IOLBF, 256 * 1024) != 0 &&
+                     errno == ENOMEM && fp->_bf._base == fp->_nbuf;
+                if (setrlimit(RLIMIT_AS, &saved) != 0)
+                    ok = 0;
+            }
+        }
+    }
+    if (fputs("b", fp) < 0)
+        ok = 0;
+    if (fclose(fp) != 0)
+        ok = 0;
+    __rtmux_mallocstats(&after);
+    if (read(fds[0], output, sizeof output) != 2 || strcmp(output, "ab"))
+        ok = 0;
+    close(fds[0]);
+    check(ok && after.failed == before.failed + deny_alloc &&
+              after.bytes_in_use == before.bytes_in_use &&
+              after.allocs - before.allocs == after.frees - before.frees,
+          name, "stream output or allocator counts differed");
+}
 
 static void expect(const char *name, const char *got, const char *want)
 {
@@ -1091,6 +1155,118 @@ static void test_printf_special(void)
     expect("fprintf through a small buffer", rbuf, want);
 }
 
+static int format_unbounded(char *result, const char *format, ...)
+{
+    va_list ap;
+    va_start(ap, format);
+    int n = vsprintf(result, format, ap);
+    va_end(ap);
+    return n;
+}
+
+static void test_rewind(void)
+{
+    FILE *fp = fopen("/bin/sh", "r");
+    if (!fp) {
+        test_fail("open file for rewind", strerror(errno));
+        return;
+    }
+    int first = fgetc(fp);
+    int seek_rc = fseek(fp, 0, SEEK_END);
+    int last = fgetc(fp);
+    int write_rc = fputc('x', fp);
+    check(first != EOF && seek_rc == 0 && last == EOF && feof(fp) &&
+              write_rc == EOF && ferror(fp),
+          "rewind fixture sets EOF and error", "stream indicators");
+    rewind(fp);
+    check(!ferror(fp) && !feof(fp) && fgetc(fp) == first,
+          "rewind clears indicators and seeks to start", "stream state");
+    fclose(fp);
+}
+
+enum { POOL_WORKERS = 8, POOL_ROUNDS = 1000 };
+static pthread_mutex_t stream_test_lock = PTHREAD_MUTEX_INITIALIZER;
+static FILE *open_streams[POOL_WORKERS];
+struct stream_worker {
+    unsigned index;
+    unsigned failures;
+};
+
+static void *exercise_stream_slot(void *arg)
+{
+    struct stream_worker *worker = arg;
+    for (unsigned round = 0; round < POOL_ROUNDS; round++) {
+        FILE *fp = fopen("/bin/sh", "r");
+        if (!fp) {
+            worker->failures++;
+            continue;
+        }
+        pthread_mutex_lock(&stream_test_lock);
+        for (unsigned i = 0; i < POOL_WORKERS; i++) {
+            if (open_streams[i] == fp)
+                worker->failures++;
+        }
+        open_streams[worker->index] = fp;
+        pthread_mutex_unlock(&stream_test_lock);
+        if (fgetc(fp) != 0x7f)
+            worker->failures++;
+        pthread_mutex_lock(&stream_test_lock);
+        open_streams[worker->index] = NULL;
+        pthread_mutex_unlock(&stream_test_lock);
+        if (fclose(fp) != 0)
+            worker->failures++;
+    }
+    return NULL;
+}
+
+static void test_stream_pool(void)
+{
+    FILE *streams[2 * FOPEN_MAX];
+    size_t count = 0;
+    while (count < sizeof(streams) / sizeof(*streams)) {
+        streams[count] = fopen("/bin/sh", "r");
+        if (!streams[count])
+            break;
+        count++;
+    }
+    check(count == sizeof(streams) / sizeof(*streams),
+          "stdio grows beyond the static stream pool", "open failed");
+    while (count)
+        fclose(streams[--count]);
+
+    struct stream_worker workers[POOL_WORKERS] = {0};
+    pthread_t threads[POOL_WORKERS];
+    unsigned started = 0, failures = 0;
+    for (; started < POOL_WORKERS; started++) {
+        workers[started].index = started;
+        if (pthread_create(&threads[started], NULL, exercise_stream_slot,
+                           &workers[started]) != 0)
+            break;
+    }
+    for (unsigned i = 0; i < started; i++) {
+        pthread_join(threads[i], NULL);
+        failures += workers[i].failures;
+    }
+    check(started == POOL_WORKERS && !failures,
+          "eight threads open and close 1000 private streams each", "stream collision or I/O error");
+
+    if (sysconf(_SC_OPEN_MAX) > SHRT_MAX + 1L) {
+        int fd = fcntl(STDIN_FILENO, F_DUPFD, SHRT_MAX + 1);
+        if (fd < 0) {
+            test_fail("create high descriptor for fdopen", strerror(errno));
+            return;
+        }
+        errno = 0;
+        FILE *fp = fdopen(fd, "r");
+        check(!fp && errno == EMFILE && fcntl(fd, F_GETFL, 0) >= 0,
+              "fdopen refuses an unrepresentable descriptor and preserves it", "fd ownership or errno");
+        if (fp)
+            fclose(fp);
+        else
+            close(fd);
+    }
+}
+
 void test_printf(void)
 {
     char buf[128];
@@ -1149,9 +1325,16 @@ void test_printf(void)
     snprintf(buf, sizeof buf, "%#.6x", 0xffu);
     expect("%#.6x precision", buf, "0x0000ff");
 
+    check(format_unbounded(buf, "%s %d", "number", 42) == 9 &&
+              strcmp(buf, "number 42") == 0,
+          "vsprintf writes the formatted string and length", "bad result");
+    test_rewind();
+    test_stream_pool();
     test_printf_table();
     test_printf_special();
     test_flockfile();
     test_char_unlocked_stdio();
     test_stdio_locked_ops();
+    test_setvbuf_failure(0);
+    test_setvbuf_failure(1);
 }

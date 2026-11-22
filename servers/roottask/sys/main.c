@@ -5,6 +5,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <sys/priority-bands.h>
 #include "externs.h"
 #include <stdalign.h>
 #include <startup.h>
@@ -92,12 +93,11 @@ static void *root_heartbeat_thread(void *arg)
 int roottask_main(int argc, char **argv)
 {
     /* Parse the boot command line for roottask's tunables. We accept the same
-     * short options the kernel parses for kopt ("-v", "-F", "-u") so a single
+     * short options the kernel parses for kopt ("-v", "-u") so a single
      * boot command line drives both sides. kopt itself is kernel-only now;
      * roottask owns its own scalars.
      *
      *   -v / -vv / -vvv ...  → roottask_loglevel = number of 'v's
-     *   -F <count> / -F<count>  → roottask_max_fds
      *   -u <umask> / -u<umask>  → roottask_procfs_umask (octal/auto)
      *
      * Any unrelated '-' arguments on the kernel command line are silently
@@ -118,16 +118,6 @@ int roottask_main(int argc, char **argv)
                     continue;
                 if (n > roottask_loglevel)
                     roottask_loglevel = n;
-                continue;
-            }
-
-            /* -F<count> / -F <count> — max open files. */
-            if (a[1] == 'F') {
-                const char *val = (a[2] != '\0')   ? a + 2
-                                  : (i + 1 < argc) ? argv[++i]
-                                                   : NULL;
-                if (val)
-                    roottask_max_fds = (unsigned) strtoul(val, NULL, 0);
                 continue;
             }
 
@@ -158,6 +148,9 @@ int roottask_main(int argc, char **argv)
          */
         root_process_init(ROOTTASK_PID, 0);
         root_process_boot_session(ROOTTASK_PID);
+        root_proc_info_t boot_info;
+        if (process_query_info(ROOTTASK_PID, &boot_info) == EOK)
+            roottask_max_fds = (unsigned) boot_info.rlimit_vals_hard[RLIMIT_NOFILE];
         root_proc(ROOTTASK_PID)->debug_name = strdup("roottask");
 
         /* Cache the adp pointer too. process_create's kcall_args adp_out
@@ -178,7 +171,7 @@ int roottask_main(int argc, char **argv)
      * would run at idle priority. Roottask's base priority is 10r.
      */
     {
-        struct sched_param sp = {.sched_priority = 10};
+        struct sched_param sp = {.sched_priority = RTMUX_PRIO_SERVER};
         (void) __sched_set(0, 0, SCHED_RR, &sp);
     }
 

@@ -89,7 +89,7 @@ void specialret_attr specialret(thread_t *thp)
 
         case RTMUX_FLG_THR_SHORT_MSG: {
             int status = 0;
-            thread_t *thp2 = thp->blocked_on;
+            thread_t *thp2 = thp->short_msg_source;
 
 #ifndef NDEBUG
 

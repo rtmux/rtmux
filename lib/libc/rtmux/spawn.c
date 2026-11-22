@@ -15,6 +15,7 @@
 #include <sys/iomsg.h>
 
 #include "env-lock.h"
+#include "exec-path-default.h"
 
 extern char **environ;
 
@@ -120,6 +121,17 @@ static pid_t spawn_common(const char *path,
         }
     }
     __env_unlock();
+
+    if (inherit && (inherit->flags & SPAWN_SEARCH_PATH) && !search) {
+        search = exec_path_default();
+        if (!search || strlen(search) >= UINT16_MAX) {
+            int err = search ? E2BIG : errno;
+            free(search);
+            free(data);
+            errno = err;
+            return -1;
+        }
+    }
 
     SETIOV(iov + 0, &msg.i, sizeof msg.i);
     SETIOV(iov + 1, fd_map, (size_t) fd_count * sizeof fd_map[0]);

@@ -192,9 +192,11 @@ int kdecl ksys_thread_destroy(thread_t *act,
         if (prp->num_active_threads > 1 ||
             (prp->threads.nentries - 1 == prp->threads.nfree)) {
             thp->status = kap->status;
+            SETKSTATUS(act, EOK);
             kspinlock_unlock(&prp->vec_slock);
             thread_destroy(thp);
-            return EOK;
+            /* The caller may have destroyed itself or been displaced. */
+            return ENOERROR;
         }
         kspinlock_unlock(&prp->vec_slock);
 

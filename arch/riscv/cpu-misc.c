@@ -443,6 +443,7 @@ void cpu_icache_sync_all(void)
 {
     extern unsigned hart_ids[];
     unsigned self = get_cpunum();
+    uint64_t online = cpu_online_snapshot();
     unsigned long mask = 0;
     unsigned i;
 
@@ -455,7 +456,7 @@ void cpu_icache_sync_all(void)
      * want of a PLIC context), so one mask from base 0 names them all.
      */
     for (i = 0; i < num_processors; ++i) {
-        if (i != self && cpu_online(i))
+        if (i != self && cpu_in_mask(online, i))
             mask |= 1UL << hart_ids[i];
     }
     if (mask != 0)

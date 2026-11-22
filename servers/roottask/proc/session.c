@@ -64,42 +64,105 @@ static int session_setsid(ioserv_context_t *ctp, session_t **old)
     return EOK;
 }
 
-/* One terminal is bound to a session, or let go, at a time: the unbind of a
- * session's terminal (tcsetsid -1, or the release of its last link) must not
- * run its message to the terminal server after a rebind's, or it would clear
- * the new binding, and the check that a terminal is free must hold until the
- * binding is recorded. One lock for every terminal, as a terminal is known by
- * its server and not by its session. It also makes "this is the last link" and
- * the drop of it one step. Taken before pgrp_mutex and any slot lock, and held
- * across the messages to the terminal server, which never calls back into a
- * bind or an unbind (terminal servers do call back for job control, which does
- * not take it); a server that never answers holds up every bind and unbind.
+/* A binding is reserved by server pid before sending OPENFD. Keep it on
+ * this list through the final unbind reply, even after the last process slot
+ * has disappeared. Only short list operations hold the mutex.
  */
 static pthread_mutex_t tty_bind_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t tty_changed = PTHREAD_COND_INITIALIZER;
+static session_t *tty_sessions;
 
 void proc_tty_init(void)
 {
     root_mutex_init_pi(&tty_bind_mutex);
 }
 
-/* Tell a terminal server it has no session now, so that tcgetsid on a
- * descriptor that is still open stops naming one, and drop roottask's
- * descriptor to it. A server that is gone cannot answer, and has nothing to
- * clear. tty_bind_mutex held. The terminal may be roottask's own, which answers
- * on a pool thread, so a caller with none reserved asks for one: without one to
- * spare the message is not sent (it could not be answered), and the server
- * keeps naming the session until it is bound to another.
+static void tty_unlist(session_t *sep)
+{
+    session_t **link = &tty_sessions;
+    while (*link && *link != sep)
+        link = &(*link)->tty_next;
+    if (*link)
+        *link = sep->tty_next;
+    sep->tty_next = NULL;
+    sep->tty_server = 0;
+}
+
+/* One queued operation per session permits a normal detach followed by a
+ * rebind, without parking the dispatch pool behind an unresponsive server.
+ * A reference held by the caller keeps sep alive across the timed wait.
  */
+static int tty_claim(session_t *sep, pid_t server)
+{
+    struct timespec deadline;
+    int rc = EOK;
+
+    pthread_mutex_lock(&tty_bind_mutex);
+    if (sep->tty_changing) {
+        if (sep->tty_waiter || clock_gettime(CLOCK_REALTIME, &deadline) < 0) {
+            rc = EBUSY;
+            goto out;
+        }
+        deadline.tv_sec++;
+        sep->tty_waiter = true;
+        while (sep->tty_changing && rc == EOK)
+            rc = pthread_cond_timedwait(&tty_changed, &tty_bind_mutex,
+                                        &deadline);
+        sep->tty_waiter = false;
+        if (rc != EOK)
+            goto out;
+    }
+    if (server) {
+        if (sep->fd != -1) {
+            struct _server_info info;
+            if (connect_server_info(0, (uint64_t) sep->fd, &info) == sep->fd) {
+                rc = EPERM;
+                goto out;
+            }
+            (void) connect_detach_r((uint64_t) sep->fd);
+            sep->fd = -1;
+            tty_unlist(sep);
+        }
+        for (session_t *other = tty_sessions; other; other = other->tty_next) {
+            if (other->tty_server == server) {
+                rc = EPERM;
+                goto out;
+            }
+        }
+        sep->tty_server = server;
+        sep->tty_next = tty_sessions;
+        tty_sessions = sep;
+    }
+    sep->tty_changing = true;
+out:
+    pthread_mutex_unlock(&tty_bind_mutex);
+    return rc;
+}
+
+static void tty_finish(session_t *sep)
+{
+    pthread_mutex_lock(&tty_bind_mutex);
+    if (sep->tty_server && sep->fd == -1)
+        tty_unlist(sep);
+    sep->tty_changing = false;
+    if (sep->tty_waiter)
+        pthread_cond_broadcast(&tty_changed);
+    pthread_mutex_unlock(&tty_bind_mutex);
+}
+
 static void tty_release(int fd, bool reserved)
 {
     pid_t none = 0;
 
-    if (reserved || proc_thread_pool_reserve() == 0) {
-        (void) _devctl(fd, DEVCTL_TTY_SET_SID, &none, sizeof none, 0);
-        if (!reserved)
-            proc_thread_pool_reserve_done();
+    if (!reserved && proc_thread_pool_reserve() != 0) {
+        /* Neither devctl nor close can self-send without a spare worker. */
+        (void) connect_detach_r((uint64_t) fd);
+        return;
     }
+    (void) _devctl(fd, DEVCTL_TTY_SET_SID, &none, sizeof none, 0);
     close(fd);
+    if (!reserved)
+        proc_thread_pool_reserve_done();
 }
 
 /* Drop one link on a session. The last drop lets go of the terminal, if one is
@@ -109,119 +172,77 @@ static void tty_release(int fd, bool reserved)
  */
 void proc_session_unref(session_t *sep)
 {
-    uint32_t links = __atomic_load_n(&sep->links, __ATOMIC_RELAXED);
-    bool last;
-
-    /* A drop that leaves other links needs no lock, so one stalled terminal
-     * server does not hold up every unrelated exit.
-     */
-    while (links > 1) {
-        if (__atomic_compare_exchange_n(&sep->links, &links, links - 1, false,
-                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
-            return;
-    }
-    pthread_mutex_lock(&tty_bind_mutex);
-    last = atomic_sub_value(&sep->links, 1) == 1;
-    if (last && sep->fd >= 0) {
+    if (atomic_sub_value(&sep->links, 1) != 1)
+        return;
+    if (sep->fd >= 0) {
         int fd = sep->fd;
-
         sep->fd = -1;
         tty_release(fd, false);
+        tty_finish(sep);
     }
-    pthread_mutex_unlock(&tty_bind_mutex);
-    if (last)
-        free(sep);
+    free(sep);
 }
 
 /* TCSETSID: bind the caller's session to the terminal on descriptor id, or (id
- * -1) let it go. tty_bind_mutex held.
+ * -1) let it go.
  */
 static int session_tcsetsid(ioserv_context_t *ctp, proc_session_t *msg)
 {
     io_openfd_t io_openfd;
-    process_t *prp;
     session_t *sep;
+    pid_t sid, pgid;
     int fd;
-    int status;
+    int status = EOK;
     root_proc_info_t qinfo;
 
-    if (!(prp = root_proc_lock(ctp->info.pid))) {
-        return EL2HLT;
+    /* Pin the session while the group lock excludes setsid and the slot
+     * lock still protects the reference from a departing process. */
+    proc_pgrp_lock();
+    sep = root_session_link_of(ctp->info.pid, &sid, &pgid);
+    if (!sep || sid != ctp->info.pid || sid != msg->i.sid) {
+        status = EPERM;
+    } else if (!root_proc_lock(ctp->info.pid)) {
+        status = ESRCH;
+    } else {
+        status = process_query_info(ctp->info.pid, &qinfo);
+        if (status == EOK && !(qinfo.flags & RTMUX_FLG_PROC_SLEADER))
+            status = EPERM;
+        root_proc_unlock(ctp->info.pid);
     }
-
-    /* prp->{flags,session} live in the kernel-allocated process_t; U-mode
-     * roottask can't deref them. Snapshot via the kernel extension — the
-     * session pointer itself is safe to deref because session_t is a
-     * libc-malloc'd roottask-owned object.
-     */
-    if (process_query_info(ctp->info.pid, &qinfo) != EOK) {
-        return proc_error(ESRCH, ctp->info.pid);
-    }
-    sep = qinfo.session;
-    if (!(qinfo.flags & RTMUX_FLG_PROC_SLEADER) || !sep ||
-        msg->i.sid != sep->leader) {
-        return proc_error(EPERM, ctp->info.pid);
-    }
-
+    proc_pgrp_unlock();
+    if (status != EOK)
+        goto unref;
     if (proc_thread_pool_reserve() != 0) {
-        return proc_error(EAGAIN, ctp->info.pid);
+        status = EAGAIN;
+        goto unref;
     }
 
+    memset(&io_openfd.i, 0, sizeof io_openfd.i);
     if (msg->i.id == -1) {
+        status = tty_claim(sep, 0);
+        if (status != EOK)
+            goto done;
         fd = sep->fd;
         sep->fd = -1;
-        root_proc_unlock(ctp->info.pid);
         proc_pgrp_window(PGRP_WINDOW_DETACH);
         if (fd >= 0)
             tty_release(fd, true);
-        proc_thread_pool_reserve_done();
-        return EOK;
+        goto finish;
     }
 
-    /* We know the process won't die because we haven't replied so sep stays
-     * valid
-     */
-    root_proc_unlock(ctp->info.pid);
-
-    memset(&io_openfd.i, 0x00, sizeof io_openfd.i);
-
-    /* If we have a controlling terminal, and the managing server is still alive
-     * then error out can't have two controlling terminals. If we detect the
-     * server has disappeared, the set sep->fd = -1;
-     */
-    if (sep->fd != -1) {
-        if (connect_server_info(0, (uint64_t) sep->fd, &io_openfd.i.info) ==
-            sep->fd) {
-            proc_thread_pool_reserve_done();
-            return EPERM;
-        } else {
-            fd = sep->fd;
-            sep->fd = -1;
-            close(fd);
-        }
-    }
-    /* Get information on passed fd */
     if (connect_server_info(ctp->info.pid, (uint64_t) msg->i.id,
                             &io_openfd.i.info) != msg->i.id) {
-        proc_thread_pool_reserve_done();
-        return EBADF;
+        status = EBADF;
+        goto done;
     }
-    /* make a connection to the channel */
-    if ((fd = connect_attach(io_openfd.i.info.nd, io_openfd.i.info.pid,
-                             io_openfd.i.info.chid, 0, 0)) == -1) {
-        proc_thread_pool_reserve_done();
-        return EINVAL;
-    }
-    /* A terminal is the controlling terminal of one session at a time. */
-    {
-        struct _server_info srv;
-
-        if (connect_server_info(0, (uint64_t) fd, &srv) != fd ||
-            proc_jobctl_tty_busy(srv.pid, sep->leader)) {
-            connect_detach_r((uint64_t) fd);
-            proc_thread_pool_reserve_done();
-            return EPERM;
-        }
+    status = tty_claim(sep, io_openfd.i.info.pid);
+    if (status != EOK)
+        goto done;
+    fd = connect_attach(io_openfd.i.info.nd, io_openfd.i.info.pid,
+                        io_openfd.i.info.chid, 0, 0);
+    if (fd == -1) {
+        status = errno;
+        goto finish;
     }
     /* send the openfd message (no share flags) */
     io_openfd.i.type = _IO_OPENFD;
@@ -235,25 +256,30 @@ static int session_tcsetsid(ioserv_context_t *ctp, proc_session_t *msg)
 
     /* ipc-send: roottask-fsio -> romfs,lkl-fsd,dev-nvme,pipe */
     if (msg_sendnc(fd, &io_openfd.i, sizeof io_openfd.i, 0, 0) == -1) {
+        status = errno;
         connect_detach_r((uint64_t) fd);
-        proc_thread_pool_reserve_done();
-        return errno;
+        goto finish;
     }
 
     if (_devctl(fd, DEVCTL_TTY_SET_SID, &sep->leader, sizeof sep->leader, 0) ==
         -1) {
         status = errno;
         close(fd);
-        proc_thread_pool_reserve_done();
-        return status;
+        goto finish;
     }
     /* The foreground group is what tcsetpgrp records, under pgrp_mutex. */
     proc_pgrp_lock();
     sep->fd = fd;
     sep->pgrp = sep->leader; /* Posix.1 7.1.1.3: the leader's group leads */
     proc_pgrp_unlock();
+finish:
+    tty_finish(sep);
+done:
     proc_thread_pool_reserve_done();
-    return EOK;
+unref:
+    if (sep)
+        proc_session_unref(sep);
+    return status;
 }
 
 /* SETPGRP: record group id as the foreground group of the session led by sid,
@@ -321,14 +347,8 @@ static int session_setpgrp(ioserv_context_t *ctp, proc_session_t *msg)
 int proc_msg_session(ioserv_context_t *ctp, proc_session_t *msg)
 {
     switch (msg->i.event) {
-    case _PROC_SESSION_TCSETSID: {
-        int rc;
-
-        pthread_mutex_lock(&tty_bind_mutex);
-        rc = session_tcsetsid(ctp, msg);
-        pthread_mutex_unlock(&tty_bind_mutex);
-        return rc;
-    }
+    case _PROC_SESSION_TCSETSID:
+        return session_tcsetsid(ctp, msg);
 
     case _PROC_SESSION_SETSID: {
         session_t *old = NULL;

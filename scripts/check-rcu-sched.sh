@@ -209,6 +209,7 @@ if ! awk '
     in_destroy && /RCU drain\. At this point/ { in_reap = 1 }
     in_reap && /^    if \(stats_enabled\) {$/ { stats_branch = NR }
     in_reap && stats_branch && /rcu_sched_synchronize_detail\(&stats_busy\)/ { stats_rcu = NR }
+    in_reap && stats_rcu && !in_else && /thread_prio_defer_cancel\(thp\);/ { stats_cancel = NR }
     in_reap && stats_branch && /stats_pin_waited = tthread_wait_unpinned\(thp\)/ { stats_pin = NR }
     in_destroy && /thread_destroy_wait_inactive\(thp, prp\)/ && stats_pin && !stats_active {
         stats_active = NR
@@ -219,6 +220,7 @@ if ! awk '
     in_reap && /cap_revoke_object_all_tables\(thp\);/ { stats_revoke = NR }
     in_reap && /^    } else {$/ && stats_branch { in_else = 1 }
     in_destroy && in_else && /rcu_sched_synchronize\(\);/ { saw_rcu = NR }
+    in_destroy && in_else && saw_rcu && /thread_prio_defer_cancel\(thp\);/ { saw_cancel = NR }
     in_destroy && in_else && /tthread_wait_unpinned\(thp\);/ && saw_rcu {
         saw_pin = NR
     }
@@ -229,9 +231,9 @@ if ! awk '
     }
     in_destroy && /^}/ { in_destroy = 0 }
     END { exit !(stats_branch && stats_rcu && stats_pin && stats_active && stats_revoke && stats_free &&
-                 stats_branch < stats_rcu && stats_rcu < stats_pin && stats_pin < stats_active &&
+                 stats_branch < stats_rcu && stats_rcu < stats_cancel && stats_cancel < stats_pin && stats_pin < stats_active &&
                  stats_active < stats_revoke && stats_revoke < stats_free &&
-                 saw_rcu && saw_pin && saw_active && saw_free) }
+                 saw_rcu && saw_rcu < saw_cancel && saw_cancel < saw_pin && saw_active && saw_free) }
 ' kernel/thread/lifecycle.c; then
     echo "RCU detail: sync reap" >&2
     echo "RCU-sched: thread reap must drain RCU, pins, and active harts before freeing" >&2
@@ -1622,7 +1624,7 @@ fi
 if ! awk '
     /void kext_process_destroy\(void \*data\)/ { in_destroy = 1 }
     in_destroy && /rcu_sched_synchronize\(\);/ { saw_sync = NR }
-    in_destroy && /process_wait_unpinned\(prp\);/ { saw_wait = NR }
+    in_destroy && /process_wait_unpinned\(prp, 0\);/ { saw_wait = NR }
     in_destroy && /object_free\(NULL, &process_souls, prp\);/ { saw_free = NR }
     in_destroy && /^}/ { in_destroy = 0 }
     END { exit !(saw_sync && saw_wait && saw_free && saw_sync < saw_wait && saw_wait < saw_free) }
@@ -2395,7 +2397,7 @@ fi
 if ! awk '
     /void rcu_sched_wait/ { in_wait = 1 }
     in_wait && /unsigned self = get_cpunum\(\);/ { saw_self = 1 }
-    in_wait && /if \(cpu == self\)/ { saw_skip = 1 }
+    in_wait && /if \(cpu == self \|\| !cpu_in_mask\(online, cpu\)\)/ { saw_skip = 1 }
     in_wait && /__atomic_load_n\(&in_kcall\[cpu\], __ATOMIC_RELAXED\)/ {
         saw_relaxed_counter = 1
     }
@@ -2989,7 +2991,7 @@ fi
 if ! awk '
     /void kext_process_shutdown\(void \*data\)/ { in_shutdown = 1 }
     in_shutdown && /process_clear_as_bindings\(prp\)/ { saw_clear = NR }
-    in_shutdown && /process_wait_unpinned\(prp\)/ { saw_wait = NR }
+    in_shutdown && /process_wait_unpinned\(prp, 0\)/ { saw_wait = NR }
     in_shutdown && /vm_ops->mdestroy\(prp\)/ { saw_destroy = NR }
     in_shutdown && /^}/ { in_shutdown = 0 }
     END {

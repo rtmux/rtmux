@@ -51,6 +51,13 @@ The kernel remains unaware of POSIX path strings.
 - environment and argv are copied as data;
 - wait authority is returned as process/wait state, not as pid ownership.
 
+An identity dup2 file action keeps the descriptor open in the child and
+clears its close-on-exec flag. The parent keeps its original descriptor flags.
+For bare executable names, an empty PATH component selects the current
+directory and an unset PATH uses the path returned by `confstr(_CS_PATH)`.
+An unsuccessful search preserves a permission denial across later missing
+entries and propagates resource errors immediately.
+
 ## Regression Gate
 
 `scripts/qemu-regress.sh --mode posix-cap-boundary --timeout 180` boots RTMux and

@@ -52,6 +52,7 @@ void cpu_tlb_flush_complete(void)
         return;
 
     unsigned self = get_cpunum();
+    uint64_t online = cpu_online_snapshot();
     unsigned ticket[PROCESSORS_MAX];
     bool wait[PROCESSORS_MAX];
 
@@ -73,7 +74,7 @@ void cpu_tlb_flush_complete(void)
          * alive its TLB is clean, and while it is not alive it has not touched
          * the flushed VAs.
          */
-        if (cpu == self || !cpu_online(cpu)) {
+        if (cpu == self || !cpu_in_mask(online, cpu)) {
             wait[hi] = false;
             continue;
         }
@@ -106,8 +107,11 @@ void cpu_tlb_flush_complete(void)
                       ticket[hi]) < 0) {
             interrupt_enable();
             interrupt_disable();
-            if ((++spins & 0x3ff) == 0)
+            if ((++spins & 0x3ff) == 0) {
+                if (!cpu_online(cpu))
+                    break;
                 SENDIPI(cpu, IPI_TLB_FLUSH);
+            }
         }
     }
 #endif
@@ -163,25 +167,25 @@ int cpu_pte_manipulate(struct mm_pte_manipulate *data)
     uint64_t paddr = 0; /* only a MAP supplies one */
     uintptr_t start = data->start;
     uintptr_t end = data->end;
-    enum sv39_manip_op mop;
+    enum pte_op mop;
     int changed = 0;
     bool cut = false;
     int r;
 
     if (op & (PTE_OP_MAP | PTE_OP_BAD)) {
-        mop = SV39_MANIP_MAP;
+        mop = PTE_OP_MAP;
         paddr = data->paddr;
     }
     else if (op & PTE_OP_UNMAP)
-        mop = SV39_MANIP_UNMAP;
+        mop = PTE_OP_UNMAP;
     else if (op & PTE_OP_PROT)
-        mop = SV39_MANIP_PROT;
+        mop = PTE_OP_PROT;
     else if (op & PTE_OP_PREALLOC)
-        mop = SV39_MANIP_PREALLOC;
+        mop = PTE_OP_PREALLOC;
     else
         return EOK;
 
-    if (mop == SV39_MANIP_MAP && (bits & PTE_U) && start < KERNEL_VIRT_BASE) {
+    if (mop == PTE_OP_MAP && (bits & PTE_U) && start < KERNEL_VIRT_BASE) {
         extern char _text_start[], _end[];
         uintptr_t uend = end < KERNEL_VIRT_BASE ? end : KERNEL_VIRT_BASE;
         uint64_t len = uend > start ? uend - start : 0;
@@ -205,14 +209,14 @@ int cpu_pte_manipulate(struct mm_pte_manipulate *data)
     }
 
     /* Debug builds can make a MAP run dry part of the way (ENOMEM). */
-    if (mop == SV39_MANIP_MAP)
+    if (mop == PTE_OP_MAP)
         cut = inject_pte_map_stop(adp, start, &end);
     r = sv39_manip_pages(pgdir, mop, &start, end, &paddr, bits, sv39_new_table,
                          &changed);
     if (cut && r == EOK)
         r = ENOMEM;
     data->start = start;
-    if (mop == SV39_MANIP_MAP)
+    if (mop == PTE_OP_MAP)
         data->paddr = paddr;
     if (changed)
         data->tlb_flush_pending = 1;
@@ -245,57 +249,6 @@ int cpu_pte_split(uintptr_t vaddr, struct mm_pte_manipulate *data)
     (void) vaddr;
     (void) data;
     return EOK;
-}
-
-/* cpu_pte_mark_user — mark every existing leaf PTE in [start, end) with PTE_U
- * so U-mode CPUs can fetch/load through the kernel L2 entries.
- *
- * Used to expose roottask text/data and the syspage to U-mode pool threads.
- * Walks the current satp's page table without ever allocating intermediate
- * tables; pages outside any existing mapping are silently skipped. A leaf that
- * is a superpage is marked whole, and the walk resumes after it, since PTE_U
- * cannot be set on part of one; a range that cuts one crashes. Does
- * sfence_vma() once at the end.
- *
- * Parameters:
- *   start : first virtual address of the range
- *   end   : one past the last virtual address of the range
- *
- * Note: the kernel L2 (and the L1/L0 tables under it) are shared across all
- * processes in RTMux (kernel-L2 prealloc). Setting PTE_U here exposes the page
- * to U-mode in every process, not just roottask.
- */
-void cpu_pte_mark_user(uintptr_t start, uintptr_t end)
-{
-    uint64_t satp = r_satp();
-    pagetable_t pgdir =
-        (pagetable_t) PA_TO_VA((satp & 0xFFFFFFFFFFFUL) << PGSHIFT);
-    uintptr_t first = start & ~(uintptr_t) (__PAGESIZE - 1);
-    uintptr_t va = first;
-
-    while (va < end) {
-        int level;
-        pte_t *pte = sv39_lookup_leaf(pgdir, va, &level, NULL);
-
-        if (!pte) {
-            va += __PAGESIZE;
-            continue;
-        }
-        /* PTE_U on a superpage covers all of it, in every address space that
-         * shares the table: a range that cuts one is a caller bug, not
-         * something to widen silently.
-         */
-        uintptr_t mask = sv39_leaf_size(level) - 1;
-
-        if (level && ((va & ~mask) < first || (va | mask) >= end)) {
-            kprintf("BUG: cpu_pte_mark_user [%lx, %lx) cuts a level %d leaf\n",
-                    (unsigned long) start, (unsigned long) end, level);
-            crash();
-        }
-        *pte |= PTE_U;
-        va = (va | mask) + 1;
-    }
-    sfence_vma();
 }
 
 /* cpu_as_vaddrinfo — report the physical mapping for a virtual address.

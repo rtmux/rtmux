@@ -61,42 +61,35 @@ static int find_with_insert(cursor_t **chead, char *name)
     cursor_t *ctarget;
     unsigned indx;
 
-    if (!(ctarget = *chead)) {
-        ctarget = calloc(sizeof(cursor_t), 1);
-        if (!(*chead = ctarget)) {
-            errno = ENOMEM;
-            return 0;
-        }
-        ctarget->data[0] = strdup(name);
-        if (!ctarget->data[0]) {
-            free(ctarget);
-            errno = ENOMEM;
-            return 0;
-        }
-        ctarget->count++;
-        return 0;
-    }
-
-    do {
+    while ((ctarget = *chead)) {
         if (bsearch(name, ctarget->data, ctarget->count, sizeof(char *),
                     compare))
             return 1;
-    } while (ctarget->next && (ctarget = ctarget->next));
+        if (ctarget->count < DATA_COUNT)
+            break;
+        chead = &ctarget->next;
+    }
 
-    if (ctarget->count >= DATA_COUNT)
-        return find_with_insert(&ctarget->next, name);
-
+    /* Allocate before publishing a node or shifting its sorted entries. */
+    char *copy = strdup(name);
+    if (!copy)
+        return -1;
+    if (!ctarget) {
+        ctarget = calloc(1, sizeof(*ctarget));
+        if (!ctarget) {
+            free(copy);
+            errno = ENOMEM;
+            return -1;
+        }
+        *chead = ctarget;
+    }
     for (indx = 0; indx < ctarget->count; indx++) {
         if (strcmp(name, ctarget->data[indx]) < 0)
             break;
     }
     memmove(&ctarget->data[indx + 1], &ctarget->data[indx],
             (ctarget->count - indx) * sizeof(char *));
-    ctarget->data[indx] = strdup(name);
-    if (!ctarget->data[indx]) {
-        errno = ENOMEM;
-        return 0;
-    }
+    ctarget->data[indx] = copy;
     ctarget->count++;
     return 0;
 }
@@ -185,37 +178,57 @@ bad_alloc:
 
 struct dirent *readdir(DIR *dirp)
 {
-    struct dirent *d;
-    do {
-        if (dirp->dd_loc >= dirp->dd_size) {
+    const size_t hdr = offsetof(struct dirent, d_name);
+
+    for (;;) {
+        while (dirp->dd_loc == dirp->dd_size) {
+            if (dirp->dd_fd_block.index >= dirp->dd_fd_block.count)
+                return NULL;
+            ssize_t n = _readx(dirp->dd_fd_block.fds[dirp->dd_fd_block.index],
+                               dirp->dd_buf, BUF_SIZE, 0, "", 0);
+            if (n < 0)
+                return NULL;
+            if (n > BUF_SIZE) {
+                errno = EOVERFLOW;
+                return NULL;
+            }
             dirp->dd_loc = 0;
-
-            do {
-                if ((dirp->dd_fd_block.index >= dirp->dd_fd_block.count) ||
-                    (dirp->dd_size = (int) _readx(
-                         dirp->dd_fd_block.fds[dirp->dd_fd_block.index],
-                         dirp->dd_buf, BUF_SIZE, 0, "", 0)) == -1) {
-                    dirp->dd_size = 0;
-                    return NULL;
-                }
-
-                if (dirp->dd_size > BUF_SIZE)
-                    dirp->dd_size = 0;
-
-                if (dirp->dd_size == 0) {
-                    if (++dirp->dd_fd_block.index >= dirp->dd_fd_block.count)
-                        return 0;
-                }
-            } while (dirp->dd_size == 0);
+            dirp->dd_size = (int) n;
+            if (n == 0)
+                ++dirp->dd_fd_block.index;
         }
 
-        d = (struct dirent *) &dirp->dd_buf[dirp->dd_loc];
-        dirp->dd_loc += d->d_reclen;
-    } while ((dirp->dd_flags & DIR_FLAG_FILTER) &&
-             find_with_insert(&dirp->dd_cursor, d->d_name));
+        size_t left = (size_t) (dirp->dd_size - dirp->dd_loc);
+        struct dirent *d = (void *) (dirp->dd_buf + dirp->dd_loc);
+        if (left <= hdr || d->d_reclen <= hdr || d->d_reclen > left ||
+            (d->d_reclen < left && d->d_reclen % _Alignof(struct dirent)))
+            goto malformed;
 
-    dirp->dd_pos++;
-    return d;
+        char *nul = memchr(d->d_name, '\0', d->d_reclen - hdr);
+        if (!nul)
+            goto malformed;
+        size_t len = (size_t) (nul - d->d_name);
+        /* Older procfs mount entries include the NUL in d_namelen. */
+        if (d->d_namelen != len && d->d_namelen != len + 1)
+            goto malformed;
+        d->d_namelen = (uint16_t) len;
+        int duplicate = 0;
+        if (dirp->dd_flags & DIR_FLAG_FILTER) {
+            duplicate = find_with_insert(&dirp->dd_cursor, d->d_name);
+            if (duplicate < 0)
+                return NULL;
+        }
+        dirp->dd_loc += d->d_reclen;
+        if (!duplicate) {
+            dirp->dd_pos++;
+            return d;
+        }
+    }
+
+malformed:
+    dirp->dd_loc = dirp->dd_size;
+    errno = EIO;
+    return NULL;
 }
 
 /* readdir_r -- reentrant readdir: copy the next entry into the caller-supplied
@@ -244,12 +257,8 @@ int readdir_r(DIR *dirp, struct dirent *entry, struct dirent **result)
     hdr = offsetof(struct dirent, d_name);
     namelen = d->d_namelen;
 
-    /* Defend against a malformed or hostile record: a name longer than NAME_MAX
-     * cannot fit a POSIX-sized caller buffer, and a name that overruns the
-     * record's own d_reclen would over-read the DIR buffer. Either is a corrupt
-     * entry -- fail closed rather than overflow.
-     */
-    if (namelen > NAME_MAX || hdr + namelen + 1 > d->d_reclen) {
+    /* readdir checked the wire record. The caller's buffer holds NAME_MAX. */
+    if (namelen > NAME_MAX) {
         *result = NULL;
         errno = EOVERFLOW;
         return EOVERFLOW;

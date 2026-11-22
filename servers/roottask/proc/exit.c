@@ -34,6 +34,10 @@ int proc_exit(ioserv_context_t *ctp, union proc_msg_union *msg)
     pid_t pid = ctp->info.pid;
     process_t *prp;
 
+    if (ctp->info.msglen < (int) sizeof(*ep) || ep->by_signal > 1 ||
+        (ep->by_signal && (ep->status < 1 || ep->status > MAXSIG)))
+        return EINVAL;
+
     prp = root_proc_lock(pid);
     if (!prp) {
         root_log("proc_exit: pid %d not found\n", pid);
@@ -65,7 +69,7 @@ int proc_exit(ioserv_context_t *ctp, union proc_msg_union *msg)
     {
         root_process_t *tmp = root_proc(pid);
         tmp->siginfo.si_signo = SIGCHLD;
-        tmp->siginfo.si_code = CLD_EXITED;
+        tmp->siginfo.si_code = ep->by_signal ? CLD_KILLED : CLD_EXITED;
         tmp->siginfo.si_status = ep->status;
         tmp->siginfo.si_pid = pid;
     }

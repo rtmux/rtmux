@@ -603,6 +603,7 @@ static void thread_destroy_wait_inactive(thread_t *thp, process_t *prp)
 
     for (;;) {
         unsigned hi;
+        uint64_t online = cpu_online_snapshot();
         int active_hart = -1;
         unsigned depth = 0;
 
@@ -610,7 +611,7 @@ static void thread_destroy_wait_inactive(thread_t *thp, process_t *prp)
             unsigned cpu = hi;
             thread_t *cur;
 
-            if (cpu == self || !cpu_online(cpu))
+            if (cpu == self || !cpu_in_mask(online, cpu))
                 continue;
             cur = __atomic_load_n(&pcpu_array[cpu].pc_curthread,
                                   __ATOMIC_ACQUIRE);
@@ -667,10 +668,11 @@ static void thread_soul_free(process_t *prp, thread_t *thp)
  */
 int thread_active_hart(thread_t *thp)
 {
+    uint64_t online = cpu_online_snapshot();
     for (unsigned cpu = 0; cpu < num_processors; cpu++) {
         thread_t *cur;
 
-        if (!cpu_online(cpu))
+        if (!cpu_in_mask(online, cpu))
             continue;
         cur = __atomic_load_n(&pcpu_array[cpu].pc_curthread, __ATOMIC_ACQUIRE);
         if (cur == thp)
@@ -999,6 +1001,20 @@ unsigned rdecl thread_as_release_borrowers(process_t *prp)
     }
     kspinlock_unlock(&thread_as_slock);
     return released;
+}
+
+/* Accept borrows of prp's address space again, for an exec that has given the
+ * process a new one: kext_process_shutdown closed the list for the old address
+ * space, which is gone, and the process itself lives on. The list is empty from
+ * the close until here, so nothing needs releasing.
+ */
+void rdecl thread_as_reopen_borrowers(process_t *prp)
+{
+    kspinlock_lock(&thread_as_slock);
+    if (prp->as_borrowers)
+        crash();
+    prp->as_borrow_closed = false;
+    kspinlock_unlock(&thread_as_slock);
 }
 
 
@@ -1398,10 +1414,11 @@ int rdecl thread_create(thread_t *act,
  */
 void fpu_drop_claims(thread_t *thp)
 {
+    uint64_t online = cpu_online_snapshot();
     for (unsigned c = 0; c < num_processors; c++) {
         struct thread_entry *me = thp;
 
-        if (!cpu_online(c))
+        if (!cpu_in_mask(online, c))
             continue;
 
         __atomic_compare_exchange_n(&pcpu_array[c].pc_active_fpu, &me, NULL, 0,
@@ -1625,7 +1642,7 @@ void rdecl thread_destroy(thread_t *thp)
             thp->args.ri.thp->restart = 0;
         }
         if (thp->flags & RTMUX_FLG_THR_SHORT_MSG) {
-            ((thread_t *) thp->blocked_on)->restart = 0;
+            thp->short_msg_source->restart = 0;
         }
 
         thp->timeout_flags = 0;

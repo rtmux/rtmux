@@ -2427,15 +2427,25 @@ static void test_posix_poll_hup(void)
         (void) close(fds[1]);
     }
 
-    if (pipe(fds) == 0) {
+    const short requests[] = {POLLIN, POLLOUT};
+    for (unsigned i = 0; i < sizeof requests / sizeof *requests; i++) {
+        if (pipe(fds) < 0) {
+            test_fail("blocking poll hangup fixture", strerror(errno));
+            break;
+        }
         if (pthread_create(&tid, NULL, poll_hup_closer, &fds[1]) == 0) {
             pfd.fd = fds[0];
-            pfd.events = POLLIN;
+            pfd.events = requests[i];
             pfd.revents = 0;
-            check(poll(&pfd, 1, 2000) == 1 && (pfd.revents & POLLHUP),
-                  "poll blocks then wakes on hup",
-                  "a blocked poll must wake with POLLHUP when the writer closes");
+            check(
+                poll(&pfd, 1, 2000) == 1 && (pfd.revents & POLLHUP),
+                i ? "POLLOUT waiter wakes on hangup"
+                  : "POLLIN waiter wakes on hangup",
+                "a blocked poll must wake with POLLHUP when the writer closes");
             (void) pthread_join(tid, NULL);
+        } else {
+            test_fail("start blocking poll closer", "pthread_create failed");
+            (void) close(fds[1]);
         }
         (void) close(fds[0]);
     }
@@ -3001,6 +3011,22 @@ void test_console_poll(void)
         return;
     }
 
+    struct termios saved, raw;
+    if (tcgetattr(fd, &saved) < 0) {
+        test_fail("console termios", strerror(errno));
+        close(fd);
+        return;
+    }
+    test_tty_discipline(fd, console_inject);
+    raw = saved;
+    raw.c_lflag &= ~(tcflag_t) (ICANON | ECHO);
+    raw.c_cc[VMIN] = 1;
+    raw.c_cc[VTIME] = 0;
+    if (tcsetattr(fd, TCSANOW, &raw) < 0) {
+        test_fail("console raw poll fixture", strerror(errno));
+        close(fd);
+        return;
+    }
     rc = serial_poll_once(fd, SERIAL_WAIT_POLL, 50, &ready);
     check(rc == 0, "console_poll idle poll times out",
           "poll({/dev/text, POLLIN}, 50) with nothing typed must return 0");
@@ -3044,6 +3070,7 @@ void test_console_poll(void)
     check(rc == 0, "console_poll drained console idle again",
           "a drained console must not poll readable");
 out:
+    (void) tcsetattr(fd, TCSANOW, &saved);
     (void) close(fd);
 }
 
@@ -3735,8 +3762,106 @@ static void test_posix_getlogin(void)
     unsetenv("LOGNAME");
 }
 
+struct identity_sample {
+    char path[PATH_MAX];
+    struct stat st;
+};
+
+static void record_identity(struct identity_sample *samples,
+                            size_t *count,
+                            size_t capacity,
+                            const char *path)
+{
+    struct stat st;
+    if (lstat(path, &st) < 0) {
+        test_fail(path, strerror(errno));
+        return;
+    }
+    if (S_ISLNK(st.st_mode))
+        return;
+    for (size_t i = 0; i < *count; i++) {
+        const struct stat *other = &samples[i].st;
+        if (!strcmp(path, samples[i].path))
+            return;
+        if ((st.st_dev == other->st_dev && st.st_ino == other->st_ino) ||
+            ((S_ISCHR(st.st_mode) || S_ISBLK(st.st_mode)) &&
+             (S_ISCHR(other->st_mode) || S_ISBLK(other->st_mode)) &&
+             st.st_rdev == other->st_rdev)) {
+            test_fail(path, samples[i].path);
+            return;
+        }
+    }
+    if (*count == capacity) {
+        test_fail(path, "too many device identities");
+        return;
+    }
+    strcpy(samples[*count].path, path);
+    samples[(*count)++].st = st;
+}
+
+void test_device_identity(const char *second_mount)
+{
+    static const char *const roots[] = {"/",    "/dev", "/proc",
+                                        "/sys", "/cap", "/usr"};
+    const size_t capacity = 128;
+    struct identity_sample *samples = calloc(capacity, sizeof(*samples));
+    struct stat console, target;
+    char link[PATH_MAX];
+    size_t count = 0;
+    DIR *dir = opendir("/dev");
+    printf("[device-identity]\n");
+    if (!dir || !samples) {
+        test_fail("device namespace", strerror(errno));
+        goto out;
+    }
+    for (;;) {
+        struct dirent *ent;
+        char path[PATH_MAX];
+        errno = 0;
+        if (!(ent = readdir(dir))) {
+            check(!errno, "device namespace enumerated", strerror(errno));
+            break;
+        }
+        if (!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, ".."))
+            continue;
+        if ((size_t) snprintf(path, sizeof(path), "/dev/%s", ent->d_name) >=
+            sizeof(path)) {
+            test_fail("device name", "path too long");
+            continue;
+        }
+        record_identity(samples, &count, capacity, path);
+    }
+    for (size_t i = 0; i < sizeof roots / sizeof roots[0]; i++)
+        record_identity(samples, &count, capacity, roots[i]);
+    if (second_mount) {
+        struct stat first, second;
+        record_identity(samples, &count, capacity, second_mount);
+        check(stat("/usr", &first) == 0 && stat(second_mount, &second) == 0 &&
+                  first.st_ino == second.st_ino &&
+                  first.st_dev != second.st_dev,
+              "two mounts of one romfs have distinct devices", second_mount);
+    }
+    ssize_t len = readlink("/dev/console", link, sizeof(link) - 1);
+    if (len > 0) {
+        link[len] = 0;
+        check(stat("/dev/console", &console) == 0 && stat(link, &target) == 0 &&
+                  console.st_rdev == target.st_rdev &&
+                  console.st_dev == target.st_dev &&
+                  console.st_ino == target.st_ino,
+              "console alias identifies its target", link);
+    } else {
+        test_fail("console alias target", strerror(errno));
+    }
+    check(count >= sizeof roots / sizeof roots[0],
+          "found device and mount identities", NULL);
+out:
+    if (dir)
+        closedir(dir);
+    free(samples);
+}
+
 /* ttyname_r distinguishes a bad fd (EBADF) from a non-terminal (ENOTTY), and on
- * RTMux any real terminal descriptor names the single console.
+ * a terminal it returns a path with the same device number.
  */
 static void test_posix_ttyname(void)
 {
@@ -3754,9 +3879,11 @@ static void test_posix_ttyname(void)
     }
 
     if (isatty(STDIN_FILENO)) {
+        struct stat actual, named;
         check(ttyname_r(STDIN_FILENO, buf, sizeof buf) == 0 &&
-                  !strcmp(buf, "/dev/console"),
-              "ttyname_r on a terminal names /dev/console", "wrong name/rc");
+                  fstat(STDIN_FILENO, &actual) == 0 && stat(buf, &named) == 0 &&
+                  S_ISCHR(named.st_mode) && actual.st_rdev == named.st_rdev,
+              "ttyname_r names the open terminal", "wrong terminal identity");
         check(ttyname_r(STDIN_FILENO, buf, 3) == ERANGE,
               "ttyname_r ERANGE on short buffer", "expected ERANGE");
         check(ttyname(STDIN_FILENO) != NULL, "ttyname non-NULL on a terminal",
@@ -7356,7 +7483,7 @@ static void test_spawn_file_actions_close_dup2_spawn(void)
 {
     posix_spawn_file_actions_t actions;
     char *argv[] = {"true", NULL};
-    SPAWN_ARGV_CLOSED(fd3_closed, 3);
+    SPAWN_ARGV_READABLE(fd3_readable, 3);
     SPAWN_ARGV_READABLE_CLOSED(fd5_readable_fd3_closed, 5, 3);
     SPAWN_ARGV_READABLE(fd40_readable, 40);
     pid_t pid = (pid_t) -1;
@@ -7408,16 +7535,18 @@ static void test_spawn_file_actions_close_dup2_spawn(void)
     }
     pid = (pid_t) -1;
     rc = posix_spawn(&pid, "/bin/syscall_testing", &actions, NULL,
-                     fd3_closed_argv, NULL);
+                     fd3_readable_argv, NULL);
+    check(fcntl(fd, F_GETFD) == FD_CLOEXEC, "spawn identity dup2 parent",
+          "parent must retain its close-on-exec flag");
     (void) close(fd);
     (void) posix_spawn_file_actions_destroy(&actions);
     check(rc == EOK && pid > 0, "spawn identity dup2 cloexec",
-          "dup2(fd, fd) file action must not clear FD_CLOEXEC");
+          "spawn with an identity dup2 file action must succeed");
     if (rc == EOK && pid > 0) {
         check(waitpid(pid, &status, 0) == pid && WIFEXITED(status) &&
                   WEXITSTATUS(status) == 0,
               "spawn identity dup2 cloexec child",
-              "child must still see the descriptor closed on exec");
+              "child must inherit the readable descriptor");
     }
 
     (void) close(3);
@@ -7540,6 +7669,68 @@ static void test_spawnp_absolute_path(void)
     check(posix_spawnp(&pid, "", NULL, NULL, argv, NULL) == EINVAL &&
               pid == (pid_t) -1,
           "posix_spawnp empty file", "expected EINVAL without child");
+}
+
+static void test_spawn_search_contract(void)
+{
+    const char *env = getenv("PATH");
+    char *old_path = env ? strdup(env) : NULL;
+    char cwd[PATH_MAX];
+    char *argv[] = {"true", NULL};
+    char *exec_argv[] = {"syscall_testing", "--execvp-path", NULL};
+    const char *paths[] = {NULL, "", ":/missing",
+                           "/missing:", "/missing::/missing"};
+    if ((env && !old_path) || !getcwd(cwd, sizeof cwd) || chdir("/bin") < 0) {
+        test_fail("PATH search fixture", strerror(errno));
+        free(old_path);
+        return;
+    }
+    for (size_t i = 0; i < sizeof paths / sizeof *paths; i++) {
+        int status, rc;
+        pid_t pid;
+        char what[96];
+        rc = paths[i] ? setenv("PATH", paths[i], 1) : unsetenv("PATH");
+        if (rc) {
+            test_fail("set search path", strerror(errno));
+            break;
+        }
+        rc = posix_spawnp(&pid, "true", NULL, NULL, argv, environ);
+        snprintf(what, sizeof what, "spawnp PATH %s",
+                 paths[i] ? paths[i] : "(unset)");
+        check(!rc && wait_child_exit(pid, &status, 500) && WIFEXITED(status) &&
+                  !WEXITSTATUS(status),
+              what, rc ? strerror(rc) : "child did not exit successfully");
+        rc = posix_spawn(&pid, "/bin/syscall_testing", NULL, NULL, exec_argv,
+                         environ);
+        snprintf(what, sizeof what, "execvp PATH %s",
+                 paths[i] ? paths[i] : "(unset)");
+        check(!rc && wait_child_exit(pid, &status, 500) && WIFEXITED(status) &&
+                  !WEXITSTATUS(status),
+              what, rc ? strerror(rc) : "child did not execute true");
+    }
+    if (setenv("PATH", "/:/missing", 1) == 0) {
+        pid_t pid;
+        int rc = posix_spawnp(&pid, "bin", NULL, NULL, argv, environ);
+        check(rc == EACCES, "spawnp remembers denied candidate", strerror(rc));
+        rc = execvp("bin", argv);
+        check(rc == -1 && errno == EACCES, "execvp remembers denied candidate",
+              strerror(errno));
+    }
+    if (old_path)
+        (void) setenv("PATH", old_path, 1);
+    else
+        (void) unsetenv("PATH");
+    free(old_path);
+    (void) chdir(cwd);
+}
+
+void test_spawn_contract(void)
+{
+    test_spawn_search_contract();
+    test_spawn_file_actions_close_dup2_spawn();
+    test_posix_poll_hup();
+    test_spawn_malformed_messages_fail_closed();
+    pgrp_exec_eacces();
 }
 
 static void test_spawnattr_flags(void)
@@ -11165,6 +11356,7 @@ void test_spawn_storm(unsigned residents)
 
 void test_vfs(void)
 {
+    test_exec();
     test_system_db_r();
     test_fcntl_dupfd_cloexec();
     test_dup_dup2();
@@ -11233,6 +11425,7 @@ void test_vfs(void)
     test_posix_exec_family();
     test_posix_credentials();
     test_posix_getlogin();
+    test_device_identity(NULL);
     test_posix_ttyname();
     test_posix_reentrant_helpers();
     test_posix_file_locking();
@@ -11282,6 +11475,7 @@ void test_vfs(void)
     test_spawn_malformed_messages_fail_closed();
     test_spawn_file_actions_close_dup2_spawn();
     test_spawnp_absolute_path();
+    test_spawn_search_contract();
     test_spawnattr_flags();
     test_spawnattr_resetids_runtime();
     test_spawnattr_setsid();

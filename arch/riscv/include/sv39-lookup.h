@@ -23,6 +23,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <cpu-paging.h>
+#include "pte-op.h"
 
 /* sv39_leaf_size — bytes mapped by a leaf PTE at level (0, 1 or 2). */
 static inline uint64_t sv39_leaf_size(int level)
@@ -150,14 +151,6 @@ static inline pte_t *sv39_walk_slot(pagetable_t pgdir,
     return &pgdir[PX(0, va)];
 }
 
-/* What sv39_manip_pages does to each page of its range. */
-enum sv39_manip_op {
-    SV39_MANIP_MAP,      /* store a leaf: frame and bits, one frame per page */
-    SV39_MANIP_UNMAP,    /* clear a valid leaf */
-    SV39_MANIP_PROT,     /* swap a valid leaf's flag bits, keep the rest */
-    SV39_MANIP_PREALLOC, /* only make the tables a MAP would need */
-};
-
 /* sv39_manip_pages — apply op to the 4 KiB pages in pgdir that start between
  * *startp and end, end excluded when it is page aligned.
  *
@@ -169,13 +162,13 @@ enum sv39_manip_op {
  * part of one. PROT keeps the PPN and the attribute bits above it (Svpbmt,
  * Svnapot) and replaces bits 0..9 with bits.
  *
- * Progress is kept in the caller's variables after every page: *startp is the
+ * Progress is kept in the caller's variables after each level-zero table run: *startp is the
  * first page not done and, for MAP, *paddrp the frame it gets, so on an error
  * they name what was done and a caller can undo [first, *startp) or resume.
  * *changedp is set to 1 once a PTE has been written.
  */
 static inline int sv39_manip_pages(pagetable_t pgdir,
-                                   enum sv39_manip_op op,
+                                   enum pte_op op,
                                    uintptr_t *startp,
                                    uintptr_t end,
                                    uint64_t *paddrp,
@@ -183,34 +176,34 @@ static inline int sv39_manip_pages(pagetable_t pgdir,
                                    sv39_alloc_fn alloc,
                                    int *changedp)
 {
-    int create = op == SV39_MANIP_MAP || op == SV39_MANIP_PREALLOC;
+    int create = op == PTE_OP_MAP || op == PTE_OP_PREALLOC;
 
-    for (uintptr_t va = *startp; va < end; va += PGSIZE, *startp = va) {
-        int err = create ? ENOMEM : ENOENT;
+    uintptr_t va = *startp;
+    while (va < end) {
+        int err = 0;
         pte_t *pte = sv39_walk_slot(pgdir, va, create ? alloc : NULL, &err);
-
-        if (!pte) {
-            if (create || err == EEXIST)
-                return err;
-            continue; /* no table, so no leaf to unmap or re-protect */
+        if (!pte && (create || err == EEXIST))
+            return err;
+        /* The remaining slots in this level-zero table are contiguous. */
+        size_t pages = (end - va - 1) / PGSIZE + 1;
+        size_t slots = PXMASK + 1 - PX(0, va);
+        if (pages > slots)
+            pages = slots;
+        if (pte && op != PTE_OP_PREALLOC) {
+            for (size_t i = 0; i < pages; i++) {
+                if (op == PTE_OP_MAP) {
+                    pte[i] = PA2PTE(*paddrp) | bits;
+                    *paddrp += PGSIZE;
+                } else if (pte[i] & PTE_V) {
+                    pte[i] = op == PTE_OP_UNMAP ? 0 : (pte[i] & ~PTE_FLAG_BITS) | bits;
+                } else {
+                    continue;
+                }
+                *changedp = 1;
+            }
         }
-        switch (op) {
-        case SV39_MANIP_MAP:
-            *pte = PA2PTE(*paddrp) | bits;
-            *paddrp += PGSIZE;
-            *changedp = 1;
-            break;
-        case SV39_MANIP_UNMAP:
-        case SV39_MANIP_PROT:
-            if (!(*pte & PTE_V))
-                break;
-            *pte = op == SV39_MANIP_UNMAP ? 0
-                                          : (*pte & ~PTE_FLAG_BITS) | bits;
-            *changedp = 1;
-            break;
-        case SV39_MANIP_PREALLOC:
-            break;
-        }
+        va += pages * PGSIZE;
+        *startp = va;
     }
     return 0;
 }

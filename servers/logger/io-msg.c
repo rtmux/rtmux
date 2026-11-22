@@ -54,10 +54,7 @@ int io_msg(ioserv_context_t *ctp, io_msg_t *msg, struct slog_ocb *ocb)
 
         if (ctp->size < (int) sizeof(struct _io_native_stat))
             return EINVAL;
-        memset(st, 0, sizeof(*st));
-        st->st_mode = S_IFCHR | 0666;
-        st->st_nlink = 1;
-        st->st_size = (off_t) (trp->cnt * sizeof(int));
+        logger_stat(st, trp, ctp->id != trp->id);
         return IOSERV_PTR(ctp, st, sizeof(*st));
     }
     case _IO_NATIVE_READ: {

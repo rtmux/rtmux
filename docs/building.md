@@ -78,7 +78,9 @@ CPUS=8 ./scripts/emu.sh          # SMP
 
 The script runs the virt machine with 256 MB RAM, the initramfs as initrd, and
 auto-creates `build/images/nvme.img` (192 MiB, 8 GPT partitions, p8 = `/usr`
-romfs). Boot lands at `login:`; accounts are `root`/`RTMux` and
+romfs). On a normal boot init mounts /usr, starts the pipe service, then runs
+/usr/sbin/sysinit/level1.sh from the disk. Getty accepts logins on the
+inherited /dev/text console. The accounts are `root`/`RTMux` and
 `rtmuxuser`/`rtmux`.
 
 ## Build output

@@ -74,7 +74,7 @@ static int pq_init_run(void *dst, size_t len, void *d)
              * preemption disabled for milliseconds, blowing the RT budget. 64
              * KiB chunks bound each non-preemptible burst.
              */
-            paddr_t p = (paddr_t) ((uintptr_t) dst - CPU_1TO1_VADDR_BIAS);
+            paddr_t p = (paddr_t) VA_TO_PA(dst);
             size_t left = len;
 
             while (left) {
@@ -90,7 +90,7 @@ static int pq_init_run(void *dst, size_t len, void *d)
             do {
                 if (!(pa_pq_flags(pq) & PAQ_FLAG_ZEROED)) {
                     (void) kernel_page_zero(
-                        (paddr_t) ((uintptr_t) dst - CPU_1TO1_VADDR_BIAS),
+                        (paddr_t) VA_TO_PA(dst),
                         QUANTUM_SIZE);
 
                     /* RUSH3: If we set PAQ_FLAG_ZEROED here and maintained
@@ -144,7 +144,7 @@ static int pq_init_run(void *dst, size_t len, void *d)
              * above; route through kernel_page_zero.
              */
             uintptr_t pad = (uintptr_t) dst + got;
-            (void) kernel_page_zero((paddr_t) (pad - CPU_1TO1_VADDR_BIAS),
+            (void) kernel_page_zero((paddr_t) VA_TO_PA(pad),
                                     len - got);
         }
         data->icache_check = 1;

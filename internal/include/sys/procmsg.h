@@ -595,6 +595,7 @@ enum {
 };
 
 /* _PROC_JOBCTL_DEBUG windows (arg): where roottask holds the next operation. */
+#define PGRP_WINDOW_ACTIVE 3 /* query whether the specified window is open */
 #define PGRP_WINDOW_NONE 0
 #define PGRP_WINDOW_SETPGID 1 /* setpgid, checked and not yet changed */
 #define PGRP_WINDOW_DETACH 2  /* tcsetsid(-1), terminal let go, server not told */
@@ -635,8 +636,8 @@ typedef union {
  */
 struct _proc_exit {
     uint16_t type; /* _PROC_EXIT */
-    uint16_t zero;
-    int32_t status; /* exit status */
+    uint16_t by_signal; /* zero for _exit, one for signal termination */
+    int32_t status; /* exit status or signal number */
 };
 
 struct _proc_exit_reply {

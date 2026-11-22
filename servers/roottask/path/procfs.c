@@ -318,7 +318,7 @@ static int procfs_path_read(ioserv_context_t *ctp,
                 snprintf(d->d_name, max_npc_size, "%u,%d,%d,%u,%u",
                          obj->server.nd, obj->server.pid, obj->server.chid,
                          obj->server.handle, obj->server.file_type);
-                d->d_namelen = (uint16_t) (strlen(d->d_name) + 1);
+                d->d_namelen = (uint16_t) strlen(d->d_name);
                 d->d_ino = (ino_t) (ocb->offset + 1);
                 d->d_reclen = (uint16_t) ((offsetof(struct dirent, d_name) +
                                            (size_t) d->d_namelen + 1 + 7) &
@@ -364,7 +364,7 @@ static int procfs_path_read(ioserv_context_t *ctp,
                 memset(d, 0x00, sizeof *d);
                 memcpy(d->d_name, tmpnode->name, tmpnode->len);
                 d->d_name[tmpnode->len] = '\0';
-                d->d_namelen = (uint16_t) (tmpnode->len + 1);
+                d->d_namelen = (uint16_t) tmpnode->len;
                 d->d_ino = (ino_t) (ocb->offset + 1);
                 d->d_reclen = (uint16_t) ((offsetof(struct dirent, d_name) +
                                            (size_t) d->d_namelen + 1 + 7) &

@@ -30,7 +30,8 @@
                                              : MEM_RESIZE_END_MAX)
 
 static int mem_handle;
-static dev_t mem_devno;
+static dev_t mem_devno, shmem_devno, tymem_devno;
+static int tymem_handle;
 
 struct mem_ocb {
     uint64_t pos;
@@ -405,7 +406,8 @@ static int mem_stat(ioserv_context_t *ctp, io_stat_t *msg, void *vocb)
         msg->o.st_mode =
             (obp->mem.pm.mode != 0) ? obp->mem.pm.mode : S_IFNAM | 0777;
         msg->o.st_nlink = obp->hdr.refs;
-        msg->o.st_dev = path_devno;
+        msg->o.st_dev =
+            obp->hdr.type == OBJECT_MEM_TYPED ? tymem_devno : shmem_devno;
         msg->o.st_rdev = S_ISNAM(msg->o.st_mode) ? _S_INSHD : 0;
     } else {
         /* The /dev/mem device is set to rw root only, the /dev/shmem device is
@@ -413,7 +415,9 @@ static int mem_stat(ioserv_context_t *ctp, io_stat_t *msg, void *vocb)
          */
         msg->o.st_mode = ocb ? S_IFREG | 0600 : S_IFDIR | 0777;
         msg->o.st_nlink = ocb ? 1 : 2;
-        msg->o.st_dev = mem_devno;
+        msg->o.st_dev =
+            ocb ? mem_devno
+                : (ctp->id == tymem_handle ? tymem_devno : shmem_devno);
         msg->o.st_rdev = 0;
     }
     msg->o.st_dev |= (ctp->info.srcnd << RTMUX_NODE_BITS);
@@ -1515,9 +1519,13 @@ void devmem_init(void)
     /* RUSH3: Decide if "/dev/tymem" should be a fully usable directory RUSH3:
      * structure
      */
-    ioserv_attach(dpp, NULL, "/dev/tymem", _FTYPE_TYMEM, IOSERV_FLAG_DIR,
-                  &tymem_connect_funcs, &tymem_io_funcs, 0);
-    hwres_proc_devno("dev", &mem_devno, -1, 0);
+    tymem_handle =
+        ioserv_attach(dpp, NULL, "/dev/tymem", _FTYPE_TYMEM, IOSERV_FLAG_DIR,
+                      &tymem_connect_funcs, &tymem_io_funcs, 0);
+    if (hwres_proc_devno("dev", &mem_devno, -1, 0) != EOK ||
+        hwres_proc_devno("shmem", &shmem_devno, -1, 0) != EOK ||
+        hwres_proc_devno("tymem", &tymem_devno, -1, 0) != EOK)
+        crash();
 }
 
 

@@ -9,6 +9,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <exec-path.h>
 #include <stdbool.h>
 #include <string.h>
 #include <termios.h>
@@ -332,44 +333,21 @@ static int searchpath(const char *name,
                       char *buffer,
                       size_t bufsize)
 {
-    char *b;
-    ssize_t n;
-    int trailing;
-
-
-    if (!name || *name == '\0' || !path || *path == '\0') {
-        errno = ENOENT;
-    } else {
-#ifndef NDEBUG
-        /* assert proper args */
-        if ((!buffer) || (bufsize < strlen(name)))
-            crash();
-#endif
-
-        bufsize -= strlen(name);
-        do {
-            for (n = (ssize_t) bufsize, *(b = buffer) = 0;
-                 *path && *path != ':'; n--, path++) {
-                if (n > 0) {
-                    *b++ = *path;
-                }
-            }
-            if (n > 0) {
-                if (*buffer && b[-1] != '/') {
-                    *b++ = '/';
-                }
-                STRLCPY(b, name, bufsize - (size_t) (b - buffer));
-                if (is_exec(buffer) != -1) {
-                    return 0;
-                }
-            } else {
-                errno = ENAMETOOLONG;
-                break;
-            }
-            trailing = (*path != ':') ? 0 : !*++path;
-        } while (*path || trailing);
+    int saved = ENOENT;
+    while (name && *name && path) {
+        int rc = exec_path_candidate(&path, name, buffer, bufsize, false);
+        if (rc == EOK) {
+            if (is_exec(buffer) == 0)
+                return 0;
+            rc = errno;
+        }
+        if (!exec_path_continue(rc, &saved)) {
+            saved = rc;
+            break;
+        }
     }
     *buffer = 0;
+    errno = saved;
     return -1;
 }
 
@@ -747,7 +725,70 @@ static int boot_image_hash_fd(int fd, uint64_t *hashp)
     return EOK;
 }
 
+static uint64_t loader_sigset_word(const sigset_t *set)
+{
+    return ((uint64_t) set->bits[1] << 32) | set->bits[0];
+}
+
+/* Publish the signals the spawn asks the new image to start blocked or ignored
+ * as auxiliary vector entries; the new image's libc takes them up before main().
+ * This is how an exec passes the two sets on. Appended to the entries the ELF
+ * loader made, before the argument block is laid out.
+ */
+static void loader_signal_aux(struct loader_context *lcp)
+{
+    auxv_t *auxv = lcp->ctx.start.aux;
+    unsigned long flags = lcp->msg.spawn.i.parms.flags;
+    int n = 0;
+
+    while (auxv[n].a_type != AT_NULL)
+        n++;
+    if (flags & SPAWN_SETSIGMASK) {
+        auxv[n].a_type = AT_RTMUX_SIGMASK;
+        auxv[n++].a_un.a_val =
+            (long) loader_sigset_word(&lcp->msg.spawn.i.parms.sigmask);
+    }
+    if (flags & SPAWN_SETSIGIGN) {
+        auxv[n].a_type = AT_RTMUX_SIGIGN;
+        auxv[n++].a_un.a_val =
+            (long) loader_sigset_word(&lcp->msg.spawn.i.parms.sigignore);
+    }
+    auxv[n].a_type = AT_NULL;
+    auxv[n].a_un.a_val = 0;
+}
+
 #define LOADER_EXIT(code) _exit(code)
+
+/* The loader has temporary bootstrap authority. Apply a scheduling request
+ * only after resolving the image grant, with the limits of the parent and
+ * the final image. Returning the error here wakes the blocked spawner.
+ */
+static int loader_schedule(struct loader_context *lcp)
+{
+    struct inheritance *parms = &lcp->msg.spawn.i.parms;
+    struct _sched_info limits;
+    int policy = RTMUX_SCHED_NOCHANGE;
+    if (!(parms->flags &
+          (POSIX_SPAWN_SETSCHEDULER | POSIX_SPAWN_SETSCHEDPARAM)))
+        return EOK;
+    if (parms->flags & POSIX_SPAWN_SETSCHEDULER) {
+        policy = parms->policy;
+        if (policy < SCHED_FIFO || policy > SCHED_SPORADIC)
+            return EINVAL;
+    }
+    if (parms->param.sched_priority <= 0)
+        return EINVAL;
+    if (__sched_info(0, SCHED_RR, &limits) == -1)
+        return errno;
+    if (parms->param.sched_priority > limits.priority_priv) {
+        root_proc_info_t parent;
+        if (!(lcp->ctx.grant_caps & RTMUX_PRIV_CAP_SCHED) ||
+            process_query_info(lcp->ctx.ppid, &parent) != EOK ||
+            !parent.may_set_priv_priority)
+            return EPERM;
+    }
+    return __sched_set(0, 0, policy, &parms->param) == -1 ? errno : EOK;
+}
 
 /* Loader thread for posix_spawn(): turn a spawn request into a running process
  * image.
@@ -1025,6 +1066,8 @@ void *loader_load(void *parm)
         LOADER_EXIT(errno == EFAULT ? ENOMEM : errno);
     }
 
+    loader_signal_aux(lcp);
+
     loader_args(lcp, p, buffer, interp_name, interp_arg);
 
     if (!(lcp->ctx.flags & SPAWN_EXEC)) {
@@ -1060,6 +1103,10 @@ void *loader_load(void *parm)
             }
         }
     }
+
+    status = loader_schedule(lcp);
+    if (status != EOK)
+        LOADER_EXIT(status);
 
     /* Pre-publish initial_ip and initial_sp on the child's prp so
      * kext_process_startup can read them. The kernel heap is PTE_U=0, so U-mode

@@ -172,9 +172,8 @@ static const char *killspawn_round(const int *pfd)
     }
     if (kill(pid, SIGKILL) != 0)
         why = why ? why : "kill";
-    /* RTMux may report a SIGKILLed child as exit status 128 + SIGKILL. */
-    if (waitpid(pid, &status, 0) != pid ||
-        !(WIFSIGNALED(status) || (WIFEXITED(status) && WEXITSTATUS(status) == 128 + SIGKILL)))
+    if (waitpid(pid, &status, 0) != pid || !WIFSIGNALED(status) ||
+        WTERMSIG(status) != SIGKILL)
         why = why ? why : "child was not reaped as SIGKILLed";
     return why;
 }

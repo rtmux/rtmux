@@ -251,7 +251,7 @@ static int capfs_readdir(ioserv_context_t *ctp, io_read_t *msg, void *handle)
     }
 
     memset(de, 0, reclen);
-    de->d_ino = 1;
+    de->d_ino = 2; /* self */
     de->d_reclen = (uint16_t) reclen;
     de->d_namelen = (uint16_t) nlen;
     memcpy(de->d_name, "self", nlen + 1);
@@ -303,8 +303,8 @@ static void capfs_fill_stat(ioserv_context_t *ctp,
     st->st_mode = ocb->mode;
     st->st_size = (off_t) ocb->size;
     st->st_nlink = 1;
-    st->st_dev = (ctp->info.srcnd << RTMUX_NODE_BITS) | path_devno;
-    st->st_rdev = (ctp->info.srcnd << RTMUX_NODE_BITS) | capfs_devno;
+    st->st_dev = (ctp->info.srcnd << RTMUX_NODE_BITS) | capfs_devno;
+    st->st_ino = S_ISDIR(ocb->mode) ? 1 : 2;
 }
 
 static int capfs_stat(ioserv_context_t *ctp, io_stat_t *msg, void *handle)

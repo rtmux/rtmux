@@ -14,14 +14,6 @@
 
 extern int ProcessCapMint(pid_t pid, uint32_t rights, rtmux_cap_t *cap);
 
-static int spawn_add_size(size_t *sum, size_t add)
-{
-    if (add > SIZE_MAX - *sum)
-        return E2BIG;
-    *sum += add;
-    return EOK;
-}
-
 
 /* Mint the key that lets the loader's _IO_DUP for one parent fd pass
  * _ioserv_access. The key covers the exact bytes the loader will send and is
@@ -304,7 +296,8 @@ int proc_spawn(ioserv_context_t *ctp, void *vmsg)
 
         {
             pid_t new_pid = 0;
-            prp = lcp->ctx.process = process_create(ppid, lcp, &new_pid);
+            prp = lcp->ctx.process = process_create(
+                ppid, lcp, (lcp->ctx.flags & SPAWN_EXEC) != 0, &new_pid);
             if (prp == (void *) -1) {
                 int err = errno ? errno : EAGAIN;
 
@@ -329,14 +322,6 @@ int proc_spawn(ioserv_context_t *ctp, void *vmsg)
         }
 
         loader_thread_attr(&attr, lcp, ctp);
-        if (msg->spawn.i.parms.flags & SPAWN_EXPLICIT_SCHED) {
-            memcpy(&attr.sched_param, &msg->spawn.i.parms.param,
-                   sizeof attr.sched_param);
-            if (msg->spawn.i.parms.policy != RTMUX_SCHED_NOCHANGE) {
-                attr.policy = msg->spawn.i.parms.policy;
-            }
-        }
-
         prp = lcp->ctx.process;
         root_trace("proc_spawn: SPAWN_START pid=%d loader=%p lcp=%p\n",
                    lcp->ctx.pid, loader_load, lcp);
@@ -500,59 +485,23 @@ int proc_spawn(ioserv_context_t *ctp, void *vmsg)
 
     case _PROC_SPAWN_EXEC:
         root_trace("SPAWN_EXEC: pid=%d nd=%d\n", ctp->info.pid, ctp->info.nd);
-        if (ctp->info.nd != RTMUX_LOCAL_NODE) {
-            root_trace("SPAWN_EXEC: non-local nd=%d, breaking\n", ctp->info.nd);
+        if (ctp->info.nd != RTMUX_LOCAL_NODE)
             break;
-        }
         spawn_key_revoke(ctp->rcvid);
+
+        /* The loader context names the process that called exec; it exists
+         * only while this process is still loading.
+         */
         lcp = process_startup(ctp->info.pid, 0, 0);
-        root_trace("SPAWN_EXEC: process_startup(%d) returned %p\n",
-                   ctp->info.pid, lcp);
-        if (!lcp || (uintptr_t) lcp >= (uintptr_t) -256L) {
-            root_trace("SPAWN_EXEC: process_startup FAILED\n");
+        if (!lcp || (uintptr_t) lcp >= (uintptr_t) -256L ||
+            !(lcp->ctx.flags & SPAWN_EXEC)) {
+            root_trace("SPAWN_EXEC: not the loader of an exec\n");
             break;
         }
         lcp->ctx.fds_done = 1;
-        root_trace(
-            "SPAWN_EXEC: lcp=%p state=0x%x flags=0x%lx ppid=%d rcvid=%d\n", lcp,
-            lcp->ctx.state, lcp->ctx.flags, lcp->ctx.ppid, lcp->ctx.rcvid);
         lcp->ctx.state = LC_EXEC_SWAP;
-        if (lcp->ctx.flags & SPAWN_NOZOMBIE) {
-            root_trace("SPAWN_EXEC: NOZOMBIE path, ppid=%d\n", lcp->ctx.ppid);
-            proc_nozombie(lcp->ctx.ppid, EOK);
-        }
-        {
-            int rcvid = lcp->ctx.rcvid;
-            pid_t exec_pid = lcp->ctx.ppid;
+        return proc_exec_swap(ctp, lcp);
 
-            root_trace(
-                "SPAWN_EXEC: calling process_exec lcp=%p rcvid=%d "
-                "ctp->rcvid=%d "
-                "ppid=%d\n",
-                lcp, rcvid, ctp->rcvid, lcp->ctx.ppid);
-
-            /* Once the image is replaced the parent can no longer setpgid the
-             * process. Marked before the swap, so that no setpgid sees the new
-             * image unmarked, and undone if the swap fails. The slot outlives
-             * the swap, so the mark does too. The exec'ing process is the
-             * loader's parent (kext_process_exec swaps the image into
-             * child->parent), hence ppid. The mark is set under the group lock
-             * so that a setpgid already past its execed check finishes its move
-             * before the swap rather than after it.
-             */
-            proc_pgrp_lock();
-            root_proc(exec_pid)->execed = 1;
-            proc_pgrp_unlock();
-            if (process_exec(lcp, &lcp->ctx.rcvid, ctp->rcvid, lcp->ctx.ppid) ==
-                -1) {
-                root_proc(exec_pid)->execed = 0;
-                msg_error(ctp->rcvid, errno);
-                return IOSERV_NOREPLY;
-            }
-
-            msg_error(rcvid, EOK);
-        }
-        return IOSERV_NOREPLY;
 
     case _PROC_SPAWN_DONE: {
         uint64_t caps = 0;

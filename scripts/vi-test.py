@@ -139,7 +139,9 @@ def malformed_cups(data):
 
 def login(q, c):
     print("== boot + login ==")
-    if not c.ok(q.expect("login:", 90), "reached login prompt"):
+    if not c.ok(q.expect("Starting on-disk sysinit level 1.", 90), "on-disk sysinit started"):
+        return False
+    if not c.ok(q.expect("login:", 20), "reached login prompt"):
         return False
     q.send("\n")
     q.expect("login:", 5)
@@ -251,12 +253,54 @@ def scenario_shell(q, c):
     # mount point) appears in the listing but not in the typed command line, so
     # matching it proves the shell ran the command rather than the terminal merely
     # echoing input. The returning prompt confirms the shell is ready for more.
-    # (Pipelines are not exercised here: the interactive login session runs no
-    # /bin/pipe service, so `cmd | cmd` returns ENOSYS — that path is covered by
-    # the rtmux.run=interactive-smoke mode, which starts the pipe service first.)
     q.send("ls /\r")
     c.ok(q.expect(b"usr", 8), "ls / lists the mounted /usr")
     c.ok(q.expect(b"# ", 5), "shell prompt returns, ready for the next command")
+    q.send("echo a | wc -l\r")
+    c.ok(q.expect(b"\n1\r", 8), "pipeline counts one line")
+    c.ok(q.expect(b"# ", 5), "shell prompt returns after the pipeline")
+
+
+def scenario_editor_keys(q, c):
+    print("== interactive shell editing ==")
+    q.send("abc\x04\r")
+    if not c.ok(q.expect("abc: No such file or directory", 8),
+                "Ctrl-D leaves a nonempty command ready to run"):
+        return
+    if not c.ok(q.expect(b"\n# ", 8), "prompt after abc"):
+        return
+    q.send("abc\x03")
+    if not c.ok(q.expect(b"^C", 8) and q.expect(b"\n# ", 8),
+                "Ctrl-C cancels the partial command"):
+        return
+    start = q.pos
+    q.send("echo ok-$?\r")
+    if not c.ok(q.expect(b"\nok-130\r", 8), "next command sees status 130"):
+        return
+    c.ok(b"abc:" not in q.slice(start, q.pos), "cancelled command was discarded")
+    c.ok(q.expect(b"\n# ", 8), "prompt after echo")
+
+
+def scenario_login_environment(q, c):
+    print("== login starts the shell with a fresh environment ==")
+    q.send("FOO=1 PATH=/untrusted TERM=vt220 /bin/login root\r")
+    if not c.ok(q.expect(b"Password:", 10), "nested login requests credentials"):
+        return
+    q.send("RTMux\r")
+    if not c.ok(q.expect(b"\n# ", 20), "nested shell starts"):
+        return
+    q.send("/bin/env\r")
+    start = q.pos
+    if not c.ok(q.expect(b"\n# ", 10), "env returns to the nested prompt"):
+        return
+    lines = q.slice(start, q.pos).replace(b"\r", b"").splitlines()
+    for entry in (b"USER=root", b"LOGNAME=root", b"PATH=/bin:/sbin:/usr/bin:/usr/sbin",
+                  b"TERM=vt220"):
+        c.ok(entry in lines, "login provides " + entry.decode())
+    c.ok(not any(line.startswith(b"FOO=") for line in lines),
+         "login discards inherited FOO")
+    q.send("exit\r")
+    c.ok(q.expect(b"\n# ", 10), "parent shell resumes")
 
 
 def scenario_login_failure(q, c):
@@ -412,7 +456,48 @@ def scenario_insert(q, c):
     c.ok(quit_vi(q), "vi exited after insert")
 
 
+def serial_priority():
+    os.environ["CPUS"] = "1"
+    os.environ["EMU_EXTRA_CMDLINE"] = "-T rtmux.run=serial-priority"
+    q = Qemu()
+    c = Checks()
+    try:
+        if not q.expect(b"login: ", 90):
+            return 1
+        q.send("\n")
+        if not q.expect(b"login: ", 10):
+            return 1
+        q.send("root\n")
+        if not q.expect(b"Password:", 10):
+            return 1
+        q.send("RTMux\n")
+        if not q.expect(b"# ", 10):
+            return 1
+        q.send("/bin/syscall_testing --serial-priority-spinner\r")
+        if not c.ok(q.expect(b"serial priority spinner ready", 10),
+                    "priority-15 foreground spinner running"):
+            return 1
+        start = time.monotonic_ns()
+        q.send(b"\x03")
+        prompt = q.expect(b"# ", 8)
+        elapsed_ms = (time.monotonic_ns() - start) / 1_000_000
+        c.ok(prompt and elapsed_ms <= 100,
+             f"Ctrl-C returned to the shell in {elapsed_ms:.1f} ms")
+        q.send("echo status-$?\r")
+        c.ok(q.expect(b"\nstatus-130\r", 5), "foreground job died from SIGINT")
+        q.send("/bin/syscall_testing --signal-priority\r")
+        c.ok(q.expect(b"PASS  spawn refuses priority", 30),
+             "spawn enforces its scheduling ceiling")
+        c.ok(q.expect(b"PASS  sigthread_prio_stable:", 30),
+             "ordinary signals preserve the handler's FIFO priority")
+        return int(c.failed != 0)
+    finally:
+        q.close()
+
+
 def main():
+    if sys.argv[1:] == ["--serial-priority"]:
+        return serial_priority()
     if not os.path.exists(os.path.join(TOP, "build", "initramfs.cpio")):
         print("initramfs.cpio missing — run `make -j` first", file=sys.stderr)
         return 2
@@ -423,6 +508,8 @@ def main():
             print("login failed; aborting", file=sys.stderr)
             return 1
         scenario_shell(q, c)
+        scenario_editor_keys(q, c)
+        scenario_login_environment(q, c)
         scenario_render(q, c)
         scenario_search(q, c)
         scenario_help(q, c)

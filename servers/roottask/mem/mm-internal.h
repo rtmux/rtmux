@@ -128,6 +128,7 @@ paddr_t pa_quantum_to_paddr(struct pa_quantum *pq);
 struct pa_quantum *pa_paddr_to_quantum(paddr_t paddr);
 
 memsize_t pa_free_size(void);
+unsigned long pte_rollback_pages(void);
 
 extern int shmem_create(path_object_t *, void *);
 extern int shmem_done(path_object_t *);

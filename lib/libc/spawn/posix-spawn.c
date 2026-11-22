@@ -247,8 +247,6 @@ static int materialize_open_actions(_posix_spawn_file_actions_t *fact,
                 ret = errno;
                 goto fail;
             }
-            if (action->_type.dup.fd == action->_type.dup.new_fd)
-                break;
             map[action->_type.dup.new_fd] = map[action->_type.dup.fd];
             open_slot[action->_type.dup.new_fd] = true;
             cloexec_slot[action->_type.dup.new_fd] = false;

@@ -102,7 +102,7 @@ unsigned as_vaddrinfo(pid_t pid,
     int status;
 
     if (CPU_1TO1_IS_VADDR(vaddr)) {
-        *paddrp = vaddr - CPU_1TO1_VADDR_BIAS;
+        *paddrp = VA_TO_PA(vaddr);
         if (lenp)
             *lenp = ~(size_t) 0;
         return PROT_READ | PROT_WRITE | PROT_EXEC;

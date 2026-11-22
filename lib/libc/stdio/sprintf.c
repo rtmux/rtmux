@@ -9,13 +9,19 @@
 #include <stdio.h>
 #include <stdarg.h>
 
+int vsprintf(char *__restrict str, const char *__restrict fmt, va_list ap)
+{
+    /* The string sink accepts INT_MAX bytes of output and the final NUL. */
+    return vsnprintf(str, (size_t) INT_MAX + 1, fmt, ap);
+}
+
 int sprintf(char *__restrict str, const char *__restrict fmt, ...)
 {
     int ret;
     va_list ap;
 
     va_start(ap, fmt);
-    ret = vsnprintf(str, INT_MAX, fmt, ap);
+    ret = vsprintf(str, fmt, ap);
     va_end(ap);
     return ret;
 }

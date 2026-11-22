@@ -57,6 +57,13 @@ static int pte_manipulate(struct pte_manip *manip)
 }
 
 
+static unsigned long rolled_back_pages;
+
+unsigned long pte_rollback_pages(void)
+{
+    return __atomic_load_n(&rolled_back_pages, __ATOMIC_RELAXED);
+}
+
 /* Map a virtual address range to physical memory.
  *
  * On failure, unmaps whatever portion was already mapped. Parameters:
@@ -102,10 +109,13 @@ int pte_map(address_t *adp,
     if ((r != EOK) && (manip.mapped > start)) {
         /* pte_manipulate failed => need to unmap whatever's been mapped so far.
          */
-        manip.data.end = manip.data.start - 1;
+        uintptr_t mapped = manip.mapped;
+        manip.data.end = mapped - 1;
         manip.data.start = start;
         manip.data.op = PTE_OP_UNMAP;
-        (void) pte_manipulate(&manip);
+        if (pte_manipulate(&manip) == EOK)
+            __atomic_fetch_add(&rolled_back_pages, (mapped - start) / __PAGESIZE,
+                               __ATOMIC_RELAXED);
     }
     return r;
 }

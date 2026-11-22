@@ -64,14 +64,18 @@ int exit_ready_stopped(thread_t *thp)
     return 0;
 }
 
-/* kext_exit_destroy_threads — tear down every thread in a dying process.
+/* exit_destroy_threads — tear down the threads of a process, all but one.
  *
- * Called from roottask's process_threads_destroy via syscall_priv. Parameters:
- *   arg : process_t * for the dying process
+ * keep is NULL for a dying process, where every thread goes. An exec keeps the
+ * thread that called it: that one is reply-blocked in roottask for the whole
+ * swap and becomes the new image's first thread, so no pass here may touch it.
+ * A request to try again (EAGAIN) is left in the caller's kcall status, as for
+ * any teardown call. Parameters:
+ *   prp  : process whose threads to destroy
+ *   keep : thread to leave alone, or NULL
  */
-void kext_exit_destroy_threads(void *arg)
+void exit_destroy_threads(process_t *prp, thread_t *keep)
 {
-    process_t *prp = arg;
     thread_t *act = get_active_thread(get_cpunum());
     int tid;
     thread_t *thp;
@@ -90,7 +94,8 @@ void kext_exit_destroy_threads(void *arg)
     }
     /* First pass: destroy what we can */
     for (tid = 0; tid < prp->threads.nentries; ++tid) {
-        if ((thp = vector_lookup2(&prp->threads, (unsigned) tid))) {
+        if ((thp = vector_lookup2(&prp->threads, (unsigned) tid)) &&
+            thp != keep) {
             atomic_or(&thp->flags, RTMUX_FLG_THR_DETACHED);
             thread_destroy(thp);
             destroyed++;
@@ -107,7 +112,8 @@ void kext_exit_destroy_threads(void *arg)
      */
     for (tid = 0; tid < prp->threads.nentries; ++tid) {
         if ((thp = vector_lookup2(&prp->threads, (unsigned) tid)) &&
-            thp->state == STATE_STOPPED && tthread_pin(thp) == EOK) {
+            thp != keep && thp->state == STATE_STOPPED &&
+            tthread_pin(thp) == EOK) {
             unparked |= exit_ready_stopped(thp);
             tthread_unpin(thp);
         }
@@ -138,7 +144,8 @@ void kext_exit_destroy_threads(void *arg)
      * chp->reply_queue; the LINK2_REM below handles a missing next pointer.
      */
     for (tid = 0; tid < prp->threads.nentries; ++tid) {
-        if ((thp = vector_lookup2(&prp->threads, (unsigned) tid))) {
+        if ((thp = vector_lookup2(&prp->threads, (unsigned) tid)) &&
+            thp != keep) {
             int reply_send;
             int stamped_dead = 0;
 
@@ -307,6 +314,16 @@ void kext_exit_destroy_threads(void *arg)
 
     LOGF_T("proc_exit: pid=%d destroyed %d threads\n", prp->pid, destroyed);
     SETKSTATUS(act, EOK);
+}
+
+/* kext_exit_destroy_threads — tear down every thread in a dying process.
+ *
+ * Called from roottask's process_threads_destroy via syscall_priv. Parameters:
+ *   arg : process_t * for the dying process
+ */
+void kext_exit_destroy_threads(void *arg)
+{
+    exit_destroy_threads(arg, NULL);
 }
 
 /* Per-process resource teardown bodies.

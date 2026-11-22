@@ -24,7 +24,31 @@ static int rxbuf_get(void);
 static void tx_drain(void);
 static int tx_break(void);
 
+#include <sys/priority-bands.h>
+static int notification_coid;
+#define NOTIFICATION_CODE_RX (_NOTIFICATION_CODE_MINAVAIL + 1)
 #include "serial-service.h"
+
+/* Serial timer delivery is exercised by the guest test. */
+int timer_create(clockid_t id, struct sigevent *event, timer_t *timer)
+{
+    (void) id;
+    (void) event;
+    *timer = 1;
+    return 0;
+}
+
+int timer_settime(timer_t timer,
+                  int flags,
+                  const struct itimerspec *spec,
+                  struct itimerspec *old)
+{
+    (void) timer;
+    (void) flags;
+    (void) spec;
+    (void) old;
+    return 0;
+}
 
 static int rx_next = -1;      /* byte rxbuf_get() hands out once, or -1 */
 static int reply_result;      /* what the stubbed msg_reply returns */
@@ -229,6 +253,7 @@ static void test_notify(void)
 
 static void park_reader(void)
 {
+    pending_size = 1;
     pending_rcvid = 42;
     pending_scoid = 7;
     pending_coid = 3;
@@ -246,21 +271,22 @@ int main(void)
     rx_notification_handler(NULL, 0, 0, NULL);
     assert(reply_calls == 1 && reply_byte == 'a');
     assert(pending_rcvid == -1);
-    assert(cooked_peek() == 'a');
+    assert(ser_input.tail != ser_input.head &&
+           ser_input.queue[ser_input.tail % TTY_QUEUE] == 'a');
 
     /* The next reader gets that same byte, and a good reply consumes it. */
     park_reader();
     reply_result = 0;
     rx_notification_handler(NULL, 0, 0, NULL);
     assert(reply_calls == 2 && reply_byte == 'a');
-    assert(cooked_peek() == -1);
+    assert(ser_input.head == ser_input.tail);
 
     /* A later byte is not skipped or duplicated. */
     park_reader();
     rx_next = 'b';
     rx_notification_handler(NULL, 0, 0, NULL);
     assert(reply_calls == 3 && reply_byte == 'b');
-    assert(cooked_peek() == -1);
+    assert(ser_input.head == ser_input.tail);
 
     test_notify();
 

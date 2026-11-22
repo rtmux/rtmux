@@ -9,6 +9,7 @@
 
 #include <setjmp.h>
 #include <stdio.h>
+#include <signal.h>
 
 #include "test.h"
 
@@ -38,10 +39,7 @@ static void test_basic_setjmp(void)
     }
 }
 
-/* setjmp / longjmp macro path. Same as above but goes through the <setjmp.h>
- * sigsetjmp/_setjmp chain.
- */
-static void test_macro_setjmp(void)
+static void test_public_setjmp(void)
 {
     jmp_buf env;
     volatile int rc;
@@ -57,9 +55,6 @@ static void test_macro_setjmp(void)
     }
 }
 
-/* siglongjmp can target the same env saved by setjmp. This proves the layout is
- * shared between the macro and direct asm forms.
- */
 static void test_siglongjmp(void)
 {
     sigjmp_buf env;
@@ -114,10 +109,30 @@ static void test_callee_saves(void)
     check(hit == 1, "longjmp returns to setjmp's caller frame", "hit != 1");
 }
 
+static void test_saved_mask(int save)
+{
+    sigjmp_buf env;
+    sigset_t one, old, observed;
+    sigemptyset(&one);
+    sigaddset(&one, SIGUSR1);
+    sigprocmask(SIG_BLOCK, &one, &old);
+    if (sigsetjmp(env, save) == 0) {
+        sigprocmask(SIG_UNBLOCK, &one, NULL);
+        siglongjmp(env, 1);
+    }
+    sigprocmask(SIG_SETMASK, NULL, &observed);
+    sigprocmask(SIG_SETMASK, &old, NULL);
+    check(sigismember(&observed, SIGUSR1) == save,
+          save ? "siglongjmp restores the saved mask" : "siglongjmp retains the live mask",
+          "SIGUSR1 mask mismatch");
+}
+
 void test_setjmp(void)
 {
     test_basic_setjmp();
-    test_macro_setjmp();
+    test_public_setjmp();
     test_siglongjmp();
     test_callee_saves();
+    test_saved_mask(1);
+    test_saved_mask(0);
 }

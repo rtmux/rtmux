@@ -310,11 +310,12 @@ static void stall_dump(void)
             !!(ik & (INKERNEL_NOW >> 1)), /* INKERNEL_LOCK adjacent bit */
             (ik >> 24) & 0xff, ik & 0xff);
 
+    uint64_t online = cpu_online_snapshot();
     kprintf("-- Per-CPU active thread --\n");
     for (cpu = 0; cpu < num_processors; cpu++) {
         thread_t *thp;
 
-        if (!cpu_online(cpu))
+        if (!cpu_in_mask(online, cpu))
             continue;
         thp = get_active_thread(cpu);
         if (!thp) {

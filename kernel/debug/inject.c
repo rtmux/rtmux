@@ -115,6 +115,7 @@ void inject_note_sched_return(thread_t *act, bool switched)
  */
 static atomic_int in_departure_hart[CONFIG_PROCESSORS_MAX];
 static atomic_ullong prio_thread_runs;
+static atomic_ullong prio_idle_runs;
 static atomic_ullong prio_departure_work;
 
 void inject_in_departure(int on)
@@ -134,6 +135,11 @@ void inject_note_prio_work(void)
 
 void inject_note_prio_deferred_run(void)
 {
+    if (!get_active_thread(get_cpunum())) {
+        if (intr_get())
+            crash("idle priority settle with interrupts enabled");
+        atomic_fetch_add_explicit(&prio_idle_runs, 1, memory_order_relaxed);
+    }
     atomic_fetch_add_explicit(&prio_thread_runs, 1, memory_order_relaxed);
 }
 
@@ -416,14 +422,15 @@ void kext_debug_inject(void *data)
         hart = (unsigned) kap->arg0;
         ms = kap->op == INJECT_OP_HANG_HART ? UINT32_MAX : (unsigned) kap->arg1;
 
+        uint64_t online = cpu_online_snapshot();
         for (unsigned c = 0; c < num_processors; c++)
-            live += cpu_online(c) ? 1u : 0u;
+            live += cpu_in_mask(online, c) ? 1u : 0u;
 
         /* Refuse the caller's own hart, a hart that is not alive, and the last
          * live hart: any of them would turn a test into an unrecoverable stop
          * rather than a stall to be diagnosed.
          */
-        if (hart == self || !cpu_online(hart) || live < 2) {
+        if (hart == self || !cpu_in_mask(online, hart) || live < 2) {
             ret = EINVAL;
             break;
         }
@@ -491,9 +498,12 @@ void kext_debug_inject(void *data)
         break;
     case INJECT_OP_PRIO_SETTLE_STATS:
         if (kap->arg0 == 2) {
+            atomic_store_explicit(&prio_idle_runs, 0, memory_order_relaxed);
             atomic_store_explicit(&prio_thread_runs, 0, memory_order_relaxed);
             atomic_store_explicit(&prio_departure_work, 0,
                                   memory_order_relaxed);
+        } else if (kap->arg0 == 3) {
+            ret = (int) atomic_load_explicit(&prio_idle_runs, memory_order_relaxed);
         } else if (kap->arg0 <= 1) {
             ret = (int) atomic_load_explicit(
                 kap->arg0 ? &prio_departure_work : &prio_thread_runs,

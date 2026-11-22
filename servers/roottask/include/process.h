@@ -44,6 +44,9 @@ int proc_setpgid(ioserv_context_t *ctp, proc_setpgid_t *msg);
 /* spawn.c */
 int proc_spawn(ioserv_context_t *ctp, void *vmsg);
 
+/* exec.c */
+int proc_exec_swap(ioserv_context_t *ctp, struct loader_context *lcp);
+
 /* posix-spawn.c */
 int proc_pspawn(ioserv_context_t *ctp, void *vmsg);
 
@@ -106,7 +109,6 @@ int proc_jobctl_query(pid_t server, pid_t pid, struct _proc_jobctl_reply *out);
 int proc_jobctl_signal_fg(pid_t server, pid_t sid, int signo);
 int proc_jobctl_signal_bg(pid_t server, pid_t pid, int signo);
 int proc_jobctl_setpgrp(pid_t server, pid_t pid, pid_t pgrp);
-int proc_jobctl_tty_busy(pid_t server, pid_t sid);
 
 /* Process groups are tracked by their members (group.c). proc_pgrp_session
  * finds a group's session while it has a member, a zombie included.

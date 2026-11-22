@@ -73,6 +73,7 @@ PROC_OBJECTS = \
 	proc/signal.o \
 	proc/jobctl.o \
 	proc/exit.o \
+	proc/exec.o \
 	proc/coredump.o \
 	proc/stack.o
 

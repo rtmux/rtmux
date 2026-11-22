@@ -99,10 +99,10 @@ static unsigned char crash_mode_active[CONFIG_PROCESSORS_MAX];
 /* The CPUs that have joined the rendezvous. */
 static _Atomic uint64_t crash_arrived_mask;
 
-/* The CPUs that were online when the first CPU began crash handling, and so the
+/* The CPUs online or committed to join when the first CPU began crashing, the
  * ones that get IPI_CRASH; 0 until then.
  */
-static _Atomic uint64_t crash_online_at_entry;
+static _Atomic uint64_t crash_peers_at_entry;
 
 /* The CPUs that have entered crash handling; the rendezvous waits for these
  * too. A mask, so the wait loop reads one word instead of every CPU's flag.
@@ -914,7 +914,14 @@ static void crash_enter_self(void)
      */
     uint64_t set = 0, mine = cpu_online_snapshot() | (1ULL << me);
 
-    if (atomic_compare_exchange_strong_explicit(&crash_online_at_entry, &set,
+    /* A committed AP will reach its interrupt handler even if its online
+     * bit has not been published yet. Dropped and parked CPUs cannot. */
+    for (unsigned cpu = 0; cpu < num_processors; ++cpu)
+        if (__atomic_load_n(&smp_slot[cpu], __ATOMIC_ACQUIRE) == SMP_SLOT_JOINED)
+            mine |= 1ULL << cpu;
+    mine &= __atomic_load_n(&legal_cpu_bitmask, __ATOMIC_ACQUIRE);
+    mine |= 1ULL << me;
+    if (atomic_compare_exchange_strong_explicit(&crash_peers_at_entry, &set,
                                                 mine, memory_order_acq_rel,
                                                 memory_order_acquire))
         set = mine;
@@ -1026,8 +1033,8 @@ void crash_quiesce_self(void)
     /* NOTREACHED */
 }
 
-/* The CPUs the rendezvous waits for: those online when the first CPU began
- * crash handling (the ones sent IPI_CRASH) plus every CPU that has entered
+/* The CPUs the rendezvous waits for: those online or committed to join when the first CPU began
+ * crash handling and still eligible to run, plus every CPU that has entered
  * crash handling. The two sets differ: a CPU that crashes before it joins was
  * never online, and one that joins after the first crash is never signalled and
  * not waited for. Each CPU records itself in crash_entered_mask before it
@@ -1035,7 +1042,8 @@ void crash_quiesce_self(void)
  */
 static uint64_t crash_participants(void)
 {
-    return atomic_load_explicit(&crash_online_at_entry, memory_order_acquire) |
+    return (atomic_load_explicit(&crash_peers_at_entry, memory_order_acquire) &
+            __atomic_load_n(&legal_cpu_bitmask, __ATOMIC_ACQUIRE)) |
            atomic_load_explicit(&crash_entered_mask, memory_order_acquire);
 }
 

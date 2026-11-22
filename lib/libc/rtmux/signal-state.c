@@ -393,6 +393,53 @@ void __libc_signal_init(void)
     intr_rearm();
 }
 
+/* The signal state an exec carries into the new image: the signals that are
+ * ignored, and the ones that are blocked. Handlers do not survive an exec, so
+ * they are not in either set. Parameters:
+ *   ignored : out — the signals whose disposition is SIG_IGN
+ *   blocked : out — the blocked set
+ */
+void __libc_signal_exec_state(sigset_t *ignored, sigset_t *blocked)
+{
+    int signo;
+
+    sigemptyset(ignored);
+    pthread_mutex_lock(&state.lock);
+    for (signo = 1; signo <= LIBC_NSIG; signo++) {
+        if (state.handlers[signo].sa_handler == SIG_IGN)
+            sigset_set(ignored, signo);
+    }
+    *blocked = state.mask;
+    pthread_mutex_unlock(&state.lock);
+}
+
+static void tty_hold_report(void);
+
+/* Start the table the way an exec left it, from the two words the loader
+ * passes (see AT_RTMUX_SIGMASK): bit n-1 of a word is signal n. Called once,
+ * right after __libc_signal_init(), before any thread but the first exists.
+ * Parameters:
+ *   ignored : signals to start with SIG_IGN
+ *   blocked : signals to start blocked
+ */
+void __libc_signal_exec_inherit(uint64_t ignored, uint64_t blocked)
+{
+    int signo;
+
+    pthread_mutex_lock(&state.lock);
+    for (signo = 1; signo <= LIBC_NSIG; signo++) {
+        uint64_t bit = (uint64_t) 1 << (signo - 1);
+
+        if ((ignored & bit) && !signo_uncatchable(signo))
+            state.handlers[signo].sa_handler = SIG_IGN;
+        if ((blocked & bit) && !signo_uncatchable(signo))
+            sigset_set(&state.mask, signo);
+    }
+    intr_rearm();
+    tty_hold_report();
+    pthread_mutex_unlock(&state.lock);
+}
+
 /* deliver_one — run the handler for "signo" if installed and not blocked.
  * Caller MUST hold state.lock; this function drops the lock around the actual
  * handler call and re-acquires before returning.
@@ -443,7 +490,7 @@ static int deliver_one(int signo)
          * into _exit.
          */
         pthread_mutex_unlock(&state.lock);
-        _exit(128 + signo);
+        __libc_signal_exit(signo);
     }
 
     /* Real handler. POSIX: while running, the signal itself is blocked (unless
@@ -547,7 +594,7 @@ void __libc_signal_notification_recv(int signo, pid_t sender)
          * wakes it and SIGKILL ends it; the rest wait as pending.
          */
         if (signo == SIGKILL)
-            _exit(128 + signo);
+            __libc_signal_exit(signo);
         if (signo != SIGCONT) {
             if (signo != SIGSTOP) {
                 sigset_set(&state.pending, signo);

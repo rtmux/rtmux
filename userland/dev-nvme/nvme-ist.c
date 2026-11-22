@@ -16,6 +16,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <sys/priority-bands.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -155,7 +156,7 @@ static void *ist_thread(void *arg)
      * dispatch thread when the device fires.
      */
     {
-        struct sched_param sp = {.sched_priority = 21};
+        struct sched_param sp = {.sched_priority = RTMUX_PRIO_DEVICE_IST};
         (void) __sched_set(0, 0, SCHED_RR, &sp);
     }
 

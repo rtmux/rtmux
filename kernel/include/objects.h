@@ -271,6 +271,13 @@ typedef struct process_entry {
     struct kdebug_entry kdebug;
     thread_t *valid_thp;
 
+    /* The thread that called exec while its swap is under way (set by the
+     * begin step, cleared by the commit), compared and never dereferenced: it
+     * tells a retry of the begin step from a second exec of another thread.
+     * Guarded by vec_slock.
+     */
+    thread_t *exec_thp;
+
     /* conf_table and rsrc_list previously lived here but were never read by the
      * kernel — roottask-side bookkeeping (sysconf and hwres respectively).
      * Moved into root_process_t; see servers/roottask/include/root-process.h.
@@ -473,7 +480,7 @@ typedef struct remote_ipc_state {
 
 typedef struct notification_entry {
     PRIL_ENTRY_FIELDS
-    uint8_t spare;
+    bool terminal_signal;
     int8_t code;
     uintptr_t value;
     intptr_t id; /* scoid if TYPE_NOTIFICATION */
@@ -566,6 +573,7 @@ typedef struct thread_entry { /* Also used for vthread_entry */
     } un;
     thread_t *client; /* the client that the server thread works on behalf */
     void *blocked_on; /* blocked wait object */
+    thread_t *short_msg_source; /* special return can outlive a scheduler wait */
     turnstile_t *blocked_on_turnstile; /* PI/PC wait-chain object, not
                                         * blocked_on channel state
                                         */
@@ -1097,7 +1105,11 @@ typedef struct session_entry {
     pid_t leader;
     pid_t pgrp;
     int fd;
-    unsigned reserved[10];
+    /* Owned by roottask, protected by its terminal binding lock. */
+    pid_t tty_server;
+    bool tty_changing;
+    bool tty_waiter;
+    struct session_entry *tty_next;
 } session_t;
 
 

@@ -25,6 +25,7 @@ int ioserv_backend_open_bind(ioserv_context_t *ctp,
     }
 
     if (!(binding = calloc(sizeof *binding, 1))) {
+        _ioserv_link_return(link, 1);
         errno = ENOMEM;
         return -1;
     }

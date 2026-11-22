@@ -452,6 +452,7 @@ void cpu_thread_enter_umode(thread_t *thp);
 
 struct sigevent *hook_trace(void *, interrupt_t *);
 
+bool rdecl thread_disown_client(thread_t *srv);
 int rdecl remote_ipc_msg(thread_t *act, connect_t *cop, unsigned prio);
 int rdecl remote_ipc_notify(thread_t *act,
                             connect_t *cop,

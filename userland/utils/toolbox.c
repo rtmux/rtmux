@@ -154,7 +154,7 @@ static const struct toolbox_applet applets[] = {
      "stall-force-ready PID MS | pte-superpage PID VA | "
      "pte-clear-superpage PID VA | pte-probe PID VA | "
      "fail-pte-map PID PAGES | manip-partial MIN | "
-     "prio-settle-thread MIN | prio-settle-departure MAX | "
+     "prio-settle-thread MIN | prio-settle-idle MIN | prio-settle-departure MAX | "
      "prio-settle-reset"},
     {"kill", applet_kill, "kill [-SIG] PID ..."},
     {"login", applet_login, "login [USER]"},
@@ -962,7 +962,6 @@ static int applet_login(int argc, char **argv)
     const char *hash = NULL;
     char *guess;
     int tries = 0;
-    int home_ok;
     const char *shell;
     char *shell_argv0;
     pid_t pid;
@@ -1010,8 +1009,7 @@ static int applet_login(int argc, char **argv)
         name[0] = '\0';
     }
 
-    home_ok = chdir(pw->pw_dir) == 0;
-    if (!home_ok)
+    if (chdir(pw->pw_dir) != 0)
         chdir("/");
 
     if (setgid(pw->pw_gid) < 0) {
@@ -1024,13 +1022,6 @@ static int applet_login(int argc, char **argv)
     }
 
     shell = pw->pw_shell[0] != '\0' ? pw->pw_shell : LOGIN_DEFAULT_SHELL;
-    setenv("HOME", pw->pw_dir, 1);
-    setenv("PWD", home_ok ? pw->pw_dir : "/", 1);
-    setenv("USER", pw->pw_name, 1);
-    setenv("LOGNAME", pw->pw_name, 1);
-    setenv("SHELL", shell, 1);
-    setenv("PATH", LOGIN_DEFAULT_PATH, 0);
-
     shell_argv0 = login_argv0(shell);
     if (!shell_argv0)
         return 1;
@@ -1041,7 +1032,29 @@ static int applet_login(int argc, char **argv)
         };
         int err;
 
-        err = posix_spawn(&pid, shell, NULL, NULL, spawn_argv, NULL);
+        const char *term = getenv("TERM");
+        const struct {
+            const char *name;
+            const char *value;
+        } vars[] = {{"HOME", pw->pw_dir},
+                    {"USER", pw->pw_name},
+                    {"LOGNAME", pw->pw_name},
+                    {"SHELL", shell},
+                    {"PATH", LOGIN_DEFAULT_PATH},
+                    {"TERM", term && *term ? term : "vt100"}};
+        char *envp[sizeof(vars) / sizeof(vars[0]) + 1] = {0};
+        size_t i;
+        for (i = 0; i < sizeof(vars) / sizeof(vars[0]); i++) {
+            size_t n = strlen(vars[i].name) + strlen(vars[i].value) + 2;
+            if (!(envp[i] = malloc(n)))
+                break;
+            snprintf(envp[i], n, "%s=%s", vars[i].name, vars[i].value);
+        }
+        err = i == sizeof(vars) / sizeof(vars[0])
+                  ? posix_spawn(&pid, shell, NULL, NULL, spawn_argv, envp)
+                  : ENOMEM;
+        while (i)
+            free(envp[--i]);
         if (err != EOK) {
             fprintf(stderr, "%s: %s\n", shell, strerror(err));
             free(shell_argv0);
@@ -3164,13 +3177,15 @@ static int applet_inject(int argc, char **argv)
     } else if (argc == 4 && !strcmp(argv[1], "stall-force-ready")) {
         rc = inject_call(INJECT_OP_STALL_FORCE_READY, strtoul(argv[2], NULL, 0),
                          strtoul(argv[3], NULL, 0));
-    } else if (argc == 3 && !strcmp(argv[1], "prio-settle-thread")) {
+    } else if (argc == 3 && (!strcmp(argv[1], "prio-settle-thread") ||
+                            !strcmp(argv[1], "prio-settle-idle"))) {
         /* Exit 0 when at least MIN deferred priority settles ran in thread
          * context since the last reset.
          */
-        rc = inject_call(INJECT_OP_PRIO_SETTLE_STATS, 0, 0);
+        rc = inject_call(INJECT_OP_PRIO_SETTLE_STATS,
+                         !strcmp(argv[1], "prio-settle-idle") ? 3 : 0, 0);
         if (rc >= 0)
-            printf("prio-settle-thread=%d\n", rc);
+            printf("%s=%d\n", argv[1], rc);
         return rc >= 0 && (unsigned long) rc >= strtoul(argv[2], NULL, 0) ? 0
                                                                           : 3;
     } else if (argc == 3 && !strcmp(argv[1], "prio-settle-departure")) {
@@ -3226,7 +3241,7 @@ static int applet_inject(int argc, char **argv)
                 "pte-clear-superpage PID VA | pte-probe PID VA | "
                 "fail-pte-map PID PAGES | manip-partial MIN | "
                 "stall-lock-early PID MS | stall-lock-propagated PID MS | "
-                "prio-settle-thread MIN | prio-settle-departure MAX | "
+                "prio-settle-thread MIN | prio-settle-idle MIN | prio-settle-departure MAX | "
                 "prio-settle-reset\n");
         return 2;
     }

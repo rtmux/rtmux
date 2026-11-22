@@ -86,6 +86,7 @@ struct lklfs_ocb {
     POOL_CANARY_TAIL
 };
 
+static dev_t lklfs_devno;
 static char lklfs_mount[64];
 static char lklfs_root[64] = "/fs/root";
 static char lklfs_source[64];
@@ -228,7 +229,7 @@ static mode_t lkl_mode_to_posix(unsigned int mode)
 static void lkl_stat_to_posix(const struct lkl_stat *lst, struct stat *st)
 {
     memset(st, 0, sizeof(*st));
-    st->st_dev = (dev_t) lst->st_dev;
+    st->st_dev = lklfs_devno;
     st->st_ino = (ino_t) lst->st_ino;
     st->st_mode = lkl_mode_to_posix(lst->st_mode);
     st->st_nlink = (nlink_t) lst->st_nlink;
@@ -1078,8 +1079,10 @@ static int serve_ext4(const char *path, const char *root, int readonly)
     dpp = rtmux_lkl_dispatch_begin("lkl-fsd");
     if (!dpp)
         return -1;
-    if (ioserv_attach(dpp, NULL, lklfs_root, _FTYPE_ANY, IOSERV_FLAG_DIR,
-                      &lklfs_connect_funcs, &lklfs_io_funcs, NULL) == -1) {
+    ino_t root_ino;
+    int id = ioserv_attach(dpp, NULL, lklfs_root, _FTYPE_ANY, IOSERV_FLAG_DIR,
+                           &lklfs_connect_funcs, &lklfs_io_funcs, NULL);
+    if (id == -1 || ioserv_devino(id, &lklfs_devno, &root_ino) == -1) {
         fprintf(stderr, "lkl-fsd: attach %s: %s\n", lklfs_root,
                 strerror(errno));
         return -1;

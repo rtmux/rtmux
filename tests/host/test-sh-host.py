@@ -16,6 +16,7 @@ suite. Two checks:
   gaps            the suite whose expected values dash made, run by the shell.
 """
 import os
+import pty
 import select
 import subprocess
 import sys
@@ -52,6 +53,47 @@ def trap_read_race(sh):
     return ok
 
 
+def editor_keys(sh):
+    master, slave = pty.openpty()
+    p = subprocess.Popen([sh, "-i"], stdin=slave, stdout=slave, stderr=slave)
+    os.close(slave)
+    buf = b""
+
+    def expect(needle):
+        nonlocal buf
+        end = time.monotonic() + DEADLINE
+        while needle not in buf:
+            remain = end - time.monotonic()
+            if remain <= 0 or not select.select([master], [], [], remain)[0]:
+                return False
+            buf += os.read(master, 4096)
+        buf = buf.split(needle, 1)[1]
+        return True
+
+    try:
+        prompt = b"# " if os.geteuid() == 0 else b"$ "
+        if not expect(prompt):
+            return False
+        # Each sequence must be fully consumed. Any printable tail alters the
+        # command's output. A trailing Ctrl-D leaves the nonempty line intact.
+        os.write(master, b"echo key" + b"\x1b[15~\x1b[1;5D\x1b[5;2~\x1bOP" + b"s\x04\r")
+        if not expect(b"\nkeys\r") or not expect(prompt):
+            return False
+        os.write(master, b"abc\x03echo status=$?\r")
+        if not expect(b"^C\r\n") or not expect(b"\nstatus=130\r") or not expect(prompt):
+            return False
+        os.write(master, b"echo axc\x1b[D\x1b[D\x04\r")
+        if not expect(b"\nac\r") or not expect(prompt):
+            return False
+        os.write(master, b"\x04")
+        return p.wait(timeout=DEADLINE) == 0
+    finally:
+        if p.poll() is None:
+            p.kill()
+            p.wait()
+        os.close(master)
+
+
 def gaps(sh, suite):
     with tempfile.TemporaryDirectory() as tmp:
         env = dict(os.environ, SH=sh, GAPS_DIR=tmp)
@@ -67,6 +109,7 @@ def main():
     sh, suite = sys.argv[1:3]
     failed = []
     for name, ok in (("trap-read-race", lambda: trap_read_race(sh)),
+                     ("editor-keys", lambda: editor_keys(sh)),
                      ("gaps", lambda: gaps(sh, suite))):
         good = ok()
         print(f"sh-host {name}: {'PASS' if good else 'FAIL'}")

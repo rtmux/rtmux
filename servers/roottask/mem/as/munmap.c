@@ -318,7 +318,7 @@ int as_munmap(pid_t pid, process_t *prp, uintptr_t vaddr, size_t len, int flags)
          */
         if (CPU_1TO1_IS_VADDR(vaddr)) {
             CPU_1TO1_FLUSH(vaddr, len);
-            pa_free_paddr(vaddr - CPU_1TO1_VADDR_BIAS, len, 0);
+            pa_free_paddr(VA_TO_PA(vaddr), len, 0);
         } else {
 #if CPU_SYSTEM_PADDR_MUST
             crash();

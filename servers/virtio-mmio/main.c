@@ -85,11 +85,15 @@ static int virtio_close_ocb(ioserv_context_t *ctp, void *reserved, void *ocb)
     return EOK;
 }
 
+static dev_t service_devno;
+static ino_t service_inode;
+
 static int virtio_stat(ioserv_context_t *ctp, io_stat_t *msg, void *ocb)
 {
     (void) ocb;
     memset(&msg->o, 0, sizeof(msg->o));
-    msg->o.st_ino = 1;
+    msg->o.st_ino = service_inode;
+    msg->o.st_dev = msg->o.st_rdev = service_devno;
     msg->o.st_mode = VIRTIO_MMIO_MODE;
     msg->o.st_nlink = 1;
     msg->o.st_uid = 0;
@@ -556,8 +560,11 @@ int main(int argc, char **argv)
     io_funcs.stat = virtio_stat;
     io_funcs.msg = virtio_io_msg;
     service_created = time(NULL);
-    if (ioserv_attach(dpp, &attr, VIRTIO_MMIO_SERVICE_PATH, _FTYPE_ANY, 0,
-                      &connect_funcs, &io_funcs, NULL) == -1) {
+    int service_id =
+        ioserv_attach(dpp, &attr, VIRTIO_MMIO_SERVICE_PATH, _FTYPE_ANY, 0,
+                      &connect_funcs, &io_funcs, NULL);
+    if (service_id == -1 ||
+        ioserv_devino(service_id, &service_devno, &service_inode) == -1) {
         fprintf(stderr, "virtio-mmio: attach %s: %s\n",
                 VIRTIO_MMIO_SERVICE_PATH, strerror(errno));
         return EXIT_FAILURE;

@@ -28,8 +28,7 @@ static int msg_current_take(thread_t *act, struct kcall_args_msg_current *kap);
  */
 int kdecl ksys_msg_current(thread_t *act, struct kcall_args_msg_current *kap)
 {
-    thread_t *prior_client = act->client;
-    bool ended = false;
+    bool ended;
     int r;
 
     /* Disown act's prior client, if any, and end the loan it lent, whatever
@@ -38,12 +37,9 @@ int kdecl ksys_msg_current(thread_t *act, struct kcall_args_msg_current *kap)
      * observes server=0 with act->client cleared; eventually consistent for its
      * own ksys_msg_current.
      */
-    if (prior_client) {
-        prior_client->args.ms.server = 0;
-        ended = thread_client_departed(act, prior_client);
-        if (ended)
-            CRITICAL_CLEAR(act);
-    }
+    ended = thread_disown_client(act);
+    if (ended)
+        CRITICAL_CLEAR(act);
 
     r = kap->rcvid == 0 ? EOK : msg_current_take(act, kap);
 
@@ -53,8 +49,11 @@ int kdecl ksys_msg_current(thread_t *act, struct kcall_args_msg_current *kap)
      * only while act still runs, so publish the status first.
      */
     if (ended && (kap->rcvid == 0 || r != EOK)) {
-        if (r != EOK && r != ENOERROR) {
-            kcall_err(act, r);
+        if (r != ENOERROR) {
+            if (r == EOK)
+                SETKSTATUS(act, EOK);
+            else
+                kcall_err(act, r);
             r = ENOERROR;
         }
         thread_prio_update(act);
@@ -130,9 +129,10 @@ static int msg_current_take(thread_t *act, struct kcall_args_msg_current *kap)
         return ESRCH;
     }
 
-    if (thp->args.ms.server != 0) {
-        thp->args.ms.server->client = 0;
-    }
+    rcu_read_lock(&tthread_rcu);
+    thread_t *previous = __atomic_load_n(&thp->args.ms.server, __ATOMIC_ACQUIRE);
+    bool settle_previous = previous && previous != act &&
+                           thread_client_departed(previous, thp);
 
     thp->args.ms.server = act;
     act->client = thp;
@@ -149,6 +149,12 @@ static int msg_current_take(thread_t *act, struct kcall_args_msg_current *kap)
 
     kspinlock_unlock(&cop->lock);
 
+    if (settle_previous)
+        thread_prio_defer_settle(previous);
+    rcu_read_unlock(&tthread_rcu);
+
+    /* The loan update can displace act before the dispatcher writes status. */
+    SETKSTATUS(act, EOK);
     /* PI propagation — outside cop->lock to honor SCHED-vs-CONNECT rank. */
     if (do_pi) {
         /* act now serves thp, which lends its priority until act replies. Read

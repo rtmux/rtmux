@@ -135,6 +135,7 @@ void kext_proc_query(void *data)
     out->num_total_threads = prp->threads.nentries - prp->threads.nfree;
     out->terming_priority = prp->terming_priority;
     out->process_priority = prp->process_priority;
+    out->may_set_priv_priority = (prp->priv_caps & RTMUX_PRIV_CAP_SCHED) != 0;
     out->base_addr = prp->base_addr;
     out->boundary_addr = prp->boundary_addr;
     out->max_cpu_time = prp->max_cpu_time;

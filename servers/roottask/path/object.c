@@ -292,6 +292,7 @@ static int dummy_devctl(ioserv_context_t *ctp,
 }
 
 extern int server_create(path_object_t *, void *);
+extern int server_done(path_object_t *);
 extern int symlink_create(path_object_t *, void *);
 extern int anmem_create(path_object_t *, void *);
 extern int anmem_done(path_object_t *);
@@ -321,7 +322,7 @@ static const struct object_info obj_info[] = {
         {
             .len = sizeof(struct server_object),
             .create = server_create,
-            .done = dummy_done,
+            .done = server_done,
             .name = dummy_name,
             .devctl = dummy_devctl,
         },

@@ -17,6 +17,7 @@
 #include <sys/rtmux-core.h>
 #include <sys/wait.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 
 #define GETTY_LOGIN_PATH "/bin/login"
@@ -32,8 +33,23 @@ static int getty_read_name(char *buf, size_t bufsz)
 {
     size_t len;
 
-    if (!fgets(buf, (int) bufsz, stdin))
-        return -1;
+    int reported = 0;
+    while (!fgets(buf, (int) bufsz, stdin)) {
+        int err = errno;
+        int eof = feof(stdin);
+        clearerr(stdin);
+        if (!eof && err == EINTR)
+            continue;
+        if (!reported || (!eof && err == EBUSY)) {
+            fprintf(stderr, "getty: %s\n", eof ? "end of file" : strerror(err));
+            reported = 1;
+        }
+        if (!eof && err == EBUSY)
+            return -1;
+        struct timespec delay = {.tv_sec = 1};
+        while (nanosleep(&delay, &delay) < 0 && errno == EINTR)
+            continue;
+    }
     len = strlen(buf);
     while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r'))
         buf[--len] = '\0';
@@ -124,7 +140,7 @@ int toolbox_getty_main(int argc, char **argv)
             fflush(stdout);
             n = getty_read_name(name, sizeof(name));
             if (n < 0)
-                break;
+                return 1;
             if (n == 0)
                 continue;
             if (!getty_name_is_valid(name)) {
@@ -133,8 +149,6 @@ int toolbox_getty_main(int argc, char **argv)
             }
             break;
         }
-        if (name[0] == '\0')
-            continue;
 
         spawn_argv[0] = (char *) "login";
         spawn_argv[1] = name;

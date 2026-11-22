@@ -217,7 +217,7 @@ struct server {
     int base;
     pthread_mutex_t *hold; /* held from before the receive until `go` */
     atomic_int ready, received, go;
-    int rcvid;
+    int rcvid, current_rc;
     int prio_recv, prio_unlocked, prio_after, base_after, reply_rc;
 };
 
@@ -477,7 +477,7 @@ static void test_reply_cycle_deadlock(void)
 }
 
 /* A /sys/kstats value, or -1. */
-static long kstats_value(const char *key)
+long kstats_value(const char *key)
 {
     static char buf[8192];
     char want[64];
@@ -670,7 +670,7 @@ static void *case7_server(void *raw)
     k->rcvid = msg_receive(k->chid, buf, sizeof buf, NULL);
     k->prio_recv = self_prio(NULL);
     set_flag(&k->received);
-    (void) msg_current(0);
+    k->current_rc = msg_current(0);
     k->prio_unlocked = self_prio(NULL);
     set_flag(&k->go);
     k->reply_rc = k->rcvid == -1 ? -1 : msg_reply(k->rcvid, 0, &z, 1);
@@ -707,7 +707,7 @@ static void test_loan_ends_at_msg_current_zero(void)
              "received at %d (want 40), %d after msg_current(0) (want %d), "
              "reply rc %d",
              k.prio_recv, k.prio_unlocked, C7_BASE, k.reply_rc);
-    check(k.prio_recv == 40 && k.prio_unlocked == C7_BASE,
+    check(k.current_rc == 0 && k.prio_recv == 40 && k.prio_unlocked == C7_BASE,
           "prio loan: msg_current(0) ends the client's loan", detail);
     chan_close(k.chid, coid);
 }
@@ -878,9 +878,46 @@ static void test_loan_ends_for_blocked_server(void)
     run_loan_ends_for_blocked_server(false);
 }
 
+/* Measure the fence used by thread_end_orphan_loan against the same loop
+ * with only a compiler barrier. Batching amortizes both timer reads. */
+static uint64_t loan_fence_batch(bool fence)
+{
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    if (fence) {
+        for (unsigned i = 0; i < 1000000; ++i)
+            __asm__ volatile("fence rw, rw" ::: "memory");
+    } else {
+        for (unsigned i = 0; i < 1000000; ++i)
+            __asm__ volatile("" ::: "memory");
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    return (end.tv_sec - start.tv_sec) * 1000000000LL +
+           end.tv_nsec - start.tv_nsec;
+}
+
 int loan_settle_context(void)
 {
-    run_loan_ends_for_blocked_server(true);
+    unsigned idle_rounds = 0;
+    if (inject_run("prio-settle-reset", NULL, NULL) != 0) {
+        test_skip("prio loan: settle context", "fault injection unavailable");
+        return 0;
+    }
+    for (int i = 0; i < 8; i++) {
+        run_loan_ends_for_blocked_server(true);
+        idle_rounds += inject_run("prio-settle-idle", "1", NULL) == 0;
+    }
+    check(idle_rounds != 0,
+          "prio loan: idle hart drained a deferred settle with interrupts off",
+          "no timeout exercised the idle-hart drain");
+    for (int i = 0; i < 5; i++) {
+        uint64_t first = loan_fence_batch(i & 1);
+        uint64_t second = loan_fence_batch(!(i & 1));
+        printf("loan departure fence: 1000000 iterations, control %llu ns, fenced %llu ns\n",
+               (unsigned long long) ((i & 1) ? second : first),
+               (unsigned long long) ((i & 1) ? first : second));
+    }
+    test_loan_ends_at_msg_current_zero();
     test_loan_ends_at_failed_msg_current();
     return 0;
 }

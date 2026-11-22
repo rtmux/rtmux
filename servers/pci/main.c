@@ -246,11 +246,15 @@ static int PCI_CloseOcb(ioserv_context_t *ctp,
     return EOK;
 }
 
+static dev_t service_devno;
+static ino_t service_inode;
+
 static int PCI_Stat(ioserv_context_t *ctp, io_stat_t *msg, pci_dev_list_t *ocb)
 {
     (void) ocb;
     memset(&msg->o, 0, sizeof(msg->o));
-    msg->o.st_ino = 1;
+    msg->o.st_ino = service_inode;
+    msg->o.st_dev = msg->o.st_rdev = service_devno;
     msg->o.st_mode = PCI_MODE;
     msg->o.st_nlink = 1;
     msg->o.st_uid = 0;
@@ -531,8 +535,10 @@ int main(int argc, char **argv)
         exit(EXIT_FAILURE);
     }
 
-    if (ioserv_attach(dpp, &ioserv_attr, "/dev/pci", _FTYPE_ANY, 0,
-                      &connect_funcs, &io_funcs, NULL) == -1) {
+    int service_id = ioserv_attach(dpp, &ioserv_attr, "/dev/pci", _FTYPE_ANY, 0,
+                                   &connect_funcs, &io_funcs, NULL);
+    if (service_id == -1 ||
+        ioserv_devino(service_id, &service_devno, &service_inode) == -1) {
         pci_slogf(_SLOGC_PCI, _SLOG_ERROR, "ioserv_attach failed");
         exit(EXIT_FAILURE);
     }

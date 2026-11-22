@@ -27,6 +27,7 @@
 #define _RTMUX_LIBC_SIGNAL_STATE_H
 
 #include <signal.h>
+#include <stdint.h>
 #include <sys/cdefs.h>
 #include <sys/types.h>
 
@@ -34,6 +35,13 @@
  * pending). Called once from crt0 / syschan_init startup.
  */
 void __libc_signal_init(void) __hidden;
+_Noreturn void __libc_signal_exit(int signo) __hidden;
+
+/* What an exec passes on to the new image (see AT_RTMUX_SIGMASK): the signals
+ * ignored and blocked now, and the same two sets taken up at startup.
+ */
+void __libc_signal_exec_state(sigset_t *ignored, sigset_t *blocked) __hidden;
+void __libc_signal_exec_inherit(uint64_t ignored, uint64_t blocked) __hidden;
 
 /* Called by the system thread when a _NOTIFICATION_CODE_SIGNAL notification is
  * received. Updates pending, runs the handler asynchronously from the system

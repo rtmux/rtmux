@@ -27,6 +27,24 @@ static int slog_close_ocb(ioserv_context_t *ctp,
 static void parse_options(int argc, char *argv[]);
 static void logger_init(struct slogdev *trp);
 
+void logger_stat(struct stat *st, const struct slogdev *dev, bool console)
+{
+    memset(st, 0, sizeof(*st));
+    st->st_mode = S_IFCHR | 0666;
+    st->st_nlink = 1;
+    st->st_dev = st->st_rdev = dev->identity[console].device;
+    st->st_ino = dev->identity[console].inode;
+    st->st_size = (off_t) (dev->cnt * sizeof(int));
+}
+
+static int slog_stat(ioserv_context_t *ctp,
+                     io_stat_t *msg,
+                     struct slog_ocb *ocb)
+{
+    logger_stat(&msg->o, ocb->dev, ctp->id != ocb->dev->id);
+    return IOSERV_PTR(ctp, &msg->o, sizeof msg->o);
+}
+
 static struct slogdev SlogDev;
 
 static const ioserv_connect_ops_t SlogConnectFuncs = {
@@ -44,6 +62,7 @@ static const ioserv_ops_t SlogIoFuncs = {
     .nfuncs = IOSERV_IO_NFUNCS,
     .read = io_read,
     .write = io_write,
+    .stat = slog_stat,
     .close_ocb = slog_close_ocb,
     .notify = io_notify,
     .unblock = io_unblock,
@@ -53,6 +72,7 @@ static const ioserv_ops_t SlogIoFuncs = {
 static const ioserv_ops_t ConsoleIoFuncs = {
     .nfuncs = IOSERV_IO_NFUNCS,
     .write = io_console_write,
+    .stat = slog_stat,
     .close_ocb = slog_close_ocb,
 };
 
@@ -107,7 +127,9 @@ int main(int argc, char *argv[])
      */
     if ((trp->id = ioserv_attach(dpp, &res_attr, "/dev/slog", _FTYPE_ANY,
                                  IOSERV_FLAG_SELF, &SlogConnectFuncs,
-                                 &SlogIoFuncs, trp)) == -1) {
+                                 &SlogIoFuncs, trp)) == -1 ||
+        ioserv_devino(trp->id, &trp->identity[0].device,
+                      &trp->identity[0].inode) == -1) {
         fprintf(stderr, "%s: Unable to allocate device %s (%s)\n",
                 logger_program_name, "/dev/slog", strerror(errno));
         exit(EXIT_FAILURE);
@@ -116,12 +138,14 @@ int main(int argc, char *argv[])
     /* Create /dev/console in the pathname space. At this point we can get
      * opens.
      */
-    if (AttachConsole &&
-        ioserv_attach(dpp, &res_attr, "/dev/console", _FTYPE_ANY, 0,
-                      &ConsoleConnectFuncs, &ConsoleIoFuncs, trp) == -1) {
-        fprintf(stderr, "%s: Unable to allocate device %s (%s)\n",
-                logger_program_name, "/dev/console", strerror(errno));
-        exit(EXIT_FAILURE);
+    if (AttachConsole) {
+        int id = ioserv_attach(dpp, &res_attr, "/dev/console", _FTYPE_ANY, 0,
+                               &ConsoleConnectFuncs, &ConsoleIoFuncs, trp);
+        if (id == -1 || ioserv_devino(id, &trp->identity[1].device,
+                                      &trp->identity[1].inode) == -1) {
+            perror("/dev/console");
+            exit(EXIT_FAILURE);
+        }
     }
     /* If a logfile was specified then create a thread to write it */
     if (LogFname) {

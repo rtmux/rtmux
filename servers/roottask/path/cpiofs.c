@@ -357,6 +357,13 @@ static int cpiofs_read(ioserv_context_t *ctp, io_read_t *msg, void *handle)
     return IOSERV_NPARTS(1);
 }
 
+/* The offset of the payload identifies its entry for the archive lifetime.
+ * Even an empty entry has its own header before the next payload. */
+static ino_t cpiofs_inode(const uint8_t *data)
+{
+    return data ? (ino_t) (data - cpio_base) : 1;
+}
+
 static int cpiofs_stat(ioserv_context_t *ctp, io_stat_t *msg, void *handle)
 {
     struct cpiofs_ocb *ocb = handle;
@@ -371,7 +378,8 @@ static int cpiofs_stat(ioserv_context_t *ctp, io_stat_t *msg, void *handle)
     msg->o.st_mode = ocb->mode;
     msg->o.st_size = (off_t) ocb->size;
     msg->o.st_nlink = 1;
-    msg->o.st_dev = (ctp->info.srcnd << RTMUX_NODE_BITS) | path_devno;
+    msg->o.st_dev = (ctp->info.srcnd << RTMUX_NODE_BITS) | cpiofs_devno;
+    msg->o.st_ino = cpiofs_inode(ocb->data);
     msg->o.st_rdev = (ctp->info.srcnd << RTMUX_NODE_BITS) | cpiofs_devno;
 
     return IOSERV_PTR(ctp, &msg->o, sizeof(msg->o));
@@ -502,7 +510,7 @@ static void readdir_cb(const cpio_file_info_t *info, void *user_data)
         return;
 
     struct dirent *dp = (struct dirent *) ((char *) ctx->dp + ctx->used_bytes);
-    dp->d_ino = (ino_t) (ctx->entry_idx + 1);
+    dp->d_ino = cpiofs_inode(info->data);
     dp->d_reclen = (uint16_t) reclen;
     dp->d_namelen = (uint16_t) strlen(name);
     memcpy(dp->d_name, name, strlen(name) + 1);

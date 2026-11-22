@@ -25,7 +25,7 @@ static int lflush(FILE *fp)
 int __srefill(FILE *fp)
 {
     if (!__sdidinit)
-        __sinit();
+        __sdidinit = 1;
 
     ORIENT(fp, -1);
 
@@ -63,7 +63,7 @@ int __srefill(FILE *fp)
 
     if (fp->_flags & (__SLBF | __SNBF)) {
         fp->_flags |= __SIGN;
-        (void) _fwalk(lflush);
+        (void) _fwalk(lflush, 1);
         __sclear(fp, __SIGN);
 
         if ((fp->_flags & (__SLBF | __SWR)) == (__SLBF | __SWR))

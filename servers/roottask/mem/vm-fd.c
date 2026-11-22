@@ -113,17 +113,10 @@ int fdmem_create(path_object_t *obp, void *extra)
 int fdmem_done(path_object_t *obp)
 {
     if (obp == fdmem_cleaner_object) {
-        atomic_add(&fdmem_close_lock, 1);
-
-        /* RUSH1: We should release the fdmem_mutex over the close, RUSH1: but
-         * then we get into race conditions with the open
-         */
         if (root_vm_ops.resize(obp, 0) != EOK)
             crash();
         vector_rem(&vm_fd_vector, (unsigned) obp->fdmem.fd);
-        close(obp->fdmem.fd);
         free(obp->fdmem.name);
-        atomic_sub(&fdmem_close_lock, 1);
         return 1;
     }
 
@@ -708,6 +701,7 @@ static int vm_fd_cleanup(message_context_t *ctp,
             mtime = obp->mem.pm.mtime;
             if (force || (currtime >= mtime)) {
                 int r;
+                int fd = obp->fdmem.fd;
 
                 *owner = obp->hdr.next;
                 __atomic_sub_fetch(&fdmem_zombie_count, 1, __ATOMIC_RELAXED);
@@ -718,7 +712,19 @@ static int vm_fd_cleanup(message_context_t *ctp,
                 fdmem_cleaner_object = NULL;
                 if (r) {
                     VM_FD_TALLY(vm_fd_freed);
-                    /* owner already points at the next entry. */
+                    /* close may send _IO_CLOSE to this same worker pool.
+                     * Let exit handlers enqueue their objects and get back
+                     * to receive. Keep opens out until the old fd is gone. */
+                    atomic_add(&fdmem_close_lock, 1);
+                    pthread_mutex_unlock(&fdmem_mutex);
+                    close(fd);
+                    pthread_mutex_lock(&fdmem_mutex);
+                    atomic_sub(&fdmem_close_lock, 1);
+                    pthread_cond_broadcast(&fdmem_condvar);
+                    if (gen != fdmem_zombie_gen) {
+                        gen = fdmem_zombie_gen;
+                        owner = &fdmem_zombies;
+                    }
                     continue;
                 }
                 /* Free failed for some reason, put things back */

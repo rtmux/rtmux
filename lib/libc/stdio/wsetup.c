@@ -17,7 +17,7 @@
 int __swsetup(FILE *fp)
 {
     if (!__sdidinit)
-        __sinit();
+        __sdidinit = 1;
 
     if ((fp->_flags & __SWR) == 0) {
         if ((fp->_flags & __SRW) == 0) {

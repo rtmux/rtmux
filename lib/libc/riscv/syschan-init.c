@@ -89,6 +89,11 @@ static void __systhrd_entry(void)
 extern long SysCpupageGet_r(int index) __hidden;
 extern struct syspage_entry *_syspage_ptr;
 
+int cpuid(void)
+{
+    return (int) SysCpupageGet_r(CPUPAGE_CPU);
+}
+
 void __rtmux_syschan_init(void)
 {
     int chid, coid;
@@ -110,6 +115,13 @@ void __rtmux_syschan_init(void)
             ep++;
         __libc_auxv = (const uint64_t *) (ep + 1);
     }
+
+    /* An image started by exec begins with the signals its predecessor
+     * ignored and blocked, as the loader passes them on.
+     */
+    if (__libc_auxv_get(AT_RTMUX_SIGMASK) || __libc_auxv_get(AT_RTMUX_SIGIGN))
+        __libc_signal_exec_inherit(__libc_auxv_get(AT_RTMUX_SIGIGN),
+                                   __libc_auxv_get(AT_RTMUX_SIGMASK));
 
     /* Initialize the syspage pointer for this process. */
     if (!_syspage_ptr)

@@ -80,14 +80,6 @@ static bool pspawn_region_aligned(const void *p)
     return align == 0 || align == 4;
 }
 
-static int pspawn_add_size(size_t *sum, size_t add)
-{
-    if (add > SIZE_MAX - *sum)
-        return E2BIG;
-    *sum += add;
-    return EOK;
-}
-
 /** fill_struct_inheritance
  *
  * Populate a struct inheritance from a posix_spawnattr_t by extracting each
@@ -364,10 +356,10 @@ static int parse_pspawn_msg(pid_t ppid,
      *     - identical argv and env parameters (nbytes == argenv_bytes)
      */
     spawn_msg_len = sizeof(new_msg->i);
-    if (pspawn_add_size(&spawn_msg_len, fdmap_size) != EOK ||
-        pspawn_add_size(&spawn_msg_len, msg->i.cwdlen) != EOK ||
-        pspawn_add_size(&spawn_msg_len, msg->i.pathlen) != EOK ||
-        pspawn_add_size(&spawn_msg_len, msg->i.argenv_bytes) != EOK)
+    if (spawn_add_size(&spawn_msg_len, fdmap_size) != EOK ||
+        spawn_add_size(&spawn_msg_len, msg->i.cwdlen) != EOK ||
+        spawn_add_size(&spawn_msg_len, msg->i.pathlen) != EOK ||
+        spawn_add_size(&spawn_msg_len, msg->i.argenv_bytes) != EOK)
         return E2BIG;
     if (spawn_msg_len > (size_t) INT_MAX)
         return E2BIG;

@@ -311,13 +311,17 @@ addmem:
 static size_t _heap_alloc(size_t size, void **addr)
 {
     size = ROUNDUP(size, __PAGESIZE);
+    kspinlock_lock(&alloc_slock);
     if (size <= pregrow_size) {
         /* Can use the memory that was pre-allocated by heap_init() */
         *addr = pregrow_start;
         pregrow_size -= size;
         pregrow_start = (uint8_t *) pregrow_start + size;
+        kspinlock_unlock(&alloc_slock);
         return size;
     }
+
+    kspinlock_unlock(&alloc_slock);
 
     if (vm_ops->mmap(0, NULL, 0, size, PROT_READ | PROT_WRITE | PROT_EXEC,
                      MAP_ANON | MAP_PRIVATE, 0, 0, _MALLOC_ALIGN, 0, NOFD, addr,

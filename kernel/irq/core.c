@@ -467,9 +467,10 @@ int rdecl interrupt_mask(unsigned level, interrupt_t *itp)
         if (pcpu_array[boot_cpunum].pc_alive &&
             ilp->info->flags & INTR_FLAG_SMP_BROADCAST_MASK) {
             unsigned mycpu = get_cpunum();
+            uint64_t online = cpu_online_snapshot();
 
             for (unsigned cpu = 0; cpu < num_processors; ++cpu) {
-                if (cpu != mycpu && cpu_online(cpu))
+                if (cpu != mycpu && cpu_in_mask(online, cpu))
                     SENDIPI(cpu, IPI_INTR_MASK);
             }
         }
@@ -516,9 +517,10 @@ int rdecl interrupt_unmask(unsigned level, interrupt_t *itp)
         if (pcpu_array[boot_cpunum].pc_alive &&
             ilp->info->flags & INTR_FLAG_SMP_BROADCAST_UNMASK) {
             unsigned mycpu = get_cpunum();
+            uint64_t online = cpu_online_snapshot();
 
             for (unsigned cpu = 0; cpu < num_processors; ++cpu) {
-                if (cpu != mycpu && cpu_online(cpu))
+                if (cpu != mycpu && cpu_in_mask(online, cpu))
                     SENDIPI(cpu, IPI_INTR_UNMASK);
             }
         }

@@ -7,9 +7,7 @@
 # "  ok NAME" or "  FAIL NAME: ..." per case, then "gaps: PASS" or "gaps: FAIL".
 #
 # $SH is the shell the cases run as `sh -c`, and the one a case runs as a child;
-# it defaults to sh. $GAPS_DIR is the directory for scratch files. A non-empty
-# $GAPS_NO_EXEC skips the cases that need a successful exec to start the new
-# image.
+# it defaults to sh. $GAPS_DIR is the directory for scratch files.
 #
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -37,6 +35,19 @@ ck() {
         bad="$bad$1 "
     fi
 }
+
+out=$($SH -c 'echo before; echo "$((1 / 0))"; echo after' 2>/dev/null)
+rc=$?
+ck arithmetic-error-command "before" "$out"
+if test "$rc" -gt 0; then ck arithmetic-error-exits yes yes; else ck arithmetic-error-exits yes no; fi
+out=$($SH -c 'unset GLOCAL; GLOCAL=private; printenv GLOCAL || echo unset; export GLOCAL; printenv GLOCAL')
+ck shell-local-export "$(printf 'unset\nprivate')" "$out"
+out=$($SH -c 'unset GLOCAL; GLOCAL=private; echo "$(echo "$GLOCAL")"; GLOCAL=scoped printenv GLOCAL; printenv GLOCAL || echo hidden')
+ck shell-local-scope "$(printf 'private\nscoped\nhidden')" "$out"
+out=$($SH -c 'unset GLOCAL; GLOCAL=direct exec printenv GLOCAL')
+ck exec-prefix direct "$out"
+out=$($SH -c 'true &' 2>&1)
+ck quiet-background "" "$out"
 
 # --- a quote or a substitution that never ends is a syntax error, and nothing
 # of the line runs -----------------------------------------------------------
@@ -313,10 +324,8 @@ out=$(echo "$raw" | tr -d '$>#')
 ck multiline-prompt "a b done" "$(echo $out)"
 
 # --- exec with a command applies its redirections to that command -------------
-if test -z "$GAPS_NO_EXEC"; then
-    out=$($SH -c 'exec echo hi 1>&2' 2>&1 >/dev/null)
-    ck exec-cmd-redirect hi "$out"
-fi
+out=$($SH -c 'exec echo hi 1>&2' 2>&1 >/dev/null)
+ck exec-cmd-redirect hi "$out"
 
 # --- elif ---------------------------------------------------------------------------------
 out=$($SH -c 'if false; then echo a; elif true; then echo b; else echo c; fi')

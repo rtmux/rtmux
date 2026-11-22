@@ -347,10 +347,11 @@ const struct sigevent *clock_handler(void *dummy, int id)
                  * read these lines to prove the periodic tick is gone.
                  */
                 static uint64_t stimer_last[CONFIG_PROCESSORS_MAX];
+                uint64_t online = cpu_online_snapshot();
                 for (unsigned i = 0; i < num_processors; i++) {
                     uint64_t cur;
 
-                    if (!cpu_online(i))
+                    if (!cpu_in_mask(online, i))
                         continue;
                     cur = atomic_load_explicit(&stimer_intr_count[i],
                                                memory_order_relaxed);

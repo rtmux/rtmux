@@ -16,6 +16,7 @@
  * freed, so overlapping blocks and a corrupt free list fail here too.
  */
 
+#include <errno.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -29,6 +30,16 @@
 
 void *__crt_malloc(size_t);
 void __crt_free(void *);
+
+/* A depleted PI turnstile pool rejects the first lock attempt. */
+static _Thread_local int lock_attempt;
+int __real_pthread_mutex_lock(pthread_mutex_t *mutex);
+int __wrap_pthread_mutex_lock(pthread_mutex_t *mutex)
+{
+    if (lock_attempt && ++lock_attempt == 2)
+        return EAGAIN;
+    return __real_pthread_mutex_lock(mutex);
+}
 
 static int failures;
 static long checks;
@@ -220,6 +231,13 @@ int main(int argc, char **argv)
 {
     const char *only = argc > 1 ? argv[1] : NULL;
 
+    if (!only || !strcmp(only, "lock")) {
+        struct roottask_heap_stats st;
+        lock_attempt = 1;
+        roottask_heap_stats(&st);
+        CHECK(lock_attempt == 3, "extent access must retry after EAGAIN");
+        lock_attempt = 0;
+    }
     if (!only || !strcmp(only, "merge"))
         test_merge();
     if (!only || !strcmp(only, "threads"))

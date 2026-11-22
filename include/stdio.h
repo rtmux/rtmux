@@ -42,7 +42,7 @@ struct __sFILE {
     unsigned char *_p;     /* current position in (some) buffer */
     int _r;                /* read space left for getc() */
     int _w;                /* write space left for putc() */
-    unsigned short _flags; /* implementation flags; this FILE is free if 0 */
+    unsigned short _flags; /* implementation flags */
     short _file;           /* fileno, if Unix descriptor, else -1 */
     struct __sbuf _bf;     /* the buffer (at least 1 byte, if !NULL) */
     int _lbfsize;          /* 0 or -_bf._size, for inline putc */
@@ -67,7 +67,7 @@ struct __sFILE {
     int _blksize;   /* stat.st_blksize (may be != _bf._size) */
     fpos_t _offset; /* current lseek offset */
 
-    /* Threading fields — reserved by the FILE layout, unused in RTMux */
+    /* Recursive per-stream lock and its current owner. */
     void *_fl_mutex;
     void *_fl_owner;
     int _fl_count;

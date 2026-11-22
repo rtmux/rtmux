@@ -601,37 +601,23 @@ void rdecl sched_account_restart(void)
  */
 uint64_t rdecl sched_account_read(thread_t *thp, uint64_t now)
 {
-    uint64_t online = cpu_online_snapshot();
-
-    for (unsigned cpu = 0; cpu < num_processors; cpu++) {
+    for (int tries = 0; tries < 3; tries++) {
+        unsigned cpu = __atomic_load_n(&thp->runcpu, __ATOMIC_ACQUIRE);
+        if (!cpu_online(cpu))
+            break;
         struct pcpu *pc = &pcpu_array[cpu];
+        unsigned seq = atomic_load_explicit(&pc->pc_account_seq, memory_order_acquire);
+        uint64_t stamp = pc->pc_account_stamp;
+        uint64_t banked = thp->running_time;
+        thread_t *cur = __atomic_load_n(&pc->pc_curthread, __ATOMIC_ACQUIRE);
 
-        if (!cpu_in_mask(online, cpu))
-            continue;
-
-        /* runcpu is set by mark_running on the hart that now runs thp, so a
-         * hart that still names thp after it was handed to another (yield/
-         * resched enqueue, then mark_running) is skipped.
-         */
-        if (__atomic_load_n(&pc->pc_curthread, __ATOMIC_ACQUIRE) != thp ||
-            thp->runcpu != cpu)
-            continue;
-        for (int tries = 0; tries < 3; tries++) {
-            unsigned s1 =
-                atomic_load_explicit(&pc->pc_account_seq, memory_order_acquire);
-            uint64_t stamp = pc->pc_account_stamp;
-            uint64_t banked = thp->running_time;
-            thread_t *cur =
-                __atomic_load_n(&pc->pc_curthread, __ATOMIC_ACQUIRE);
-
-            atomic_thread_fence(memory_order_acquire);
-            if ((s1 & 1u) || cur != thp ||
-                s1 != atomic_load_explicit(&pc->pc_account_seq,
-                                           memory_order_relaxed))
-                continue;
+        atomic_thread_fence(memory_order_acquire);
+        if (!(seq & 1u) && cur == thp &&
+            cpu == __atomic_load_n(&thp->runcpu, __ATOMIC_RELAXED) &&
+            seq == atomic_load_explicit(&pc->pc_account_seq, memory_order_relaxed))
             return banked + (now > stamp ? now - stamp : 0);
-        }
-        break;
+        if (cur != thp && cpu == __atomic_load_n(&thp->runcpu, __ATOMIC_RELAXED))
+            break;
     }
     return thp->running_time;
 }

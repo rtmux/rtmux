@@ -46,7 +46,6 @@
  * Sv39 space), established at boot via the kernel page tables. For now,
  * temp_map always goes through explicit page-table mappings.
  */
-#define CPU_1TO1_VADDR_BIAS KERNEL_VIRT_BASE
 #define CPU_1TO1_IS_VADDR(v) ((uintptr_t) (v) >= KERNEL_VIRT_BASE)
 #define CPU_1TO1_IS_PADDR(p) 1
 

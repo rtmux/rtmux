@@ -18,8 +18,6 @@
 #include <smpswitch.h>
 
 
-#define PROC_INIT_PRIORITY 10 /* priority to start init thread at */
-
 union proc_msg_union {
     uint16_t type;
     proc_spawn_t spawn;

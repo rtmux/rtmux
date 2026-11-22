@@ -35,6 +35,8 @@ typedef struct nvme_ocb nvme_ocb_t;
 #include "gpt.h"
 
 struct nvme_region {
+    dev_t devno;
+    ino_t inode;
     uint32_t nsid;
     uint64_t start_lba;
     uint64_t nlba;
@@ -373,7 +375,8 @@ static int nvme_stat(ioserv_context_t *ctp, io_stat_t *msg, nvme_ocb_t *ocb)
 {
     nvme_region_t *rg = ocb->region;
     memset(&msg->o, 0, sizeof(msg->o));
-    msg->o.st_ino = 1;
+    msg->o.st_dev = msg->o.st_rdev = rg->devno;
+    msg->o.st_ino = rg->inode;
     msg->o.st_size = (off_t) rg->size_bytes;
     msg->o.st_mode = rg->mode;
     msg->o.st_nlink = 1;
@@ -539,6 +542,10 @@ static int register_region(dispatch_t *dpp,
 
     int rc = ioserv_attach(dpp, NULL, rg->path, _FTYPE_ANY, 0, &connect_funcs,
                            &io_funcs, rg);
+    if (rc >= 0 && ioserv_devino(rc, &rg->devno, &rg->inode) == -1) {
+        ioserv_detach(dpp, rc, 0);
+        return -1;
+    }
     if (rc == -1) {
         fprintf(stderr, "dev-nvme: ioserv_attach(%s) failed: %s\n", rg->path,
                 strerror(errno));

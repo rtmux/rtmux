@@ -115,8 +115,8 @@ struct netd_watch {
     int fd;
     unsigned gen;
     unsigned set;
-    unsigned
-        pins; /* notifies checking the socket now: a store to the slot waits */
+    pthread_mutex_t
+        pin; /* PI donation from a writer to the last notify check */
     ioserv_notify_t lists[IOSERV_NOTIFY_COUNT];
 };
 
@@ -129,9 +129,6 @@ static struct netd_watch tcp_watch[NETD_SLOTS];
 static struct netd_watch udp_watch[NETD_SLOTS];
 static pthread_mutex_t netd_watch_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t netd_watch_cond = PTHREAD_COND_INITIALIZER;
-
-/* Signalled when a slot's last pin is dropped, for the store that waits. */
-static pthread_cond_t netd_pin_cond = PTHREAD_COND_INITIALIZER;
 
 /* An LKL eventfd in the watcher's poll set: an arm that adds to what the
  * watcher polls (a socket, or a condition of one) writes it, so the watcher
@@ -285,6 +282,16 @@ static struct netd_watch *watch_for(const int *slots, int slot)
     return &(slots == tcp_fd ? tcp_watch : udp_watch)[slot];
 }
 
+static int netd_pin_lock(struct netd_watch *w)
+{
+    int err;
+    while ((err = pthread_mutex_lock(&w->pin)) == EAGAIN) {
+        struct timespec delay = {.tv_nsec = 1000000};
+        nanosleep(&delay, NULL);
+    }
+    return err;
+}
+
 /* Every write to a slot table goes through here. The notify handler reads the
  * tables without the admission lock, under netd_watch_lock, so the writers take
  * it too. A socket that leaves the slot wakes its pollers, so they look again
@@ -294,9 +301,9 @@ static void slot_store(int *slots, pid_t *owners, int slot, int fd, pid_t owner)
 {
     struct netd_watch *w = watch_for(slots, slot);
 
+    if (netd_pin_lock(w))
+        abort();
     pthread_mutex_lock(&netd_watch_lock);
-    while (w->pins) /* a notify is checking the socket this slot holds */
-        pthread_cond_wait(&netd_pin_cond, &netd_watch_lock);
     slots[slot] = fd;
     if (owners)
         owners[slot] = owner;
@@ -308,6 +315,7 @@ static void slot_store(int *slots, pid_t *owners, int slot, int fd, pid_t owner)
             ioserv_notify_trigger(w->lists, INT_MAX, i);
     }
     pthread_mutex_unlock(&netd_watch_lock);
+    pthread_mutex_unlock(&w->pin);
 }
 
 static void slot_close(int *slots, pid_t *owners, int slot)
@@ -1173,25 +1181,26 @@ static int netd_notify(ioserv_context_t *ctp,
      * never a guess.
      */
     for (unsigned tries = 0;; tries++) {
+        bool pinned = tries >= netd_notify_retries;
+        if (pinned && (ret = netd_pin_lock(w)) != EOK)
+            return ret;
         pthread_mutex_lock(&netd_watch_lock);
         ret = slot_check(slots,
                          ocb->kind == NETD_TCP_DATA ? tcp_owner : udp_owner,
                          ocb->slot, ctp->info.pid);
         fd = ret == EOK ? slots[ocb->slot] : -1;
         gen = w->gen;
-        if (ret == EOK && fd >= 0 && tries >= netd_notify_retries) {
+        if (ret == EOK && fd >= 0 && pinned) {
             /* Retries spent: the slot is pinned, so a store to it waits, and
              * the socket is checked once more with the lock dropped, which
              * keeps the watcher and the other slots from waiting on LKL. The
              * slot cannot change meanwhile, so the answer is true: not-ready is
              * never guessed.
              */
-            w->pins++;
             pthread_mutex_unlock(&netd_watch_lock);
             ret = socket_ready(fd, &sat, &hup);
             pthread_mutex_lock(&netd_watch_lock);
-            if (--w->pins == 0)
-                pthread_cond_broadcast(&netd_pin_cond);
+            pthread_mutex_unlock(&w->pin);
             if (ret != EOK) {
                 pthread_mutex_unlock(&netd_watch_lock);
                 return ret;
@@ -1199,6 +1208,8 @@ static int netd_notify(ioserv_context_t *ctp,
             break;
         }
         pthread_mutex_unlock(&netd_watch_lock);
+        if (pinned)
+            pthread_mutex_unlock(&w->pin);
         if (ret != EOK)
             return ret;
         if (fd < 0)
@@ -1450,8 +1461,22 @@ static int serve_net(void)
         long kick = lkl_sys_eventfd2(0, LKL_O_NONBLOCK);
         int err;
 
-        for (int i = 0; i < NETD_SLOTS; i++)
+        pthread_mutexattr_t attr;
+        if ((err = pthread_mutexattr_init(&attr)) != EOK)
+            return -1;
+        err = pthread_mutexattr_setprotocol(&attr, PTHREAD_PRIO_INHERIT);
+        for (int i = 0; !err && i < NETD_SLOTS; i++) {
             tcp_watch[i].fd = udp_watch[i].fd = -1;
+            err = pthread_mutex_init(&tcp_watch[i].pin, &attr);
+            if (!err)
+                err = pthread_mutex_init(&udp_watch[i].pin, &attr);
+        }
+        pthread_mutexattr_destroy(&attr);
+        if (err) {
+            fprintf(stderr, "lkl-netd: initialize slot mutex: %s\n",
+                    strerror(err));
+            return -1;
+        }
         netd_watch_kick = kick >= 0 ? (int) kick : -1;
         err = pthread_create(&tid, NULL, netd_watcher, NULL);
 

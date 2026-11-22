@@ -730,6 +730,28 @@ void rdecl remove_unblock(thread_t *thp, connect_t *cop, int rcvid)
                RTMUX_ITF_UNBLOCK_QUEUED);
 }
 
+/* A receiving server can disown its previous client as that client times out
+ * or is taken over by another server. Read the link inside the lifetime
+ * guard and clear only a reverse link that still names this server.
+ */
+bool rdecl thread_disown_client(thread_t *srv)
+{
+    bool ended = false;
+    if (!__atomic_load_n(&srv->client, __ATOMIC_ACQUIRE))
+        return false;
+    rcu_read_lock(&tthread_rcu);
+    thread_t *client = __atomic_load_n(&srv->client, __ATOMIC_ACQUIRE);
+    if (client) {
+        thread_t *expect = srv;
+        (void) __atomic_compare_exchange_n(&client->args.ms.server, &expect,
+                                            NULL, false, __ATOMIC_ACQ_REL,
+                                            __ATOMIC_RELAXED);
+        ended = thread_client_departed(srv, client);
+    }
+    rcu_read_unlock(&tthread_rcu);
+    return ended;
+}
+
 /* Send a buffered remote IPC message from a vthread to a local channel.
  *
  * If a receiver is waiting, hands it the buffered message and reply- blocks the
@@ -772,9 +794,8 @@ int rdecl remote_ipc_msg(thread_t *act, connect_t *cop, unsigned prio)
     }
 #endif
     if ((thp) && !(thp->internal_flags & RTMUX_ITF_RCVNOTIFICATION)) {
+        thp->short_msg_source = act;
         atomic_or(&thp->flags, RTMUX_FLG_THR_SHORT_MSG);
-        thp->blocked_on = act;
-        IPC_BLK(thp);
 
         /* Indicate that there is a receiver depending on data in our thread_t
          * object.
@@ -791,6 +812,8 @@ int rdecl remote_ipc_msg(thread_t *act, connect_t *cop, unsigned prio)
         }
         /* Unlink receive thread from the receive queue. */
         LINKPRIL_REM(thp);
+        thp->blocked_on = NULL;
+        IPC_BLK(thp);
         kspinlock_unlock(&chp->lock);
 
         /* By default the receiver runs with message driven priority: the remote

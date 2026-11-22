@@ -315,12 +315,13 @@ static void timer_fire_deferred_flush(void)
 {
 #if CONFIG_PROCESSORS_MAX > 1
     for (;;) {
+        uint64_t online = cpu_online_snapshot();
         bool pending = false;
         unsigned i;
 
         MEM_BARRIER_RW();
         for (i = 0; i < num_processors; i++) {
-            if (cpu_online(i) && timer_fire_deferred_n[i]) {
+            if (cpu_in_mask(online, i) && timer_fire_deferred_n[i]) {
                 pending = true;
                 break;
             }

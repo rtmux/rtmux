@@ -311,7 +311,7 @@ check: check-posix-matrix-options check-pse51 check-posix-profile-header
 check: check-posix-profile-config check-posix-profile-surface check-lkl-profile
 check: check-syscall-abi check-libc-abi check-make-target-names check-trace-export check-rt-budgets check-irq-contract
 check: check-platform-boundary-contracts
-check: check-lock-rank check-prio-writes check-preempt-inventory check-loader-negative check-fu740-smoke-scripts
+check: check-serial-priority check-lock-rank check-driver-priorities check-prio-writes check-preempt-inventory check-loader-negative check-fu740-smoke-scripts
 check: driver-gate $(LKL_CHECK_DEP) check-emu-headless check-rt check-qemu-deps
 check: $(AUTOCONF_H) $(VER_FILE) startup initramfs
 ifeq ($(CONFIG_LKL_SERVERS),y)
@@ -357,6 +357,10 @@ tty-smoke: check-qemu-deps $(AUTOCONF_H) $(VER_FILE) startup initramfs
 	$(Q)python3 scripts/vi-test.py
 	@echo "  CHECK    job control over serial (^C, ^Z, fg, TOSTOP)"
 	$(Q)python3 scripts/tty-jobctl-test.py
+.PHONY: check-serial-priority
+check-serial-priority: check-qemu-deps $(AUTOCONF_H) $(VER_FILE) startup initramfs
+	$(Q)$(PYTHON) scripts/vi-test.py --serial-priority
+
 .PHONY: tty-smoke
 
 check-cap-namespace: host-tests check-posix-matrix check-qemu-deps $(AUTOCONF_H) $(VER_FILE) startup initramfs
@@ -903,10 +907,11 @@ check-syscall-abi:
 	$(msg) CHECK syscall ABI shape
 	$(Q)$(PYTHON) scripts/check-syscall-abi.py
 
-check-libc-abi: libc
+check-libc-abi: libc ldso
 	$(msg) CHECK "libc.so export surface"
 	$(Q)$(PYTHON) scripts/check-libc-abi.py --self-test
 	$(Q)$(PYTHON) scripts/check-libc-abi.py --readelf "$(READELF)" --so "$(LIBC_SO)"
+	$(Q)$(PYTHON) scripts/check-public-prototypes.py --cc "$(CC)" --libc "$(LIBC_SO)" --ldso "$(LDSO_SO)"
 	$(Q)$(PYTHON) scripts/check-sysconf-names.py
 
 check-rt-budgets:
@@ -938,6 +943,10 @@ check-lock-rank:
 	$(msg) CHECK static lock-rank acquisition order
 	$(Q)$(PYTHON) scripts/check-lock-rank.py
 .PHONY: check-lock-rank
+
+.PHONY: check-driver-priorities
+check-driver-priorities:
+	$(Q)$(PYTHON) scripts/check-driver-priorities.py
 
 # Base vs lent priority: only kernel/include/thread-prio.h writes a thread's
 # base (real_priority) or its loans. Static text check, no build needed.

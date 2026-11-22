@@ -46,7 +46,6 @@ int proc_snapshot(pid_t pid, struct proc_snap *s)
     s->fg = qinfo.sess_pgrp;
     s->fd = qinfo.sess_fd;
     s->flags = qinfo.flags;
-    s->execed = root_proc(pid)->execed;
     s->chp = qinfo.sys_chp;
     root_proc_unlock(pid);
     return EOK;
@@ -269,24 +268,6 @@ int proc_jobctl_setpgrp(pid_t server, pid_t pid, pid_t pgrp)
     return rc;
 }
 
-/* proc_jobctl_tty_busy — whether another live session already has the terminal
- * served by server for its controlling terminal. A terminal belongs to at most
- * one session; the leader of a session that lost every member is gone with it.
- */
-int proc_jobctl_tty_busy(pid_t server, pid_t sid)
-{
-    for (unsigned i = 0; i < ROOT_PROCESS_MAX; i++) {
-        pid_t pid = root_process[i].pid;
-        struct proc_snap m;
-
-        if (pid != 0 && proc_snapshot(pid, &m) == EOK && m.sid != 0 &&
-            m.sid != sid && !(m.flags & JC_DEAD) && m.fd >= 0 &&
-            jc_tty_server(m.fd) == server)
-            return 1;
-    }
-    return 0;
-}
-
 /* Tell the parent a child stopped or continued: SIGCHLD, as for an exit. */
 static void jc_notify_parent(pid_t pid)
 {
@@ -389,6 +370,8 @@ int proc_msg_jobctl(ioserv_context_t *ctp, proc_jobctl_t *msg)
 
 #ifdef CONFIG_DEBUG_INJECT
     case _PROC_JOBCTL_DEBUG:
+        if (!proc_isaccess(0, &ctp->info))
+            return EPERM;
         return proc_pgrp_window_arm((unsigned) arg, (unsigned) arg2);
 #endif
 

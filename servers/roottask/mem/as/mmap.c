@@ -637,7 +637,7 @@ int as_mmap(pid_t pid,
         }
         *sizep = size_requested;
         if (CPU_1TO1_IS_PADDR(boff)) {
-            vaddr = (uintptr_t) boff + CPU_1TO1_VADDR_BIAS;
+            vaddr = (uintptr_t) PA_TO_VA(boff);
         } else {
 #if CPU_SYSTEM_PADDR_MUST
             if (!(flags & MAP_ANON)) {

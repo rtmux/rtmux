@@ -240,9 +240,14 @@ static void ipi_handler(void)
     if ((cmds & IPI_CLOCK_LOAD) && !kopt.disable_timer)
         (void) arch_timer_reload(qtimeptr); /* honor the dynamic deadline */
 
-    if (cmds & IPI_PARKIT)
+    if (cmds & IPI_PARKIT) {
+        uint64_t bit = 1ULL << cpu;
+        __atomic_store_n(&pcpu_array[cpu].pc_alive, false, __ATOMIC_RELEASE);
+        __atomic_and_fetch(&online_cpu_mask, ~bit, __ATOMIC_RELEASE);
+        __atomic_and_fetch(&legal_cpu_bitmask, ~bit, __ATOMIC_RELEASE);
         for (;;)
             __asm__ volatile("wfi");
+    }
 
     if (cmds & IPI_CRASH) {
         /* A sibling CPU is crashing and IPI'd us to quiesce. Snapshot our
@@ -313,6 +318,23 @@ static void __attribute__((noreturn)) enter_dispatch_exit(void)
     in_kcall_inc();
     in_kcall_phase(IN_KCALL_PHASE_DISPATCH);
     kernel_exit();
+}
+
+/* An interrupt handler can dispatch a ready thread on this hart. In that case
+ * the interrupted frame can already belong to a thread running elsewhere.
+ * Never restore it directly or read its status after handling the interrupt.
+ */
+static void interrupt_return(CPU_REGISTERS *interrupted, bool from_user)
+{
+    if (from_user) {
+        unsigned cpu = get_cpunum();
+        thread_t *cur = get_active_thread(cpu);
+        if (!cur || &cur->reg != interrupted ||
+            pcpu_array[cpu].pc_pending_preempt_prio ||
+            (atomic_load_explicit(&cur->async_flags, memory_order_acquire) &
+             (RTMUX_ATF_TIMESLICE | RTMUX_ATF_SMP_RESCHED)))
+            enter_dispatch_exit();
+    }
 }
 
 /* smode_preempt — called when a timer interrupt sets async_flags on the active
@@ -497,6 +519,7 @@ void strap_handler_c(CPU_REGISTERS *regs)
     pcpu_array[_mon_cpu].pc_last_scause = scause;
 
     if (scause & (1UL << 63)) {
+        bool from_user = !(regs->sstatus & SSTATUS_SPP);
         unsigned long _cause_early = scause & ~(1UL << 63);
 
         /* IPIs (S-mode software interrupt) are dispatched here. ipi_handler()
@@ -516,14 +539,7 @@ void strap_handler_c(CPU_REGISTERS *regs)
              * interrupted lower-priority thread and strand the readied one.
              * S-mode returns (SPP=1) drain on their own kernel_exit.
              */
-            unsigned cpu = get_cpunum();
-            thread_t *cur = get_active_thread(cpu);
-            if (!(regs->sstatus & SSTATUS_SPP) && cur &&
-                (atomic_load_explicit(&cur->async_flags, memory_order_acquire) &
-                 (RTMUX_ATF_TIMESLICE | RTMUX_ATF_SMP_RESCHED))) {
-                enter_dispatch_exit();
-                /* never returns */
-            }
+            interrupt_return(regs, from_user);
             return;
         }
 
@@ -798,16 +814,7 @@ void strap_handler_c(CPU_REGISTERS *regs)
          * If SPP=1 (interrupt from S-mode kernel code) we do not route here;
          * the interrupted kernel extension drains on its own kernel_exit.
          */
-        unsigned cpu = get_cpunum();
-        thread_t *cur = get_active_thread(cpu);
-        if (!(regs->sstatus & SSTATUS_SPP) &&
-            (pcpu_array[cpu].pc_pending_preempt_prio != 0 ||
-             (cur &&
-              (atomic_load_explicit(&cur->async_flags, memory_order_acquire) &
-               (RTMUX_ATF_TIMESLICE | RTMUX_ATF_SMP_RESCHED))))) {
-            enter_dispatch_exit();
-            /* never returns */
-        }
+        interrupt_return(regs, from_user);
         return;
     }
 
@@ -1100,16 +1107,13 @@ void strap_handler_c(CPU_REGISTERS *regs)
              */
         }
 
-        /* Store the status before testing for a switch. SchedSet on itself
-         * defers its switch (RTMUX_ITF_DEFER_DISPLACE), so this store reaches
-         * the caller and kernel_exit switches afterwards (YIELD_TAIL). Other
-         * bodies that switch the caller out publish their status first, and
-         * this store repeats it; thread destroy (kcall 47) relies on it too.
-         */
-        SETKSTATUS(act, -(long) ret);
-
-        bool displaced = act->state != STATE_RUNNING ||
-                         get_active_thread(get_cpunum()) != act;
+        /* A displaced caller already published its status and may now be
+         * running on another hart. Check ownership before touching its frame.
+         * A deferred yield still owns the frame until kernel_exit. */
+        bool displaced = get_active_thread(get_cpunum()) != act ||
+                         act->state != STATE_RUNNING;
+        if (!displaced)
+            SETKSTATUS(act, -(long) ret);
         bool switch_pending =
             displaced || (act->internal_flags & RTMUX_ITF_YIELD_TAIL) != 0;
 
@@ -1122,8 +1126,9 @@ void strap_handler_c(CPU_REGISTERS *regs)
         /* S-mode: regs is the caller's stack frame, a different copy from
          * act->reg, so it needs the return value too.
          */
+        if (from_smode)
+            regs->gpr[RISCV_REG_A0] = (uint64_t) (-(long) ret);
         in_kcall_dec();
-        regs->gpr[RISCV_REG_A0] = (uint64_t) (-(long) ret);
         return;
     }
 

@@ -35,7 +35,8 @@ typedef struct root_proc_info {
     uint32_t num_total_threads;
     uint8_t terming_priority;
     uint8_t process_priority;
-    uint8_t pad0[2];
+    bool may_set_priv_priority;
+    uint8_t pad0;
 
     /* Session summary. sess_leader is always the session id: that of the system
      * session, roottask, for a process with no session.

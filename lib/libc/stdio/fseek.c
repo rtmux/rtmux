@@ -206,7 +206,7 @@ int fseek(FILE *fp, long offset, int whence)
     int serrno = errno;
 
     if (!__sdidinit)
-        __sinit();
+        __sdidinit = 1;
 
     FLOCKFILE(fp);
     ret = _fseeko(fp, (off_t) offset, whence, 1);
@@ -222,7 +222,7 @@ int fseeko(FILE *fp, off_t offset, int whence)
     int serrno = errno;
 
     if (!__sdidinit)
-        __sinit();
+        __sdidinit = 1;
 
     FLOCKFILE(fp);
     ret = _fseeko(fp, offset, whence, 0);
@@ -230,4 +230,17 @@ int fseeko(FILE *fp, off_t offset, int whence)
     if (ret == 0)
         errno = serrno;
     return ret;
+}
+
+void rewind(FILE *fp)
+{
+    int saved_errno = errno;
+    if (!__sdidinit)
+        __sdidinit = 1;
+    FLOCKFILE(fp);
+    int rc = _fseeko(fp, 0, SEEK_SET, 0);
+    fp->_flags &= (unsigned short) ~__SERR;
+    FUNLOCKFILE(fp);
+    if (rc == 0)
+        errno = saved_errno;
 }
