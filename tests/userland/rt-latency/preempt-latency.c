@@ -23,8 +23,8 @@
  * its own hart so it survives a same-hart dispatch failure and can report the
  * stall rather than let the run hang; the controller sits on a third hart and
  * blocks in thread_join, so it never busy-competes with the pinned workers. The
- * ipc source has no watchdog: a reply that never dispatches ends in the
- * harness timeout.
+ * ipc source has the same watchdog, so a reply that never arrives or never
+ * dispatches fails the probe instead of running into the harness timeout.
  *
  * A wake later than WAKE_BOUND_NS is a failure too, unless the probe was
  * started with --host-audit. Under multi-threaded TCG every hart is a host
@@ -144,6 +144,12 @@ static int host_audit;
  */
 static unsigned inject_stall_ms;
 static atomic_int inject_result; /* 1 the hart was stalled, -1 it was not */
+
+/* Self-test of the ipc watchdog (--drop-reply): the server withholds the reply
+ * to one request after the warm-up, and the ipc pass must report the stall.
+ */
+static bool drop_reply;
+#define DROP_REPLY_AT (IPC_WARMUP + 8) /* request whose reply is withheld */
 #define INJECT_ITERS 1000        /* wakes of the injected pass: one second */
 #define INJECT_AFTER 20          /* wakes to let pass before the stall */
 
@@ -399,11 +405,37 @@ static void *hog_worker(void *arg)
  * is dominated and never runs. The lower-priority thread the reply preempts is
  * therefore the server returning from msg_reply. That wake runs in the server's
  * syscall context, which already dispatches a higher-priority thread promptly
- * (see pi-inversion-xfail), so this measures a working reply-to-dispatch rather
- * than probing for a stall, and needs no watchdog.
+ * (see pi-inversion-xfail), so this measures a working reply-to-dispatch. A
+ * watchdog on OFF_CPU still bounds it: a reply that is lost, or that never
+ * dispatches the client, leaves the client blocked in msg_send and stops its
+ * progress count, and the pass fails when the watchdog says so.
  */
 
+/* State a watchdog observes for one phase. The ipc, timer and IRQ phases differ
+ * only in which globals they watch, so all drive the same wd_worker through
+ * this.
+ */
+struct wd_arg {
+    atomic_uint *progress; /* iterations the waiter has completed */
+    atomic_int *done;      /* waiter finished */
+    atomic_int *stalled;   /* watchdog sets on a declared stall */
+    atomic_int *stop;      /* watchdog sets to stop the hog on a stall */
+    atomic_int *ready;     /* watchdog publishes its own readiness here */
+};
+
+static void *wd_worker(void *arg);
+
 static atomic_int ipc_srv_ready, ipc_client_done;
+static atomic_uint ipc_progress; /* client steps: connect retries and sends */
+static atomic_uint ipc_sends;    /* sends the client has completed */
+static atomic_int ipc_client_exited, ipc_stalled, ipc_wd_stop, ipc_wd_ready;
+static struct wd_arg ipc_wd_arg = {
+    .progress = &ipc_progress,
+    .done = &ipc_client_exited,
+    .stalled = &ipc_stalled,
+    .stop = &ipc_wd_stop, /* no hog to stop in this phase */
+    .ready = &ipc_wd_ready,
+};
 static atomic_uint_least64_t ipc_reply_ts; /* server rdtime just before reply */
 static uint64_t ipc_samples[IPC_ITERS]; /* reply-to-dispatch ticks per wake */
 static int ipc_chid;
@@ -416,6 +448,7 @@ static int ipc_chid;
 static void *ipc_server(void *arg)
 {
     static char buf[256];
+    unsigned served = 0;
     (void) arg;
 
     if (prio_then_pin(SCHED_FIFO, SRV_PRIO, WAIT_CPU) == -1)
@@ -436,6 +469,8 @@ static void *ipc_server(void *arg)
             (void) msg_reply(rcvid, 0, buf, (int) len);
             return NULL;
         }
+        if (drop_reply && served++ == DROP_REPLY_AT)
+            continue; /* the client stays reply-blocked on rcvid */
         atomic_store_explicit(&ipc_reply_ts, read_time(), memory_order_release);
         if (msg_reply(rcvid, 0, buf, (int) len) == -1)
             return NULL;
@@ -447,29 +482,29 @@ static void *ipc_server(void *arg)
  * server's reply timestamp to the client's post-send read is the
  * reply-to-dispatch latency.
  */
-static void *ipc_client(void *arg)
+static void ipc_client_run(void)
 {
     static char sbuf[256], rbuf[256];
     uint64_t rate = cycles_per_sec();
     int coid = -1;
-    (void) arg;
 
     if (prio_then_pin(SCHED_FIFO, WAIT_PRIO, WAIT_CPU) == -1)
-        return NULL;
+        return;
 
     for (int tries = 0; tries < 1000; tries++) {
         coid = connect_attach(0, getpid(), ipc_chid, RTMUX_SIDE_CHANNEL, 0);
         if (coid != -1)
             break;
+        atomic_fetch_add_explicit(&ipc_progress, 1, memory_order_release);
         if (errno != ESRCH && errno != ENOENT && errno != EAGAIN) {
             atomic_store_explicit(&setup_failed, 1, memory_order_release);
-            return NULL;
+            return;
         }
         (void) sleep_ms(1);
     }
     if (coid == -1) {
         atomic_store_explicit(&setup_failed, 1, memory_order_release);
-        return NULL;
+        return;
     }
 
     memset(sbuf, 0xA5, sizeof sbuf);
@@ -479,7 +514,7 @@ static void *ipc_client(void *arg)
 
         if (msg_send(coid, sbuf, sizeof sbuf, rbuf, sizeof rbuf) == -1) {
             atomic_store_explicit(&setup_failed, 1, memory_order_release);
-            return NULL;
+            return;
         }
         wake = read_time();
         reply = atomic_load_explicit(&ipc_reply_ts, memory_order_acquire);
@@ -493,11 +528,21 @@ static void *ipc_client(void *arg)
             wake_measured((unsigned) (i - IPC_WARMUP), ticks_to_ns(lat, rate),
                           wake, wake);
         }
+        atomic_fetch_add_explicit(&ipc_sends, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&ipc_progress, 1, memory_order_release);
     }
 
     sbuf[0] = OP_STOP;
     (void) msg_send(coid, sbuf, sizeof sbuf, rbuf, sizeof rbuf);
     atomic_store_explicit(&ipc_client_done, 1, memory_order_release);
+}
+
+/* The client thread: tells the watchdog it has finished, whichever way. */
+static void *ipc_client(void *arg)
+{
+    (void) arg;
+    ipc_client_run();
+    atomic_store_explicit(&ipc_client_exited, 1, memory_order_release);
     return NULL;
 }
 
@@ -515,10 +560,13 @@ static void release_ipc_server(void)
         (void) msg_send(coid, stop, sizeof stop, reply, sizeof reply);
 }
 
-/* Returns 0 on a clean measured pass, -1 on failure. */
+/* Returns 0 on a clean measured pass, -1 on failure. After a stall the client
+ * is still reply-blocked and the server may still hold its request, so neither
+ * is joined; the caller exits.
+ */
 static int run_ipc_source(void)
 {
-    pthread_t srv, client;
+    pthread_t srv, client, wd;
     uint64_t maxns, p99ns, rate;
 
     /* Fixed-priority channel: without it, message-driven priority inheritance
@@ -542,12 +590,35 @@ static int run_ipc_source(void)
         (void) thread_join(srv, NULL);
         return -1;
     }
+    if (pthread_create(&wd, NULL, wd_worker, &ipc_wd_arg) != EOK) {
+        release_ipc_server();
+        (void) thread_join(srv, NULL);
+        return -1;
+    }
+    if (await_ready(&ipc_wd_ready) == -1) {
+        printf("preempt-latency: ipc FAIL watchdog setup\n");
+        atomic_store_explicit(&ipc_client_exited, 1, memory_order_release);
+        (void) thread_join(wd, NULL);
+        release_ipc_server();
+        (void) thread_join(srv, NULL);
+        return -1;
+    }
     if (pthread_create(&client, NULL, ipc_client, NULL) != EOK) {
+        atomic_store_explicit(&ipc_client_exited, 1, memory_order_release);
+        (void) thread_join(wd, NULL);
         release_ipc_server();
         (void) thread_join(srv, NULL);
         return -1;
     }
 
+    (void) thread_join(wd, NULL);
+    if (atomic_load_explicit(&ipc_stalled, memory_order_acquire)) {
+        printf("preempt-latency: ipc FAIL client stalled in msg_send after "
+               "%u/%d sends; a reply was lost or never dispatched it\n",
+               atomic_load_explicit(&ipc_sends, memory_order_acquire),
+               IPC_WARMUP + IPC_ITERS);
+        return -1;
+    }
     (void) thread_join(client, NULL);
 
     /* If the client failed before sending its own stop, it left the server
@@ -651,17 +722,6 @@ static void *waiter_worker(void *arg)
     atomic_store_explicit(&waiter_done, 1, memory_order_release);
     return NULL;
 }
-
-/* State a watchdog observes for one phase. The timer and IRQ phases differ only
- * in which globals they watch, so both drive the same wd_worker through this.
- */
-struct wd_arg {
-    atomic_uint *progress; /* iterations the waiter has completed */
-    atomic_int *done;      /* waiter finished */
-    atomic_int *stalled;   /* watchdog sets on a declared stall */
-    atomic_int *stop;      /* watchdog sets to stop the hog on a stall */
-    atomic_int *ready;     /* watchdog publishes its own readiness here */
-};
 
 /* Watchdog on OFF_CPU. Uses rdtime (per-hart, always advancing) as its stall
  * clock, so it can declare a stall even if the boot CPU's software clock has
@@ -1105,10 +1165,12 @@ int main(int argc, char **argv)
             host_audit = 1;
         } else if (strcmp(argv[i], "--inject-stall") == 0 && i + 1 < argc) {
             inject_stall_ms = (unsigned) strtoul(argv[++i], NULL, 0);
+        } else if (strcmp(argv[i], "--drop-reply") == 0) {
+            drop_reply = true;
         } else {
             printf(
                 "usage: preempt-latency [--host-audit] "
-                "[--inject-stall MS]\n");
+                "[--inject-stall MS | --drop-reply]\n");
             return EXIT_FAILURE;
         }
     }
@@ -1143,6 +1205,17 @@ int main(int argc, char **argv)
 
     if (inject_stall_ms)
         return run_inject_selftest();
+    if (drop_reply) {
+        if (run_ipc_source() == -1 &&
+            atomic_load_explicit(&ipc_stalled, memory_order_acquire)) {
+            printf("preempt-latency: drop-reply PASS the withheld reply "
+                   "failed the ipc pass\n");
+            return EXIT_SUCCESS;
+        }
+        printf("preempt-latency: drop-reply FAIL the withheld reply went "
+               "unreported\n");
+        return EXIT_FAILURE;
+    }
 
     ipc_rc = run_ipc_source();
     if (atomic_load_explicit(&setup_failed, memory_order_acquire)) {

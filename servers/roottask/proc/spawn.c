@@ -12,6 +12,7 @@
 #include <sys/rtmux-core.h>
 #include "spawn-fd-policy.h"
 #include <sys/spawn-action-wire.h>
+#include <sys/spawn-limits.h>
 
 extern int ProcessCapMint(pid_t pid, uint32_t rights, rtmux_cap_t *cap);
 
@@ -296,6 +297,13 @@ int proc_spawn_with_actions(ioserv_context_t *ctp, void *vmsg,
         if (ctp->info.msglen < sizeof(struct _proc_spawn))
             return EMSGSIZE;
 
+        /* ARG_MAX, before anything is sized from the request: this is the
+         * only bound on a native request's arguments, which the loader
+         * copies to the child's stack.
+         */
+        if (!spawn_args_fit(msg->spawn.i.nbytes, msg->spawn.i.nargv,
+                            msg->spawn.i.narge))
+            return E2BIG;
         off = sizeof(struct _proc_spawn);
         if (spawn_add_size(&off, msg->spawn.i.searchlen) != EOK ||
             spawn_add_size(&off, msg->spawn.i.cwdlen) != EOK ||
@@ -306,7 +314,7 @@ int proc_spawn_with_actions(ioserv_context_t *ctp, void *vmsg,
             return E2BIG;
         if (off > ctp->info.srcmsglen)
             return EMSGSIZE;
-        if (off > (size_t) INT_MAX)
+        if (off > SPAWN_MSG_MAX)
             return E2BIG;
         msgsize = (unsigned) off;
 
@@ -331,10 +339,8 @@ int proc_spawn_with_actions(ioserv_context_t *ctp, void *vmsg,
                   msgsize + bytes + bitmap,
                   LC_SPAWN | (((ctp->info.flags & RTMUX_MI_ENDIAN_DIFF))
                                   ? LC_CROSS_ENDIAN
-                                  : 0)))) {
-            roottask_heap_note_nomem("loader context", msgsize);
-            return ENOMEM;
-        }
+                                  : 0))))
+            return ENOMEM; /* loader_context_alloc logged the cause */
 
         if (bytes) {
             unsigned char *copy = (unsigned char *) &lcp->msg + msgsize;
@@ -402,6 +408,13 @@ int proc_spawn_with_actions(ioserv_context_t *ctp, void *vmsg,
              * which faults from U-mode roottask. TODO: kext to set flag by pid;
              * for now rely on the destroy path.
              */
+            static atomic_uint nfail;
+            unsigned n = root_warn_due(&nfail);
+
+            if (n)
+                root_warn("spawn: no loader thread for pid %d (failure %u): "
+                          "%s\n",
+                          (int) lcp->ctx.pid, n, strerror(-status));
             (void) msg_send_notification_r(ROOTTASK_COID,
                                            attr.sched_param.sched_priority,
                                            PROC_CODE_TERM, lcp->ctx.pid);

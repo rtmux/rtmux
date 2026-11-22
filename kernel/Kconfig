@@ -16,19 +16,15 @@ config TIMER_HZ
          100 = 10 ms tick (traditional Unix)
 
 config SMP_MSGOPT
-    bool "SMP lockless message transfer optimization"
-    default y
+    def_bool y
     depends on SMP
     help
-      Allow cross-CPU message transfers without holding the kernel lock.
-      Threads in mid-transfer are marked with RTMUX_ITF_MSG_DELIVERY so
-      other CPUs skip them.
-
-      Default flipped to y in P2.1e (May 2026) — the IPC calls are
-      transitioning off the BKL (the "inkernel lock relaxed" condition
-      the option was waiting for).  See arch/riscv/calls.c's
-      kcall_no_bkl[] table and kernel/ipc/fastmsg.c::kcall_msg_receivev
-      for the consumers.
+      Cross-CPU message transfers run without a kernel-wide lock: a thread
+      in mid-transfer is claimed with RTMUX_ITF_MSG_DELIVERY, and force_ready
+      defers to the claimer. An SMP kernel is not correct without it (a
+      timeout or teardown would unlink a thread another hart is copying to),
+      so it is not a choice; kernel/include/core/macros.h refuses the
+      combination at build time.
 
 config PRIO_REPLY_DEPTH
     int "Priority propagation depth through REPLY-blocked clients"

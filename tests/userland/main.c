@@ -20,6 +20,7 @@
 #include <stddef.h>
 #include <semaphore.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <spawn.h>
@@ -82,6 +83,54 @@ static int finish(int require_run)
 {
     tc_summary(&suite_counts);
     return tc_status(&suite_counts, require_run) ? EXIT_FAILURE : EXIT_SUCCESS;
+}
+
+/* An interrupt that reaches a thread on its way into interrupt_wait must end
+ * that wait. inject names the point where the kernel posts it (inject.h); a
+ * lost one shows as the 150 ms guard timeout. A second wait then has to time
+ * out: the interrupt is consumed exactly once.
+ */
+static void intr_pending_case(const char *inject, const char *where)
+{
+    char pid[16], what[96];
+    uint64_t ns = 150000000;
+    int rc;
+
+    snprintf(pid, sizeof pid, "%d", (int) getpid());
+    rc = inject_run(inject, pid, NULL);
+    if (!rc && __timer_timeout(CLOCK_MONOTONIC, RTMUX_TIMEOUT_INTR, NULL, &ns,
+                               NULL) >= 0)
+        rc = interrupt_wait(0, NULL);
+    else
+        rc = -1;
+    snprintf(what, sizeof what, "pending interrupt reaches the waiter %s", where);
+    check(rc == 0, what, "interrupt wait or injection failed");
+    rc = __timer_timeout(CLOCK_MONOTONIC, RTMUX_TIMEOUT_INTR, NULL, &ns, NULL);
+    if (rc >= 0) {
+        errno = 0;
+        rc = interrupt_wait(0, NULL);
+        check(rc == -1 && errno == ETIMEDOUT,
+              "pending interrupt consumed exactly once", "unexpected second wake");
+    } else {
+        test_fail("pending interrupt consumed exactly once", "cannot arm guard timer");
+    }
+}
+
+struct intr_spin {
+    atomic_int pinned, turns, stop, done;
+};
+
+static void *intr_spinner(void *arg)
+{
+    struct intr_spin *spin = arg;
+
+    atomic_store(&spin->pinned, test_pin_mask(2U) == 0 ? 1 : -1);
+    while (!atomic_load(&spin->stop)) {
+        atomic_fetch_add(&spin->turns, 1);
+        (void) sched_yield();
+    }
+    atomic_store(&spin->done, 1);
+    return NULL;
 }
 
 #define FAULT_RECOVERY_CHECK(name, expr, detail) \
@@ -1029,6 +1078,23 @@ int main(int argc, char *argv[])
             test_skip("disconnect_under_alloc_failure", "fault injection unavailable");
         return finish(1);
     }
+    if (argc == 2 && !strcmp(argv[1], "--cap-step")) {
+        printf("[cap_step]\n");
+        (void) test_cap_step();
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--xfer-resume")) {
+        printf("[xfer_resume]\n");
+        if (test_xfer_resume() == TC_EXIT_SKIP)
+            test_skip("xfer_resume", "fault injection unavailable");
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--reply-claim")) {
+        printf("[reply_claim]\n");
+        if (test_reply_claim() == TC_EXIT_SKIP)
+            test_skip("reply_claim", "fault injection unavailable");
+        return finish(1);
+    }
     if (argc == 2 && !strcmp(argv[1], "--sched-set-error")) {
         printf("[sched_set_error_after_lowering]\n");
         if (sched_set_error_after_lowering() == TC_EXIT_SKIP)
@@ -1052,6 +1118,12 @@ int main(int argc, char *argv[])
         int status;
         return rc || waitpid(child, &status, 0) != child ||
                !WIFEXITED(status) || WEXITSTATUS(status);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--exec-arg-max-child"))
+        return exec_arg_max_child();
+    if (argc == 2 && !strcmp(argv[1], "--spawn-arg-max")) {
+        test_spawn_arg_max();
+        return finish(1);
     }
     if (argc == 2 && !strcmp(argv[1], "--spawn-actions")) {
         test_spawn_actions();
@@ -1092,6 +1164,16 @@ int main(int argc, char *argv[])
         test_cancel_before_block();
         return finish(1);
     }
+    if (argc == 2 && !strcmp(argv[1], "--block-kill-cancel")) {
+        test_block_kill_cancel();
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--block-request-race")) {
+        if (block_request_race() == TC_EXIT_SKIP)
+            test_skip("block request race",
+                      "three harts and fault injection required");
+        return finish(1);
+    }
     if (argc == 2 && !strcmp(argv[1], "--mutex-handoff-loan")) {
         printf("[mutex_handoff_loan]\n");
         if (mutex_handoff_loan() == TC_EXIT_SKIP)
@@ -1105,26 +1187,53 @@ int main(int argc, char *argv[])
         return finish(1);
     }
     if (argc == 2 && !strcmp(argv[1], "--intr-before-switch")) {
-        char pid[16];
-        uint64_t ns = 150000000;
-        snprintf(pid, sizeof pid, "%d", (int) getpid());
-        int rc = inject_run("intr-before-switch", pid, NULL);
-        if (!rc && __timer_timeout(CLOCK_MONOTONIC, RTMUX_TIMEOUT_INTR, NULL,
-                                   &ns, NULL) >= 0)
-            rc = interrupt_wait(0, NULL);
-        else
-            rc = -1;
-        check(rc == 0, "pending interrupt reaches the waiter before its timer expires",
-              "interrupt wait or injection failed");
-        rc = __timer_timeout(CLOCK_MONOTONIC, RTMUX_TIMEOUT_INTR, NULL, &ns, NULL);
-        if (rc >= 0) {
-            errno = 0;
-            rc = interrupt_wait(0, NULL);
-            check(rc == -1 && errno == ETIMEDOUT,
-                  "pending interrupt consumed exactly once", "unexpected second wake");
-        } else {
-            test_fail("pending interrupt consumed exactly once", "cannot arm guard timer");
+        intr_pending_case("intr-before-switch", "before its timer expires");
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--intr-after-select")) {
+        struct intr_spin spin = {0};
+        pthread_t spinner;
+        int seen;
+
+        if (sysconf(_SC_NPROCESSORS_ONLN) < 2 || test_pin_mask(2U) != 0) {
+            test_skip("intr-after-select", "needs a second hart to pin to");
+            return finish(1);
         }
+
+        /* Alone on its hart the waiter usually finds no thread to run; one
+         * stolen from another hart is as good.
+         */
+        intr_pending_case("intr-after-select", "after the selection");
+        seen = inject_run("intr-select-seen", NULL, NULL);
+        check(seen == 11 || seen == 12, "interrupt was posted after the selection",
+              "injection point not reached");
+
+        /* A sibling that has run on this hart is on its run list when the
+         * waiter blocks: a thread has been chosen when the interrupt arrives,
+         * and has to go back on the list.
+         */
+        if (pthread_create(&spinner, NULL, intr_spinner, &spin) == 0) {
+            for (int i = 0; i < 3000 && !atomic_load(&spin.turns); i++)
+                sleep_ms(1);
+            intr_pending_case("intr-after-select", "after a thread was chosen");
+            char tid[16];
+
+            snprintf(tid, sizeof tid, "%d", (int) spinner);
+            seen = inject_run("intr-select-seen", tid, NULL);
+            check(atomic_load(&spin.pinned) == 1 && seen == 13,
+                  "the sibling had been chosen when the interrupt was posted",
+                  "sibling not pinned, not the one chosen, or injection not reached");
+            atomic_store(&spin.stop, 1);
+            for (int i = 0; i < 300 && !atomic_load(&spin.done); i++)
+                sleep_ms(10);
+            check(atomic_load(&spin.done) == 1,
+                  "thread chosen and put back still runs", "sibling lost");
+            if (atomic_load(&spin.done))
+                (void) pthread_join(spinner, NULL);
+        } else {
+            test_fail("intr-after-select fixture", "pthread_create");
+        }
+        (void) test_pin_mask(~0U);
         return finish(1);
     }
     if (argc == 2 && !strcmp(argv[1], "--sync-kill-handoff")) {
@@ -1138,10 +1247,26 @@ int main(int argc, char *argv[])
             test_skip("condvar_interrupt_stale", "fault injection unavailable");
         return finish(1);
     }
+    if (argc == 2 && !strcmp(argv[1], "--ioserv-lost-reply")) {
+        printf("[ioserv_lost_reply]\n");
+        test_ioserv_lost_reply_binding();
+        return finish(1);
+    }
     if (argc == 2 && !strcmp(argv[1], "--ns-open-deferral")) {
         printf("[ns_open_deferral]\n");
         if (ns_open_deferral() == TC_EXIT_SKIP)
             test_skip("ns_open_deferral", "fault injection unavailable");
+        printf("[ns_stat_unlink]\n");
+        if (ns_stat_unlink() == TC_EXIT_SKIP)
+            test_skip("ns_stat_unlink", "fault injection unavailable");
+        printf("[ns_open_detach]\n");
+        if (ns_open_detach() == TC_EXIT_SKIP)
+            test_skip("ns_open_detach", "fault injection unavailable");
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--nanosleep-1ns-storm")) {
+        printf("[nanosleep_1ns_storm]\n");
+        test_nanosleep_1ns_storm();
         return finish(1);
     }
     if (argc == 2 && !strcmp(argv[1], "--pte-partial-map")) {
@@ -1265,6 +1390,10 @@ int main(int argc, char *argv[])
     if (argc == 2 && !strcmp(argv[1], "--cond-pi-cycle")) {
         test_cond_reacquire_cycle();
         return finish(0);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--cond-above-ceiling")) {
+        test_cond_reacquire_above_ceiling();
+        return finish(1);
     }
     if (argc == 2 && !strcmp(argv[1], "--pi-owner-loans")) {
         test_pi_owned_turnstiles();

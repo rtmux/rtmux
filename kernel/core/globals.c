@@ -86,6 +86,12 @@ DEFINE_PER_CPU(unsigned, in_kcall);
  */
 struct pcpu pcpu_array[PROCESSORS_MAX];
 
+#ifndef NDEBUG
+/* MARK_POTN_INF_LOOP's pass count and last site (kernel/include/log.h). */
+unsigned long potn_inf_loop_marks;
+const char *potn_inf_loop_site;
+#endif
+
 /* in_kcall accessors. Wrapping the per-CPU counter behind a function boundary
  * serves two goals:
  *

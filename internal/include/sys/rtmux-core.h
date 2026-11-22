@@ -334,6 +334,14 @@ struct _thread_destroy_stats {
     uint64_t destroy_post_cpu_ns;
     uint64_t destroy_post_name_ns;
     uint64_t destroy_post_notify_ns;
+    /* The rcu_wait_ns, pin_wait_ns, active_scan_ns and object_free_ns totals
+     * over the destroys that woke a joiner only (destroy_join_post_ready of
+     * them), the population the post-ready interval covers.
+     */
+    uint64_t join_rcu_wait_ns;
+    uint64_t join_pin_wait_ns;
+    uint64_t join_active_scan_ns;
+    uint64_t join_object_free_ns;
 };
 
 /* Limit on the maximum number of characters for a thread name */

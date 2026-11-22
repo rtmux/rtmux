@@ -156,6 +156,8 @@ int rdecl kernel_thread_checkpoint(CPU_REGISTERS *regs);
 void rdecl thread_destroy(thread_t *thp);
 void rdecl thread_destroyall(thread_t *thp);
 void rdecl thread_cancel(thread_t *thp);
+void rdecl thread_block_recheck(thread_t *thp);
+void rdecl thread_cancel_posted_refresh(thread_t *act);
 int rdecl process_pin(process_t *prp);
 void rdecl process_unpin(process_t *prp);
 int rdecl tthread_pin(thread_t *thp);

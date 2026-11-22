@@ -20,10 +20,7 @@ int _ioserv_disconnect_handler(ioserv_context_t *ctp,
     while ((binding = (struct binding *) _ioserv_handle(
                 &ctp->info, 0, _IOSERV_HANDLE_DISCONNECT_LOCK)) !=
            (void *) -1) {
-        ctp->info.msglen = sizeof msg->close;
-        msg->close.i.type = _IO_CLOSE;
-        msg->close.i.combine_len = sizeof msg->close.i;
-        (void) _ioserv_io_handler(ctp, msg, binding);
+        _ioserv_close_binding(ctp, msg, binding);
     }
     __connect_detach((uint64_t) scoid);
     return IOSERV_NOREPLY;

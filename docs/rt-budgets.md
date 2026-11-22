@@ -740,6 +740,34 @@ reads the whole destination vector to find how much arrived (`xferlen_upto`
 stops once the entries add up to the message). `rcvmsg`, unused, and its
 unbounded boundary scans are gone.
 
+A step is a span of time, not an amount of work. `xfermsg_bounded` and the
+vector scans work for XFER_BUDGET_US (100 us) per kernel entry
+(`xfer_step_begin`, `xfer_piece_done`). They look at the clock, and at a
+pending preemption, once per piece of work (XFER_STEP_ENTRIES entries or
+XFER_STEP_BYTES bytes copied, XFER_SUM_ENTRIES entries scanned), and the budget
+runs from the first look, so a transfer that is over within one piece never
+reads the clock. A fixed step is too small where the copy is fast and too
+large where it is slow. `xfer_memcpy` moves aligned words. The pre-claim
+check and the loops that total a send, receive or reply vector are one
+function, `xfer_iov_sum` (kernel/xfer/check.c): it reads each entry once under
+a fault handler, keeps the prefix it has done and its running total on the
+thread (`scan[]`, two of them, as a send has two vectors), and restarts the
+call when its step is over. What a call saved to resume from, the scans and
+the copy cursor, lives from a KCALL_RESTART to the kernel entry it leads to:
+`xfer_begin_call`, at every kernel call entry, drops it unless the entry is
+that restart (same call number, same user stack pointer). A message of any
+number of entries is copied in steps. Where the paragraphs below name
+`xfer_iov_check`, `iovchk_*`, XFER_IOV_CHECK_STEP or XFER_STEP_PARTS_MAX, read
+`xfer_iov_sum`, `scan[]`, XFER_SUM_ENTRIES and no limit.
+
+`ipc-roundtrip` times the gap between the restarts of one long call
+(`iov-gap`): a high-priority thread is woken from another hart while its own
+hart exchanges 65536-entry messages without pause, and the wake is compared
+with the same wake over a thread spinning in user space. The wake itself has
+a tail of some 14 ms at p99 on QEMU, with or without the exchange,
+so the check is on what the exchange adds: both the median and the p99 must
+stay within 250 us of the wake alone.
+
 The other callers of `xfermsg` are stepped the same way. Send, receive and
 reply (kernel/ipc/fastmsg.c) call `xfermsg_bounded` through `fastmsg_xfer`,
 and a copy that uses its step up gives up the claim on the peer under the
@@ -1468,6 +1496,38 @@ The block carries no `budget-ns`: the realtime deviation is characterization,
 not a gated ceiling, for the TCG reason above. The gated facts are structural
 and asserted by the probe's exit status: hog reaches ENOMEM without a crash,
 canary intact at peak pressure, realtime loop not starved.
+
+### Fence in the Blocking Path (kill and cancel recheck)
+
+Every switch away from a blocking thread runs one full fence (`cpu_smp_mb()` in
+`block_recheck_arm()`, `kernel/sched/dispatch.c`) and two flag loads, and every
+kernel call tests one bit at entry. The fence cannot be skipped when the flags
+read clear: it is what orders this hart's displacement store before the flag
+loads, against a requester that stores its flag and then reads the displacement
+(docs/smp-contract.md, kill or cancel of a blocking thread). Testing the flags
+first would reopen the lost request.
+
+Cost: not measurable on the reference setup. The kernel with the recheck and
+the same tree with that commit reverted were run in pairs at the same time on
+the same host (QEMU 11 TCG, 1 vCPU, `/proc/pressure/cpu` some avg10 between
+0.00 and 2.6 at the start of each run), `scripts/qemu-regress.sh --mode
+ipc-roundtrip`, 14 runs with the recheck and 12 without, in two batches:
+
+| p99 (ns), median of runs [min..max] | with recheck | reverted |
+| --- | --- | --- |
+| empty round trip, batch 1 (6+6) | 285000 [240300..368800] | 292650 [208000..359500] |
+| empty round trip, batch 2 (8+6) | 309550 [225900..371000] | 300750 [250400..450900] |
+| iov-send, 1 entry, batch 1 | 229500 [159100..243300] | 177450 [129400..226800] |
+| iov-send, 1 entry, batch 2 | 209350 [159300..243000] | 195050 [168800..218600] |
+| iov-send, 32 entries, batch 1 | 258950 [187700..288600] | 200550 [144500..283700] |
+| iov-send, 32 entries, batch 2 | 225150 [170100..273300] | 262400 [154800..275800] |
+
+The sign changes between batches and the run-to-run spread of one kernel is
+about 30%, far above anything a fence can cost (tens of nanoseconds against a
+round trip of 150 to 300 microseconds under TCG). Three paired `rt-check` runs
+show the same: rt-latency p99 549000, 613400, 400700 ns with the recheck and
+771400, 413300, 434100 ns without. Real hardware needs its own figure; TCG
+executes a fence as a host barrier and says little about a U74.
 
 ### Native IPC MsgSend Round Trip
 

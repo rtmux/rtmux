@@ -27,6 +27,7 @@
  */
 
 #include <errno.h>
+#include <stdatomic.h>
 #include <sched.h>
 #include <spawn.h>
 #include <stdint.h>
@@ -1295,7 +1296,8 @@ static int check_iov_bytes(int chid)
 #define PATH_ENTRY \
     16 /* so that PATH_PARTS entries make a long message (over 256 bytes) */
 #define PATH_PARTS 32 /* each side: one step of work, timed */
-#define PATH_BIG 2048 /* each side: many steps, which must move the bytes */
+#define PATH_MID 2048 /* each side: many steps, which must move the bytes */
+#define PATH_BIG 4097 /* the same past the 4096 entries once copied whole */
 #define PATH_BIG_ROUNDS 4
 #define PATH_NAP_NS 2000000L
 #define PATH_TOO_MANY 600000 /* more entries than a transfer takes */
@@ -1428,9 +1430,10 @@ static int path_round(int chid, int receiver_first, int parts, int entry)
          * slow whatever the kernel does: a step is judged by what it adds to
          * the same message in one entry.
          */
-        uint64_t p99;
+        uint64_t p99, p50;
 
         qsort(snd, IOV_STEP_CALLS, sizeof snd[0], cmp_u64);
+        p50 = snd[IOV_STEP_CALLS / 2];
         p99 = snd[p99_index(IOV_STEP_CALLS)];
         smax = snd[IOV_STEP_CALLS - 1];
         if (parts == 1) {
@@ -1439,9 +1442,10 @@ static int path_round(int chid, int receiver_first, int parts, int entry)
             ok = ok && p99 < path_base_ns + IOV_STEP_NS_MAX;
         }
         printf(
-            "ipc-roundtrip: iov-send %s parts=%d p99-ns=%llu max-ns=%llu "
-            "one-entry-p99-ns=%llu\n",
-            ok ? "PASS" : "FAIL", parts, (unsigned long long) p99,
+            "ipc-roundtrip: iov-send %s parts=%d bytes=%d p50-ns=%llu "
+            "p99-ns=%llu max-ns=%llu one-entry-p99-ns=%llu\n",
+            ok ? "PASS" : "FAIL", parts, parts * entry,
+            (unsigned long long) p50, (unsigned long long) p99,
             (unsigned long long) smax, (unsigned long long) path_base_ns);
     } else if (timed) {
         ok = ok && path_p99(rcv, &rmax) == 0 && path_p99(rep, &pmax) == 0;
@@ -1583,6 +1587,253 @@ static int check_sendv_array(int chid)
     return ok ? 0 : -1;
 }
 
+/* The gap between the restarts of one long call, which no timing of whole
+ * calls shows. A pair of low-priority threads on one hart exchange messages
+ * of GAP_PARTS one-byte entries each way without pause, so that hart is
+ * nearly always inside a send, receive or reply: totalling a vector, or
+ * copying. A high-priority probe on the same hart waits for a notification
+ * that this thread sends from another hart at times of its own choosing. The
+ * wake is a reschedule request to the busy hart, not a tick, so the probe
+ * runs as soon as the call in progress gives the hart up: the time from the
+ * send to the probe's return is the longest the kernel stays in one entry,
+ * plus the wake itself. The same wake over a thread that only spins in user
+ * space is measured first, for what the wake costs alone: on QEMU its p99 is
+ * milliseconds whatever the kernel is doing, far over the budget of a step.
+ * So the exchange is judged by what it adds: its median and its p99 must each
+ * stay within IOV_STEP_NS_MAX of the wake alone.
+ */
+#define GAP_PARTS 65536
+#define GAP_SAMPLES 200
+#define GAP_LOW_PRIORITY 20
+#define GAP_PROBE_PRIORITY 50
+#define GAP_KICK_PRIORITY 51
+#define GAP_BUSY_HART 1U
+#define GAP_KICK_HART 0U
+#define GAP_CODE_KICK 1
+#define GAP_CODE_STOP 2
+#define GAP_OP_STOP 0x7e
+
+struct gap_ctx {
+    int chid, probe_chid;
+    _Atomic uint64_t t_kick;
+    _Atomic int woken, stop, spin, failed, rounds;
+    uint64_t ns[GAP_SAMPLES];
+    unsigned char out[GAP_PARTS], in[GAP_PARTS], srv[GAP_PARTS];
+    iov_t sarr[GAP_PARTS], rarr[GAP_PARTS], riov[GAP_PARTS], siov[GAP_PARTS];
+};
+
+static int gap_pin(int priority, unsigned cpu)
+{
+    size_t bytes = sizeof(struct _thread_runmask) + 2U * sizeof(unsigned);
+    struct _thread_runmask *m = calloc(1U, bytes);
+    unsigned *runmask;
+    int rc;
+
+    if (!m || raise_to_rt(priority) != 0) {
+        free(m);
+        return -1;
+    }
+    m->size = 1U;
+    runmask = (unsigned *) (m + 1);
+    runmask[0] = runmask[1] = 1U << cpu; /* run mask, then inherit mask */
+    rc = thread_ctl(RTMUX_TCTL_RUNMASK_GET_AND_SET_INHERIT, m);
+    free(m);
+    return rc;
+}
+
+static void *gap_probe(void *arg)
+{
+    struct gap_ctx *g = arg;
+    uint64_t cps = cycles_per_sec();
+
+    if (gap_pin(GAP_PROBE_PRIORITY, GAP_BUSY_HART) != 0)
+        atomic_store(&g->failed, 1);
+    for (int n = 0;;) {
+        struct _notification note;
+        uint64_t now;
+
+        if (msg_receive_notification(g->probe_chid, &note, sizeof note, NULL) !=
+            0) {
+            atomic_store(&g->failed, 1);
+            break;
+        }
+        now = read_time();
+        if (note.code == GAP_CODE_STOP)
+            break;
+        g->ns[n++ % GAP_SAMPLES] =
+            ticks_to_ns(now - atomic_load(&g->t_kick), cps);
+        atomic_store(&g->woken, n);
+    }
+    return NULL;
+}
+
+static void *gap_sender(void *arg)
+{
+    struct gap_ctx *g = arg;
+    int coid = connect_attach((uint32_t) 0, 0, g->chid, RTMUX_SIDE_CHANNEL, 0);
+
+    if (coid == -1 || gap_pin(GAP_LOW_PRIORITY, GAP_BUSY_HART) != 0) {
+        atomic_store(&g->failed, 1);
+        return NULL;
+    }
+    while (atomic_load(&g->spin) && !atomic_load(&g->stop))
+        ; /* the hart is busy in user space: the cost of the wake alone */
+    while (!atomic_load(&g->stop)) {
+        if (msg_sendv(coid, g->sarr, GAP_PARTS, g->rarr, GAP_PARTS) == -1 ||
+            memcmp(g->in, g->out, GAP_PARTS) != 0) {
+            atomic_store(&g->failed, 1);
+            break;
+        }
+        atomic_fetch_add(&g->rounds, 1);
+    }
+    g->out[0] = GAP_OP_STOP;
+    (void) msg_send(coid, g->out, 1, NULL, 0);
+    (void) __connect_detach((uint64_t) coid);
+    return NULL;
+}
+
+static void *gap_server(void *arg)
+{
+    struct gap_ctx *g = arg;
+
+    if (gap_pin(GAP_LOW_PRIORITY, GAP_BUSY_HART) != 0)
+        atomic_store(&g->failed, 1);
+    for (;;) {
+        int rcvid = msg_receivev(g->chid, g->riov, GAP_PARTS, NULL);
+
+        if (rcvid == -1) {
+            atomic_store(&g->failed, 1);
+            break;
+        }
+        if (g->srv[0] == GAP_OP_STOP) {
+            (void) msg_reply(rcvid, 0, NULL, 0);
+            break;
+        }
+        if (msg_replyv(rcvid, 0, g->siov, GAP_PARTS) == -1) {
+            atomic_store(&g->failed, 1);
+            break;
+        }
+    }
+    return NULL;
+}
+
+/* GAP_SAMPLES wakes of the probe, a few milliseconds apart and never on a
+ * period, so they fall anywhere in the busy hart's calls; the median goes to
+ * *p50, the p99 to *p99, the slowest to *max.
+ */
+static int gap_measure(struct gap_ctx *g,
+                       int coid,
+                       uint64_t *p50,
+                       uint64_t *p99,
+                       uint64_t *max)
+{
+    int base = atomic_load(&g->woken);
+
+    for (int i = 0; i < GAP_SAMPLES; i++) {
+        struct timespec nap = {.tv_nsec = 1500000L + (i * 7919L) % 1000000L};
+        uint64_t t0;
+
+        (void) nanosleep(&nap, NULL);
+        atomic_store(&g->t_kick, read_time());
+        if (msg_send_notification(coid, GAP_PROBE_PRIORITY, GAP_CODE_KICK, i) !=
+            EOK)
+            return -1;
+        t0 = read_time();
+        while (atomic_load(&g->woken) == base + i && !atomic_load(&g->failed) &&
+               ticks_to_ns(read_time() - t0, cycles_per_sec()) <
+                   STRADDLE_TIMEOUT_NS)
+            ;
+        if (atomic_load(&g->woken) != base + i + 1)
+            return -1;
+    }
+    qsort(g->ns, GAP_SAMPLES, sizeof g->ns[0], cmp_u64);
+    *p50 = g->ns[GAP_SAMPLES / 2];
+    *p99 = g->ns[p99_index(GAP_SAMPLES)];
+    *max = g->ns[GAP_SAMPLES - 1];
+    return 0;
+}
+
+struct gap_run {
+    int chid, rc;
+};
+
+/* Runs in a thread of its own: it pins itself, which the caller must not be. */
+static void *gap_control(void *arg)
+{
+    static struct gap_ctx g;
+    uint64_t wake_p50 = 0, wake_p99 = 0, wake_max = 0, p50 = 0, p99 = 0,
+             max = 0;
+    pthread_t tp, ts, tv;
+    struct gap_run *run = arg;
+    int coid, ok, rounds;
+
+    memset(&g, 0, sizeof g);
+    g.chid = run->chid;
+    g.probe_chid = channel_create(0);
+    coid = g.probe_chid == -1 ? -1
+                              : connect_attach((uint32_t) 0, 0, g.probe_chid,
+                                               RTMUX_SIDE_CHANNEL, 0);
+    if (coid == -1)
+        return NULL;
+    for (int i = 0; i < GAP_PARTS; i++) {
+        g.out[i] = (unsigned char) (i * 5 + 3);
+        if (i == 0)
+            g.out[i] = 1; /* never GAP_OP_STOP */
+        SETIOV(&g.sarr[i], g.out + i, 1);
+        SETIOV(&g.rarr[i], g.in + i, 1);
+        SETIOV(&g.riov[i], g.srv + i, 1);
+        SETIOV(&g.siov[i], g.out + i, 1);
+    }
+    atomic_store(&g.spin, 1);
+    if (pthread_create(&tp, NULL, gap_probe, &g) != EOK ||
+        pthread_create(&tv, NULL, gap_server, &g) != EOK ||
+        pthread_create(&ts, NULL, gap_sender, &g) != EOK ||
+        gap_pin(GAP_KICK_PRIORITY, GAP_KICK_HART) != 0) {
+        /* The run fails and the process exits, its threads with it. */
+        fprintf(stderr, "ipc-roundtrip: iov-gap setup failed\n");
+        return NULL;
+    }
+    ok = gap_measure(&g, coid, &wake_p50, &wake_p99, &wake_max) == 0;
+    atomic_store(&g.spin, 0); /* the exchange starts */
+    ok = ok && gap_measure(&g, coid, &p50, &p99, &max) == 0;
+    rounds = atomic_load(&g.rounds); /* exchanges finished under the wakes */
+    atomic_store(&g.stop, 1);
+    (void) msg_send_notification(coid, GAP_PROBE_PRIORITY, GAP_CODE_STOP, 0);
+    (void) pthread_join(ts, NULL);
+    (void) pthread_join(tv, NULL);
+    (void) pthread_join(tp, NULL);
+    (void) __connect_detach((uint64_t) coid);
+    (void) channel_destroy(g.probe_chid);
+    ok = ok && !atomic_load(&g.failed) && rounds > 0 &&
+         p50 < wake_p50 + IOV_STEP_NS_MAX && p99 < wake_p99 + IOV_STEP_NS_MAX;
+    printf(
+        "ipc-roundtrip: iov-gap %s parts=%d exchanges=%d p50-ns=%llu "
+        "p99-ns=%llu "
+        "max-ns=%llu wake-only-p50-ns=%llu wake-only-p99-ns=%llu "
+        "wake-only-max-ns=%llu\n",
+        ok ? "PASS" : "FAIL", GAP_PARTS, rounds, (unsigned long long) p50,
+        (unsigned long long) p99, (unsigned long long) max,
+        (unsigned long long) wake_p50, (unsigned long long) wake_p99,
+        (unsigned long long) wake_max);
+    run->rc = ok ? 0 : -1;
+    return NULL;
+}
+
+static int check_iov_gap(int chid)
+{
+    struct gap_run run = {.chid = chid, .rc = -1};
+    pthread_t tc;
+
+    if (sysconf(_SC_NPROCESSORS_ONLN) < 2) {
+        printf("ipc-roundtrip: iov-gap SKIP needs two harts\n");
+        return 0;
+    }
+    if (pthread_create(&tc, NULL, gap_control, &run) != EOK)
+        return -1;
+    (void) pthread_join(tc, NULL);
+    return run.rc;
+}
+
 static int check_iov_paths(int chid)
 {
     int rc = check_sendv_array(chid);
@@ -1591,8 +1842,11 @@ static int check_iov_paths(int chid)
     rc |= path_round(chid, 1, 1, PATH_PARTS * PATH_ENTRY);
     rc |= path_round(chid, 1, PATH_PARTS, PATH_ENTRY);
     rc |= path_round(chid, 0, PATH_PARTS, PATH_ENTRY);
+    rc |= path_round(chid, 1, PATH_MID, PATH_ENTRY);
+    rc |= path_round(chid, 0, PATH_MID, PATH_ENTRY);
     rc |= path_round(chid, 1, PATH_BIG, PATH_ENTRY);
     rc |= path_round(chid, 0, PATH_BIG, PATH_ENTRY);
+    rc |= check_iov_gap(chid);
     return rc;
 }
 
@@ -1780,6 +2034,35 @@ int main(int argc, char **argv)
         }
         return run_client(ppid, chid, iters) == 0 ? EXIT_SUCCESS
                                                   : EXIT_FAILURE;
+    }
+
+    /* The delivery of a waiting receiver's message alone, three ways: one
+     * byte (a short message: the wake and nothing else), 512 bytes in one
+     * entry, and the same in 32 entries. For telling the cost of the wake
+     * from the cost of the copy.
+     */
+    if (argc == 2 && !strcmp(argv[1], "--iov-send")) {
+        int rc;
+
+        chid = channel_create(0);
+        if (chid == -1)
+            return EXIT_FAILURE;
+        rc = path_round(chid, 1, 1, 1);
+        rc |= path_round(chid, 1, 1, PATH_PARTS * PATH_ENTRY);
+        rc |= path_round(chid, 1, PATH_PARTS, PATH_ENTRY);
+        return rc == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+
+    /* One group of checks alone, for a comparison between two kernels. */
+    if (argc == 2 &&
+        (!strcmp(argv[1], "--iov-paths") || !strcmp(argv[1], "--iov-gap"))) {
+        chid = channel_create(0);
+        if (chid == -1)
+            return EXIT_FAILURE;
+        return (!strcmp(argv[1], "--iov-paths") ? check_iov_paths(chid)
+                                                : check_iov_gap(chid)) == 0
+                   ? EXIT_SUCCESS
+                   : EXIT_FAILURE;
     }
 
     if (argc > 1)

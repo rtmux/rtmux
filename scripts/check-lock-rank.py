@@ -50,6 +50,11 @@ ANNOTATIONS = {
     # remote_ipc is a file-scope anonymous struct in kernel/ipc/channel.c whose
     # .chp field is a channel_t*, so remote_ipc.chp->lock is a CHANNEL lock.
     "remote_ipc.chp->lock": "LOCK_CLASS_CHANNEL",
+    # idle_pick_thread (kernel/core/idle.c) takes the dispatch locks with the
+    # irqsave pair, which the SCHED_LOCK* wrappers do not cover: LOCAL_DPP and
+    # its dpp are kdispatch_t, whose lock is a SCHED lock.
+    "LOCAL_DPP->lock": "LOCK_CLASS_SCHED",
+    "dpp->lock": "LOCK_CLASS_SCHED",
 }
 
 # Lock primitive / runtime checker itself — not lock consumers.  Excluded from

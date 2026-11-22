@@ -12,8 +12,9 @@
  * and __crt_lesscore(p, n). The libc default maps and unmaps anonymous memory,
  * so a process heap grows on demand. Roottask is the mmap server and cannot use
  * that, so servers/roottask/sys/heap.c overrides both with a static arena. A
- * request of LARGE_MIN bytes or more gets its own mapping and is returned to
- * the system on free. malloc is not async-signal-safe.
+ * request too big for a size-class block of LARGE_MIN bytes gets its own
+ * mapping and is returned to the system on free. malloc is not
+ * async-signal-safe.
  *
  * Statistics: five counters (see struct __rtmux_mallocstats in
  * <sys/mallocstats.h>). Small blocks are counted inside the critical sections
@@ -40,7 +41,7 @@
 
 #define RTMUX_PAGE_SIZE 4096
 #define CHUNK_SIZE (256 * 1024) /* backing requested per refill */
-#define LARGE_MIN (128 * 1024)  /* requests this big are mapped directly */
+#define LARGE_MIN (128 * 1024)  /* largest size-class block; see below */
 #define LARGE_HDR 16            /* size_t mapping length + overhead word */
 
 static char *pagepool_start; /* unused tail of the current chunk */
@@ -64,7 +65,13 @@ __attribute__((weak)) void __crt_lesscore(void *p, size_t n)
     (void) munmap(p, n);
 }
 
-/* Smallest request that is mapped directly rather than cut from a size class.
+/* Largest size-class block. A request that needs a bigger one (its payload and
+ * the overhead word do not fit in this many bytes) is mapped directly, so a
+ * request a few bytes under a power of two is not rounded up to a class block
+ * of twice that size, which is never merged or unmapped. Only when the mapping
+ * fails does such a request take a size-class block, and then only one that is
+ * already backed (see refill).
+ *
  * Weak so roottask, whose arena is fixed and whose backing store takes mapped
  * blocks back and merges them, can lower it: a size-class block is never
  * merged, so a one-off 64 KiB request would otherwise keep a 128 KiB class
@@ -83,6 +90,12 @@ union overhead {
 #define ov_magic ovu.ovu_magic
 #define ov_index ovu.ovu_index
 };
+
+/* True for a request that is mapped directly rather than cut from a class. */
+static inline int is_large(size_t nbytes)
+{
+    return nbytes > __crt_large_min - sizeof(union overhead);
+}
 
 #define MAGIC 0xef
 #define AMAGIC 0xdf
@@ -236,7 +249,7 @@ static void *cp2op(void *cp)
 
 /* Core allocator (from FreeBSD malloc-core.c) */
 
-static int refill(int bucket);
+static int refill(int bucket, int cached_only);
 
 /* Directly mapped block: [size_t maplen][overhead word][payload...]. */
 static void *large_alloc(size_t nbytes)
@@ -265,12 +278,16 @@ void *__crt_malloc(size_t nbytes)
     int bucket;
     size_t amt;
     void *ret;
+    int large = is_large(nbytes);
 
-    if (nbytes >= __crt_large_min) {
-        if (!(ret = large_alloc(nbytes)))
-            stat_fail();
+    /* When the mapping fails, a free block of the request's class or a larger
+     * one, or the unused tail of the current chunk, may still hold it: fall
+     * through. No backing is asked for a second time: a class block is bigger
+     * than the mapping that was just refused, and one obtained after a
+     * concurrent free would stay with its class for good.
+     */
+    if (large && (ret = large_alloc(nbytes)))
         return ret;
-    }
 
     amt = FIRST_BUCKET_SIZE;
     bucket = 0;
@@ -285,7 +302,7 @@ void *__crt_malloc(size_t nbytes)
 
     alloc_lock();
     while (!(op = nextf[bucket])) {
-        if (!refill(bucket)) {
+        if (!refill(bucket, large)) {
             alloc_unlock();
             stat_fail();
             return NULL;
@@ -411,11 +428,13 @@ static int steal(int bucket)
 }
 
 /* Make nextf[bucket] non-empty. Called and returns with the lock held, but
- * drops it while asking for backing memory.
+ * drops it while asking for backing memory. With cached_only it asks for none
+ * and keeps the lock: the block comes from the tail of the current chunk or
+ * from a free block of a larger class, or not at all.
  *
  * Returns 0 if memory ran out.
  */
-static int refill(int bucket)
+static int refill(int bucket, int cached_only)
 {
     union overhead *op;
     size_t sz = (size_t) FIRST_BUCKET_SIZE << bucket;
@@ -426,6 +445,8 @@ static int refill(int bucket)
         size_t want = amt > CHUNK_SIZE ? amt : CHUNK_SIZE;
         char *chunk;
 
+        if (cached_only)
+            return steal(bucket);
         alloc_unlock();
         chunk = __crt_morecore(want);
         if (!chunk && want > amt) {
@@ -538,9 +559,9 @@ void *__crt_realloc(void *cp, size_t nbytes, int *bad)
         size_t cap = *(size_t *) (void *) base - LARGE_HDR;
 
         /* Keep the mapping while the new size still belongs in a mapped block;
-         * shrinking below __crt_large_min moves to the bucketed heap.
+         * a smaller one moves to the bucketed heap.
          */
-        if (nbytes >= __crt_large_min && nbytes <= cap)
+        if (is_large(nbytes) && nbytes <= cap)
             return cp;
         if (!(res = __crt_malloc(nbytes)))
             return NULL;

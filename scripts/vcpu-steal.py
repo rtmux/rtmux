@@ -318,7 +318,6 @@ def hart_of_cpu(text):
 
 
 def cmd_audit(args):
-    # The caller strips the kernel's spin markers, which land inside lines.
     text = sys.stdin.read().replace("\r", "")
     over = [
         (m.group(1),) + tuple(int(g) for g in m.groups()[1:])

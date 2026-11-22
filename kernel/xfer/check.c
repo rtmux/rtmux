@@ -122,3 +122,106 @@ int(xfer_memchk)(uintptr_t bound, const iov_t *iov, size_t iov_len)
 
     return 0;
 }
+
+/* Total and check the caller's own iov array before a transfer uses it: the
+ * array and every entry that is not empty must lie inside the caller's
+ * boundary, the array is no longer than XFER_IOV_LIMIT, and the lengths add up
+ * without wrapping. An empty array totals 0; a flat buffer (parts < 0) has no
+ * entries to read and is not for this function.
+ *
+ * A kernel entry spends at most its step on it (xfer_piece_done), then
+ * restarts the call. The prefix done so far is kept in act->scan[slot] (an
+ * XFER_SCAN_* slot), keyed
+ * by the array and its length, so the restart goes on where this entry
+ * stopped, and a call that restarts later for another reason (its copy
+ * yielded) does not walk the array again. The entries are read under a fault
+ * handler; another thread can rewrite the array afterwards, so the transfer
+ * still checks each entry it uses.
+ *
+ * Returns EOK with the total in *bytes, EFAULT, EOVERFLOW for a total that
+ * wraps (not looked for when bytes is NULL: the caller wants the check only),
+ * or XFER_CALL_RESTART when the call was restarted: the caller undoes what it
+ * holds and returns ENOERROR.
+ */
+int xfer_iov_sum(thread_t *act,
+                 const iov_t *iov,
+                 int parts,
+                 unsigned slot,
+                 size_t *bytes)
+{
+    struct xfer_iov_scan *scan = &act->scan[slot];
+    uintptr_t bound = act->process->boundary_addr;
+    uintptr_t base = (uintptr_t) iov, last;
+    jmp_buf env, *old_env = GET_XFER_ENV();
+    void *old_handler = (void *) GET_XFER_HANDLER();
+    struct xfer_spent spent;
+    int rc = EOK;
+
+    if (parts == 0) {
+        if (bytes)
+            *bytes = 0;
+        return EOK;
+    }
+    if (parts < 0 || parts > XFER_IOV_LIMIT)
+        return EFAULT;
+
+    /* The array itself must lie in the caller's space: a fault-recovering
+     * read still succeeds on a mapped kernel address.
+     */
+    last = base + (size_t) parts * sizeof(iov_t) - 1;
+    if (!base || base > last || !WITHIN_BOUNDARY(base, last, bound))
+        return EFAULT;
+    if (scan->vector != iov || scan->parts != (uint32_t) parts)
+        *scan =
+            (struct xfer_iov_scan) {.vector = iov, .parts = (uint32_t) parts};
+
+    /* A piece at a time: xfer_memchk() checks its entries against the
+     * boundary (it is the function the fuzz and Frama-C harnesses cover, and
+     * returns through its own fault env), then the lengths are added up under
+     * the env armed here. The two passes read an entry twice; the total is
+     * for the caller's accounting only, and the transfer checks every entry
+     * it uses again.
+     */
+    xfer_step_begin(&spent);
+    SET_XFER_HANDLER(&xfer_src_handlers);
+    while (rc == EOK && scan->done < scan->parts) {
+        uint32_t n = scan->parts - scan->done;
+
+        if (n > XFER_SUM_ENTRIES)
+            n = XFER_SUM_ENTRIES;
+        if (xfer_memchk(bound, iov + scan->done, n)) {
+            rc = EFAULT; /* an entry out of range, or a page not there */
+            break;
+        }
+        SET_XFER_ENV(&env);
+        if (xfer_setjmp(*GET_XFER_ENV())) {
+            rc = EFAULT;
+            break;
+        }
+        for (uint32_t i = 0; bytes && i < n; i++) {
+            size_t len = GETIOVLEN(iov + scan->done + i);
+
+            if (len > SIZE_MAX - scan->bytes) {
+                rc = EOVERFLOW;
+                break;
+            }
+            scan->bytes += len;
+        }
+        if (rc != EOK)
+            break;
+        scan->done += n;
+        spent.ents = XFER_SUM_ENTRIES;
+        if (scan->done < scan->parts && xfer_piece_done(&spent))
+            rc = XFER_CALL_RESTART;
+    }
+    SET_XFER_HANDLER(old_handler);
+    SET_XFER_ENV(old_env);
+    if (rc == XFER_CALL_RESTART) {
+        KCALL_RESTART(act);
+    } else if (rc != EOK) {
+        scan->vector = NULL;
+    } else if (bytes) {
+        *bytes = scan->bytes;
+    }
+    return rc;
+}

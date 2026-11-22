@@ -11,23 +11,23 @@
 #include <stdatomic.h>
 #include <sys/mallocstats.h>
 
-/* Only the first few failures and every 64th after are logged, so a client that
- * keeps asking cannot flood the ring buffer.
+/* Rate limited (root_warn_due), so a client that keeps asking cannot flood the
+ * ring buffer.
  */
 void roottask_heap_note_nomem(const char *what, size_t want)
 {
     static atomic_uint nfail;
     struct roottask_heap_stats hs;
     struct __rtmux_mallocstats ms;
-    unsigned n = atomic_fetch_add_explicit(&nfail, 1, memory_order_relaxed);
+    unsigned n = root_warn_due(&nfail);
 
-    if (n >= 8 && (n & 63))
+    if (!n)
         return;
     roottask_heap_stats(&hs);
     (void) __rtmux_mallocstats(&ms);
     root_warn(
         "nomem: %s failed for %zu bytes (failure %u): arena %zu used %zu "
-        "free extents %u/%zu largest %zu dropped %zu live %llu peak %llu\n",
-        what, want, n + 1, hs.arena, hs.used, hs.extents, hs.extent_bytes,
-        hs.largest, hs.dropped, ms.bytes_in_use, ms.bytes_peak);
+        "free extents %u/%zu largest %zu live %llu peak %llu\n",
+        what, want, n, hs.arena, hs.used, hs.extents, hs.extent_bytes,
+        hs.largest, ms.bytes_in_use, ms.bytes_peak);
 }

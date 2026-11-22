@@ -39,6 +39,7 @@ struct binding {
     const ioserv_ops_t *funcs; /* functions from the link structure */
     int id;                    /* numeric id of the link structure */
     unsigned count;            /* reference count on this structure */
+    unsigned serial;           /* tells it from a later one at its address */
 };
 
 enum _ioserv_handle_type {
@@ -140,5 +141,8 @@ extern __hidden int _ioserv_access(ioserv_context_t *ctp,
                                    unsigned key1,
                                    void *msg,
                                    int size);
+extern __hidden void _ioserv_close_binding(ioserv_context_t *ctp,
+                                           ioserv_msg_t *msg,
+                                           struct binding *binding);
 extern __hidden void _ioserv_close_handler(ioserv_context_t *ctp,
                                            struct binding *binding);

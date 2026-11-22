@@ -598,13 +598,29 @@ typedef struct thread_entry { /* Also used for vthread_entry */
     unsigned robust_nheld; /* length of robust_held (under sync_pi_slock) */
     thread_t *restart;
 
-    /* Resume point of the msg_readv / msg_writev iov check (xfer_iov_check):
-     * the array being checked, its part count, and how many entries are done.
-     * Valid only until the thread makes any other kernel call.
+    /* Resume points of xfer_iov_sum(), which totals and checks an iov array
+     * of the caller a step at a time: the array, its part count, how many
+     * entries are done and the bytes they add up to. A send checks two
+     * arrays before it can rendezvous, hence two. Together with xcur below
+     * they live from a KCALL_RESTART to the entry it leads to and no longer:
+     * xfer_resume is that call's number plus one, or 0, xfer_resume_sp the
+     * caller's stack pointer (a signal handler that runs before the restart
+     * and makes the same call is on a deeper frame), and xfer_begin_call()
+     * drops them at any other kernel entry.
      */
-    const iov_t *iovchk_iov;
-    int32_t iovchk_parts;
-    uint32_t iovchk_done;
+    struct xfer_iov_scan {
+        const iov_t *vector;
+        uint32_t parts, done;
+        size_t bytes;
+    } scan[2];
+    uintptr_t xfer_resume_sp;
+    uint16_t xfer_resume;
+
+    /* When the step of this kernel entry ends (xfer_piece_done), or 0 while
+     * no stepped transfer has looked at the clock in it: the scans and the
+     * copy of one entry share one budget.
+     */
+    uint64_t xfer_deadline;
 
     /* The following is used to hold arguments when a thread blocks to make them
      * easy to access in another threads context. Only a very small number of
@@ -854,7 +870,7 @@ typedef struct thread_entry { /* Also used for vthread_entry */
      * forward from that entry (an offset still to be skipped is kept whole), so
      * a restart neither rescans the entries it passed nor trusts them. Valid
      * while armed, for the thread pair, vectors, offsets and message length of
-     * the transfer that saved it, and dropped with the iov check state.
+     * the transfer that saved it, and dropped with the iov scan state.
      * Appended at the tail like the fields above it.
      */
     struct {

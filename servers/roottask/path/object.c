@@ -10,6 +10,7 @@
 #include "path-object.h"
 #include "path.h"
 
+#include <stdatomic.h>
 #include <sys/path-registry.h>
 
 /* Mark flags for quicker searching later */
@@ -413,6 +414,24 @@ path_object_t *object_create(int type, void *extra, pid_t creator_pid)
 
 #define OBJECT_DONE_INPROGRESS 0x80000000
 
+#ifdef CONFIG_DEBUG_INJECT
+/* Freed objects are marked and kept allocated for the next OBJECT_QUARANTINE
+ * frees, so that a use after the free reads the mark, not reused memory
+ * (path_open checks the type of the object it works on).
+ */
+#define OBJECT_QUARANTINE 32
+
+static void object_quarantine(path_object_t *obp)
+{
+    static path_object_t *_Atomic held[OBJECT_QUARANTINE];
+    static atomic_uint next;
+    unsigned i = atomic_fetch_add(&next, 1) % OBJECT_QUARANTINE;
+
+    obp->hdr.type = OBJECT_POISONED;
+    free(atomic_exchange(&held[i], obp));
+}
+#endif
+
 int object_done(path_object_t *obp)
 {
     int r = 0;
@@ -422,7 +441,11 @@ int object_done(path_object_t *obp)
         r = obj_info[obp->hdr.type].done(obp);
         atomic_clr(&obp->hdr.refs, OBJECT_DONE_INPROGRESS);
         if (r) {
+#ifdef CONFIG_DEBUG_INJECT
+            object_quarantine(obp);
+#else
             free(obp);
+#endif
         }
     }
     return r;

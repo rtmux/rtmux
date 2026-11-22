@@ -585,6 +585,27 @@ int kdecl ksys_thread_cancel(thread_t *act,
 
     thp->process->canstub = kap->canstub;
 
+    /* A target that is about to block has passed its own pending check and
+     * reads as running below. If it can act on the cancel, leave word for the
+     * hart that blocks it, and order both publishes before the state read
+     * (thread_block_recheck).
+     *
+     * The target may have disabled cancellation and entered a kernel call
+     * between the TLS read above and the bit, too early to refresh the bit
+     * itself. Read its TLS once more behind the fence (same process, so the
+     * same address space): either it saw the bit at its kernel entry, or its
+     * disable is visible here and the bit comes off again.
+     */
+    if (thp != act) {
+        if (!(tlsflags & PTHREAD_CANCEL_DISABLE))
+            ITF_SET(thp, RTMUX_ITF_CANCEL_POSTED);
+        cpu_smp_mb();
+        if (!(tlsflags & PTHREAD_CANCEL_DISABLE) &&
+            !(thp->flags & RTMUX_FLG_THR_WAAA) &&
+            (tls_flags_load(thp) & PTHREAD_CANCEL_DISABLE))
+            ITF_CLR(thp, RTMUX_ITF_CANCEL_POSTED);
+    }
+
     /* If cancelation is enabled and we are blocked, force thread ready at
      * address of cancelation handler. We also make thread birth a cancellation
      * point.
@@ -607,6 +628,70 @@ int kdecl ksys_thread_cancel(thread_t *act,
     if (thp != act)
         tthread_unpin(thp);
     return EOK;
+}
+
+/* Bring CANCEL_POSTED up to date at the start of a kernel call of act.
+ *
+ * The bit says that a cancel act can act on is pending, for the hart that
+ * blocks act: that hart cannot read act's TLS (it holds the dispatch lock, and
+ * an IPC send may already have switched to the receiver's address space). So
+ * the bit must not outlive the cancel. act may have acted on it or disabled
+ * cancellation in user mode since; here, in its own address space, it reads
+ * the TLS again. Clear first, then read: a canceller publishes PENDING before
+ * the bit, so a post that the clear wiped is seen by the read.
+ *
+ * Only called while the bit is set. Parameters:
+ *   act : the calling (active) thread
+ */
+void rdecl thread_cancel_posted_refresh(thread_t *act)
+{
+    ITF_CLR(act, RTMUX_ITF_CANCEL_POSTED);
+    cpu_smp_mb();
+    if (PENDCAN(tls_flags_load(act)))
+        ITF_SET(act, RTMUX_ITF_CANCEL_POSTED);
+}
+
+/* Deliver a kill or a cancel that was posted while thp was on its way to block.
+ *
+ * Both requesters publish the request (KILLSELF in thp->flags; CANCEL_PENDING
+ * in its TLS and CANCEL_POSTED) and only then look at the thread. One that
+ * still finds it running leaves the rest to the thread: a kill sends a
+ * reschedule IPI, a cancel does nothing more. The thread checks for a kill when
+ * it returns to user mode and for a cancel before it queues itself, but a
+ * request published after that check and before the blocked state found a
+ * running thread and was then never delivered: the thread slept in a wait that
+ * nobody would end.
+ *
+ * So the hart that blocks a thread looks once more after it has displaced it
+ * (block_recheck_arm), and kernel_exit calls this for a thread it noted.
+ * Either the requester saw the blocked, displaced thread and unblocked it, or
+ * the blocking hart sees the request: each side has a full fence between its
+ * store and its load. force_ready claims the wait under the wait's own lock, so
+ * both doing it is harmless, and the kernel call has finished queueing by now
+ * (its WAIT_PENDING bridge is closed).
+ *
+ * CANCEL_POSTED was true at the start of the kernel call that blocked thp or
+ * was set during it, and thp cannot change its cancel state inside a kernel
+ * call, so the cancel is pending and enabled for this wait. As in
+ * ksys_thread_cancel, the wait is identified by the thread's state alone: a
+ * thread that was woken, returned to user mode and blocked again before this
+ * runs is unblocked in its new wait. Parameters:
+ *   thp : a thread this hart blocked, pinned by block_recheck_arm; unpinned
+ *         here
+ */
+void rdecl thread_block_recheck(thread_t *thp)
+{
+    if (__atomic_load_n(&thp->flags, __ATOMIC_ACQUIRE) &
+        RTMUX_FLG_THR_KILLSELF) {
+        /* A thread that is no longer waiting is left alone by force_ready. */
+        force_ready(thp, _FORCE_KILL_SELF);
+    } else if ((thp->internal_flags & RTMUX_ITF_CANCEL_POSTED) &&
+               STATE_CANCELABLE(thp)) {
+        atomic_fetch_or_explicit(&thp->async_flags, RTMUX_ATF_CANCEL,
+                                 memory_order_release);
+        force_ready(thp, EINTR);
+    }
+    tthread_unpin(thp);
 }
 
 

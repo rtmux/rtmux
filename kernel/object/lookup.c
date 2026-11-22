@@ -169,12 +169,16 @@ connect_t *rdecl lookup_rcvid(kcall_args_t *kap, int rcvid, thread_t **thpp)
             kcall_err(act, EBADF);
             return NULL;
         }
+        /* A channel destroy clears cop->channel at any moment: read it once.
+         * A detached connection has no server process to look the thread up
+         * in, and is not the remote IPC service's own.
+         */
+        channel_t *chp = __atomic_load_n(&cop->channel, __ATOMIC_ACQUIRE);
+
         if (act->process == remote_ipc.prp &&
-            (cop->scoid != MCINDEX(rcvid) ||
-             cop->channel->process != remote_ipc.prp)) {
-            thp = cop->channel
-                      ? vector_lookup(&cop->channel->process->threads, tid)
-                      : NULL;
+            (cop->scoid != MCINDEX(rcvid) || !chp ||
+             chp->process != remote_ipc.prp)) {
+            thp = chp ? vector_lookup(&chp->process->threads, tid) : NULL;
         } else {
             thp = vector_lookup(&vthread_vector, tid);
             if (kap) {

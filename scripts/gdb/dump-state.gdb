@@ -12,6 +12,22 @@ import gdb
 inf = gdb.selected_inferior()
 threads = sorted(inf.threads(), key=lambda t: t.num)
 print("harts visible to gdb: %d" % len(threads))
+
+# The dump writes $pc and $priv of a hart it finds in the firmware (below).
+# Keep each hart's values and put them back at the end, so a guest that was
+# only slow carries on as before once gdb detaches: left at $sepc in M-mode,
+# OpenSBI loops on traps and the guest looks hung.
+saved_regs = {}
+for t in threads:
+    t.switch()
+    regs = {}
+    for r in ("pc", "priv"):
+        try:
+            regs[r] = int(gdb.parse_and_eval("$" + r))
+        except gdb.error:
+            pass
+    saved_regs[t.num] = regs
+
 for t in threads:
     t.switch()
     hart = t.num - 1
@@ -25,6 +41,17 @@ for t in threads:
         gdb.execute("info registers")
     except gdb.error as e:
         print("info registers: %s" % e)
+    # A hart stopped in the SBI firmware runs in M-mode, where gdb reads memory
+    # untranslated and no kernel virtual address resolves: every hart of a
+    # guest that powered off under -no-shutdown is there. Read through the
+    # S-mode page table instead (QEMU's virtual priv register; satp still holds
+    # the hart's address space). The end of the dump puts $priv back.
+    try:
+        if saved_regs[t.num].get("priv") == 3:
+            gdb.execute("set $priv = 1")
+            print("  hart in M-mode; reading memory as S-mode")
+    except gdb.error as e:
+        print("  (priv switch failed: %s)" % e)
     try:
         gdb.execute("bt 32")
     except gdb.error as e:
@@ -34,10 +61,14 @@ for t in threads:
     try:
         pcv = int(gdb.parse_and_eval("$pc"))
         sepc = int(gdb.parse_and_eval("$sepc")) & 0xffffffffffffffff
-        if pcv < 0xffffffc000000000 and sepc >= 0xffffffc000000000:
+        if (pcv < 0xffffffc000000000 and sepc >= 0xffffffc000000000 and
+                "pc" in saved_regs[t.num]):
             print("  hart in firmware; S-mode backtrace from sepc 0x%x:" % sepc)
             gdb.execute("set $pc = $sepc")
-            gdb.execute("bt 32")
+            try:
+                gdb.execute("bt 32")
+            finally:
+                gdb.execute("set $pc = %d" % saved_regs[t.num]["pc"])
     except gdb.error as e:
         print("  (sepc backtrace failed: %s)" % e)
     # Name the lock a hart is spinning on and print its contents.
@@ -358,7 +389,33 @@ try:
             print("  chain %d walk failed: %s" % (ci, e))
 except gdb.error as e:
     print("sync chain walk unavailable: %s" % e)
-if kernel_view:
+
+# Passes through a potentially endless kernel loop (MARK_POTN_INF_LOOP in
+# kernel/include/log.h), which counts them instead of writing to the console.
+try:
+    marks = int(gdb.parse_and_eval("potn_inf_loop_marks"))
+    site = gdb.parse_and_eval("potn_inf_loop_site")
+    print("=== spin marks: %d, last at %s ===" %
+          (marks, site.string() if int(site) else "-"))
+except gdb.error as e:
+    print("spin marks unavailable: %s" % e)
+# Put back what the dump changed. A hart left altered fails the dump: a
+# guest resumed with it is no longer the guest that was dumped.
+restored = True
+for t in threads:
+    t.switch()
+    for r in ("priv", "pc"):
+        if r in saved_regs.get(t.num, {}):
+            try:
+                gdb.execute("set $%s = %d" % (r, saved_regs[t.num][r]))
+            except gdb.error as e:
+                restored = False
+                print("hart %d: restoring $%s failed: %s" % (t.num - 1, r, e))
+if restored:
+    print("registers restored on %d harts" % len(threads))
+else:
+    print("REGISTER RESTORE FAILED")
+if kernel_view and restored:
     print("DUMP COMPLETE: %d harts" % len(threads))
 else:
     print("DUMP INCOMPLETE: %d harts, no kernel view" % len(threads))

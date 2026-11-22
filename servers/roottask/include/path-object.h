@@ -19,6 +19,7 @@ enum {
     OBJECT_MEM_SHARED,
     OBJECT_MEM_FD,
     OBJECT_MEM_TYPED,
+    OBJECT_POISONED = 0xa5, /* CONFIG_DEBUG_INJECT: set on a freed object */
 };
 
 /* Max size of a path object is limited by the uint8_t we use to keep track of

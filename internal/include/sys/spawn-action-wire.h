@@ -7,12 +7,12 @@
 #include <stddef.h>
 #include <string.h>
 #include <sys/posix-spawn.h>
+#include <sys/spawn-limits.h>
 
 /* Value of _proc_posix_spawn.reserved[0] for ordered child file actions.
  * Records are consecutive with no padding between a pathname and the next
  * record. Decode into an aligned local before accessing the integer fields. */
 #define PSPAWN_CHILD_ACTIONS 1U
-#define PSPAWN_MSG_MAX (256U * 1024U)
 struct spawn_action_record {
     uint32_t type;
     int32_t fd, target;

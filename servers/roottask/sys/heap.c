@@ -15,9 +15,10 @@
  *
  * Blocks come from a bump pointer and go back to a list of free extents kept in
  * address order, merged with their neighbours and, at the top, with the bump
- * region. Directly mapped blocks (__crt_large_min and up) are the ones that
- * come back, so a large request that is freed leaves its bytes for any later
- * request of any size, not for one size class only.
+ * region. Directly mapped blocks (requests too big for a class block of
+ * __crt_large_min bytes) are the ones that come back, so a large request that
+ * is freed leaves its bytes for any later request of any size, not for one size
+ * class only.
  */
 
 #include <stdbool.h>
@@ -42,19 +43,22 @@ static alignas(
 /* Bytes of the arena below the bump pointer. Guarded by ext_lock. */
 static size_t roottask_heap_used;
 
-/* Free extents come only from mapped blocks, which are whole pages, and two
- * extents are apart by at least one live page, so the arena holds fewer than
- * this many and the table cannot overflow. Giving a block up when it does
- * (ext_dropped) is only a guard.
- */
 #define HEAP_LARGE_MIN (32 * 1024)
-#define FREE_EXTENTS (CONFIG_ROOTTASK_HEAP_SIZE / (2 * ROOTTASK_HEAP_PAGE) + 1)
+
+/* The table cannot overflow. Every block taken or given back is a whole number
+ * of pages (malloc asks for page multiples and the arena is page aligned), an
+ * extent is merged with any extent it touches, and one that reaches the bump
+ * pointer is given to the bump region. So each extent is at least a page and
+ * is followed by at least one live page below the bump pointer: n extents need
+ * 2n pages, and the arena holds no more than half its page count.
+ * test_extent_limit (tests/host/test-heap-arena.c) fills the table.
+ */
+#define FREE_EXTENTS (CONFIG_ROOTTASK_HEAP_SIZE / (2 * ROOTTASK_HEAP_PAGE))
 static struct {
     char *p;
     size_t n;
 } free_ext[FREE_EXTENTS];
 static unsigned nfree;
-static size_t ext_dropped;
 
 /* A priority-inheritance mutex, statically initialized so that taking it never
  * allocates (see alloc_mutex in lib/libc/alloc/malloc-core.c): a spinner on a
@@ -68,10 +72,10 @@ static pthread_mutex_t ext_mutex = {RTMUX_SYNC_NONRECURSIVE,
                                     RTMUX_SYNC_INITIALIZER};
 #endif
 
-/* Smallest request malloc maps directly. Roottask sets it well below libc's 128
- * KiB so that the 32 and 64 KiB buffers of a large spawn are returned here and
- * merged, instead of becoming size-class blocks that keep their bytes for one
- * class for ever (K43).
+/* Largest size-class block: malloc maps a request that needs a bigger one.
+ * Roottask sets it well below libc's 128 KiB so that the 32 and 64 KiB buffers
+ * of a large spawn are returned here and merged, instead of becoming size-class
+ * blocks that keep their bytes for one class for ever.
  */
 size_t __crt_large_min = HEAP_LARGE_MIN;
 
@@ -96,7 +100,6 @@ void roottask_heap_stats(struct roottask_heap_stats *st)
     st->extents = nfree;
     st->extent_bytes = 0;
     st->largest = sizeof roottask_heap - roottask_heap_used;
-    st->dropped = ext_dropped;
     for (unsigned i = 0; i < nfree; i++) {
         st->extent_bytes += free_ext[i].n;
         if (free_ext[i].n > st->largest)
@@ -169,11 +172,6 @@ void __crt_lesscore(void *ptr, size_t n)
         i++;
     prev_adj = i > 0 && free_ext[i - 1].p + free_ext[i - 1].n == p;
     next_adj = i < nfree && p + n == free_ext[i].p;
-    if (nfree == FREE_EXTENTS && !prev_adj && !next_adj) {
-        ext_dropped += n;
-        ext_release();
-        return;
-    }
     if (prev_adj) {
         free_ext[--i].n += n;
     } else if (next_adj) {

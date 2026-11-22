@@ -17,6 +17,11 @@ PROCS=
 # QEMU_REGRESS_GDB_ON_TIMEOUT=1 is --gdb-on-timeout for a caller (CI) that
 # cannot pass the flag through its make targets.
 GDB_ON_TIMEOUT=${QEMU_REGRESS_GDB_ON_TIMEOUT:-0}
+# QEMU_REGRESS_DUMP_EVERY=N (with --gdb-on-timeout): also dump the running guest
+# every N seconds into MODE-idx.live-K.dump, detach and let it run on. The run
+# must still pass, so this checks that a dump leaves a guest it caught merely
+# slow as it was.
+DUMP_EVERY=${QEMU_REGRESS_DUMP_EVERY:-0}
 KEEP_LOGS=$GDB_ON_TIMEOUT
 REQUIRE_SUPPORTED=0
 DISK_SUITE=0
@@ -328,27 +333,15 @@ differential_net_check()
     return 0
 }
 
-# Print a serial log without the kernel's spin marker (MARK_POTN_INF_LOOP in
-# kernel/include/log.h). The kernel writes it straight to the console from any
-# hart, so it lands in the middle of whatever line user space is printing, and
-# a pattern anchored to that line would miss an otherwise complete result.
-log_without_spin_marker()
-{
-    sed $'s/\x1b\\[41m\xf0\x9f\x9f\xa5\x1b\\[0m//g' "$1"
-}
-
 require_log_patterns()
 {
     local log="$1"
     local label="$2"
     local re
 
-    local text
-    text="$(log_without_spin_marker "$log")"
-
     shift 2
     for re in "$@"; do
-        if ! grep -Eq "$re" <<<"$text"; then
+        if ! grep -Eq "$re" "$log"; then
             echo "  FAIL     ${MODE} missing ${label} evidence: ${re}"
             tail -n 160 "$log"
             return 1
@@ -363,7 +356,7 @@ require_log_patterns_in_order()
     local label="$2"
 
     shift 2
-    if ! log_without_spin_marker "$log" | awk -v mode="$MODE" -v label="$label" '
+    if ! awk -v mode="$MODE" -v label="$label" '
         BEGIN {
             next_pat = 1
             pat_count = ARGC - 1
@@ -382,7 +375,7 @@ require_log_patterns_in_order()
                 exit 1
             }
         }
-    ' "$@"; then
+    ' "$@" < "$log"; then
         tail -n 160 "$log"
         return 1
     fi
@@ -445,19 +438,17 @@ check_preempt_latency()
     done
     require_log_patterns "$log" "wake-latency measurement" "${pats[@]}" ||
         return 1
-    if ! log_without_spin_marker "$log" |
-         grep -Eq '^preempt-latency: (AUDIT-REQUIRED|[a-z-]+ UNAUDITED) '; then
+    if ! grep -Eq '^preempt-latency: (AUDIT-REQUIRED|[a-z-]+ UNAUDITED) ' "$log"; then
         return 0
     fi
     if [ "$audit" -ne 1 ]; then
         echo "  FAIL     ${MODE} has wakes over the bound and no host audit"
         return 1
     fi
-    log_without_spin_marker "$log" |
-        python3 "$TOP_DIR/scripts/vcpu-steal.py" audit --expect-samples \
-            --trace "${log}.steal-trace" --sched "${log}.steal-sched" |
-        sed 's/^/  STEAL    /'
-    case "${PIPESTATUS[1]}" in
+    python3 "$TOP_DIR/scripts/vcpu-steal.py" audit --expect-samples \
+            --trace "${log}.steal-trace" --sched "${log}.steal-sched" \
+            < "$log" | sed 's/^/  STEAL    /'
+    case "${PIPESTATUS[0]}" in
         0) return 0 ;;
         "$RC_INVALID_RUN") return "$RC_INVALID_RUN" ;;
     esac
@@ -607,6 +598,12 @@ Options:
                     "liveness:" lines naming the reply-blocked roottask thread),
                     hang-inject (hang all but one hart; needs --gdb-on-timeout,
                     passes on a complete per-hart dump),
+                    crash-inject (crash the kernel; needs --gdb-on-timeout,
+                    passes on a complete per-hart dump taken after the crash),
+                    crash-inject-shutdown (as crash-inject, through the
+                    Shutdown[...] banner and SBI shutdown; needs
+                    --gdb-on-timeout, passes on a complete dump of the
+                    stopped guest),
                     tickless-idle (quiet-hart tick drop + one-shot deadline),
                     fault-recovery (fault taxonomy smoke),
                     monotonic-time (continuous clock across a skipped-tick gap),
@@ -693,7 +690,9 @@ Options:
                     above 100 the guest gets 2 MiB more RAM per resident
   --gdb-on-timeout  On a timeout or unexpected crash, dump every hart through a live gdb stub
                     (scripts/gdb/dump-state.gdb) into build/lkl-logs/MODE-N.dump
-                    before killing QEMU; implies --keep-logs
+                    before killing QEMU; implies --keep-logs.
+                    QEMU_REGRESS_DUMP_EVERY=N also dumps the running guest
+                    every N seconds and lets it run on
   --keep-logs       Keep passing logs (at build/lkl-logs/MODE-idx.log) instead
                     of deleting them; IOMMU DTB preflights also keep
                     build/lkl-logs/MODE-iommu.{dtb,dts}
@@ -1474,7 +1473,7 @@ validate_lkl_personality_archive()
         return 1
     fi
     ar_tool="$(resolve_tool "${LKL_AR:-}" riscv64-unknown-linux-gnu-ar \
-        riscv64-linux-gnu-ar riscv-none-elf-ar llvm-ar ar)" || {
+        riscv64-linux-gnu-ar "${CROSS_COMPILE:-riscv-none-elf-}ar" llvm-ar ar)" || {
         echo "qemu-regress: need ar to verify $lib" >&2
         return 1
     }
@@ -1682,6 +1681,33 @@ case "$MODE" in
         NEEDS_DEBUG_INJECT=1
         if [ "$GDB_ON_TIMEOUT" -ne 1 ]; then
             echo "qemu-regress: --mode hang-inject needs --gdb-on-timeout" >&2
+            exit 2
+        fi
+        ;;
+    crash-inject|crash-inject-shutdown)
+
+        # Crashes the kernel: crash-inject through its crash path, which reports
+        # and parks every hart; crash-inject-shutdown through shutdown(), which
+        # prints the Shutdown[...] banner and powers off through the SBI. Only
+        # meaningful with --gdb-on-timeout: the pass condition is a complete
+        # dump, taken after the crash (of the guest -no-shutdown kept stopped,
+        # for the second), with a block for every hart.
+        BEGIN_MARKER="RTMux ${MODE}: BEGIN"
+        PASS_MARKER="RTMux ${MODE}: PASS"
+        FAIL_MARKER="RTMux ${MODE}: FAIL"
+        MODE_ARG="rtmux.run=${MODE}"
+        NEEDS_DEBUG_INJECT=1
+        if [ "$GDB_ON_TIMEOUT" -ne 1 ]; then
+            echo "qemu-regress: --mode ${MODE} needs --gdb-on-timeout" >&2
+            exit 2
+        fi
+
+        # The stopped guest is kept and found through QMP, which run_one
+        # drives with python3; without it QEMU exits on the power-off and
+        # takes the state to dump with it.
+        if [ "$MODE" = "crash-inject-shutdown" ] &&
+           ! command -v python3 >/dev/null 2>&1; then
+            echo "qemu-regress: --mode ${MODE} needs python3" >&2
             exit 2
         fi
         ;;
@@ -1966,6 +1992,7 @@ esac
 # default run is one vCPU, which has no CPU1 and would false-fail; bump the
 # default when the caller did not set CPUS explicitly.
 if { [ "$MODE" = "debug-inject" ] || [ "$MODE" = "hang-inject" ] ||
+     [ "$MODE" = "crash-inject" ] || [ "$MODE" = "crash-inject-shutdown" ] ||
      [ "$MODE" = "hart-watchdog" ] || [ "$MODE" = "hart-watchdog-console" ] ||
      [ "$MODE" = "hart-watchdog-idle" ]; } && [ -z "${CPUS:-}" ]; then
     CPUS=4
@@ -2379,14 +2406,17 @@ run_identity()
     echo "${prefix}cpus: ${CPUS:-default}"
 }
 
-# dump_guest_state LOG PORT REASON: attach to the live gdb stub and write every hart's
-# state to LOG's .dump sibling, headed by the build identity. A gdb failure is
-# written into the dump as such: an incomplete dump is never passed off as a
-# complete one.
+# dump_guest_state LOG PORT REASON [DUMP detach]: attach to the live gdb stub and
+# write every hart's state to DUMP (LOG's .dump sibling by default), headed by
+# the build identity. With "detach" gdb lets the guest run on afterwards. A gdb
+# failure is written into the dump as such: an incomplete dump is never passed
+# off as a complete one.
 dump_guest_state()
 {
     local log="$1" port="$2" reason="$3"
-    local dump="${log%.log}.dump"
+    local dump="${4:-${log%.log}.dump}"
+    local after=()
+    [ "${5:-}" = detach ] && after=(-ex detach)
     local kernel
     kernel=$(run_kernel)
     local gdb="${GDB:-gdb-multiarch}"
@@ -2397,7 +2427,7 @@ dump_guest_state()
     } >"$dump"
     echo "  DUMP     ${MODE}: ${reason}, dumping harts to ${dump}"
     if "$TIMEOUT_CMD" "${HANG_DUMP_TIMEOUT:-120}" "$gdb" -batch -ex "target remote :${port}" \
-        -x "$TOP_DIR/scripts/gdb/dump-state.gdb" "$kernel" >>"$dump" 2>&1 &&
+        -x "$TOP_DIR/scripts/gdb/dump-state.gdb" "${after[@]}" "$kernel" >>"$dump" 2>&1 &&
        grep -q "DUMP COMPLETE" "$dump"; then
         echo "# result: complete" >>"$dump"
 
@@ -2594,6 +2624,45 @@ check_roottask_wait_reports()
     return "$bad"
 }
 
+# log_has_crash LOG: whether LOG holds one of this mode's fatal markers that
+# names a crash (not, say, a missing file).
+log_has_crash()
+{
+    awk -v bad="$BAD_RE" '$0 ~ bad && /FAULT|FATAL|CRASH|panic|FREED-ACTIVE|__kernel_restore bad ptr/ { found=1; exit } END { exit !found }' "$1"
+}
+
+# guest_shut_down SOCK: whether the QEMU listening for QMP on SOCK holds a guest
+# that has shut down. Under --gdb-on-timeout QEMU runs with -no-shutdown, so a
+# guest that powers off (a kernel crash ending in Shutdown[...], or the end of a
+# run) leaves QEMU stopped rather than gone, and the gdb stub still answers.
+guest_shut_down()
+{
+    [ -S "$1" ] || return 1
+    "$TIMEOUT_CMD" 5 python3 -I - "$1" 2>/dev/null <<'PY'
+import json, socket, sys
+
+s = socket.socket(socket.AF_UNIX)
+s.settimeout(2)
+s.connect(sys.argv[1])
+f = s.makefile("rw")
+
+
+def call(name):
+    f.write(json.dumps({"execute": name}) + "\n")
+    f.flush()
+    while True:
+        r = json.loads(f.readline())
+        if "return" in r or "error" in r:
+            return r
+
+
+f.readline()  # greeting
+call("qmp_capabilities")
+status = call("query-status").get("return", {}).get("status")
+sys.exit(0 if status == "shutdown" else 1)
+PY
+}
+
 # check_hang_inject_dump DUMP: the injected hang must have left a complete dump
 # with a register block and a backtrace for every hart the guest has.
 check_hang_inject_dump()
@@ -2605,7 +2674,7 @@ check_hang_inject_dump()
        [ "$bt" -ge "$want" ] && grep -q "^DUMP COMPLETE: ${want} harts" "$dump"; then
         return 0
     fi
-    echo "  FAIL     hang-inject: dump has $got hart blocks and $bt backtraces, want $want of each"
+    echo "  FAIL     ${MODE}: dump has $got hart blocks and $bt backtraces, want $want of each"
     return 1
 }
 
@@ -2666,8 +2735,9 @@ run_one()
         cmd+=("${EXTRA_ARGS[@]}")
     fi
     local wrap_timeout="$TIMEOUT"
-    local gdb_port=
-    local ticks=0 hung=0 hang_ok=0
+    local gdb_port='' qmp_sock='' qmp_opts='' log_size='' last_size=-1
+    local start_s="$SECONDS" hung=0 hang_ok=0 crash_ok=0 shutdown_crash=0
+    local live_dumps=0 live_bad=0
     if [ "$GDB_ON_TIMEOUT" -eq 1 ]; then
 
         # Unique per process and run, so concurrent harness loops do not
@@ -2675,6 +2745,14 @@ run_one()
         gdb_port=$((20000 + ($$ % 20000) + idx))
         cmd+=("-gdb-live=${gdb_port}")
         wrap_timeout=$((TIMEOUT + ${HANG_DUMP_TIMEOUT:-120} + 20)) # headroom for the dump
+
+        # A guest that powers off would take QEMU, and the state to dump, with
+        # it: keep the stopped guest, and ask QMP whether it has shut down.
+        # The socket goes in /tmp, whose short path fits a socket name.
+        if command -v python3 >/dev/null 2>&1; then
+            qmp_sock="$(mktemp -u /tmp/rtmux-qmp.XXXXXX)"
+            qmp_opts="-no-shutdown -qmp unix:${qmp_sock},server=on,wait=off"
+        fi
     fi
 
     # serial-unblock feeds the guest UART (QEMU's stdio) the bytes the guest
@@ -2699,6 +2777,9 @@ run_one()
             --trace "${log}.steal-trace" --out "${log}.steal-sched" &
         steal_pid=$!
     fi
+    if [ -n "$qmp_opts" ]; then
+        steal_opts="${steal_opts:+$steal_opts }${qmp_opts}"
+    fi
     EMU_QEMU_OPTS="$steal_opts" \
         "$TIMEOUT_CMD" "$wrap_timeout" "${cmd[@]}" <"$stdin_src" >"$log" 2>&1 &
     local runner=$!
@@ -2709,8 +2790,12 @@ run_one()
             # Only markers already fatal to this mode count. Some fixtures
             # deliberately fault or crash and check the guest's own report.
             if [ "$GDB_ON_TIMEOUT" -eq 1 ] &&
-               awk -v bad="$BAD_RE" '$0 ~ bad && /FAULT|FATAL|CRASH|panic|FREED-ACTIVE|__kernel_restore bad ptr/ { found=1; exit } END { exit !found }' "$log"; then
+               log_has_crash "$log"; then
                 dump_guest_state "$log" "$gdb_port" "unexpected crash"
+                if [ "$MODE" = "crash-inject" ] &&
+                   check_hang_inject_dump "${log%.log}.dump"; then
+                    crash_ok=1
+                fi
             fi
             terminal=1
             kill "$runner" 2>/dev/null || true
@@ -2728,6 +2813,31 @@ run_one()
             printf "\\x${serial_hex##* }" >&"$serial_fd"
             serial_sent=$((serial_sent + 1))
         done
+        # A guest that shut down under -no-shutdown leaves QEMU stopped. Ask
+        # only once the log has stopped growing: a running guest prints. A
+        # crash that ended in the shutdown is dumped first; any other shutdown
+        # ends the run as QEMU exiting would have.
+        if [ -n "$qmp_sock" ]; then
+            log_size="$(wc -c <"$log")"
+            if [ "$log_size" = "$last_size" ] && guest_shut_down "$qmp_sock"; then
+                if grep -aEq 'Shutdown\[[0-9]+\]' "$log"; then
+                    shutdown_crash=1
+                fi
+                if [ "$shutdown_crash" -eq 1 ] ||
+                   log_has_crash "$log"; then
+                    dump_guest_state "$log" "$gdb_port" "guest shutdown after a crash"
+                    if [ "$MODE" = "crash-inject-shutdown" ] &&
+                       [ "$shutdown_crash" -eq 1 ] &&
+                       check_hang_inject_dump "${log%.log}.dump"; then
+                        crash_ok=1
+                    fi
+                fi
+                terminal=1
+                kill "$runner" 2>/dev/null || true
+                break
+            fi
+            last_size="$log_size"
+        fi
         if [ "$pass_seen" -eq 0 ] &&
            grep -q "$PASS_GREP" "$PASS_MARKER" "$log"; then
             pass_seen=1
@@ -2747,26 +2857,56 @@ run_one()
             break
         fi
         sleep 1
-        ticks=$((ticks + 1))
-        if [ "$GDB_ON_TIMEOUT" -eq 1 ] && [ "$ticks" -ge "$TIMEOUT" ]; then
+
+        # A live dump stops the guest, so its time is not the guest's: move
+        # the timeout's start by it, and look at the log again before
+        # judging the run.
+        if [ "$GDB_ON_TIMEOUT" -eq 1 ] && [ "$DUMP_EVERY" -gt 0 ] &&
+           kill -0 "$runner" 2>/dev/null &&
+           [ $((SECONDS - start_s)) -ge $(((live_dumps + 1) * DUMP_EVERY)) ]; then
+            local dump_s="$SECONDS"
+            live_dumps=$((live_dumps + 1))
+            dump_guest_state "$log" "$gdb_port" "live dump ${live_dumps}" \
+                "${log%.log}.live-${live_dumps}.dump" detach
+            grep -q '^# result: complete' "${log%.log}.live-${live_dumps}.dump" ||
+                live_bad=$((live_bad + 1))
+            start_s=$((start_s + SECONDS - dump_s))
+            continue
+        fi
+
+        # Wall-clock time, not loop passes: each pass also greps a growing
+        # log, so on a loaded host a pass count falls behind the clock, and the
+        # outer timeout (TIMEOUT plus the dump's headroom) killed QEMU before
+        # the count reached TIMEOUT and the dump was taken.
+        if [ "$GDB_ON_TIMEOUT" -eq 1 ] &&
+           [ $((SECONDS - start_s)) -ge "$TIMEOUT" ]; then
             dump_guest_state "$log" "$gdb_port" "timeout after ${TIMEOUT}s"
             kill "$runner" 2>/dev/null || true
             hung=1
             if [ "$MODE" = "hang-inject" ]; then
                 if check_hang_inject_dump "${log%.log}.dump"; then
                     hang_ok=1
-                    echo "RTMux hang-inject: PASS" >>"$log"
                 fi
             fi
             break
         fi
     done
     wait "$runner" 2>/dev/null || rc=$?
+    if [ -n "$qmp_sock" ]; then
+        rm -f "$qmp_sock"
+    fi
     if [ -n "$steal_pid" ]; then
         # The sampler stops by itself when QEMU is gone; the signal is for a
         # QEMU that never started.
         kill "$steal_pid" 2>/dev/null || true
         wait "$steal_pid" 2>/dev/null || true
+    fi
+
+    # The injected hang or crash was the test, and its dump is complete. QEMU
+    # writes the log at its own offset, so add the verdict only once it is gone
+    # and cannot write over the line.
+    if [ "$hang_ok" -eq 1 ] || [ "$crash_ok" -eq 1 ]; then
+        echo "RTMux ${MODE}: PASS" >>"$log"
     fi
     if [ -n "$serial_fd" ]; then
         exec {serial_fd}>&-
@@ -2796,13 +2936,31 @@ run_one()
         return 1
     fi
 
+    if [ "$live_bad" -gt 0 ]; then
+        echo "  FAIL     ${MODE}: ${live_bad} of ${live_dumps} live dumps incomplete"
+        return 1
+    fi
+    if [ "$live_dumps" -gt 0 ]; then
+        echo "  DUMP     ${MODE}: ${live_dumps} live dumps, guest ran on" \
+             "($(cat "${log%.log}".live-*.dump | grep -c 'hart in firmware') harts caught in firmware)"
+    fi
+
+    # The Shutdown[...] banner of a fatal kernel fault is not in BAD_RE, and
+    # the guest may have printed its pass marker before the fault, with or
+    # without --gdb-on-timeout.
+    if [ "$crash_ok" -ne 1 ] && grep -aEq 'Shutdown\[[0-9]+\]' "$log"; then
+        echo "  FAIL     ${MODE} guest shut down after a kernel fault (Shutdown[...])"
+        tail -n 160 "$log"
+        return 1
+    fi
+
     if ! grep -Fq "$BEGIN_MARKER" "$log"; then
         echo "  FAIL     ${MODE} missing begin marker: ${BEGIN_MARKER}"
         tail -n 120 "$log"
         return 1
     fi
 
-    if grep -Eq "$BAD_RE" "$log"; then
+    if [ "$crash_ok" -ne 1 ] && grep -Eq "$BAD_RE" "$log"; then
         echo "  FAIL     ${MODE} boot log contains crash/fault signature"
         grep -En "$BAD_RE" "$log" | tail -n 20
         tail -n 160 "$log"

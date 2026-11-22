@@ -24,6 +24,12 @@ struct open_entry {
     int deferred; /* parked behind another op on the node (IOSERV_NOREPLY) */
     int unlink;   /* an unlink: owns NODE_FLAG_UNLINKING while pending */
     ioserv_context_t *ctp; /* context of the request this entry stands for */
+    /* The object the open works on, referenced from the time it was chosen
+     * under path_mutex until the reply is sent (the reply can point into it,
+     * as a symlink's does): a detach can come at any point once the mutex is
+     * released, and would otherwise free it under the open.
+     */
+    path_object_t *held;
 };
 
 static soul_t open_souls INITSOUL(-1, struct open_entry, 2, 8, ~0);
@@ -33,6 +39,12 @@ static struct open_entry *pending_opens;
 struct node_ocb {
     struct node_entry *node;
     off_t offset;
+    /* What the open found on the node, for node_stat: the object can be
+     * unlinked, or replaced, while the descriptor stays open.
+     */
+    int object_type; /* OBJECT_* of the node's first object, or OBJECT_NONE */
+    bool is_dir;
+    off_t symlink_size;
 };
 
 int devmem_check_perm(ioserv_context_t *ctp,
@@ -50,9 +62,11 @@ static int node_read(ioserv_context_t *ctp, io_read_t *msg, void *vocb)
     unsigned nbytes;
     off_t skip;
 
-    /* Our NAME objects always return 0 bytes like a dev null */
-    if ((node = ocb->node) && node->object &&
-        node->object->hdr.type == OBJECT_NAME) {
+    /* Our NAME objects always return 0 bytes like a dev null. The type is the
+     * one the open found: the object itself can be unlinked, and freed, while
+     * the descriptor stays open.
+     */
+    if (ocb->object_type == OBJECT_NAME) {
         _IO_SET_READ_NBYTES(ctp, 0);
         return IOSERV_PTR(ctp, NULL, 0);
     }
@@ -171,10 +185,46 @@ static int node_devctl(ioserv_context_t *ctp, io_devctl_t *msg, void *vocb)
     return EOK;
 }
 
+#ifdef CONFIG_DEBUG_INJECT
+/* A node named <tag>MS holds a request on it for MS milliseconds, so a test can
+ * have a second operation arrive while the first is in a window that is
+ * otherwise a matter of luck: rtmux-open-stall-MS holds each open once it is
+ * registered, rtmux-stat-stall-MS each stat of an opened node. Only a
+ * CONFIG_DEBUG_INJECT image has this.
+ */
+static void debug_stall(const node_t *nop, const char *tag)
+{
+    size_t len = strlen(tag);
+    unsigned long ms;
+
+    if (strncmp(nop->name, tag, len) != 0)
+        return;
+    ms = strtoul(nop->name + len, NULL, 10);
+    if (ms > 5000)
+        ms = 5000;
+    (void) nanosleep(
+        &(struct timespec) {.tv_nsec = (long) (ms % 1000) * 1000000L,
+                            .tv_sec = (time_t) (ms / 1000)},
+        NULL);
+}
+
+/* A node named <tag>* fails each such request on it with err, so a test can
+ * have a combined message fail after its open bound an OCB:
+ * rtmux-stat-fail-* fails each stat of an opened node with EIO.
+ */
+static int debug_fail(const node_t *nop, const char *tag, int err, int ret)
+{
+    return strncmp(nop->name, tag, strlen(tag)) == 0 ? err : ret;
+}
+#else
+#define debug_stall(nop, tag) ((void) 0)
+#define debug_fail(nop, tag, err, ret) (ret)
+#endif
+
 static int node_stat(ioserv_context_t *ctp, io_stat_t *msg, void *vocb)
 {
-    path_object_t *o;
     struct node_ocb *ocb = vocb;
+    int ret = EOK;
 
     memset(&msg->o, 0x00, sizeof msg->o);
     msg->o.st_ino = INODE_XOR(ocb->node);
@@ -182,30 +232,28 @@ static int node_stat(ioserv_context_t *ctp, io_stat_t *msg, void *vocb)
     msg->o.st_dev = (ctp->info.srcnd << RTMUX_NODE_BITS) | path_devno;
     msg->o.st_rdev = 0;
 
-    o = ocb->node->object;
-    if ((!o || o->hdr.type != OBJECT_PROC_SYMLINK) && ocb->node->child) {
+    debug_stall(ocb->node, "rtmux-stat-stall-");
+
+    /* The file is what the open found, as for any open descriptor: an unlink
+     * of the node (or of its entries) is not held back once the open is
+     * complete, and can come before this stat (a combined one too) or while
+     * the descriptor is open.
+     */
+    if (ocb->is_dir) {
         msg->o.st_nlink = 2;
         msg->o.st_mode = S_IFDIR | 0555;
-        return IOSERV_PTR(ctp, &msg->o, sizeof msg->o);
+    } else if (ocb->object_type == OBJECT_PROC_SYMLINK) {
+        msg->o.st_size = ocb->symlink_size;
+        msg->o.st_nlink = 1;
+        msg->o.st_mode = S_IFLNK | 0777;
+    } else if (ocb->object_type == OBJECT_NAME) {
+        msg->o.st_nlink = 1;
+        msg->o.st_mode = S_IFNAM | 0666;
+    } else {
+        ret = ENOSYS;
     }
-
-    if (o) {
-        switch (o->hdr.type) {
-        case OBJECT_PROC_SYMLINK:
-            msg->o.st_size = o->symlink.len - 1;
-            msg->o.st_nlink = 1;
-            msg->o.st_mode = S_IFLNK | 0777;
-            return IOSERV_PTR(ctp, &msg->o, sizeof msg->o);
-        case OBJECT_NAME:
-            msg->o.st_nlink = 1;
-            msg->o.st_mode = S_IFNAM | 0666;
-            return IOSERV_PTR(ctp, &msg->o, sizeof msg->o);
-        default:
-            break;
-        }
-    }
-
-    return ENOSYS;
+    ret = debug_fail(ocb->node, "rtmux-stat-fail-", EIO, ret);
+    return ret == EOK ? IOSERV_PTR(ctp, &msg->o, sizeof msg->o) : ret;
 }
 
 static const ioserv_ops_t node_funcs = {
@@ -218,60 +266,44 @@ static const ioserv_ops_t node_funcs = {
 };
 
 
-#ifdef CONFIG_DEBUG_INJECT
-/* A node named rtmux-open-stall-MS holds each open of it for MS milliseconds
- * once the open is registered, so a test can have a second operation arrive
- * while the first is still in flight, which is otherwise a matter of luck. Only
- * a CONFIG_DEBUG_INJECT image has this.
- */
-static void open_debug_stall(const node_t *nop, int subtype)
-{
-    static const char tag[] = "rtmux-open-stall-";
-    unsigned long ms;
-
-    if (subtype == _IO_CONNECT_UNLINK ||
-        strncmp(nop->name, tag, sizeof tag - 1) != 0)
-        return;
-    ms = strtoul(nop->name + sizeof tag - 1, NULL, 10);
-    if (ms > 5000)
-        ms = 5000;
-    (void) nanosleep(
-        &(struct timespec) {.tv_nsec = (long) (ms % 1000) * 1000000L,
-                            .tv_sec = (time_t) (ms / 1000)},
-        NULL);
-}
-#else
-#define open_debug_stall(nop, subtype) ((void) 0)
-#endif
-
 /* Operations parked behind a finished one wait on the finished operation's
  * context, in ctp->post, until its handler has sent the reply: a connect that
  * carries combined messages (a stat, then a close) runs them after the open
  * returns, so restarting a parked operation from the open ran it between the
- * open and its combined messages. Only the thread that owns the context touches
- * the list, and it needs no allocation, so nothing can fail between taking an
- * entry off pending_opens and its restart. A restarted operation can park
- * others in turn; the loop drains those too.
+ * open and its combined messages. A finished open's own entry waits there too
+ * while it holds its object, which is released once the reply is out. Only the
+ * thread that owns the context touches the list, and it needs no allocation,
+ * so nothing can fail between taking an entry off pending_opens and its
+ * restart. A restarted operation can park others in turn; the loop drains
+ * those too.
  */
 void path_open_resume(ioserv_context_t *ctp)
 {
     struct open_entry *todo;
 
     while ((todo = ctp->post)) {
-        /* The pool reservation is a latency aid, not a requirement: on failure
-         * (low memory) the parked operations are restarted all the same.
-         * Without one, unrelated operations may wait for this thread if no
-         * other is free.
-         */
-        int reserved = proc_thread_pool_reserve() == 0;
+        bool tried = false, reserved = false;
 
         ctp->post = NULL;
         while (todo) {
             struct open_entry *next = todo->next;
 
-            errno = 0;
-            if (ioserv_msg_again(ctp, todo->rcvid) == -1)
-                msg_error(todo->rcvid, errno ? errno : EIO);
+            if (todo->held) {
+                path_object_done(todo->held);
+            } else {
+                /* The pool reservation is a latency aid, not a requirement: on
+                 * failure (low memory) the parked operations are restarted all
+                 * the same. Without one, unrelated operations may wait for
+                 * this thread if no other is free.
+                 */
+                if (!tried) {
+                    tried = true;
+                    reserved = proc_thread_pool_reserve() == 0;
+                }
+                errno = 0;
+                if (ioserv_msg_again(ctp, todo->rcvid) == -1)
+                    msg_error(todo->rcvid, errno ? errno : EIO);
+            }
             proc_object_free(&open_souls, todo);
             todo = next;
         }
@@ -320,9 +352,19 @@ static int complete_open(struct open_entry *oep, int ret)
      */
     if (oep->unlink)
         nop->flags &= (uint16_t) ~NODE_FLAG_UNLINKING;
-    proc_object_free(&open_souls, oep);
+    if (oep->held && oep->held->hdr.type == OBJECT_PROC_SYMLINK) {
+        /* The symlink reply points into the object: keep it to the reply. */
+        oep->next = oep->ctp->post;
+        oep->ctp->post = oep;
+        oep = NULL;
+    }
     path_node_complete(nop);
     path_node_detach(nop);
+    if (oep) {
+        if (oep->held)
+            path_object_done(oep->held);
+        proc_object_free(&open_souls, oep);
+    }
     return ret;
 }
 
@@ -439,6 +481,7 @@ again:
         path_object_t *o;
         struct open_entry *oep;
         struct open_entry *chk;
+        struct node_ocb found = {0};
 
         if (namespace_version_read() != namespace_version) {
             path_node_detach(nop);
@@ -454,11 +497,23 @@ again:
         }
         path_node_access(nop);
         o = nop->object;
+        /* What node_stat reports if this open binds a node OCB: a node with no
+         * object is a directory (one with no entries is refused below), one
+         * with an object is while it has entries, unless it is a symlink. An
+         * object detached after this point bumps the entry generation, which
+         * the stale check before the bind catches.
+         */
+        found.object_type = o ? o->hdr.type : OBJECT_NONE;
+        if (found.object_type == OBJECT_PROC_SYMLINK)
+            found.symlink_size = o->symlink.len - 1;
+        found.is_dir = found.object_type == OBJECT_NONE ||
+                       (found.object_type != OBJECT_PROC_SYMLINK && nop->child);
         LINK2_BEG(pending_opens, oep, struct open_entry);
         oep->node = nop;
         oep->entry_generation = nop->entry_generation;
         oep->rcvid = ctp->rcvid;
         oep->ctp = ctp;
+        oep->held = NULL;
         oep->deferred = 0;
         oep->unlink = (msg->connect.subtype == _IO_CONNECT_UNLINK);
         oep->check_generation = (msg->connect.subtype != _IO_CONNECT_UNLINK);
@@ -502,8 +557,23 @@ again:
                                      service_error(msg, PATH_SERVICE_OPEN));
             }
         }
+        if (o)
+            oep->held = path_object_clone(o);
         path_node_complete(nop);
-        open_debug_stall(nop, msg->connect.subtype);
+        if (msg->connect.subtype != _IO_CONNECT_UNLINK)
+            debug_stall(nop, "rtmux-open-stall-");
+#ifdef CONFIG_DEBUG_INJECT
+        /* A guard for the hold above: object_done marks what it frees in this
+         * image, so an object freed under the open shows here instead of
+         * being used (ns_open_detach).
+         */
+        if (o && o->hdr.type == OBJECT_POISONED) {
+            root_log("path_open: object %p freed under the open of %s\n",
+                     (void *) o, nop->name);
+            oep->held = NULL; /* not released again: leaked, poisoned */
+            return complete_open(oep, EFAULT);
+        }
+#endif
 
         if (o) {
             switch (o->hdr.type) {
@@ -660,10 +730,14 @@ again:
             _sfree(ocb, sizeof *ocb);
             return complete_open(oep, ESTALE);
         }
+        *ocb = found;
         ocb->node = path_node_clone(nop);
         if (ioserv_open_bind(ctp, ocb, &node_funcs) == -1) {
+            int err = errno;
+
             path_node_detach(ocb->node);
-            return complete_open(oep, errno);
+            _sfree(ocb, sizeof *ocb);
+            return complete_open(oep, err);
         }
         return complete_open(oep, EOK);
     }

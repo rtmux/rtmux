@@ -57,17 +57,24 @@ static void fastmsg_fill_rcvinfo(thread_t *thp,
                                  connect_t *cop,
                                  struct _msg_info *rep)
 {
+    /* A channel destroy on another hart clears cop->channel as soon as the
+     * sender has left its queues, which can be before the receiver that took
+     * the message has filled this in: read the field once. The rcvid lookup
+     * window (open in every caller) keeps a channel that was read allocated.
+     */
+    channel_t *chp = __atomic_load_n(&cop->channel, __ATOMIC_ACQUIRE);
+    channel_t *rchp = remote_ipc.chp;
+
     if ((cop->flags & COF_NETCON && TYPE_MASK(thp->type) == TYPE_VTHREAD) ||
-        (thp->process == remote_ipc.prp &&
-         cop->channel->chid == remote_ipc.chp->chid &&
-         (cop->flags & COF_NETCON) == 0)) {
+        (thp->process == remote_ipc.prp && chp && rchp &&
+         chp->chid == rchp->chid && (cop->flags & COF_NETCON) == 0)) {
         get_rcvinfo(thp, -1, cop, rep);
     } else {
         rep->nd = RTMUX_LOCAL_NODE;
         rep->srcnd = cop->un.lcl.nd;
         rep->pid = cop->process->pid;
         rep->tid = (int32_t) (thp->tid + 1);
-        rep->chid = cop->channel->chid;
+        rep->chid = chp ? chp->chid : -1;
         rep->scoid = cop->scoid | RTMUX_SIDE_CHANNEL;
         rep->coid = (int32_t) thp->args.ms.coid;
         rep->msglen = thp->args.ms.msglen;
@@ -203,170 +210,259 @@ static void fastmsg_native_cap_rollback(thread_t *receiver,
     tx->nxfers = 0;
 }
 
+/* How many entries of a vector the header peek, and the write of the header
+ * back, may step over. A message whose first sizeof(struct _io_native_hdr)
+ * bytes are spread wider than this, or lie behind that many empty entries,
+ * is refused: the walk is made in one kernel entry, with the peer claimed.
+ */
+#define NATIVE_HDR_ENTRIES_MAX 64
+
+/* Read up to want bytes from the head of the active sender's own message
+ * into a kernel buffer.
+ *
+ * Returns EOK with the bytes read in *copied, XFER_SRC_FAULT, or E2BIG when
+ * the bytes are not within the first NATIVE_HDR_ENTRIES_MAX entries.
+ */
 static int fastmsg_copy_source_prefix(thread_t *sender,
                                       void *dst,
                                       size_t want,
                                       uint32_t *copied)
 {
-    iov_t *iov;
+    uintptr_t bound = sender->process->boundary_addr;
+    const iov_t *iov;
     char *out = dst;
-    size_t n;
-    int parts;
-    int ret;
+    int parts = sender->args.ms.sparts;
 
     *copied = 0;
-    parts = sender->args.ms.sparts;
     if (parts == 0 || want == 0)
         return EOK;
-
     if (parts < 0) {
-        n = min_size(want, PARTS_TO_LEN(parts));
-        ret = xfer_memcpy(out, sender->args.ms.smsg, n);
-        if (ret != 0)
-            return ret;
+        size_t n = min_size(want, PARTS_TO_LEN(parts));
+
+        if (xfer_memcpy(out, sender->args.ms.smsg, n))
+            return XFER_SRC_FAULT;
         *copied = (uint32_t) n;
         return EOK;
     }
 
     iov = sender->args.ms.smsg;
-    while (parts-- > 0 && *copied < want) {
-        n = min_size(want - *copied, GETIOVLEN(iov));
-        ret = xfer_memcpy(out + *copied, GETIOVBASE(iov), n);
-        if (ret != 0)
-            return ret;
+    for (int i = 0; i < parts && *copied < want; i++) {
+        iov_t v;
+        uintptr_t base, last;
+        size_t n;
+
+        if (i == NATIVE_HDR_ENTRIES_MAX)
+            return E2BIG;
+        if (xfer_memcpy(&v, iov + i, sizeof(v)))
+            return XFER_SRC_FAULT;
+        n = min_size(want - *copied, GETIOVLEN(&v));
+        if (!n)
+            continue;
+        base = (uintptr_t) GETIOVBASE(&v);
+        last = base + n - 1;
+        if (last < base || !WITHIN_BOUNDARY(base, last, bound) ||
+            xfer_memcpy(out + *copied, (void *) base, n))
+            return XFER_SRC_FAULT;
         *copied += (uint32_t) n;
-        iov++;
     }
     return EOK;
 }
 
-static int fastmsg_native_cap_install_long_peek(thread_t *sender,
-                                                thread_t *receiver,
-                                                bool reply,
-                                                fastmsg_native_cap_tx_t *tx,
-                                                int *patched)
-{
-    struct _io_msg msg;
-    struct _io_native_hdr hdr;
-    iov_t *rmsg;
-    int32_t rparts;
-    uint32_t copied;
-    int ret;
-    unsigned cpu;
-    thread_t *active;
-    process_t *active_as;
-
-    *patched = 0;
-    tx->hdr = NULL;
-    tx->nxfers = 0;
-
-    cpu = get_cpunum();
-    active = get_active_thread(cpu);
-    active_as = active->as_prp ? active->as_prp : active->process;
-    rmsg = receiver->args.ms.rmsg;
-    rparts = receiver->args.ms.rparts;
-
-    if (active == sender) {
-        if (pcpu_array[cpu].pc_as_prp != active_as)
-            vm_ops->as(active_as, &pcpu_array[cpu].pc_as_prp);
-        ret = fastmsg_copy_source_prefix(sender, &msg, sizeof(msg), &copied);
-    } else {
-        receiver->args.ms.rmsg = (iov_t *) (void *) &msg;
-        receiver->args.ms.rparts = -(int32_t) sizeof(msg);
-        ret = xfermsg(receiver, sender, 0, 0);
-        copied = sender->args.ms.msglen;
-        receiver->args.ms.rmsg = rmsg;
-        receiver->args.ms.rparts = rparts;
-        receiver->restart = NULL;
-        sender->restart = NULL;
-        sender->args.ms.msglen = 0;
-        sender->args.ms.dthp = NULL;
-    }
-    if (pcpu_array[cpu].pc_as_prp != active_as)
-        vm_ops->as(active_as, &pcpu_array[cpu].pc_as_prp);
-    if (ret != 0)
-        return ret;
-    if (copied < sizeof(msg) || msg.type != _IO_MSG ||
-        msg.protocol != _IOMSG_RTMUX_NATIVE)
-        return EOK;
-
-    if (active == sender) {
-        ret = fastmsg_copy_source_prefix(sender, &hdr, sizeof(hdr), &copied);
-    } else {
-        receiver->args.ms.rmsg = (iov_t *) (void *) &hdr;
-        receiver->args.ms.rparts = -(int32_t) sizeof(hdr);
-        ret = xfermsg(receiver, sender, 0, 0);
-        copied = sender->args.ms.msglen;
-        receiver->args.ms.rmsg = rmsg;
-        receiver->args.ms.rparts = rparts;
-        receiver->restart = NULL;
-        sender->restart = NULL;
-        sender->args.ms.msglen = 0;
-        sender->args.ms.dthp = NULL;
-    }
-    if (pcpu_array[cpu].pc_as_prp != active_as)
-        vm_ops->as(active_as, &pcpu_array[cpu].pc_as_prp);
-    if (ret != 0)
-        return ret;
-    if (copied < sizeof(hdr))
-        return reply
-                   ? EOK
-                   : EINVAL; /* a short reply is data, as in the buffer path */
-    if (fastmsg_native_hdr_is_data(&hdr, reply))
-        return EOK;
-    if (hdr.nxfers == 0)
-        return EOK;
-
-    ret = fastmsg_native_cap_install_buffer(sender, receiver, (uint8_t *) &hdr,
-                                            sizeof(hdr), reply, tx);
-    if (ret != EOK)
-        return ret;
-    tx->hdr = NULL;
-    ret = xfer_cpy_diov(receiver, rmsg, (uint8_t *) &hdr, rparts, sizeof(hdr));
-    if (ret != 0) {
-        fastmsg_native_cap_rollback(receiver, tx);
-        return ret;
-    }
-    *patched = 1;
-    return EOK;
-}
-
-/* fastmsg_native_cap_install_long_peek reads the head of the message through
- * xfermsg, which ends by clearing the restart links and the byte count of the
- * transfer it borrowed them from. A stepped copy that has yielded keeps its
- * cursor on exactly those, so the peek must give them back, or each restart
- * would begin the copy again and never get past its first step.
+/* Move a few bytes between the head of a message and a kernel buffer through
+ * xfermsg_peek, with one side's vector swapped for the buffer: the receiver's
+ * to read the head of the sender's message (to_receiver false), the sender's
+ * to write over the head of the receiver's buffers. The copy proper is over
+ * by now, but its restart links and byte count are the transfer's result, so
+ * they are saved around the borrowed transfer and put back.
+ *
+ * Returns 0 with the bytes moved in *moved, XFER_SRC_FAULT, XFER_DST_FAULT,
+ * or XFER_YIELD when the user side's vector is too sparse (see
+ * NATIVE_HDR_ENTRIES_MAX).
  */
-static int fastmsg_native_cap_install_long(thread_t *sender,
-                                           thread_t *receiver,
-                                           bool reply,
-                                           fastmsg_native_cap_tx_t *tx,
-                                           int *patched)
+static int fastmsg_head_xfer(thread_t *sender,
+                             thread_t *receiver,
+                             void *buf,
+                             size_t len,
+                             bool to_receiver,
+                             uint32_t *moved)
 {
     thread_t *rrestart = receiver->restart, *srestart = sender->restart;
     thread_t *sdthp = sender->args.ms.dthp;
     uint32_t msglen = sender->args.ms.msglen;
+    iov_t *smsg = sender->args.ms.smsg, *rmsg = receiver->args.ms.rmsg;
+    int32_t sparts = sender->args.ms.sparts, rparts = receiver->args.ms.rparts;
     int ret;
 
-    /* Only a copy that yielded leaves links to give back. */
-    if (!rrestart && !srestart)
-        return fastmsg_native_cap_install_long_peek(sender, receiver, reply, tx,
-                                                    patched);
-
-    /* The peek starts at the head of the message: a copy that yielded left
-     * links that would make xfermsg resume it, so they are cleared for the peek
-     * and given back.
-     */
+    inject_xfer_peek(get_active_thread(get_cpunum()));
     receiver->restart = sender->restart = NULL;
     sender->args.ms.dthp = NULL;
     sender->args.ms.msglen = 0;
-    ret = fastmsg_native_cap_install_long_peek(sender, receiver, reply, tx,
-                                               patched);
+    if (to_receiver) {
+        sender->args.ms.smsg = buf;
+        sender->args.ms.sparts = -(int32_t) len;
+    } else {
+        receiver->args.ms.rmsg = buf;
+        receiver->args.ms.rparts = -(int32_t) len;
+    }
+    ret = xfermsg_peek(receiver, sender, NATIVE_HDR_ENTRIES_MAX);
+    *moved = sender->args.ms.msglen;
+    sender->args.ms.smsg = smsg;
+    sender->args.ms.sparts = sparts;
+    receiver->args.ms.rmsg = rmsg;
+    receiver->args.ms.rparts = rparts;
     receiver->restart = rrestart;
     sender->restart = srestart;
     sender->args.ms.dthp = sdthp;
     sender->args.ms.msglen = msglen;
     return ret;
+}
+
+/* Make the active thread's own address space the current one. A transfer may
+ * leave another one current, and the active thread's memory is read and
+ * written directly after it.
+ */
+static void fastmsg_own_as(thread_t *active)
+{
+    process_t *own = active->as_prp ? active->as_prp : active->process;
+    unsigned cpu = get_cpunum();
+
+    if (pcpu_array[cpu].pc_as_prp != own)
+        vm_ops->as(own, &pcpu_array[cpu].pc_as_prp);
+}
+
+/* What fastmsg_native_cap_finish_long() found wrong: a fault on one side
+ * (XFER_SRC_FAULT, XFER_DST_FAULT), or an errno for a message that is refused
+ * with nothing at fault (a bad header, a capability that cannot be
+ * transferred, a header spread too wide).
+ */
+struct native_cap_status {
+    int fault;
+    int err;
+};
+
+/* The last step of a long message's delivery, once its bytes are in the
+ * receiver's buffers and nothing can restart the call any more: look at the
+ * head of the message for a native capability header and install the
+ * capabilities it names.
+ *
+ * The head is read once more from the sender, into a kernel snapshot, and it
+ * is the snapshot that is parsed, has the installed ids put into it, and is
+ * then written over the head of what the receiver was given. So the header
+ * the receiver sees is the one the kernel examined, whatever a sibling of the
+ * sender did to the original between the copy and now: no rewrite of nxfers
+ * or of an id can reach the receiver as if the kernel had installed it.
+ * It comes after the copy so that the copy can restart at will (an install
+ * ahead of it would be repeated), and after the last point at which the call
+ * can be abandoned, so that nothing is installed for a message that is not
+ * delivered.
+ *
+ * tx records what was installed, for fastmsg_native_cap_rollback() if the
+ * delivery still fails. Returns true when all is well.
+ */
+static bool fastmsg_native_cap_finish_long(thread_t *sender,
+                                           thread_t *receiver,
+                                           bool reply,
+                                           fastmsg_native_cap_tx_t *tx,
+                                           struct native_cap_status *st)
+{
+    struct _io_native_hdr hdr;
+    thread_t *active = get_active_thread(get_cpunum());
+    uint32_t copied = 0, written;
+    bool native;
+    int ret;
+
+    /* What the copy delivered: the receiver has no more of the head. */
+    uint32_t delivered = sender->args.ms.msglen;
+
+    tx->hdr = NULL;
+    tx->nxfers = 0;
+    st->fault = st->err = 0;
+
+    /* The first bytes say whether this is a native message at all; only one
+     * that is has a header worth reading whole. Any other message is held to
+     * no more than that its first few bytes are near the front.
+     */
+    inject_cap_peek_window(active);
+    for (size_t want = sizeof(hdr.msg);; want = sizeof(hdr)) {
+        if (active == sender) {
+            fastmsg_own_as(active);
+            ret = fastmsg_copy_source_prefix(sender, &hdr, want, &copied);
+        } else
+            ret =
+                fastmsg_head_xfer(sender, receiver, &hdr, want, false, &copied);
+        if (ret == E2BIG || ret == XFER_YIELD) {
+            st->err = EINVAL; /* the head is spread too wide to look at */
+            return false;
+        }
+        if (ret) {
+            st->fault =
+                (ret & XFER_DST_FAULT) ? XFER_DST_FAULT : XFER_SRC_FAULT;
+            return false;
+        }
+        /* The receiver holds `delivered` bytes of the message as it was when
+         * it was copied. A head that is shorter now than what was delivered
+         * of it cannot be vouched for: the sender's vector was cut down
+         * since, and what the receiver holds past the cut was never looked
+         * at.
+         */
+        if (copied < min_size(delivered, want)) {
+            st->err = EINVAL;
+            return false;
+        }
+        native = copied >= sizeof(hdr.msg) && hdr.msg.type == _IO_MSG &&
+                 hdr.msg.protocol == _IOMSG_RTMUX_NATIVE;
+        if (!native || want == sizeof(hdr))
+            break;
+    }
+    if (copied == 0)
+        return true;
+
+    if (native) {
+        if (copied < sizeof(hdr)) {
+            /* A short reply is data, as in the buffer path. */
+            if (!reply) {
+                st->err = EINVAL;
+                return false;
+            }
+        } else if (delivered < sizeof(hdr)) {
+            /* The receiver was given less than the header: nothing is
+             * installed for it, and the part it holds must not name ids.
+             */
+            hdr.nxfers = 0;
+        } else {
+            /* Only a receiver that was given the whole header gets what it
+             * names: one with a shorter buffer could not find the ids.
+             */
+            ret = fastmsg_native_cap_install_buffer(
+                sender, receiver, (uint8_t *) &hdr, sizeof(hdr), reply, tx);
+            if (ret != EOK) {
+                st->err = ret;
+                return false;
+            }
+            tx->hdr = NULL; /* the snapshot is not rolled back, the table is */
+        }
+    }
+
+    /* The receiver's own address space is current when it is the active
+     * thread; otherwise the write goes through the transfer machinery.
+     */
+    if (copied > delivered)
+        copied = delivered;
+    if (active == receiver) {
+        fastmsg_own_as(active);
+        ret = xfer_cpy_diov(receiver, receiver->args.ms.rmsg, (uint8_t *) &hdr,
+                            receiver->args.ms.rparts, copied);
+    } else {
+        ret = fastmsg_head_xfer(sender, receiver, &hdr, copied, true, &written);
+        if (!ret && written != copied)
+            ret = XFER_DST_FAULT; /* its vector changed under the copy */
+    }
+    if (ret) {
+        fastmsg_native_cap_rollback(receiver, tx);
+        st->fault = XFER_DST_FAULT;
+        return false;
+    }
+    return true;
 }
 
 #define STUFF_RCVINFO(thp, cop, info) fastmsg_fill_rcvinfo(thp, cop, info)
@@ -443,44 +539,26 @@ static thread_t *receive_candidate(channel_t *chp, int notification_only)
 #endif
 
 /* The copy of a message between a thread and its peer, for send, receive and
- * reply. One that carries capabilities (cap_patched: a native header was
- * installed ahead of the copy, and a restart would install it twice) runs in
- * one piece, as before; any other does at most a step of work per kernel entry
- * (xfermsg_bounded) and returns XFER_RESTART when it used the step up.
+ * reply: a step per kernel entry (xfermsg_bounded), XFER_RESTART when the
+ * step is over. A native capability header in it is dealt with afterwards
+ * (fastmsg_native_cap_finish_long), so the copy itself can always restart.
  */
-static inline int fastmsg_xfer(thread_t *dthp, thread_t *sthp, bool cap_patched)
+static inline int fastmsg_xfer(thread_t *dthp, thread_t *sthp)
 {
-    if (!cap_patched && sthp->args.ms.sparts <= XFER_STEP_PARTS_MAX &&
-        dthp->args.ms.rparts <= XFER_STEP_PARTS_MAX)
-        return xfermsg_bounded(dthp, sthp, 0, 0);
-    if (!cap_patched)
-        return xfermsg(dthp, sthp, 0, 0);
-    return xfermsg(dthp, sthp, sizeof(struct _io_native_hdr),
-                   sizeof(struct _io_native_hdr));
+    return xfermsg_bounded(dthp, sthp, 0, 0);
 }
 
 /* A stepped copy used its step up and arranged for the call to run again
- * (xfer_yield did the KCALL_RESTART): give up the claim on the peer, and on
- * ourselves, under the channel lock, so that another thread can use the peer in
- * the meantime, and honor a wake that was deferred while the claim was held.
- * The caller returns ENOERROR. The cursor and the restart links stay for the
+ * (xfer_yield did the KCALL_RESTART): give up our own side of the transfer
+ * and the claim on the peer, so that another thread can use the peer in the
+ * meantime, and honor a wake that was deferred while the claim was held. The
+ * caller returns ENOERROR. The cursor and the restart links stay for the
  * restarted call to resume from.
  */
 static void fastmsg_step_yield(channel_t *chp, thread_t *act, thread_t *thp)
 {
-    unsigned status = 0;
-    bool wake = false;
-
-    kspinlock_lock(&chp->lock);
-    END_SMP_XFER(act, thp);
-    if (thp->internal_flags & RTMUX_ITF_MSG_FORCE_RDY) {
-        ITF_CLR(thp, RTMUX_ITF_MSG_FORCE_RDY);
-        status = (unsigned) KSTATUS(thp);
-        wake = true;
-    }
-    kspinlock_unlock(&chp->lock);
-    if (wake)
-        force_ready(thp, status);
+    END_SMP_XFER_SELF(act);
+    msg_claim_release(chp, thp);
 }
 
 /* Whether an iov array of parts entries, which the kernel reads itself, lies
@@ -499,6 +577,47 @@ static bool fastmsg_iov_array_ok(const iov_t *iov,
         return false;
     last = base + (size_t) parts * sizeof(iov_t) - 1;
     return base <= last && WITHIN_BOUNDARY(base, last, prp->boundary_addr);
+}
+
+/* A message of a few entries that fits the short-message buffer is copied
+ * there; one of more entries goes the long way, in steps, whatever its length.
+ */
+#define SHORT_IOV_MAX 16
+
+/* Copy the bytes of the caller's iov array, which xfer_iov_sum() totalled,
+ * into a kernel buffer of exactly that many. Each entry is read once, into a
+ * snapshot, and checked against the boundary and against the room left: a
+ * sibling thread can rewrite the array after the total was taken, and an
+ * entry that grew must not run past the buffer.
+ *
+ * Returns EOK, or EFAULT when an entry cannot be read, lies outside the
+ * boundary, or the array no longer adds up to bytes.
+ */
+static int short_iov_copy(uint8_t *dst,
+                          size_t bytes,
+                          const iov_t *iov,
+                          int parts,
+                          uintptr_t bound)
+{
+    for (int i = 0; i < parts; i++) {
+        iov_t v;
+        uintptr_t base, last;
+        size_t len;
+
+        if (xfer_memcpy(&v, iov + i, sizeof(v)))
+            return EFAULT;
+        len = GETIOVLEN(&v);
+        if (!len)
+            continue;
+        base = (uintptr_t) GETIOVBASE(&v);
+        last = base + len - 1;
+        if (len > bytes || last < base || !WITHIN_BOUNDARY(base, last, bound) ||
+            xfer_memcpy(dst, (void *) base, len))
+            return EFAULT;
+        dst += len;
+        bytes -= len;
+    }
+    return bytes ? EFAULT : EOK;
 }
 
 /* Handle CPU vm_ops->as implementations that need the kernel locked */
@@ -598,6 +717,7 @@ static int sendv_body(thread_t *act,
     process_t *actprp = act->process;
     unsigned th_flags = 0;
     uint32_t remote_srcmsglen = -1U;
+    fastmsg_native_cap_tx_t captx;
 
     /* These are the usual incoming checks
      * - validate connection
@@ -617,6 +737,8 @@ static int sendv_body(thread_t *act,
      * lookup_rcvid_release at trap exit closes it.
      */
     lookup_rcvid_open();
+    captx.hdr = NULL;
+    captx.nxfers = 0;
 
     /* Lookup src connect. */
     {
@@ -708,42 +830,13 @@ static int sendv_body(thread_t *act,
             (uint32_t) ((struct _vtid_info *) (void *) kap->rmsg)->dstmsglen;
     } else if (kap->rparts >= 0) {
         size_t len = 0;
-        size_t len_last = 0;
-        iov_t *iov = kap->rmsg;
-        int rparts = kap->rparts;
-        int niov = 0;
 
-        /* Incoming reply iov_t -- make copy of reply IOVs Calculate reply
-         * length -- even if not requested, it is almost free Also do boundary
-         * check
-         */
-        while (rparts) {
-            uintptr_t base, last;
+        /* The reply vector: total it and check it, in steps. */
+        int rc =
+            xfer_iov_sum(act, kap->rmsg, kap->rparts, XFER_SCAN_ARRAY, &len);
 
-            len += GETIOVLEN(iov);
-            if (len < len_last) {
-                /* overflow. excessively long user iov_t, possibly overlayed.
-                 * pr62575
-                 */
-                return EOVERFLOW;
-            }
-            len_last = len;
-            base = (uintptr_t) GETIOVBASE(iov);
-            last = base + GETIOVLEN(iov) - 1;
-            if (((base > last) ||
-                 !WITHIN_BOUNDARY(base, last,
-                                  sender->process->boundary_addr)) &&
-                (GETIOVLEN(iov) != 0)) {
-                return EFAULT;
-            }
-            /* Keep copy of iov_t */
-            if (niov < _NUM_CACHED_REPLY_IOV) {
-                /*  sender->args.ms.riov[niov] = *iov; */
-            }
-            ++iov;
-            ++niov;
-            --rparts;
-        }
+        if (rc)
+            return rc == XFER_CALL_RESTART ? ENOERROR : rc;
         sender->args.ms.dstmsglen = (uint32_t) len;
     } else {
         /* Single part -- validate and store reply address */
@@ -801,60 +894,21 @@ static int sendv_body(thread_t *act,
             th_flags = RTMUX_FLG_THR_BUFF_MSG;
         }
     } else {
-        /* Multi iov_t case */
-        size_t len = 0;
-        size_t len_last = 0;
-        iov_t *iov = kap->smsg;
-        int sparts = kap->sparts;
-
-        /* Calculate send length -- even if not requested, it is almost free
-         * Also do boundary check
+        /* An array of several entries (or none): total and check it in steps,
+         * the second array of the call.
          */
-        while (sparts) {
-            uintptr_t base, last;
+        size_t len = 0;
+        int rc =
+            xfer_iov_sum(act, kap->smsg, kap->sparts, XFER_SCAN_SEND, &len);
 
-            len += GETIOVLEN(iov);
-            if (len < len_last) {
-                /* overflow. excessively long user iov_t, possibly overlayed.
-                 * pr62575
-                 */
-                return EOVERFLOW;
-            }
-            len_last = len;
-            base = (uintptr_t) GETIOVBASE(iov);
-            last = base + GETIOVLEN(iov) - 1;
-            if (((base > last) ||
-                 !WITHIN_BOUNDARY(base, last,
-                                  sender->process->boundary_addr)) &&
-                (GETIOVLEN(iov) != 0)) {
-                return EFAULT;
-            }
-            ++iov;
-            --sparts;
-
-            /* TODO: cache iov_t copy for deferred send (only needed if no
-             * receiver) if(niov < _NUM_CACHED_SEND_IOV) {
-             * sender->args.ms.siov[niov] = *iov; }
-             */
-        }
+        if (rc)
+            return rc == XFER_CALL_RESTART ? ENOERROR : rc;
         sender->args.ms.srcmsglen = (uint32_t) len;
-        if (len <= sizeof(sender->args.msbuff.buff)) {
-            size_t pos = 0;
-            iov = kap->smsg;
-            sparts = kap->sparts;
-
-            /* Multi-iov_t incoming message that is short FIXME -- need
-             * memcpy_siov for efficiency
-             */
-            while (sparts) {
-                size_t ilen = GETIOVLEN(iov);
-                __inline_xfer_memcpy(&sender->args.msbuff.buff[pos],
-                                     GETIOVBASE(iov), ilen);
-
-                pos += ilen;
-                iov++;
-                sparts--;
-            }
+        if (kap->sparts <= SHORT_IOV_MAX &&
+            len <= sizeof(sender->args.msbuff.buff)) {
+            if (short_iov_copy(sender->args.msbuff.buff, len, kap->smsg,
+                               kap->sparts, act->process->boundary_addr))
+                return EFAULT;
             sender->args.ms.msglen = (uint32_t) len;
             th_flags = RTMUX_FLG_THR_BUFF_MSG;
         }
@@ -902,9 +956,9 @@ static int sendv_body(thread_t *act,
         while (thp->internal_flags & RTMUX_ITF_WAIT_PENDING) {
             /* Tight spin: a normal in-flight wait-state transition clears
              * within a handful of iterations. If it never clears (the hang
-             * caught at this line under gdb), flood the red in-kernel marker so
-             * the wedge is visible on the console. Gated so the normal
-             * transient case stays silent.
+             * caught at this line under gdb), count spin marks so the wedge
+             * is visible in a crash or hang dump. Gated so the normal
+             * transient case counts nothing.
              */
             if ((++__wp_spins & 0xFFFFFU) == 0)
                 MARK_POTN_INF_LOOP();
@@ -913,7 +967,6 @@ static int sendv_body(thread_t *act,
         cpu_smp_mb();
     }
     if ((thp) && !(thp->internal_flags & RTMUX_ITF_RCVNOTIFICATION)) {
-        fastmsg_native_cap_tx_t captx;
         int xferstat;
         /* If an immediate timeout was specified we return immediately. */
         if (IMTO(act, STATE_REPLY)) {
@@ -930,35 +983,20 @@ static int sendv_body(thread_t *act,
         }
         /* Is this a long message? */
         if (th_flags == 0) {
-            int cap_patched = 0;
+            struct native_cap_status capst;
 
             sender->args.ms.smsg = kap->smsg;
             sender->args.ms.sparts = kap->sparts;
             thp->args.ms.rmsg = thp->args.ri.rmsg;
             thp->args.ms.rparts = thp->args.ri.rparts;
-            xferstat = fastmsg_native_cap_install_long(sender, thp, false,
-                                                       &captx, &cap_patched);
-            if (xferstat) {
-                if (xferstat & XFER_SRC_FAULT)
-                    goto send_fault;
-                if (xferstat & XFER_DST_FAULT)
-                    goto rcv_fault;
-#if CONFIG_PROCESSORS_MAX > 1 && defined(CONFIG_SMP_MSGOPT)
-                ITF_CLR(thp, RTMUX_ITF_MSG_DELIVERY);
-#endif
-                return xferstat;
-            }
             START_SMP_XFER(act, thp);
             /* Yes. Transfer the data. */
-            xferstat = fastmsg_xfer(thp, act, cap_patched);
+            xferstat = fastmsg_xfer(thp, act);
             if (xferstat == XFER_RESTART) {
                 fastmsg_step_yield(chp, act, thp);
                 return ENOERROR;
             }
             sender->args.ms.msglen = act->args.ms.msglen;
-            if (cap_patched)
-                sender->args.ms.msglen +=
-                    (uint32_t) sizeof(struct _io_native_hdr);
 
             /* thp's MSG_DELIVERY claim must stay set until the LINKPRIL_REM
              * further below; END_SMP_XFER_SELF drops only act's side (the full
@@ -996,9 +1034,6 @@ static int sendv_body(thread_t *act,
 #endif
 
             if (xferstat) {
-                if (cap_patched)
-                    fastmsg_native_cap_rollback(thp, &captx);
-
                 /* If sender faulted let him know and abort the operation
                  * without waking up the receiver.
                  */
@@ -1010,6 +1045,22 @@ static int sendv_body(thread_t *act,
                  * send.
                  */
                 goto rcv_fault;
+            }
+
+            /* The bytes are across and nothing restarts the call from here:
+             * install the capabilities the message names, if any.
+             */
+            if (!fastmsg_native_cap_finish_long(sender, thp, false, &captx,
+                                                &capst)) {
+                if (capst.fault & XFER_SRC_FAULT)
+                    goto send_fault;
+                if (capst.fault)
+                    goto rcv_fault;
+                /* The receiver stays queued for another sender; a wake that
+                 * was deferred to this claim meanwhile is delivered.
+                 */
+                msg_claim_release(chp, thp);
+                return capst.err;
             }
         } else {
             /* Short message. We do the following:
@@ -1090,8 +1141,6 @@ static int sendv_body(thread_t *act,
             }
         }
 
-        SETKSTATUS(thp, (sender->tid << 16) | cop->scoid);
-
         /* The destroyer drains receive_queue before reply_queue. Publish the
          * sender in the same locked transition that removes the receiver,
          * or the destroyer can observe both queues empty and leave the sender
@@ -1102,9 +1151,15 @@ static int sendv_body(thread_t *act,
         LINKPRIL_REM(thp);
         sender->state = STATE_REPLY;
         LINKPRIL_BEG(chp->reply_queue, sender, thread_t);
-#if CONFIG_PROCESSORS_MAX > 1 && defined(CONFIG_SMP_MSGOPT)
-        ITF_CLR(thp, RTMUX_ITF_MSG_DELIVERY);
-#endif
+
+        /* The delivery completes the receive, so it supersedes a wake that
+         * was deferred to this claim, as a reply supersedes one for its
+         * client. The receiver's status is stored here, under the lock that
+         * force_ready_msgxfer writes its own under, so a deferred wake cannot
+         * leave its error where the rcvid belongs.
+         */
+        SETKSTATUS(thp, (sender->tid << 16) | cop->scoid);
+        ITF_CLR(thp, RTMUX_ITF_MSG_DELIVERY | RTMUX_ITF_MSG_FORCE_RDY);
         kspinlock_unlock(&chp->lock);
 
         sender->args.ms.server = thp;
@@ -1413,17 +1468,19 @@ static int sendv_body(thread_t *act,
 
 send_fault:
     atomic_clr(&sender->flags, RTMUX_FLG_THR_BUFF_MSG);
-#if CONFIG_PROCESSORS_MAX > 1 && defined(CONFIG_SMP_MSGOPT)
 
-    /* Clear MSG_DELIVERY claim acquired at the receive_queue peek; we never
-     * reached LINKPRIL_REM, but thp is still valid (the fault was on the sender
-     * side) and remains on the queue.
+    /* The receiver was never unlinked (the fault was on the sender's side) and
+     * stays queued for another sender: give the claim up, and deliver a wake
+     * that was deferred to it meanwhile.
      */
-    ITF_CLR(thp, RTMUX_ITF_MSG_DELIVERY);
-#endif
+    msg_claim_release(chp, thp);
     return EFAULT;
 
 rcv_fault:
+    /* The receiver is failed: it keeps none of the capabilities installed
+     * for this message.
+     */
+    fastmsg_native_cap_rollback(thp, &captx);
     atomic_clr(&sender->flags, RTMUX_FLG_THR_BUFF_MSG);
     kcall_err(thp, EFAULT);
 
@@ -1791,41 +1848,15 @@ int kdecl ksys_msg_receivev(thread_t *act, struct kcall_args_msg_receivev *kap)
     /* Validate incoming IOVs and calculate receive length */
     if (kap->rparts >= 0) {
         size_t len = 0;
-        size_t len_last = 0;
-        iov_t *iov = kap->rmsg;
-        int rparts = kap->rparts;
 
-        if (kap->rparts != 0) {
-            if (!WITHIN_BOUNDARY((uintptr_t) iov, (uintptr_t) (&iov[rparts]),
-                                 act->process->boundary_addr)) {
-                return EFAULT;
-            }
-        }
-
-        /* Calculate receive length -- even if not requested, we use it for
-         * msginfo Do boundary check
+        /* The array must lie inside the caller's space, entries included;
+         * its total is the room the receive has, used for msginfo.
          */
-        while (rparts) {
-            uintptr_t base, last;
+        int rc =
+            xfer_iov_sum(act, kap->rmsg, kap->rparts, XFER_SCAN_ARRAY, &len);
 
-            len += GETIOVLEN(iov);
-            if (len < len_last) {
-                /* overflow. excessively long user iov_t, possibly overlayed.
-                 * pr62575
-                 */
-                return EOVERFLOW;
-            }
-            len_last = len;
-            base = (uintptr_t) GETIOVBASE(iov);
-            last = base + GETIOVLEN(iov) - 1;
-            if (((base > last) ||
-                 !WITHIN_BOUNDARY(base, last, act->process->boundary_addr)) &&
-                (GETIOVLEN(iov) != 0)) {
-                return EFAULT;
-            }
-            ++iov;
-            --rparts;
-        }
+        if (rc)
+            return rc == XFER_CALL_RESTART ? ENOERROR : rc;
         act->args.ms.srcmsglen = (uint32_t) len;
     } else {
         /* Single part -- validate receive address */
@@ -1925,6 +1956,19 @@ restart_recv:
         while (thp->internal_flags & RTMUX_ITF_WAIT_PENDING)
             __asm__ volatile("" ::: "memory");
         cpu_smp_mb();
+
+        /* A sender that is claimed and on the send queue is blocked on its
+         * connection, so a NULL here is not expected; it was seen once all
+         * the same (a load fault on cop->flags in fastmsg_fill_rcvinfo).
+         * Nothing is delivered from a sender in that state: give it up,
+         * before anything is copied or installed, and look at the queue
+         * again.
+         */
+        if (!__atomic_load_n(&thp->blocked_on, __ATOMIC_ACQUIRE)) {
+            fastmsg_step_yield(chp, act, thp);
+            KCALL_RESTART(act);
+            return ENOERROR;
+        }
     }
 
     if (notification_chosen) {
@@ -1969,9 +2013,11 @@ restart_recv:
 
     if (thp) {
         fastmsg_native_cap_tx_t captx;
+        struct native_cap_status capst;
         int capstat = EOK;
-        int cap_patched = 0;
         int xferstat;
+        bool deferred;
+        unsigned deferred_status = 0;
 
         captx.hdr = NULL;
         captx.nxfers = 0;
@@ -2000,19 +2046,10 @@ restart_recv:
             act->args.ri.rmsg = kap->rmsg;
             act->args.ri.rparts = kap->rparts;
 
-            capstat = fastmsg_native_cap_install_long(thp, act, false, &captx,
-                                                      &cap_patched);
-            if (capstat == EOK) {
-                xferstat = fastmsg_xfer(act, thp, cap_patched);
-                if (xferstat == XFER_RESTART) {
-                    fastmsg_step_yield(chp, act, thp);
-                    return ENOERROR;
-                }
-            } else if (capstat & (XFER_SRC_FAULT | XFER_DST_FAULT)) {
-                xferstat = capstat;
-                capstat = EOK;
-            } else {
-                xferstat = 0;
+            xferstat = fastmsg_xfer(act, thp);
+            if (xferstat == XFER_RESTART) {
+                fastmsg_step_yield(chp, act, thp);
+                return ENOERROR;
             }
 
 
@@ -2041,6 +2078,15 @@ restart_recv:
                 return ENOERROR;
             }
 #endif
+
+            /* The bytes are across and nothing restarts the call from here:
+             * install the capabilities the message names, if any.
+             */
+            if (!xferstat && !fastmsg_native_cap_finish_long(thp, act, false,
+                                                             &captx, &capst)) {
+                xferstat = capst.fault;
+                capstat = capst.err;
+            }
         }
 
         if (capstat != EOK) {
@@ -2079,9 +2125,6 @@ restart_recv:
             act->timeout_flags = 0;
             return EFAULT;
         }
-        if (cap_patched)
-            thp->args.ms.msglen += (uint32_t) sizeof(struct _io_native_hdr);
-
         if (TYPE_MASK(thp->type) == TYPE_VTHREAD) {
             tid = thp->args.ri.rparts;
         } else {
@@ -2089,6 +2132,16 @@ restart_recv:
                 (int) thp->tid; /* tid fits in int, used in rcvid calculation */
         }
         cop = thp->blocked_on;
+        if (!cop) {
+            /* It went since the check after the claim: undo what the
+             * delivery did for the receiver and start again.
+             */
+            fastmsg_native_cap_rollback(act, &captx);
+            fastmsg_step_yield(chp, act, thp);
+            KCALL_RESTART(act);
+            act->restart = NULL;
+            return ENOERROR;
+        }
         if (thp->args.ms.srcmsglen == ~0U) {
             /* This should never occur with the new code */
             crash();
@@ -2147,8 +2200,21 @@ restart_recv:
             SETKSTATUS(act, -((tid << 16) | cop->scoid));
         }
         LINKPRIL_BEG(chp->reply_queue, thp, thread_t);
+
+        /* A wake that was deferred to this claim (a timeout, a signal, a
+         * teardown) still stands for the sender, which waits for a reply
+         * now: take it over here, in the window that drops the claim, and
+         * deliver it below.
+         */
+        deferred = (thp->internal_flags & RTMUX_ITF_MSG_FORCE_RDY) != 0;
+        if (deferred) {
+            ITF_CLR(thp, RTMUX_ITF_MSG_FORCE_RDY);
+            deferred_status = (unsigned) KSTATUS(thp);
+        }
         END_SMP_XFER(act, thp);
         kspinlock_unlock(&chp->lock);
+        if (deferred)
+            (void) force_ready(thp, deferred_status);
 
         /* The sender blocked in SEND before any receiver was waiting, so its
          * reply timeout was not armed (timeout_start only arms for the state
@@ -2158,7 +2224,7 @@ restart_recv:
          * (TIMEOUT_ACTIVE guard). thp is on reply_queue with WAIT_PENDING clear
          * and no lock is held, so an expired deadline may fire inline.
          */
-        if (thp->timeout_flags & RTMUX_TIMEOUT_REPLY)
+        if (!deferred && (thp->timeout_flags & RTMUX_TIMEOUT_REPLY))
             timeout_start(thp);
 
         /* By default the receiver runs with message driven priority. RUSH: Fix
@@ -2360,86 +2426,55 @@ static int msg_replyv_body(thread_t *act,
 {
     connect_t *cop;
     thread_t *thp;
-    channel_t *chp; /* = cop->channel, for chp->lock */
-    int xferstat, status;
+    channel_t *chp; /* the channel thp is reply-blocked on, for chp->lock */
+    int xferstat, status, scan_rc = EOK;
+    size_t vector_bytes = 0;
     unsigned flags = 0;
 
-    /* Reply-queue exclusion stays under chp->lock; receiver claim under
-     * MSG_DELIVERY is preserved.
+    /* Total and check an array of several entries first of all, in steps:
+     * nothing is held yet, so a step that restarts the call has nothing to
+     * undo. A bad array is acted on below, once the client is claimed and can
+     * be failed with it.
      */
+    if (kap->sparts > 1) {
+        scan_rc = xfer_iov_sum(act, kap->smsg, kap->sparts, XFER_SCAN_ARRAY,
+                               &vector_bytes);
+        if (scan_rc == XFER_CALL_RESTART)
+            return ENOERROR;
+    }
 
-    /* Future: Think about an inline version of this for speed */
     if ((cop = lookup_rcvid((kcall_args_t *) (void *) kap, kap->rcvid, &thp)) ==
         NULL) {
         return ENOERROR;
     }
-    chp = cop->channel; /* channel for the per-channel chp->lock */
-
-    /* Spin-wait if thp is mid-transition into STATE_REPLY + on reply_queue.
-     * Pairs with ksys_msg_sendv's WAIT_PENDING set+clear around its
-     * sender->state = STATE_REPLY → LINKPRIL_BEG window. The bridge prevents us
-     * from acting on a thp whose state has been set but whose reply_queue
-     * insertion has not landed (which would make our LINKPRIL_REM dereference a
-     * stale prev pointer). The trailing fence pairs with the writer's
-     * smp_mb-before-clear.
+    /* Claim thp with MSG_DELIVERY, under chp->lock, once it is known to be
+     * reply-blocked on this connection and free of any other claim. From
+     * here, with CONFIG_SMP_MSGOPT, force_ready on thp defers to this call
+     * (dispatch.c's STATE_REPLY arm), so the unlinks at the success and
+     * error tails cannot race a ConnectDetach or channel-destroy wake. Every
+     * path that leaves before those tails must give the claim up with
+     * msg_claim_release().
      */
-    while (thp->internal_flags & RTMUX_ITF_WAIT_PENDING)
-        __asm__ volatile("" ::: "memory");
-    cpu_smp_mb();
+    status = reply_client_claim(act, &cop, thp, &chp);
+    if (status)
+        return status == EAGAIN ? ENOERROR : status;
 
-    /* Claim thp via RTMUX_ITF_MSG_DELIVERY under chp->lock after re-validating
-     * state. Mirrors the claim in sendv: once the bit is set, force_ready on
-     * thp defers (via force_ready_msgxfer in dispatch.c's STATE_REPLY case) so
-     * the LINKPRIL_REM(thp) at the success/error tails of this kcall can no
-     * longer race against a concurrent ksys_connect_detach's EBADF wakeup
-     * cascade. The bit is cleared INSIDE chp->lock after each LINKPRIL_REM
-     * (success path + xfer_err path). Every early-return path between here and
-     * LINKPRIL_REM must clear it — see the explicit clears below.
-     */
-#if CONFIG_PROCESSORS_MAX > 1 && defined(CONFIG_SMP_MSGOPT)
-    kspinlock_lock(&chp->lock);
-    if (thp->state != STATE_REPLY && thp->state != STATE_NET_REPLY) {
-        kspinlock_unlock(&chp->lock);
-        return ESRCH;
-    }
-    ITF_SET(thp, RTMUX_ITF_MSG_DELIVERY);
-    kspinlock_unlock(&chp->lock);
-#else
-
-    /* Make sure thread is replied blocked on a channel owned by this process.
-     */
-    if (thp->state != STATE_REPLY && thp->state != STATE_NET_REPLY) {
-        return ESRCH;
-    }
-#endif
-
-    /* See comment in ksys_msg_error about channel_destroy handling. This is a
-     * placeholder to make sure that the remote IPC service keeps calling
-     * msg_error rather than msg_reply.
+    /* Channel destruction with remote connections is answered by msg_error,
+     * never by a reply (see ksys_msg_error).
      */
     CRASHCHECK(_TRACE_GETSYSCALL(thp->syscall) == __KSYS_CHANNEL_DESTROY);
 
-    /* Verify that the message has been fully received, and that the receiving
-     * thread has completed any specialret() processing that needs to be done.
-     */
-    if (thp->internal_flags & RTMUX_ITF_SPECRET_PENDING) {
-#if CONFIG_PROCESSORS_MAX > 1 && defined(CONFIG_SMP_MSGOPT)
-        ITF_CLR(thp, RTMUX_ITF_MSG_DELIVERY);
-#endif
-        return ESRCH;
-    }
-
-    cop = reply_client_connection(thp, cop);
-    if (!cop) {
-#if CONFIG_PROCESSORS_MAX > 1 && defined(CONFIG_SMP_MSGOPT)
-        ITF_CLR(thp, RTMUX_ITF_MSG_DELIVERY);
-#endif
-        return ESRCH;
-    }
-
     if (thp->internal_flags & RTMUX_ITF_UNBLOCK_QUEUED) {
         remove_unblock(thp, cop, kap->rcvid);
-        KSYS_PREEMPT(act, ENOERROR);
+        /* The queue walk above is as long as the send queue. A restart
+         * leaves the kernel, so it may not keep the claim: the restarted
+         * call takes it again, and so may whoever runs in between.
+         */
+        if (NEED_PREEMPT(act) || inject_reply_unblock_preempt()) {
+            msg_claim_release(chp, thp);
+            KCALL_RESTART(act);
+            return ENOERROR;
+        }
     }
 
     atomic_clr(&thp->flags, (RTMUX_FLG_THR_BUFF_MSG | RTMUX_FLG_THR_SHORT_MSG));
@@ -2502,64 +2537,20 @@ static int msg_replyv_body(thread_t *act,
                 flags = RTMUX_FLG_THR_BUFF_MSG;
             }
         } else {
-            /* Multi iov_t case */
-            size_t len = 0;
-            size_t len_last = 0;
-            iov_t *iov = kap->smsg;
-            int sparts = kap->sparts;
-
-            /* Calculate reply length -- even if not requested, it is almost
-             * free Also do boundary check
-             */
-            while (sparts) {
-                uintptr_t base, last;
-
-                len += GETIOVLEN(iov);
-                if (len < len_last) {
-                    /* overflow. excessively long user iov_t, possibly
-                     * overlayed. pr62575
-                     */
-                    xferstat = XFER_SRC_FAULT;
-                    goto xfer_err;
-                }
-                len_last = len;
-                base = (uintptr_t) GETIOVBASE(iov);
-                last = base + GETIOVLEN(iov) - 1;
-                if (((base > last) ||
-                     !WITHIN_BOUNDARY(base, last,
-                                      act->process->boundary_addr)) &&
-                    (GETIOVLEN(iov) != 0)) {
-                    xferstat = XFER_SRC_FAULT;
-                    goto xfer_err;
-                }
-                ++iov;
-                --sparts;
-
-                /* TODO: cache iov_t copy for deferred send (only needed if no
-                 * receiver) if(niov < _NUM_CACHED_SEND_IOV) {
-                 * act->args.ms.siov[niov] = *iov; }
-                 */
+            /* An array of several entries, totalled and checked on entry. */
+            if (scan_rc) {
+                xferstat = XFER_SRC_FAULT;
+                goto xfer_err;
             }
-            if (len <= sizeof(thp->args.msbuff.buff)) {
-                size_t pos = 0;
-                iov = kap->smsg;
-                sparts = kap->sparts;
-
-                /* Multi-iov_t incoming message that is short Optimization --
-                 * need memcpy_siov for efficiency
-                 */
-                while (sparts) {
-                    if ((xferstat =
-                             xfer_memcpy(&thp->args.msbuff.buff[pos],
-                                         GETIOVBASE(iov), GETIOVLEN(iov)))) {
-                        goto xfer_err;
-                    }
-
-                    pos += GETIOVLEN(iov);
-                    iov++;
-                    sparts--;
+            if (kap->sparts <= SHORT_IOV_MAX &&
+                vector_bytes <= sizeof(thp->args.msbuff.buff)) {
+                if (short_iov_copy(thp->args.msbuff.buff, vector_bytes,
+                                   kap->smsg, kap->sparts,
+                                   act->process->boundary_addr)) {
+                    xferstat = XFER_SRC_FAULT;
+                    goto xfer_err;
                 }
-                thp->args.ms.msglen = (uint32_t) len;
+                thp->args.ms.msglen = (uint32_t) vector_bytes;
                 flags = RTMUX_FLG_THR_BUFF_MSG;
             }
         }
@@ -2573,21 +2564,13 @@ static int msg_replyv_body(thread_t *act,
 
         /* This is a long message */
         if (flags == 0) {
-            int cap_patched = 0;
+            struct native_cap_status capst;
 
             act->args.ms.smsg = kap->smsg;
             act->args.ms.sparts = kap->sparts;
-            xferstat = native_reply ? fastmsg_native_cap_install_long(
-                                          act, thp, true, &captx, &cap_patched)
-                                    : 0;
-            if (xferstat) {
-                if ((xferstat & (XFER_SRC_FAULT | XFER_DST_FAULT)) == 0)
-                    xferstat = XFER_SRC_FAULT;
-                goto xfer_err;
-            }
             START_SMP_XFER(act, thp);
             /* Yes. Transfer the data. */
-            xferstat = fastmsg_xfer(thp, act, cap_patched);
+            xferstat = fastmsg_xfer(thp, act);
             if (xferstat == XFER_RESTART) {
                 fastmsg_step_yield(chp, act, thp);
                 return ENOERROR;
@@ -2611,8 +2594,12 @@ static int msg_replyv_body(thread_t *act,
                 return ENOERROR;
             }
 #endif
-            if (xferstat)
-                fastmsg_native_cap_rollback(thp, &captx);
+            /* The bytes are across and nothing restarts the call from here.
+             * A reply the kernel cannot vouch for fails as a bad source does.
+             */
+            if (!xferstat && native_reply &&
+                !fastmsg_native_cap_finish_long(act, thp, true, &captx, &capst))
+                xferstat = capst.fault ? capst.fault : XFER_SRC_FAULT;
         } else {
             /* Short message. We only do something if there is no target as --
              * reply to proc case. Else, this is handled in specret.
@@ -2688,13 +2675,11 @@ static int msg_replyv_body(thread_t *act,
         thp->blocked_on = NULL;
         IPC_BLK(thp);
     }
-#if CONFIG_PROCESSORS_MAX > 1 && defined(CONFIG_SMP_MSGOPT)
     /* The reply completes the exchange, so it supersedes an abort a channel
      * destroy deferred to us; drop that flag with the claim, in the same lock
      * window, so it cannot linger on a healthy client.
      */
     ITF_CLR(thp, RTMUX_ITF_MSG_DELIVERY | RTMUX_ITF_MSG_FORCE_RDY);
-#endif
     kspinlock_unlock(&chp->lock);
     if (connect_links_drop(cop)) {
         connect_detach(cop, thp->priority);
@@ -2729,9 +2714,7 @@ xfer_err:
         thp->blocked_on = NULL;
         IPC_BLK(thp);
     }
-#if CONFIG_PROCESSORS_MAX > 1 && defined(CONFIG_SMP_MSGOPT)
     ITF_CLR(thp, RTMUX_ITF_MSG_DELIVERY | RTMUX_ITF_MSG_FORCE_RDY);
-#endif
     kspinlock_unlock(&chp->lock);
     atomic_clr(&thp->flags, (RTMUX_FLG_THR_BUFF_MSG | RTMUX_FLG_THR_SHORT_MSG));
 
@@ -2761,77 +2744,17 @@ static int msg_error_body(thread_t *act,
 {
     connect_t *cop;
     thread_t *thp;
-    channel_t *chp; /* = cop->channel, for chp->lock */
-
-    /* Reply-queue exclusion stays under chp->lock; receiver claim under
-     * MSG_DELIVERY is preserved.
-     */
+    channel_t *chp; /* the channel thp is reply-blocked on, for chp->lock */
+    int status;
 
     if ((cop = lookup_rcvid((kcall_args_t *) (void *) kap, kap->rcvid, &thp)) ==
         NULL) {
         return ENOERROR;
     }
-    chp = cop->channel; /* channel for the per-channel chp->lock */
-
-#if CONFIG_PROCESSORS_MAX > 1 && defined(CONFIG_SMP_MSGOPT)
-
-    /* Atomic state-check + MSG_DELIVERY claim under chp->lock. Mirrors the
-     * claim pattern in ksys_msg_replyv. Without this, the window between a
-     * plain state check and the eventual LINKPRIL_REM lets a concurrent
-     * ksys_msg_replyv (or a force_ready cascade from ksys_connect_detach's
-     * EBADF path) wake thp first; we then arrive at ready(thp) with thp already
-     * STATE_READY — caught by the READY invariant in dispatch.c.
-     *
-     * If state has already flipped, OR another path is mid-claim on this thread
-     * (replyv claimed MSG_DELIVERY), bail with ESRCH. The rcvid is effectively
-     * gone from the perspective of this msg_error caller — it can either retry
-     * or accept that the reply (or another error) won the race.
-     *
-     * force_ready's STATE_REPLY case checks MSG_DELIVERY and defers via
-     * force_ready_msgxfer when set, so once we hold the claim concurrent wakers
-     * stand off.
-     */
-    kspinlock_lock(&chp->lock);
-    if (thp->state != STATE_REPLY && thp->state != STATE_NET_REPLY) {
-        kspinlock_unlock(&chp->lock);
-        return ESRCH;
-    }
-    if (thp->internal_flags & RTMUX_ITF_SPECRET_PENDING) {
-        kspinlock_unlock(&chp->lock);
-        return ESRCH;
-    }
-    if (thp->internal_flags & RTMUX_ITF_MSG_DELIVERY) {
-        /* Another path holds the claim on this thread. */
-        kspinlock_unlock(&chp->lock);
-        return ESRCH;
-    }
-    cop = reply_client_connection(thp, cop);
-    if (!cop) {
-        kspinlock_unlock(&chp->lock);
-        return ESRCH;
-    }
-    ITF_SET(thp, RTMUX_ITF_MSG_DELIVERY);
-    kspinlock_unlock(&chp->lock);
-#else
-
-    /* Make sure thread is replied blocked on a channel owned by this process.
-     */
-    if (thp->state != STATE_REPLY && thp->state != STATE_NET_REPLY) {
-        return ESRCH;
-    }
-
-    /* Verify that the message has been fully received, and that the receiving
-     * thread has completed any specialret() processing that needs to be done.
-     */
-    if (thp->internal_flags & RTMUX_ITF_SPECRET_PENDING) {
-        return ESRCH;
-    }
-
-    cop = reply_client_connection(thp, cop);
-    if (!cop) {
-        return ESRCH;
-    }
-#endif
+    /* Same claim as ksys_msg_replyv. */
+    status = reply_client_claim(act, &cop, thp, &chp);
+    if (status)
+        return status == EAGAIN ? ENOERROR : status;
 
     if (thp->internal_flags & RTMUX_ITF_UNBLOCK_QUEUED) {
         remove_unblock(thp, cop, kap->rcvid);
@@ -2882,14 +2805,15 @@ static int msg_error_body(thread_t *act,
     kspinlock_lock(&chp->lock);
     LINKPRIL_REM(thp);
     reply_pending_loan_locked(act, chp, changedp);
-    /* Complete the exchange under the lock; see ksys_msg_replyv. */
+    /* Complete the exchange under the lock; see ksys_msg_replyv. The error
+     * supersedes a deferred abort as a reply does: a MSG_FORCE_RDY left on
+     * the readied client would make a later force_ready ready it twice.
+     */
     if (thp->blocked_on == cop) {
         thp->blocked_on = NULL;
         IPC_BLK(thp);
     }
-#if CONFIG_PROCESSORS_MAX > 1 && defined(CONFIG_SMP_MSGOPT)
-    ITF_CLR(thp, RTMUX_ITF_MSG_DELIVERY);
-#endif
+    ITF_CLR(thp, RTMUX_ITF_MSG_DELIVERY | RTMUX_ITF_MSG_FORCE_RDY);
     kspinlock_unlock(&chp->lock);
     if (connect_links_drop(cop)) {
         connect_detach(cop, thp->priority);

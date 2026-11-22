@@ -6,6 +6,7 @@
  */
 
 #include <core/globals.h>
+#include "reply-client.h"
 #include <unistd.h>
 #include <user-slice.h>
 
@@ -169,7 +170,12 @@ void rdecl get_rcvinfo(thread_t *thp,
         rep->pid = cop->process->pid;
         rep->flags = 0;
     }
-    rep->chid = cop->channel ? cop->channel->chid : -1;
+    {
+        /* Read once: a channel destroy clears the field at any moment. */
+        channel_t *chp = __atomic_load_n(&cop->channel, __ATOMIC_ACQUIRE);
+
+        rep->chid = chp ? chp->chid : -1;
+    }
     rep->scoid = cop->scoid | RTMUX_SIDE_CHANNEL;
     rep->msglen = thp->args.ms.msglen;
     rep->srcmsglen = (thp->flags & RTMUX_FLG_THR_BUFF_MSG)
@@ -463,6 +469,30 @@ done:
 }
 
 
+/* Take a vthread off the queue of cop's channel, the send queue or the reply
+ * queue by its state, under the channel's lock. The channel is read once: a
+ * channel destroy clears cop->channel at any moment, after it has drained
+ * both queues, so a vthread found without a channel is on neither.
+ */
+static void remote_ipc_unqueue(connect_t *cop, thread_t *thp)
+{
+    channel_t *chp = __atomic_load_n(&cop->channel, __ATOMIC_ACQUIRE);
+
+    if (!chp)
+        return;
+    kspinlock_lock(&chp->lock);
+    switch (thp->state) {
+    case STATE_SEND:
+    case STATE_NET_SEND:
+        pril_rem(&chp->send_queue, thp);
+        break;
+    default:
+        LINKPRIL_REM(thp);
+        break;
+    }
+    kspinlock_unlock(&chp->lock);
+}
+
 /* Forward a kernel message operation to the remote IPC service.
  *
  * Packages the active thread's msg_read/Write/Reply/Error/DeliverEvent request
@@ -498,20 +528,7 @@ connect_t *rdecl remote_ipc_send(kcall_args_t *kap,
                 thp->args.ms.server->client = 0;
                 thp->args.ms.server = 0;
             }
-            /* Queue mutation under the per-channel lock */
-            kspinlock_lock(&cop->channel->lock);
-            switch (thp->state) {
-            case STATE_SEND:
-            case STATE_NET_SEND:
-                /* Remove vthread from send queue */
-                pril_rem(&cop->channel->send_queue, thp);
-                break;
-            default:
-                /* Remove vthread from reply queue */
-                LINKPRIL_REM(thp);
-                break;
-            }
-            kspinlock_unlock(&cop->channel->lock);
+            remote_ipc_unqueue(cop, thp);
             thp->state = STATE_STOPPED;
             snap_time(&thp->timestamp_last_block, 0);
 
@@ -604,20 +621,7 @@ connect_t *rdecl remote_ipc_send(kcall_args_t *kap,
             thp->args.ms.server->client = 0;
             thp->args.ms.server = 0;
         }
-        /* Queue mutation under the per-channel lock */
-        kspinlock_lock(&cop->channel->lock);
-        switch (thp->state) {
-        case STATE_SEND:
-        case STATE_NET_SEND:
-            /* Remove vthread from send queue */
-            pril_rem(&cop->channel->send_queue, thp);
-            break;
-        default:
-            /* Remove vthread from reply queue */
-            LINKPRIL_REM(thp);
-            break;
-        }
-        kspinlock_unlock(&cop->channel->lock);
+        remote_ipc_unqueue(cop, thp);
         thp->state = STATE_STOPPED;
 
         _TRACE_TH_EMIT_STATE(thp, STOPPED);
@@ -629,7 +633,8 @@ connect_t *rdecl remote_ipc_send(kcall_args_t *kap,
     /* this is not a client blocked for server, no onbehalf */
     act->args.ms.server = 0;
     act->args.ms.coid = vtid;
-    debug_set_blocked_connect(act, cop, cop->channel);
+    debug_set_blocked_connect(act, cop,
+                              __atomic_load_n(&cop->channel, __ATOMIC_ACQUIRE));
     act->state = STATE_REPLY;
     act->restart = 0;
 
@@ -729,6 +734,124 @@ void rdecl remove_unblock(thread_t *thp, connect_t *cop, int rcvid)
 
     atomic_clr((volatile unsigned *) &thp->internal_flags,
                RTMUX_ITF_UNBLOCK_QUEUED);
+}
+
+/* Lock the channel that serves the reply-blocked client an rcvid named.
+ *
+ * Returns the connection the client is blocked on, with *chpp locked, or NULL
+ * with nothing locked when the rcvid no longer names such a client (ESRCH).
+ *
+ * The rcvid lookup keeps received and client allocated, and its RCU-sched
+ * section (open until the kcall leaves the kernel) keeps a channel that was
+ * read from received->channel allocated: ksys_channel_destroy clears that
+ * field before its rcu_sched_synchronize() and object_free(). It does not
+ * keep the connection attached: a destroy on another hart drains the reply
+ * queue, unpublishes the connection and clears the field at any moment, so
+ * the field is read once and a NULL fails the call. A client found here in
+ * STATE_REPLY and blocked on the connection is on chp's reply queue, since
+ * the sender links itself under chp->lock and the destroy drain unlinks it
+ * under the same lock before it detaches the connection. That holds for a
+ * client blocked on a virtual connection of received as well: it is attached
+ * to the channel of its master (ksys_connect_attach) and detached with it.
+ *
+ * A sender stores STATE_REPLY, its queue link and blocked_on in separate
+ * steps bracketed by WAIT_PENDING, and its receiver can run and use the rcvid
+ * on another hart before the last one, so wait the bracket out first.
+ */
+connect_t *reply_client_lock(connect_t *received,
+                             thread_t *client,
+                             channel_t **chpp)
+{
+    channel_t *chp;
+    connect_t *bound;
+
+    while (client->internal_flags & RTMUX_ITF_WAIT_PENDING)
+        __asm__ volatile("" ::: "memory");
+    cpu_smp_mb();
+    inject_reply_claim_stall(received);
+    chp = __atomic_load_n(&received->channel, __ATOMIC_ACQUIRE);
+    if (!chp)
+        return NULL;
+    kspinlock_lock(&chp->lock);
+    if ((client->state == STATE_REPLY || client->state == STATE_NET_REPLY) &&
+        !(client->internal_flags & RTMUX_ITF_SPECRET_PENDING) &&
+        (bound = reply_client_connection(client, received)) != NULL) {
+        *chpp = chp;
+        return bound;
+    }
+    kspinlock_unlock(&chp->lock);
+    return NULL;
+}
+
+/* Take the MSG_DELIVERY claim on a client found by reply_client_lock(), with
+ * the channel lock still held. A client some other path has claimed is not
+ * taken: the bit has one owner, and setting it twice lets the first release
+ * expose the second owner's copy. The bit is set in every configuration, so
+ * that it excludes the claimers from each other even where force_ready does
+ * not read it (no CONFIG_SMP_MSGOPT).
+ */
+bool reply_client_claim_locked(thread_t *client)
+{
+    if (client->internal_flags & RTMUX_ITF_MSG_DELIVERY)
+        return false;
+    ITF_SET(client, RTMUX_ITF_MSG_DELIVERY);
+    return true;
+}
+
+/* Claim the reply-blocked client an rcvid named, for a reply, an error or a
+ * follow-up copy: reply_client_lock(), the claim, and the unlock. While the
+ * claim is held force_ready defers to the claimer and the channel cannot
+ * finish its destroy drain, so *chpp and *copp stay usable until
+ * msg_claim_release() or the caller's own unlink.
+ *
+ * Returns EOK with *copp the connection the client is blocked on; ESRCH when
+ * the rcvid no longer names a reply-blocked client; or EAGAIN when the client
+ * is there but another thread's reply, error or follow-up copy holds it. That
+ * claim lasts no longer than one kernel entry of its holder, and failing the
+ * call would lose a reply that is still deliverable, so act's call has been
+ * restarted (KCALL_RESTART) to find the client free, or gone, on a later
+ * entry: the caller only returns.
+ */
+int reply_client_claim(thread_t *act,
+                       connect_t **copp,
+                       thread_t *client,
+                       channel_t **chpp)
+{
+    connect_t *bound = reply_client_lock(*copp, client, chpp);
+    bool taken;
+
+    if (!bound)
+        return ESRCH;
+    taken = reply_client_claim_locked(client);
+    kspinlock_unlock(&(*chpp)->lock);
+    if (!taken) {
+        KCALL_RESTART(act);
+        return EAGAIN;
+    }
+    *copp = bound;
+    return EOK;
+}
+
+/* Give up a MSG_DELIVERY claim on a peer without completing the exchange,
+ * and deliver a wake that force_ready deferred to the claimer meanwhile.
+ * force_ready takes the scheduler lock, which ranks below the channel lock,
+ * so it runs after the unlock.
+ */
+void msg_claim_release(channel_t *chp, thread_t *peer)
+{
+    unsigned status = 0;
+    bool wake = false;
+
+    kspinlock_lock(&chp->lock);
+    ITF_CLR(peer, RTMUX_ITF_MSG_DELIVERY);
+    if (peer->internal_flags & RTMUX_ITF_MSG_FORCE_RDY) {
+        ITF_CLR(peer, RTMUX_ITF_MSG_FORCE_RDY);
+        status = (unsigned) KSTATUS(peer);
+        wake = true;
+    }
+    kspinlock_unlock(&chp->lock);
+    if (wake)
+        force_ready(peer, status);
 }
 
 /* A receiving server can disown its previous client as that client times out

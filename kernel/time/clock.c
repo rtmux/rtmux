@@ -68,10 +68,9 @@ int kdecl ksys_clock_time(thread_t *act, struct kcall_args_clock_time *kap)
             return ESRCH;
         }
         if ((tid + 1) == 0) {
-            /* Get process running time. The banked value lacks the caller's own
-             * unbilled stretch (it is running, on this hart), so add it;
-             * threads of the process running on other harts contribute only
-             * what they have banked.
+            /* Get process running time: the banked total, after banking the
+             * caller's own unbilled stretch below. Threads of the process
+             * running on other harts contribute only what they have banked.
              */
             rtp = &prp->running_time;
             thp = NULL;
@@ -84,24 +83,38 @@ int kdecl ksys_clock_time(thread_t *act, struct kcall_args_clock_time *kap)
             rtp = &thp->running_time;
         }
 
-        /* Loop until we get a consistent time */
-        do {
-            old = *rtp;
-        } while (old != *rtp);
-
-        /* Add the live, not-yet-billed stretch of a running thread, read under
-         * the owner hart's pc_account_seq seqcount (sched_account_read falls
-         * back to the banked value after three torn attempts). Read-only, so
-         * the owner-hart-writes invariant of sched_account_current() holds.
-         */
-        {
+        if (thp) {
+            /* Add the live, not-yet-billed stretch of a running thread, read
+             * under the owner hart's pc_account_seq seqcount
+             * (sched_account_read falls back to the banked value after three
+             * torn attempts). Read-only, so the owner-hart-writes invariant of
+             * sched_account_current() holds.
+             */
             uint64_t now;
 
             snap_time(&now, 0);
-            if (thp)
-                old = sched_account_read(thp, now);
-            else /* act is on this hart: no concurrent writer of its time */
-                old += sched_account_read(act, now) - act->running_time;
+            old = sched_account_read(thp, now);
+        } else {
+            /* The process clock is the banked total, which only grows, so every
+             * reader on every hart sees it monotonic. Bank the caller's own
+             * stretch first, as the tick would: an owner-hart write, with
+             * interrupts off so the tick cannot bill between the stamp read and
+             * the stamp update (that would charge the stretch twice). Adding
+             * the live stretch to a banked value read earlier instead went
+             * backwards whenever the tick billed in between: the stretch moved
+             * into a total already sampled and the remainder was measured from
+             * the new stamp. It also let a sibling thread read less than this
+             * one just had.
+             */
+            unsigned long sie = interrupt_save();
+            uint64_t now;
+
+            if (act == get_active_thread(get_cpunum())) {
+                snap_time(&now, 0);
+                sched_account_current(now);
+            }
+            old = __atomic_load_n(rtp, __ATOMIC_RELAXED);
+            interrupt_restore(sie);
         }
 
         rcu_read_unlock(&process_rcu);

@@ -5,6 +5,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <align.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -18,6 +19,7 @@
 #include <sys/rtmux-core.h>
 #include <sys/pathmsg.h>
 #include <sys/spawn-action-wire.h>
+#include <sys/spawn-limits.h>
 #include <sys/loader-fd.h>
 
 #include <devctl/common.h>
@@ -78,6 +80,43 @@ extern void *_mmap2(void *addr,
 
 /* set_signal() removed — signal subsystem eliminated */
 
+/* Give the load up with `code`, which loader_exit hands to the spawner, and
+ * leave the line for its log. For the loader thread, with its context in a
+ * variable named lcp. Not for use once _PROC_SPAWN_DONE has been sent: the
+ * context is no longer this loader's.
+ */
+#define LOADER_EXIT(code)              \
+    do {                               \
+        lcp->ctx.exit_line = __LINE__; \
+        _exit(code);                   \
+    } while (0)
+
+/* A spawn fails after its loader started. Say why when the spawner is told
+ * ENOMEM or the loader was killed, since neither names a cause: the loader
+ * exits with the errno of whatever step failed (a cpiofs open or mapping at its
+ * OCB limit, the stack mapping, ...), and a loader that faulted is reported as
+ * ENOMEM too. Other errors (ENOENT, EACCES, ...) are ordinary and are not
+ * logged. Rate limited.
+ */
+static void loader_exit_note(const struct loader_context *lcp, pid_t pid,
+                             int signo, int error)
+{
+    static atomic_uint nfail;
+    unsigned n;
+
+    if ((signo == SIGCHLD && error != ENOMEM) || !(n = root_warn_due(&nfail)))
+        return;
+    if (signo == SIGCHLD)
+        root_warn("spawn: loader of pid %d (parent %d) gave up at "
+                  "proc-loader.c:%d (failure %u): %s\n",
+                  (int) pid, (int) lcp->ctx.ppid, lcp->ctx.exit_line, n,
+                  strerror(error));
+    else
+        root_warn("spawn: loader of pid %d (parent %d) died of signal %d "
+                  "(failure %u): reported as %s\n",
+                  (int) pid, (int) lcp->ctx.ppid, signo, n, strerror(error));
+}
+
 /* loader_exit — runs when a child died during loading (failed to exec, fault,
  * etc.). Pulls prp->lcp via process_query_info (lcp is a roottask-user-VA
  * pointer that the kernel just copied through, so the deref below is safe) and
@@ -119,6 +158,7 @@ int loader_exit(ioserv_context_t *ctp, union proc_msg_union *msg, pid_t pid)
             r = EINTR;
             break;
         }
+        loader_exit_note(lcp, pid, tmp->siginfo.si_signo, r);
         msg_error(lcp->ctx.rcvid, r);
         replied = 1;
     }
@@ -605,8 +645,24 @@ static void loader_args(struct loader_context *lcp,
         /* ipc-send: roottask-fsio -> roottask-core */
         if (msg_send(ROOTTASK_COID, &args.i, sizeof args.i, strings + interplen,
                      args.i.nbytes) == -1) {
-            _exit(errno);
+            LOADER_EXIT(errno);
         }
+    }
+
+    /* The request must hold a NUL-terminated string for every argument and
+     * environment entry it counts. The walk below hands out one pointer per
+     * count and does not look at the last string, so with fewer strings than
+     * that a pointer would lead into the executable path above them, past
+     * what ARG_MAX counted.
+     */
+    {
+        const char *q = strings + interplen;
+        size_t have = 0;
+
+        for (; q < aux_exefile; q++)
+            have += *q == '\0';
+        if (have < (size_t) lcp->msg.spawn.i.nargv + lcp->msg.spawn.i.narge)
+            LOADER_EXIT(EINVAL);
     }
 
     /* count the size of the aux vector */
@@ -798,10 +854,11 @@ static int try_hash_bang(int fd,
  *
  * Tries the real uid/gid first, falling back to the effective ids, and clears
  * the setuid/setgid bits if the containing filesystem is mounted nosuid. On any
- * error it _exit()s the loader thread with errno. Parameters:
+ * error it returns -1 with errno set, for the caller to give the load up.
+ * Parameters:
  *   name  : pathname of the executable
  *   statp : out — stat of the opened file
- * Return value: the open file descriptor (never returns on failure).
+ * Return value: the open file descriptor, or -1.
  */
 static int open_exe(const char *name, struct stat *statp)
 {
@@ -811,10 +868,15 @@ static int open_exe(const char *name, struct stat *statp)
     /* ipc-send: roottask-fsio -> romfs,lkl-fsd,dev-nvme,pipe */
     fd = open(name, O_RDONLY);
     if ((fd == -1) || (fstat(fd, statp) == -1)) {
-        if (errno == EBUSY) {
-            errno = ETXTBSY;
-        }
-        _exit(errno);
+        int err = errno == EBUSY ? ETXTBSY : errno;
+
+        /* The caller only sees -1, so a descriptor whose stat failed is closed
+         * here.
+         */
+        if (fd != -1)
+            (void) close(fd);
+        errno = err;
+        return -1;
     }
 
     /* Honour the MOUNT_NOSUID qualifier by knocking down these bits (affects
@@ -893,8 +955,6 @@ static void loader_signal_aux(struct loader_context *lcp)
     auxv[n].a_un.a_val = 0;
 }
 
-#define LOADER_EXIT(code) _exit(code)
-
 /* The loader has temporary bootstrap authority. Apply a scheduling request
  * only after resolving the image grant, with the limits of the parent and
  * the final image. Returning the error here wakes the blocked spawner.
@@ -957,6 +1017,7 @@ void *loader_load(void *parm)
     int needs_secure;
     int resetids;
     unsigned prealloc;
+    size_t argspace;
 
     buffer[0] = '\0';
     lcp->ctx.tid = pthread_self();
@@ -1077,7 +1138,8 @@ void *loader_load(void *parm)
         }
     }
 
-    fd = open_exe(buffer, &statl);
+    if ((fd = open_exe(buffer, &statl)) == -1)
+        LOADER_EXIT(errno);
 
     /* Provenance for the bootstrap capability grant: a manifest grant is
      * honored only for an image that physically lives on the read-only boot
@@ -1158,7 +1220,8 @@ void *loader_load(void *parm)
             if (is_exec(interp_name) == -1) {
                 LOADER_EXIT(errno);
             }
-            fd = open_exe(interp_name, &statl);
+            if ((fd = open_exe(interp_name, &statl)) == -1)
+                LOADER_EXIT(errno);
             status = elf_load_hook(fd, interp_name, &lcp->ctx.start, &statl,
                                    &lcp->msg.spawn.i.parms);
         }
@@ -1193,10 +1256,34 @@ void *loader_load(void *parm)
     if (lcp->ctx.start.stacksize < lcp->ctx.start.stackalloc) {
         lcp->ctx.start.stacksize = lcp->ctx.start.stackalloc;
     }
+    /* The argument and environment strings and their vectors are laid out at
+     * the top of this stack (loader_args). Add their size, in whole pages, to
+     * the mapping and to its populated part, so that they do not come out of
+     * the stack the program asked for: ARG_MAX of them would otherwise use up
+     * a small stack_max before main() runs. (The executable path, the aux
+     * vector and the TLS block are small and still come out of it.)
+     */
+    argspace = lcp->msg.spawn.i.nbytes +
+               spawn_arg_pointers(lcp->msg.spawn.i.nargv,
+                                  lcp->msg.spawn.i.narge);
+    if (interp_name) {
+        /* a script: its interpreter, the optional argument and its own path */
+        argspace += strlen(interp_name) + 1 + strlen(buffer) + 1 +
+                    2 * sizeof(char *);
+        if (interp_arg)
+            argspace += strlen(interp_arg) + 1 + sizeof(char *);
+    }
+    argspace = lib_align_up_size(argspace, root_vm_ops.pagesize);
+    if (lcp->ctx.start.stacksize > SIZE_MAX - argspace - root_vm_ops.pagesize)
+        LOADER_EXIT(E2BIG);
+    lcp->ctx.start.stacksize += argspace;
     if (lcp->ctx.flags & PROC_LF_LAZYSTACK) {
         prealloc = 0;
     } else {
-        prealloc = (unsigned) lcp->ctx.start.stackalloc;
+        /* stackalloc <= the stacksize checked above: the sum cannot wrap */
+        size_t populate = lcp->ctx.start.stackalloc + argspace;
+
+        prealloc = (unsigned) min(populate, (size_t) UINT_MAX);
     }
     if (_mmap2((void *) lcp->ctx.start.stackaddr,
                lcp->ctx.start.stacksize + root_vm_ops.pagesize,
@@ -1289,6 +1376,6 @@ void *loader_load(void *parm)
            sizeof lcp->msg.spawn_done.i);
     /* ipc-send: roottask-fsio -> roottask-core */
     msg_sendv(ROOTTASK_COID, lcp->ctx.iov, 1, 0, 0);
-    LOADER_EXIT(errno);
+    _exit(errno); /* not LOADER_EXIT: the handler may have freed lcp */
     return 0;
 }

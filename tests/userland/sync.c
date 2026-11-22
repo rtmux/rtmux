@@ -3887,6 +3887,7 @@ void test_sync(void)
     test_mutex_unlock_unowned();
     test_mutex_hash_collision_wake_is_keyed();
     test_cond_reacquire_cycle();
+    test_cond_reacquire_above_ceiling();
     test_pi_owned_turnstiles();
     test_pi_two_mutex_cycle_detects_deadlock();
     test_pi_large_pid();
@@ -3922,6 +3923,7 @@ void test_sync(void)
     test_malloc_fifo_mixed_prio();
     test_fp_isolation();
     test_cancel_before_block();
+    test_block_kill_cancel();
 }
 
 /* A cancel that arrives while the target runs, before it blocks, must not be
@@ -4650,4 +4652,305 @@ int sync_kill_handoff(void)
     sem_destroy(&sem);
     (void) test_pin_mask(~0U);
     return 0;
+}
+
+/* A kill or a cancel must end every kind of wait, whether it finds the thread
+ * blocked or still on its way there.
+ *
+ * In the second form the thread is held (STALL_BLOCK) inside its blocking
+ * kernel call, past the call's own pending checks and before it publishes the
+ * blocked state. The requester then sees a running thread: a kill only sends a
+ * reschedule IPI and a cancel only records itself. The thread used to block
+ * after that with the request pending and nobody left to wake it.
+ */
+enum {
+    BLK_RECEIVE,
+    BLK_NANOSLEEP,
+    BLK_SEM,
+    BLK_COND,
+    BLK_JOIN,
+    BLK_SEND,  /* nobody receives: the sender queues in STATE_SEND */
+    BLK_REPLY, /* a receiver waits: the sender switches to it in STATE_REPLY */
+    BLK_MUTEX, /* not a cancellation point: kill only */
+    BLK_KINDS
+};
+
+struct blk_ctx {
+    int kind;
+    int chid, coid;
+    unsigned pin;
+    atomic_int ready, go, finished;
+    sem_t sem, hold;
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    pthread_t target;
+    int unlock_status;
+};
+
+/* The join target, or the server that takes a request and never replies. */
+static void *blk_target(void *raw)
+{
+    struct blk_ctx *c = raw;
+    char buf[8];
+
+    if (c->kind == BLK_REPLY)
+        (void) msg_receive(c->chid, buf, sizeof buf, NULL);
+    (void) sem_wait(&c->hold);
+    return NULL;
+}
+
+static void blk_cleanup(void *raw)
+{
+    struct blk_ctx *c = raw;
+
+    if (c->kind == BLK_COND)
+        c->unlock_status = pthread_mutex_unlock(&c->mutex);
+    atomic_store(&c->finished, 1);
+}
+
+static void *blk_thread(void *raw)
+{
+    struct blk_ctx *c = raw;
+    char buf[8];
+
+    (void) test_pin_mask(c->pin);
+    if (c->kind == BLK_COND && pthread_mutex_lock(&c->mutex) != EOK)
+        return NULL;
+    pthread_cleanup_push(blk_cleanup, c);
+    atomic_store(&c->ready, 1);
+
+    /* Nothing between here and the wait may block: the stall is armed for this
+     * thread's next block.
+     */
+    while (!atomic_load(&c->go))
+        (void) sched_yield();
+    switch (c->kind) {
+    case BLK_RECEIVE:
+        (void) msg_receive(c->chid, buf, sizeof buf, NULL);
+        break;
+    case BLK_NANOSLEEP:
+        (void) nanosleep(&(struct timespec) {.tv_sec = 60}, NULL);
+        break;
+    case BLK_SEM:
+        (void) sem_wait(&c->sem);
+        break;
+    case BLK_COND:
+        (void) pthread_cond_wait(&c->cond, &c->mutex);
+        break;
+    case BLK_JOIN:
+        (void) pthread_join(c->target, NULL);
+        break;
+    case BLK_SEND:
+    case BLK_REPLY:
+        (void) msg_send(c->coid, buf, sizeof buf, buf, sizeof buf);
+        break;
+    default:
+        (void) pthread_mutex_lock(&c->mutex);
+        break;
+    }
+    pthread_cleanup_pop(0);
+    atomic_store(&c->finished, -1);
+    return NULL;
+}
+
+/* One wait kind, ended by a kill (status 42) or by a cancel. */
+static void blk_case(int kind, bool cancel, bool race)
+{
+    static const char *const name[BLK_KINDS] = {
+        "msg_receive", "nanosleep", "sem_wait",   "cond_wait",
+        "pthread_join", "msg_send", "msg_send to a receiver", "mutex_lock"};
+    static const int state[BLK_KINDS] = {
+        STATE_RECEIVE, STATE_NANOSLEEP, STATE_SEM,   STATE_CONDVAR,
+        STATE_JOIN,    STATE_SEND,      STATE_REPLY, STATE_MUTEX};
+    /* A thread that stays blocked keeps using its context. */
+    static struct blk_ctx ctxs[2][2][BLK_KINDS];
+    struct blk_ctx *c = &ctxs[cancel][race][kind];
+    struct stall_watch watch = {.pid = -1};
+    pthread_t th;
+    bool have_target = false, locked = false, held = !race;
+    void *ret = NULL;
+    char what[96], pid[16], tid[16];
+    int rc;
+
+    bool ipc = kind == BLK_RECEIVE || kind == BLK_SEND || kind == BLK_REPLY;
+
+    *c = (struct blk_ctx) {.kind = kind,
+                           .chid = -1,
+                           .coid = -1,
+                           .pin = race ? 2U : ~0U,
+                           .unlock_status = -1,
+                           .mutex = PTHREAD_MUTEX_INITIALIZER,
+                           .cond = PTHREAD_COND_INITIALIZER};
+    snprintf(what, sizeof what, "%s %s %s", cancel ? "cancel" : "kill",
+             race ? "entering" : "blocked in", name[kind]);
+    if (sem_init(&c->sem, 0, 0) != 0 || sem_init(&c->hold, 0, 0) != 0 ||
+        (ipc && (c->chid = channel_create(0)) == -1)) {
+        test_fail(what, "fixture");
+        return;
+    }
+    if (kind == BLK_SEND || kind == BLK_REPLY) {
+        c->coid = connect_attach(0, getpid(), c->chid, RTMUX_SIDE_CHANNEL, 0);
+        if (c->coid == -1) {
+            test_fail(what, "connect_attach");
+            goto out;
+        }
+    }
+    if (kind == BLK_JOIN || kind == BLK_REPLY) {
+        have_target =
+            pthread_create(&c->target, NULL, blk_target, c) == EOK;
+        if (!have_target ||
+            (kind == BLK_REPLY &&
+             !wait_thread_state(c->target, STATE_RECEIVE))) {
+            test_fail(what, "target thread");
+            goto out;
+        }
+    }
+    if (kind == BLK_MUTEX)
+        locked = pthread_mutex_lock(&c->mutex) == EOK;
+    if (pthread_create(&th, NULL, blk_thread, c) != EOK) {
+        test_fail(what, "pthread_create");
+        goto out;
+    }
+    for (int i = 0; i < 3000 && !atomic_load(&c->ready); i++)
+        sleep_ms(1);
+    if (race) {
+        snprintf(pid, sizeof pid, "%d", (int) getpid());
+        snprintf(tid, sizeof tid, "%d", (int) th);
+        held = atomic_load(&c->ready) &&
+               inject_run("stall-block", pid, tid) == 0 &&
+               stall_watch_start(&watch, "block") == 0;
+        atomic_store(&c->go, 1);
+        held = held && stall_watch_entered(&watch);
+    } else {
+        atomic_store(&c->go, 1);
+        held = wait_thread_state(th, state[kind]);
+    }
+
+    rc = cancel ? pthread_cancel(th) : __thread_destroy((int) th, 0, (void *) 42);
+    stall_watch_finish(&watch);
+
+    /* A thread the request missed stays blocked: never join it unseen. */
+    bool gone = wait_thread_state(th, STATE_DEAD);
+    check(held && rc == 0 && gone, what,
+          !held ? "thread was not held at the wait"
+                : "the request was lost: thread still blocked");
+    if (!gone) {
+        (void) __thread_destroy((int) th, 0, NULL);
+        if (!wait_thread_state(th, STATE_DEAD))
+            return; /* leave everything it may still touch */
+    }
+    (void) pthread_join(th, &ret);
+    if (gone && cancel) {
+        snprintf(what, sizeof what, "cancel %s %s runs cleanup once",
+                 race ? "entering" : "blocked in", name[kind]);
+        check(ret == PTHREAD_CANCELED && atomic_load(&c->finished) == 1 &&
+                  (kind != BLK_COND || c->unlock_status == EOK),
+              what, "wrong exit value, no cleanup, or mutex not owned");
+    } else if (gone) {
+        snprintf(what, sizeof what, "kill %s %s reports its status",
+                 race ? "entering" : "blocked in", name[kind]);
+        check(ret == (void *) 42 && atomic_load(&c->finished) == 0, what,
+              "wrong exit value or the wait returned");
+    }
+out:
+    if (locked)
+        (void) pthread_mutex_unlock(&c->mutex);
+    if (c->coid != -1)
+        (void) __connect_detach((uint64_t) c->coid);
+    if (c->chid != -1)
+        (void) channel_destroy(c->chid); /* also ends a receive still waiting */
+    if (have_target) {
+        (void) sem_post(&c->hold);
+        (void) pthread_join(c->target, NULL);
+    }
+    (void) sem_destroy(&c->sem);
+    (void) sem_destroy(&c->hold);
+}
+
+/* Every wait kind, found blocked. */
+void test_block_kill_cancel(void)
+{
+    for (int kind = 0; kind < BLK_KINDS; kind++) {
+        blk_case(kind, false, false);
+        if (kind != BLK_MUTEX)
+            blk_case(kind, true, false);
+    }
+}
+
+/* Every wait kind, caught between its pending check and the block. */
+int block_request_race(void)
+{
+    if (sysconf(_SC_NPROCESSORS_ONLN) < 3 ||
+        inject_run("alloc-status", NULL, NULL))
+        return TC_EXIT_SKIP;
+    (void) test_pin_mask(1U);
+    for (int kind = 0; kind < BLK_KINDS; kind++) {
+        blk_case(kind, false, true);
+
+        /* A sender switching to its receiver is already in STATE_REPLY when it
+         * is held: the canceller unblocks that one itself, after the hold.
+         */
+        if (kind != BLK_MUTEX && kind != BLK_REPLY)
+            blk_case(kind, true, true);
+    }
+    (void) test_pin_mask(~0U);
+    return 0;
+}
+
+/* A condition wait returns holding its mutex also when the waiter's priority
+ * was raised above a PRIO_PROTECT ceiling during the wait. The reacquire used
+ * to apply the ceiling check of an explicit lock: the wait returned EINVAL
+ * without the mutex, and the caller's unlock then failed with EPERM.
+ */
+struct ceil_wait {
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    int wait_rc, unlock_rc;
+};
+
+static void *ceil_waiter(void *raw)
+{
+    struct ceil_wait *c = raw;
+
+    if (pthread_mutex_lock(&c->mutex) != EOK)
+        return NULL;
+    c->wait_rc = pthread_cond_wait(&c->cond, &c->mutex);
+    c->unlock_rc = pthread_mutex_unlock(&c->mutex);
+    return NULL;
+}
+
+void test_cond_reacquire_above_ceiling(void)
+{
+    struct ceil_wait c = {.cond = PTHREAD_COND_INITIALIZER,
+                          .wait_rc = -1,
+                          .unlock_rc = -1};
+    pthread_mutexattr_t attr;
+    pthread_t waiter;
+    char detail[64];
+
+    if (pthread_mutexattr_init(&attr) != EOK ||
+        pthread_mutexattr_setprotocol(&attr, PTHREAD_PRIO_PROTECT) != EOK ||
+        pthread_mutexattr_setprioceiling(&attr, 12) != EOK ||
+        pthread_mutex_init(&c.mutex, &attr) != EOK) {
+        test_fail("condition wait above ceiling", "fixture");
+        return;
+    }
+    if (!condloan_create(&waiter, 8, ceil_waiter, &c)) {
+        test_fail("condition wait above ceiling", "pthread_create");
+        return;
+    }
+    bool waiting = wait_thread_state(waiter, STATE_CONDVAR);
+    int raise_rc = pthread_setschedprio(waiter, 14);
+
+    (void) pthread_cond_signal(&c.cond);
+    (void) pthread_join(waiter, NULL);
+    snprintf(detail, sizeof detail, "waiting=%d raise=%d wait=%d unlock=%d",
+             waiting, raise_rc, c.wait_rc, c.unlock_rc);
+    check(waiting && raise_rc == EOK && c.wait_rc == EOK &&
+              c.unlock_rc == EOK,
+          "condition wait raised above the ceiling returns owning the mutex",
+          detail);
+    (void) pthread_mutex_destroy(&c.mutex);
+    (void) pthread_cond_destroy(&c.cond);
+    (void) pthread_mutexattr_destroy(&attr);
 }

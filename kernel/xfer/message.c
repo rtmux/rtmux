@@ -111,7 +111,7 @@ static int xferiov_walk(thread_t *sthp, struct xfer_walk *w)
         }
         if (sp) {
             sp->ents += dnext + snext;
-            if (sp->ents >= XFER_STEP_ENTRIES || sp->bytes >= XFER_STEP_BYTES)
+            if (xfer_step_over(sp))
                 return XFER_YIELD;
         }
         if (dnext && (ret = xfer_entry(w->dst, w->dbound, 0, XFER_DST_FAULT,

@@ -232,6 +232,33 @@ void __attribute__((noreturn)) kernel_exit(void)
     xfer_handler_check_exit();
     for (;;) {
         unsigned cpu = get_cpunum();
+        thread_t *blocked = pcpu_array[cpu].pc_block_recheck;
+
+        /* A kill or a cancel was pending on the thread this hart just blocked.
+         * Deliver it before anything is dispatched. On a hart with no active
+         * thread interrupts stay off and the nesting depth is held, as for the
+         * settle below: the delivery takes and drops kspinlocks, and a nested
+         * trap would have no thread to run on.
+         */
+        if (blocked) {
+            bool idle = !get_active_thread(cpu);
+
+            pcpu_array[cpu].pc_block_recheck = NULL;
+            if (idle) {
+                interrupt_disable();
+                pcpu_array[cpu].pc_kspin_depth++;
+#if defined(CONFIG_INSTRUMENTATION)
+                irqoff_open(LOCK_CLASS_SCHED);
+#endif
+            }
+            thread_block_recheck(blocked);
+            if (idle) {
+#if defined(CONFIG_INSTRUMENTATION)
+                irqoff_close();
+#endif
+                pcpu_array[cpu].pc_kspin_depth--;
+            }
+        }
         thp = get_active_thread(cpu);
         if (!thp) {
             /* A hart about to idle settles its stale servers first. Interrupts

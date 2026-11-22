@@ -27,6 +27,7 @@
 #ifndef _ROOTTASK_ROOT_LOG_H
 #define _ROOTTASK_ROOT_LOG_H
 
+#include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <sys/types.h>
@@ -49,6 +50,17 @@ void root_warn(const char *fmt, ...);
 void root_log(const char *fmt, ...);
 void root_dbg(const char *fmt, ...);
 void root_trace(const char *fmt, ...);
+
+/* Rate limit for a warning a client can provoke at will, so that it cannot
+ * flood the ring: counts one occurrence in *seen and returns its number
+ * (from 1) for the first eight and every 64th after, else 0.
+ */
+static inline unsigned root_warn_due(atomic_uint *seen)
+{
+    unsigned n = atomic_fetch_add_explicit(seen, 1, memory_order_relaxed);
+
+    return n < 8 || (n & 63) == 0 ? n + 1 : 0;
+}
 
 /* The ring is also readable by absolute byte sequence (served as /sys/log). A
  * single root_log_read returns at most ROOT_LOG_READ_MAX bytes.

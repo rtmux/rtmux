@@ -10,87 +10,12 @@
 #include <core/globals.h>
 
 #define XFER_IOV_NUM 32 /* Number of iov's to copy at a time */
-#define XFER_PREEMPT(act)    \
-    if (NEED_PREEMPT(act)) { \
-        xfer_preempt(act);   \
-    }
 
 /* The xfer longjmp target is per-hart, reached via SET_XFER_ENV/GET_XFER_ENV
  * (macros.h). A shared global would let a fault on one hart longjmp into
  * another hart's stale xfer frame.
  */
 jmp_buf *xfer_env[CONFIG_PROCESSORS_MAX];
-
-#if CONFIG_PROCESSORS_MAX > 1 && defined(CONFIG_SMP_MSGOPT)
-
-/* Restore message-pass state after an xfer preemption/fault.
- *
- * Invoked from xfer-fault recovery (longjmp from xfer_*_fault). Releases the
- * MSG_DELIVERY claim on the active thread and, if a peer was mid delivery,
- * releases its claim too and force-readies it if it was waiting.
- *
- * "act" is this CPU's active thread, so its internal_flags / blocked_on writes
- * are single-writer-by-CPU; the cross-thread effect on the peer goes through
- * force_ready_msgxfer's IPI mechanism. Flag updates use atomic_clr for
- * cross-CPU safety. Parameters:
- *   act : the active thread whose xfer was interrupted
- */
-static void xfer_restorestate(thread_t *act)
-{
-    thread_t *thp;
-
-    if (act->internal_flags & RTMUX_ITF_MSG_DELIVERY) {
-        atomic_clr((volatile unsigned *) &act->internal_flags,
-                   RTMUX_ITF_MSG_DELIVERY);
-
-        if ((thp = act->blocked_on)) {
-            act->blocked_on = 0;
-            IPC_BLK(act);
-            if (thp->internal_flags & RTMUX_ITF_MSG_DELIVERY) {
-                atomic_clr((volatile unsigned *) &thp->internal_flags,
-                           RTMUX_ITF_MSG_DELIVERY);
-                if (thp->internal_flags & RTMUX_ITF_MSG_FORCE_RDY) {
-                    force_ready(thp, (unsigned) KSTATUS(thp));
-                    atomic_clr((volatile unsigned *) &thp->internal_flags,
-                               RTMUX_ITF_MSG_FORCE_RDY);
-                }
-            }
-        }
-    }
-}
-#endif
-
-/* Preempt a thread mid-xfer (the XFER_PREEMPT macro tail).
- *
- * Rewinds the thread's IP so the kernel call restarts (or unwinds the specret),
- * restores any interrupted message-pass state, and tail-calls kernel_exit
- * (which does not return). Parameters:
- *   thp : thread being preempted
- */
-static void xfer_preempt(thread_t *thp)
-{
-    /* The specret-active flag is per-CPU (pc_in_specret). */
-    if (pcpu_array[get_cpunum()].pc_in_specret) {
-        unspecret_kernel();
-    } else {
-        /* KCALL_RESTART, not a bare rewind of the IP: a0 holds the first
-         * argument only until something stores a status in it, and the call
-         * must run again with the arguments it was entered with.
-         */
-        KCALL_RESTART(thp);
-    }
-#if CONFIG_PROCESSORS_MAX > 1 && defined(CONFIG_SMP_MSGOPT)
-    xfer_restorestate(thp);
-#endif
-    SET_XFER_HANDLER(NULL);
-
-    /* kernel_exit does not return to the trap handler that closes the rcvid
-     * lookup window, so close it here: a call that restarts many times would
-     * otherwise open more than the nesting counter can hold.
-     */
-    lookup_rcvid_release_all();
-    kernel_exit();
-}
 
 /* This routine is called when the kernel wants to preempt a thread in the
  * middle of a message pass. The current position should be saved so when we
@@ -199,10 +124,87 @@ void xfer_async_restart(thread_t *thp, CPU_REGISTERS *regs)
 /* xfer_skip() went past every entry of the vector. */
 #define XFER_SKIP_ALL (-1)
 
+/* Start a stepped transfer's count of work in this kernel entry. The clock
+ * is not read yet: it costs a trap to the SBI on some targets, and most
+ * transfers are over before their first piece of work is.
+ */
+void xfer_step_begin(struct xfer_spent *sp)
+{
+    sp->ents = sp->bytes = sp->unclocked_ents = sp->unclocked_bytes = 0;
+}
+
+/* A stepped transfer has finished a piece of work (XFER_STEP_*). Whether it
+ * is to save where it stands and restart its call: another thread is to have
+ * this hart, or the kernel entry has used its budget. Neither is looked at
+ * per entry: a restart costs the prelude of the call again, and the clock
+ * costs a read, so it is consulted less often still (XFER_CLOCK_ENTRIES). The
+ * budget is the kernel entry's, shared by the
+ * scans and the copy it makes (act->xfer_deadline, cleared at every entry),
+ * and runs from the end of its first piece, so an entry works for two pieces
+ * and XFER_BUDGET_US at most.
+ */
+bool xfer_piece_done(struct xfer_spent *sp)
+{
+    thread_t *act = get_active_thread(get_cpunum());
+    uint64_t now;
+
+    sp->unclocked_ents += sp->ents;
+    sp->unclocked_bytes += sp->bytes;
+    sp->ents = sp->bytes = 0;
+
+    /* NEED_PREEMPT sees a wake made on this hart. One made on another hart
+     * arrives as a reschedule IPI, which marks the running thread and is
+     * acted on at the next kernel exit, as the end of a timeslice is: take
+     * that exit now.
+     */
+    if (NEED_PREEMPT(act) ||
+        (atomic_load_explicit(&act->async_flags, memory_order_relaxed) &
+         (RTMUX_ATF_TIMESLICE | RTMUX_ATF_SMP_RESCHED)))
+        return true;
+    if (sp->unclocked_ents < XFER_CLOCK_ENTRIES &&
+        sp->unclocked_bytes < XFER_STEP_BYTES)
+        return false;
+    sp->unclocked_ents = sp->unclocked_bytes = 0;
+    now = r_time();
+    if (!act->xfer_deadline) {
+        act->xfer_deadline = now + (uint64_t) XFER_BUDGET_US *
+                                       (qtimeptr->cycles_per_sec / 1000000U);
+        return false;
+    }
+    if ((int64_t) (now - act->xfer_deadline) < 0)
+        return false;
+    inject_xfer_budget(act);
+    return true;
+}
+
+/* Called at every kernel call entry. What a stepped transfer saved on the
+ * thread (the checked prefix of an iov array, the cursor of a copy) is for the
+ * restart of the call that saved it: KCALL_RESTART leaves that call's number
+ * and the caller's stack pointer on the thread, and this entry is that restart
+ * only if it finds both. Any other entry drops the lot, so a call that was
+ * abandoned (it failed, was cancelled, or a signal handler ran first, whose
+ * own calls come from a deeper frame) leaves nothing a later call that
+ * happens to look the same could resume from.
+ */
+void xfer_begin_call(thread_t *act, unsigned num)
+{
+    unsigned mark = act->xfer_resume;
+
+    act->xfer_deadline = 0; /* a new kernel entry, a new budget */
+    if (!mark && !act->xcur.armed && !act->scan[XFER_SCAN_ARRAY].vector &&
+        !act->scan[XFER_SCAN_SEND].vector)
+        return; /* nothing saved: every call but a restarted transfer */
+    act->xfer_resume = 0;
+    if (mark == num + 1U && act->xfer_resume_sp == (uintptr_t) KSP(act))
+        return;
+    act->scan[XFER_SCAN_ARRAY].vector = act->scan[XFER_SCAN_SEND].vector = NULL;
+    act->xcur.armed = false;
+}
+
 /* Step *iovp forward over the *offp bytes still to be skipped, an entry at a
  * time, leaving *offp the offset into the entry it stops at. A bounded transfer
- * (sp set) stops with XFER_YIELD after XFER_STEP_ENTRIES entries, the position
- * left in place. Each entry's length is read once, under the fault handlers the
+ * (sp set) stops with XFER_YIELD when its step is over, the position left in
+ * place. Each entry's length is read once, under the fault handlers the
  * caller armed, so another thread cannot change it between the test and the
  * subtraction.
  *
@@ -234,7 +236,7 @@ static int xfer_skip(iov_t **iovp,
             break;
         }
         ++iov;
-        if (sp && ++sp->ents >= XFER_STEP_ENTRIES) {
+        if (sp && ++sp->ents >= XFER_STEP_ENTRIES && xfer_step_over(sp)) {
             ret = XFER_YIELD;
             break;
         }
@@ -270,25 +272,53 @@ static int xfer_yield(thread_t *act,
     act->xcur.didx = (uint32_t) (dst - dbase);
     act->xcur.doff = doff;
     act->xcur.armed = true;
+    inject_xfer_yield(act);
     SET_XFER_HANDLER(0);
     KCALL_RESTART(act);
     return XFER_RESTART;
 }
 
-/* The restart point of every loop of a transfer: a preemption check for the
- * callers that restart by msglen, and for a bounded transfer a step of work
- * done or a preemption request, either of which saves the cursor and restarts.
- * It names the locals of xfermsg_run.
+/* The restart point of every loop of a stepped transfer: the end of its step
+ * (budget used, or a preemption request) saves the cursor and restarts. It
+ * does not stop here before it has moved anything in this kernel entry: a
+ * preemption pending at every entry would otherwise restart it for ever from
+ * the same cursor. A peek does not stop here at all. It names the locals of
+ * xfermsg_run.
  */
 #define XFER_CHECKPOINT(src, soff, dst, doff)                                \
     do {                                                                     \
-        if (!bounded) {                                                      \
-            XFER_PREEMPT(act);                                               \
-        } else if (spent.ents >= XFER_STEP_ENTRIES ||                        \
-                   spent.bytes >= XFER_STEP_BYTES || NEED_PREEMPT(act)) {    \
+        if (bounded && moved &&                                              \
+            (NEED_PREEMPT(act) || xfer_step_over(&spent))) {                 \
             return xfer_yield(act, dthp, sthp, sbase, src, soff, dbase, dst, \
                               doff);                                         \
         }                                                                    \
+    } while (0)
+
+/* map_xfer stopped at its cap over a skip or a run of empty entries, with the
+ * position updated: a piece of work, after which the step may be over.
+ */
+#define XFER_MAP_CHECKPOINT(src, soff, dst, doff)                            \
+    do {                                                                     \
+        if (mode == XFER_ATOMIC) {                                           \
+            SET_XFER_HANDLER(0);                                             \
+            return XFER_YIELD; /* too sparse a vector for a peek */          \
+        }                                                                    \
+        spent.ents += XFER_STEP_ENTRIES;                                     \
+        if (xfer_piece_done(&spent)) {                                       \
+            return xfer_yield(act, dthp, sthp, sbase, src, soff, dbase, dst, \
+                              doff);                                         \
+        }                                                                    \
+    } while (0)
+
+/* A peek that reached its limit on entries stops for good: it has no cursor
+ * and does not restart.
+ */
+#define XFER_PEEK_STOP()           \
+    do {                           \
+        if (mode == XFER_ATOMIC) { \
+            SET_XFER_HANDLER(0);   \
+            return XFER_YIELD;     \
+        }                          \
     } while (0)
 
 /* Skip the bytes still to be skipped at the start of one vector. */
@@ -300,6 +330,7 @@ static int xfer_yield(thread_t *act,
             return 0;                                                        \
         }                                                                    \
         if (status == XFER_YIELD) {                                          \
+            XFER_PEEK_STOP();                                                \
             return xfer_yield(act, dthp, sthp, sbase, src, soff, dbase, dst, \
                               doff);                                         \
         }                                                                    \
@@ -308,13 +339,13 @@ static int xfer_yield(thread_t *act,
         }                                                                    \
     } while (0)
 
-/* The boundary a bounded vector's entries must lie inside: that of the process
- * the vector belongs to, or 0 where entries are not checked (roottask, a kernel
- * buffer, or a transfer that is not bounded).
+/* The boundary a vector's entries must lie inside: that of the process the
+ * vector belongs to, or 0 where entries are not checked (roottask, a kernel
+ * buffer).
  */
-static uintptr_t xfer_bound(bool bounded, unsigned flags, process_t *prp)
+static uintptr_t xfer_bound(unsigned flags, process_t *prp)
 {
-    if (!bounded || (flags & (MAPADDR_FLAGS_SYSPRP | MAPADDR_FLAGS_IOVKERNEL)))
+    if (flags & (MAPADDR_FLAGS_SYSPRP | MAPADDR_FLAGS_IOVKERNEL))
         return 0;
     return prp->boundary_addr;
 }
@@ -334,12 +365,21 @@ static bool xfer_array_in_bound(const iov_t *iov,
     return base <= last && WITHIN_BOUNDARY(base, last, bound);
 }
 
+/* How a transfer gives the hart up: XFER_STEPPED saves a cursor and returns
+ * XFER_RESTART when its step is over; XFER_ATOMIC runs to its end or to its
+ * limit on entries (XFER_YIELD), for a copy of a few bytes whose caller has
+ * state to put back when it returns.
+ */
+enum xfer_mode { XFER_STEPPED, XFER_ATOMIC };
+
 static int xfermsg_run(thread_t *dthp,
                        thread_t *sthp,
                        size_t doff,
                        size_t soff,
-                       bool bounded)
+                       enum xfer_mode mode,
+                       unsigned cap)
 {
+    const bool bounded = mode == XFER_STEPPED;
     iov_t *dst, *src, *dbase, *sbase;
     int dparts, sparts;
     process_t *prp, *sprp, *dprp;
@@ -347,19 +387,14 @@ static int xfermsg_run(thread_t *dthp,
     int status;
     iov_t diov[1], siov[1];
     thread_t *act = get_active_thread(get_cpunum());
-    struct xfer_spent spent = {0, 0};
-    struct xfer_spent *sp = bounded ? &spent : NULL;
-    bool resume = false, fresh;
+    struct xfer_spent spent = {.cap = cap};
+    struct xfer_spent *sp = &spent;
+    bool resume = false, fresh, moved = false;
     unsigned sall, dall;
     uintptr_t sbound, dbound;
 
-    /* A bounded transfer restarts only at its own checkpoints, which save the
-     * cursor and leave through the call, so the claim on the peer is given up
-     * under the channel lock; XFER_PREEMPT would exit with it held.
-     */
-    if (!bounded) {
-        XFER_PREEMPT(act);
-    }
+    if (bounded)
+        xfer_step_begin(&spent);
 
     /* If restarted, and threads match, continue where we left off. A bounded
      * transfer continues only from its own cursor, for the same vectors and
@@ -380,6 +415,7 @@ static int xfermsg_run(thread_t *dthp,
         sthp->args.ms.msglen = 0;
         sthp->args.ms.dthp = dthp;
         if (bounded) {
+            inject_xfer_start(act);
             act->xcur.armed = false;
             act->xcur.sthp = sthp;
             act->xcur.dthp = dthp;
@@ -401,9 +437,6 @@ static int xfermsg_run(thread_t *dthp,
         atomic_order(sthp->restart = dthp->restart = sthp);
     } else if (bounded) {
         resume = true;
-    } else {
-        soff += sthp->args.ms.msglen;
-        doff += sthp->args.ms.msglen;
     }
 
     /* Special case for 1 part source messages. */
@@ -452,10 +485,8 @@ static int xfermsg_run(thread_t *dthp,
     }
     dprp = dthp->as_prp;
 
-    if (bounded) {
-        sflags |= MAPADDR_FLAGS_STEP;
-        dflags |= MAPADDR_FLAGS_STEP;
-    }
+    sflags |= MAPADDR_FLAGS_STEP;
+    dflags |= MAPADDR_FLAGS_STEP;
 
     sbase = src;
     dbase = dst;
@@ -498,8 +529,8 @@ static int xfermsg_run(thread_t *dthp,
      * address space against that vector's process, at the time it copies. The
      * other side of a cross-as transfer is checked by map_xfer.
      */
-    sbound = xfer_bound(bounded, sflags, sprp ? sprp : sthp->process);
-    dbound = xfer_bound(bounded, dflags, dprp ? dprp : dthp->process);
+    sbound = xfer_bound(sflags, sprp ? sprp : sthp->process);
+    dbound = xfer_bound(dflags, dprp ? dprp : dthp->process);
     if (!xfer_array_in_bound(sbase, sall, sbound)) {
         return XFER_SRC_FAULT;
     }
@@ -545,20 +576,23 @@ static int xfermsg_run(thread_t *dthp,
                         if (nbytes == 0) {
                             break;
                         } else if (nbytes == XFER_MAP_YIELD) {
-                            return xfer_yield(act, dthp, sthp, sbase, src, soff,
-                                              dbase, dst, doff);
+                            XFER_MAP_CHECKPOINT(src, soff, dst, doff);
+                            continue;
                         } else {
                             XFER_FAULTRET(XFER_DST_FAULT);
                         }
                     }
                     dflags |= MAPADDR_FLAGS_NOTFIRST;
-                    spent.ents += (unsigned) parts;
+                    moved = true;
+                    if (bounded)
+                        spent.ents += (unsigned) parts;
 
                     SET_XFER_HANDLER(&xfer_src_handlers);
                     w = (struct xfer_walk) {iovlist, src, parts,  sparts, 0,
                                             soff,    0,   sbound, sp};
                     if ((status = xferiov(sthp, &w)) != 0) {
                         if (status == XFER_YIELD) {
+                            XFER_PEEK_STOP();
                             return xfer_yield(
                                 act, dthp, sthp, sbase, w.src, w.soff, dbase,
                                 dst0, doff0 + (sthp->args.ms.msglen - msglen0));
@@ -607,19 +641,22 @@ static int xfermsg_run(thread_t *dthp,
                     if (nbytes == 0) {
                         break;
                     } else if (nbytes == XFER_MAP_YIELD) {
-                        return xfer_yield(act, dthp, sthp, sbase, src, soff,
-                                          dbase, dst, doff);
+                        XFER_MAP_CHECKPOINT(src, soff, dst, doff);
+                        continue;
                     } else {
                         XFER_FAULTRET(XFER_SRC_FAULT);
                     }
                 }
                 sflags |= MAPADDR_FLAGS_NOTFIRST;
-                spent.ents += (unsigned) parts;
+                moved = true;
+                if (bounded)
+                    spent.ents += (unsigned) parts;
 
                 w = (struct xfer_walk) {dst, iovlist, dparts, parts, doff,
                                         0,   dbound,  0,      sp};
                 if ((status = xferiov(sthp, &w)) != 0) {
                     if (status == XFER_YIELD) {
+                        XFER_PEEK_STOP();
                         return xfer_yield(
                             act, dthp, sthp, sbase, src0,
                             soff0 + (sthp->args.ms.msglen - msglen0), dbase,
@@ -672,6 +709,7 @@ static int xfermsg_run(thread_t *dthp,
 
         status = xferiov(sthp, &w);
         if (status == XFER_YIELD) {
+            XFER_PEEK_STOP();
             return xfer_yield(act, dthp, sthp, sbase, w.src, w.soff, dbase,
                               w.dst, w.doff);
         }
@@ -681,19 +719,26 @@ static int xfermsg_run(thread_t *dthp,
     return status;
 }
 
-int xfermsg(thread_t *dthp, thread_t *sthp, size_t doff, size_t soff)
+/* xfermsg for the head of a message, a few bytes to or from a kernel buffer:
+ * it runs to its end whatever is pending, since its caller borrows the
+ * restart links and the byte count of the transfer proper and must put them
+ * back. So that it stays short it steps over max_entries vector entries at
+ * most and returns XFER_YIELD, with the bytes moved so far counted, when the
+ * vector is sparser than that.
+ */
+int xfermsg_peek(thread_t *dthp, thread_t *sthp, unsigned max_entries)
 {
-    return xfermsg_run(dthp, sthp, doff, soff, false);
+    return xfermsg_run(dthp, sthp, 0, 0, XFER_ATOMIC, max_entries);
 }
 
-/* xfermsg for msg_readv and msg_writev: each kernel entry does at most a step
- * of work (XFER_STEP_ENTRIES vector entries stepped over, XFER_STEP_BYTES
- * copied), then saves where it stands and restarts the call. The vector entries
- * it uses are read once and checked as it copies.
+/* xfermsg in steps: each kernel entry works for XFER_BUDGET_US at most (and
+ * less when a higher-priority thread wants the hart), then saves where it
+ * stands and restarts the call. The vector entries it uses are read once and
+ * checked as it copies.
  */
 int xfermsg_bounded(thread_t *dthp, thread_t *sthp, size_t doff, size_t soff)
 {
-    int status = xfermsg_run(dthp, sthp, doff, soff, true);
+    int status = xfermsg_run(dthp, sthp, doff, soff, XFER_STEPPED, 0);
 
     /* A cursor is for the restart of a call that yielded, not for a later call
      * that happens to look the same.

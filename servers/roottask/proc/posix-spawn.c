@@ -10,6 +10,7 @@
 #include <limits.h>
 #include <spawn.h>
 #include <sys/spawn-action-wire.h>
+#include <sys/spawn-limits.h>
 
 #define SPAWN_FD_TARGET_MAX (UINT16_MAX - 1)
 
@@ -427,16 +428,6 @@ static int parse_pspawn_msg(pid_t ppid,
     return EOK;
 }
 
-/* Bytes the header declares for itself and its trailing regions. 64-bit sum:
- * the uint32 byte counts could otherwise overflow.
- */
-static uint64_t pspawn_declared_len(const proc_posixspawn_t *msg)
-{
-    return (uint64_t) sizeof(*msg) + msg->i.attr_bytes + msg->i.filact_bytes +
-           msg->i.filact_obytes + msg->i.pathlen + msg->i.argenv_bytes +
-           msg->i.cwdlen;
-}
-
 /** proc_pspawn
  *
  * Implement posix_spawn(): receive a _PROC_POSIX_SPAWN message and rebuild it
@@ -462,7 +453,14 @@ int proc_pspawn(ioserv_context_t *ctp, void *vmsg)
      */
     if (ctp->info.msglen < sizeof(*msg))
         return EMSGSIZE;
-    len = pspawn_declared_len(msg);
+    if (ctp->info.flags & RTMUX_MI_ENDIAN_DIFF)
+        return ENOTSUP; /* before the header's fields are believed */
+    /* ARG_MAX first: an oversized argument list is E2BIG whether or not the
+     * sender went on to send it, and nothing is allocated for it.
+     */
+    if (!spawn_args_fit(msg->i.argenv_bytes, msg->i.nargv, msg->i.narge))
+        return E2BIG;
+    len = pspawn_declared_len(&msg->i);
     if (len > ctp->info.srcmsglen)
         return EMSGSIZE;
     if (len > PSPAWN_MSG_MAX)
@@ -470,9 +468,6 @@ int proc_pspawn(ioserv_context_t *ctp, void *vmsg)
     if (msg->i.reserved[1] || msg->i.reserved[0] > PSPAWN_CHILD_ACTIONS ||
         (msg->i.reserved[0] && (msg->i.cwdlen || msg->i.filact_obytes)))
         return EINVAL;
-
-    if (ctp->info.flags & RTMUX_MI_ENDIAN_DIFF)
-        return ENOTSUP;
     if (msg->i.subtype != _PROC_SPAWN_START)
         return ENOSYS;
 

@@ -89,6 +89,10 @@ struct loader_context_base {
     int state;
     struct loader_startup start;
     int fault_errno;
+    /* The proc-loader.c line of the LOADER_EXIT that gave the load up, so the
+     * log can say which step failed (see loader_exit).
+     */
+    int exit_line;
 
     /* Bootstrap capabilities the manifest grants this child, resolved by the
      * loader from the absolute path it opened. Committed at _PROC_SPAWN_DONE.

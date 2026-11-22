@@ -72,7 +72,9 @@ static void thread_recycle_reset(thread_t *thp)
     thp->ts_spare = NULL;
     thp->robust_nheld = 0;
     thp->restart = NULL;
-    thp->iovchk_iov = NULL;
+    thp->scan[0].vector = thp->scan[1].vector = NULL;
+    thp->xfer_resume = 0;
+    thp->xfer_deadline = 0;
     thp->xcur.armed = false;
     memset(&thp->args.wa, 0, sizeof(thp->args.wa));
     thp->runmask = 0;
@@ -175,6 +177,11 @@ static volatile unsigned long thread_destroy_post_vector_ns;
 static volatile unsigned long thread_destroy_post_cpu_ns;
 static volatile unsigned long thread_destroy_post_name_ns;
 static volatile unsigned long thread_destroy_post_notify_ns;
+/* The RCU, pin, scan and free totals again, over joiner-woken destroys only. */
+static volatile unsigned long thread_destroy_join_rcu_wait_ns;
+static volatile unsigned long thread_destroy_join_pin_wait_ns;
+static volatile unsigned long thread_destroy_join_active_scan_ns;
+static volatile unsigned long thread_destroy_join_object_free_ns;
 static volatile unsigned thread_destroy_stats_enabled;
 
 static uint64_t thread_destroy_cycles_to_ns(uint64_t cycles_delta);
@@ -304,6 +311,14 @@ void rdecl thread_destroy_stats_snapshot(struct _thread_destroy_stats *out,
             &thread_destroy_post_name_ns, 0, __ATOMIC_RELAXED);
         out->destroy_post_notify_ns = __atomic_exchange_n(
             &thread_destroy_post_notify_ns, 0, __ATOMIC_RELAXED);
+        out->join_rcu_wait_ns = __atomic_exchange_n(
+            &thread_destroy_join_rcu_wait_ns, 0, __ATOMIC_RELAXED);
+        out->join_pin_wait_ns = __atomic_exchange_n(
+            &thread_destroy_join_pin_wait_ns, 0, __ATOMIC_RELAXED);
+        out->join_active_scan_ns = __atomic_exchange_n(
+            &thread_destroy_join_active_scan_ns, 0, __ATOMIC_RELAXED);
+        out->join_object_free_ns = __atomic_exchange_n(
+            &thread_destroy_join_object_free_ns, 0, __ATOMIC_RELAXED);
         out->calls =
             __atomic_exchange_n(&thread_destroy_calls, 0, __ATOMIC_ACQUIRE);
         if (reset == 1)
@@ -431,6 +446,14 @@ void rdecl thread_destroy_stats_snapshot(struct _thread_destroy_stats *out,
             __atomic_load_n(&thread_destroy_post_name_ns, __ATOMIC_RELAXED);
         out->destroy_post_notify_ns =
             __atomic_load_n(&thread_destroy_post_notify_ns, __ATOMIC_RELAXED);
+        out->join_rcu_wait_ns =
+            __atomic_load_n(&thread_destroy_join_rcu_wait_ns, __ATOMIC_RELAXED);
+        out->join_pin_wait_ns =
+            __atomic_load_n(&thread_destroy_join_pin_wait_ns, __ATOMIC_RELAXED);
+        out->join_active_scan_ns = __atomic_load_n(
+            &thread_destroy_join_active_scan_ns, __ATOMIC_RELAXED);
+        out->join_object_free_ns = __atomic_load_n(
+            &thread_destroy_join_object_free_ns, __ATOMIC_RELAXED);
     }
     out->reset = 0;
     out->reserved = 0;
@@ -580,6 +603,14 @@ static void thread_destroy_stats_add(uint64_t rcu_wait_ns,
                            __ATOMIC_RELAXED);
         __atomic_fetch_add(&thread_destroy_post_notify_ns, post_notify_ns,
                            __ATOMIC_RELAXED);
+        __atomic_fetch_add(&thread_destroy_join_rcu_wait_ns,
+                           (unsigned long) rcu_wait_ns, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&thread_destroy_join_pin_wait_ns,
+                           (unsigned long) pin_wait_ns, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&thread_destroy_join_active_scan_ns,
+                           (unsigned long) active_scan_ns, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&thread_destroy_join_object_free_ns,
+                           (unsigned long) object_free_ns, __ATOMIC_RELAXED);
     }
     old_max =
         __atomic_load_n(&thread_destroy_rcu_busy_peer_max, __ATOMIC_RELAXED);
@@ -1575,6 +1606,15 @@ void rdecl thread_destroy(thread_t *thp)
             active_remote) {
             atomic_or(&thp->flags,
                       (RTMUX_FLG_THR_KILLSELF | RTMUX_FLG_THR_ONLYME));
+
+            /* Look again now that KILLSELF is published. A thread seen running
+             * above may have blocked since, and an IPI does not wake it. One
+             * still running here finds the flag itself: at its return to user
+             * mode, or in thread_block_recheck if it blocks first.
+             */
+            cpu_smp_mb();
+            active_hart = thread_active_hart(thp);
+            state = thread_state_load_acquire(thp);
             if (active_hart >= 0) {
                 SENDIPI((unsigned) active_hart, IPI_RESCHED);
             } else if (state == STATE_RUNNING) {

@@ -9,6 +9,7 @@
 #include "private.h"
 #include "root-process.h"
 #include <sys/mman.h> /* PROT_* for roottask_mmap_anon_user */
+#include <sys/spawn-limits.h>
 
 /* Every loader context ever allocated, once free. They come from the
  * roottask_mmap_anon_user window, which only grows (kernel/ext/query.c,
@@ -18,10 +19,52 @@
  */
 static pthread_mutex_t loader_context_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-/* Largest loader context: a spawn needing more is refused rather than kept. */
+/* Largest loader context: a spawn needing more is refused rather than kept.
+ * No request that passes the checks of proc_pspawn() and
+ * proc_spawn_with_actions() needs more. A native request's context holds the
+ * head (descriptor map, search path, cwd and path) without the arguments,
+ * unless the whole request fit the receive buffer, which is far smaller.
+ * A message rebuilt from a posix_spawn request is kept whole: with legacy file
+ * actions it has a full descriptor map, a cwd, a path and ARG_MAX of
+ * arguments; with packed ones the path, the arguments and the action records
+ * all come out of one PSPAWN_MSG_MAX, and a bitmap of source descriptors
+ * follows.
+ */
 #define LOADER_CLASS_MAX (512u * 1024u)
+#define LOADER_CONTEXT_HEAD \
+    (offsetof(struct loader_context, msg) + sizeof(struct _proc_spawn))
+_Static_assert(LOADER_CONTEXT_HEAD + UINT16_MAX * sizeof(int32_t) +
+                       2u * UINT16_MAX + ARG_MAX <=
+                   LOADER_CLASS_MAX,
+               "a rebuilt spawn message with a full fd map must fit the "
+               "largest loader context");
+_Static_assert(LOADER_CONTEXT_HEAD + UINT16_MAX * sizeof(int32_t) +
+                       3u * UINT16_MAX <=
+                   LOADER_CLASS_MAX,
+               "the head of a native spawn request must fit the largest "
+               "loader context");
+_Static_assert(LOADER_CONTEXT_HEAD + PSPAWN_MSG_MAX + UINT16_MAX / 8u + 1u <=
+                   LOADER_CLASS_MAX,
+               "a spawn with packed file actions must fit the largest loader "
+               "context");
 static struct loader_context *lcp_list;
 
+
+/* A spawn is about to fail with ENOMEM for want of a loader context, which is
+ * not roottask's heap: the context is contiguous physical memory mapped by the
+ * kernel (kext_root_mmap_anon_user). `why` names the cause: a request over the
+ * largest class, or the error of that mapping, ENOMEM when no contiguous run of
+ * `size` bytes is free. Rate limited.
+ */
+static void loader_context_note(size_t size, const char *why)
+{
+    static atomic_uint nfail;
+    unsigned n = root_warn_due(&nfail);
+
+    if (n)
+        root_warn("spawn: no loader context of %zu bytes (failure %u): %s\n",
+                  size, n, why);
+}
 
 /* loader_context_alloc — obtain a loader context for a spawn.
  *
@@ -53,8 +96,10 @@ struct loader_context *loader_context_alloc(unsigned msgsize, int state)
      * Reuse takes an exact class first, so a big context is not used up by a
      * small spawn.
      */
-    if (size > LOADER_CLASS_MAX)
+    if (size > LOADER_CLASS_MAX) {
+        loader_context_note(size, "over the largest class");
         return NULL;
+    }
     class = sizeof(struct loader_context);
     while (class < size)
         class <<= 1;
@@ -97,8 +142,11 @@ struct loader_context *loader_context_alloc(unsigned msgsize, int state)
          * 0xc1000000) — squarely inside L2[3] — and skips the I/O service
          * message round-trip entirely (it's a single kernel extension).
          */
-        if (roottask_mmap_anon_user(size, PROT_READ | PROT_WRITE | PROT_EXEC,
-                                    &va) != EOK) {
+        int rc = roottask_mmap_anon_user(
+            size, PROT_READ | PROT_WRITE | PROT_EXEC, &va);
+
+        if (rc != EOK) {
+            loader_context_note(size, strerror(rc));
             return NULL;
         }
         lcp = (void *) va;

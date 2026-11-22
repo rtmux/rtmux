@@ -152,7 +152,12 @@ static const struct toolbox_applet applets[] = {
      "fail-sched-set PID COUNT | sched-set-status | "
      "sched-set-displaced MIN | stall-lock PID MS | "
      "stall-lock-early PID MS | stall-lock-propagated PID MS | "
-     "stall-force-ready PID MS | stall-sync-waker PID MS | sync-wake-claims | intr-before-switch PID | pte-superpage PID VA | "
+     "stall-force-ready PID MS | stall-sync-waker PID MS | sync-wake-claims | intr-before-switch PID | intr-after-select PID | intr-select-seen [TID] | "
+     "stall-block PID TID | crash [shutdown] | stall-reply-claim PID MS | "
+     "preempt-reply-unblock PID | xfer-trace PID | xfer-stats N | "
+     "stall-claim-held PID MS | stall-force-claimed PID MS | "
+     "stall-cap-peek PID TID | "
+     "pte-superpage PID VA | "
      "pte-clear-superpage PID VA | pte-probe PID VA | "
      "fail-pte-map PID PAGES | manip-partial MIN | "
      "prio-settle-thread MIN | prio-settle-idle MIN | prio-settle-departure "
@@ -3173,7 +3178,14 @@ static int applet_inject(int argc, char **argv)
             [STALL_LOCK_PROPAGATED] = "propagated",
             [STALL_FORCE_READY] = "force-ready",
             [STALL_SYNC_WAKER] = "sync-waker",
+            [STALL_BLOCK] = "block",
+            [STALL_REPLY_CLAIM] = "reply-claim",
+            [STALL_REPLY_UNBLOCK] = "reply-unblock",
+            [STALL_CLAIM_HELD] = "claim-held",
+            [STALL_FORCE_CLAIMED] = "force-claimed",
+            [STALL_CAP_PEEK] = "cap-peek",
             [INJECT_SITE_TURNSTILE] = "turnstile",
+            [INJECT_SITE_REPLY_DETACHED] = "reply-detached",
         };
         unsigned site = 0;
         while (site < sizeof(names) / sizeof(names[0]) &&
@@ -3213,6 +3225,18 @@ static int applet_inject(int argc, char **argv)
                          strtoul(argv[2], NULL, 0), strtoul(argv[3], NULL, 0));
     } else if (argc == 3 && !strcmp(argv[1], "intr-before-switch")) {
         rc = inject_call(INJECT_OP_INTR_BEFORE_SWITCH, strtoul(argv[2], NULL, 0), 0);
+    } else if ((argc == 2 || argc == 3) && !strcmp(argv[1], "intr-select-seen")) {
+        rc = inject_call(INJECT_OP_INTR_SELECT_SEEN, 0, 0);
+        printf("intr-select-seen=%d tid=%d\n", rc & 0xff, rc >> 8);
+        if (rc < 0)
+            return 3;
+
+        /* 10 not taken, 11 no thread, 12 a thread, 13 the thread named. */
+        if (argc == 3 && (rc & 0xff) == 2 && rc >> 8 == atoi(argv[2]))
+            return 13;
+        return (rc & 0xff) + 10;
+    } else if (argc == 3 && !strcmp(argv[1], "intr-after-select")) {
+        rc = inject_call(INJECT_OP_INTR_AFTER_SELECT, strtoul(argv[2], NULL, 0), 0);
     } else if (argc == 2 && !strcmp(argv[1], "sync-wake-claims")) {
         rc = inject_call(INJECT_OP_SYNC_WAKE_CLAIMS, 0, 0);
         printf("sync-wake-claims=%d\n", rc);
@@ -3220,6 +3244,36 @@ static int applet_inject(int argc, char **argv)
     } else if (argc == 4 && !strcmp(argv[1], "stall-sync-waker")) {
         rc = inject_call(INJECT_OP_STALL_SYNC_WAKER, strtoul(argv[2], NULL, 0),
                          strtoul(argv[3], NULL, 0));
+    } else if (argc == 2 && !strcmp(argv[1], "crash")) {
+        rc = inject_call(INJECT_OP_CRASH, 0, 0);
+    } else if (argc == 4 && !strcmp(argv[1], "stall-cap-peek")) {
+        rc = inject_call(INJECT_OP_STALL_CAP_PEEK, strtoul(argv[2], NULL, 0),
+                         strtoul(argv[3], NULL, 0) << 32 | INJECT_SPIN_MAX_MS);
+    } else if (argc == 3 && !strcmp(argv[1], "crash") &&
+               !strcmp(argv[2], "shutdown")) {
+        rc = inject_call(INJECT_OP_CRASH, INJECT_CRASH_SHUTDOWN, 0);
+    } else if (argc == 4 && !strcmp(argv[1], "stall-block")) {
+        rc = inject_call(INJECT_OP_STALL_BLOCK, strtoul(argv[2], NULL, 0),
+                         strtoul(argv[3], NULL, 0) << 32 | INJECT_SPIN_MAX_MS);
+    } else if (argc == 4 && (!strcmp(argv[1], "stall-claim-held") ||
+                             !strcmp(argv[1], "stall-force-claimed"))) {
+        rc = inject_call(argv[1][6] == 'c' ? INJECT_OP_STALL_CLAIM_HELD
+                                           : INJECT_OP_STALL_FORCE_CLAIMED,
+                         strtoul(argv[2], NULL, 0), strtoul(argv[3], NULL, 0));
+    } else if (argc == 3 && !strcmp(argv[1], "xfer-trace")) {
+        rc = inject_call(INJECT_OP_XFER_TRACE, strtoul(argv[2], NULL, 0), 0);
+    } else if (argc == 3 && !strcmp(argv[1], "xfer-stats")) {
+        /* Exit status: the counter, capped at 200 (it is a small number). */
+        rc = inject_call(INJECT_OP_XFER_STATS, strtoul(argv[2], NULL, 0), 0);
+        if (rc >= 0)
+            printf("xfer-stats[%s]=%d\n", argv[2], rc);
+        return rc < 0 ? 255 : (rc > 200 ? 200 : rc);
+    } else if (argc == 4 && !strcmp(argv[1], "stall-reply-claim")) {
+        rc = inject_call(INJECT_OP_STALL_REPLY_CLAIM, strtoul(argv[2], NULL, 0),
+                         strtoul(argv[3], NULL, 0));
+    } else if (argc == 3 && !strcmp(argv[1], "preempt-reply-unblock")) {
+        rc = inject_call(INJECT_OP_PREEMPT_REPLY_UNBLOCK,
+                         strtoul(argv[2], NULL, 0), 0);
     } else if (argc == 4 && !strcmp(argv[1], "stall-force-ready")) {
         rc = inject_call(INJECT_OP_STALL_FORCE_READY, strtoul(argv[2], NULL, 0),
                          strtoul(argv[3], NULL, 0));
@@ -3283,7 +3337,8 @@ static int applet_inject(int argc, char **argv)
                 "alloc-status [consumed] | fail-sched-set PID COUNT | "
                 "sched-set-status | "
                 "sched-set-displaced MIN | stall-lock PID MS | "
-                "stall-force-ready PID MS | stall-sync-waker PID MS | sync-wake-claims | intr-before-switch PID | pte-superpage PID VA | "
+                "stall-force-ready PID MS | stall-sync-waker PID MS | sync-wake-claims | intr-before-switch PID | intr-after-select PID | intr-select-seen [TID] | "
+                "stall-block PID TID | crash [shutdown] | pte-superpage PID VA | "
                 "pte-clear-superpage PID VA | pte-probe PID VA | "
                 "fail-pte-map PID PAGES | manip-partial MIN | "
                 "stall-lock-early PID MS | stall-lock-propagated PID MS | "

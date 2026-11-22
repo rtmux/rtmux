@@ -15,6 +15,7 @@
 #include <sys/spawn-action-wire.h>
 
 #include "env-lock.h"
+#include "spawn-args.h"
 #include "posix.h"
 
 extern char **environ;
@@ -90,9 +91,8 @@ int posix_spawn(pid_t *restrict pid,
     proc_posixspawn_t msg;
     iov_t iov[5];
     unsigned char *packed = NULL;
-    char *const *arg;
-    char *src;
-    char *dst, *data = NULL;
+    char *data = NULL;
+    size_t strings;
     pid_t _pid;
     int coid;
     _posix_spawnattr_t *_attrp;
@@ -142,55 +142,36 @@ int posix_spawn(pid_t *restrict pid,
     if (packed)
         msg.i.reserved[0] = PSPAWN_CHILD_ACTIONS;
 
-    /* Accumulate in size_t and bound before narrowing: argenv_bytes is uint32_t
-     * and nargv/narge are uint16_t on the wire, so an oversized argv/env would
-     * otherwise wrap and under-allocate `data`, overflowing it during the copy
-     * loops below.
+    /* Hold the environment lock from here until argv and envp are copied: a
+     * concurrent setenv may edit environ, or rewrite in place a value that any
+     * vector the caller built can point at, which would change a length
+     * between measuring and copying.
      */
-    {
-        size_t argenv = 0, nv = 0, ne = 0;
-
-        /* Hold the environment lock from here until argv and envp are copied: a
-         * concurrent setenv may edit environ, or rewrite in place a value that
-         * any vector the caller built can point at, which would change a length
-         * between counting and copying.
-         */
-        __env_lock();
-        env_locked = true;
-        if (argv)
-            for (arg = argv; *arg; arg++, nv++)
-                argenv += strlen(*arg) + 1;
-        if (!envp)
-            envp = environ;
-        if (envp)
-            for (arg = envp; *arg; arg++, ne++)
-                argenv += strlen(*arg) + 1;
-        if (argenv > UINT32_MAX || nv > UINT16_MAX || ne > UINT16_MAX) {
-            r = E2BIG;
-            goto cleanup;
-        }
-        msg.i.argenv_bytes = (uint32_t) argenv;
-        msg.i.nargv = (uint16_t) nv;
-        msg.i.narge = (uint16_t) ne;
+    __env_lock();
+    env_locked = true;
+    if (!envp)
+        envp = environ;
+    /* ARG_MAX, then the whole request: roottask refuses either with E2BIG, so
+     * do not send it.
+     */
+    r = spawn_measure_args(argv, envp, &msg.i.nargv, &msg.i.narge, &strings);
+    if (r != EOK)
+        goto cleanup;
+    msg.i.argenv_bytes = (uint32_t) strings;
+    if (pspawn_declared_len(&msg.i) > PSPAWN_MSG_MAX) {
+        r = E2BIG;
+        goto cleanup;
     }
 
     coid = ROOTTASK_COID;
 
-    if ((dst = data = malloc(msg.i.argenv_bytes ? msg.i.argenv_bytes : 1)) ==
-        NULL) {
+    if (!(data = malloc(strings ? strings : 1))) {
         r = ENOMEM;
         goto cleanup;
     }
-    if (argv) {
-        for (arg = argv; (src = *arg); arg++)
-            while ((*dst++ = *src++))
-                ;
-    }
-    if (envp) {
-        for (arg = envp; (src = *arg); arg++)
-            while ((*dst++ = *src++))
-                ;
-    }
+    r = spawn_copy_args(data, strings, argv, envp);
+    if (r != EOK)
+        goto cleanup;
     __env_unlock();
     env_locked = false;
 

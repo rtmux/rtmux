@@ -177,27 +177,37 @@ void crash_quiesce_self(void) __attribute__((noreturn));
             kprintf(fmt, ##__VA_ARGS__); \
     } while (0)
 
-/* MARK_POTN_INF_LOOP() — drop a marker on each (rate-limited) pass of a KERNEL
- * loop that could spin forever, so a live in-kernel hang shows up as a flood on
- * the console instead of a silent busy-spin.
+/* MARK_POTN_INF_LOOP() — count each (rate-limited) pass of a KERNEL loop that
+ * could spin forever, and remember where the last one was, so a hang inside
+ * such a loop is visible in a crash or hang dump (scripts/gdb/dump-state.gdb
+ * prints both) instead of being a silent busy-spin.
  *
- * Uses con_puts() — a lock-free SBI debug-console write, NOT the kprintf_slock
- * path — so it is safe to call from inside a spin loop. Debug-only: NDEBUG
- * strips it to nothing.
+ * It writes nothing to the console. A console marker from a spinning hart lands
+ * in the middle of whatever line another hart or user space is printing, and
+ * every log pattern anchored to that line then had to strip it first.
  *
- * Defined only for KERNEL_INTERNAL builds: con_puts() is a kernel symbol, so
- * this marker is meaningful only in-kernel.
+ * One relaxed atomic add and a pointer store, so it is safe inside any spin
+ * loop. Debug-only: NDEBUG strips it.
+ *
+ * Defined only for KERNEL_INTERNAL builds.
  *
  * For a TIGHT spin (millions of iters/sec) gate the call with a counter so a
- * normal transient wait emits nothing and only a true infinite spin floods,
+ * normal transient wait counts nothing and only a true infinite spin climbs,
  * e.g.:
  *     while (cond) { if ((++spins & 0xFFFFF) == 0) MARK_POTN_INF_LOOP(); ... }
  */
 #ifdef KERNEL_INTERNAL
 #ifndef NDEBUG
-#define MARK_POTN_INF_LOOP() con_puts("\033[41m🟥\033[0m")
+extern unsigned long potn_inf_loop_marks; /* kernel/core/globals.c */
+extern const char *potn_inf_loop_site;
+#define MARK_POTN_INF_LOOP()                                                   \
+    do {                                                                       \
+        __atomic_fetch_add(&potn_inf_loop_marks, 1UL, __ATOMIC_RELAXED);       \
+        __atomic_store_n(&potn_inf_loop_site,                                  \
+                         __FILE__ ":" STRINGIZE(__LINE__), __ATOMIC_RELAXED);  \
+    } while (0)
 #else
-#define MARK_POTN_INF_LOOP()
+#define MARK_POTN_INF_LOOP() ((void) 0)
 #endif
 #endif /* KERNEL_INTERNAL */
 

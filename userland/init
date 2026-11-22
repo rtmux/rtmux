@@ -93,6 +93,26 @@ if test "$rtmux_run" = "tickless-idle"; then
     exec /bin/sh -i
 fi
 
+if test "$rtmux_run" = "crash-inject"; then
+    echo "RTMux crash-inject: BEGIN"
+
+    # Crash the kernel on purpose. The guest never reports a result; the
+    # harness's crash dump is what is under test.
+    /bin/inject crash
+    sleep 100000
+    exec /bin/sh -i
+fi
+
+if test "$rtmux_run" = "crash-inject-shutdown"; then
+    echo "RTMux crash-inject-shutdown: BEGIN"
+
+    # As crash-inject, through the Shutdown[...] banner and the SBI power-off
+    # a fatal kernel fault ends in; the harness keeps QEMU for the dump.
+    /bin/inject crash shutdown
+    sleep 100000
+    exec /bin/sh -i
+fi
+
 if test "$rtmux_run" = "hang-inject"; then
     echo "RTMux hang-inject: BEGIN"
 
@@ -164,12 +184,16 @@ if test "$rtmux_run" = "debug-inject"; then
     if test "$ok" = 5; then
         if /bin/syscall_testing --condvar-interrupt-stale &&
             /bin/syscall_testing --sync-kill-handoff &&
-            /bin/syscall_testing --intr-before-switch; then
+            /bin/syscall_testing --block-request-race &&
+            /bin/syscall_testing --intr-before-switch &&
+            /bin/syscall_testing --intr-after-select; then
             ok=6
         fi
     fi
     # A request parked behind another on one namespace node must not cost the
-    # request it waited for its combined result or its connection state.
+    # request it waited for its combined result or its connection state, nor
+    # must an unlink that lands between a request's open and its stat, nor a
+    # detach that frees the object an open is working on.
     if test "$ok" = 6; then
         if /bin/syscall_testing --ns-open-deferral; then
             ok=7
@@ -224,7 +248,29 @@ if test "$rtmux_run" = "debug-inject"; then
             ok=13
         fi
     fi
+    # A reply must fail cleanly when a channel destroy detaches its connection
+    # after the rcvid lookup, and must give its claim up when it restarts after
+    # removing an unblock notification.
     if test "$ok" = 13; then
+        if /bin/syscall_testing --reply-claim; then
+            ok=14
+        fi
+    fi
+    # A stepped copy must resume where it stopped when its header peek meets a
+    # pending preemption.
+    if test "$ok" = 14; then
+        if /bin/syscall_testing --xfer-resume; then
+            ok=15
+        fi
+    fi
+    # A long message with a capability header is copied in steps, and its
+    # receiver sees the header the kernel examined.
+    if test "$ok" = 15; then
+        if /bin/syscall_testing --cap-step; then
+            ok=16
+        fi
+    fi
+    if test "$ok" = 16; then
         echo "RTMux debug-inject: PASS"
     else
         echo "RTMux debug-inject: FAIL"

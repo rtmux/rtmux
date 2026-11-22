@@ -1190,6 +1190,9 @@ static FILE *open_streams[POOL_WORKERS];
 struct stream_worker {
     unsigned index;
     unsigned failures;
+    /* Which call failed, and the last errno or byte seen, for the detail. */
+    unsigned open_failed, collided, read_failed, close_failed;
+    int open_errno, read_byte, read_errno, close_errno;
 };
 
 static void *exercise_stream_slot(void *arg)
@@ -1198,23 +1201,36 @@ static void *exercise_stream_slot(void *arg)
     for (unsigned round = 0; round < POOL_ROUNDS; round++) {
         FILE *fp = fopen("/bin/sh", "r");
         if (!fp) {
+            worker->open_errno = errno;
+            worker->open_failed++;
             worker->failures++;
             continue;
         }
         pthread_mutex_lock(&stream_test_lock);
         for (unsigned i = 0; i < POOL_WORKERS; i++) {
-            if (open_streams[i] == fp)
+            if (open_streams[i] == fp) {
+                worker->collided++;
                 worker->failures++;
+            }
         }
         open_streams[worker->index] = fp;
         pthread_mutex_unlock(&stream_test_lock);
-        if (fgetc(fp) != 0x7f)
+        errno = 0;
+        int byte = fgetc(fp);
+        if (byte != 0x7f) {
+            worker->read_byte = byte;
+            worker->read_errno = errno;
+            worker->read_failed++;
             worker->failures++;
+        }
         pthread_mutex_lock(&stream_test_lock);
         open_streams[worker->index] = NULL;
         pthread_mutex_unlock(&stream_test_lock);
-        if (fclose(fp) != 0)
+        if (fclose(fp) != 0) {
+            worker->close_errno = errno;
+            worker->close_failed++;
             worker->failures++;
+        }
     }
     return NULL;
 }
@@ -1243,12 +1259,33 @@ static void test_stream_pool(void)
                            &workers[started]) != 0)
             break;
     }
+    struct stream_worker sum = {0};
+    char stream_detail[200];
     for (unsigned i = 0; i < started; i++) {
         pthread_join(threads[i], NULL);
         failures += workers[i].failures;
+        sum.open_failed += workers[i].open_failed;
+        sum.collided += workers[i].collided;
+        sum.read_failed += workers[i].read_failed;
+        sum.close_failed += workers[i].close_failed;
+        if (workers[i].open_failed)
+            sum.open_errno = workers[i].open_errno;
+        if (workers[i].read_failed) {
+            sum.read_byte = workers[i].read_byte;
+            sum.read_errno = workers[i].read_errno;
+        }
+        if (workers[i].close_failed)
+            sum.close_errno = workers[i].close_errno;
     }
+    snprintf(stream_detail, sizeof stream_detail,
+             "started=%u fopen failed=%u (errno %d) collisions=%u fgetc "
+             "wrong=%u (byte %d errno %d) fclose failed=%u (errno %d)",
+             started, sum.open_failed, sum.open_errno, sum.collided,
+             sum.read_failed, sum.read_byte, sum.read_errno, sum.close_failed,
+             sum.close_errno);
     check(started == POOL_WORKERS && !failures,
-          "eight threads open and close 1000 private streams each", "stream collision or I/O error");
+          "eight threads open and close 1000 private streams each",
+          stream_detail);
 
     if (sysconf(_SC_OPEN_MAX) > SHRT_MAX + 1L) {
         int fd = fcntl(STDIN_FILENO, F_DUPFD, SHRT_MAX + 1);

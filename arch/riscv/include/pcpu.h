@@ -157,7 +157,13 @@ struct pcpu {
      */
     atomic_ulong pc_timer_progress;
     atomic_uint pc_ipi_refused; /* IPIs sent to this CPU after it was dropped */
-    uint8_t pc_pad[68];         /* keep sizeof(struct pcpu) power-of-two */
+
+    /* A thread this hart just blocked while a kill or a cancel was pending on
+     * it, pinned; kernel_exit delivers the request before it dispatches
+     * anything (thread_block_recheck). Owner hart only.
+     */
+    struct thread_entry *pc_block_recheck;
+    uint8_t pc_pad[56]; /* keep sizeof(struct pcpu) power-of-two */
 };
 
 #ifndef __cplusplus

@@ -2198,6 +2198,231 @@ out:
     (void) dispatch_destroy(dpp);
 }
 
+/* A service whose open is still running when its client leaves: the server's
+ * reply then fails, and the binding the open set must be closed, not left on
+ * the client's connection id. The client leaves by a reply timeout, which on a
+ * channel without RTMUX_FLG_CHF_UNBLOCK ends its REPLY at once, and detaches the
+ * id, as libc's connect does on a failed send. The next connect given that id
+ * used to fail EINVAL (EBUSY in the server's handle table), and the server kept
+ * an OCB for a client that never had it.
+ */
+#define LOST_REPLY_PATH "/lost-reply-test"
+#define LOST_REPLY_HOLD_MS 300
+
+static atomic_int lost_reply_hold; /* the next open waits before it binds */
+static atomic_int lost_reply_held_bound; /* the held open bound and returned */
+static atomic_int lost_reply_bound, lost_reply_closed;
+
+static int lost_reply_open(ioserv_context_t *ctp, io_open_t *msg, void *handle,
+                           void *extra)
+{
+    int *ocb;
+
+    (void) msg;
+    (void) handle;
+    (void) extra;
+    int held = atomic_exchange(&lost_reply_hold, 0);
+
+    if (held)
+        sleep_ms(LOST_REPLY_HOLD_MS);
+    if (!(ocb = calloc(1, sizeof *ocb)))
+        return ENOMEM;
+    if (ioserv_open_bind(ctp, ocb, NULL) == -1) {
+        int err = errno;
+
+        free(ocb);
+        return err;
+    }
+    atomic_fetch_add(&lost_reply_bound, 1);
+    if (held)
+        atomic_store(&lost_reply_held_bound, 1);
+    return EOK;
+}
+
+static int lost_reply_close_ocb(ioserv_context_t *ctp, void *reserved, void *ocb)
+{
+    (void) ctp;
+    (void) reserved;
+    free(ocb);
+    atomic_fetch_add(&lost_reply_closed, 1);
+    return EOK;
+}
+
+static const ioserv_connect_ops_t lost_reply_connect_ops = {
+    .nfuncs = IOSERV_CONNECT_NFUNCS,
+    .open = lost_reply_open,
+};
+
+static int lost_reply_stat(ioserv_context_t *ctp, io_stat_t *msg, void *ocb)
+{
+    (void) ocb;
+    memset(&msg->o, 0, sizeof msg->o);
+    msg->o.st_mode = S_IFREG | 0444;
+    return IOSERV_PTR(ctp, &msg->o, sizeof msg->o);
+}
+
+static const ioserv_ops_t lost_reply_io_ops = {
+    .nfuncs = IOSERV_IO_NFUNCS,
+    .close_ocb = lost_reply_close_ocb,
+    .stat = lost_reply_stat,
+};
+
+/* Send the service an open of "node" on a connection of its own, with a reply
+ * timeout shorter than the hold: a plain open, or a combined open and stat
+ * with no close (what access() sends). Returns the send's errno (0 if it was
+ * answered).
+ */
+static int lost_reply_timed_open(int chid, int id, bool combine)
+{
+    union {
+        struct _io_connect connect;
+        char bytes[128];
+    } msg;
+    size_t len = offsetof(struct _io_connect, path) + sizeof "node";
+    char reply[sizeof(struct _io_connect_link_reply) + sizeof(struct stat)];
+    uint64_t ns = (LOST_REPLY_HOLD_MS / 3) * 1000000ULL;
+    int coid, err = 0;
+
+    if ((coid = connect_attach(0, getpid(), chid, 0, 0)) == -1)
+        return errno;
+    memset(&msg, 0, sizeof msg);
+    msg.connect.type = _IO_CONNECT;
+    msg.connect.subtype = combine ? _IO_CONNECT_COMBINE : _IO_CONNECT_OPEN;
+    msg.connect.file_type = _FTYPE_ANY;
+    msg.connect.reply_max = sizeof reply;
+    msg.connect.handle = (uint32_t) id;
+    msg.connect.ioflag = O_RDONLY + 1;
+    msg.connect.path_len = sizeof "node";
+    memcpy(msg.connect.path, "node", sizeof "node");
+    if (combine) {
+        struct _io_stat *st;
+
+        len = (len + RTMUX_MSG_ALIGN - 1) & ~(size_t) (RTMUX_MSG_ALIGN - 1);
+        st = (struct _io_stat *) (void *) (msg.bytes + len);
+        st->type = _IO_STAT;
+        st->combine_len = sizeof *st;
+        msg.connect.extra_len = sizeof *st;
+        len += sizeof *st;
+    }
+    (void) __timer_timeout(CLOCK_MONOTONIC, RTMUX_TIMEOUT_REPLY, NULL, &ns, NULL);
+    if (msg_send(coid, &msg, len, reply, sizeof reply) == -1)
+        err = errno;
+    (void) __connect_detach((uint64_t) coid);
+    return err;
+}
+
+static void *lost_reply_open_path(void *arg)
+{
+    int *err = arg;
+    int fd;
+
+    errno = 0;
+    fd = open(LOST_REPLY_PATH "/node", O_RDONLY);
+    *err = fd == -1 ? errno : 0;
+    if (fd != -1)
+        (void) close(fd);
+    return NULL;
+}
+
+void test_ioserv_lost_reply_binding(void)
+{
+    char why[128];
+    dispatch_t *dpp;
+    pthread_t server, th;
+    int chid, id, err, main_err, thread_err, keeper;
+
+    /* No RTMUX_FLG_CHF_UNBLOCK: the reply timeout ends the client's REPLY at
+     * once, while the service still runs the open.
+     */
+    if ((chid = channel_create(RTMUX_FLG_CHF_DISCONNECT)) == -1) {
+        test_fail("lost reply channel", strerror(errno));
+        return;
+    }
+    if (!(dpp = dispatch_create_channel(chid, 0))) {
+        test_fail("lost reply dispatch", strerror(errno));
+        (void) channel_destroy(chid);
+        return;
+    }
+    /* SELF: see test_posix_poll_service_faults. */
+    id = ioserv_attach(dpp, NULL, LOST_REPLY_PATH, _FTYPE_ANY,
+                       IOSERV_FLAG_DIR | IOSERV_FLAG_SELF, &lost_reply_connect_ops,
+                       &lost_reply_io_ops, NULL);
+    if (id == -1) {
+        test_skip("lost reply service", "cannot attach a test path");
+        (void) dispatch_destroy(dpp);
+        return;
+    }
+    if (pthread_create(&server, NULL, poll_fault_server, dpp) != 0) {
+        test_fail("lost reply service thread", "pthread_create failed");
+        (void) ioserv_detach(dpp, id, 0);
+        (void) dispatch_destroy(dpp);
+        return;
+    }
+
+    /* A connection held open across the case, as a client's other descriptors
+     * to the service would be: with none, the detach of the timed-out one is
+     * the client's last, and the server's disconnect handling closes every
+     * binding the client had, the lost one too.
+     */
+    if ((keeper = connect_attach(0, getpid(), chid, 0, 0)) == -1) {
+        test_fail("lost reply keeper", strerror(errno));
+        goto out;
+    }
+    for (int round = 0; round < 2; round++) {
+        bool combine = round == 0; /* what access() sends, then a plain open */
+        const char *what = combine ? "combined stat" : "open";
+        char name[64];
+
+        atomic_store(&lost_reply_bound, 0);
+        atomic_store(&lost_reply_closed, 0);
+        atomic_store(&lost_reply_held_bound, 0);
+        atomic_store(&lost_reply_hold, 1);
+        err = lost_reply_timed_open(chid, id, combine);
+        /* The timed request is the held one: the server took the hold, bound
+         * its OCB and replied to a client that had left. Its binding is closed
+         * by now unless it was kept; wait a moment for that close.
+         */
+        for (int i = 0; i < 400 && !atomic_load(&lost_reply_held_bound); i++)
+            sleep_ms(5);
+        for (int i = 0; i < 40 && atomic_load(&lost_reply_closed) == 0; i++)
+            sleep_ms(5);
+        snprintf(name, sizeof name, "lost reply %s client times out", what);
+        snprintf(why, sizeof why, "send errno %d (want ETIMEDOUT), held open %s bound", err,
+                 atomic_load(&lost_reply_held_bound) ? "was" : "not");
+        check(err == ETIMEDOUT && atomic_load(&lost_reply_held_bound) &&
+                  atomic_load(&lost_reply_bound) == 1,
+              name, why);
+        snprintf(name, sizeof name, "lost reply %s binding closed", what);
+        snprintf(why, sizeof why, "%d closed of 1", atomic_load(&lost_reply_closed));
+        check(atomic_load(&lost_reply_closed) == 1, name, why);
+
+        /* Fresh opens, from this thread and from a new one: one of them is
+         * given the freed id, which is the lowest free descriptor.
+         */
+        (void) lost_reply_open_path(&main_err);
+        thread_err = EAGAIN;
+        if (pthread_create(&th, NULL, lost_reply_open_path, &thread_err) == 0)
+            (void) pthread_join(th, NULL);
+        snprintf(name, sizeof name, "lost reply %s id reusable", what);
+        snprintf(why, sizeof why, "open: %s here, %s in a new thread", strerror(main_err),
+                 strerror(thread_err));
+        check(!main_err && !thread_err, name, why);
+
+        snprintf(name, sizeof name, "lost reply %s leaves no binding", what);
+        snprintf(why, sizeof why, "%d bound, %d closed", atomic_load(&lost_reply_bound),
+                 atomic_load(&lost_reply_closed));
+        check(atomic_load(&lost_reply_bound) == atomic_load(&lost_reply_closed), name, why);
+        if (main_err || thread_err)
+            break; /* the id is spoiled for the next round */
+    }
+    (void) __connect_detach((uint64_t) keeper);
+out:
+    (void) ioserv_detach(dpp, id, 0);
+    (void) pthread_cancel(server);
+    (void) pthread_join(server, NULL);
+    (void) dispatch_destroy(dpp);
+}
+
 /* A service in this process that answers _IO_NOTIFY with the real
  * ioserv_notify, to check what it arms: a hangup already known is the reply, so
  * nothing is armed for it, whether the request is a condition arm or a
@@ -5028,6 +5253,54 @@ static void test_namespace_open_race(void)
     (void) unlink(path);
 }
 
+#define NSU_PROBE_PATH "/dev/name/local/rtmux-stat-probe"
+
+/* Stats and accesses of a name node and of /dev/zero: 0 or the first errno. */
+static void *nsu_probe(void *arg)
+{
+    int *err = arg;
+    struct stat st;
+
+    /* A binding left on an id fails the first connect given it. */
+    errno = 0;
+    if (stat(NSU_PROBE_PATH, &st) != 0 || !S_ISNAM(st.st_mode) ||
+        access(NSU_PROBE_PATH, F_OK) != 0 || stat("/dev/zero", &st) != 0 ||
+        access("/dev/zero", F_OK) != 0)
+        *err = errno ? errno : EIO;
+    else
+        *err = 0;
+    return NULL;
+}
+
+/* A binding left behind on a connection id fails each later connect that is
+ * given that id, and which one that is depends on the order the ids were freed
+ * in: in practice a request of the same shape from a new thread. Probe from
+ * this thread and from a new one; true when both succeed.
+ */
+static bool nsu_no_binding_left(char *why, size_t len)
+{
+    name_attach_t *attach;
+    int main_err, thread_err;
+    pthread_t th;
+
+    (void) unlink(NSU_PROBE_PATH);
+    attach = name_attach(NULL, "rtmux-stat-probe", 0);
+    if (!attach) {
+        snprintf(why, len, "probe fixture: %s", strerror(errno));
+        return false;
+    }
+    nsu_probe(&main_err);
+    thread_err = 0;
+    if (pthread_create(&th, NULL, nsu_probe, &thread_err) == 0)
+        (void) pthread_join(th, NULL);
+    else
+        thread_err = EAGAIN;
+    (void) name_detach(attach, 0);
+    snprintf(why, len, "stat or access: %s here, %s in a new thread",
+             strerror(main_err), strerror(thread_err));
+    return !main_err && !thread_err;
+}
+
 struct entry_generation_race_args {
     const char *name;
     atomic_int stop;
@@ -5159,6 +5432,16 @@ static void test_namespace_open_entry_generation_race(void)
         check(mismatch_without_generation_bump == 0,
               "namespace access/open generation", detail);
     }
+    {
+        char detail[112];
+
+        /* An access that lost its node to the toggler between its open and its
+         * stat used to keep its binding on its connection id, and later stats
+         * and accesses given that id failed EINVAL (ns_stat_unlink).
+         */
+        check(nsu_no_binding_left(detail, sizeof detail),
+              "namespace entry-generation race leaves no binding", detail);
+    }
 }
 
 /* ns_open_deferral: a stat or access that was in flight when an unlink of the
@@ -5181,34 +5464,124 @@ static void test_namespace_open_entry_generation_race(void)
 #define NSD_ATTEMPTS 3
 
 static struct {
+    const char *path;
     bool use_access;
     atomic_int started;
     int rc;
     int err;
     struct stat st;
     long ms;
+    struct timespec t0, t1; /* the request's start and end */
 } nsd;
+
+static long nsd_ms_between(const struct timespec *a, const struct timespec *b)
+{
+    return (b->tv_sec - a->tv_sec) * 1000L + (b->tv_nsec - a->tv_nsec) / 1000000L;
+}
 
 static long nsd_ms_since(const struct timespec *t0)
 {
     struct timespec t1;
 
     clock_gettime(CLOCK_MONOTONIC, &t1);
-    return (t1.tv_sec - t0->tv_sec) * 1000L + (t1.tv_nsec - t0->tv_nsec) / 1000000L;
+    return nsd_ms_between(t0, &t1);
 }
 
 static void *nsd_thread(void *arg)
 {
-    struct timespec t0;
-
     (void) arg;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
+    clock_gettime(CLOCK_MONOTONIC, &nsd.t0);
     atomic_store(&nsd.started, 1);
     errno = 0;
-    nsd.rc = nsd.use_access ? access(NSD_PATH, F_OK) : stat(NSD_PATH, &nsd.st);
+    nsd.rc = nsd.use_access ? access(nsd.path, F_OK) : stat(nsd.path, &nsd.st);
     nsd.err = errno;
-    nsd.ms = nsd_ms_since(&t0);
+    clock_gettime(CLOCK_MONOTONIC, &nsd.t1);
+    nsd.ms = nsd_ms_between(&nsd.t0, &nsd.t1);
     return NULL;
+}
+
+/* Attach the fixture node and start a thread on a stat or access of it, then
+ * give the request a quarter of the stall to reach the server. Returns the
+ * attach, or NULL after a failure it has reported.
+ */
+static name_attach_t *nsd_start(const char *tag, const char *name, const char *path,
+                                long stall_ms, bool use_access, pthread_t *th)
+{
+    char what[48];
+    name_attach_t *attach;
+
+    snprintf(what, sizeof what, "%s fixture", tag);
+    (void) unlink(path);
+    attach = name_attach(NULL, name, 0);
+    if (!attach) {
+        test_fail(what, strerror(errno));
+        return NULL;
+    }
+    memset(&nsd, 0, sizeof nsd);
+    nsd.path = path;
+    nsd.use_access = use_access;
+    if (pthread_create(th, NULL, nsd_thread, NULL) != 0) {
+        test_fail(what, "pthread_create");
+        (void) name_detach(attach, 0);
+        return NULL;
+    }
+    while (!atomic_load(&nsd.started))
+        (void) __sched_yield();
+    sleep_ms(stall_ms / 4);
+    return attach;
+}
+
+/* Run a stall case: skip when the image has no stall for the node (a stat of it
+ * returns at once), else two rounds, the access first when access_first, each
+ * retried until it is held. round_fn returns 1 when held, 0 when not (retry),
+ * -1 after a failure it has reported.
+ */
+static int nsd_run(const char *tag, const char *name, const char *path, long stall_ms,
+                   int (*round_fn)(bool use_access), bool access_first,
+                   const char *never_held)
+{
+    char what[48];
+    struct stat st;
+    struct timespec t0;
+    name_attach_t *attach;
+    long ms;
+    int rc;
+
+    /* Is the stall in this image? A held stat of the fixture node takes the
+     * stall; judged on its time alone when it succeeds, so that a stat that
+     * fails fast is a failure and not a skip.
+     */
+    snprintf(what, sizeof what, "%s fixture", tag);
+    (void) unlink(path);
+    attach = name_attach(NULL, name, 0);
+    if (!attach) {
+        test_fail(what, strerror(errno));
+        return 0;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    rc = stat(path, &st);
+    ms = nsd_ms_since(&t0);
+    (void) name_detach(attach, 0);
+    if (rc != 0) {
+        test_fail(what, strerror(errno));
+        return 0;
+    }
+    if (ms < stall_ms / 2)
+        return TC_EXIT_SKIP;
+
+    for (int round = 0; round < 2; round++) {
+        int held = 0;
+
+        for (int i = 0; i < NSD_ATTEMPTS && !held; i++)
+            held = round_fn((round == 0) == access_first);
+        if (held < 0)
+            return 0;
+        if (!held) {
+            test_fail(tag, never_held);
+            return 0;
+        }
+    }
+    return 0;
 }
 
 /* One round. Returns 1 when the request was held and the unlink parked behind
@@ -5225,23 +5598,10 @@ static int nsd_round(bool use_access)
     long unlink_ms;
     int unlink_rc, unlink_err;
 
-    (void) unlink(NSD_PATH);
-    attach = name_attach(NULL, NSD_NAME, 0);
-    if (!attach) {
-        test_fail("ns_open_deferral fixture", strerror(errno));
+    attach = nsd_start("ns_open_deferral", NSD_NAME, NSD_PATH, NSD_STALL_MS, use_access, &th);
+    if (!attach)
         return -1;
-    }
-    memset(&nsd, 0, sizeof nsd);
-    nsd.use_access = use_access;
-    if (pthread_create(&th, NULL, nsd_thread, NULL) != 0) {
-        test_fail("ns_open_deferral fixture", "pthread_create");
-        (void) name_detach(attach, 0);
-        return -1;
-    }
-    while (!atomic_load(&nsd.started))
-        (void) __sched_yield();
     /* The request is held in the server by now; this unlink parks behind it. */
-    (void) nanosleep(&(struct timespec){.tv_nsec = (NSD_STALL_MS / 4) * 1000000L}, NULL);
     clock_gettime(CLOCK_MONOTONIC, &t0);
     errno = 0;
     unlink_rc = unlink(NSD_PATH);
@@ -5265,45 +5625,201 @@ static int nsd_round(bool use_access)
 
 int ns_open_deferral(void)
 {
+    return nsd_run("ns_open_deferral", NSD_NAME, NSD_PATH, NSD_STALL_MS, nsd_round, false,
+                   "the unlink was never held behind the request");
+}
+
+/* ns_stat_unlink: a stat or access whose node is unlinked after the open and
+ * before the combined stat still reports the file the open found, and a
+ * combined stat that fails leaves no connection state behind.
+ *
+ * The open is complete by then, so the unlink is not parked behind it. The stat
+ * read the node's object at that point, found none and failed ENOSYS, and an
+ * access (a combine with no close) kept its binding on the error: the client
+ * detached the connection id, and the next connect given that id failed EINVAL
+ * for the rest of the process. In a CONFIG_DEBUG_INJECT image a node named
+ * rtmux-stat-stall-MS holds each stat of it for MS ms, and one named
+ * rtmux-stat-fail-* fails each stat of it with EIO; elsewhere the case is
+ * skipped.
+ */
+#define NSU_STALL_MS 400
+#define NSU_NAME "rtmux-stat-stall-400"
+#define NSU_PATH "/dev/name/local/" NSU_NAME
+#define NSU_FAIL_NAME "rtmux-stat-fail-1"
+#define NSU_FAIL_PATH "/dev/name/local/" NSU_FAIL_NAME
+
+/* One round. Returns 1 when the request was held across the unlink, 0 when it
+ * was not (the caller retries), and -1 after a failure it has reported.
+ */
+static int nsu_round(bool use_access)
+{
+    const char *what = use_access ? "access" : "stat";
+    char name[64], why[112];
+    name_attach_t *attach;
+    pthread_t th;
+    struct timespec d0, d1;
+    bool entry, held, ok, probe_ok;
+
+    attach = nsd_start("ns_stat_unlink", NSU_NAME, NSU_PATH, NSU_STALL_MS, use_access, &th);
+    if (!attach)
+        return -1;
+    /* The request is in its stat by now; the unlink removes the object. */
+    clock_gettime(CLOCK_MONOTONIC, &d0);
+    (void) name_detach(attach, 0);
+    clock_gettime(CLOCK_MONOTONIC, &d1);
+    (void) pthread_join(th, NULL);
+
+    /* The result is the entry, or ENOENT when the unlink came first and the
+     * open missed it; anything else fails, held or not. Held, which only
+     * decides whether to retry, means an entry whose stall, which ends the
+     * request, began before the unlink did (no later than STALL before the
+     * request ended) and ended after it. It is judged from client-side times,
+     * so a delayed reply can make a round count that missed the window; the
+     * window is one quarter into the stall to keep that rare.
+     */
+    entry = nsd.rc == 0 && (use_access || S_ISNAM(nsd.st.st_mode));
+    ok = entry || (nsd.rc == -1 && nsd.err == ENOENT);
+    held = entry && nsd.ms >= NSU_STALL_MS && nsd_ms_between(&d0, &nsd.t1) <= NSU_STALL_MS &&
+           nsd_ms_between(&d1, &nsd.t1) >= 0;
+    if (ok && !held)
+        return 0;
+    snprintf(name, sizeof name, "ns_stat_unlink %s result", what);
+    snprintf(why, sizeof why, "rc %d errno %d mode %#o after %ld ms (want the entry or ENOENT)", nsd.rc,
+             nsd.err, (unsigned) nsd.st.st_mode, nsd.ms);
+    check(ok, name, why);
+    snprintf(name, sizeof name, "ns_stat_unlink %s leaves no binding", what);
+    probe_ok = nsu_no_binding_left(why, sizeof why);
+    check(probe_ok, name, why);
+    return ok && probe_ok ? 1 : -1;
+}
+
+/* A combined stat that fails, first with an access (a combine with no close)
+ * and then with a stat: the error reaches the caller and no binding is left.
+ */
+static void nsu_failed_stat(void)
+{
+    char why[112];
+    name_attach_t *attach;
+    struct stat st;
+    int rc_access, err_access, rc_stat, err_stat;
+
+    (void) unlink(NSU_FAIL_PATH);
+    attach = name_attach(NULL, NSU_FAIL_NAME, 0);
+    if (!attach) {
+        test_fail("ns_stat_unlink fixture", strerror(errno));
+        return;
+    }
+    errno = 0;
+    rc_access = access(NSU_FAIL_PATH, F_OK);
+    err_access = errno;
+    errno = 0;
+    rc_stat = stat(NSU_FAIL_PATH, &st);
+    err_stat = errno;
+    snprintf(why, sizeof why, "access rc %d errno %d, stat rc %d errno %d (want EIO)", rc_access,
+             err_access, rc_stat, err_stat);
+    check(rc_access == -1 && err_access == EIO && rc_stat == -1 && err_stat == EIO,
+          "ns_stat_unlink failed stat result", why);
+    (void) name_detach(attach, 0);
+    check(nsu_no_binding_left(why, sizeof why), "ns_stat_unlink failed stat leaves no binding",
+          why);
+}
+
+/* The access first: it is the combine with no close. */
+int ns_stat_unlink(void)
+{
+    int rc = nsd_run("ns_stat_unlink", NSU_NAME, NSU_PATH, NSU_STALL_MS, nsu_round, true,
+                     "the request was never held across the unlink");
+
+    if (rc != TC_EXIT_SKIP)
+        nsu_failed_stat();
+    return rc;
+}
+
+/* ns_open_detach: an open whose object is detached while it runs, after the
+ * object was chosen and path_mutex released, still works on that object, and
+ * never on a freed one.
+ *
+ * path_open used the object it found with no reference once the mutex was
+ * released. A detach that is not an unlink (here the close of a non-sticky
+ * link's descriptor) is not parked behind the open, so it could free the object
+ * under it. A node named rtmux-open-stall-MS holds each open of it for MS ms
+ * there in a CONFIG_DEBUG_INJECT image, which also marks each object it frees;
+ * the open then answers EFAULT when its object has been freed. Elsewhere the
+ * case is skipped.
+ */
+#define NSO_STALL_MS 500
+#define NSO_NAME "rtmux-open-stall-500"
+#define NSO_PATH "/dev/name/local/" NSO_NAME
+
+int ns_open_detach(void)
+{
+    char why[128];
     struct stat st;
     struct timespec t0;
-    name_attach_t *attach;
+    pthread_t th;
     long ms;
-    int rc;
+    int chid, fd, rc;
 
-    /* Is the stall in this image? A held stat of the fixture node takes the
-     * stall; judged on its time alone when it succeeds, so that a stat that
-     * fails fast is a failure and not a skip.
-     */
-    (void) unlink(NSD_PATH);
-    attach = name_attach(NULL, NSD_NAME, 0);
-    if (!attach) {
-        test_fail("ns_open_deferral fixture", strerror(errno));
+    if ((chid = channel_create(0)) == -1) {
+        test_fail("ns_open_detach fixture", strerror(errno));
+        return 0;
+    }
+    /* Is the stall in this image? */
+    (void) unlink(NSO_PATH);
+    if ((fd = namespace_link(NSO_PATH, 0, getpid(), chid, 0, _FTYPE_NAME, 0)) == -1) {
+        test_fail("ns_open_detach fixture", strerror(errno));
+        (void) channel_destroy(chid);
         return 0;
     }
     clock_gettime(CLOCK_MONOTONIC, &t0);
-    rc = stat(NSD_PATH, &st);
+    rc = stat(NSO_PATH, &st);
     ms = nsd_ms_since(&t0);
-    (void) name_detach(attach, 0);
+    (void) close(fd);
     if (rc != 0) {
-        test_fail("ns_open_deferral fixture", strerror(errno));
+        test_fail("ns_open_detach fixture", strerror(errno));
+        (void) channel_destroy(chid);
         return 0;
     }
-    if (ms < NSD_STALL_MS / 2)
+    if (ms < NSO_STALL_MS / 2) {
+        (void) channel_destroy(chid);
         return TC_EXIT_SKIP;
-
-    for (int round = 0; round < 2; round++) {
-        int held = 0;
-
-        for (int i = 0; i < NSD_ATTEMPTS && !held; i++)
-            held = nsd_round(round == 1);
-        if (held < 0)
-            return 0;
-        if (!held) {
-            test_fail("ns_open_deferral", "the unlink was never held behind the request");
-            return 0;
-        }
     }
+
+    for (int i = 0; i < NSD_ATTEMPTS; i++) {
+        (void) unlink(NSO_PATH);
+        fd = namespace_link(NSO_PATH, 0, getpid(), chid, 0, _FTYPE_NAME, 0);
+        if (fd == -1) {
+            test_fail("ns_open_detach fixture", strerror(errno));
+            break;
+        }
+        memset(&nsd, 0, sizeof nsd);
+        nsd.path = NSO_PATH;
+        if (pthread_create(&th, NULL, nsd_thread, NULL) != 0) {
+            test_fail("ns_open_detach fixture", "pthread_create");
+            (void) close(fd);
+            break;
+        }
+        while (!atomic_load(&nsd.started))
+            (void) __sched_yield();
+        sleep_ms(NSO_STALL_MS / 4);
+        (void) close(fd); /* detaches the link's object */
+        (void) pthread_join(th, NULL);
+        /* An open held across the detach finds, once it resumes, that the
+         * entry changed under it and fails ESTALE; one that came after the
+         * detach misses the node (ENOENT) and is retried. EFAULT is the image
+         * telling that the object was freed under the open.
+         */
+        if (nsd.rc == -1 && nsd.err == ENOENT)
+            continue;
+        snprintf(why, sizeof why, "rc %d errno %d after %ld ms (want ESTALE; EFAULT: freed under "
+                 "the open)", nsd.rc, nsd.err, nsd.ms);
+        check(nsd.rc == -1 && nsd.err == ESTALE && nsd.ms >= NSO_STALL_MS,
+              "ns_open_detach object outlives the open", why);
+        (void) channel_destroy(chid);
+        return 0;
+    }
+    test_fail("ns_open_detach", "the open was never held across the detach");
+    (void) channel_destroy(chid);
     return 0;
 }
 
@@ -8386,6 +8902,186 @@ out:
     free(envp);
     free(argv);
     return rc;
+}
+
+/* Child of test_spawn_arg_max: exec with an argument list of ARG_MAX + 1 must
+ * fail with E2BIG. The image is /bin/false, so an exec that goes through shows
+ * as exit status 1.
+ */
+int exec_arg_max_child(void)
+{
+    char *env[] = {NULL};
+    char *argv[] = {"false", NULL, NULL};
+    size_t len = ARG_MAX - sizeof argv - sizeof env - sizeof "false" + 1;
+
+    if (!(argv[1] = malloc(len)))
+        return 3;
+    memset(argv[1], 'a', len - 1);
+    argv[1][len - 1] = '\0';
+    errno = 0;
+    return execve("/bin/false", argv, env) == -1 && errno == E2BIG ? 0 : 2;
+}
+
+static long arg_max_heap_used(void)
+{
+    char snap[4096];
+    int fd = open("/sys/kstats", O_RDONLY);
+    long used = -1;
+
+    if (fd < 0)
+        return -1;
+    if (kstats_read(fd, snap, sizeof snap) > 0)
+        used = kstats_get(snap, "roottask.heap_used");
+    (void) close(fd);
+    return used;
+}
+
+/* Native spawn of /bin/true; returns the errno of the spawn, with *code the
+ * child's exit status or -1.
+ */
+static int arg_max_native(const struct inheritance *attr,
+                          char *argv[],
+                          char *envp[],
+                          int *code)
+{
+    pid_t pid = rtmux_spawn("/bin/true", 0, NULL, attr, argv, envp);
+    int status;
+
+    *code = -1;
+    if (pid == -1)
+        return errno;
+    if (wait_child_exit(pid, &status, 500) && WIFEXITED(status))
+        *code = WEXITSTATUS(status);
+    return EOK;
+}
+
+/* The errno roottask answers a raw request of n bytes with. */
+static int arg_max_raw(const void *msg, size_t n)
+{
+    return roottask_errno_status(msg_sendnc_r(ROOTTASK_COID, msg, n, NULL, 0));
+}
+
+/* ARG_MAX counts every argument and environment string with its NUL and
+ * a pointer for each string and for the two terminating null pointers. A list
+ * of exactly ARG_MAX is accepted by posix_spawn and by the native spawn, there
+ * on a 32 KiB stack that the arguments alone would overflow; one byte more is
+ * E2BIG from libc, from exec, and from both roottask handlers when a raw
+ * request bypasses libc, and takes nothing from roottask's heap.
+ */
+void test_spawn_arg_max(void)
+{
+    struct inheritance attr = {.flags = SPAWN_SETSTACKMAX, .stack_max = 32768};
+    char *argv[] = {"true", NULL, NULL};
+    char *env[] = {"CHECK=1", NULL};
+    char *exec_argv[] = {"syscall_testing", "--exec-arg-max-child", NULL};
+    static const char path[] = "/bin/true";
+    /* bytes left for argv[1] with its NUL */
+    size_t len = ARG_MAX - sizeof argv - sizeof env - sizeof "true" -
+                 sizeof "CHECK=1";
+    /* a raw request with one argument and one environment string */
+    size_t vectors = 4 * sizeof(char *);
+    proc_spawn_t ns = {.i = {.type = _PROC_SPAWN, .subtype = _PROC_SPAWN_START}};
+    proc_posixspawn_t ps = {
+        .i = {.type = _PROC_POSIX_SPAWN, .subtype = _PROC_SPAWN_START}};
+    struct {
+        struct _proc_spawn i;
+        char data[16];
+    } raw = {.i = {.type = _PROC_SPAWN, .subtype = _PROC_SPAWN_START}};
+    char *buf = malloc(len + 1);
+    long before, after;
+    int rc, code;
+
+    if (!buf) {
+        test_fail("spawn ARG_MAX fixture", strerror(errno));
+        return;
+    }
+    memset(buf, 'a', len);
+    buf[len - 1] = '\0';
+    argv[1] = buf;
+    check(sysconf(_SC_ARG_MAX) == ARG_MAX,
+          "sysconf(_SC_ARG_MAX) is the enforced ARG_MAX",
+          "differs from limits.h");
+
+    rc = spawn_wait_code(path, NULL, NULL, argv, env, NULL, &code);
+    check(rc == EOK && code == 0, "posix_spawn accepts exactly ARG_MAX",
+          strerror(rc));
+    rc = arg_max_native(&attr, argv, env, &code);
+    check(rc == EOK && code == 0,
+          "native spawn accepts ARG_MAX on a 32 KiB stack", strerror(rc));
+
+    rc = spawn_wait_code("/bin/syscall_testing", NULL, NULL, exec_argv, env,
+                         NULL, &code);
+    check(rc == EOK && code == 0, "execve rejects ARG_MAX + 1 with E2BIG",
+          "the exec went through or the child failed");
+
+    /* Every refusal from here to the second sample is made before roottask
+     * creates a process or allocates (libc's are made before anything is
+     * sent), so the heap must not move. The spawns outside this window create
+     * and reap processes, which may take a new size-class chunk.
+     */
+    before = arg_max_heap_used();
+    buf[len - 1] = 'a'; /* one byte more */
+    buf[len] = '\0';
+    rc = spawn_wait_code(path, NULL, NULL, argv, env, NULL, &code);
+    check(rc == E2BIG, "posix_spawn rejects ARG_MAX + 1 with E2BIG",
+          strerror(rc));
+    rc = arg_max_native(&attr, argv, env, &code);
+    check(rc == E2BIG, "native spawn rejects ARG_MAX + 1 with E2BIG",
+          strerror(rc));
+
+    /* Raw requests, as a client that skips libc's check would send them: the
+     * header alone, declaring one argument and one environment string. With
+     * strings one byte over the limit both handlers answer E2BIG; exactly at
+     * the limit they get as far as noticing that the declared bytes were not
+     * sent (EMSGSIZE). Then the vectors alone over the limit.
+     */
+    ns.i.nargv = ps.i.nargv = 1;
+    ns.i.narge = ps.i.narge = 1;
+    ns.i.nbytes = ps.i.argenv_bytes = (uint32_t) (ARG_MAX - vectors + 1);
+    check(arg_max_raw(&ns, sizeof ns) == E2BIG,
+          "roottask _PROC_SPAWN rejects ARG_MAX + 1", "expected E2BIG");
+    check(arg_max_raw(&ps, sizeof ps) == E2BIG,
+          "roottask _PROC_POSIX_SPAWN rejects ARG_MAX + 1", "expected E2BIG");
+    ns.i.nbytes = ps.i.argenv_bytes = (uint32_t) (ARG_MAX - vectors);
+    check(arg_max_raw(&ns, sizeof ns) == EMSGSIZE,
+          "roottask _PROC_SPAWN does not reject ARG_MAX as too big",
+          "expected EMSGSIZE for the missing bytes");
+    check(arg_max_raw(&ps, sizeof ps) == EMSGSIZE,
+          "roottask _PROC_POSIX_SPAWN does not reject ARG_MAX as too big",
+          "expected EMSGSIZE for the missing bytes");
+    ns.i.nbytes = ps.i.argenv_bytes = 0;
+    ns.i.nargv = ARG_MAX / sizeof(char *);
+    ps.i.narge = ARG_MAX / sizeof(char *);
+    check(arg_max_raw(&ns, sizeof ns) == E2BIG,
+          "roottask _PROC_SPAWN counts the argument pointers",
+          "expected E2BIG");
+    check(arg_max_raw(&ps, sizeof ps) == E2BIG,
+          "roottask _PROC_POSIX_SPAWN counts the environment pointers",
+          "expected E2BIG");
+    after = arg_max_heap_used();
+    check(before >= 0 && after == before,
+          "refused spawns leave roottask.heap_used unchanged",
+          "heap statistic missing or backing grew");
+
+    /* The counts must be backed by strings: one argument declared whose
+     * bytes hold no NUL, then two declared with one string sent. Either
+     * would leave the child an argv entry that runs into the bytes above the
+     * arguments.
+     */
+    raw.i.pathlen = sizeof path;
+    memcpy(raw.data, path, sizeof path);
+    memcpy(raw.data + sizeof path, "true", 5);
+    raw.i.nargv = 1;
+    raw.i.nbytes = 4;
+    rc = arg_max_raw(&raw, sizeof raw.i + sizeof path + 4);
+    check(rc == EINVAL, "spawn rejects an argument without its NUL",
+          strerror(rc));
+    raw.i.nargv = 2;
+    raw.i.nbytes = 5;
+    rc = arg_max_raw(&raw, sizeof raw.i + sizeof path + 5);
+    check(rc == EINVAL, "spawn rejects more arguments than strings",
+          strerror(rc));
+    free(buf);
 }
 
 static void test_spawn_large_arguments(void)
@@ -11519,6 +12215,7 @@ void test_vfs(void)
     test_posix_poll_readiness();
     test_posix_poll_null_devices();
     test_posix_poll_service_faults();
+    test_ioserv_lost_reply_binding();
     test_posix_poll_blocking();
     test_posix_poll_hup();
     test_posix_select();
@@ -11602,6 +12299,7 @@ void test_vfs(void)
     test_spawnattr_setsid();
     test_spawn_file_actions_chdir();
     test_spawn_large_arguments();
+    test_spawn_arg_max();
     test_getsid_cases();
     test_pgrp_model();
     test_proc_lifecycle_burst_wait();

@@ -15,6 +15,7 @@
 #include <sys/iomsg.h>
 
 #include "env-lock.h"
+#include "spawn-args.h"
 #include "exec-path-default.h"
 
 extern char **environ;
@@ -29,14 +30,22 @@ static pid_t spawn_common(const char *path,
 {
     proc_spawn_t msg;
     iov_t iov[6];
-    char *const *arg;
-    char *src;
     char *search = NULL; /* PATH, copied under the environment lock */
-    char *dst, *data;
-    size_t nargv = 0, narge = 0;
+    char *data;
+    size_t pathlen;
     pid_t pid;
     int coid;
 
+    /* nfds and pathlen are 16 bits on the wire: refuse what would be cut. */
+    if (fd_count < 0 || fd_count > UINT16_MAX) {
+        errno = EINVAL;
+        return -1;
+    }
+    pathlen = strlen(path);
+    if (pathlen >= UINT16_MAX) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
     msg.i.type = _PROC_SPAWN;
     msg.i.subtype = _PROC_SPAWN_START;
 
@@ -70,32 +79,22 @@ static pid_t spawn_common(const char *path,
         msg.i.parms.flags = 0;
     }
 
-    msg.i.nbytes = 0;
-    if (argv) {
-        for (arg = argv; *arg; msg.i.nbytes += strlen(*arg++) + 1, nargv++)
-            ;
-    }
-    if (envp) {
-        for (arg = envp; *arg; msg.i.nbytes += strlen(*arg++) + 1, narge++)
-            ;
-    }
-    /* nargv and narge are 16 bits on the wire; count before narrowing. */
-    if (nargv > UINT16_MAX || narge > UINT16_MAX) {
+    if (spawn_measure_args(argv, envp, &msg.i.nargv, &msg.i.narge,
+                           &msg.i.nbytes)) {
         __env_unlock();
         free(search);
         errno = E2BIG;
         return -1;
     }
-    msg.i.nargv = (uint16_t) nargv;
-    msg.i.narge = (uint16_t) narge;
 
     msg.i.nfds = (uint16_t) fd_count;
     msg.i.cwdlen = 0;
 
     coid = ROOTTASK_COID;
 
-    /* Heap, not alloca: the environment has no size bound, and alloca cannot
-     * report failure. malloc may run under the environment lock (env-lock.h).
+    /* Heap, not alloca: ARG_MAX is far more than a caller's stack need hold,
+     * and alloca cannot report failure. malloc may run under the environment
+     * lock (env-lock.h).
      */
     data = malloc(msg.i.nbytes ? msg.i.nbytes : 1);
     if (!data) {
@@ -104,21 +103,13 @@ static pid_t spawn_common(const char *path,
         errno = ENOMEM;
         return -1;
     }
-    dst = data;
     SETIOV(iov + 5, data, 0);
-
-    if (argv) {
-        for (arg = argv; (src = *arg); arg++) {
-            while ((*dst++ = *src++))
-                ;
-        }
-    }
-
-    if (envp) {
-        for (arg = envp; (src = *arg); arg++) {
-            while ((*dst++ = *src++))
-                ;
-        }
+    if (spawn_copy_args(data, msg.i.nbytes, argv, envp) != EOK) {
+        __env_unlock();
+        free(search);
+        free(data);
+        errno = E2BIG;
+        return -1;
     }
     __env_unlock();
 
@@ -137,7 +128,7 @@ static pid_t spawn_common(const char *path,
     SETIOV(iov + 1, fd_map, (size_t) fd_count * sizeof fd_map[0]);
     msg.i.searchlen = (uint16_t) (search ? strlen(search) + 1 : 0);
     SETIOV(iov + 2, search, msg.i.searchlen);
-    msg.i.pathlen = (uint16_t) (strlen(path) + 1);
+    msg.i.pathlen = (uint16_t) (pathlen + 1);
     SETIOV(iov + 3, path, msg.i.pathlen);
     SETIOV(iov + 4, data, msg.i.nbytes);
 

@@ -17,6 +17,17 @@ static inline connect_t *reply_client_connection(thread_t *client,
                : NULL;
 }
 
+/* The claim on a reply-blocked client (message-core.c). */
+connect_t *reply_client_lock(connect_t *received,
+                             thread_t *client,
+                             channel_t **chpp);
+bool reply_client_claim_locked(thread_t *client);
+int reply_client_claim(thread_t *act,
+                       connect_t **copp,
+                       thread_t *client,
+                       channel_t **chpp);
+void msg_claim_release(channel_t *chp, thread_t *peer);
+
 /* Called after publishing the new client and dropping the channel/connection
  * lock. Each caller applies the critical-thread policy for its receive path. */
 static inline void reply_client_priority(thread_t *server,

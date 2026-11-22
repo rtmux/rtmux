@@ -1001,20 +1001,10 @@ void strap_handler_c(CPU_REGISTERS *regs)
          */
         act->reg.pc += 4;
 
-        /* A saved msg_readv/msg_writev iov check resumes only into the same
-         * call; any other kernel call in between discards it.
+        /* What a stepped transfer saved resumes only into the restart of the
+         * call that saved it.
          */
-        if ((act->iovchk_iov || act->xcur.armed) && num != __KSYS_MSG_READV &&
-            num != __KSYS_MSG_WRITEV) {
-            act->iovchk_iov = NULL;
-
-            /* A copy cursor resumes only into the call that saved it: one of
-             * the calls that copy a message in steps.
-             */
-            if (num != __KSYS_MSG_SENDV && num != __KSYS_MSG_SENDVNC &&
-                num != __KSYS_MSG_RECEIVEV && num != __KSYS_MSG_REPLYV)
-                act->xcur.armed = false;
-        }
+        xfer_begin_call(act, num);
 
         /* Reject invalid syscall numbers AFTER advancing the PC so the faulting
          * thread resumes past the ecall instead of re-triggering it in an
@@ -1068,6 +1058,10 @@ void strap_handler_c(CPU_REGISTERS *regs)
          * after a restart re-runs this snapshot over the just-restored values,
          * which is harmless.)
          */
+        /* Keep the word a blocking hart reads about a pending cancel true. */
+        if (act->internal_flags & RTMUX_ITF_CANCEL_POSTED)
+            thread_cancel_posted_refresh(act);
+
         act->kcall_c_args[0] = kap[0];
         act->kcall_c_args[1] = kap[1];
         act->kcall_c_args[2] = kap[2];

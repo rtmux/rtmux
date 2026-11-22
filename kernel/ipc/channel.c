@@ -483,7 +483,7 @@ send_done:
                             connect_coid_disconnect(cop,
                                                     cop->process->death_chp,
                                                     prp->terming_priority);
-                        cop->channel = NULL;
+                        __atomic_store_n(&cop->channel, NULL, __ATOMIC_RELEASE);
                     } while ((cop = cop->next));
                 }
             }
@@ -492,7 +492,7 @@ send_done:
         cop = ((global_channel_t *) chp)->cons;
         while (cop) {
             connect_t *next = cop->next;
-            cop->channel = NULL;
+            __atomic_store_n(&cop->channel, NULL, __ATOMIC_RELEASE);
             cop->next = NULL;
             cop = next;
         }
@@ -815,7 +815,7 @@ int kdecl ksys_channel_destroy(thread_t *act,
                                 cop, cop->process->death_chp, act->priority);
                         }
                         /* Null channel pointer since it is gone. */
-                        cop->channel = NULL;
+                        __atomic_store_n(&cop->channel, NULL, __ATOMIC_RELEASE);
                     } while ((cop = cop->next));
                 }
             }
@@ -825,7 +825,7 @@ int kdecl ksys_channel_destroy(thread_t *act,
         cop = ((global_channel_t *) chp)->cons;
         while (cop) {
             connect_t *next = cop->next;
-            cop->channel = NULL;
+            __atomic_store_n(&cop->channel, NULL, __ATOMIC_RELEASE);
             cop->next = NULL;
             cop = next;
         }

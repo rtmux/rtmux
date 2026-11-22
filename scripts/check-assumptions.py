@@ -20,6 +20,7 @@ SCAN_PATHS = (
     "internal/include/sys/iomsg.h",
     "internal/include/sys/virtio-mmio-msg.h",
     "internal/include/sys/rtmux-core.h",
+    "internal/include/sys/spawn-limits.h",
 )
 
 NAME_RE = re.compile(

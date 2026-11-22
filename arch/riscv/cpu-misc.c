@@ -527,6 +527,15 @@ void cpu_idle(unsigned cpu)
     w_sie(r_sie() | SIE_SSIE | SIE_SEIE | (kopt.disable_timer ? 0 : SIE_STIE));
 
     for (;;) {
+        /* SIE stays off in this loop except across the wfi window below (see
+         * above). Not every way in disables it first: kernel_exit runs with
+         * interrupts on and reaches here when it abandons a dead current
+         * thread. An IPI taken during the idle picks is cleared without
+         * readying anything here, and the hart then sleeps on the thread that
+         * IPI announced until the IDLE_MAX_SLEEP_NS backstop.
+         */
+        interrupt_disable();
+
         /* Idle state convention: while we're in this loop (no real thread has
          * the CPU), the idle thread for this CPU is conceptually RUNNING. The
          * state field is flipped to READY just before we dispatch a real thread
@@ -677,8 +686,13 @@ void cpu_idle(unsigned cpu)
              * (or, under a long tick, far longer). Re-pick with interrupts
              * still disabled and dispatch instead of sleeping.
              * idle_pick_thread() honours runmask, so this cannot spin on an
-             * unpickable thread.
+             * unpickable thread. It leaves SIE as it finds it, and the
+             * prologue above (as switch, timer arm) can take and drop plain
+             * kspinlocks, which turn SIE back on: disable it again so the IPI
+             * of a thread readied after the pick's scan stays pending for the
+             * wfi below.
              */
+            interrupt_disable();
             {
                 thread_t *late = idle_pick_thread(cpu);
                 if (late) {

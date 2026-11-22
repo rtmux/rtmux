@@ -13,6 +13,33 @@
 #include "internal.h"
 #include "dispatch/state.h"
 
+/* The request bound the client's id, but its call failed: it answered an
+ * error, or its reply could not be delivered because the client left first
+ * (timed out, or its unblock notice was lost). Either way the client detached
+ * the id without a close. Close the binding here, as a close from the client
+ * would: kept, it would fail every later open given that id (EBUSY in the
+ * handle table). Only the binding this request set is closed, so one that a
+ * later request set on the same id is left alone. A client that left early can
+ * be given the id again before its failed reply is seen here; a connect of it
+ * in that window still fails, and the ones after it do not.
+ */
+static void _ioserv_close_lost_binding(ioserv_context_t *ctp, ioserv_msg_t *msg)
+{
+    void *bound = ctp->bound;
+    struct binding *found;
+
+    ctp->bound = NULL;
+    found = _ioserv_handle(&ctp->info, 0, _IOSERV_HANDLE_FIND_LOCK);
+    if (found == (void *) -1)
+        return;
+    /* found is live (the table holds it, locked); bound may not be. */
+    if (found != bound || found->serial != ctp->bound_serial) {
+        _ioserv_handle(&ctp->info, 0, _IOSERV_HANDLE_UNLOCK);
+        return;
+    }
+    _ioserv_close_binding(ctp, msg, found);
+}
+
 void _ioserv_handler(ioserv_context_t *ctp)
 {
     int n;
@@ -25,6 +52,7 @@ void _ioserv_handler(ioserv_context_t *ctp)
     dpp = ctp->dpp;
     n = IOSERV_DEFAULT;
     ctp->status = 0;
+    ctp->bound = NULL;
     if (ctp->rcvid != -1) {
         if (ctp->rcvid == 0) {
             if (msg->type == _NOTIFICATION_TYPE &&
@@ -143,8 +171,16 @@ void _ioserv_handler(ioserv_context_t *ctp)
     default:
         ioserv_reply_counters_record(n > 0 ? n : EOK, 0);
         if (n <= 0) {
-            (void) msg_replyv(ctp->rcvid, ctp->status, ctp->iov, -n);
+            if (msg_replyv(ctp->rcvid, ctp->status, ctp->iov, -n) == -1 &&
+                ctp->bound)
+                _ioserv_close_lost_binding(ctp, msg);
         } else {
+            /* A request that bound and then failed: the client gets the error
+             * and detaches the id, so the binding goes as well, and first: once
+             * the error is out the client may be given the id again.
+             */
+            if (ctp->bound)
+                _ioserv_close_lost_binding(ctp, msg);
             msg_error(ctp->rcvid, n);
         }
     }

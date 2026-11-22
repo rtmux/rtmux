@@ -14,6 +14,7 @@
 #include <signal.h>
 #include <spawn.h>
 #include <stdatomic.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -209,6 +210,48 @@ static void test_posix_clock_edges(void)
     rc = clock_getres((clockid_t) -1, &ts);
     snprintf(detail, sizeof detail, "rc=%d errno=%d", rc, errno);
     check(rc == -1 && errno == EINVAL, "clock_getres(invalid clock)", detail);
+
+    /* CPU-time clocks have a resolution too: the two fixed IDs, the ID
+     * pthread_getcpuclockid makes, and not an ID naming a thread that does not
+     * exist. It is at most one tick, the resolution of CLOCK_MONOTONIC.
+     */
+    {
+        static const clockid_t fixed[] = {CLOCK_THREAD_CPUTIME_ID,
+                                          CLOCK_PROCESS_CPUTIME_ID};
+        struct timespec tick = {0, 0}, cpu = {-1, -1};
+        clockid_t self = 0;
+        int ok = clock_getres(CLOCK_MONOTONIC, &tick) == 0;
+
+        for (size_t i = 0; i < sizeof fixed / sizeof fixed[0]; i++) {
+            cpu = (struct timespec) {-1, -1};
+            errno = 0;
+            rc = clock_getres(fixed[i], &cpu);
+            ok = ok && rc == 0 && cpu.tv_sec == 0 && cpu.tv_nsec > 0 &&
+                 cpu.tv_nsec <= tick.tv_nsec &&
+                 clock_getres(fixed[i], NULL) == 0;
+        }
+        snprintf(detail, sizeof detail, "rc=%d errno=%d res=%lld.%09lld", rc,
+                 errno, (long long) cpu.tv_sec, (long long) cpu.tv_nsec);
+        check(ok, "clock_getres(CPU-time clocks)", detail);
+
+        cpu = (struct timespec) {-1, -1};
+        errno = 0;
+        rc = pthread_getcpuclockid(pthread_self(), &self);
+        if (rc == 0)
+            rc = clock_getres(self, &cpu);
+        snprintf(detail, sizeof detail, "rc=%d errno=%d res=%lld.%09lld", rc,
+                 errno, (long long) cpu.tv_sec, (long long) cpu.tv_nsec);
+        check(rc == 0 && cpu.tv_sec == 0 && cpu.tv_nsec > 0 &&
+                  cpu.tv_nsec <= tick.tv_nsec,
+              "clock_getres(pthread_getcpuclockid clock)", detail);
+
+        /* The same ID with a thread number no thread of this process has. */
+        errno = 0;
+        rc = clock_getres(self | 0xffffU, &cpu) == -1 ? errno : 0;
+        snprintf(detail, sizeof detail, "id=%llx rc=%d",
+                 (unsigned long long) (self | 0xffffU), rc);
+        check(rc == EINVAL, "clock_getres(CPU clock of no thread)", detail);
+    }
 
     ts.tv_sec = 0;
     ts.tv_nsec = 1000000000L;
@@ -862,6 +905,103 @@ static void test_cputime_two_threads(void)
           "cputime two threads: no more CPU than wall x harts", detail);
 }
 
+/* CLOCK_PROCESS_CPUTIME_ID never goes backwards: not for one thread reading it
+ * in a loop (the tick bills the reader between two reads), and not across
+ * threads (a read may not return less than a value another thread's read had
+ * already returned before this one began). Each reader takes the largest value
+ * published so far, reads the clock, and then publishes its own; a value below
+ * the one taken first is a step backwards.
+ */
+struct cpumono {
+    atomic_uint_fast64_t *seen;
+    atomic_int *stop;
+    uint64_t reads, back, worst;
+};
+
+static void cpumono_step(struct cpumono *m)
+{
+    uint64_t floor = atomic_load(m->seen);
+    uint64_t v = clock_ns(CLOCK_PROCESS_CPUTIME_ID);
+
+    if (v < floor) {
+        m->back++;
+        if (floor - v > m->worst)
+            m->worst = floor - v;
+    }
+    while (v > floor && !atomic_compare_exchange_weak(m->seen, &floor, v))
+        ;
+    m->reads++;
+}
+
+static void *cpumono_reader(void *arg)
+{
+    while (!atomic_load_explicit(((struct cpumono *) arg)->stop,
+                                 memory_order_relaxed))
+        cpumono_step(arg);
+    return NULL;
+}
+
+static void test_cputime_process_monotonic(void)
+{
+    atomic_uint_fast64_t seen;
+    atomic_int stop;
+    struct cpumono solo = {&seen, &stop, 0, 0, 0};
+    struct cpumono pair[2] = {{&seen, &stop, 0, 0, 0}, {&seen, &stop, 0, 0, 0}};
+    pthread_t t[2];
+    uint64_t end, prev, back = 0, worst = 0, reads = 0;
+    int made = 0;
+    char detail[200];
+
+    /* One reader, 300 ms: every read at least the one before. */
+    prev = clock_ns(CLOCK_PROCESS_CPUTIME_ID);
+    end = clock_ns(CLOCK_MONOTONIC) + 300000000ULL;
+    do {
+        for (int i = 0; i < 64; i++) {
+            uint64_t v = clock_ns(CLOCK_PROCESS_CPUTIME_ID);
+
+            if (v < prev) {
+                back++;
+                if (prev - v > worst)
+                    worst = prev - v;
+            }
+            prev = v;
+            reads++;
+        }
+    } while (clock_ns(CLOCK_MONOTONIC) < end);
+    snprintf(detail, sizeof detail, "reads=%llu backwards=%llu worst=%llu ns",
+             (unsigned long long) reads, (unsigned long long) back,
+             (unsigned long long) worst);
+    check(prev != 0 && back == 0,
+          "cputime: process clock is monotonic for one reader", detail);
+
+    /* Three readers (two threads and this one), 300 ms. */
+    atomic_init(&seen, 0);
+    atomic_init(&stop, 0);
+    for (; made < 2; made++)
+        if (pthread_create(&t[made], NULL, cpumono_reader, &pair[made]) != 0)
+            break;
+    end = clock_ns(CLOCK_MONOTONIC) + 300000000ULL;
+    do {
+        for (int i = 0; i < 64; i++)
+            cpumono_step(&solo);
+    } while (clock_ns(CLOCK_MONOTONIC) < end);
+    atomic_store(&stop, 1);
+    for (int i = 0; i < made; i++)
+        (void) pthread_join(t[i], NULL);
+    back = solo.back + pair[0].back + pair[1].back;
+    reads = solo.reads + pair[0].reads + pair[1].reads;
+    worst = solo.worst;
+    for (int i = 0; i < 2; i++)
+        if (pair[i].worst > worst)
+            worst = pair[i].worst;
+    snprintf(detail, sizeof detail,
+             "threads=%d reads=%llu backwards=%llu worst=%llu ns", made,
+             (unsigned long long) reads, (unsigned long long) back,
+             (unsigned long long) worst);
+    check(made == 2 && pair[0].reads > 0 && pair[1].reads > 0 && back == 0,
+          "cputime: process clock is monotonic across threads", detail);
+}
+
 /* Q63(c): yield/steal stress for the Q25 switch-time billing. N = 2 x harts
  * threads call sched_yield() in a tight loop (every 256th round they nap 50 us
  * instead, so a hart can go idle and steal another's just-yielded thread) for
@@ -1443,7 +1583,13 @@ static void test_rlimit_data(void)
 /* Q34: 1 ns nanosleep storm on a tickless hart. The sleeper is pinned to hart 1
  * and a watchdog counter to hart 2; the sleeper checks the watchdog advances in
  * every 100 ms window, i.e. that a storm of sub-tick timer deadlines does not
- * wedge or starve another hart. Needs three online harts.
+ * wedge or starve another hart. With fewer than three online harts there is no
+ * hart for the watchdog: the sleeper runs alone on the last hart and only the
+ * completion, monotonic-time and interrupt checks apply.
+ *
+ * Each sleep is woken across harts (the boot hart owns the timer wheel), so a
+ * wakeup lost on the way to an idle sleeper hart costs an IDLE_MAX_SLEEP_NS
+ * backstop; a few thousand of those exhaust the deadline.
  */
 enum { STORM_CALLS = 100000, STORM_WINDOW_NS = 100000000 };
 #define STORM_DEADLINE_NS 100000000000ULL /* 100 s */
@@ -1456,6 +1602,7 @@ struct storm_ctx {
     int sleeper_cpu, watchdog_cpu;
     uint64_t elapsed_ns;
     long backward, failed_calls, stalled_windows, windows;
+    long done; /* calls completed before the loop ended */
     long intr_before, intr_after;
 };
 
@@ -1538,6 +1685,7 @@ static void *storm_sleeper(void *arg)
             req = rem;
         }
         now = clock_ns(CLOCK_MONOTONIC);
+        c->done = i + 1;
         if (now - t0 > STORM_DEADLINE_NS) {
             c->failed_calls++; /* bounded: a regression must fail, not hang */
             break;
@@ -1545,7 +1693,7 @@ static void *storm_sleeper(void *arg)
         if (now < last)
             c->backward++;
         last = now;
-        if (now - win_start >= STORM_WINDOW_NS) {
+        if (c->watchdog_cpu >= 0 && now - win_start >= STORM_WINDOW_NS) {
             uint64_t cnt = atomic_load(&c->counter);
 
             c->windows++;
@@ -1560,20 +1708,24 @@ static void *storm_sleeper(void *arg)
     return NULL;
 }
 
-static void test_nanosleep_1ns_storm(void)
+void test_nanosleep_1ns_storm(void)
 {
     static struct storm_ctx c;
     pthread_t wd, sl;
     char detail[200];
+    long harts = sysconf(_SC_NPROCESSORS_ONLN);
+    bool watchdog = harts >= 3;
 
-    if (sysconf(_SC_NPROCESSORS_ONLN) < 3) {
-        test_skip("nanosleep_1ns_storm", "needs 3 online harts");
+    if (harts < 1) {
+        test_fail("nanosleep_1ns_storm fixture", "no online harts");
         return;
     }
-    c.sleeper_cpu = 1;
-    c.watchdog_cpu = 2;
+    c.sleeper_cpu = watchdog ? 1 : (int) harts - 1;
+    c.watchdog_cpu = watchdog ? 2 : -1;
     c.intr_before = c.intr_after = -1;
-    if (pthread_create(&wd, NULL, storm_watchdog, &c) != 0) {
+    if (!watchdog) {
+        atomic_store(&c.pinned, 1);
+    } else if (pthread_create(&wd, NULL, storm_watchdog, &c) != 0) {
         test_fail("nanosleep_1ns_storm fixture", strerror(errno));
         return;
     }
@@ -1581,27 +1733,34 @@ static void test_nanosleep_1ns_storm(void)
         (void) sched_yield();
     if (pthread_create(&sl, NULL, storm_sleeper, &c) != 0) {
         atomic_store(&c.stop, 1);
-        (void) pthread_join(wd, NULL);
+        if (watchdog)
+            (void) pthread_join(wd, NULL);
         test_fail("nanosleep_1ns_storm fixture", strerror(errno));
         return;
     }
     (void) pthread_join(sl, NULL);
     atomic_store(&c.stop, 1);
-    (void) pthread_join(wd, NULL);
+    if (watchdog)
+        (void) pthread_join(wd, NULL);
 
     snprintf(detail, sizeof detail,
-             "calls=%d failed=%ld backward=%ld windows=%ld stalled=%ld "
+             "calls=%ld/%d failed=%ld backward=%ld windows=%ld stalled=%ld "
              "elapsed_ns=%llu intr_delta=%ld",
-             STORM_CALLS, c.failed_calls, c.backward, c.windows,
+             c.done, STORM_CALLS, c.failed_calls, c.backward, c.windows,
              c.stalled_windows, (unsigned long long) c.elapsed_ns,
              c.intr_before >= 0 && c.intr_after >= 0
                  ? c.intr_after - c.intr_before
                  : -1L);
     printf("  nanosleep_1ns_storm: %s\n", detail);
-    check(atomic_load(&c.pinned) == 1 && c.failed_calls == 0 && !c.backward &&
-              c.windows > 0 && !c.stalled_windows,
-          "nanosleep_1ns_storm completes, time monotonic, watchdog advances",
-          detail);
+    if (watchdog)
+        check(atomic_load(&c.pinned) == 1 && c.failed_calls == 0 &&
+                  !c.backward && c.windows > 0 && !c.stalled_windows,
+              "nanosleep_1ns_storm completes, time monotonic, watchdog advances",
+              detail);
+    else
+        check(c.failed_calls == 0 && !c.backward,
+              "nanosleep_1ns_storm completes, time monotonic (no watchdog hart)",
+              detail);
 
     /* Upper bound on the sleeper hart's STIMER interrupts. Each 1 ns sleep arms
      * one deadline, and one deadline costs at most one interrupt (a sleep that
@@ -1676,6 +1835,7 @@ void test_timers(void)
     /* CPU-time billing */
     test_cputime_short_bursts();
     test_cputime_two_threads();
+    test_cputime_process_monotonic();
     test_cputime_yield_steal_stress();
     test_rlimit_negative();
     test_rlimit_cpu_kill();

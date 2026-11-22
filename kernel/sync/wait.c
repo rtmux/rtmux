@@ -2131,7 +2131,15 @@ static void mutex_lock_body(thread_t *act,
     int pi_enabled;
     int rc;
 
-    rc = mutex_prio_ceiling_check(act, sync);
+    /* An explicit lock by a thread above the ceiling is refused. A condition
+     * wait gave its mutex up to wait and must hold it again when it returns,
+     * also when the waiter's priority was raised past the ceiling meanwhile:
+     * pthread_cond_wait has no error for that, and the caller would go on to
+     * unlock a mutex it does not own.
+     */
+    rc = (act->flags & RTMUX_FLG_THR_ACQUIRE_MUTEX)
+             ? EOK
+             : mutex_prio_ceiling_check(act, sync);
     if (rc) {
         kcall_err(act, rc);
         return;

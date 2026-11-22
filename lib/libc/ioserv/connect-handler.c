@@ -63,7 +63,6 @@ int _ioserv_connect_handler(ioserv_context_t *ctp, ioserv_msg_t *msg)
     case _IO_CONNECT_COMBINE:
     case _IO_CONNECT_COMBINE_CLOSE: {
         int n;
-        int rcvid;
         int subtype;
         struct binding *binding;
         ioserv_msg_t *combined;
@@ -111,18 +110,19 @@ int _ioserv_connect_handler(ioserv_context_t *ctp, ioserv_msg_t *msg)
         }
 
         /* Finish the transaction calling the close message, but ignore its
-         * return value
+         * return value. A combine whose combined message failed keeps its
+         * binding here; _ioserv_handler closes it before the error is sent, as
+         * for any request that bound and failed. A combined message no handler
+         * took (IOSERV_DEFAULT) is answered ENOSYS here: passed out, it would
+         * reach the dispatch's other_func as if it were the connect.
          */
+        if (n == IOSERV_DEFAULT)
+            n = ENOSYS;
         if (subtype == _IO_CONNECT_COMBINE_CLOSE &&
             _ioserv_handle(&ctp->info, 0, _IOSERV_HANDLE_FIND) != (void *) -1) {
             int status = ctp->status;
 
-            rcvid = ctp->rcvid;
-            ctp->rcvid = 0;
-            msg->close.i.type = _IO_CLOSE;
-            msg->close.i.combine_len = sizeof msg->close.i;
-            (void) _ioserv_io_handler(ctp, msg, binding);
-            ctp->rcvid = rcvid;
+            _ioserv_close_binding(ctp, msg, binding);
             ctp->status = status;
         } else
             _ioserv_handle(&ctp->info, 0, _IOSERV_HANDLE_UNLOCK);

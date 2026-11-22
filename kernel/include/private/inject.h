@@ -137,14 +137,101 @@
 #define INJECT_OP_SYNC_WAKE_CLAIMS 23
 #define INJECT_OP_INTR_BEFORE_SWITCH 24
 
+/* STALL_BLOCK(pid, tid << 32 | ms): thread tid (as pthread_t) of pid stalls
+ * the next time it is about to publish a blocked state: past every pending
+ * check of the kernel call, still running. A kill or a cancel posted during
+ * the stall finds a running thread and must still reach it once it blocks.
+ */
+#define INJECT_OP_STALL_BLOCK 25
+
+/* CRASH(how): the calling hart reports a fatal error and takes the kernel's
+ * crash path, as an assertion failure does (how 0), or the shutdown() path a
+ * fatal kernel fault takes, which prints the Shutdown[...] banner and powers
+ * the machine off through the SBI (how INJECT_CRASH_SHUTDOWN). For the
+ * harness's crash dump.
+ */
+#define INJECT_OP_CRASH 26
+#define INJECT_CRASH_SHUTDOWN 1
+
+/* STALL_REPLY_CLAIM(pid, ms): the next reply, error or follow-up copy by a
+ * thread of that process stalls after the rcvid lookup and before it reads the
+ * connection's channel, until a channel destroy on another hart has detached
+ * the connection or ms milliseconds pass. SITE_STATUS(STALL_REPLY_CLAIM)
+ * reports whether the stall was taken, and
+ * SITE_STATUS(INJECT_SITE_REPLY_DETACHED) whether a detach ended it.
+ */
+#define INJECT_OP_STALL_REPLY_CLAIM 27
+
+/* PREEMPT_REPLY_UNBLOCK(pid): the next reply by a thread of that process that
+ * removes a queued unblock notification restarts as if a preemption were
+ * pending (after a 1 ms stall). SITE_STATUS(STALL_REPLY_UNBLOCK) reports
+ * whether it was.
+ */
+#define INJECT_OP_PREEMPT_REPLY_UNBLOCK 28
+
+/* XFER_TRACE(pid): count, for the threads of that process, what its stepped
+ * message copies do from now on. XFER_STATS(what) reads a counter:
+ * INJECT_XFER_STARTS stepped copies begun from byte 0, INJECT_XFER_YIELDS
+ * steps that ended in a restart, INJECT_XFER_PEEKS transfers of a message's
+ * head to or from a kernel buffer (the header peek and its write-back), and
+ * INJECT_XFER_BUDGETS steps (of a copy or a vector scan) that ended because
+ * their time was up, not because a preemption was pending.
+ */
+#define INJECT_OP_XFER_TRACE 29
+#define INJECT_OP_XFER_STATS 30
+
+/* STALL_CLAIM_HELD(pid, ms): the next msg_readv by a thread of that process
+ * stalls with its claim on the client held, until SITE_RELEASE or ms.
+ * STALL_FORCE_CLAIMED(pid, ms): the next force_ready of a thread of that
+ * process that finds it claimed releases the STALL_CLAIM_HELD stall and then
+ * waits, before it hands its wake to the claimer, for the claim to go or ms
+ * to pass. Together they put a claimer's release inside a waker's decision.
+ */
+#define INJECT_OP_STALL_CLAIM_HELD 33
+#define INJECT_OP_STALL_FORCE_CLAIMED 34
+
+/* STALL_CAP_PEEK(pid, tid << 32 | ms): thread tid (as pthread_t) of pid
+ * stalls the next time it has copied a long message and is about to look at
+ * its head for a native capability header: the window in which a sibling of
+ * the sender can rewrite the header the receiver was already given.
+ */
+#define INJECT_OP_STALL_CAP_PEEK 35
+
+enum {
+    INJECT_XFER_STARTS,
+    INJECT_XFER_YIELDS,
+    INJECT_XFER_PEEKS,
+    INJECT_XFER_BUDGETS,
+    INJECT_XFER_COUNTERS
+};
+
+/* INTR_AFTER_SELECT(pid): like INTR_BEFORE_SWITCH, but the interrupt arrives
+ * after the blocking IST has chosen the next thread, the window in which the
+ * scheduler drops the dispatch lock to look for a thread to steal.
+ */
+#define INJECT_OP_INTR_AFTER_SELECT 31
+
+/* INTR_SELECT_SEEN: ret is what the last INTR_AFTER_SELECT injection found: 0
+ * not taken, 1 no thread had been chosen, or 2 plus the chosen thread's
+ * pthread_t shifted left by 8. Reading it resets it.
+ */
+#define INJECT_OP_INTR_SELECT_SEEN 32
+
 enum inject_site {
     STALL_LOCK,
     STALL_LOCK_EARLY,
     STALL_LOCK_PROPAGATED,
     STALL_FORCE_READY,
     STALL_SYNC_WAKER,
+    STALL_BLOCK,
+    STALL_REPLY_CLAIM,
+    STALL_REPLY_UNBLOCK,
+    STALL_CLAIM_HELD,
+    STALL_FORCE_CLAIMED,
+    STALL_CAP_PEEK,
     STALL_SITES,
-    INJECT_SITE_TURNSTILE = STALL_SITES
+    INJECT_SITE_TURNSTILE = STALL_SITES,
+    INJECT_SITE_REPLY_DETACHED
 };
 
 #define INJECT_SPIN_MAX_MS 10000

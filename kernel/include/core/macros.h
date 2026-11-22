@@ -160,12 +160,19 @@
 
 /* Kernel-call restart / preemption */
 
-#define KCALL_RESTART(act)                                  \
-    {                                                       \
-        CRASHCHECK(TYPE_MASK(act->type) != TYPE_THREAD);    \
-        KSYS_RESTORE_KCALL_C_ARGS(act);                     \
-        SETKTYPE((act), _TRACE_GETSYSCALL((act)->syscall)); \
-        SETKIP(act, KIP(act) - KSYS_ENTRY_SIZE);            \
+/* The call runs again from its entry. What a transfer saved to resume from
+ * (xfer_begin_call) is kept for exactly that entry, so the mark is set here,
+ * where no restart can forget it.
+ */
+#define KCALL_RESTART(act)                                                  \
+    {                                                                       \
+        CRASHCHECK(TYPE_MASK(act->type) != TYPE_THREAD);                    \
+        KSYS_RESTORE_KCALL_C_ARGS(act);                                     \
+        SETKTYPE((act), _TRACE_GETSYSCALL((act)->syscall));                 \
+        SETKIP(act, KIP(act) - KSYS_ENTRY_SIZE);                            \
+        (act)->xfer_resume =                                                \
+            (uint16_t) (_TRACE_GETSYSCALL((unsigned) (act)->syscall) + 1U); \
+        (act)->xfer_resume_sp = (uintptr_t) KSP(act);                       \
     }
 
 /* NEED_PREEMPT — mid-kernel-extension-loop yield-check.
@@ -504,21 +511,28 @@ static __inline__ void __attribute__((__unused__)) atomic_boundary()
 /* Maximum number of iov entries in one message vector */
 #define XFER_IOV_LIMIT ((4 * 1024 * 1024) / 8)
 
-/* Entries xfer_iov_check() examines in one kernel entry */
-#define XFER_IOV_CHECK_STEP 512
-
-/* Work one bounded msg_readv / msg_writev kernel entry may do (xfermsg) before
- * it saves its cursor and restarts the call: iov entries stepped over, and
- * bytes copied.
+/* How long one kernel entry of a stepped transfer may spend on its vectors
+ * and its copy before it saves where it stands and restarts the call. The
+ * prelude of the call (lookup, claim) and two pieces of work come on top, so
+ * the budget is well under the 250 us a path may take (docs/rt-budgets.md).
  */
-#define XFER_STEP_ENTRIES 128
+#define XFER_BUDGET_US 100
+
+/* Work a stepped transfer does between two looks at the clock: iov entries
+ * stepped over, bytes copied, or (XFER_SUM_ENTRIES) entries of an array
+ * totalled and checked, which is far less work each. The budget runs from the
+ * first look, so a kernel entry does one such piece before it and overruns it
+ * by one at most. map_xfer maps no more than a piece per call.
+ */
+#define XFER_STEP_ENTRIES 64
 #define XFER_STEP_BYTES (8 * 1024)
+#define XFER_SUM_ENTRIES 512
 
-/* Send, receive and reply rescan both vectors before the copy on every restart,
- * so a message of more entries than this is copied in one piece, as before: the
- * rescans would cost more than the steps save.
+/* A pending preemption is looked for at the end of every piece; the clock,
+ * which costs a trap to the SBI on some targets, only once XFER_STEP_BYTES
+ * bytes or this many entries have gone by since it was last read.
  */
-#define XFER_STEP_PARTS_MAX 4096
+#define XFER_CLOCK_ENTRIES 512
 
 /* xferiov stopped at its work budget; map_xfer stopped skipping iov entries */
 #define XFER_YIELD 0x04
@@ -537,6 +551,16 @@ static __inline__ void __attribute__((__unused__)) atomic_boundary()
 #define XFER_DST_CHECK 0x02
 
 /* Thread internal_flags */
+
+/* MSG_DELIVERY is a claim that force_ready must defer to, and it does so only
+ * with CONFIG_SMP_MSGOPT. A kernel for several harts without it would let a
+ * timeout or a teardown unlink a thread that another hart is copying to.
+ */
+#if defined(CONFIG_SMP) && CONFIG_PROCESSORS_MAX > 1 && \
+    !defined(CONFIG_SMP_MSGOPT)
+#error \
+    "an SMP kernel needs CONFIG_SMP_MSGOPT: force_ready ignores transfer claims without it"
+#endif
 
 #define RTMUX_ITF_MSG_DELIVERY 0x01U
 #define RTMUX_ITF_MSG_FORCE_RDY 0x02U
@@ -585,6 +609,15 @@ static __inline__ void __attribute__((__unused__)) atomic_boundary()
  */
 #define RTMUX_ITF_DEFER_DISPLACE 0x400U
 #define RTMUX_ITF_YIELD_TAIL 0x800U
+
+/* CANCEL_POSTED: a cancel this thread can act on is pending in its TLS. Set by
+ * the canceller, and brought up to date from the TLS by the thread itself at
+ * the start of each kernel call while it is set
+ * (thread_cancel_posted_refresh). The TLS is user memory, which the hart that
+ * blocks the thread cannot read, so this bit is what it tests once the thread
+ * is displaced (block_recheck_arm).
+ */
+#define RTMUX_ITF_CANCEL_POSTED 0x1000U
 
 /* internal_flags is a single 32-bit word whose bits are written from MULTIPLE
  * CPUs concurrently. A thread sets/clears its OWN WAIT_PENDING /

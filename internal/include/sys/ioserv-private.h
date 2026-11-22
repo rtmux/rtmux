@@ -69,7 +69,9 @@ typedef struct _ioserv_context {
     int status;
     int offset;
     int size;
-    void *post; /* the server's work to do once this request is replied to */
+    void *post;  /* the server's work to do once this request is replied to */
+    void *bound; /* binding this request set, until replied */
+    unsigned bound_serial; /* its serial: bound may be freed and reused */
     iov_t iov[1];
 } ioserv_context_t;
 

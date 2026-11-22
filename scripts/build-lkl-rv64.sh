@@ -464,12 +464,12 @@ test "$arch" = "riscv64" && test "$fmt" = "elf64-littleriscv" || {
 }
 
 ar_tool=$(resolve_tool "${LKL_AR:-}" riscv64-unknown-linux-gnu-ar llvm-ar \
-    riscv-none-elf-ar) || {
+    "${CROSS_COMPILE:-riscv-none-elf-}ar") || {
     echo "LKL rv64: need an ar (llvm-ar or riscv64-*-ar) to verify $lib" >&2
     exit 1
 }
 nm_tool=$(resolve_tool "${LKL_NM:-}" riscv64-unknown-linux-gnu-nm llvm-nm \
-    riscv-none-elf-nm) || {
+    "${CROSS_COMPILE:-riscv-none-elf-}nm") || {
     echo "LKL rv64: need an nm (llvm-nm or riscv64-*-nm) to verify $lib ABI" >&2
     exit 1
 }
