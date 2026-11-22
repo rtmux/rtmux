@@ -11,6 +11,7 @@
 #include <limits.h>
 #include <sys/rtmux-core.h>
 #include "spawn-fd-policy.h"
+#include <sys/spawn-action-wire.h>
 
 extern int ProcessCapMint(pid_t pid, uint32_t rights, rtmux_cap_t *cap);
 
@@ -65,7 +66,8 @@ static int spawn_fd_permitted(struct loader_context *lcp,
     case SPAWN_OFFER_SCAN:
         return connect_server_info(lcp->ctx.ppid, (uint64_t) parent_fd, &si) ==
                    parent_fd &&
-               spawn_fd_scan_ok(si.flags);
+               (spawn_fd_scan_ok(si.flags) ||
+                (!(si.flags & RTMUX_FLG_COF_DEAD) && loader_action_source(lcp, parent_fd)));
     default:
         return 0;
     }
@@ -183,6 +185,59 @@ static int get_fdinfo(int rcvid,
  */
 int proc_spawn(ioserv_context_t *ctp, void *vmsg)
 {
+    return proc_spawn_with_actions(ctp, vmsg, NULL, 0);
+}
+
+/* libc recognizes /proc/self/fd/N as an open through an existing fd.
+ * Such a pathname names an input just as explicitly as a dup action. */
+static int action_source_fd(const struct spawn_action_record *r, const char *path)
+{
+    static const char prefix[] = "/proc/self/fd/";
+    if (r->type == posix_file_action_type_DUP ||
+        r->type == posix_file_action_type_FCHDIR)
+        return r->fd;
+    if (r->type != posix_file_action_type_OPEN ||
+        strncmp(path, prefix, sizeof prefix - 1))
+        return -1;
+    path += sizeof prefix - 1;
+    if (*path < '0' || *path > '9')
+        return -1;
+    unsigned fd = 0;
+    do {
+        fd = fd * 10 + (unsigned) (*path++ - '0');
+        if (fd >= UINT16_MAX)
+            return -1;
+    } while (*path >= '0' && *path <= '9');
+    return *path ? -1 : (int) fd;
+}
+
+/* Validate the entire byte stream before creating a child. The second pass
+ * fills the descriptor bitmap next to the immutable action records. */
+static int action_sources(const unsigned char *actions, unsigned bytes,
+                          unsigned char *bits, unsigned *size)
+{
+    size_t left = bytes;
+    while (left) {
+        struct spawn_action_record r;
+        const char *path;
+        int err = spawn_action_next(&actions, &left, &r, &path);
+        if (err)
+            return err;
+        int fd = action_source_fd(&r, path);
+        if (fd >= 0) {
+            unsigned i = (unsigned) fd / 8;
+            if (*size <= i)
+                *size = i + 1;
+            if (bits)
+                bits[i] |= (unsigned char) (1U << ((unsigned) fd % 8));
+        }
+    }
+    return EOK;
+}
+
+int proc_spawn_with_actions(ioserv_context_t *ctp, void *vmsg,
+                            const unsigned char *actions, unsigned bytes)
+{
     struct loader_context *lcp;
     struct _thread_attr attr;
     int status;
@@ -266,8 +321,14 @@ int proc_spawn(ioserv_context_t *ctp, void *vmsg)
             }
         }
 
+        unsigned bitmap = 0;
+        status = action_sources(actions, bytes, NULL, &bitmap);
+        if (status)
+            return status;
+        if (bytes > UINT_MAX - msgsize || bitmap > UINT_MAX - msgsize - bytes)
+            return E2BIG;
         if (!(lcp = loader_context_alloc(
-                  msgsize,
+                  msgsize + bytes + bitmap,
                   LC_SPAWN | (((ctp->info.flags & RTMUX_MI_ENDIAN_DIFF))
                                   ? LC_CROSS_ENDIAN
                                   : 0)))) {
@@ -275,6 +336,15 @@ int proc_spawn(ioserv_context_t *ctp, void *vmsg)
             return ENOMEM;
         }
 
+        if (bytes) {
+            unsigned char *copy = (unsigned char *) &lcp->msg + msgsize;
+            memcpy(copy, actions, bytes);
+            memset(copy + bytes, 0, bitmap);
+            (void) action_sources(copy, bytes, copy + bytes, &bitmap);
+            lcp->ctx.msgsize = msgsize;
+            lcp->ctx.action_bytes = bytes;
+            lcp->ctx.action_source_bytes = bitmap;
+        }
         lcp->ctx.flags = msg->spawn.i.parms.flags;
         ppid = lcp->ctx.ppid = ctp->info.pid;
         if (msgsize <= (unsigned) ctp->info.msglen) {

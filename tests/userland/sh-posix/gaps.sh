@@ -144,6 +144,18 @@ out=$($SH -c 'set -- "$1-g*"nomatch*; echo "$#:$1"' sh "$P")
 ck glob-quoted-nomatch "1:$P-g*nomatch*" "$out"
 out=$($SH -c 'set -- ${nov:-"$1-g*"}x*; echo "$#:$1"' sh "$P")
 ck glob-quoted-in-default "1:$P-g*x" "$out"
+control=$(printf '\003')
+: > "$P-g${control}a"
+out=$($SH -c 'set -- "$1-g$2"*; echo "$#:$1"' sh "$P" "$control")
+ck glob-control-byte "1:$P-g${control}a" "$out"
+: > "$P-bracket-"
+: > "$P-bracket]"
+: > "$P-bracketb"
+out=$($SH -c 'set -- "$1-bracket"[a"-"c]; echo "$#:$1"' sh "$P")
+ck glob-bracket-quoted-hyphen "1:$P-bracket-" "$out"
+out=$($SH -c 'set -- "$1-bracket"[a"]"c]; echo "$#:$1"' sh "$P")
+ck glob-bracket-quoted-close "1:$P-bracket]" "$out"
+rmf "$P-g${control}a" "$P-bracket-" "$P-bracket]" "$P-bracketb"
 rmf "$P-g*x" "$P-gax"
 
 # --- a ) in a comment or a case pattern does not end a $( ... ) -------------------
@@ -211,6 +223,11 @@ out=$($SH -c 'for i in 1 2; do echo $i; done >&-; echo "rc=$?"; echo after' 2>/d
 ck close-compound-for "$(printf 'rc=1\nafter')" "$out"
 out=$($SH -c '{ echo a; } >&-; echo "rc=$?"; echo after' 2>/dev/null)
 ck close-compound-brace "$(printf 'rc=1\nafter')" "$out"
+out=$($SH -c '{ $SH -c "echo first"; a=$?; $SH -c "echo second"; b=$?; } >&-; echo "$a $b"' 2>/dev/null)
+ck close-compound-external "1 1" "$out"
+out=$($SH -c '{ { echo recovered; } >"$1"; $SH -c "echo hidden"; rc=$?; } >&-; cat "$1"; echo "$rc"' _ "$P-cl" 2>/dev/null)
+ck close-compound-inner-open "$(printf 'recovered\n1')" "$out"
+
 rmf "$P-cl"
 
 # --- a background compound command, with a command after it -------------------------
@@ -370,6 +387,12 @@ out=$($SH -c "case abc in 'a*') echo bad;; *) echo glob;; esac")
 ck case-squote-pattern-no-glob glob "$out"
 out=$($SH -c 'case a in a) echo A;; esac; case b in b) echo B;; esac')
 ck case-twice-one-line "A B" "$(echo $out)"
+out=$($SH -c 'if case x in x) true;; esac; then echo matched; fi')
+ck case-if-condition matched "$out"
+out=$($SH -c 'x=go; while case "$x" in go) true;; *) false;; esac; do echo once; x=stop; done')
+ck case-while-condition once "$out"
+out=$($SH -c '{ case a in a) case b in b) echo nested;; esac;; esac; }')
+ck case-nested-brace nested "$out"
 out=$($SH -c 'y="a b"; case "a b" in "$y") echo var;; esac')
 ck case-quoted-var-pattern var "$out"
 out=$($SH -c 'case ")" in ")") echo paren;; esac')
@@ -387,6 +410,21 @@ printf '%s\n' 'f() {' '  case $1 in' '    a)' '      if [ "$2" = y ]; then' '   
 out=$($SH "$P-ca.sh")
 ck case-multiline-in-function "AY other" "$(echo $out)"
 rmf "$P-ca.sh"
+
+out=$($SH -c 'cat <<"END" | cat
+;; esac ${literal}
+END
+echo done')
+ck pipe-quoted-heredoc "$(printf ';; esac ${literal}\ndone')" "$out"
+out=$($SH -c 'f() { f() { echo second; }; echo first; }; f; f')
+ck redefine-running-function "$(printf 'first\nsecond')" "$out"
+out=$($SH -c 'for i in first do last; do echo "$i"; done')
+ck for-do-word "$(printf 'first\ndo\nlast')" "$out"
+
+for invalid in 'echo before; fi' 'echo before; ; true' 'if true; then fi'; do
+    out=$($SH -c "$invalid" 2>/dev/null; echo "rc=$?")
+    ck malformed-compound "rc=2" "$out"
+done
 
 echo "  $n gap cases"
 if test -z "$bad"; then

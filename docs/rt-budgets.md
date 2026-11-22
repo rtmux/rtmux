@@ -926,14 +926,93 @@ the same-hart configuration stays 35 of 35, and syscall-testing passes 934 of 93
 So the trap-exit interrupt-wake preemption rule now holds at CPUS=8 for both
 same-hart and cross-hart wakes on the authoritative host.
 
-The probe now runs the cross-hart pass as a standing guard: after the same-hart
-timer pass it checks for a fourth hart and, if present, repeats the timer
-measurement with the waiter and hog pinned to a non-boot hart so the boot-hart
-timer readies them across harts. A stall there is a hard failure (the same-hart
-pass only names the gap), so a regression of the cross-hart preemption fix fails
-the gate rather than passing silently. It is skipped cleanly below four harts.
-Validated on the reference host: CPUS=8 passes 15 of 15 runs and the four-hart-only skip path
-is correct at CPUS=3.
+The probe runs the cross-hart pass as a standing guard: given a fourth hart it
+runs the timer measurement with the waiter and hog pinned to a non-boot hart so
+the boot-hart timer readies them across harts, before and independently of the
+same-hart pass. A wake that never dispatches is a hard failure in every source
+(the watchdog reports it as FAIL; no source passes by naming a gap any more),
+and the harness requires a measured result from each of ipc, timer,
+timer-crosshart and irq, so a pass that skipped one fails. The cross-hart pass
+is skipped cleanly below four harts.
+
+#### Late wakes under TCG: host scheduling, not the kernel
+
+Hard-checking the 50 ms bound at CPUS=8 failed 23 of 30 boots on the local
+validation host while every boot completed all its wakes: maxima anywhere from
+2 to 123 ms, in every source, including the IPC reply, which involves no
+interrupt at all. The host was saturated (48 CPUs, none idle, CPU pressure
+40-99%), and QEMU runs one host thread per hart. Three independent methods
+attribute the late wakes to the host.
+
+Host attribution. `scripts/vcpu-steal.py` polls every QEMU thread's run-queue
+wait (`/proc/<pid>/task/<tid>/schedstat`) each millisecond; the probe writes an
+rdtime beacon to the goldfish-rtc after each wake, which QEMU's
+`goldfish_rtc_write` trace event stamps with host time, so each late wake has
+a window on the host clock (the beacons bound the clock offset to about
+15 us). Over 33
+boots of the unmodified kernel, 17 measured wakes were more than 50 ms late.
+In all 17 the time during which at least one QEMU thread was runnable but not
+running covers the window to within 13 ms, and in 15 the wait of the threads
+the wake depends on (the hart whose timer fires, the hart running the waiter,
+QEMU's main loop) accounts for the excess over the bound by itself. The guest's
+logical CPU numbers are not hart numbers: OpenSBI picks the boot hart, which
+becomes CPU 0, so the audit maps them through the boot log.
+
+Guest stages. With timebase stamps at the stage boundaries (timer interrupt
+due and taken, wheel expiry, spinlock acquisition, reschedule IPI sent and
+taken), the delays inside the late windows are spinlock waits: 152 waits of
+10-110 ms with interrupts off in 24 boots, all but one on a dispatch lock
+(`sched_dpp`), the other on `timer_wheel_slock`, with the vCPU thread of the
+spinning hart or of the lock's owner off the CPU for much of the wait (of the
+36 waits whose owner was known, the owner's thread was waiting for a host CPU
+for at least half of 18). That is lock-holder preemption. It reaches the wake path from
+any hart because an idle hart's steal scan (`select_thread_default`) takes
+every other hart's dispatch lock, and because `ready_on_hart` sends the
+reschedule IPI under the target's dispatch lock, which in QEMU is an MMIO
+write that waits for QEMU's own big lock. No stage showed a wake that was due,
+with the harts running, and not delivered.
+
+Deterministic time. Under QEMU's instruction-count clock (`EMU_ICOUNT=1`:
+single-threaded TCG, `-icount shift=1,sleep=off`, RTC on the virtual clock) the
+host cannot delay the guest. Over fifteen boots the same eight-hart probe then
+measured an IPC reply-to-dispatch of 16-180 us, a same-hart timer wake of
+0.14-1.1 ms, a cross-hart timer wake of 0.2-0.6 ms and an IRQ wake of
+0.08-0.23 ms: a handful of distinct values that repeat from boot to boot, none
+within a factor of 45 of the bound. What this cannot show is a race: harts interleave only at
+translation-block boundaries there.
+
+Quiet host. When the other load on the same host stopped (CPU pressure under
+2%), twelve of twelve eight-hart multi-threaded boots passed with the audit
+off and the bound checked strictly by the guest. The worst maxima over the
+twelve were 0.15 ms (ipc), 1.3 ms (timer), 4.6 ms (timer-crosshart) and 1.1 ms
+(irq), against 50-230 ms for the same binaries an hour earlier under load.
+
+What the gate proves now. The bound itself is unchanged.
+
+- `EMU_ICOUNT=1 CPUS=8 scripts/qemu-regress.sh --mode smp-invariants` checks
+  the bound in the guest, strictly, on a clock the host cannot disturb. It
+  proves that each wake path, run to completion, dispatches within the bound.
+- The multi-threaded run proves that no wake is lost or stalls with the harts
+  truly parallel, and audits every wake over the bound. A sample is INVALID,
+  excluded and reported, never passed, when the proven host wait of its
+  wake-path threads covers the excess; each phase must keep 75% of its samples
+  valid. It is a FAIL when no QEMU thread's wait covers the excess: the harts
+  were running and the wake was late. When only other QEMU threads' wait covers
+  it, lock-holder preemption is possible but schedstat cannot show who held a
+  lock, so the sample is UNDECIDED and the whole run is invalid: repeated,
+  counted, and never a pass. Without host data (no schedstat, no trace event)
+  every over-bound sample is a failure, as before.
+
+The audit under-credits by construction: a wait counts only where two polls
+prove it. On a saturated host it therefore reports invalid runs rather than
+passes, and a rare late wake caused by the guest can hide in an invalid run
+there; the icount run and a less loaded host are what catch it.
+
+The detector is tested against a real stall: on a CONFIG_DEBUG_INJECT kernel,
+`preempt-latency --inject-stall 300` holds the waiter's hart with interrupts off
+for 300 ms in the middle of the cross-hart pass and passes only if the pass
+reports the late wake (part of `--mode debug-inject`). Under the host audit the
+same stall is refused as a FAIL, because the hart's thread was running.
 
 ### Contended PRIO_INHERIT mutex wake
 
@@ -3847,3 +3926,41 @@ capability quota on an existing process or server boundary with a named latency
 budget.  Avoid nested cgroup-style hierarchy until a measured workload shows
 that runmask, IRQ affinity, and existing process/I/O-service boundaries cannot
 isolate it.
+
+
+### Spinlock admission
+
+For an IRQ-off kernel lock, each other hart can hold or wait for at most
+one ticket. A new waiter therefore waits for at most (online CPUs minus
+one) critical sections. Holder duration and host vCPU scheduling determine elapsed
+time. The 16-bit ticket space covers the configured maximum of 64 harts.
+Capability operations run with their incoming interrupt state, so an
+interrupt or preemption can extend a queued capability operation. Console
+crash takeover uses a separate test-and-set lock.
+
+The eight-hart lock-debug fixture first queues every worker behind one owner,
+then checks 80,000 grants in ticket order across the 16-bit wrap. It uses the
+same lock observation as the monitor to check the released state. The longest acquisition took 71.86 ms and 154.50 ms in two
+eight-hart parallel TCG runs.
+
+Three paired four-hart instruction-clock TCG runs passed `rt-check`.
+FIFO wake p99 was 20.5, 17.1 and 31.3 µs with test-and-set and 17.2,
+17.2 and 20.6 µs with tickets. In a separate `mutex-uncontended` run
+the default lock/unlock p99 was 210 ns for both builds. The ceiling
+mutex measured 9.4 and 9.5 µs respectively. These measurements use
+`-icount shift=1,sleep=off -accel tcg,thread=single`.
+
+
+### Priority inheritance during mutex acquisition
+
+A contending thread lends its effective priority before joining the mutex
+wait queue. During that interval, raising or lowering its priority refreshes
+the turnstile maximum. If a waiter takes the free mutex, it inherits the
+remaining contenders' maximum. If a third thread took the mutex during the
+priority walk, the waiter updates that owner's loan after releasing the
+chain lock.
+
+The four-hart `--mutex-handoff-loan` fixture holds a waiter at each of
+these transitions. Its observer starts before contention and stays alive
+until it releases the stall. Separate injected faults cover wait-bit
+withdrawal and turnstile allocation failure.

@@ -238,6 +238,7 @@ int sem_wait(sem_t *sem)
     libc_waiter_t w;
     int ret;
 
+    pthread_testcancel();
     if (sem && sem->owner == RTMUX_SYNC_NAMED_SEM)
         return read((int) sem->count, NULL, 0) == 0 ? 0 : -1;
 
@@ -258,6 +259,7 @@ int sem_timedwait(sem_t *sem, const struct timespec *abs_timeout)
     uint64_t timeout;
     int ret;
 
+    pthread_testcancel();
     if (sem && sem->owner == RTMUX_SYNC_NAMED_SEM) {
         if (!TIMESPEC_VALID(abs_timeout)) {
             errno = EINVAL;

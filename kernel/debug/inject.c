@@ -8,6 +8,8 @@
 /* Debug-only fault injection; built only with CONFIG_DEBUG_INJECT. */
 
 #include <core/globals.h>
+
+#ifdef CONFIG_DEBUG_INJECT
 #include "as.h"
 #include <sv39-lookup.h>
 #include <private/inject.h>
@@ -29,11 +31,13 @@ static atomic_int sched_armed_pid = -1;
 static atomic_int sched_left;
 static atomic_int sched_consumed;
 static atomic_int sched_displaced;
-static _Atomic(thread_t *) sched_failed_thr; /* the caller just failed */
+static thread_t * _Atomic sched_failed_thr; /* the caller just failed */
 
 static inline bool inject_op_is_status(unsigned op)
 {
-    return op == INJECT_OP_ALLOC_STATUS || op == INJECT_OP_SCHED_SET_STATUS ||
+    return op == INJECT_OP_SYNC_WAKE_CLAIMS || op == INJECT_OP_SITE_STATUS ||
+           op == INJECT_OP_ALLOC_STATUS ||
+           op == INJECT_OP_SCHED_SET_STATUS ||
            op == INJECT_OP_SCHED_SET_DISPLACED || op == INJECT_OP_PTE_PROBE ||
            op == INJECT_OP_MANIP_PARTIAL || op == INJECT_OP_PRIO_SETTLE_STATS;
 }
@@ -147,6 +151,7 @@ void inject_note_prio_deferred_run(void)
  * armed_soul so exactly one allocation takes the failure.
  */
 static atomic_int armed_ts_pid = -1;
+static atomic_bool ts_consumed;
 
 int inject_should_fail_turnstile(process_t *prp)
 {
@@ -157,7 +162,7 @@ int inject_should_fail_turnstile(process_t *prp)
                                                  memory_order_acq_rel,
                                                  memory_order_relaxed))
         return 0;
-    atomic_store_explicit(&consumed, 1, memory_order_release);
+    atomic_store_explicit(&ts_consumed, true, memory_order_release);
     return 1;
 }
 
@@ -167,26 +172,35 @@ int inject_should_fail_turnstile(process_t *prp)
  * WAITING is published, after the priority walk) and force_ready's wait-chain
  * window.
  */
-enum stall_site {
-    STALL_LOCK,
-    STALL_LOCK_EARLY,
-    STALL_LOCK_PROPAGATED,
-    STALL_FORCE_READY,
-    STALL_SITES
-};
-
 static struct {
     atomic_int pid;
     atomic_uint ms;
+    atomic_bool taken, release;
 } stall_site[STALL_SITES] = {
     [STALL_LOCK] = {.pid = -1},
     [STALL_LOCK_EARLY] = {.pid = -1},
     [STALL_LOCK_PROPAGATED] = {.pid = -1},
     [STALL_FORCE_READY] = {.pid = -1},
+    [STALL_SYNC_WAKER] = {.pid = -1},
 };
 
+static _Atomic(thread_t *) stalled_waiter;
+static atomic_int wake_claims;
+static atomic_int intr_before_switch_pid;
+
+void inject_intr_before_switch(thread_t *thp)
+{
+    if (thp->state != STATE_INTR)
+        return;
+    int pid = thp->process->pid;
+    if (atomic_compare_exchange_strong_explicit(&intr_before_switch_pid, &pid,
+                                                0, memory_order_relaxed,
+                                                memory_order_relaxed))
+        atomic_or(&thp->flags, RTMUX_FLG_THR_INTR_PENDING);
+}
+
 /* Claim a one-shot stall armed for the site's pid and spin for its time. */
-static void inject_stall_once(enum stall_site site, const process_t *prp)
+static void inject_stall_once(enum inject_site site, const process_t *prp, thread_t *waiter)
 {
     int pid = atomic_load_explicit(&stall_site[site].pid, memory_order_acquire);
     uint64_t ms;
@@ -201,20 +215,30 @@ static void inject_stall_once(enum stall_site site, const process_t *prp)
                                                  memory_order_relaxed))
         return;
     end = r_time() + ms * (qtimeptr->cycles_per_sec / 1000);
-    atomic_store_explicit(&consumed, 1, memory_order_release);
+    if (waiter) {
+        atomic_store_explicit(&wake_claims, 0, memory_order_relaxed);
+        atomic_store_explicit(&stalled_waiter, waiter, memory_order_release);
+    }
+    atomic_store_explicit(&stall_site[site].taken, true, memory_order_release);
     inject_spin_begin();
-    while (r_time() < end)
+    while (!atomic_load_explicit(&stall_site[site].release,
+                                 memory_order_acquire) &&
+           r_time() < end)
         ;
     inject_spin_end();
+    if (waiter)
+        atomic_store_explicit(&stalled_waiter, NULL, memory_order_release);
 }
 
 /* Arm a stall at site for pid and ms milliseconds; an errno. */
-static int inject_stall_arm(enum stall_site site, uint64_t pid, uint64_t ms)
+static int inject_stall_arm(enum inject_site site, uint64_t pid, uint64_t ms)
 {
     /* A pid past INT32_MAX would truncate to another process's pid below. */
     if (pid > INT32_MAX || ms == 0 || ms > INJECT_SPIN_MAX_MS)
         return EINVAL;
-    atomic_store_explicit(&consumed, 0, memory_order_relaxed);
+    atomic_store_explicit(&stall_site[site].taken, false, memory_order_relaxed);
+    atomic_store_explicit(&stall_site[site].release, false,
+                          memory_order_relaxed);
     atomic_store_explicit(&stall_site[site].ms, (unsigned) ms,
                           memory_order_relaxed);
     atomic_store_explicit(&stall_site[site].pid, (int) pid,
@@ -227,19 +251,19 @@ static int inject_stall_arm(enum stall_site site, uint64_t pid, uint64_t ms)
  */
 void inject_mutex_lock_stall(process_t *prp)
 {
-    inject_stall_once(STALL_LOCK, prp);
+    inject_stall_once(STALL_LOCK, prp, NULL);
 }
 
 /* Called with the chain lock held, before WAITING is published. */
 void inject_mutex_lock_early(process_t *prp)
 {
-    inject_stall_once(STALL_LOCK_EARLY, prp);
+    inject_stall_once(STALL_LOCK_EARLY, prp, NULL);
 }
 
 /* Called with the chain lock dropped, after the priority walk. */
 void inject_mutex_lock_propagated(process_t *prp)
 {
-    inject_stall_once(STALL_LOCK_PROPAGATED, prp);
+    inject_stall_once(STALL_LOCK_PROPAGATED, prp, NULL);
 }
 
 /* Called from sync_chain_force_ready after it read the waiter's key, before it
@@ -247,7 +271,14 @@ void inject_mutex_lock_propagated(process_t *prp)
  */
 void inject_force_ready_stall(thread_t *thp)
 {
-    inject_stall_once(STALL_FORCE_READY, thp->process);
+    if (atomic_load_explicit(&stalled_waiter, memory_order_acquire) == thp)
+        atomic_fetch_add_explicit(&wake_claims, 1, memory_order_relaxed);
+    inject_stall_once(STALL_FORCE_READY, thp->process, NULL);
+}
+
+void inject_sync_waker_stall(thread_t *thp)
+{
+    inject_stall_once(STALL_SYNC_WAKER, thp->process, thp);
 }
 
 /* Called from object_alloc before it touches the free list. Ordinary allocation
@@ -459,7 +490,7 @@ void kext_debug_inject(void *data)
             ret = EINVAL;
             break;
         }
-        atomic_store_explicit(&consumed, 0, memory_order_relaxed);
+        atomic_store_explicit(&ts_consumed, false, memory_order_relaxed);
         atomic_store_explicit(&armed_ts_pid, (int) kap->arg0,
                               memory_order_release);
         break;
@@ -474,6 +505,37 @@ void kext_debug_inject(void *data)
         break;
     case INJECT_OP_STALL_FORCE_READY:
         ret = inject_stall_arm(STALL_FORCE_READY, kap->arg0, kap->arg1);
+        break;
+    case INJECT_OP_INTR_BEFORE_SWITCH:
+        if (!kap->arg0 || kap->arg0 > INT_MAX)
+            ret = EINVAL;
+        else {
+            atomic_store_explicit(&intr_before_switch_pid, (int) kap->arg0,
+                                  memory_order_relaxed);
+            ret = EOK;
+        }
+        break;
+    case INJECT_OP_STALL_SYNC_WAKER:
+        ret = inject_stall_arm(STALL_SYNC_WAKER, kap->arg0, kap->arg1);
+        break;
+    case INJECT_OP_SYNC_WAKE_CLAIMS:
+        ret = atomic_load_explicit(&wake_claims, memory_order_acquire);
+        break;
+    case INJECT_OP_SITE_STATUS:
+        if (kap->arg0 == INJECT_SITE_TURNSTILE)
+            ret = atomic_load_explicit(&ts_consumed, memory_order_acquire);
+        else if (kap->arg0 < STALL_SITES)
+            ret = atomic_load_explicit(&stall_site[kap->arg0].taken,
+                                       memory_order_acquire);
+        else
+            ret = -EINVAL;
+        break;
+    case INJECT_OP_SITE_RELEASE:
+        if (kap->arg0 >= STALL_SITES)
+            ret = EINVAL;
+        else
+            atomic_store_explicit(&stall_site[kap->arg0].release, true,
+                                  memory_order_release);
         break;
     case INJECT_OP_ALLOC_STATUS:
         ret = atomic_load_explicit(&consumed, memory_order_acquire);
@@ -700,3 +762,5 @@ void thr_trace_dump(const thread_t *thp)
         shown++;
     }
 }
+
+#endif /* CONFIG_DEBUG_INJECT */

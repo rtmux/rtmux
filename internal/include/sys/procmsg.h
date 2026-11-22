@@ -319,7 +319,7 @@ struct _proc_posix_spawn {
     uint16_t narge;
     uint16_t cwdlen; /* bytes of the child cwd with its null, or 0 */
     uint16_t reserved[2];
-    uint32_t filact_bytes;  /* size of the _posix_spawn_file_actions_t */
+    uint32_t filact_bytes;  /* file-action bytes, format in reserved[0] */
     uint32_t filact_obytes; /* size of the _posix_spawn_file_actions_t.open */
     uint32_t argenv_bytes;  /* Number of bytes of argv + arge with nulls */
     uint32_t attr_bytes;    /* size of the _posix_spawnattr_t */

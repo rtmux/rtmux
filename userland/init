@@ -21,6 +21,7 @@ mainfs=/dev/nvme0n1p8
 rtmux_run=
 rtmux_laps=
 rtmux_spawn_procs=0
+preempt_latency_args=
 if read cmdline < /sys/cmdline; then
     for arg in $cmdline; do
         case "$arg" in
@@ -28,6 +29,9 @@ if read cmdline < /sys/cmdline; then
             rtmux.run=*) rtmux_run=${arg#rtmux.run=} ;;
             rtmux.laps=*) rtmux_laps=${arg#rtmux.laps=} ;;
             rtmux.spawn_procs=*) rtmux_spawn_procs=${arg#rtmux.spawn_procs=} ;;
+            # The host audits late wakes against its own scheduling
+            # (scripts/vcpu-steal.py).
+            rtmux.host_audit=1) preempt_latency_args=--host-audit ;;
         esac
     done
 fi
@@ -150,14 +154,17 @@ if test "$rtmux_run" = "debug-inject"; then
     # A PI mutex waiter that has published itself but not yet queued must not
     # be stranded by another unlock.
     if test "$ok" = 4; then
-        if /bin/syscall_testing --mutex-waiting-republish; then
+        /bin/pipe &
+        if waitfor /dev/pipe 10 && /bin/syscall_testing --mutex-waiting-republish; then
             ok=5
         fi
     fi
     # An interrupt of a condition wait that lost the race with the wakeup must
     # leave the woken thread alone.
     if test "$ok" = 5; then
-        if /bin/syscall_testing --condvar-interrupt-stale; then
+        if /bin/syscall_testing --condvar-interrupt-stale &&
+            /bin/syscall_testing --sync-kill-handoff &&
+            /bin/syscall_testing --intr-before-switch; then
             ok=6
         fi
     fi
@@ -192,7 +199,6 @@ if test "$rtmux_run" = "debug-inject"; then
     # point where it has checked and not yet changed. The case spawns children
     # that wait on pipes, and binds a terminal the init session does not own.
     if test "$ok" = 10; then
-        /bin/pipe &
         /sbin/logger
         /sbin/virtio-mmio
         /sbin/virtio-mmio --register-boot
@@ -210,7 +216,15 @@ if test "$rtmux_run" = "debug-inject"; then
             ok=12
         fi
     fi
+    # The wake-latency probe must report a hart held with interrupts off as a
+    # late wake: the detector behind the smp-invariants gate, tested against
+    # a real stall.
     if test "$ok" = 12; then
+        if /bin/preempt-latency --inject-stall 300; then
+            ok=13
+        fi
+    fi
+    if test "$ok" = 13; then
         echo "RTMux debug-inject: PASS"
     else
         echo "RTMux debug-inject: FAIL"
@@ -353,7 +367,7 @@ if test "$rtmux_run" = "preempt-latency"; then
     /sbin/virtio-mmio
     /sbin/virtio-mmio --register-boot
     echo "RTMux preempt-latency: BEGIN"
-    /bin/preempt-latency
+    /bin/preempt-latency $preempt_latency_args
     report_rc preempt-latency $?
     shutdown -h
     sleep 1
@@ -394,6 +408,18 @@ if test "$rtmux_run" = "ipc-contention"; then
     exec /bin/sh -i
 fi
 
+if test "$rtmux_run" = "lock-debug"; then
+    echo "RTMux lock-debug: BEGIN"
+    if /bin/lock-rank-stress --tickets && /bin/lock-rank-stress 100; then
+        echo "RTMux lock-debug: PASS"
+    else
+        echo "RTMux lock-debug: FAIL"
+    fi
+    shutdown -h
+    sleep 1
+    exec /bin/sh -i
+fi
+
 if test "$rtmux_run" = "smp-invariants"; then
     /sbin/virtio-mmio
     /sbin/virtio-mmio --register-boot
@@ -410,7 +436,7 @@ if test "$rtmux_run" = "smp-invariants"; then
     /bin/revoke-stress 2 8 1 || smp_fail=1
 
     echo "RTMux smp-invariants: preempt-latency"
-    /bin/preempt-latency || smp_fail=1
+    /bin/preempt-latency $preempt_latency_args || smp_fail=1
 
     echo "RTMux smp-invariants: ipc-contention"
     /bin/ipc-contention || smp_fail=1

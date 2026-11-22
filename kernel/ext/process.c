@@ -572,8 +572,13 @@ void kext_process_destroy(void *data)
         crash();
     if (prp->alarm)
         crash();
-    if (prp->nfds)
+    if (prp->nfds) {
+        kprintf("process destroy: pid %d nfds %u fd slots %u channel/connection slots %u\n",
+                pid, (unsigned) prp->nfds,
+                (unsigned) (prp->fdcons.nentries - prp->fdcons.nfree),
+                (unsigned) (prp->chancons.nentries - prp->chancons.nfree));
         crash();
+    }
     if (prp->chancons.vector) {
         vector_free(&prp->chancons);
     }

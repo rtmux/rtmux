@@ -42,6 +42,7 @@ void loader_thread_attr(struct _thread_attr *attr,
 int proc_setpgid(ioserv_context_t *ctp, proc_setpgid_t *msg);
 
 /* spawn.c */
+int proc_spawn_with_actions(ioserv_context_t *ctp, void *msg, const unsigned char *actions, unsigned bytes);
 int proc_spawn(ioserv_context_t *ctp, void *vmsg);
 
 /* exec.c */

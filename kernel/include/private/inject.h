@@ -56,23 +56,23 @@
 
 /* FAIL_NEXT_TURNSTILE(pid): the next allocation of a PI turnstile on behalf of
  * that process fails once, whether it is a condvar wait's reservation or a
- * contended lock's own. ALLOC_STATUS reports whether it was consumed.
+ * contended lock's own. SITE_STATUS(TURNSTILE) reports whether it was consumed.
  */
 #define INJECT_OP_FAIL_NEXT_TURNSTILE 9
 
 /* STALL_MUTEX_LOCK(pid, ms): the next contended PI mutex lock by that process
  * stalls for ms milliseconds in the window where it has published its wait but
- * not yet queued, with the chain lock dropped. ALLOC_STATUS reports whether the
- * stall was taken. A race that needs another thread to act in that window is
- * otherwise a matter of luck.
+ * not yet queued, with the chain lock dropped. SITE_STATUS(STALL_LOCK) reports
+ * whether the stall was taken. A race that needs another thread to act in that
+ * window is otherwise a matter of luck.
  */
 #define INJECT_OP_STALL_MUTEX_LOCK 10
 
 /* STALL_FORCE_READY(pid, ms): the next force_ready of a thread of that process
  * that read it as a condvar, semaphore or mutex waiter stalls for ms
  * milliseconds before it takes the wait chain lock, the window in which the
- * waiter can be woken and block elsewhere. ALLOC_STATUS reports whether the
- * stall was taken.
+ * waiter can be woken and block elsewhere. SITE_STATUS(STALL_FORCE_READY)
+ * reports whether the stall was taken.
  */
 #define INJECT_OP_STALL_FORCE_READY 11
 
@@ -128,6 +128,24 @@
  * the subset of deferred settles run on idle harts with interrupts off.
  */
 #define INJECT_OP_PRIO_SETTLE_STATS 19
+
+/* SITE_STATUS(site) returns one after that particular injection was taken.
+ * SITE_RELEASE(site) ends the current stall before its watchdog expires. */
+#define INJECT_OP_SITE_STATUS 20
+#define INJECT_OP_SITE_RELEASE 21
+#define INJECT_OP_STALL_SYNC_WAKER 22
+#define INJECT_OP_SYNC_WAKE_CLAIMS 23
+#define INJECT_OP_INTR_BEFORE_SWITCH 24
+
+enum inject_site {
+    STALL_LOCK,
+    STALL_LOCK_EARLY,
+    STALL_LOCK_PROPAGATED,
+    STALL_FORCE_READY,
+    STALL_SYNC_WAKER,
+    STALL_SITES,
+    INJECT_SITE_TURNSTILE = STALL_SITES
+};
 
 #define INJECT_SPIN_MAX_MS 10000
 

@@ -629,6 +629,7 @@ connect_t *rdecl remote_ipc_send(kcall_args_t *kap,
     /* this is not a client blocked for server, no onbehalf */
     act->args.ms.server = 0;
     act->args.ms.coid = vtid;
+    debug_set_blocked_connect(act, cop, cop->channel);
     act->state = STATE_REPLY;
     act->restart = 0;
 

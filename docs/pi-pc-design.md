@@ -137,6 +137,13 @@ Every path below must deboost or transfer ownership correctly:
 | priority change | `sched_thread` (`__sched_set`), `sched_ss_update`/`sched_ss_adjust` | set the base only (`thread_set_base_prio`), then reapply `max(base, loans)`; see "Base and Effective Priority" |
 | condvar reacquire | `ksys_sync_condvar_wait` re-lock leg | move from CV wait to mutex turnstile without collision-mixing |
 
+Each owner keeps its turnstiles in a priority list keyed by their highest
+waiter. Recomputing the owner's inherited priority reads the first entry.
+Updating a loan skips equal-priority groups, so insertion visits at most
+`NUM_PRI` priority levels. Debug list validation can also walk the entries.
+The `--pi-owner-loans` guest test releases three contended mutexes out of
+priority order and checks the effective priority after each handoff.
+
 When a non-winning waiter leaves the queue, recompute the owner's boost from
 remaining waiters.  Clearing the boost simply because one waiter left is wrong
 when another higher-than-base waiter remains.
@@ -147,13 +154,9 @@ timeout cleanup, recompute owner boosts from remaining turnstiles, and free
 idle turnstiles after the last contender/owner/reference leaves.  The table
 remains the audit map for future priority-ceiling work.
 
-Legacy fields in `kernel/include/objects.h` are not reused blindly.  The design
-replacement is:
-
-- `thread_t.blocked_on_turnstile`: explicit pointer for PI propagation;
-- `thread_t.owned_turnstiles`: owner-held list used for deboost and death;
-- `ksync_t.mutex_holdlist`: retired from new PI code unless a replacement proves
-  it has the exact lifetime and granularity above.
+A blocked PI waiter records its turnstile in `thread_t.blocked_on_turnstile`.
+Each owner links its turnstiles through `thread_t.owned_turnstiles` for
+priority recomputation and thread teardown.
 
 ## RCU And Pinning
 
@@ -289,12 +292,16 @@ Bounds and policies:
   `prio.reply_depth_overflow` counts the stop. No error is returned: the thread
   whose change started the walk is not deadlocked. `prio-loan` case 5 builds a
   chain one longer than the bound and checks both.
-- Cycles: a mutex-only cycle returns `EDEADLK` as before. An IPC hop that comes
+- Cycles: an explicit mutex lock that encounters a mutex-only cycle returns `EDEADLK`. An IPC hop that comes
   back to the contending waiter (it holds the request its mutex's owner waits
   on) is also a cycle and returns `EDEADLK` to that waiter instead of blocking
   forever (`prio-loan` case 4). The failed lock then walks the owner's chain
   again unconditionally (`sync_pi_recompute_chain`), taking the contender's
-  floor back out of every thread it reached.
+  floor back out of every thread it reached. A condition waiter has already
+  released its mutex before its reacquire encounters the cycle. The walk stops
+  at the same bound, and the waiter stays queued for handoff. The
+  `--cond-pi-cycle` fixture times out another participant and verifies that
+  the condition waiter returns holding its mutex.
 - Re-sorting: every adjust re-sorts the thread in the queue it waits on: the
   dispatch queue, a channel send queue (`adjust_priority_default`), or its
   sync chain (`sync_chain_requeue_waiter_locked`, which first finds the thread

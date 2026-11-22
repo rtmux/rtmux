@@ -100,10 +100,18 @@ static int thread_destroy_stats_report(const char *label, unsigned long calls)
             break;
         (void) __sched_yield();
     }
-    post_ready_named_ns = stats.rcu_wait_ns + stats.pin_wait_ns +
-        stats.active_scan_ns + stats.object_free_ns +
-        stats.destroy_post_vector_ns + stats.destroy_post_cpu_ns +
-        stats.destroy_post_name_ns;
+    /* The post-ready interval and its vector, cpu and name parts are recorded
+     * only by a destroy that woke a joiner; the RCU, pin, scan and free totals
+     * by every destroy. A joiner that arrives after the thread has exited is
+     * not woken, so the two sets differ whenever that happens, and the totals
+     * of the larger one can exceed the interval of the smaller. Count them
+     * against the interval only when both cover the same destroys.
+     */
+    post_ready_named_ns = stats.destroy_post_vector_ns +
+        stats.destroy_post_cpu_ns + stats.destroy_post_name_ns;
+    if (stats.destroy_join_post_ready == stats.calls)
+        post_ready_named_ns += stats.rcu_wait_ns + stats.pin_wait_ns +
+            stats.active_scan_ns + stats.object_free_ns;
     post_ready_residual_ns =
         post_ready_named_ns <= stats.destroy_join_post_ready_ns ?
         stats.destroy_join_post_ready_ns - post_ready_named_ns : (uint64_t) 0;

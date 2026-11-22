@@ -57,7 +57,6 @@ void shutdown(unsigned sigcode, const CPU_REGISTERS *reg)
     static int shutting_down = 0; /* In case of fault during shutdown() */
     if (!shutting_down) {
         shutting_down = 1;
-        SPINUNLOCK(&debug_slock);
 
         kprintf("\nShutdown[%d] S/C/F=%d/%d/%d", get_cpunum(),
                 SIGCODE_SIGNO(sigcode), SIGCODE_CODE(sigcode),

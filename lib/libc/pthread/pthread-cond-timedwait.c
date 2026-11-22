@@ -28,6 +28,7 @@ int pthread_cond_timedwait(pthread_cond_t *cond,
         return EINVAL;
     }
 
+    pthread_testcancel();
     t = timespec2nsec(abstime);
 
     /* Passing a NULL for event is the same as notify = SIGEV_UNBLOCK */

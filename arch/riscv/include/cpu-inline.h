@@ -9,7 +9,7 @@
 #define _RISCV_CPUINLINE_H
 
 #include <inttypes.h>
-#include <sys/spinlock.h>
+#include "ticket-lock.h"
 
 /* __cpu_membarrier — full hardware memory barrier (read+write).
  *
@@ -353,36 +353,6 @@ static inline void sfence_vma()
 static inline void cpu_icache_sync(void)
 {
     __asm__ volatile("fence.i" ::: "memory");
-}
-
-/* Spin until the lock is ours. The caller has disabled interrupts. */
-static inline void intrspin_acquire(struct intrspin *__spin)
-{
-#if CONFIG_PROCESSORS_MAX > 1
-    __asm__ __volatile__(
-        "       li           t0, 1;"        /* Initialize swap value */
-        "1:     lw           t1, (%0);"     /* Check if lock is held */
-        "       bnez         t1, 1b;"       /* Retry if held */
-        "       amoswap.w.aq t1, t0, (%0);" /* Attempt to acquire lock */
-        "       bnez         t1, 1b"        /* Retry if held */
-        :
-        : "r"(&__spin->value)
-
-        /* "memory": the .aq bit orders the hardware, but without a compiler
-         * barrier gcc may hoist critical-section accesses above the acquire.
-         * The matching release in intrspin_release() already carries it.
-         */
-        : "t0", "t1", "memory");
-#else
-    __spin->value = 1;
-#endif
-}
-
-/* Release the lock without touching the interrupt state. */
-static inline void intrspin_release(struct intrspin *__spin)
-{
-    __asm__ __volatile__("amoswap.w.rl x0, x0, (%0)" ::"r"(&__spin->value)
-                         : "memory");
 }
 
 /**

@@ -79,7 +79,7 @@ class Window(NamedTuple):
 # Regenerate with --emit; see the module docstring.
 AUDIT = [
     Window("kernel/cap/table.o", "cap_lookup_pin_typed",
-           ["beqz", "bnez", "beqz", "bgeu", "beqz", "beqz", "beqz", "beqz",
+           ["beqz", "bnez", "beqz", "bgeu", "beqz", "bne", "beqz",
             "beq", "bne", "bne", "bnez", "beq", "beqz"]),
     Window("kernel/object/vector.o", "vector_lookup2",
            ["beqz", "bgeu", "bnez"]),

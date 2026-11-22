@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <sys/iomsg.h>
 #include <core/globals.h>
+#include "reply-client.h"
 
 /* New message passing code. Faster version than original -- optimizes for the
  * common I/O service cases:
@@ -685,6 +686,7 @@ static int sendv_body(thread_t *act,
         sender->args.ms.rparts = kap->rparts;
     }
 
+    debug_set_blocked_connect(sender, cop, chp);
     atomic_clr(&sender->flags, RTMUX_FLG_THR_BUFF_MSG);
     /* Make sure the SPECRET_PENDING bit isn't set when we don't need it. */
     ITF_CLR(sender, RTMUX_ITF_SPECRET_PENDING);
@@ -1090,14 +1092,16 @@ static int sendv_body(thread_t *act,
 
         SETKSTATUS(thp, (sender->tid << 16) | cop->scoid);
 
-        /* Unlink receive thread from the receive queue. Queue mutation under
-         * chp->lock; thp's MSG_DELIVERY was held since the peek up top to keep
-         * force_ready / other peekers off it. Clear the claim only AFTER
-         * LINKPRIL_REM completes so a force_ready that wins the chp->lock race
-         * after our release sees thp no longer on the queue.
-         */
+        /* The destroyer drains receive_queue before reply_queue. Publish the
+         * sender in the same locked transition that removes the receiver,
+         * or the destroyer can observe both queues empty and leave the sender
+         * waiting on a detached connection. WAIT_PENDING holds off reply and
+         * forced wake until block_and_ready has displaced the sender. */
+        ITF_SET(sender, RTMUX_ITF_WAIT_PENDING);
         kspinlock_lock(&chp->lock);
         LINKPRIL_REM(thp);
+        sender->state = STATE_REPLY;
+        LINKPRIL_BEG(chp->reply_queue, sender, thread_t);
 #if CONFIG_PROCESSORS_MAX > 1 && defined(CONFIG_SMP_MSGOPT)
         ITF_CLR(thp, RTMUX_ITF_MSG_DELIVERY);
 #endif
@@ -1105,15 +1109,6 @@ static int sendv_body(thread_t *act,
 
         sender->args.ms.server = thp;
         thp->client = sender;
-
-        /* Set WAIT_PENDING on the sender BEFORE the state = STATE_REPLY →
-         * LINKPRIL_BEG(reply_queue) transition. Cleared with a hardware fence
-         * after LINKPRIL_BEG below. Pairs with the spin-wait in ksys_msg_replyv
-         * post-lookup. This bridge prevents a concurrent replyv from finding
-         * the sender state == REPLY but not yet on reply_queue (which would
-         * corrupt the pril list on LINKPRIL_REM).
-         */
-        ITF_SET(sender, RTMUX_ITF_WAIT_PENDING);
 
         /* Check fast path conditions - no timeouts, no remote IPC, no sporadic.
          * We can inline the block_and_ready()
@@ -1135,8 +1130,6 @@ static int sendv_body(thread_t *act,
             thp->dpp = sender->dpp;
             CRITICAL_INHERIT(thp, sender);
 
-            sender->state =
-                STATE_REPLY; /* Must be set before calling block_and_ready() */
             snap_time(&sender->timestamp_last_block, 0);
             _TRACE_TH_EMIT_STATE(sender, REPLY);
 #if defined(INLINE_BLOCKANDREADY)
@@ -1180,8 +1173,6 @@ static int sendv_body(thread_t *act,
             }
             thread_set_pend_loan(thp, 0);
             thread_prio_settle(thp); /* thp is on no queue yet */
-            sender->state =
-                STATE_REPLY; /* Must be set before calling block_and_ready() */
             _TRACE_TH_EMIT_STATE(sender, REPLY);
 
             if (cop->flags & COF_NETCON) {
@@ -1209,21 +1200,6 @@ static int sendv_body(thread_t *act,
         sender->blocked_on = cop;
         IPC_BLK(sender);
 
-        /* Link the now reply blocked sending thread in the reply queue Queue
-         * mutation under chp->lock. No ->destroying recheck here (unlike the
-         * send-block path): the common wake for a reply-blocked sender is the
-         * server's ksys_msg_replyv via rcvid, independent of this channel. chp
-         * is valid across this link (caller's RCU-sched read section), but that
-         * section ends once the sender context-switches away, so in the narrow
-         * window where a channel_destroy links this sender after its reply
-         * drain has passed, chp can be freed with the sender still linked. That
-         * stale reply_queue linkage is made memory-safe by force_ready's
-         * STATE_REPLY->RECEIVE unlink, which skips LINKPRIL_REM when the owning
-         * channel is gone (dispatch.c). Residual is liveness only.
-         */
-        kspinlock_lock(&chp->lock);
-        LINKPRIL_BEG(chp->reply_queue, sender, thread_t);
-        kspinlock_unlock(&chp->lock);
         *heldp = NULL; /* the reply-side drop releases it */
 
         /* Hardware SMP fence pairs with the spin-wait + fence in
@@ -2193,13 +2169,10 @@ restart_recv:
                 CRITICAL_INHERIT(act, thp);
             else
                 CRITICAL_CLEAR(act);
-            thread_lend_msg(act, thp->priority, true); /* act->client = thp */
-            (void) thread_end_orphan_loan(act);
-            (void) thread_prio_update_dpp(act, thp->dpp, 1);
+            reply_client_priority(act, thp, thp->dpp);
         } else {
             CRITICAL_CLEAR(act);
-            thread_lend_msg(act, 0, false);
-            thread_prio_update(act);
+            reply_client_priority(act, NULL, NULL);
         }
 
         return ENOERROR;
@@ -2456,21 +2429,12 @@ static int msg_replyv_body(thread_t *act,
         return ESRCH;
     }
 
-    if (thp->blocked_on != cop) {
-        connect_t *cop1 = cop;
-        cop = thp->blocked_on;
-
-        /* NULL: client's blocked_on was cleared by a concurrent teardown
-         * (force_ready on a client whose process is exiting) -> ESRCH. Without
-         * it the deref below load-faults near NULL.
-         */
-        if (!cop || (cop->flags & COF_VCONNECT) == 0 ||
-            cop->un.lcl.cop != cop1) {
+    cop = reply_client_connection(thp, cop);
+    if (!cop) {
 #if CONFIG_PROCESSORS_MAX > 1 && defined(CONFIG_SMP_MSGOPT)
-            ITF_CLR(thp, RTMUX_ITF_MSG_DELIVERY);
+        ITF_CLR(thp, RTMUX_ITF_MSG_DELIVERY);
 #endif
-            return ESRCH;
-        }
+        return ESRCH;
     }
 
     if (thp->internal_flags & RTMUX_ITF_UNBLOCK_QUEUED) {
@@ -2841,14 +2805,10 @@ static int msg_error_body(thread_t *act,
         kspinlock_unlock(&chp->lock);
         return ESRCH;
     }
-    if (thp->blocked_on != cop) {
-        connect_t *cop1 = cop;
-        cop = thp->blocked_on;
-        if (!cop || (cop->flags & COF_VCONNECT) == 0 ||
-            cop->un.lcl.cop != cop1) {
-            kspinlock_unlock(&chp->lock);
-            return ESRCH;
-        }
+    cop = reply_client_connection(thp, cop);
+    if (!cop) {
+        kspinlock_unlock(&chp->lock);
+        return ESRCH;
     }
     ITF_SET(thp, RTMUX_ITF_MSG_DELIVERY);
     kspinlock_unlock(&chp->lock);
@@ -2867,18 +2827,9 @@ static int msg_error_body(thread_t *act,
         return ESRCH;
     }
 
-    if (thp->blocked_on != cop) {
-        connect_t *cop1 = cop;
-        cop = thp->blocked_on;
-
-        /* NULL: client's blocked_on was cleared by a concurrent teardown
-         * (force_ready on a client whose process is exiting) -> ESRCH. Without
-         * it the deref below load-faults near NULL.
-         */
-        if (!cop || (cop->flags & COF_VCONNECT) == 0 ||
-            cop->un.lcl.cop != cop1) {
-            return ESRCH;
-        }
+    cop = reply_client_connection(thp, cop);
+    if (!cop) {
+        return ESRCH;
     }
 #endif
 

@@ -63,7 +63,7 @@ void rdecl deliver_fault(thread_t *thp, siginfo_t *info)
          * delivery.
          *
          * Read each slot (and nentries) UNDER vec_slock so we always see the
-         * current buffer. We must NOT hold vec_slock across force_ready /
+         * current buffer. We must NOT hold vec_slock across
          * thread_destroy — thread_destroy takes it itself to vector_rem
          * (lifecycle.c). "t" stays valid after the lock drops because a reaper
          * frees a thread only after an RCU-sched grace period, and this loop
@@ -82,10 +82,8 @@ void rdecl deliver_fault(thread_t *thp, siginfo_t *info)
              */
             got = ((t = VECP2(t, &prp->threads, tid)) && t != thp);
             kspinlock_unlock(&prp->vec_slock);
-            if (got) {
-                force_ready(t, _FORCE_KILL_SELF);
+            if (got)
                 thread_destroy(t);
-            }
         }
     }
 }

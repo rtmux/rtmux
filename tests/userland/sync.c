@@ -16,6 +16,10 @@
  */
 
 #include <errno.h>
+#include <devctl.h>
+#include <devctl/proc.h>
+#include <sys/procfs.h>
+#include <sys/states.h>
 #include <stdint.h>
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -235,6 +239,12 @@ static void test_pthread_mutex_types(void)
                       pthread_mutex_trylock(&m) == EAGAIN,
                   "RECURSIVE mutex depth saturates with EAGAIN",
                   "lock and trylock must fail EAGAIN at the depth limit");
+            unsigned long saturated = (unsigned long) m.count;
+            errno = 0;
+            check(__sync_mutex_lock((sync_t *) &m) == -1 && errno == EAGAIN &&
+                      (unsigned long) m.count == saturated,
+                  "raw recursive mutex depth saturates with EAGAIN",
+                  "kernel acquire must preserve count and flags at saturation");
             m.count = (long) saved;
             (void) pthread_mutex_unlock(&m);
         }
@@ -387,6 +397,17 @@ static void test_pthread_mutex_prio_protect_required_pass_body(void)
                 pthread_mutex_init(&rec, &rattr) == EOK) {
                 int r1 = pthread_mutex_lock(&rec);
                 int r2 = sync_mutex_lock_r((sync_t *) &rec);
+                if (r2 == EOK) {
+                    long saved = rec.count;
+                    long saturated = (long) ((unsigned long) saved | rtmux_sync_depth_mask(saved));
+
+                    rec.count = saturated;
+                    check(sync_mutex_lock_r((sync_t *) &rec) == -EAGAIN &&
+                              rec.count == saturated,
+                          "PRIO_PROTECT raw recursive depth saturation",
+                          "the ceiling and flags must survive a failed acquire");
+                    rec.count = saved;
+                }
                 int r3 = pthread_mutex_unlock(&rec); /* depth 2 to 1 */
                 int r4 = pthread_mutex_unlock(&rec); /* final: kernel pop */
 
@@ -744,8 +765,9 @@ struct pi_cycle_args {
     pthread_mutex_t *first;
     pthread_mutex_t *second;
     atomic_int *locked_count;
-    atomic_int *release_second;
+    atomic_bool *abort;
     atomic_int *result;
+    atomic_bool finished;
 };
 
 struct pi_timeout_waiter_args {
@@ -810,24 +832,27 @@ static void *pi_cycle_worker(void *raw)
 
     rc = pthread_mutex_lock(arg->first);
     if (rc != EOK) {
-        atomic_store_explicit(arg->result, -rc, memory_order_release);
-        return NULL;
+        atomic_store(arg->abort, true);
+        atomic_store(arg->result, -rc);
+        goto done;
     }
-    atomic_fetch_add_explicit(arg->locked_count, 1, memory_order_acq_rel);
-    while (atomic_load_explicit(arg->locked_count, memory_order_acquire) < 2)
+    atomic_fetch_add(arg->locked_count, 1);
+    while (atomic_load(arg->locked_count) < 2 && !atomic_load(arg->abort))
         (void) __sched_yield();
+    if (atomic_load(arg->abort))
+        goto unlock;
 
     (void) __timer_timeout_r(CLOCK_REALTIME, RTMUX_TIMEOUT_MUTEX, NULL,
                              &timeout_ns, NULL);
     rc = pthread_mutex_lock(arg->second);
     (void) __timer_timeout_r(CLOCK_REALTIME, 0, NULL, NULL, NULL);
     atomic_store_explicit(arg->result, rc, memory_order_release);
-    if (rc == EDEADLK) {
-        atomic_store_explicit(arg->release_second, 1, memory_order_release);
-    } else if (rc == EOK) {
+    if (rc == EOK)
         (void) pthread_mutex_unlock(arg->second);
-    }
+unlock:
     (void) pthread_mutex_unlock(arg->first);
+done:
+    atomic_store_explicit(&arg->finished, true, memory_order_release);
     return NULL;
 }
 
@@ -893,7 +918,7 @@ static int pi_cycle_run(int *got1, int *got2)
     pthread_t t1;
     pthread_t t2;
     atomic_int locked_count;
-    atomic_int release_second;
+    atomic_bool abort;
     atomic_int r1;
     atomic_int r2;
     struct pi_cycle_args arg1;
@@ -910,38 +935,52 @@ static int pi_cycle_run(int *got1, int *got2)
         return -1;
 
     atomic_init(&locked_count, 0);
-    atomic_init(&release_second, 0);
+    atomic_init(&abort, false);
     atomic_init(&r1, -1);
     atomic_init(&r2, -1);
     arg1.first = &a;
     arg1.second = &b;
     arg1.locked_count = &locked_count;
-    arg1.release_second = &release_second;
+    arg1.abort = &abort;
+    atomic_init(&arg1.finished, false);
     arg1.result = &r1;
     arg2.first = &b;
     arg2.second = &a;
     arg2.locked_count = &locked_count;
-    arg2.release_second = &release_second;
+    arg2.abort = &abort;
+    atomic_init(&arg2.finished, false);
     arg2.result = &r2;
 
-    if (pthread_create(&t1, NULL, pi_cycle_worker, &arg1) != EOK ||
-        pthread_create(&t2, NULL, pi_cycle_worker, &arg2) != EOK)
-        return -1;
+    int made1 = pthread_create(&t1, NULL, pi_cycle_worker, &arg1);
+    int made2 = made1 ? made1 : pthread_create(&t2, NULL, pi_cycle_worker, &arg2);
+    if (made2)
+        atomic_store(&abort, true);
 
-    (void) thread_join(t1, NULL);
-    (void) thread_join(t2, NULL);
+    int join1 = made1 ? 0 : pthread_join(t1, NULL);
+    int join2 = made2 ? 0 : pthread_join(t2, NULL);
+    bool early = (!made1 && !atomic_load(&arg1.finished)) ||
+                 (!made2 && !atomic_load(&arg2.finished));
+    if (early || join1 || join2)
+        printf("  PI cycle join: tids=%d,%d rc=%d,%d finished=%d,%d\n",
+               made1 ? -1 : (int)t1, made2 ? -1 : (int)t2, join1, join2,
+               atomic_load(&arg1.finished), atomic_load(&arg2.finished));
+    /* Keep the fixture alive even when a join fails or returns too early. */
+    while ((!made1 && !atomic_load_explicit(&arg1.finished, memory_order_acquire)) ||
+           (!made2 && !atomic_load_explicit(&arg2.finished, memory_order_acquire)))
+        sleep_ms(1);
 
     *got1 = atomic_load_explicit(&r1, memory_order_acquire);
     *got2 = atomic_load_explicit(&r2, memory_order_acquire);
-    ok = (*got1 == EDEADLK || *got2 == EDEADLK) &&
+    ok = !early && !join1 && !join2 && (*got1 == EDEADLK || *got2 == EDEADLK) &&
          (*got1 == EDEADLK || *got1 == EOK) &&
          (*got2 == EDEADLK || *got2 == EOK);
     (void) pthread_mutex_destroy(&a);
     (void) pthread_mutex_destroy(&b);
-    return ok;
+    (void) pthread_mutexattr_destroy(&attr);
+    return made2 ? -1 : ok;
 }
 
-static void test_pi_two_mutex_cycle_detects_deadlock(void)
+void test_pi_two_mutex_cycle_detects_deadlock(void)
 {
     int got1 = -1, got2 = -1;
     int ok = pi_cycle_run(&got1, &got2);
@@ -3043,6 +3082,72 @@ static void *robust_waiter(void *raw)
     return NULL;
 }
 
+/* Three distinct waiter priorities on three mutexes owned by this thread.
+ * Release the middle loan first, then the highest. The remaining low loan
+ * must still be visible when its turnstile becomes the head. */
+void test_pi_owned_turnstiles(void)
+{
+    const int priorities[] = {20, 25, 30};
+    const int release_order[] = {1, 2, 0};
+    const int remaining[] = {30, 20, 5};
+    pthread_mutex_t locks[3];
+    pthread_t waiters[3];
+    struct robust_waiter_args args[3];
+    atomic_int results[3];
+    struct sched_param original, current;
+    int policy = __sched_get(0, 0, &original);
+    unsigned created = 0, locked = 0;
+    int ok = policy >= 0 && set_fifo_prio(5) == EOK;
+
+    for (unsigned i = 0; ok && i < 3; i++) {
+        ok = robust_mutex_init(&locks[i], PTHREAD_PRIO_INHERIT,
+                               PTHREAD_PROCESS_PRIVATE) == EOK;
+        if (!ok)
+            break;
+        if (pthread_mutex_lock(&locks[i]) != EOK) {
+            pthread_mutex_destroy(&locks[i]);
+            ok = 0;
+            break;
+        }
+        locked++;
+        atomic_init(&results[i], -1);
+        args[i] = (struct robust_waiter_args) {
+            .mutex = &locks[i], .prio = priorities[i], .result = &results[i]};
+        ok = pthread_create(&waiters[i], NULL, robust_waiter, &args[i]) == EOK;
+        if (!ok)
+            break;
+        created++;
+        for (int n = 0; n < 1000; n++) {
+            if (__sched_get(0, 0, &current) >= 0 &&
+                current.sched_curpriority == priorities[i])
+                break;
+            (void) nanosleep(&(struct timespec){.tv_nsec = 1000000}, NULL);
+        }
+        ok = __sched_get(0, 0, &current) >= 0 &&
+             current.sched_curpriority == priorities[i];
+    }
+    for (unsigned i = 0; i < 3; i++) {
+        unsigned index = (unsigned) release_order[i];
+        if (index >= locked)
+            continue;
+        if (pthread_mutex_unlock(&locks[index]) != EOK)
+            ok = 0;
+        if (index < created &&
+            (pthread_join(waiters[index], NULL) != EOK ||
+             atomic_load(&results[index]) != EOK))
+            ok = 0;
+        if (pthread_mutex_destroy(&locks[index]) != EOK)
+            ok = 0;
+        if (__sched_get(0, 0, &current) < 0 ||
+            current.sched_curpriority != remaining[i])
+            ok = 0;
+    }
+    if (policy >= 0 && __sched_set(0, 0, policy, &original) != EOK)
+        ok = 0;
+    check(ok, "PI owner keeps the highest remaining mutex loan",
+          "expected boosts 20, 25, 30 then 30, 20, 5 across handoff");
+}
+
 /* A PI robust mutex whose owner dies with a waiter queued: the waiter gets it
  * with EOWNERDEAD, and a higher-priority contender that queues behind the new
  * owner lends it its priority.
@@ -3740,7 +3845,21 @@ static void test_robust_held_limit(void)
         (void) pthread_mutex_destroy(&m[i]);
 }
 
-static void test_cancel_before_block(void);
+
+void test_mutex_owner_death(void)
+{
+    test_robust_mutexattr();
+    test_robust_owner_thread_exit();
+    test_robust_waiter_handoff_pi();
+    test_robust_waiters_notrecoverable();
+    test_robust_condvar_handoff();
+    test_robust_condvar_inconsistent();
+    test_robust_held_limit();
+    test_robust_owner_process_death();
+    test_robust_handoff_owner_death();
+    test_nonrobust_owner_thread_death();
+    test_nonrobust_owner_process_death();
+}
 
 void test_sync(void)
 {
@@ -3767,6 +3886,8 @@ void test_sync(void)
     test_recursive_mutex_nested_lock();
     test_mutex_unlock_unowned();
     test_mutex_hash_collision_wake_is_keyed();
+    test_cond_reacquire_cycle();
+    test_pi_owned_turnstiles();
     test_pi_two_mutex_cycle_detects_deadlock();
     test_pi_large_pid();
     test_pi_contender_timeout_does_not_match_reused_tid();
@@ -3775,17 +3896,7 @@ void test_sync(void)
     test_condvar_wait_loan_drop_with_ready_thread();
     test_condvar_wait_errorcheck_type_preserved();
     test_condvar_timeout_removes_waiter();
-    test_robust_mutexattr();
-    test_robust_owner_thread_exit();
-    test_robust_waiter_handoff_pi();
-    test_robust_waiters_notrecoverable();
-    test_robust_condvar_handoff();
-    test_robust_condvar_inconsistent();
-    test_robust_held_limit();
-    test_robust_owner_process_death();
-    test_robust_handoff_owner_death();
-    test_nonrobust_owner_thread_death();
-    test_nonrobust_owner_process_death();
+    test_mutex_owner_death();
 
     test_sem_post_wait();
     test_sem_post_twice_wait_twice();
@@ -3820,7 +3931,7 @@ void test_sync(void)
  * in kernel memory, which is never so for a user thread, so such a cancel left
  * the thread blocked for good.
  */
-enum { CBB_RECEIVE, CBB_NANOSLEEP, CBB_KINDS };
+enum { CBB_RECEIVE, CBB_NANOSLEEP, CBB_SEM, CBB_COND, CBB_JOIN, CBB_KINDS };
 
 struct cbb_ctx {
     int kind;
@@ -3828,11 +3939,124 @@ struct cbb_ctx {
     atomic_int ready;
     atomic_int go;
     atomic_int finished;
+    sem_t token;
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    pthread_t target;
+    int unlock_status;
 };
+
+static void *cbb_target(void *arg)
+{
+    return arg;
+}
+
+/* Wait for a specific thread state. TIDSTATUS may report the next thread
+ * when this slot has gone away, so also compare the returned TID. */
+static bool wait_thread_state(pthread_t tid, int state)
+{
+    char path[32];
+    snprintf(path, sizeof(path), "/proc/%d", (int) getpid());
+    int fd = open(path, O_RDONLY);
+    if (fd < 0)
+        return false;
+    bool found = false;
+    for (int i = 0; i < 300; i++) {
+        procfs_status st = {.tid = tid};
+        if (devctl(fd, DEVCTL_PROC_TIDSTATUS, &st, sizeof(st), NULL) != EOK ||
+            st.tid != tid)
+            break;
+        if (st.state == state) {
+            found = true;
+            break;
+        }
+        sleep_ms(10);
+    }
+    close(fd);
+    return found;
+}
+
+struct cond_cycle {
+    pthread_mutex_t bound, outer;
+    pthread_cond_t cond;
+    int wait_rc, unlock_rc, other_rc;
+};
+
+static void *cond_cycle_waiter(void *arg)
+{
+    struct cond_cycle *c = arg;
+    struct timespec end;
+    if (pthread_mutex_lock(&c->outer))
+        return NULL;
+    if (pthread_mutex_lock(&c->bound) == EOK) {
+        clock_gettime(CLOCK_REALTIME, &end);
+        end.tv_sec += 10;
+        c->wait_rc = pthread_cond_timedwait(&c->cond, &c->bound, &end);
+        c->unlock_rc = pthread_mutex_unlock(&c->bound);
+    }
+    pthread_mutex_unlock(&c->outer);
+    return NULL;
+}
+
+static void *cond_cycle_owner(void *arg)
+{
+    struct cond_cycle *c = arg;
+    struct timespec end;
+    if (pthread_mutex_lock(&c->bound))
+        return NULL;
+    clock_gettime(CLOCK_REALTIME, &end);
+    end.tv_sec += 2;
+    /* timedlock first tries an immediate kernel wait on a robust mutex.
+     * Arm the deadline once so the observed STATE_MUTEX is the real wait. */
+    uint64_t deadline = timespec2nsec(&end);
+    c->other_rc = __timer_timeout_r(CLOCK_REALTIME,
+                                    TIMER_ABSTIME | RTMUX_TIMEOUT_MUTEX,
+                                    NULL, &deadline, NULL);
+    if (c->other_rc == EOK)
+        c->other_rc = pthread_mutex_lock(&c->outer);
+    if (c->other_rc == EOK)
+        pthread_mutex_unlock(&c->outer);
+    pthread_mutex_unlock(&c->bound);
+    return NULL;
+}
+
+void test_cond_reacquire_cycle(void)
+{
+    struct cond_cycle c = {.cond = PTHREAD_COND_INITIALIZER,
+                           .wait_rc = -1, .unlock_rc = -1, .other_rc = -1};
+    pthread_t waiter, owner;
+    bool bound = robust_mutex_init(&c.bound, PTHREAD_PRIO_INHERIT,
+                                   PTHREAD_PROCESS_PRIVATE) == EOK;
+    bool outer = bound && robust_mutex_init(&c.outer, PTHREAD_PRIO_INHERIT,
+                                             PTHREAD_PROCESS_PRIVATE) == EOK;
+    bool made_waiter = outer &&
+        pthread_create(&waiter, NULL, cond_cycle_waiter, &c) == EOK;
+    bool made_owner = made_waiter && wait_thread_state(waiter, STATE_CONDVAR) &&
+        pthread_create(&owner, NULL, cond_cycle_owner, &c) == EOK;
+    bool queued = made_owner && wait_thread_state(owner, STATE_MUTEX);
+    pthread_cond_signal(&c.cond);
+    if (made_waiter)
+        pthread_join(waiter, NULL);
+    if (made_owner)
+        pthread_join(owner, NULL);
+    char detail[96];
+    snprintf(detail, sizeof detail, "queued=%d wait=%d unlock=%d other=%d",
+             queued, c.wait_rc, c.unlock_rc, c.other_rc);
+    check(queued && c.wait_rc == EOK && c.unlock_rc == EOK &&
+          c.other_rc == ETIMEDOUT, "condition wake reacquires across a PI cycle", detail);
+    if (outer)
+        pthread_mutex_destroy(&c.outer);
+    if (bound)
+        pthread_mutex_destroy(&c.bound);
+    pthread_cond_destroy(&c.cond);
+}
 
 static void cbb_finish(void *raw)
 {
-    atomic_store(&((struct cbb_ctx *) raw)->finished, 1);
+    struct cbb_ctx *c = raw;
+    if (c->kind == CBB_COND)
+        c->unlock_status = pthread_mutex_unlock(&c->mutex);
+    atomic_store(&c->finished, 1);
 }
 
 static void *cbb_thread(void *raw)
@@ -3840,15 +4064,24 @@ static void *cbb_thread(void *raw)
     struct cbb_ctx *c = raw;
     char buf[8];
 
+    if (c->kind == CBB_COND && pthread_mutex_lock(&c->mutex) != EOK)
+        return NULL;
     pthread_cleanup_push(cbb_finish, c);
     atomic_store(&c->ready, 1);
     while (!atomic_load(&c->go))
         (void) sched_yield();
     if (c->kind == CBB_RECEIVE)
         (void) msg_receive(c->chid, buf, sizeof buf, NULL);
-    else
+    else if (c->kind == CBB_NANOSLEEP)
         (void) nanosleep(&(struct timespec){.tv_sec = 30}, NULL);
+    else if (c->kind == CBB_SEM)
+        (void) sem_wait(&c->token);
+    else if (c->kind == CBB_COND)
+        (void) pthread_cond_wait(&c->cond, &c->mutex);
+    else
+        (void) pthread_join(c->target, NULL);
     pthread_cleanup_pop(0);
+    atomic_store(&c->finished, -1);
     return NULL;
 }
 
@@ -3860,9 +4093,10 @@ static int cbb_wait_finished(struct cbb_ctx *cp)
     return atomic_load(&cp->finished);
 }
 
-static void test_cancel_before_block(void)
+void test_cancel_before_block(void)
 {
-    static const char *const name[CBB_KINDS] = {"msg_receive", "nanosleep"};
+    static const char *const name[CBB_KINDS] = {
+        "msg_receive", "nanosleep", "sem_wait", "cond_wait", "pthread_join"};
 
     static struct cbb_ctx cbb_ctxs[CBB_KINDS]; /* a stuck thread keeps its context */
 
@@ -3871,11 +4105,27 @@ static void test_cancel_before_block(void)
         pthread_t th;
         void *ret = NULL;
 
-        *cp = (struct cbb_ctx){.kind = kind, .chid = -1};
+        *cp = (struct cbb_ctx) {.kind = kind,
+                                .chid = -1,
+                                .unlock_status = -1,
+                                .mutex = PTHREAD_MUTEX_INITIALIZER,
+                                .cond = PTHREAD_COND_INITIALIZER};
         char what[64];
 
         if (kind == CBB_RECEIVE && (cp->chid = channel_create(0)) == -1) {
             test_fail("cancel before block fixture", strerror(errno));
+            continue;
+        }
+        if ((kind == CBB_SEM && sem_init(&cp->token, 0, 1) != 0) ||
+            (kind == CBB_JOIN &&
+             pthread_create(&cp->target, NULL, cbb_target, cp) != EOK)) {
+            test_fail("cancel before block fixture",
+                      "semaphore or join target");
+            continue;
+        }
+        if (kind == CBB_JOIN && !wait_thread_state(cp->target, STATE_DEAD)) {
+            test_fail("cancel before join setup", "target did not reach STATE_DEAD");
+            (void) pthread_join(cp->target, NULL);
             continue;
         }
         if (pthread_create(&th, NULL, cbb_thread, cp) != 0) {
@@ -3898,7 +4148,8 @@ static void test_cancel_before_block(void)
         int done = cbb_wait_finished(cp);
 
         snprintf(what, sizeof what, "cancel before %s block terminates", name[kind]);
-        check(done, what, "a cancel pending when the thread blocked was lost");
+        check(done == 1, what,
+              "a cancel pending when the thread blocked was lost");
         if (!done) {
             /* It is blocked now, so this cancel lands. Do not join a thread
              * that may still not exit: the suite must not hang on a failure.
@@ -3910,6 +4161,23 @@ static void test_cancel_before_block(void)
         (void) pthread_join(th, &ret);
         check(ret == PTHREAD_CANCELED, "cancelled thread reports PTHREAD_CANCELED",
               "the join value must be PTHREAD_CANCELED");
+        if (kind == CBB_SEM) {
+            check(sem_trywait(&cp->token) == 0,
+                  "cancel before sem_wait preserves token",
+                  "the semaphore must stay available");
+            (void) sem_destroy(&cp->token);
+        } else if (kind == CBB_COND) {
+            check(cp->unlock_status == EOK,
+                  "cancel before cond_wait preserves ownership",
+                  "the cleanup handler must own the mutex");
+            (void) pthread_cond_destroy(&cp->cond);
+            (void) pthread_mutex_destroy(&cp->mutex);
+        } else if (kind == CBB_JOIN) {
+            void *result = NULL;
+            check(pthread_join(cp->target, &result) == EOK && result == cp,
+                  "cancel before join leaves target joinable",
+                  "target was consumed");
+        }
         if (cp->chid != -1)
             (void) channel_destroy(cp->chid);
     }
@@ -4074,6 +4342,7 @@ static void *mwr_b(void *arg)
 
 int mutex_waiting_republish(void)
 {
+    struct stall_watch watch = {.pid = -1};
     pthread_mutexattr_t ma;
     pthread_t w, b;
     char ms[16];
@@ -4105,7 +4374,8 @@ int mutex_waiting_republish(void)
         goto out;
     }
     sleep_ms(50); /* W is queued, so the unlock below hands the mutex to it */
-    if (inject_run("stall-lock", pid, ms) != 0) {
+    if (inject_run("stall-lock", pid, ms) != 0 ||
+        stall_watch_start(&watch, "lock") != 0) {
         test_fail("mutex_waiting_republish fixture", "inject refused");
         goto out;
     }
@@ -4115,16 +4385,14 @@ int mutex_waiting_republish(void)
     }
     for (int i = 0; i < 1000 && !atomic_load(&mwr_b_started); i++)
         sleep_ms(5);
-    sleep_ms(100); /* B is inside its stall: published, not yet queued */
+    check(stall_watch_entered(&watch), "late waiter reached the bind window",
+          "stall was not taken");
     pthread_mutex_unlock(&mwr_mutex); /* hands the mutex to W alone */
-    sleep_ms(MWR_STALL_MS + 400); /* B has left its stall and queued */
+    stall_watch_release(&watch);
     atomic_store(&mwr_w_release, 1);
 
     for (long i = 0; i < MWR_WAIT_MS / 10 && !atomic_load(&mwr_b_done); i++)
         sleep_ms(10);
-    check(inject_run("alloc-status", "consumed", NULL) == 0,
-          "the injected stall held the late waiter in its window",
-          "the stall was not taken");
     check(atomic_load(&mwr_b_done),
           "PI mutex waiter published but not yet queued is not stranded",
           "the late waiter slept on a mutex released in user space");
@@ -4134,6 +4402,7 @@ int mutex_waiting_republish(void)
         pthread_mutex_destroy(&mwr_mutex);
     }
 out:
+    stall_watch_finish(&watch);
     (void) test_pin_mask(~0U);
     return 0;
 }
@@ -4168,6 +4437,7 @@ static void *mww_locker(void *arg)
 
 int mutex_waiting_withdrawn(void)
 {
+    struct stall_watch watch = {.pid = -1};
     pthread_mutexattr_t ma;
     pthread_t t;
     char ms[16];
@@ -4193,7 +4463,8 @@ int mutex_waiting_withdrawn(void)
 
     if (pthread_mutex_lock(&mww_mutex) != 0 ||
         inject_run("fail-turnstile", pid, NULL) != 0 ||
-        inject_run("stall-lock-early", pid, ms) != 0) {
+        inject_run("stall-lock-early", pid, ms) != 0 ||
+        stall_watch_start(&watch, "early") != 0) {
         test_fail("mutex_waiting_withdrawn fixture", "lock or inject refused");
         goto out;
     }
@@ -4203,12 +4474,15 @@ int mutex_waiting_withdrawn(void)
     }
     for (int i = 0; i < 1000 && !atomic_load(&mww_started); i++)
         sleep_ms(5);
-    sleep_ms(200); /* the locker is inside its stall, before it publishes */
+    check(stall_watch_entered(&watch),
+          "locker reached the pre-publication stall",
+          "early stall was not taken");
     pthread_mutex_unlock(&mww_mutex); /* in user space: no bit to see yet */
+    stall_watch_release(&watch);
     (void) pthread_join(t, NULL);
-    check(inject_run("alloc-status", "consumed", NULL) == 0,
-          "the injected stall held the locker before it published",
-          "the stall was not taken");
+    check(inject_run("site-wait", "turnstile", NULL) == 0,
+          "turnstile allocation consumed its own fault",
+          "allocation fault was not taken");
     check(atomic_load(&mww_rc) == EAGAIN,
           "contended PI lock without a turnstile fails with EAGAIN",
           "the lock did not fail as injected");
@@ -4219,6 +4493,7 @@ int mutex_waiting_withdrawn(void)
         pthread_mutex_unlock(&mww_mutex);
     pthread_mutex_destroy(&mww_mutex);
 out:
+    stall_watch_finish(&watch);
     (void) inject_run("fail-turnstile", "2147483647", NULL);
     (void) test_pin_mask(~0U);
     return 0;
@@ -4232,106 +4507,147 @@ out:
  * with the debug injection call and signals the condvar meanwhile. Needs
  * /bin/inject; otherwise the case is skipped.
  */
-#define CIS_STALL_MS 800L
-#define CIS_SLEEP_MS 1200L
+#define CIS_SLEEP_NS 2500000000ULL
 
 static pthread_mutex_t cis_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t cis_cond = PTHREAD_COND_INITIALIZER;
 static int cis_flag;
-static atomic_int cis_state; /* 1 waiting, 2 woken and asleep, 3 slept */
-static atomic_int cis_sleep_rc;
-static sem_t cis_go;
+
+struct cis_result {
+    pthread_t waiter;
+    int interrupt_rc, sleep_rc;
+    uint64_t elapsed;
+};
 
 static void *cis_waiter(void *arg)
 {
-    struct timespec ts = {CIS_SLEEP_MS / 1000, (CIS_SLEEP_MS % 1000) * 1000000L};
-
-    (void) arg;
-    (void) test_pin_mask(2U);
+    struct cis_result *r = arg;
+    struct timespec delay = {.tv_sec = 2, .tv_nsec = 500000000};
+    struct timespec begin, end;
     pthread_mutex_lock(&cis_mutex);
-    atomic_store(&cis_state, 1);
     while (!cis_flag)
         pthread_cond_wait(&cis_cond, &cis_mutex);
     pthread_mutex_unlock(&cis_mutex);
-    atomic_store(&cis_state, 2);
-    atomic_store(&cis_sleep_rc, nanosleep(&ts, NULL));
-    atomic_store(&cis_state, 3);
+    clock_gettime(CLOCK_MONOTONIC, &begin);
+    r->sleep_rc = nanosleep(&delay, NULL);
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    r->elapsed = (uint64_t) ((end.tv_sec - begin.tv_sec) * 1000000000LL +
+                             end.tv_nsec - begin.tv_nsec);
     return NULL;
 }
 
-static void *cis_signaler(void *arg)
+static void *cis_interrupt(void *arg)
 {
-    (void) arg;
-    (void) test_pin_mask(2U); /* not the hart that is stalled */
-    sem_wait(&cis_go);
-    sleep_ms(100); /* the interrupt is inside its stall by now */
-    pthread_mutex_lock(&cis_mutex);
-    cis_flag = 1;
-    pthread_cond_signal(&cis_cond);
-    pthread_mutex_unlock(&cis_mutex);
+    struct cis_result *r = arg;
+    (void) test_pin_mask(2U);
+    r->interrupt_rc = thread_ctl(RTMUX_TCTL_INTERRUPT, (void *) (long) r->waiter);
     return NULL;
 }
 
 int condvar_interrupt_stale(void)
 {
-    pthread_t w, s;
-    struct timespec t0, t1;
+    struct stall_watch watch = {.pid = -1};
+    struct cis_result result = {.interrupt_rc = -1, .sleep_rc = -1};
+    pthread_t interrupt;
+    bool started = false, entered = false;
     char pid[16];
-    char ms[16];
-    long stalled;
-    int ir;
 
-    if (inject_run("alloc-status", NULL, NULL) != 0)
+    if (sysconf(_SC_NPROCESSORS_ONLN) < 2 ||
+        inject_run("alloc-status", NULL, NULL) != 0)
         return TC_EXIT_SKIP;
     snprintf(pid, sizeof pid, "%d", (int) getpid());
-    snprintf(ms, sizeof ms, "%ld", CIS_STALL_MS);
-    cis_flag = 0;
-    sem_init(&cis_go, 0, 0);
-    atomic_store(&cis_state, 0);
-    atomic_store(&cis_sleep_rc, 0);
     (void) test_pin_mask(1U);
-    if (pthread_create(&w, NULL, cis_waiter, NULL) != 0) {
-        test_fail("condvar_interrupt_stale fixture", "pthread_create");
+    cis_flag = 0;
+    if (pthread_create(&result.waiter, NULL, cis_waiter, &result)) {
+        test_fail("condvar_interrupt_stale fixture", "cannot create waiter");
         goto out;
     }
-    while (atomic_load(&cis_state) < 1)
-        sleep_ms(5);
-    sleep_ms(50); /* the waiter is inside pthread_cond_wait */
-    if (inject_run("stall-force-ready", pid, ms) != 0) {
-        test_fail("condvar_interrupt_stale fixture", "inject refused");
-        goto release;
+    if (wait_thread_state(result.waiter, STATE_CONDVAR) &&
+        !inject_run("stall-force-ready", pid, "10000") &&
+        !stall_watch_start(&watch, "force-ready") &&
+        !pthread_create(&interrupt, NULL, cis_interrupt, &result)) {
+        started = true;
+        entered = stall_watch_entered(&watch);
     }
-    if (pthread_create(&s, NULL, cis_signaler, NULL) != 0) {
-        test_fail("condvar_interrupt_stale fixture", "pthread_create");
-        goto release;
-    }
-    sleep_ms(50); /* the signaler is blocked on its hart */
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-    sem_post(&cis_go);
-    ir = thread_ctl(RTMUX_TCTL_INTERRUPT, (void *) (long) w); /* stalls */
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    stalled = (t1.tv_sec - t0.tv_sec) * 1000L +
-              (t1.tv_nsec - t0.tv_nsec) / 1000000L;
-    check(ir == 0 && stalled >= CIS_STALL_MS - 100,
-          "the injected stall held the interrupt in its window",
-          "the interrupt was not stalled");
-    (void) pthread_join(s, NULL);
-    sleep_ms(200); /* a spurious wake of the sleep would have landed by now */
-    check(atomic_load(&cis_state) == 2,
-          "an interrupt that lost the race leaves the woken waiter alone",
-          "the waiter's sleep ended early");
-    (void) pthread_join(w, NULL);
-    check(atomic_load(&cis_sleep_rc) == 0,
-          "the waiter's sleep runs its course after a lost interrupt",
-          "nanosleep reported an error");
-    goto out;
-release: /* the waiter is still parked on the condvar: let it go */
+    check(entered, "interrupt observed the original condvar wait",
+          "force_ready did not reach its stall");
     pthread_mutex_lock(&cis_mutex);
     cis_flag = 1;
     pthread_cond_signal(&cis_cond);
     pthread_mutex_unlock(&cis_mutex);
-    (void) pthread_join(w, NULL);
+    if (entered)
+        check(wait_thread_state(result.waiter, STATE_NANOSLEEP),
+              "waiter entered its new sleep before interrupt resumed",
+              "new wait state was not observed");
+    if (watch.pid > 0)
+        stall_watch_release(&watch);
+    if (started)
+        pthread_join(interrupt, NULL);
+    pthread_join(result.waiter, NULL);
+    stall_watch_finish(&watch);
+    check(result.interrupt_rc == 0 && result.sleep_rc == 0 &&
+              result.elapsed >= CIS_SLEEP_NS,
+          "a stale condvar interrupt leaves the new nanosleep intact",
+          "interrupt failed or nanosleep returned early");
 out:
+    (void) test_pin_mask(~0U);
+    return 0;
+}
+
+static void *sync_kill_waiter(void *arg)
+{
+    (void) sem_wait(arg);
+    return (void *) 1;
+}
+
+static void *sync_kill_waker(void *arg)
+{
+    (void) test_pin_mask(2U);
+    return (void *) (intptr_t) sem_post(arg);
+}
+
+int sync_kill_handoff(void)
+{
+    struct stall_watch watch = {.pid = -1};
+    char pid[16];
+    pthread_t waiter, waker;
+    bool started = false, entered = false;
+    void *result = NULL;
+    sem_t sem;
+
+    if (sysconf(_SC_NPROCESSORS_ONLN) < 3 ||
+        inject_run("alloc-status", NULL, NULL))
+        return TC_EXIT_SKIP;
+    snprintf(pid, sizeof pid, "%d", (int) getpid());
+    if (sem_init(&sem, 0, 0) != 0 || pthread_create(&waiter, NULL, sync_kill_waiter, &sem)) {
+        test_fail("sync kill handoff", "cannot start waiter");
+        return 0;
+    }
+    (void) test_pin_mask(1U);
+    if (wait_thread_state(waiter, STATE_SEM) &&
+        !inject_run("stall-sync-waker", pid, "10000") &&
+        !stall_watch_start(&watch, "sync-waker") &&
+        !pthread_create(&waker, NULL, sync_kill_waker, &sem)) {
+        started = true;
+        entered = stall_watch_entered(&watch);
+    }
+    check(entered, "sem_post holds the dequeued waiter", "wake stall unavailable");
+    if (entered) {
+        int rc = __thread_destroy((int) waiter, 0, (void *) 42);
+        check(rc == 0 && !inject_run("sync-wake-claims", NULL, NULL),
+              "kill hands the waiter to its waker in one attempt",
+              "kill failed or polled the pending wake");
+    }
+    stall_watch_finish(&watch);
+    if (started)
+        pthread_join(waker, NULL);
+    else
+        sem_post(&sem);
+    int rc = pthread_join(waiter, &result);
+    check(entered && rc == 0 && result == (void *) 42,
+          "dequeued waiter self-reaps before returning from sem_wait",
+          "waiter survived kill or failed to join");
+    sem_destroy(&sem);
     (void) test_pin_mask(~0U);
     return 0;
 }

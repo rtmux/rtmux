@@ -147,14 +147,16 @@ static const struct toolbox_applet applets[] = {
     {"id", applet_id, "id [USER]"},
     {"inject", applet_inject,
      "inject spin-irqoff HART MS | spin-console HART MS | hang-hart HART | "
-     "fail-alloc POOL PID | fail-turnstile PID | alloc-status | "
+     "fail-alloc POOL PID | fail-turnstile PID | site-wait SITE | site-release "
+     "SITE | alloc-status | "
      "fail-sched-set PID COUNT | sched-set-status | "
      "sched-set-displaced MIN | stall-lock PID MS | "
      "stall-lock-early PID MS | stall-lock-propagated PID MS | "
-     "stall-force-ready PID MS | pte-superpage PID VA | "
+     "stall-force-ready PID MS | stall-sync-waker PID MS | sync-wake-claims | intr-before-switch PID | pte-superpage PID VA | "
      "pte-clear-superpage PID VA | pte-probe PID VA | "
      "fail-pte-map PID PAGES | manip-partial MIN | "
-     "prio-settle-thread MIN | prio-settle-idle MIN | prio-settle-departure MAX | "
+     "prio-settle-thread MIN | prio-settle-idle MIN | prio-settle-departure "
+     "MAX | "
      "prio-settle-reset"},
     {"kill", applet_kill, "kill [-SIG] PID ..."},
     {"login", applet_login, "login [USER]"},
@@ -3162,6 +3164,41 @@ static int applet_inject(int argc, char **argv)
             printf("sched-set-displaced=%d\n", rc);
         return rc >= 0 && (unsigned long) rc >= strtoul(argv[2], NULL, 0) ? 0
                                                                           : 3;
+    } else if (argc == 3 && (!strcmp(argv[1], "site-wait") ||
+                             !strcmp(argv[1], "site-watch") ||
+                             !strcmp(argv[1], "site-release"))) {
+        static const char *const names[] = {
+            [STALL_LOCK] = "lock",
+            [STALL_LOCK_EARLY] = "early",
+            [STALL_LOCK_PROPAGATED] = "propagated",
+            [STALL_FORCE_READY] = "force-ready",
+            [STALL_SYNC_WAKER] = "sync-waker",
+            [INJECT_SITE_TURNSTILE] = "turnstile",
+        };
+        unsigned site = 0;
+        while (site < sizeof(names) / sizeof(names[0]) &&
+               strcmp(argv[2], names[site]))
+            site++;
+        if (site == sizeof(names) / sizeof(names[0]))
+            return 2;
+        if (!strcmp(argv[1], "site-release"))
+            return inject_call(INJECT_OP_SITE_RELEASE, site, 0) != 0;
+        bool watch = !strcmp(argv[1], "site-watch");
+        if (watch && write(STDOUT_FILENO, "R", 1) != 1)
+            return 1;
+        for (unsigned i = 0; i < INJECT_SPIN_MAX_MS; i++) {
+            rc = inject_call(INJECT_OP_SITE_STATUS, site, 0);
+            if (rc)
+                break;
+            (void) nanosleep(&(struct timespec) {.tv_nsec = 1000000}, NULL);
+        }
+        if (watch) {
+            char done;
+            if (write(STDOUT_FILENO, rc == 1 ? "Y" : "N", 1) == 1)
+                (void) read(STDIN_FILENO, &done, 1);
+            (void) inject_call(INJECT_OP_SITE_RELEASE, site, 0);
+        }
+        return rc == 1 ? 0 : 3;
     } else if (argc == 3 && !strcmp(argv[1], "fail-turnstile")) {
         rc = inject_call(INJECT_OP_FAIL_NEXT_TURNSTILE,
                          strtoul(argv[2], NULL, 0), 0);
@@ -3174,11 +3211,20 @@ static int applet_inject(int argc, char **argv)
     } else if (argc == 4 && !strcmp(argv[1], "stall-lock-propagated")) {
         rc = inject_call(INJECT_OP_STALL_MUTEX_PROPAGATED,
                          strtoul(argv[2], NULL, 0), strtoul(argv[3], NULL, 0));
+    } else if (argc == 3 && !strcmp(argv[1], "intr-before-switch")) {
+        rc = inject_call(INJECT_OP_INTR_BEFORE_SWITCH, strtoul(argv[2], NULL, 0), 0);
+    } else if (argc == 2 && !strcmp(argv[1], "sync-wake-claims")) {
+        rc = inject_call(INJECT_OP_SYNC_WAKE_CLAIMS, 0, 0);
+        printf("sync-wake-claims=%d\n", rc);
+        return rc == 1 ? 0 : 3;
+    } else if (argc == 4 && !strcmp(argv[1], "stall-sync-waker")) {
+        rc = inject_call(INJECT_OP_STALL_SYNC_WAKER, strtoul(argv[2], NULL, 0),
+                         strtoul(argv[3], NULL, 0));
     } else if (argc == 4 && !strcmp(argv[1], "stall-force-ready")) {
         rc = inject_call(INJECT_OP_STALL_FORCE_READY, strtoul(argv[2], NULL, 0),
                          strtoul(argv[3], NULL, 0));
     } else if (argc == 3 && (!strcmp(argv[1], "prio-settle-thread") ||
-                            !strcmp(argv[1], "prio-settle-idle"))) {
+                             !strcmp(argv[1], "prio-settle-idle"))) {
         /* Exit 0 when at least MIN deferred priority settles ran in thread
          * context since the last reset.
          */
@@ -3237,7 +3283,7 @@ static int applet_inject(int argc, char **argv)
                 "alloc-status [consumed] | fail-sched-set PID COUNT | "
                 "sched-set-status | "
                 "sched-set-displaced MIN | stall-lock PID MS | "
-                "stall-force-ready PID MS | pte-superpage PID VA | "
+                "stall-force-ready PID MS | stall-sync-waker PID MS | sync-wake-claims | intr-before-switch PID | pte-superpage PID VA | "
                 "pte-clear-superpage PID VA | pte-probe PID VA | "
                 "fail-pte-map PID PAGES | manip-partial MIN | "
                 "stall-lock-early PID MS | stall-lock-propagated PID MS | "

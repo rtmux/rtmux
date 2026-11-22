@@ -36,6 +36,7 @@
 
 /* Core scheduler/thread calls */
 void rdecl block(void);
+void block_interrupt_wait(void);
 void rdecl unready(thread_t *thp, int newstate);
 void __attribute__((noreturn)) rdecl
 unready_release_and_exit(thread_t *thp, int newstate, kspinlock_t *to_release);
@@ -167,7 +168,6 @@ void rdecl thread_clear_as_prp_if(thread_t *thp, process_t *prp);
 unsigned rdecl thread_as_release_borrowers(process_t *prp);
 void rdecl thread_as_reopen_borrowers(process_t *prp);
 void rdecl sync_thread_cleanup(thread_t *thp);
-void rdecl thread_sync_teardown(thread_t *thp);
 uint32_t rdecl keygen(const unsigned char *buf, size_t n, uint64_t secret);
 uint64_t keydata_draw(uintptr_t salt);
 void keydata_stir(void);
@@ -338,6 +338,7 @@ int viov_to_piov(thread_t *act,
                  struct _iov_cursor *curp);
 
 int rdecl debug_process(process_t *prp, debug_process_t *dpp);
+void debug_set_blocked_connect(thread_t *thp, connect_t *cop, channel_t *chp);
 int rdecl debug_thread(process_t *prp, thread_t *thp, debug_thread_t *dtp);
 int rdecl debug_stop(process_t *prp);
 int rdecl debug_run(process_t *prp, debug_run_t *drp);

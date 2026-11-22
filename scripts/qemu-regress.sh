@@ -328,15 +328,27 @@ differential_net_check()
     return 0
 }
 
+# Print a serial log without the kernel's spin marker (MARK_POTN_INF_LOOP in
+# kernel/include/log.h). The kernel writes it straight to the console from any
+# hart, so it lands in the middle of whatever line user space is printing, and
+# a pattern anchored to that line would miss an otherwise complete result.
+log_without_spin_marker()
+{
+    sed $'s/\x1b\\[41m\xf0\x9f\x9f\xa5\x1b\\[0m//g' "$1"
+}
+
 require_log_patterns()
 {
     local log="$1"
     local label="$2"
     local re
 
+    local text
+    text="$(log_without_spin_marker "$log")"
+
     shift 2
     for re in "$@"; do
-        if ! grep -Eq "$re" "$log"; then
+        if ! grep -Eq "$re" <<<"$text"; then
             echo "  FAIL     ${MODE} missing ${label} evidence: ${re}"
             tail -n 160 "$log"
             return 1
@@ -351,13 +363,13 @@ require_log_patterns_in_order()
     local label="$2"
 
     shift 2
-    if ! awk -v mode="$MODE" -v label="$label" '
+    if ! log_without_spin_marker "$log" | awk -v mode="$MODE" -v label="$label" '
         BEGIN {
             next_pat = 1
-            pat_count = ARGC - 2
-            for (i = 2; i < ARGC; i++)
-                pat[i - 1] = ARGV[i]
-            ARGC = 2
+            pat_count = ARGC - 1
+            for (i = 1; i < ARGC; i++)
+                pat[i] = ARGV[i]
+            ARGC = 1
         }
         {
             if (next_pat <= pat_count && $0 ~ pat[next_pat])
@@ -370,11 +382,87 @@ require_log_patterns_in_order()
                 exit 1
             }
         }
-    ' "$log" "$@"; then
+    ' "$@"; then
         tail -n 160 "$log"
         return 1
     fi
     return 0
+}
+
+# What run_one returns, and vcpu-steal.py exits with, for a run that is neither
+# a pass nor a failure; the repeat loop runs it again.
+RC_INVALID_RUN=3
+
+# Whether this mode runs the wake-latency probe.
+mode_runs_wake_probe()
+{
+    [ "$MODE" = "smp-invariants" ] || [ "$MODE" = "preempt-latency" ]
+}
+
+# Whether this run can have its late wakes audited against host scheduling
+# (scripts/vcpu-steal.py): the modes that run the wake-latency probe, on a host
+# that accounts run-queue wait per thread, with a QEMU that can timestamp the
+# probe's beacons. QEMU_REGRESS_STEAL_AUDIT=0 turns it off, and an icount run
+# needs none: its clock does not see the host.
+steal_audit_available()
+{
+    mode_runs_wake_probe || return 1
+    [ "${QEMU_REGRESS_STEAL_AUDIT:-1}" != 0 ] || return 1
+    [ -z "${EMU_ICOUNT:-}" ] || return 1
+    [ -r /proc/self/schedstat ] || return 1
+    # emu.sh splits EMU_QEMU_OPTS on white space, and the trace file's name
+    # goes through it.
+    case "$1" in *[[:space:]]*) return 1 ;; esac
+    command -v python3 >/dev/null 2>&1 || return 1
+    # The same answer for every run: ask QEMU once.
+    if [ -z "$STEAL_TRACE_EVENT" ]; then
+        STEAL_TRACE_EVENT=no
+        if "${QEMU:-qemu-system-riscv64}" -trace help 2>/dev/null |
+           grep -qx goldfish_rtc_write; then
+            STEAL_TRACE_EVENT=yes
+        fi
+    fi
+    [ "$STEAL_TRACE_EVENT" = yes ]
+}
+STEAL_TRACE_EVENT=
+
+# The wake-latency probe must have measured every source: a pass that skipped
+# one, or that the guest could not judge, is not a pass. A phase the probe left
+# to the host audit is settled here.
+#
+# Returns 0 for a pass, 1 for a failure, and RC_INVALID_RUN for a run the host
+# was too loaded to judge (see scripts/vcpu-steal.py), which is neither.
+check_preempt_latency()
+{
+    local log="$1" audit="$2"
+    local phase pats=()
+
+    # The cross-hart pass needs a fourth hart.
+    for phase in ipc timer timer-crosshart irq; do
+        if [ "$phase" != timer-crosshart ] || [ "${CPUS:-1}" -ge 4 ]; then
+            pats+=("^preempt-latency: ${phase} (PASS|UNAUDITED) ")
+        fi
+    done
+    require_log_patterns "$log" "wake-latency measurement" "${pats[@]}" ||
+        return 1
+    if ! log_without_spin_marker "$log" |
+         grep -Eq '^preempt-latency: (AUDIT-REQUIRED|[a-z-]+ UNAUDITED) '; then
+        return 0
+    fi
+    if [ "$audit" -ne 1 ]; then
+        echo "  FAIL     ${MODE} has wakes over the bound and no host audit"
+        return 1
+    fi
+    log_without_spin_marker "$log" |
+        python3 "$TOP_DIR/scripts/vcpu-steal.py" audit --expect-samples \
+            --trace "${log}.steal-trace" --sched "${log}.steal-sched" |
+        sed 's/^/  STEAL    /'
+    case "${PIPESTATUS[1]}" in
+        0) return 0 ;;
+        "$RC_INVALID_RUN") return "$RC_INVALID_RUN" ;;
+    esac
+    echo "  FAIL     ${MODE} has wakes over the bound that host scheduling does not explain"
+    return 1
 }
 
 require_lkl_net_oracle()
@@ -523,7 +611,13 @@ Options:
                     fault-recovery (fault taxonomy smoke),
                     monotonic-time (continuous clock across a skipped-tick gap),
                     pi-inversion-xfail, rcu-lookup-measure, revoke-stress,
-                    smp-invariants (CPUS=8 bounded SMP invariant smoke),
+                    lock-debug (8-hart FIFO ticket and lock rank checks),
+                    smp-invariants (CPUS=8 bounded SMP invariant smoke; it
+                    and preempt-latency audit every wake over the latency
+                    bound against host scheduling with scripts/vcpu-steal.py,
+                    QEMU_REGRESS_STEAL_AUDIT=0 turns that off; EMU_ICOUNT=1
+                    runs either on QEMU's instruction-count clock, where the
+                    bound is checked without the host),
                     syslog-wrap (CONFIG_ROOTTASK_SYSLOG_SIZE=4096; /sys/log
                     wrap and EOVERFLOW),
                     serial-unblock (dev-serial-8250 drops a SIGKILLed parked
@@ -597,7 +691,7 @@ Options:
                     storm's 800 exits are all but one of the pshut samples);
                     forces CONFIG_INSTRUMENTATION=y; at most 256 residents;
                     above 100 the guest gets 2 MiB more RAM per resident
-  --gdb-on-timeout  On a timeout, dump every hart through a live gdb stub
+  --gdb-on-timeout  On a timeout or unexpected crash, dump every hart through a live gdb stub
                     (scripts/gdb/dump-state.gdb) into build/lkl-logs/MODE-N.dump
                     before killing QEMU; implies --keep-logs
   --keep-logs       Keep passing logs (at build/lkl-logs/MODE-idx.log) instead
@@ -1519,6 +1613,15 @@ case "$MODE" in
         FAIL_MARKER="RTMux ${MODE}: FAIL"
         MODE_ARG="rtmux.run=${MODE}"
         ;;
+    lock-debug)
+        BEGIN_MARKER="RTMux lock-debug: BEGIN"
+        PASS_MARKER="RTMux lock-debug: PASS"
+        FAIL_MARKER="RTMux lock-debug: FAIL"
+        MODE_ARG="rtmux.run=lock-debug"
+        NEEDS_DEBUG_INJECT=1
+        CPUS=8
+        export CPUS
+        ;;
     debug-inject)
 
         # Forces CONFIG_DEBUG_INJECT=y, boots four harts, stalls hart 1 for
@@ -2003,8 +2106,10 @@ if [ "$NEEDS_LKL_SERVERS" -eq 1 ] || [ "$NEEDS_INSTRUMENTATION" -eq 1 ] ||
         fi
         rm -f .config.bak
     fi
-    if [ "$NEEDS_DEBUG_INJECT" -eq 1 ] &&
-       ! grep -q '^CONFIG_DEBUG_INJECT=y$' .config; then
+    for feature in DEBUG_INJECT LOCK_DEBUG; do
+        [ "$NEEDS_DEBUG_INJECT" -eq 1 ] || continue
+        [ "$feature" != LOCK_DEBUG ] || [ "$MODE" = lock-debug ] || continue
+        grep -q "^CONFIG_${feature}=y$" .config && continue
         if [ "$RESTORE_CONFIG" -eq 0 ]; then
             CONFIG_SAVE="$(mktemp /tmp/rtmux-config.XXXXXX)"
             AUTOCONF_SAVE="$(mktemp /tmp/rtmux-autoconf.XXXXXX)"
@@ -2016,15 +2121,9 @@ if [ "$NEEDS_LKL_SERVERS" -eq 1 ] || [ "$NEEDS_INSTRUMENTATION" -eq 1 ] ||
             RESTORE_CONFIG=1
         fi
 
-        if grep -q '^CONFIG_DEBUG_INJECT=' .config; then
-            sed -i.bak 's/^CONFIG_DEBUG_INJECT=.*/CONFIG_DEBUG_INJECT=y/' .config
-        elif grep -q '^# CONFIG_DEBUG_INJECT is not set' .config; then
-            sed -i.bak 's/^# CONFIG_DEBUG_INJECT is not set/CONFIG_DEBUG_INJECT=y/' .config
-        else
-            printf '\nCONFIG_DEBUG_INJECT=y\n' >>.config
-        fi
-        rm -f .config.bak
-    fi
+        sed -i -e "/^CONFIG_${feature}=/d" -e "/^# CONFIG_${feature} is not set$/d" .config
+        printf 'CONFIG_%s=y\n' "$feature" >>.config
+    done
     if [ "$NEEDS_STALL_DETECTOR" -eq 1 ] &&
        ! grep -q '^CONFIG_STALL_DETECTOR=y$' .config; then
         if [ "$RESTORE_CONFIG" -eq 0 ]; then
@@ -2280,23 +2379,23 @@ run_identity()
     echo "${prefix}cpus: ${CPUS:-default}"
 }
 
-# dump_hang_state LOG PORT: attach to the live gdb stub and write every hart's
+# dump_guest_state LOG PORT REASON: attach to the live gdb stub and write every hart's
 # state to LOG's .dump sibling, headed by the build identity. A gdb failure is
 # written into the dump as such: an incomplete dump is never passed off as a
 # complete one.
-dump_hang_state()
+dump_guest_state()
 {
-    local log="$1" port="$2"
+    local log="$1" port="$2" reason="$3"
     local dump="${log%.log}.dump"
     local kernel
     kernel=$(run_kernel)
     local gdb="${GDB:-gdb-multiarch}"
 
     {
-        echo "# hang dump for ${MODE} after ${TIMEOUT}s"
+        echo "# ${reason} dump for ${MODE}"
         run_identity '# '
     } >"$dump"
-    echo "  HANG     ${MODE}: no pass marker after ${TIMEOUT}s; dumping harts to ${dump}"
+    echo "  DUMP     ${MODE}: ${reason}, dumping harts to ${dump}"
     if "$TIMEOUT_CMD" "${HANG_DUMP_TIMEOUT:-120}" "$gdb" -batch -ex "target remote :${port}" \
         -x "$TOP_DIR/scripts/gdb/dump-state.gdb" "$kernel" >>"$dump" 2>&1 &&
        grep -q "DUMP COMPLETE" "$dump"; then
@@ -2590,12 +2689,29 @@ run_one()
         exec {serial_fd}<>"$serial_fifo"
         stdin_src="$serial_fifo"
     fi
-    "$TIMEOUT_CMD" "$wrap_timeout" "${cmd[@]}" <"$stdin_src" >"$log" 2>&1 &
+    local steal_audit=0 steal_pid= steal_opts="${EMU_QEMU_OPTS:-}"
+    if steal_audit_available "$log"; then
+        steal_audit=1
+        cmd+=("rtmux.host_audit=1")
+        : >"${log}.steal-trace"
+        steal_opts="${steal_opts:+$steal_opts }-trace goldfish_rtc_write -msg timestamp=on -D ${log}.steal-trace"
+        python3 "$TOP_DIR/scripts/vcpu-steal.py" sample \
+            --trace "${log}.steal-trace" --out "${log}.steal-sched" &
+        steal_pid=$!
+    fi
+    EMU_QEMU_OPTS="$steal_opts" \
+        "$TIMEOUT_CMD" "$wrap_timeout" "${cmd[@]}" <"$stdin_src" >"$log" 2>&1 &
     local runner=$!
     local terminal=0
     while kill -0 "$runner" 2>/dev/null; do
         if grep -Fq -e "$FAIL_MARKER" -e "RTMux ${MODE}: SKIP" "$log" ||
            grep -Eq "$BAD_RE" "$log"; then
+            # Only markers already fatal to this mode count. Some fixtures
+            # deliberately fault or crash and check the guest's own report.
+            if [ "$GDB_ON_TIMEOUT" -eq 1 ] &&
+               awk -v bad="$BAD_RE" '$0 ~ bad && /FAULT|FATAL|CRASH|panic|FREED-ACTIVE|__kernel_restore bad ptr/ { found=1; exit } END { exit !found }' "$log"; then
+                dump_guest_state "$log" "$gdb_port" "unexpected crash"
+            fi
             terminal=1
             kill "$runner" 2>/dev/null || true
             break
@@ -2633,7 +2749,7 @@ run_one()
         sleep 1
         ticks=$((ticks + 1))
         if [ "$GDB_ON_TIMEOUT" -eq 1 ] && [ "$ticks" -ge "$TIMEOUT" ]; then
-            dump_hang_state "$log" "$gdb_port"
+            dump_guest_state "$log" "$gdb_port" "timeout after ${TIMEOUT}s"
             kill "$runner" 2>/dev/null || true
             hung=1
             if [ "$MODE" = "hang-inject" ]; then
@@ -2646,6 +2762,12 @@ run_one()
         fi
     done
     wait "$runner" 2>/dev/null || rc=$?
+    if [ -n "$steal_pid" ]; then
+        # The sampler stops by itself when QEMU is gone; the signal is for a
+        # QEMU that never started.
+        kill "$steal_pid" 2>/dev/null || true
+        wait "$steal_pid" 2>/dev/null || true
+    fi
     if [ -n "$serial_fd" ]; then
         exec {serial_fd}>&-
         rm -f "$serial_fifo"
@@ -2965,8 +3087,14 @@ run_one()
             '^lock-rank-stress: AB_workers=' \
             '^rcu-lookup-measure: measure-overhead samples=100 ' \
             '^revoke-stress: PASS[[:space:]]*$' \
-            '^preempt-latency: PASS ' \
+            '^preempt-latency: (PASS|AUDIT-REQUIRED) ' \
             '^ipc-contention: PASS ' || return 1
+    fi
+
+    local steal_rc=0
+    if mode_runs_wake_probe; then
+        check_preempt_latency "$log" "$steal_audit" || steal_rc=$?
+        [ "$steal_rc" -ne 1 ] || return 1
     fi
 
     if [ "$MODE" = "lkl-netd-iommu-fail-closed" ]; then
@@ -3046,13 +3174,17 @@ run_one()
     require_sync_log_oracle "$log" || return 1
     require_lkl_mode_oracle "$log" || return 1
 
+    if [ "$steal_rc" -eq "$RC_INVALID_RUN" ]; then
+        echo "  INVALID  ${MODE} run ${idx}: the host descheduled QEMU threads during wakes over the bound; not counted"
+        return "$RC_INVALID_RUN"
+    fi
     result="$(grep -E '=== Results:|RTMux .*: PASS|login:' "$log" | tail -n 1)"
     echo "  PASS     ${result:-$PASS_MARKER}"
     postprocess_trace_log "$log" || return 1
     # fdt-cpu-status inspects the log in the main loop, which removes it.
     if [ "$KEEP_LOGS" -eq 0 ] && [ "$MODE" != "fdt-cpu-status" ] &&
        { [ "$DIFFERENTIAL" -eq 0 ] || [ "$NET_LOG_DIFF" -eq 0 ]; }; then
-        rm -f "$log"
+        rm -f "$log" "${log}.steal-trace" "${log}.steal-sched"
     fi
 }
 
@@ -3218,6 +3350,7 @@ if [ "$DIFFERENTIAL" -eq 1 ]; then
 fi
 
 i=1
+INVALID_RUNS=0
 FDT_CPU_BASE_OPTS="${EMU_QEMU_OPTS:-}"
 while [ "$i" -le "$REPEAT" ]; do
     if [ "$MODE" = "fdt-cpu-status" ]; then
@@ -3231,7 +3364,29 @@ while [ "$i" -le "$REPEAT" ]; do
         i=$((i + 1))
         continue
     fi
-    run_one "$i" || exit 1
+    run_rc=0
+    run_one "$i" || run_rc=$?
+    if [ "$run_rc" -eq "$RC_INVALID_RUN" ]; then
+        # A run the host was too loaded to judge is repeated, and its log kept
+        # beside the others. More invalid runs than requested ones means this
+        # host cannot measure wake latency at all.
+        INVALID_RUNS=$((INVALID_RUNS + 1))
+        if [ "$KEEP_LOGS" -eq 1 ]; then
+            invalid_log="${LAST_LOG%.log}-invalid${INVALID_RUNS}.log"
+            for suffix in "" .steal-trace .steal-sched; do
+                [ ! -e "${LAST_LOG}${suffix}" ] ||
+                    mv "${LAST_LOG}${suffix}" "${invalid_log}${suffix}"
+            done
+        else
+            rm -f "$LAST_LOG" "${LAST_LOG}.steal-trace" "${LAST_LOG}.steal-sched"
+        fi
+        if [ "$INVALID_RUNS" -gt "$REPEAT" ]; then
+            echo "  FAIL     ${MODE}: ${INVALID_RUNS} invalid runs for $((i - 1)) valid ones; the host is too loaded to measure wake latency"
+            exit 1
+        fi
+        continue
+    fi
+    [ "$run_rc" -eq 0 ] || exit 1
     if [ "$DIFFERENTIAL" -eq 1 ]; then
         if [ "$NET_LOG_DIFF" -eq 1 ]; then
             differential_net_check || exit 1
@@ -3246,3 +3401,6 @@ while [ "$i" -le "$REPEAT" ]; do
     fi
     i=$((i + 1))
 done
+if [ "$INVALID_RUNS" -gt 0 ]; then
+    echo "  NOTE     ${MODE}: ${REPEAT} valid runs passed, ${INVALID_RUNS} invalid runs were repeated"
+fi

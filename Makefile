@@ -326,6 +326,7 @@ endif
 	$(Q)./scripts/qemu-regress.sh --mode pci-nvme-smoke --timeout $(QEMU_BOOT_TIMEOUT)
 	@echo "  CHECK    boot RTMux + toolbox applet suite"
 	$(Q)./scripts/qemu-regress.sh --mode toolbox --timeout $(QEMU_BOOT_TIMEOUT)
+	$(Q)$(MAKE) check-lock-debug
 .PHONY: check
 
 # Boot RTMux and run the /bin toolbox applet functional suite in isolation.
@@ -399,6 +400,10 @@ check-boot-manifest: check-qemu-deps $(AUTOCONF_H) $(VER_FILE) startup initramfs
 check-loader-negative: check-qemu-deps $(AUTOCONF_H) $(VER_FILE) startup initramfs
 	$(msg) CHECK "loader image policy negatives"
 	$(Q)scripts/qemu-regress.sh --mode loader-negative --timeout $(QEMU_BOOT_TIMEOUT)
+
+check-lock-debug: check-qemu-deps
+	$(Q)scripts/qemu-regress.sh --mode lock-debug --timeout $(QEMU_SMP_TIMEOUT)
+.PHONY: check-lock-debug
 
 check-smp-invariants: check-qemu-deps $(AUTOCONF_H) $(VER_FILE) startup initramfs
 	$(msg) CHECK "SMP invariant ledger"

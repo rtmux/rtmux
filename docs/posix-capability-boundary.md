@@ -17,7 +17,7 @@ or guessed integer authority to make POSIX convenient.
 | Absolute path | Lookup through the process root namespace capability, not a kernel global namespace. |
 | `chroot` | Monotonic narrowing of the process root; cached cwd/dirfd path labels are invalidated. |
 | `pipe` | Pair of endpoint-backed fds. |
-| `posix_spawn` file actions | Explicit fd inheritance, close, dup, and open actions applied by roottask/libc. |
+| `posix_spawn` file actions | The child loader applies ordered close, dup, open, chdir and fchdir actions after setting spawn attributes. |
 | Environment | Process image state copied at spawn/exec. It carries data, not authority. |
 | Signals, wait, job control | Libc/proc-server policy over process handles and notification endpoints. |
 
@@ -50,6 +50,8 @@ The kernel remains unaware of POSIX path strings.
 - cwd/root namespace state is inherited after any monotonic narrowing;
 - environment and argv are copied as data;
 - wait authority is returned as process/wait state, not as pid ownership.
+
+The loader opens paths with the child’s effective IDs. RESETIDS selects its real IDs before any file action and before the executable is looked up, with or without file actions. An fchdir action queries the directory service for the inherited handle’s path.
 
 An identity dup2 file action keeps the descriptor open in the child and
 clears its close-on-exec flag. The parent keeps its original descriptor flags.

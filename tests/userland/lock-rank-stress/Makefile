@@ -6,7 +6,8 @@ include ../../../mk/def.mk
 include ../../../userland/lib/common.mk
 
 PROG = $(BUILD_BASE)/lock-rank-stress
-OBJS = $(OBJDIR)/stress.o
+OBJS = $(OBJDIR)/stress.o $(OBJDIR)/tickets.o
+CPPFLAGS += -I../../../arch/riscv/include
 
 all: $(PROG)
 

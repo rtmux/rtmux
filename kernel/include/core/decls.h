@@ -132,11 +132,6 @@ int rdecl ksched_ok(thread_t *thp, int policy, const struct sched_param *param);
 int kcall_attach(unsigned callnum, ksys_call_t *func);
 void ksys_start(void);
 void sync_mutex_lock(thread_t *act, sync_t *sync, int flags);
-void mutex_holdlist_add(thread_t *, ksync_t *);
-void mutex_holdlist_rem(ksync_t *);
-/* _locked variants: caller already holds sync_slock. */
-void mutex_holdlist_add_locked(thread_t *, ksync_t *);
-void mutex_holdlist_rem_locked(ksync_t *);
 void rdecl thread_specret(thread_t *thp);
 
 /* Notification-based replacement for SIGCHLD — implemented in roottask */
@@ -373,6 +368,8 @@ void inject_mutex_lock_stall(process_t *prp);
 void inject_mutex_lock_early(process_t *prp);
 void inject_mutex_lock_propagated(process_t *prp);
 void inject_force_ready_stall(thread_t *thp);
+void inject_sync_waker_stall(thread_t *thp);
+void inject_intr_before_switch(thread_t *thp);
 void ipc_blk_trace(const char *file, int line, thread_t *thp);
 #define IPC_BLK(thp) ipc_blk_trace(__FILE__, __LINE__, (thp))
 void thr_trace(const char *file, int line, thread_t *thp, void *ra);
@@ -401,6 +398,11 @@ static inline void inject_mutex_lock_early(process_t *prp)
 static inline void inject_mutex_lock_propagated(process_t *prp)
 {
     (void) prp;
+}
+static inline void inject_intr_before_switch(thread_t *thp) { (void) thp; }
+static inline void inject_sync_waker_stall(thread_t *thp)
+{
+    (void) thp;
 }
 static inline void inject_force_ready_stall(thread_t *thp)
 {

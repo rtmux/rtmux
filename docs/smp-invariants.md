@@ -21,6 +21,24 @@ or reclamation rule that makes the invariant observable under SMP.
 Run `make check-smp-invariants` after changing any row's synchronization rule.
 The QEMU half is `CPUS=8 scripts/qemu-regress.sh --mode smp-invariants
 --timeout 180`, a bounded smoke over lock-rank, RCU lookup, revoke, preemption,
-and IPC-contention paths. On reference-host, the heavy release gate remains `CPUS=8 make
+and IPC-contention paths.
+
+The preemption part (`preempt-latency`) fails on any wake that never
+dispatches and on any source it could not measure. Its 50 ms wake-to-dispatch
+bound is checked in two runs, because under multi-threaded TCG a host that
+deschedules a vCPU thread delays a wake exactly as a kernel defect would:
+
+- `EMU_ICOUNT=1 CPUS=8 scripts/qemu-regress.sh --mode smp-invariants` runs on
+  QEMU's instruction-count clock, which the host cannot disturb. The bound is
+  checked by the guest alone and the result does not depend on host load. Harts
+  interleave only at translation-block boundaries there, so this run shows
+  that the wake paths are bounded, not that they are free of races.
+- The default multi-threaded run keeps the harts truly parallel. Every wake
+  over the bound is audited by `scripts/vcpu-steal.py` against the host's
+  record of when each QEMU thread waited for a CPU. A late wake stands as a
+  failure unless that record accounts for it; a wake it accounts for is
+  excluded, never passed, and a run the host was too loaded to judge is
+  repeated and reported as invalid. `docs/rt-budgets.md` has the method and
+  what each verdict proves. On reference-host, the heavy release gate remains `CPUS=8 make
 check check-rt` plus the standalone formal gates and full per-mode benchmarks
 available in that environment.

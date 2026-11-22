@@ -7,13 +7,6 @@
 
 #include <core/globals.h>
 
-/* A killing force_ready rereads a sync waiter's state at most this many times
- * while the waker that unlinked it readies it (usually a window of a few
- * instructions, longer for a broadcast); past it force_ready returns 0 and
- * leaves the wakeup to the waker.
- */
-#define FORCE_READY_WAKER_SPINS 100000u
-
 /* Scheduler Rosetta Stone (comments/prose only; no symbol renames):
  *
  *   kdispatch_t              = per-CPU runqueue state
@@ -59,7 +52,7 @@ static void chk_dispatch(int chkstate)
 
     /* chk_dispatch is retired as a runtime check under per-CPU sched locks.
      * Most callers invoke it BEFORE taking the local lock, and even when our
-     * lock IS held, dpp->lock.spin.value == 1 may instead mean "held by ANOTHER
+     * lock IS held, the lock bit test may instead mean "held by ANOTHER
      * CPU doing a cross-CPU enqueue/steal on our queue" — legitimate under
      * per-CPU locks. Distinguishing "I hold it" from "someone else holds it"
      * would need a per-CPU sched_held_by_me[] flag, which is not maintained.
@@ -1201,9 +1194,6 @@ int rdecl force_ready(thread_t *thp, unsigned err)
      */
     bool unlinked = false;
 
-    /* Rereads of a sync waiter's state by a kill, while its wakeup settles. */
-    unsigned sync_wait_spins = 0;
-
     /* Set when control reaches the STATE_RECEIVE arm from the STATE_REPLY arm;
      * fr_chp (possibly NULL: channel gone) is then authoritative and blocked_on
      * must not be reinterpreted as a channel.
@@ -1645,29 +1635,22 @@ reread_state:
             __asm__ volatile("" ::: "memory");
         cpu_smp_mb();
 
-        /* The state above was read unlocked: thp may have been woken, and be
-         * running or waiting elsewhere, by the time its chain is locked. Never
-         * ready or unlink it then. A one-shot unblock (interrupt, timeout,
-         * cancel) that lost the race to a wakeup is moot and is dropped. A kill
-         * must still take hold of the thread wherever it went, and a thread a
-         * waker unlinked has to be waited for first, or destroying it now would
-         * let the waker ready a dead thread. blocked_on is NULL for every chain
-         * waiter, so there is no other wait list to unlink it from. Test
-         * window: thp may be woken and move on before the chain is found and
-         * locked.
-         */
+        /* The waiter can be woken and move on before the chain is locked.
+         * A one-shot interrupt belongs only to the wait it observed. */
         inject_force_ready_stall(thp);
         if (!sync_chain_force_ready(thp)) {
             if (!(err & _FORCE_KILL_SELF))
                 return 1;
 
-            /* The waker may still hold thp, so never ready it from here: past
-             * the bound report that another party will (as for a message
-             * claim), and let the caller retry or defer.
-             */
-            if (++sync_wait_spins >= FORCE_READY_WAKER_SPINS)
+            /* KILLSELF is persistent and runs first at special return.
+             * A still-blocked waiter with an empty key belongs to its
+             * waker. If it moved to another wait, claim that wait instead. */
+            atomic_or(&thp->flags, RTMUX_FLG_THR_KILLSELF);
+            unsigned state = __atomic_load_n(&thp->state, __ATOMIC_ACQUIRE);
+            if ((state == STATE_MUTEX || state == STATE_SEM ||
+                 state == STATE_CONDVAR) &&
+                !atomic_load_explicit(&thp->sync_wait_key, memory_order_acquire))
                 return 0;
-            cpu_smp_mb();
             goto reread_state;
         }
         break;
@@ -1755,7 +1738,7 @@ reread_state:
  * sched_slock on entry; cross-callers (unready, block_and_ready_default) drop
  * it before calling.
  */
-void rdecl block(void)
+static void block_current(bool interrupt_wait)
 {
     thread_t *act = get_active_thread(get_cpunum()), *thp = act;
 
@@ -1768,7 +1751,25 @@ void rdecl block(void)
         timeout_start(act);
     }
 
+    if (interrupt_wait)
+        inject_intr_before_switch(act);
     SCHED_LOCK_LOCAL();
+
+    /* The PLIC handler sets PENDING while the IST is still this hart's
+     * active thread, even after it published STATE_INTR. Check under the
+     * dispatch lock, which masks local IRQs through the active-thread switch.
+     * Once the lock drops a subsequent IRQ sees a displaced IST and wakes it.
+     */
+    if (interrupt_wait && (act->flags & RTMUX_FLG_THR_INTR_PENDING)) {
+        atomic_clr(&act->flags, RTMUX_FLG_THR_INTR_PENDING);
+        act->state = STATE_RUNNING;
+        CRITICAL_MARK_THREAD(act);
+        _TRACE_TH_EMIT_STATE(act, RUNNING);
+        SCHED_UNLOCK_LOCAL();
+        if (act->timeout_flags)
+            timeout_stop(act);
+        return;
+    }
 
     /* Get highest priority thread which can run on this processor. */
     FIND_HIGHEST(act);
@@ -1815,6 +1816,16 @@ void rdecl block(void)
 }
 
 
+void rdecl block(void)
+{
+    block_current(false);
+}
+
+void block_interrupt_wait(void)
+{
+    block_current(true);
+}
+
 /* Turnstile-style block: same as block(), but releases the supplied
  * LOCK_CLASS_TURNSTILE lock at the precise moment pc_curthread on this CPU has
  * been updated to the new active (or NULL). After that release, any peer hart
@@ -1832,7 +1843,7 @@ void rdecl block(void)
  *   to_release : turnstile chain lock to drop once pc_curthread no longer
  *                points at the blocking thread
  */
-static void rdecl block_release(kspinlock_t *to_release)
+static void rdecl block_release(int newstate, kspinlock_t *to_release)
 {
     thread_t *act = get_active_thread(get_cpunum()), *thp = act;
 
@@ -1840,16 +1851,16 @@ static void rdecl block_release(kspinlock_t *to_release)
 
     snap_time(&(act->timestamp_last_block), 0);
 
-    if (act->timeout_flags & RTMUX_FLG_TIMEOUT_MASK) {
-        /* Arm deferred: we still hold to_release (the turnstile chain lock). A
-         * past-deadline timeout fired inline here would re-enter that lock via
-         * force_ready and self-deadlock; timeout_deferred_fire() below delivers
-         * it once the lock is dropped.
-         */
-        timeout_start_deferred(act);
-    }
-
     SCHED_LOCK_LOCAL();
+    thp->state = (uint8_t) newstate;
+    _TRACE_TH_EMIT_ANY_STATE(thp, (unsigned) newstate);
+    if (act->timeout_flags & (1U << newstate)) {
+        /* Arm outside SCHED. Keep the chain lock until displacement and
+         * deliver any past-deadline timeout only after releasing it. */
+        SCHED_UNLOCK_LOCAL();
+        timeout_start_deferred(act);
+        SCHED_LOCK_LOCAL();
+    }
 
     FIND_HIGHEST(act);
 
@@ -1928,12 +1939,7 @@ void rdecl unready_release(thread_t *thp, int newstate, kspinlock_t *to_release)
         crash();
     }
 
-    SCHED_LOCK_LOCAL();
-    thp->state = (uint8_t) newstate;
-    _TRACE_TH_EMIT_ANY_STATE(thp, (unsigned) newstate);
-    SCHED_UNLOCK_LOCAL();
-
-    block_release(to_release);
+    block_release(newstate, to_release);
 }
 
 void __attribute__((noreturn)) rdecl
@@ -2667,11 +2673,15 @@ static void rdecl resched_default(void)
      * WAIT_FOR_CLOCK_DONE() in sched_ss_cleanup() waits us out instead; the
      * atomic add/sub tolerates a timer tick nesting this window.
      */
-    __atomic_fetch_add(&act->ticker_using, 1u, __ATOMIC_RELAXED);
-    __cpu_membarrier();
-    SS_CHECK_EXPIRY(act);
-    __cpu_membarrier();
-    __atomic_fetch_sub(&act->ticker_using, 1u, __ATOMIC_RELAXED);
+    if (__atomic_load_n(&act->policy, __ATOMIC_RELAXED) == SCHED_SPORADIC) {
+        __atomic_fetch_add(&act->ticker_using, 1u, __ATOMIC_RELAXED);
+        __cpu_membarrier();
+        /* Recheck the policy after publishing the reader. A concurrent
+         * switch away may already have retired the old budget. */
+        SS_CHECK_EXPIRY(act);
+        __cpu_membarrier();
+        __atomic_fetch_sub(&act->ticker_using, 1u, __ATOMIC_RELAXED);
+    }
 
     /* If there is a replenishment pending, then do the adjustment If actives
      * has changed above, early out.

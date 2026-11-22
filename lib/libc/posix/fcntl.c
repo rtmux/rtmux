@@ -17,12 +17,13 @@
 #include <sys/rtmux-core.h>
 
 #include <posix.h>
+#include <sys/loader-fd.h>
 
 /* Duplicate `fd` onto the lowest free descriptor >= `minfd`, setting the new
  * descriptor's close-on-exec flag to `fdflags` (0 for F_DUPFD, FD_CLOEXEC for
  * F_DUPFD_CLOEXEC).
  */
-static int dup_fd(int fd, int minfd, unsigned fdflags)
+int __dup_fd(int fd, int minfd, unsigned fdflags, int track)
 {
     struct _server_info info;
     io_dup_t dup;
@@ -53,7 +54,8 @@ static int dup_fd(int fd, int minfd, unsigned fdflags)
         return -1;
     }
     connect_flags_r(0, (uint64_t) fd2, FD_CLOEXEC, fdflags);
-    __atfd_dup(fd, fd2);
+    if (track)
+        __atfd_dup(fd, fd2);
     return fd2;
 }
 
@@ -68,10 +70,10 @@ static int vfcntl(int fd, int cmd, va_list ap)
 
     switch (cmd) {
     case F_DUPFD:
-        return dup_fd(fd, va_arg(ap, int), 0);
+        return __dup_fd(fd, va_arg(ap, int), 0, 1);
 
     case F_DUPFD_CLOEXEC:
-        return dup_fd(fd, va_arg(ap, int), FD_CLOEXEC);
+        return __dup_fd(fd, va_arg(ap, int), FD_CLOEXEC, 1);
 
     case F_GETFD:
         return connect_flags(0, (uint64_t) fd, 0, 0);

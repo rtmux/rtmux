@@ -239,14 +239,9 @@ void specialret_attr specialret(thread_t *thp)
 
             /* A timeout overrides a successful lock only. A lock that failed
              * keeps its own error: the caller holds no mutex, and ETIMEDOUT
-             * would tell it otherwise. EOWNERDEAD must reach the caller, which
-             * now holds an inconsistent mutex it has to repair, and
-             * ENOTRECOVERABLE says it holds no mutex at all. KSTATUS holds
-             * -errno. With the allocations reserved by the wait, the lock can
-             * still fail without the mutex held on EDEADLK (a priority
-             * inheritance cycle through the new owner) and ENOTRECOVERABLE; the
-             * caller sees that error and holds no mutex. That is a known gap
-             * against POSIX, which allows no such result.
+             * would tell it otherwise. EOWNERDEAD transfers ownership.
+             * ENOTRECOVERABLE means the mutex cannot be acquired. A PI cycle
+             * leaves the reacquire queued until a handoff is possible.
              */
             if (status == -ETIMEDOUT && (int) KSTATUS(thp) == EOK)
                 SETKSTATUS(thp, status);

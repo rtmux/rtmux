@@ -268,6 +268,80 @@ int inject_run(const char *a1, const char *a2, const char *a3)
     return WEXITSTATUS(st);
 }
 
+/* Keep the observer process alive through the injected window. Reaping an
+ * inject helper here can wait for an RCU grace period on the stalled hart. */
+
+
+int stall_watch_start(struct stall_watch *watch, const char *site)
+{
+    int events[2], commands[2];
+    if (pipe(events) < 0)
+        return -1;
+    if (pipe(commands) < 0) {
+        close(events[0]);
+        close(events[1]);
+        return -1;
+    }
+    /* A later monitor must not keep this one's release pipe open. */
+    if (fcntl(commands[1], F_SETFD, FD_CLOEXEC) == -1 ||
+        fcntl(events[0], F_SETFD, FD_CLOEXEC) == -1) {
+        close(events[0]);
+        close(events[1]);
+        close(commands[0]);
+        close(commands[1]);
+        return -1;
+    }
+    posix_spawn_file_actions_t actions;
+    int rc = posix_spawn_file_actions_init(&actions);
+    if (!rc) {
+        rc = posix_spawn_file_actions_adddup2(&actions, commands[0], 0);
+        if (!rc)
+            rc = posix_spawn_file_actions_adddup2(&actions, events[1], 1);
+        if (!rc)
+            rc = posix_spawn_file_actions_addclose(&actions, commands[1]);
+        if (!rc) {
+            char *argv[] = {"inject", "site-watch", (char *) site, NULL};
+            rc = posix_spawn(&watch->pid, "/bin/inject", &actions, NULL, argv,
+                             NULL);
+        }
+        posix_spawn_file_actions_destroy(&actions);
+    }
+    close(commands[0]);
+    close(events[1]);
+    if (rc) {
+        close(events[0]);
+        close(commands[1]);
+        return -1;
+    }
+    watch->events = events[0];
+    watch->release = commands[1];
+    char ready;
+    return read(watch->events, &ready, 1) == 1 && ready == 'R' ? 0 : -1;
+}
+
+void stall_watch_release(struct stall_watch *w)
+{
+    if (w->pid > 0 && w->release >= 0) {
+        close(w->release);
+        w->release = -1;
+    }
+}
+
+void stall_watch_finish(struct stall_watch *w)
+{
+    if (w->pid > 0) {
+        stall_watch_release(w);
+        close(w->events);
+        (void) waitpid(w->pid, NULL, 0);
+    }
+}
+
+int stall_watch_entered(struct stall_watch *w)
+{
+    char event;
+    return read(w->events, &event, 1) == 1 && event == 'Y';
+}
+
 /* Child: connect to the parent's channel DISC_CONNS times, then park. */
 int disconnect_child(const char *pid_arg, const char *chid_arg)
 {

@@ -9,12 +9,10 @@
 #include "private.h"
 #include <limits.h>
 #include <spawn.h>
-#include <sys/posix-spawn.h>
+#include <sys/spawn-action-wire.h>
 
 #define SPAWN_FD_TARGET_MAX (UINT16_MAX - 1)
 
-/* Largest _PROC_POSIX_SPAWN proc_pspawn() copies whole: ARG_MAX with room. */
-#define PSPAWN_MSG_MAX (256u * 1024u)
 
 /* 							Internal Support Routines */
 
@@ -315,7 +313,7 @@ static int parse_pspawn_msg(pid_t ppid,
      * allocate way more space than we really need. For example, if we only want
      * to modify file descriptor 10, we need fdmap array entries 0 through 9.
      */
-    if (msg->i.filact_bytes > 0) {
+    if (msg->i.filact_bytes && !msg->i.reserved[0]) {
         void *_factp = (void *) ((char *) (msg + 1) + msg->i.attr_bytes);
         void *open_action = (void *) ((char *) _factp + msg->i.filact_bytes);
 
@@ -467,6 +465,11 @@ int proc_pspawn(ioserv_context_t *ctp, void *vmsg)
     len = pspawn_declared_len(msg);
     if (len > ctp->info.srcmsglen)
         return EMSGSIZE;
+    if (len > PSPAWN_MSG_MAX)
+        return E2BIG;
+    if (msg->i.reserved[1] || msg->i.reserved[0] > PSPAWN_CHILD_ACTIONS ||
+        (msg->i.reserved[0] && (msg->i.cwdlen || msg->i.filact_obytes)))
+        return EINVAL;
 
     if (ctp->info.flags & RTMUX_MI_ENDIAN_DIFF)
         return ENOTSUP;
@@ -476,8 +479,6 @@ int proc_pspawn(ioserv_context_t *ctp, void *vmsg)
     if (len > ctp->info.msglen) {
         int head = (int) ctp->info.msglen, tail;
 
-        if (len > PSPAWN_MSG_MAX)
-            return E2BIG;
         tail = (int) len - head;
         if (!(whole = malloc((size_t) len))) {
             roottask_heap_note_nomem("spawn request", (size_t) len);
@@ -495,9 +496,13 @@ int proc_pspawn(ioserv_context_t *ctp, void *vmsg)
         msg = whole;
     }
 
-    r = parse_pspawn_msg(ctp->info.pid, msg, &spawn_msg);
-    /* spawn_msg has every byte it needs: drop the copy before the load. */
-    free(whole);
+    const char *path = (const char *) (msg + 1) + msg->i.attr_bytes +
+                       msg->i.filact_bytes + msg->i.filact_obytes;
+    if (!msg->i.pathlen || memchr(path, 0, msg->i.pathlen) != path + msg->i.pathlen - 1)
+        r = EINVAL;
+    else
+        r = parse_pspawn_msg(ctp->info.pid, msg, &spawn_msg);
+
     if (r == EOK) {
         size_t spawn_msg_len = sizeof(*spawn_msg) + spawn_msg->i.searchlen +
                                spawn_msg->i.cwdlen + spawn_msg->i.pathlen +
@@ -511,8 +516,11 @@ int proc_pspawn(ioserv_context_t *ctp, void *vmsg)
         ctp2.info.msglen = (uint32_t) spawn_msg_len;
 
         CRASHCHECK(ctp2.info.srcmsglen > ctp2.info.msglen);
-        r = proc_spawn(&ctp2, spawn_msg);
+        const unsigned char *actions = (const unsigned char *) (msg + 1) + msg->i.attr_bytes;
+        r = proc_spawn_with_actions(&ctp2, spawn_msg, actions,
+                                    msg->i.reserved[0] ? msg->i.filact_bytes : 0);
     }
+    free(whole);
     free(spawn_msg);
     return r;
 }

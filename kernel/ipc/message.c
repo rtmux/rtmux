@@ -7,6 +7,7 @@
 
 #include <unistd.h>
 #include <core/globals.h>
+#include "reply-client.h"
 #include <user-slice.h>
 /* #define   MSG_XFER_CHUNK_SIZE     1024 */
 
@@ -94,19 +95,9 @@ static int msg_current_take(thread_t *act, struct kcall_args_msg_current *kap)
         return ESRCH;
     }
 
-    if (thp->blocked_on != cop) {
-        connect_t *cop1 = cop;
-        cop = thp->blocked_on;
-
-        /* NULL: client's blocked_on was cleared by a concurrent teardown
-         * (force_ready on a client whose process is exiting) -> ESRCH, matching
-         * the locked recheck and the guard in fastmsg.c. Without it the deref
-         * below load-faults near NULL.
-         */
-        if (!cop || (cop->flags & COF_VCONNECT) == 0 ||
-            cop->un.lcl.cop != cop1) {
-            return ESRCH;
-        }
+    cop = reply_client_connection(thp, cop);
+    if (!cop) {
+        return ESRCH;
     }
 
     /* Take cop->lock (LOCK_CLASS_CONNECT) on the *final* cop — i.e.
@@ -164,16 +155,12 @@ static int msg_current_take(thread_t *act, struct kcall_args_msg_current *kap)
          * here would stay.
          */
         CRITICAL_INHERIT(act, thp);
-        thread_lend_msg(act, __atomic_load_n(&thp->priority, __ATOMIC_ACQUIRE),
-                        true);
-        (void) thread_end_orphan_loan(act);
-        (void) thread_prio_update_dpp(act, new_dpp, 1);
+        reply_client_priority(act, thp, new_dpp);
     } else {
         /* A fixed-priority channel lends nothing. Drop the loan an earlier
          * client left, or a REPLY propagation from thp would relend it.
          */
-        thread_lend_msg(act, 0, false);
-        thread_prio_update(act);
+        reply_client_priority(act, NULL, NULL);
     }
 
     return EOK;
@@ -340,19 +327,9 @@ static int msg_readv_body(thread_t *act, struct kcall_args_msg_readv *kap)
         return ESRCH;
     }
 
-    if (thp->blocked_on != cop) {
-        connect_t *cop1 = cop;
-        cop = thp->blocked_on;
-
-        /* NULL: client's blocked_on was cleared by a concurrent teardown
-         * (force_ready on a client whose process is exiting) -> ESRCH, matching
-         * the locked recheck and the guard in fastmsg.c. Without it the deref
-         * below load-faults near NULL.
-         */
-        if (!cop || (cop->flags & COF_VCONNECT) == 0 ||
-            cop->un.lcl.cop != cop1) {
-            return ESRCH;
-        }
+    cop = reply_client_connection(thp, cop);
+    if (!cop) {
+        return ESRCH;
     }
 
     act->args.ms.rmsg = kap->rmsg;
@@ -545,19 +522,9 @@ static int msg_writev_body(thread_t *act, struct kcall_args_msg_writev *kap)
         return ESRCH;
     }
 
-    if (thp->blocked_on != cop) {
-        connect_t *cop1 = cop;
-        cop = thp->blocked_on;
-
-        /* NULL: client's blocked_on was cleared by a concurrent teardown
-         * (force_ready on a client whose process is exiting) -> ESRCH, matching
-         * the locked recheck and the guard in fastmsg.c. Without it the deref
-         * below load-faults near NULL.
-         */
-        if (!cop || (cop->flags & COF_VCONNECT) == 0 ||
-            cop->un.lcl.cop != cop1) {
-            return ESRCH;
-        }
+    cop = reply_client_connection(thp, cop);
+    if (!cop) {
+        return ESRCH;
     }
 
     /* State-recheck + MSG_DELIVERY claim under channel_slock. Synchronizes with
@@ -712,19 +679,9 @@ int kdecl ksys_msg_readiov(thread_t *act, struct kcall_args_msg_readiov *kap)
         return ESRCH;
     }
 
-    if (thp->blocked_on != cop) {
-        connect_t *cop1 = cop;
-        cop = thp->blocked_on;
-
-        /* NULL: client's blocked_on was cleared by a concurrent teardown
-         * (force_ready on a client whose process is exiting) -> ESRCH, matching
-         * the locked recheck and the guard in fastmsg.c. Without it the deref
-         * below load-faults near NULL.
-         */
-        if (!cop || (cop->flags & COF_VCONNECT) == 0 ||
-            cop->un.lcl.cop != cop1) {
-            return ESRCH;
-        }
+    cop = reply_client_connection(thp, cop);
+    if (!cop) {
+        return ESRCH;
     }
 
     /* State-recheck + MSG_DELIVERY claim under channel_slock. The claim keeps
@@ -849,19 +806,9 @@ int kdecl ksys_msg_info(thread_t *act, struct kcall_args_msg_info *kap)
         return ESRCH;
     }
 
-    if (thp->blocked_on != cop) {
-        connect_t *cop1 = cop;
-        cop = thp->blocked_on;
-
-        /* NULL: client's blocked_on was cleared by a concurrent teardown
-         * (force_ready on a client whose process is exiting) -> ESRCH, matching
-         * the locked recheck and the guard in fastmsg.c. Without it the deref
-         * below load-faults near NULL.
-         */
-        if (!cop || (cop->flags & COF_VCONNECT) == 0 ||
-            cop->un.lcl.cop != cop1) {
-            return ESRCH;
-        }
+    cop = reply_client_connection(thp, cop);
+    if (!cop) {
+        return ESRCH;
     }
 
     /* channel_slock recheck + full get_rcvinfo snapshot under the lock.

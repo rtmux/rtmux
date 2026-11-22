@@ -84,6 +84,8 @@ struct loader_context_base {
     int tid;
     unsigned long flags;
     unsigned msgsize;
+    unsigned action_bytes;
+    unsigned action_source_bytes;
     int state;
     struct loader_startup start;
     int fault_errno;
@@ -109,6 +111,16 @@ struct loader_context {
      */
     union proc_msg_union msg;
 };
+
+/* Only explicitly named sources may import a close-on-exec descriptor. */
+static inline int loader_action_source(const struct loader_context *lcp, int fd)
+{
+    unsigned index = (unsigned) fd / 8;
+    const unsigned char *bits = (const unsigned char *) &lcp->msg +
+                                lcp->ctx.msgsize + lcp->ctx.action_bytes;
+    return index < lcp->ctx.action_source_bytes &&
+           (bits[index] & (1U << ((unsigned) fd % 8)));
+}
 
 /* Make a unique inode number */
 #define PID_TO_INO(pid, subtype) \

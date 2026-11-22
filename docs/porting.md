@@ -17,6 +17,14 @@ validates the list afterwards, so a thread in another part of the program that
 closes one of them during the call can make the spawn fail with `EBADF`. Create
 pipes shared with children close-on-exec and keep them open across the spawn.
 
+## Shell command lists
+
+The toolbox shell parses command lists before expanding or executing them.
+Nested conditions, case arms, function bodies and trailing redirections share
+the grammar in `userland/utils/sh-parse.c`. Patterns carry a separate quote
+mask so every non-NUL byte remains available as data. The guest `sh-posix` suite exercises
+compound redirections and nested grammar. Its `gaps.sh` cases also run under dash.
+
 ## Profiles and what is claimed
 
 The matrix in `docs/posix-compliance.md` is the source of truth. An interface

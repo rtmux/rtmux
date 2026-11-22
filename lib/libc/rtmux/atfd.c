@@ -38,6 +38,7 @@
 #include <sys/iomsg.h>
 
 #include "posix.h"
+#include <sys/loader-fd.h>
 
 static char **atfd_paths;
 static int atfd_cap;
@@ -207,7 +208,7 @@ static int atfd_cwd_copy(char *buf, size_t sz)
     return 0;
 }
 
-static int atfd_fdinfo_path(int fd, char *buf, size_t sz)
+int __atfd_fdinfo_path(int fd, char *buf, size_t sz)
 {
     struct {
         struct _io_fdinfo_reply o;
@@ -308,7 +309,7 @@ int __atfd_abspath(int dirfd, const char *path, char *out, size_t outsz)
     pthread_mutex_unlock(&atfd_lock);
 
     if (!found) {
-        if (atfd_fdinfo_path(dirfd, base, sizeof base) != 0)
+        if (__atfd_fdinfo_path(dirfd, base, sizeof base) != 0)
             return -1;
         blen = strlen(base);
         __atfd_track(dirfd, base);

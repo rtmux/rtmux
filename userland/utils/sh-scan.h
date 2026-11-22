@@ -16,6 +16,10 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+char *sh_heredoc_find(char *line);
+char *sh_heredoc_delim(char *hh, char *delim, size_t dsize, bool *strip, bool *quoted);
+bool sh_command_prefix(const char *word, size_t len);
+
 enum sh_unit_kind {
     SH_U_END,    /* end of the string */
     SH_U_LIT,    /* one character with no special meaning here */

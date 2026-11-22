@@ -17,6 +17,8 @@
 #include <sys/mount.h>
 #include <sys/rtmux-core.h>
 #include <sys/pathmsg.h>
+#include <sys/spawn-action-wire.h>
+#include <sys/loader-fd.h>
 
 #include <devctl/common.h>
 
@@ -255,7 +257,7 @@ static int loader_fd(struct loader_context *lcp)
             if (info.flags & RTMUX_FLG_COF_DEAD) {
                 continue;
             }
-            if (info.flags & RTMUX_FLG_COF_CLOEXEC) {
+            if ((info.flags & RTMUX_FLG_COF_CLOEXEC) && !loader_action_source(lcp, fd)) {
                 continue;
             }
             if (RTMUX_NODE_CMP(info.nd, RTMUX_LOCAL_NODE) != 0)
@@ -294,6 +296,140 @@ static int loader_fd(struct loader_context *lcp)
                 return errno;
         }
     }
+}
+
+/* Apply actions on the child's descriptors while its requested credentials
+ * and working directory are active. No file is opened in the parent. */
+static int action_chdir(int fd, const char *path)
+{
+    char dir[PATH_MAX + 1], resolved[PATH_MAX + 1];
+    if (fd >= 0) {
+        struct stat st;
+        if (fstat(fd, &st) < 0)
+            return errno;
+        if (!S_ISDIR(st.st_mode))
+            return ENOTDIR;
+        if (__atfd_fdinfo_path(fd, dir, sizeof dir) < 0)
+            return errno;
+        if (!__loader_root(resolved, sizeof resolved))
+            return errno;
+        size_t root = strlen(resolved);
+        while (root && resolved[root - 1] == '/')
+            root--;
+        if (strncmp(dir, resolved, root) || (dir[root] && dir[root] != '/'))
+            return EACCES;
+        path = dir[root] ? dir + root : "/";
+    }
+    if (__chdir_resolve(path, resolved, sizeof resolved) < 0 ||
+        __chdir_send(resolved) < 0)
+        return errno;
+    return EOK;
+}
+
+/* Only this loader thread owns the child's fd table. close() can report
+ * the service's error after detaching, but EINTR can leave it attached. */
+static int action_close(int fd)
+{
+    for (;;) {
+        if (__close_fd(fd, 0) >= 0)
+            return EOK;
+        int err = errno;
+        if (fcntl(fd, F_GETFD) < 0 && errno == EBADF)
+            return EOK;
+        if (err != EINTR)
+            return err;
+    }
+}
+
+static int action_dup(int source, int target, unsigned flags)
+{
+    if (fcntl(source, F_GETFD) < 0)
+        return errno;
+    if (source == target)
+        return fcntl(target, F_SETFD, (int) flags) < 0 ? errno : EOK;
+    int err = action_close(target);
+    if (err)
+        return err;
+    int fd = __dup_fd(source, target, flags, 0);
+    if (fd < 0)
+        return errno;
+    if (fd == target)
+        return EOK;
+    (void) __close_fd(fd, 0);
+    return EBUSY;
+}
+
+static int loader_actions(struct loader_context *lcp, const char *image)
+{
+    const unsigned char *records = (const unsigned char *) &lcp->msg + lcp->ctx.msgsize;
+    const unsigned char *cursor = records;
+    size_t left = lcp->ctx.action_bytes;
+    int has_open = 0, changes_dir = 0;
+    struct spawn_action_record r;
+    const char *path;
+    while (left) {
+        int err = spawn_action_next(&cursor, &left, &r, &path);
+        if (err)
+            return err;
+        has_open |= r.type == posix_file_action_type_OPEN;
+        changes_dir |= r.type == posix_file_action_type_CHDIR ||
+                       r.type == posix_file_action_type_FCHDIR;
+    }
+    if (has_open && (*image == '/' || !changes_dir)) {
+        struct stat st;
+        if (stat(image, &st) < 0)
+            return errno;
+    }
+    cursor = records;
+    left = lcp->ctx.action_bytes;
+    while (left) {
+        int err = spawn_action_next(&cursor, &left, &r, &path);
+        if (err)
+            return err;
+        switch (r.type) {
+        case posix_file_action_type_CLOSE:
+            err = action_close(r.fd);
+            break;
+        case posix_file_action_type_DUP:
+            err = action_dup(r.fd, r.target, 0);
+            break;
+        case posix_file_action_type_OPEN: {
+            err = action_close(r.target);
+            if (err)
+                return err;
+            int fd = __loader_open(path, (int) r.flags | O_NOCTTY, (mode_t) r.mode);
+            if (fd < 0)
+                return errno;
+            if (fd != r.target) {
+                err = action_dup(fd, r.target, (r.flags & O_CLOEXEC) ? FD_CLOEXEC : 0);
+                int closed = action_close(fd);
+                if (!err)
+                    err = closed;
+            }
+            break;
+        }
+        case posix_file_action_type_CHDIR:
+            err = action_chdir(-1, path);
+            break;
+        case posix_file_action_type_FCHDIR:
+            err = action_chdir(r.fd, NULL);
+            break;
+        }
+        if (err)
+            return err;
+    }
+    struct _server_info si;
+    int fd = 0;
+    while ((fd = connect_server_info(0, (unsigned) fd, &si)) >= 0 &&
+           !((unsigned) fd & RTMUX_SIDE_CHANNEL)) {
+        if (si.flags & RTMUX_FLG_COF_CLOEXEC) {
+            int err = action_close(fd);
+            if (err)
+                return err;
+        }
+        fd++;
+    }
+    return EOK;
 }
 
 /* Test whether a path names a regular (or named) file the caller may execute.
@@ -901,6 +1037,21 @@ void *loader_load(void *parm)
     /* proc_spawn set saved_user_id to 0, so this will work... */
     uid = getuid();
     gid = getgid();
+
+    /* RESETIDS gives the child its real IDs before its file actions and the
+     * lookup of the executable, as an execve the child made would see them.
+     */
+    if (resetids && (setegid(gid) < 0 || seteuid(uid) < 0))
+        LOADER_EXIT(errno);
+    if (lcp->ctx.action_bytes) {
+        status = loader_fd(lcp);
+        if (!status)
+            status = loader_actions(lcp, p);
+        if (status) {
+            loader_revoke_key(lcp);
+            LOADER_EXIT(status);
+        }
+    }
     (void) setreuid(geteuid(), 0);
     (void) setregid(getegid(), getgid());
 
@@ -911,6 +1062,16 @@ void *loader_load(void *parm)
     } else {
         if (is_exec(p) == -1) {
             LOADER_EXIT(errno);
+        } else if (*p != '/') {
+            if (!getcwd(buffer, sizeof buffer))
+                LOADER_EXIT(errno);
+            size_t len = strlen(buffer);
+            if (len && buffer[len - 1] == '/')
+                len--;
+            if (len + strlen(p) + 2 > sizeof buffer)
+                LOADER_EXIT(ENAMETOOLONG);
+            buffer[len++] = '/';
+            strcpy(buffer + len, p);
         } else if (!memccpy(buffer, p, '\0', sizeof(buffer))) {
             LOADER_EXIT(ENAMETOOLONG);
         }
@@ -1070,7 +1231,7 @@ void *loader_load(void *parm)
 
     loader_args(lcp, p, buffer, interp_name, interp_arg);
 
-    if (!(lcp->ctx.flags & SPAWN_EXEC)) {
+    if (!(lcp->ctx.flags & SPAWN_EXEC) && !lcp->ctx.action_bytes) {
         status = loader_fd(lcp);
         if (status != EOK) {
             loader_revoke_key(lcp);

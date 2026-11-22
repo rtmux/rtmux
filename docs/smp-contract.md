@@ -636,7 +636,7 @@ Audited windows and their frozen branch classification:
 | --- | --- | --- | --- |
 | cap_lookup_pin_typed | 3 zero tests (table, slots, object non-NULL) | argument sanity | non-secret, no slot access reached yet |
 | cap_lookup_pin_typed | index == 0, index >= nslots (1 bgeu) | slot bounds | the one accepted V1 bounds compare per this window |
-| cap_lookup_pin_typed | 2 lock spin tests | cap_lock acquire | control flow, no authority datum |
+| cap_lookup_pin_typed | 1 lock spin test (ticket owner != ticket) | cap_lock acquire | control flow on the lock word, no authority datum |
 | cap_lookup_pin_typed | rights == 0 | reject empty-rights lookup | authority check, precedes use |
 | cap_lookup_pin_typed | state == LIVE, generation match, object type, rights subset | authority validation | must precede the slot->object load; no branch sits between the last of these and the load |
 | cap_lookup_pin_typed | pin_count == UINT32_MAX | refcount saturation | liveness, not authority; still precedes the object publication |

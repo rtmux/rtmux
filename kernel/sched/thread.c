@@ -481,6 +481,7 @@ retry:
 
     /* If the thread is not dead and waiting we block on it. */
     if (!target_dead) {
+        act->debug_join_tid = (pthread_t) (thp->tid + 1);
         unready(act, STATE_JOIN);
         act->blocked_on = thp;
         act->args.jo.statusptr = kap->status;

@@ -1040,6 +1040,23 @@ int main(int argc, char *argv[])
         execvp("true", args);
         return errno;
     }
+    if (argc == 3 && !strcmp(argv[1], "--spawn-inherited-fchdir")) {
+        posix_spawn_file_actions_t actions;
+        if (posix_spawn_file_actions_init(&actions) ||
+            posix_spawn_file_actions_addfchdir(&actions, atoi(argv[2])))
+            return 1;
+        pid_t child;
+        char *args[] = {"syscall_testing", "--expect-cwd", "/dev/shmem", NULL};
+        int rc = posix_spawn(&child, "/bin/syscall_testing", &actions, NULL, args, NULL);
+        posix_spawn_file_actions_destroy(&actions);
+        int status;
+        return rc || waitpid(child, &status, 0) != child ||
+               !WIFEXITED(status) || WEXITSTATUS(status);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--spawn-actions")) {
+        test_spawn_actions();
+        return finish(1);
+    }
     if (argc == 2 && !strcmp(argv[1], "--spawn-contract")) {
         test_spawn_contract();
         return finish(1);
@@ -1061,10 +1078,18 @@ int main(int argc, char *argv[])
             test_skip("condvar_reacquire_alloc_failure", "fault injection unavailable");
         return finish(1);
     }
+    if (argc == 2 && !strcmp(argv[1], "--mutex-owner-death")) {
+        test_mutex_owner_death();
+        return finish(1);
+    }
     if (argc == 2 && !strcmp(argv[1], "--mutex-waiting-republish")) {
         printf("[mutex_waiting_republish]\n");
         if (mutex_waiting_republish() == TC_EXIT_SKIP)
             test_skip("mutex_waiting_republish", "fault injection unavailable");
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--cancel-before-block")) {
+        test_cancel_before_block();
         return finish(1);
     }
     if (argc == 2 && !strcmp(argv[1], "--mutex-handoff-loan")) {
@@ -1077,6 +1102,34 @@ int main(int argc, char *argv[])
         printf("[mutex_waiting_withdrawn]\n");
         if (mutex_waiting_withdrawn() == TC_EXIT_SKIP)
             test_skip("mutex_waiting_withdrawn", "fault injection unavailable");
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--intr-before-switch")) {
+        char pid[16];
+        uint64_t ns = 150000000;
+        snprintf(pid, sizeof pid, "%d", (int) getpid());
+        int rc = inject_run("intr-before-switch", pid, NULL);
+        if (!rc && __timer_timeout(CLOCK_MONOTONIC, RTMUX_TIMEOUT_INTR, NULL,
+                                   &ns, NULL) >= 0)
+            rc = interrupt_wait(0, NULL);
+        else
+            rc = -1;
+        check(rc == 0, "pending interrupt reaches the waiter before its timer expires",
+              "interrupt wait or injection failed");
+        rc = __timer_timeout(CLOCK_MONOTONIC, RTMUX_TIMEOUT_INTR, NULL, &ns, NULL);
+        if (rc >= 0) {
+            errno = 0;
+            rc = interrupt_wait(0, NULL);
+            check(rc == -1 && errno == ETIMEDOUT,
+                  "pending interrupt consumed exactly once", "unexpected second wake");
+        } else {
+            test_fail("pending interrupt consumed exactly once", "cannot arm guard timer");
+        }
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--sync-kill-handoff")) {
+        if (sync_kill_handoff() == TC_EXIT_SKIP)
+            test_skip("sync kill handoff", "three harts and fault injection required");
         return finish(1);
     }
     if (argc == 2 && !strcmp(argv[1], "--condvar-interrupt-stale")) {
@@ -1209,6 +1262,18 @@ int main(int argc, char *argv[])
         return capgate_child_dup_attack(argc, argv);
     if (argc == 3 && !strcmp(argv[1], "--dup-replay-child"))
         return capgate_child_dup_replay(argv[2]);
+    if (argc == 2 && !strcmp(argv[1], "--cond-pi-cycle")) {
+        test_cond_reacquire_cycle();
+        return finish(0);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--pi-owner-loans")) {
+        test_pi_owned_turnstiles();
+        return finish(0);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--pi-cycle")) {
+        test_pi_two_mutex_cycle_detects_deadlock();
+        return finish(1);
+    }
     if (argc == 2 && !strcmp(argv[1], "--pi-large-pid"))
         return sync_pi_large_pid_child();
     if (argc == 2 && !strcmp(argv[1], "--proc-cap-child")) {

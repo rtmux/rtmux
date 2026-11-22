@@ -80,12 +80,16 @@ static void *worker(void *raw)
     return NULL;
 }
 
+int ticket_stress(void);
+
 int main(int argc, char **argv)
 {
     int iterations = DEFAULT_ITERATIONS;
     struct worker_arg args[WORKERS];
     pthread_t tids[WORKERS];
 
+    if (argc == 2 && !strcmp(argv[1], "--tickets"))
+        return ticket_stress();
     if (argc > 1)
         iterations = atoi(argv[1]);
     if (iterations <= 0) {

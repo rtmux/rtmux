@@ -193,26 +193,11 @@ static inline void vec_slocks_unlock(process_t *a, process_t *b)
     }
 }
 
-/* Decrement a process's open-connection count under its vec_slock.
- *
- * nfds is bumped under the owning process's vec_slock at attach
- * (connect_attach), so it must be decremented under the same lock. A plain
- * non-atomic -- races a concurrent attach's ++ on another hart and loses an
- * update, leaving nfds off by one at teardown (the intermittent process.c:465
- * nfds != 0 crash, seen as either a leak or a wrap-to-65535 underflow depending
- * on which update is lost). Callers must not already hold prp->vec_slock.
- */
-static inline void process_nfds_dec(process_t *prp)
+/* Charged client slots and their count change together under vec_slock. */
+static void process_nfds_dec_locked(process_t *prp)
 {
-    kspinlock_lock(&prp->vec_slock);
-
-    /* nfds is uint16_t; a mis-categorized detach would wrap it to 65535 and
-     * resurface as the same process.c teardown crash this accounting fixes.
-     * Fail at the source instead of far downstream.
-     */
     CRASHCHECK(prp->nfds == 0);
     prp->nfds--;
-    kspinlock_unlock(&prp->vec_slock);
 }
 
 /* Attach a connection to a channel (connect_attach kcall).
@@ -627,6 +612,8 @@ int _connect_detach(process_t *prp, int coid_arg)
                   cop->channel->process == prp && coid == cop->scoid;
 
     vector_rem(vec, coid);
+    if (!server_side)
+        process_nfds_dec_locked(prp);
     kspinlock_unlock(&prp->vec_slock);
     if (cop->links == 0) {
         connect_soul_free(prp, cop);
@@ -646,8 +633,6 @@ int _connect_detach(process_t *prp, int coid_arg)
             }
         }
     }
-    if (!server_side)
-        process_nfds_dec(prp);
 
     return EOK;
 }
@@ -696,7 +681,11 @@ int kdecl ksys_connect_detach(thread_t *act,
         rcu_read_unlock(&connobj_rcu);
         return EINVAL;
     }
+    bool server_side = vec == &prp->chancons && chp && chp->process == prp &&
+                       !(cop->flags & RTMUX_FLG_COF_GLOBAL) && coid == cop->scoid;
     vector_rem(vec, (unsigned) coid);
+    if (!server_side)
+        process_nfds_dec_locked(prp);
     kspinlock_unlock(&prp->vec_slock);
     if (cap_pinned)
         (void) rtmux_cap_unpin(&prp->endpoint_caps, (rtmux_cap_t) handle);
@@ -847,10 +836,6 @@ int kdecl ksys_connect_detach(thread_t *act,
             }
         }
 
-        /* vec_slock was released earlier in this call (before the force_ready
-         * sweep), so process_nfds_dec here is a fresh, non-nested acquire.
-         */
-        process_nfds_dec(act->process);
     }
 
     SETKSTATUS(act, 0);

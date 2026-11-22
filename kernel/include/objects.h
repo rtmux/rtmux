@@ -97,6 +97,7 @@ enum {
     TYPE_CHANNEL,
     TYPE_VNOTIFICATION,
     TYPE_SYNCEVENT,
+    TYPE_TURNSTILE,
     TYPE_TYPE_MASK = 0x0f,
     TYPE_FLAG_FIRST = 0x10
 };
@@ -312,7 +313,7 @@ typedef struct process_entry {
 
     /* Open-connection count. Owner lock: this process's vec_slock (16-bit, so
      * no sub-word AMO; locked rather than atomic). Bumped at connect_attach,
-     * dropped via process_nfds_dec.
+     * dropped via process_nfds_dec_locked.
      */
     uint16_t nfds;
     uint8_t terming_priority;
@@ -574,12 +575,13 @@ typedef struct thread_entry { /* Also used for vthread_entry */
     thread_t *client; /* the client that the server thread works on behalf */
     void *blocked_on; /* blocked wait object */
     thread_t *short_msg_source; /* special return can outlive a scheduler wait */
+    atomic_uint sync_owner_flags; /* contended/robust ownership, closed at exit */
+    _Atomic sync_key_t sync_wait_key; /* zero once the waker has unlinked this wait */
     turnstile_t *blocked_on_turnstile; /* PI/PC wait-chain object, not
                                         * blocked_on channel state
                                         */
     thread_t *ts_bound_next; /* link in blocked_on_turnstile's bound list */
-    turnstile_t
-        *owned_turnstiles; /* turnstiles currently boosting this owner */
+    pril_head_t owned_turnstiles; /* highest inherited mutex priority first */
     /* Robust mutexes this thread holds (under sync_pi_slock), and one spare
      * record kept so a lock after an unlock does not allocate. Only the thread
      * itself touches the spare. See kernel/sync/wait.c.
@@ -664,14 +666,7 @@ typedef struct thread_entry { /* Also used for vthread_entry */
         } jo;
         struct { /* Used while acquiring a mutex or waiting on a condvar */
             sync_t *mutex;
-            sync_key_t
-                wait_key; /* opaque wait-queue key (VA today); not a ptr */
             uint32_t saved_timeout_flags;
-            unsigned long owner; /* owner of *mutex */
-            ksync_t *next;       /* next mutex in the thread mutex hold list */
-            ksync_t **prev; /* owner, next and prev only meaningful when the
-                             thread is the first one in a mutex waiting list
-                             */
             long incr;      /* saved sync_t.count (same type) */
         } mu;
         struct { /* Used by async_flags processing in an SMP machine */
@@ -701,15 +696,18 @@ typedef struct thread_entry { /* Also used for vthread_entry */
     char *name;
     uint64_t key;      /* msg_key_data secret; 0 = unset, never verifies */
     uint32_t key_fail; /* failed VERIFYs against key since it was minted */
+    /* Procfs reads a running peer. Copy only public identifiers while the
+     * caller still owns the wait object. blocked_on changes type at wake.
+     */
+    __typeof__(((debug_thread_t *) 0)->blocked.connect) debug_connect;
+    pthread_t debug_join_tid;
+    uintptr_t debug_sync_mutex;
     int32_t last_chid;
     void *status;
 #define SIZEOF_VTHREAD offsetof(struct thread_entry, timeout)
     /* Items below are not needed for type=vthread_t */
     ktimer_t *timeout;
     thread_t *join;
-    ksync_t *mutex_holdlist; /* list of holding mutexes whose waiting queue is
-                              not empty
-                              */
     uint64_t start_time;
     FPU_REGISTERS *fpudata;
     volatile unsigned ticker_using;

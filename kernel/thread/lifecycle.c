@@ -62,9 +62,11 @@ static void thread_recycle_reset(thread_t *thp)
     thp->prio_defer_next = NULL;
     thp->prio_defer_cpu = 0;
     thp->blocked_on = NULL;
+    atomic_store_explicit(&thp->sync_owner_flags, 0, memory_order_relaxed);
+    atomic_store_explicit(&thp->sync_wait_key, 0, memory_order_relaxed);
     thp->blocked_on_turnstile = NULL;
     thp->ts_bound_next = NULL;
-    thp->owned_turnstiles = NULL;
+    thp->owned_turnstiles.data = NULL;
     thp->robust_held = NULL;
     thp->robust_spare = NULL;
     thp->ts_spare = NULL;
@@ -77,11 +79,13 @@ static void thread_recycle_reset(thread_t *thp)
     thp->default_runmask = 0;
     thp->name = NULL;
     thp->key = 0;
+    memset(&thp->debug_connect, 0, sizeof thp->debug_connect);
+    thp->debug_join_tid = 0;
+    thp->debug_sync_mutex = 0;
     thp->last_chid = -1;
     thp->status = NULL;
     thp->timeout = NULL;
     thp->join = NULL;
-    thp->mutex_holdlist = NULL;
     thp->start_time = 0;
     thp->fpudata = NULL;
     thp->ticker_using = 0;
@@ -1151,7 +1155,7 @@ int rdecl thread_create(thread_t *act,
     thp->client = 0;
     thp->blocked_on_turnstile = NULL;
     thp->ts_bound_next = NULL;
-    thp->owned_turnstiles = NULL;
+    thp->owned_turnstiles.data = NULL;
     thp->robust_held = NULL;
     thp->robust_spare = NULL;
     thp->ts_spare = NULL;
@@ -1398,6 +1402,7 @@ int rdecl thread_create(thread_t *act,
         act->blocked_on = thp;
         SETKSTATUS(act, tid + 1);
         thp->join = act;
+        act->debug_join_tid = (pthread_t) (thp->tid + 1);
         act->state = STATE_WAITTHREAD;
         _TRACE_TH_EMIT_STATE(act, WAITTHREAD);
         block_and_ready(thp);
@@ -1424,26 +1429,6 @@ void fpu_drop_claims(thread_t *thp)
         __atomic_compare_exchange_n(&pcpu_array[c].pc_active_fpu, &me, NULL, 0,
                                     __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
     }
-}
-
-/* Give up what a dying thread holds in the sync layer: its mutex hold list, the
- * robust mutexes it owns, and the waiters of mutexes it held (see
- * sync_thread_cleanup). Shared by thread_destroy and by proc_exit, which stamps
- * some threads dead without running thread_destroy's teardown. Repeating it is
- * harmless.
- */
-void rdecl thread_sync_teardown(thread_t *thp)
-{
-    ksync_t *syp;
-
-    while ((syp = thp->mutex_holdlist)) {
-        thread_t *waiting = pril_first(&syp->waiting);
-
-        CRASHCHECK(waiting->args.mu.owner == 0);
-        mutex_holdlist_rem(syp);
-        waiting->args.mu.owner = 0;
-    }
-    sync_thread_cleanup(thp);
 }
 
 /* Destroy a thread.
@@ -1665,7 +1650,7 @@ void rdecl thread_destroy(thread_t *thp)
             kcall_op_thread_destroy_hook(thp);
         }
 
-        thread_sync_teardown(thp);
+        sync_thread_cleanup(thp);
 
         /* clear client field */
         if (thp->client != 0) {

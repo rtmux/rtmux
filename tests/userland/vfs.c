@@ -1081,6 +1081,9 @@ static void test_sys_kstats(void)
         bad++;
     check(bad == 0 && kstats_get(snap, "pa.free_bytes") > 0 &&
               kstats_get(snap, "roottask.heap_used") > 0 &&
+              kstats_get(snap, "roottask.heap_size") > 0 &&
+              kstats_get(snap, "roottask.heap_largest") >= 0 &&
+              kstats_get(snap, "vm.rollback_pages") >= 0 &&
               kstats_get(snap, "ioserv.disconnects") >= 0 &&
               kstats_get(snap, "thread.live") > 0 &&
               kstats_get(snap, "thread.live") <= kstats_get(snap, "soul.thread.used") + 2 &&
@@ -1088,7 +1091,7 @@ static void test_sys_kstats(void)
               kstats_get(snap, "timeout.live") <= kstats_get(snap, "thread.live") &&
               kstats_get(snap, "prio.reply_depth") > 0 &&
               kstats_get(snap, "prio.reply_depth_overflow") >= 0 &&
-              lines == (int) (3 * (sizeof pools / sizeof pools[0]) + 9 + (size_t) harts),
+              lines == (int) (3 * (sizeof pools / sizeof pools[0]) + 10 + (size_t) harts),
           "sys_kstats_format documented keys appear exactly once",
           "a documented key is missing, duplicated, or extra");
 
@@ -7977,6 +7980,38 @@ static void test_spawn_file_actions_chdir(void)
             "spawn addchdir sets child cwd", NULL, shm, {NULL}, EOK},
         &fa);
 
+    /* The intermediate image has no libc path-cache entry for this fd. */
+    int dir = open(shm, O_RDONLY);
+    char number[16];
+    snprintf(number, sizeof number, "%d", dir);
+    char *args[] = {"syscall_testing", "--spawn-inherited-fchdir", number, NULL};
+    int code = -1;
+    int child_rc = dir < 0 ? errno : spawn_wait_code("/bin/syscall_testing", NULL,
+                                                     NULL, args, NULL, NULL, &code);
+    check(child_rc == EOK && code == 0, "spawn fchdir through inherited directory handle",
+          child_rc ? strerror(child_rc) : "grandchild cwd mismatch");
+    if (dir >= 0)
+        close(dir);
+
+    /* /dev/zero supports _IO_OPENFD. Reopen its explicitly named handle,
+     * then verify only the new descriptor survives into the image. */
+    int source = open("/dev/zero", O_RDONLY | O_CLOEXEC);
+    char handle[48], source_arg[16];
+    snprintf(handle, sizeof handle, "/proc/self/fd/%d", source);
+    snprintf(source_arg, sizeof source_arg, "%d", source);
+    const char *dest_arg = source == 6 ? "7" : "6";
+    char *reopen_args[] = {"syscall_testing", "--expect-fd-readable-closed",
+                           (char *) dest_arg, source_arg, NULL};
+    (void) posix_spawn_file_actions_init(&fa);
+    (void) posix_spawn_file_actions_addopen(&fa, atoi(dest_arg), handle, O_RDONLY, 0);
+    child_rc = source < 0 ? errno : spawn_wait_code("/bin/syscall_testing", &fa,
+                                                    NULL, reopen_args, NULL, NULL, &code);
+    check(child_rc == EOK && code == 0, "spawn addopen through a named close-on-exec handle",
+          child_rc ? strerror(child_rc) : "child descriptor mismatch");
+    (void) posix_spawn_file_actions_destroy(&fa);
+    if (source >= 0)
+        close(source);
+
     /* A relative chdir resolves against the previous one. */
     (void) posix_spawn_file_actions_init(&fa);
     (void) posix_spawn_file_actions_addchdir(&fa, "/dev");
@@ -8127,6 +8162,91 @@ static void test_spawn_file_actions_chdir(void)
           "spawn addchdir failure closes temps",
           "a failed spawn must close the descriptors its actions opened");
     (void) unlink(created);
+}
+
+/* With real uid 0 and effective uid 1, only RESETIDS grants access
+ * to a root-owned mode-0600 file. Both attempts run from the same parent. */
+static void test_spawn_action_credentials(void)
+{
+    char path[80];
+    snprintf(path, sizeof path, "/dev/shmem/spawn-action-%d", (int) getpid());
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (fd < 0) {
+        test_fail("spawn action credentials fixture", strerror(errno));
+        return;
+    }
+    close(fd);
+    posix_spawnattr_t attr;
+    posix_spawn_file_actions_t actions;
+    int attr_ok = posix_spawnattr_init(&attr) == EOK;
+    int act_ok = posix_spawn_file_actions_init(&actions) == EOK;
+    uid_t original = geteuid();
+    if (!attr_ok || !act_ok ||
+        posix_spawnattr_setflags(&attr, POSIX_SPAWN_RESETIDS) ||
+        posix_spawn_file_actions_addopen(&actions, 7, path, O_RDONLY, 0) ||
+        seteuid(1) < 0) {
+        test_fail("spawn action credentials setup", "cannot prepare fixture");
+    } else {
+        char *argv[] = {"true", NULL};
+        int code = -1;
+        int denied = spawn_wait_code("/bin/true", &actions, NULL, argv, NULL, NULL, &code);
+        int allowed = spawn_wait_code("/bin/true", &actions, &attr, argv, NULL, NULL, &code);
+        check(denied == EACCES, "spawn addopen checks effective uid", strerror(denied));
+        check(allowed == EOK && code == 0, "spawn RESETIDS precedes addopen", strerror(allowed));
+        check(geteuid() == 1, "spawn RESETIDS preserves parent credentials", "unexpected euid");
+    }
+    (void) seteuid(original);
+    if (act_ok)
+        posix_spawn_file_actions_destroy(&actions);
+    if (attr_ok)
+        posix_spawnattr_destroy(&attr);
+    unlink(path);
+}
+
+/* Without file actions too, RESETIDS applies before the executable is looked
+ * up: with real uid 0 and effective uid 1, a root-only mode-0700 file is
+ * refused unless the spawn resets the IDs. The file is empty, so a spawn that
+ * finds it fails later, as not executable, or runs it as an empty script.
+ */
+static void test_spawn_resetids_lookup(void)
+{
+    char path[80];
+    snprintf(path, sizeof path, "/dev/shmem/spawn-exec-%d", (int) getpid());
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0700);
+    if (fd < 0) {
+        test_fail("spawn RESETIDS lookup fixture", strerror(errno));
+        return;
+    }
+    close(fd);
+    posix_spawnattr_t attr;
+    int attr_ok = posix_spawnattr_init(&attr) == EOK;
+    uid_t original = geteuid();
+    if (!attr_ok || posix_spawnattr_setflags(&attr, POSIX_SPAWN_RESETIDS) ||
+        seteuid(1) < 0) {
+        test_fail("spawn RESETIDS lookup setup", "cannot prepare fixture");
+    } else {
+        char *argv[] = {"spawn-exec", NULL};
+        int code = -1;
+        int denied = spawn_wait_code(path, NULL, NULL, argv, NULL, NULL, &code);
+        int found = spawn_wait_code(path, NULL, &attr, argv, NULL, NULL, &code);
+        check(denied == EACCES, "spawn lookup checks effective uid",
+              strerror(denied));
+        check(found != EACCES, "spawn RESETIDS precedes executable lookup",
+              strerror(found));
+    }
+    (void) seteuid(original);
+    if (attr_ok)
+        posix_spawnattr_destroy(&attr);
+    unlink(path);
+}
+
+void test_spawn_actions(void)
+{
+    test_spawn_action_credentials();
+    test_spawn_resetids_lookup();
+    test_spawn_file_actions_addopen();
+    test_spawn_file_actions_close_dup2_spawn();
+    test_spawn_file_actions_chdir();
 }
 
 /* Large-argument spawns. roottask receives at most one proc message union
@@ -11477,6 +11597,7 @@ void test_vfs(void)
     test_spawnp_absolute_path();
     test_spawn_search_contract();
     test_spawnattr_flags();
+    test_spawn_action_credentials();
     test_spawnattr_resetids_runtime();
     test_spawnattr_setsid();
     test_spawn_file_actions_chdir();

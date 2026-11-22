@@ -306,7 +306,7 @@ void exit_destroy_threads(process_t *prp, thread_t *keep)
                  * (including its sync cleanup), yet may hold a mutex: hand
                  * those on now.
                  */
-                thread_sync_teardown(thp);
+                sync_thread_cleanup(thp);
             }
             thread_destroy(thp);
         }
@@ -323,7 +323,16 @@ void exit_destroy_threads(process_t *prp, thread_t *keep)
  */
 void kext_exit_destroy_threads(void *arg)
 {
-    exit_destroy_threads(arg, NULL);
+    process_t *prp = arg;
+    thread_t *act = get_active_thread(get_cpunum());
+    exit_destroy_threads(prp, NULL);
+    /* A running sibling can pass its return-to-user KILLSELF check and enter
+     * a blocking call as another hart asks it to die. The reschedule IPI then
+     * sees a blocked thread. Retry from roottask until every sibling has
+     * self-reaped, including one that just joined a receive or sync queue. */
+    if (prp->pid != ROOTTASK_PID && (int) KSTATUS(act) == EOK &&
+        __atomic_load_n(&prp->num_active_threads, __ATOMIC_ACQUIRE) != 0)
+        kcall_err(act, EAGAIN);
 }
 
 /* Per-process resource teardown bodies.

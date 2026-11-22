@@ -69,7 +69,7 @@
  *
  * * The "ksync_t" struct (objects.h) is no longer instantiated.
  * "thp->blocked_on" stays NULL for all sync waits so force-ready paths skip
- * ksync_t hold-list surgery. "thp->args.mu.wait_key" records the exact user
+ * ksync_t hold-list surgery. "thp->sync_wait_key" records the exact user
  * sync_t key while a thread is chain-queued. Wakers filter by that key, so
  * unrelated primitives that collide in the same hash chain do not share wait
  * queues.
@@ -128,19 +128,18 @@ static struct sync_chain sync_chains[SYNC_NCHAINS];
 static kspinlock_t sync_pi_slock;
 
 static void sync_chain_requeue_waiter_locked(thread_t *thp,
-                                             struct sync_chain *held);
+                                             struct sync_chain *held,
+                                             sync_key_t key);
 
 struct turnstile_entry {
     sync_key_t key;
     struct turnstile_entry *next;
     thread_t *owner;
-    struct turnstile_entry **owner_prevp;
-    struct turnstile_entry *owner_next;
+    pril_t owner_loan; /* indexed by the maximum waiter priority */
     unsigned long owner_word;
     int owner_tid;
     unsigned contenders;
     unsigned refs;
-    unsigned max_waiter_prio;
     thread_t *bound; /* waiters bound but not yet queued, chain lock */
 };
 
@@ -270,13 +269,11 @@ static void sync_turnstile_insert_locked(struct sync_chain *c,
     ts->key = key;
     ts->next = c->turnstiles;
     ts->owner = NULL;
-    ts->owner_prevp = NULL;
-    ts->owner_next = NULL;
+    ts->owner_loan = (pril_t) {.type = TYPE_TURNSTILE};
     ts->owner_word = 0;
     ts->owner_tid = -1;
     ts->contenders = 0;
     ts->refs = 0;
-    ts->max_waiter_prio = 0;
     c->turnstiles = ts;
 }
 
@@ -295,26 +292,17 @@ static void sync_turnstile_ref(turnstile_t *ts)
     kspinlock_unlock(&sync_pi_slock);
 }
 
-static void sync_pi_owner_list_remove_locked(turnstile_t *ts)
+/* The priority list skips between priority levels. Updating a loan visits
+ * at most NUM_PRI levels regardless of how many mutexes an owner holds. */
+static void sync_pi_loan_set_locked(turnstile_t *ts, unsigned priority)
 {
-    if (!ts->owner_prevp)
+    if (ts->owner_loan.priority == priority)
         return;
-    *ts->owner_prevp = ts->owner_next;
-    if (ts->owner_next)
-        ts->owner_next->owner_prevp = ts->owner_prevp;
-    ts->owner = NULL;
-    ts->owner_prevp = NULL;
-    ts->owner_next = NULL;
-}
-
-static void sync_pi_owner_list_add_locked(thread_t *owner, turnstile_t *ts)
-{
-    ts->owner = owner;
-    ts->owner_prevp = &owner->owned_turnstiles;
-    ts->owner_next = owner->owned_turnstiles;
-    if (ts->owner_next)
-        ts->owner_next->owner_prevp = &ts->owner_next;
-    owner->owned_turnstiles = ts;
+    if (ts->owner)
+        pril_rem(&ts->owner->owned_turnstiles, &ts->owner_loan);
+    ts->owner_loan.priority = (uint8_t) priority;
+    if (ts->owner)
+        pril_add(&ts->owner->owned_turnstiles, &ts->owner_loan);
 }
 
 /* The owner word carries only the low 15 pid bits (pid << 16, bit 31 is the
@@ -372,19 +360,22 @@ static unsigned sync_pi_target_locked(thread_t *owner, unsigned floor)
 {
     unsigned loan = floor;
 
-    for (turnstile_t *ts = owner->owned_turnstiles; ts; ts = ts->owner_next) {
-        if (loan < ts->max_waiter_prio)
-            loan = ts->max_waiter_prio;
-    }
+    const pril_t *highest = owner->owned_turnstiles.data;
+    if (highest && loan < highest->priority)
+        loan = highest->priority;
     if (owner->held_ceiling_n != 0 && loan < owner->held_ceiling_floor)
         loan = owner->held_ceiling_floor;
     __atomic_store_n(&owner->pi_loan, (uint8_t) loan, __ATOMIC_RELEASE);
     return thread_effective_prio(owner);
 }
 
-/* Threads that sit on a sync chain; only these can have a meaningful
- * args.mu.wait_key (the args union is reused in every other state).
- */
+/* Chain membership is rechecked under the chain lock before using links. */
+static inline sync_key_t sync_queued_key(const thread_t *thp)
+{
+    return atomic_load_explicit(&thp->sync_wait_key, memory_order_relaxed);
+}
+
+/* States published after enqueueing under the sync chain lock. */
 static bool prio_on_sync_chain(const thread_t *thp)
 {
     unsigned state = __atomic_load_n(&thp->state, __ATOMIC_ACQUIRE);
@@ -434,10 +425,18 @@ static bool prio_apply(thread_t *thp,
         changed = true;
         cpu_smp_mb();
     }
+    /* A PI contender can still be running in the unlocked propagation
+     * window. Its turnstile already includes its effective priority. Copy
+     * the immutable key while the binding is protected by the PI lock. */
+    sync_key_t key = 0;
+    if (changed && thp->blocked_on_turnstile)
+        key = thp->blocked_on_turnstile->key;
+    else if (changed && prio_on_sync_chain(thp))
+        key = sync_queued_key(thp);
     kspinlock_unlock(&sync_pi_slock);
 
-    if (changed && prio_on_sync_chain(thp))
-        sync_chain_requeue_waiter_locked(thp, held);
+    if (key)
+        sync_chain_requeue_waiter_locked(thp, held, key);
     return changed;
 }
 
@@ -759,6 +758,19 @@ static void sync_pi_recompute_chain(thread_t *owner)
     prio_chain_from(owner);
 }
 
+/* The contending thread holds the chain lock while marking the owner. Exit
+ * either finds a mark and waits on this chain, or closes registration first
+ * and the contender handles a dead owner itself. */
+enum { SYNC_OWNER_TRACKED = 1, SYNC_OWNER_CLOSED = 2 };
+
+static bool sync_track_owner(thread_t *thp)
+{
+    unsigned old = atomic_fetch_or_explicit(&thp->sync_owner_flags,
+                                            SYNC_OWNER_TRACKED,
+                                            memory_order_acq_rel);
+    return !(old & SYNC_OWNER_CLOSED);
+}
+
 static void sync_turnstile_set_owner_thread_locked(turnstile_t *ts,
                                                    thread_t *owner,
                                                    unsigned long owner_word,
@@ -774,11 +786,17 @@ static void sync_turnstile_set_owner_thread_locked(turnstile_t *ts,
     }
 
     kspinlock_lock(&sync_pi_slock);
+    if (owner && !sync_track_owner(owner)) {
+        tthread_unpin(owner);
+        owner = NULL;
+    }
     old_owner = ts->owner;
     if (old_owner != owner) {
-        sync_pi_owner_list_remove_locked(ts);
+        if (old_owner)
+            pril_rem(&old_owner->owned_turnstiles, &ts->owner_loan);
+        ts->owner = owner;
         if (owner)
-            sync_pi_owner_list_add_locked(owner, ts);
+            pril_add(&owner->owned_turnstiles, &ts->owner_loan);
     } else if (owner && have_owner_pin) {
         tthread_unpin(owner);
     }
@@ -811,17 +829,18 @@ static void sync_turnstile_record_owner(turnstile_t *ts, unsigned long owner)
     sync_turnstile_set_owner_thread_locked(ts, owner_thp, owner, 1);
 }
 
+static thread_t *sync_turnstile_owner_pin_locked(turnstile_t *ts)
+{
+    thread_t *owner = ts ? ts->owner : NULL;
+    return owner && tthread_pin(owner) == EOK ? owner : NULL;
+}
+
 static thread_t *sync_turnstile_owner_pin(turnstile_t *ts)
 {
-    thread_t *owner = NULL;
-
     if (!ts)
         return NULL;
-
     kspinlock_lock(&sync_pi_slock);
-    owner = ts->owner;
-    if (owner && tthread_pin(owner) != EOK)
-        owner = NULL;
+    thread_t *owner = sync_turnstile_owner_pin_locked(ts);
     kspinlock_unlock(&sync_pi_slock);
     return owner;
 }
@@ -832,7 +851,7 @@ static void sync_turnstile_update_max_locked(struct sync_chain *c,
     unsigned max_prio = 0;
 
     for (thread_t *cur = c->head; cur; cur = cur->next.thread) {
-        if (cur->args.mu.wait_key == ts->key && max_prio < cur->priority)
+        if (sync_queued_key(cur) == ts->key && max_prio < cur->priority)
             max_prio = cur->priority;
     }
     for (thread_t *cur = ts->bound; cur; cur = cur->ts_bound_next) {
@@ -841,7 +860,7 @@ static void sync_turnstile_update_max_locked(struct sync_chain *c,
     }
 
     kspinlock_lock(&sync_pi_slock);
-    ts->max_waiter_prio = max_prio;
+    sync_pi_loan_set_locked(ts, max_prio);
     kspinlock_unlock(&sync_pi_slock);
 }
 
@@ -858,8 +877,8 @@ static void sync_turnstile_bind_waiter(turnstile_t *ts, thread_t *thp)
     ts->bound = thp;
     kspinlock_lock(&sync_pi_slock);
     thp->blocked_on_turnstile = ts;
-    if (ts->max_waiter_prio < thp->priority)
-        ts->max_waiter_prio = thp->priority;
+    if (ts->owner_loan.priority < thp->priority)
+        sync_pi_loan_set_locked(ts, thp->priority);
     kspinlock_unlock(&sync_pi_slock);
 }
 
@@ -942,33 +961,6 @@ static int sync_pi_propagate(thread_t *waiter, turnstile_t *start_ts)
     return prio_chain_walk(waiter, start_ts, NULL);
 }
 
-static void robust_owner_died(thread_t *thp);
-static void mutex_owner_died_waiters(thread_t *thp, struct sync_chain *c);
-
-void rdecl sync_thread_cleanup(thread_t *thp)
-{
-    robust_owner_died(thp);
-    if (thp->ts_spare) {
-        _sfree(thp->ts_spare, sizeof(*thp->ts_spare));
-        thp->ts_spare = NULL;
-    }
-    for (unsigned i = 0; i < SYNC_NCHAINS; i++) {
-        struct sync_chain *c = &sync_chains[i];
-
-        kspinlock_lock(&c->lock);
-        mutex_owner_died_waiters(thp, c);
-        for (turnstile_t *ts = c->turnstiles; ts; ts = ts->next) {
-            kspinlock_lock(&sync_pi_slock);
-            int owned = ts->owner == thp;
-            kspinlock_unlock(&sync_pi_slock);
-            if (!owned)
-                continue;
-            sync_turnstile_set_owner_thread_locked(ts, NULL, 0, 0);
-        }
-        kspinlock_unlock(&c->lock);
-    }
-}
-
 #ifdef CONFIG_DEBUG_INJECT
 /* Debug builds: crash if thp is still linked on any sync wait chain. A thread
  * that leaves STATE_MUTEX, STATE_CONDVAR or STATE_SEM, or is freed, while still
@@ -996,7 +988,7 @@ void sync_chains_assert_not_queued(const thread_t *thp, const char *what)
                 "sync chain %u still holds thread %p (%s): tid %d state %u "
                 "wait_key %#lx prev %p next %p ra %p\n",
                 i, (const void *) thp, what, thp->tid, (unsigned) thp->state,
-                (unsigned long) thp->args.mu.wait_key,
+                (unsigned long) thp->sync_wait_key,
                 (void *) thp->prev.thread, (void *) thp->next.thread,
                 __builtin_return_address(0));
             thr_trace_dump(thp);
@@ -1023,7 +1015,6 @@ static void sync_enqueue(struct sync_chain *c, sync_key_t key, thread_t *thp)
     thread_t *cur = c->head;
     thread_t **insertp = &c->head;
 
-    thp->args.mu.wait_key = key;
     thp->blocked_on = NULL;
     IPC_BLK(thp);
 
@@ -1056,7 +1047,7 @@ static void sync_enqueue(struct sync_chain *c, sync_key_t key, thread_t *thp)
         }
         if (cur->next.thread == cur) /* bound a pre-existing 1-node self-loop */
             break;
-        if (cur->args.mu.wait_key == key && cur->priority < thp->priority)
+        if (sync_queued_key(cur) == key && cur->priority < thp->priority)
             break;
         insertp = &cur->next.thread;
         cur = cur->next.thread;
@@ -1067,6 +1058,7 @@ static void sync_enqueue(struct sync_chain *c, sync_key_t key, thread_t *thp)
     if (cur)
         cur->prev.thread = &thp->next.thread;
     *insertp = thp;
+    atomic_store_explicit(&thp->sync_wait_key, key, memory_order_release);
 }
 
 static void sync_unlink_waiter_only(thread_t *thp)
@@ -1080,22 +1072,10 @@ static void sync_unlink_waiter_only(thread_t *thp)
     thp->prev.thread = NULL;
 }
 
-/* Caller holds c->lock. Whether thp is linked on chain c. */
-static bool sync_chain_holds_locked(struct sync_chain *c, thread_t *thp)
-{
-    for (thread_t *cur = c->head; cur; cur = cur->next.thread) {
-        if (cur == thp)
-            return true;
-        if (cur->next.thread == cur) /* see sync_enqueue */
-            break;
-    }
-    return false;
-}
-
 static void sync_chain_requeue_waiter_locked(thread_t *thp,
-                                             struct sync_chain *held)
+                                             struct sync_chain *held,
+                                             sync_key_t key)
 {
-    sync_key_t key = thp->args.mu.wait_key;
     struct sync_chain *c;
     turnstile_t *ts;
 
@@ -1106,20 +1086,18 @@ static void sync_chain_requeue_waiter_locked(thread_t *thp,
     if (held != c)
         kspinlock_lock(&c->lock);
 
-    /* wait_key and prev.thread alias other state once thp has left the chain
-     * (the args union and the PRIL links are reused), so neither proves thp is
-     * queued here: find it on the chain before moving it.
-     */
-    if (thp->args.mu.wait_key == key && thp->prev.thread &&
-        sync_chain_holds_locked(c, thp)) {
+    /* Only enqueue and dequeue publish this key, under its chain lock. */
+    if (sync_queued_key(thp) == key) {
         sync_unlink_waiter_only(thp);
         sync_enqueue(c, key, thp);
-        kspinlock_lock(&sync_pi_slock);
-        ts = thp->blocked_on_turnstile;
-        kspinlock_unlock(&sync_pi_slock);
-        if (ts)
-            sync_turnstile_update_max_locked(c, ts);
     }
+    kspinlock_lock(&sync_pi_slock);
+    ts = thp->blocked_on_turnstile;
+    if (ts && ts->key != key)
+        ts = NULL;
+    kspinlock_unlock(&sync_pi_slock);
+    if (ts)
+        sync_turnstile_update_max_locked(c, ts);
     if (held != c)
         kspinlock_unlock(&c->lock);
 }
@@ -1130,7 +1108,7 @@ static void sync_dequeue(struct sync_chain *c, thread_t *thp)
     if (!thp->prev.thread)
         return;
     sync_unlink_waiter_only(thp);
-    thp->args.mu.wait_key = 0;
+    atomic_store_explicit(&thp->sync_wait_key, 0, memory_order_release);
     sync_turnstile_unbind_waiter_locked(c, thp);
 }
 
@@ -1138,7 +1116,7 @@ static void sync_dequeue(struct sync_chain *c, thread_t *thp)
 static int sync_has_waiter(struct sync_chain *c, sync_key_t key)
 {
     for (thread_t *cur = c->head; cur; cur = cur->next.thread) {
-        if (cur->args.mu.wait_key == key)
+        if (sync_queued_key(cur) == key)
             return 1;
     }
     return 0;
@@ -1163,7 +1141,7 @@ static unsigned long mutex_waiting_bit_locked(struct sync_chain *c,
     if (ts)
         return ts->contenders > (except ? 1U : 0U) ? RTMUX_SYNC_WAITING : 0;
     for (thread_t *cur = c->head; cur; cur = cur->next.thread) {
-        if (cur != except && cur->args.mu.wait_key == key)
+        if (cur != except && sync_queued_key(cur) == key)
             return RTMUX_SYNC_WAITING;
     }
     return 0;
@@ -1176,7 +1154,7 @@ static thread_t *sync_dequeue_head(struct sync_chain *c, sync_key_t key)
     thread_t *best = NULL;
 
     for (thread_t *thp = c->head; thp; thp = thp->next.thread) {
-        if (thp->args.mu.wait_key == key &&
+        if (sync_queued_key(thp) == key &&
             (!best || best->priority < thp->priority)) {
             best = thp;
         }
@@ -1186,40 +1164,12 @@ static thread_t *sync_dequeue_head(struct sync_chain *c, sync_key_t key)
     return best;
 }
 
-/* Remove a thread from the chain-keyed sync wait queue during force_ready()
- * paths (timeout, signal/cancel, destroy). Chain waiters identify their queue
- * by args.mu.wait_key; there is no other sync wait queue.
- *
- * force_ready reads thp->state without any lock, so thp may have been woken,
- * run and blocked somewhere else by the time this takes the chain lock. Every
- * field read here before the lock is then stale: args.mu.wait_key aliases the
- * message arguments and prev.thread a channel queue link. Only under the chain
- * lock does a sync state mean that the thread is queued: a waker unlinks it
- * (clearing prev) under that lock before it readies it, and a waiter stamps its
- * state under the same lock it queued with.
- *
- * Returns true when thp was queued and is now unlinked, so the caller readies
- * it. False means it is not queued: a waker unlinked it and is about to ready
- * it (the caller must wait for that, or the thread may be destroyed or move on
- * before the waker's ready), or it waits somewhere else, or not at all, so the
- * caller starts over from its state.
- *
- * A thread woken and queued again on the same key passes the test and is
- * unblocked: that unblock reaches its new wait, as if it had arrived just after
- * the thread blocked again, a valid order for an interrupt or a cancel.
- * Wait_key is only written under its own chain lock, so the read here is
- * consistent. The chain address is computed from the key read before the lock,
- * so the state read under the lock is ordered after that read: a thread seen
- * with message arguments in the union has already left the sync states.
- *
- * The queued test is O(1): under the chain lock a sync state with the matching
- * key and a back link that points at thp mean thp is linked here. Walking the
- * chain to prove it would add O(chain) to the interrupt-disabled window of
- * every timeout and interrupt unblock of a condvar or semaphore waiter.
- */
+/* Claim the wait under its owning lock. A zero key means the waker
+ * already owns the transition to READY. The key lives outside the kcall
+ * argument union and cannot be overwritten by a subsequent message. */
 bool rdecl sync_chain_force_ready(thread_t *thp)
 {
-    sync_key_t key = thp->args.mu.wait_key;
+    sync_key_t key = atomic_load_explicit(&thp->sync_wait_key, memory_order_acquire);
     struct sync_chain *c;
     turnstile_t *ts;
     thread_t *owner;
@@ -1229,15 +1179,14 @@ bool rdecl sync_chain_force_ready(thread_t *thp)
 
     c = sync_chain_of(key);
     kspinlock_lock(&c->lock);
-    if (!prio_on_sync_chain(thp) || thp->args.mu.wait_key != key ||
-        !thp->prev.thread || *thp->prev.thread != thp) {
+    if (!prio_on_sync_chain(thp) || sync_queued_key(thp) != key) {
         kspinlock_unlock(&c->lock);
         return false;
     }
     kspinlock_lock(&sync_pi_slock);
     ts = thp->blocked_on_turnstile;
+    owner = sync_turnstile_owner_pin_locked(ts);
     kspinlock_unlock(&sync_pi_slock);
-    owner = sync_turnstile_owner_pin(ts);
     sync_dequeue(c, thp);
     if (thp->state == STATE_MUTEX && !sync_has_waiter(c, key)) {
         if (ts)
@@ -1287,11 +1236,14 @@ static int sync_probe(thread_t *act, sync_t *sync)
 #define MUTEX_BUSY 0           /* owned by another thread */
 #define MUTEX_DESTROYED (-1)   /* EINVAL */
 #define MUTEX_RELOCK (-2)      /* EDEADLK: non-recursive re-lock */
+#define MUTEX_SATURATED (-4)   /* recursive depth limit reached */
 #define MUTEX_UNRECOVERED (-3) /* ENOTRECOVERABLE */
 
 static int mutex_try_errno(int rc)
 {
     switch (rc) {
+    case MUTEX_SATURATED:
+        return EAGAIN;
     case MUTEX_RELOCK:
         return EDEADLK;
     case MUTEX_UNRECOVERED:
@@ -1339,7 +1291,9 @@ static int mutex_try_acquire(thread_t *act, sync_t *sync)
     if ((owner & ~RTMUX_SYNC_WAITING) == want) {
         if ((sync->count & RTMUX_SYNC_NONRECURSIVE) != 0)
             return MUTEX_RELOCK;
-        /* Recursive acquire by same owner — count the recursion. */
+        unsigned long depth_mask = rtmux_sync_depth_mask(sync->count);
+        if (((unsigned long) sync->count & depth_mask) == depth_mask)
+            return MUTEX_SATURATED;
         sync->count++;
         return MUTEX_RECURSED;
     }
@@ -1620,11 +1574,6 @@ static void robust_rec_put(thread_t *act, struct robust_hold *rec)
         _sfree(rec, sizeof(*rec));
 }
 
-/* Stands in for the list head of a thread whose list was taken for its death
- * (robust_owner_died). It matches no key and ends the list.
- */
-static struct robust_hold robust_closed;
-
 /* File rec on thp's list; uva is thp's address of the mutex. Fails, leaving rec
  * alone, if thp is being destroyed: its list is closed, and nothing filed on it
  * would be handed on. A caller that hands a mutex to a waiter files the record
@@ -1637,7 +1586,7 @@ static bool robust_attach(thread_t *thp, struct robust_hold *rec, sync_t *uva)
     bool ok;
 
     kspinlock_lock(&sync_pi_slock);
-    ok = thp->robust_held != &robust_closed;
+    ok = sync_track_owner(thp);
     if (ok) {
         rec->uva = uva;
         rec->next = thp->robust_held;
@@ -1771,7 +1720,7 @@ static thread_t *robust_pick_owner(struct sync_chain *c,
                                    struct robust_hold *rec)
 {
     for (thread_t *thp = c->head; thp; thp = thp->next.thread) {
-        if (thp->args.mu.wait_key != key)
+        if (sync_queued_key(thp) != key)
             continue;
         if (robust_attach(thp, rec, thp->args.mu.mutex)) {
             sync_dequeue(c, thp);
@@ -1846,7 +1795,7 @@ static struct robust_hold *robust_hand_on(thread_t *dead,
      * cannot find the word without the record.
      */
     for (thread_t *cand = c->head; cand && !head; cand = cand->next.thread) {
-        if (cand->args.mu.wait_key != key ||
+        if (sync_queued_key(cand) != key ||
             !robust_attach(cand, rec, cand->args.mu.mutex))
             continue;
 
@@ -1916,25 +1865,18 @@ static void robust_owner_died(thread_t *thp)
     struct robust_hold *rec;
     struct robust_hold *next;
 
-    /* Take the whole list and close it, so that a hand-off that races with this
-     * death either filed its record already (it is on the list, and the chain
-     * lock in robust_hand_on orders us after it) or finds the list closed and
-     * passes the mutex on.
-     */
+    /* Registration is closed. Wait for any earlier attach to publish
+     * its record under the same lock, then take the complete list. */
     kspinlock_lock(&sync_pi_slock);
     rec = thp->robust_held;
-    thp->robust_held = &robust_closed;
+    thp->robust_held = NULL;
     kspinlock_unlock(&sync_pi_slock);
 
-    for (; rec && rec != &robust_closed; rec = next) {
+    for (; rec; rec = next) {
         next = rec->next;
         rec = robust_hand_on(thp, rec);
         if (rec)
             _sfree(rec, sizeof(*rec));
-    }
-    if (thp->robust_spare) {
-        _sfree(thp->robust_spare, sizeof(*thp->robust_spare));
-        thp->robust_spare = NULL;
     }
 }
 
@@ -1946,10 +1888,9 @@ static void robust_owner_died(thread_t *thp)
  * that, both run under the mutex's chain lock against a thread already stamped
  * STATE_DEAD, which is set before sync_thread_cleanup runs:
  *
- * - a thread that dies scans the waiters for mutexes whose lock word names it
- *   (mutex_owner_died_waiters);
- * - a locker about to queue first checks that the word's owner is alive
- *   (mutex_owner_gone).
+ * - exit closes registration and scans waiters if any owner state was registered;
+ * - a locker publishes WAITING, then registers the owner under the chain
+ *   lock. A thread already closed for exit is treated as a dead owner.
  *
  * Whichever comes second sees the other's effect, so a waiter is never missed.
  * The mutex is then left RTMUX_SYNC_NOTRECOVERABLE and its waiters, and every
@@ -2014,7 +1955,8 @@ static bool mutex_owner_gone(sync_t *sync, unsigned long *owner)
     if (mutex_word_special(word) || (word & RTMUX_SYNC_OWNER_MASK) == 0)
         return false;
     thp = sync_lookup_owner_pin(word);
-    gone = !thp || __atomic_load_n(&thp->state, __ATOMIC_ACQUIRE) == STATE_DEAD;
+    gone = !thp || !sync_track_owner(thp) ||
+           __atomic_load_n(&thp->state, __ATOMIC_ACQUIRE) == STATE_DEAD;
     if (thp)
         tthread_unpin(thp);
     *owner = word & RTMUX_SYNC_OWNER_MASK;
@@ -2059,7 +2001,15 @@ static int mutex_try_acquire_locked(thread_t *act,
         unsigned long owner;
         int rc = mutex_try_acquire(act, sync);
 
-        if (rc != MUTEX_BUSY || mutex_robust(sync) ||
+        if (rc != MUTEX_BUSY)
+            return rc;
+        /* Once WAITING is visible, a user unlock must enter this chain
+         * before handing the mutex to a new owner. Register the owner
+         * only after publication, including after the PI walk relocks. */
+        inject_mutex_lock_early(act->process);
+        atomic_or_64((volatile unsigned long *) &sync->owner,
+                     RTMUX_SYNC_WAITING);
+        if (mutex_robust(sync) ||
             !mutex_owner_gone(sync, &owner))
             return rc;
         if (mutex_fail_dead_owner(sync, owner)) {
@@ -2083,7 +2033,7 @@ static void mutex_owner_died_waiters(thread_t *thp, struct sync_chain *c)
     do {
         failed = false;
         for (thread_t *w = c->head; w; w = w->next.thread) {
-            sync_key_t key = w->args.mu.wait_key;
+            sync_key_t key = sync_queued_key(w);
             sync_t *ks;
 
             if (w->state != STATE_MUTEX)
@@ -2099,6 +2049,40 @@ static void mutex_owner_died_waiters(thread_t *thp, struct sync_chain *c)
             }
         }
     } while (failed);
+}
+
+void rdecl sync_thread_cleanup(thread_t *thp)
+{
+    unsigned old = atomic_fetch_or_explicit(&thp->sync_owner_flags,
+                                            SYNC_OWNER_CLOSED,
+                                            memory_order_acq_rel);
+    if (old & SYNC_OWNER_TRACKED)
+        robust_owner_died(thp);
+    if (thp->robust_spare) {
+        _sfree(thp->robust_spare, sizeof(*thp->robust_spare));
+        thp->robust_spare = NULL;
+    }
+    if (thp->ts_spare) {
+        _sfree(thp->ts_spare, sizeof(*thp->ts_spare));
+        thp->ts_spare = NULL;
+    }
+    if (!(old & SYNC_OWNER_TRACKED))
+        return;
+    for (unsigned i = 0; i < SYNC_NCHAINS; i++) {
+        struct sync_chain *c = &sync_chains[i];
+
+        kspinlock_lock(&c->lock);
+        mutex_owner_died_waiters(thp, c);
+        for (turnstile_t *ts = c->turnstiles; ts; ts = ts->next) {
+            kspinlock_lock(&sync_pi_slock);
+            int owned = ts->owner == thp;
+            kspinlock_unlock(&sync_pi_slock);
+            if (!owned)
+                continue;
+            sync_turnstile_set_owner_thread_locked(ts, NULL, 0, 0);
+        }
+        kspinlock_unlock(&c->lock);
+    }
 }
 
 /* Finish a lock attempt that ended with a result other than MUTEX_BUSY.
@@ -2143,6 +2127,7 @@ static void mutex_lock_body(thread_t *act,
     turnstile_t *allocated_ts = NULL;
     turnstile_t *free_ts = NULL;
     struct robust_hold *free_rec = NULL;
+    thread_t *changed_owner = NULL;
     int pi_enabled;
     int rc;
 
@@ -2182,11 +2167,6 @@ retry_contended:
         return;
     }
 
-    /* Mark the lock word as having waiters. This is observed by mutex_unlock to
-     * know it must wake someone.
-     */
-    inject_mutex_lock_early(act->process);
-    atomic_or_64((volatile unsigned long *) &sync->owner, RTMUX_SYNC_WAITING);
     pi_enabled = mutex_pi_enabled(sync);
     turnstile_t *ts = NULL;
     if (pi_enabled) {
@@ -2227,6 +2207,12 @@ retry_contended:
         rc = sync_pi_propagate(act, ts);
         inject_mutex_lock_propagated(act->process);
         kspinlock_lock(&c->lock);
+        /* An explicit lock can report a PI cycle. A condition wait has
+         * already given up its mutex and must regain it before returning.
+         * Stop propagation at the same bound, but keep this waiter queued:
+         * a timeout or release elsewhere in the chain can break the cycle. */
+        if (rc == EDEADLK && (act->flags & RTMUX_FLG_THR_ACQUIRE_MUTEX))
+            rc = EOK;
         if (rc != EOK) {
             thread_t *owner = sync_turnstile_owner_pin(ts);
 
@@ -2246,10 +2232,23 @@ retry_contended:
 
         rc = mutex_try_acquire_locked(act, sync, c, key);
         if (rc != MUTEX_BUSY) {
+            thread_t *old_owner = sync_turnstile_owner_pin(ts);
             sync_turnstile_unbind_waiter_locked(c, act);
-            sync_turnstile_set_owner_thread_locked(ts, NULL, 0, 0);
-            sync_turnstile_free_idle_locked(c, ts);
+            bool waiting = mutex_waiting_bit_locked(c, key, ts, NULL);
+            if (waiting && rc > 0) {
+                atomic_or_64((volatile unsigned long *) &sync->owner,
+                             RTMUX_SYNC_WAITING);
+                sync_turnstile_set_owner_thread_locked(ts, act, want, 0);
+            } else if (!waiting) {
+                sync_turnstile_set_owner_thread_locked(ts, NULL, 0, 0);
+                sync_turnstile_free_idle_locked(c, ts);
+            }
             kspinlock_unlock(&c->lock);
+            sync_pi_recompute_owner(old_owner);
+            if (old_owner)
+                tthread_unpin(old_owner);
+            if (waiting && rc > 0)
+                sync_pi_recompute_owner(act);
             sync_ts_put(act, free_ts);
             mutex_lock_done(act, sync, recp, rc);
             return;
@@ -2264,38 +2263,19 @@ retry_contended:
         unsigned long now = *(volatile unsigned long *) &sync->owner;
 
         sync_turnstile_record_owner(ts, now);
-        if ((now & ~RTMUX_SYNC_WAITING) != (lent_to & ~RTMUX_SYNC_WAITING)) {
-            thread_t *owner = sync_turnstile_owner_pin(ts);
-
-            sync_pi_recompute_owner_held(owner, c);
-            if (owner)
-                tthread_unpin(owner);
-        }
+        if ((now & ~RTMUX_SYNC_WAITING) != (lent_to & ~RTMUX_SYNC_WAITING))
+            changed_owner = sync_turnstile_owner_pin(ts);
         sync_turnstile_bound_remove_locked(ts, act);
     }
 
-    /* Enqueue self, transition state under the chain lock, leaving our own
-     * address of the mutex: a handoff to a robust waiter files its record under
-     * it, and the owner's death reaches the lock word through it.
-     */
+    /* Handoff can make this waiter the owner of a mutex with other waiters.
+     * Register it now. Keep its own mutex address for robust handoff. */
+    (void) sync_track_owner(act);
+    act->debug_sync_mutex = (uintptr_t) sync;
     act->args.mu.mutex = sync;
     sync_enqueue(c, key, act);
     if (pi_enabled)
         sync_turnstile_update_max_locked(c, ts);
-
-    /* A PI lock dropped the chain lock to propagate priority after the first
-     * publish above. A handoff or a failed propagation in that window counts
-     * this waiter as bound (mutex_waiting_bit_locked) and keeps the bit, but an
-     * unlock that found nobody queued stores a free word, and a user-space
-     * locker can take it, without the bit, before this waiter relocks;
-     * republish it now that this waiter is queued. A non-PI lock never dropped
-     * the lock. A special word (the owner died meanwhile; the death scan runs
-     * under this chain lock) has no waiting bit and must not gain one.
-     */
-    if (pi_enabled &&
-        !mutex_word_special(*(volatile unsigned long *) &sync->owner))
-        atomic_or_64((volatile unsigned long *) &sync->owner,
-                     RTMUX_SYNC_WAITING);
 
     /* Lost-wakeup guard (futex re-check). The holder releases the mutex
      * entirely in user space: pthread_mutex_unlock clears the owner-id bits of
@@ -2341,6 +2321,10 @@ retry_contended:
         sync_pi_recompute_owner(old_owner);
         if (old_owner)
             tthread_unpin(old_owner);
+        if (changed_owner)
+            tthread_unpin(changed_owner); /* old_owner was just recomputed */
+        if (pi_enabled && waiting)
+            sync_pi_recompute_owner(act);
         sync_ts_put(act, free_ts);
         mutex_lock_done(act, sync, recp, MUTEX_TAKEN);
         return;
@@ -2363,6 +2347,12 @@ retry_contended:
      */
     extern void unready_release(thread_t *, int, kspinlock_t *);
     unready_release(act, STATE_MUTEX, &c->lock);
+    /* The replacement owner can itself be bound on a different chain.
+     * Refresh its effective priority only after dropping this chain lock. */
+    if (changed_owner) {
+        sync_pi_recompute_owner(changed_owner);
+        tthread_unpin(changed_owner);
+    }
 
     /* act may own the mutex and run on another hart by now, so its spare slot
      * is off limits: free the idle turnstile outright.
@@ -2709,6 +2699,7 @@ int kdecl ksys_sync_condvar_wait(thread_t *act,
      * would hand the mutex off with a stale nonzero depth.
      */
     atomic_or(&act->flags, RTMUX_FLG_THR_ACQUIRE_MUTEX);
+    act->debug_sync_mutex = (uintptr_t) mutex;
     act->args.mu.mutex = mutex;
     long saved_mutex_count = mutex->count;
     int bound_mutex_pi = (saved_mutex_count & RTMUX_SYNC_PRIOINHERIT) != 0;
@@ -2971,6 +2962,7 @@ int kdecl ksys_sync_sem_post(thread_t *act,
          * STATE_SEM; ready_default transitions it.
          */
         kspinlock_unlock(&c->lock);
+        inject_sync_waker_stall(next);
         ready(next);
     } else {
         sem->count++;

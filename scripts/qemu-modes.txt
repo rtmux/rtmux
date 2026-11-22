@@ -55,6 +55,7 @@ lkl-netd-restart
 lkl-netd-revoke
 lkl-netd-stale
 loader-negative
+lock-debug
 logger-restart
 monotonic-time
 mutex-uncontended

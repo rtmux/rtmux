@@ -1034,7 +1034,8 @@ out:
  * run at B's priority: the loan went to H, which no longer owns the mutex.
  * Needs /bin/inject and four harts; otherwise the case is skipped.
  */
-#define MHL_STALL_MS 4000L
+#define MHL_STALL_MS 10000L /* watchdog if the observer exits before release \
+                             */
 #define MHL_PRIO_H 20
 #define MHL_PRIO_W 30
 #define MHL_PRIO_B 50
@@ -1072,8 +1073,141 @@ static void *mhl_late(void *raw)
     return NULL;
 }
 
+struct bound_worker {
+    atomic_int go, acquired, done;
+    unsigned mask;
+    int priority;
+};
+
+static void *bound_locker(void *arg)
+{
+    struct bound_worker *w = arg;
+    (void) test_pin_mask(w->mask);
+    (void) set_fifo(w->priority);
+    while (!atomic_load(&w->go))
+        sleep_ms(1);
+    pthread_mutex_lock(&mhl_mutex);
+    set_flag(&w->acquired);
+    while (!atomic_load(&w->done))
+        sleep_ms(1);
+    pthread_mutex_unlock(&mhl_mutex);
+    return NULL;
+}
+
+/* Release the mutex with both waiters bound but neither on the wait queue.
+ * The lower-priority waiter takes the free word first and must inherit the
+ * other waiter's loan before that waiter resumes its walk. */
+static void mutex_bound_acquire(void)
+{
+    struct bound_worker first = {.mask = 2, .priority = MHL_PRIO_W};
+    struct bound_worker late = {.mask = 4, .priority = MHL_PRIO_B};
+    struct stall_watch a = {.pid = -1}, b = {.pid = -1};
+    pthread_t wa, wb;
+    bool ha, hb, held = true;
+    char pid[16];
+    snprintf(pid, sizeof pid, "%d", (int) getpid());
+    pthread_mutex_lock(&mhl_mutex);
+    ha = spawn(&wa, bound_locker, &first, "bound acquire first worker");
+    hb = spawn(&wb, bound_locker, &late, "bound acquire late worker");
+    if (!ha || !hb || inject_run("stall-lock", pid, "10000") != 0 ||
+        inject_run("stall-lock-propagated", pid, "10000") != 0 ||
+        stall_watch_start(&a, "lock") != 0 ||
+        stall_watch_start(&b, "propagated") != 0)
+        goto failed;
+    set_flag(&first.go);
+    if (!stall_watch_entered(&a)) {
+        test_fail("first waiter bound", "lock stall timed out");
+        goto out;
+    }
+    set_flag(&late.go);
+    if (!stall_watch_entered(&b)) {
+        test_fail("late waiter bound", "propagated stall timed out");
+        goto out;
+    }
+    pthread_mutex_unlock(&mhl_mutex);
+    held = false;
+    stall_watch_release(&a);
+    if (!wait_flag(&first.acquired)) {
+        test_fail("first bound waiter acquired",
+                  "did not return from mutex lock");
+        goto out;
+    }
+    check(
+        wait_prio(wa, MHL_PRIO_B) == MHL_PRIO_B && !atomic_load(&late.acquired),
+        "bound acquirer inherits from the remaining bound waiter",
+        "new owner did not inherit before the waiter queued");
+    goto out;
+failed:
+    test_fail("bound acquire setup", "did not reach both injection windows");
+out:
+    set_flag(&first.go);
+    set_flag(&late.go);
+    set_flag(&first.done);
+    set_flag(&late.done);
+    stall_watch_release(&a);
+    stall_watch_release(&b);
+    if (held)
+        pthread_mutex_unlock(&mhl_mutex);
+    if (ha)
+        (void) pthread_join(wa, NULL);
+    if (hb)
+        (void) pthread_join(wb, NULL);
+    stall_watch_finish(&a);
+    stall_watch_finish(&b);
+}
+
+/* The new owner takes a free word in user space while the only waiter
+ * is paused after lending to the original owner. No handoff can supply
+ * the loan: the waiter must reread the word when its walk resumes. */
+static void mutex_changed_owner(void)
+{
+    struct bound_worker waiter = {.mask = 4, .priority = MHL_PRIO_B};
+    struct bound_worker owner = {.mask = 2, .priority = MHL_PRIO_W};
+    struct stall_watch watch = {.pid = -1};
+    pthread_t tw, to;
+    bool hw, ho, held = true;
+    char pid[16];
+    snprintf(pid, sizeof pid, "%d", (int) getpid());
+    pthread_mutex_lock(&mhl_mutex);
+    hw = spawn(&tw, bound_locker, &waiter, "owner-change waiter");
+    ho = spawn(&to, bound_locker, &owner, "owner-change replacement");
+    if (!hw || !ho || inject_run("stall-lock-propagated", pid, "10000") ||
+        stall_watch_start(&watch, "propagated"))
+        goto failed;
+    set_flag(&waiter.go);
+    if (!stall_watch_entered(&watch))
+        goto failed;
+    pthread_mutex_unlock(&mhl_mutex);
+    held = false;
+    set_flag(&owner.go);
+    if (!wait_flag(&owner.acquired) || prio_of(to, NULL) != MHL_PRIO_W)
+        goto failed;
+    stall_watch_release(&watch);
+    check(wait_prio(to, MHL_PRIO_B) == MHL_PRIO_B,
+          "waiter lends to the owner that replaced its original owner",
+          "new owner did not inherit when the waiter resumed");
+    goto out;
+failed:
+    test_fail("changed owner setup",
+              "replacement did not acquire during the stall");
+out:
+    stall_watch_release(&watch);
+    set_flag(&waiter.go);
+    set_flag(&owner.go);
+    set_flag(&waiter.done);
+    set_flag(&owner.done);
+    if (held)
+        pthread_mutex_unlock(&mhl_mutex);
+    if (hw)
+        (void) pthread_join(tw, NULL);
+    if (ho)
+        (void) pthread_join(to, NULL);
+    stall_watch_finish(&watch);
+}
+
 int mutex_handoff_loan(void)
 {
+    struct stall_watch watch = {.pid = -1};
     struct sched_param saved;
     pthread_t h, w, b;
     char pid[16], ms[16], detail[96];
@@ -1107,14 +1241,16 @@ int mutex_handoff_loan(void)
         goto out;
     }
     sleep_ms(200); /* W has left its own walk and queued: it must not eat the stall */
-    if (inject_run("stall-lock-propagated", pid, ms) != 0) {
+    if (inject_run("stall-lock-propagated", pid, ms) != 0 ||
+        stall_watch_start(&watch, "propagated") != 0) {
         test_fail("mutex_handoff_loan fixture", "inject refused");
         goto out;
     }
     have_b = spawn(&b, mhl_late, NULL, "mutex_handoff_loan late waiter");
 
     /* B's walk has reached H: it is in, or just about to enter, its stall. */
-    if (!have_b || wait_prio(h, MHL_PRIO_B) != MHL_PRIO_B) {
+    if (!have_b || !stall_watch_entered(&watch) ||
+        wait_prio(h, MHL_PRIO_B) != MHL_PRIO_B) {
         test_fail("mutex_handoff_loan fixture", "late waiter did not lend");
         goto out;
     }
@@ -1133,9 +1269,16 @@ int mutex_handoff_loan(void)
                   "the stall ran out before the handoff");
         goto out;
     }
-    check(inject_run("alloc-status", "consumed", NULL) == 0,
-          "the injected stall held the late waiter in its window",
-          "the stall was not taken");
+    struct sched_param raised = {.sched_priority = MHL_PRIO_B + 1};
+    check(__sched_set(0, b, SCHED_FIFO, &raised) == 0 &&
+              wait_prio(w, MHL_PRIO_B + 1) == MHL_PRIO_B + 1,
+          "bound waiter's changed priority reaches the new mutex owner",
+          "owner retained the previous turnstile maximum");
+    raised.sched_priority = MHL_PRIO_B;
+    check(__sched_set(0, b, SCHED_FIFO, &raised) == 0 &&
+              wait_prio(w, MHL_PRIO_B) == MHL_PRIO_B,
+          "bound waiter withdrawing a priority level updates its owner",
+          "owner retained the higher turnstile maximum");
     cur = wait_prio_n(w, MHL_PRIO_B, (int) MHL_STALL_MS + POLL_MS);
     snprintf(detail, sizeof detail, "owner runs at %d, want %d", cur,
              MHL_PRIO_B);
@@ -1143,6 +1286,7 @@ int mutex_handoff_loan(void)
           "PI waiter not yet queued still lends to the next owner", detail);
 
 out:
+    stall_watch_finish(&watch);
     set_flag(&mhl_h_release);
     set_flag(&mhl_w_release);
     if (have_h)
@@ -1151,6 +1295,9 @@ out:
         (void) pthread_join(w, NULL);
     if (have_b)
         (void) pthread_join(b, NULL);
+    mutex_bound_acquire();
+    mutex_changed_owner();
+    pthread_mutex_destroy(&mhl_mutex);
     (void) test_pin_mask(~0U);
     (void) __sched_set(0, 0, policy, &saved);
     return 0;

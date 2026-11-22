@@ -301,8 +301,18 @@ fi
 # -vv for TRACE. mainfs= is read by /sbin/init from /sys/cmdline.
 CMDLINE="-Dsbi $EXTRA_CMDLINE mainfs=$MAINFS_DEV"
 
-# For SMP debugging
-add_qemu_opts -accel tcg,thread=multi
+# EMU_ICOUNT=<shift> runs every hart on one host thread with the virtual clock
+# counting guest instructions (one per 2^shift ns) and jumping over idle time,
+# so guest-visible timing does not depend on how the host schedules QEMU. The
+# RTC follows the same clock. Harts then interleave at translation-block
+# boundaries only, so this mode is for timing checks, not for finding races.
+if [[ -n "${EMU_ICOUNT:-}" ]]; then
+    add_qemu_opts -accel tcg,thread=single \
+        -icount "shift=${EMU_ICOUNT},sleep=off" -rtc clock=vm
+else
+    # One host thread per hart, for SMP debugging.
+    add_qemu_opts -accel tcg,thread=multi
+fi
 
 enforce_headless_qemu_opts
 exec "${QEMU_HEADLESS_ENV[@]}" "$QEMU" "${QEMUOPTS[@]}" -append "$CMDLINE"

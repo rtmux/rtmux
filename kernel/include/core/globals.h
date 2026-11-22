@@ -435,7 +435,6 @@ EXT void *kcallptr;
 /* ipicmds[] now lives at pcpu_array[hart].pc_ipicmds */
 EXT intrspin_t intr_slock;
 EXT intrspin_t clock_slock;
-EXT intrspin_t debug_slock;
 
 #endif
 

@@ -10,8 +10,9 @@
 #include <sys/iomsg.h>
 
 #include <posix.h>
+#include <sys/loader-fd.h>
 
-int close(int fd)
+int __close_fd(int fd, int track)
 {
     io_close_t msg;
     int ret, err;
@@ -24,7 +25,8 @@ int close(int fd)
          * still reserved -- otherwise a concurrent open() could reuse the
          * number and this forget would clear the new mapping.
          */
-        __atfd_forget(fd);
+        if (track)
+            __atfd_forget(fd);
         if ((err = connect_detach_r((uint64_t) fd)) == EOK)
             return ret;
         if (ret != -1) {
@@ -33,4 +35,9 @@ int close(int fd)
         }
     }
     return -1;
+}
+
+int close(int fd)
+{
+    return __close_fd(fd, 1);
 }

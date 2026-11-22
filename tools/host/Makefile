@@ -35,13 +35,13 @@ PROGS = $(BUILD_BASE)/mkasmoff $(BUILD_BASE)/mkromfs $(BUILD_BASE)/treeromfs \
         $(BUILD_BASE)/bootstrap-manifest-test $(BUILD_BASE)/elf-range-test \
         $(BUILD_BASE)/ldso-hash-test $(BUILD_BASE)/ldso-page-test \
         $(BUILD_BASE)/ldso-parse-test $(BUILD_BASE)/ldso-path-test \
-        $(BUILD_BASE)/tty-ldisc-test $(BUILD_BASE)/spawn-search-test $(BUILD_BASE)/cpio-parser-test $(BUILD_BASE)/spawn-fd-policy-test \
+        $(BUILD_BASE)/ticket-lock-test $(BUILD_BASE)/tty-ldisc-test $(BUILD_BASE)/spawn-search-test $(BUILD_BASE)/cpio-parser-test $(BUILD_BASE)/spawn-fd-policy-test \
         $(BUILD_BASE)/serial-reply-test $(BUILD_BASE)/open-bind-test $(BUILD_BASE)/outcomes-test \
         $(BUILD_BASE)/sv39-lookup-test $(BUILD_BASE)/sv39-manip-test \
         $(BUILD_BASE)/strftime-test $(BUILD_BASE)/sh-scan-test $(BUILD_BASE)/tz-test \
         $(BUILD_BASE)/malloc-stats-test $(BUILD_BASE)/pci-args-test \
         $(BUILD_BASE)/libc-algorithms-test $(BUILD_BASE)/pgrp-table-test $(BUILD_BASE)/process-slot-test \
-        $(BUILD_BASE)/heap-arena-test $(BUILD_BASE)/iodir-test
+        $(BUILD_BASE)/heap-arena-test $(BUILD_BASE)/kernel-alloc-test $(BUILD_BASE)/iodir-test
 
 # Each tool compiles and links its sources in one command, so -MMD cannot give a
 # per-tool dependency file (with several sources it writes one named after each
@@ -71,6 +71,13 @@ $(BUILD_BASE)/spawn-search-test: $(TEST_DIR)/test-spawn-search.c ../../lib/libc/
 	$(msg) HOSTCC $(notdir $@)
 	$(Q)$(HOST_CC) $(HOST_CFLAGS) -D__hidden= -I../../lib/libc/internal -idirafter ../../internal/include \
 	    -o $@ $(TEST_DIR)/test-spawn-search.c
+
+$(BUILD_BASE)/ticket-lock-test: ../../tests/userland/lock-rank-stress/tickets.c \
+                               ../../arch/riscv/include/ticket-lock.h ../../internal/include/sys/spinlock.h
+	@mkdir -p $(@D)
+	$(msg) HOSTCC $(notdir $@)
+	$(Q)$(HOST_CC) $(HOST_CFLAGS) -DTICKET_HOST_TEST -idirafter ../../internal/include \
+	    -I../../arch/riscv/include -pthread -o $@ $<
 
 $(BUILD_BASE)/spawn-fd-policy-test: $(TEST_DIR)/test-spawn-fd-policy.c \
                                     ../../servers/roottask/include/spawn-fd-policy.h
@@ -254,6 +261,11 @@ $(BUILD_BASE)/iodir-test: $(TEST_DIR)/test-iodir.c ../../lib/libc/posix/iodir.c 
 HEAP_DEPS = $(TEST_DIR)/test-heap-arena.c ../../lib/libc/alloc/malloc-core.c \
             ../../servers/roottask/sys/heap.c \
             ../../servers/roottask/include/heap-stats.h ../../servers/roottask/include/root-mutex.h
+$(BUILD_BASE)/kernel-alloc-test: $(TEST_DIR)/test-kernel-alloc.c ../../kernel/object/alloc.c
+	@mkdir -p $(@D)
+	$(msg) HOSTCC $(notdir $@)
+	$(Q)$(HOST_CC) $(HOST_CFLAGS) -std=c11 -o $@ $<
+
 $(BUILD_BASE)/heap-arena-test: $(HEAP_DEPS)
 	@mkdir -p $(@D)
 	$(msg) HOSTCC $(notdir $@)
@@ -303,15 +315,15 @@ $(BUILD_BASE)/sh-scan-test: $(TEST_DIR)/test-sh-scan.c $(SH_DIR)/sh-scan.c $(SH_
 # it a signal at the one moment a read could lose it (tests/host/sh-host-shim.c).
 # Subshells run this same binary. The format-truncation warning is about the
 # line editor's path buffers, which the target compiler does not report.
-$(BUILD_BASE)/sh-host: $(TEST_DIR)/sh-host-shim.c $(SH_DIR)/sh.c $(SH_DIR)/sh-scan.c \
-                       $(SH_DIR)/sh-scan.h ../../userland/include/toolbox.h
+$(BUILD_BASE)/sh-host: $(TEST_DIR)/sh-host-shim.c $(SH_DIR)/sh.c $(SH_DIR)/sh-scan.c $(SH_DIR)/sh-parse.c \
+                       $(SH_DIR)/sh-scan.h $(SH_DIR)/sh-parse.h ../../userland/include/toolbox.h
 	@mkdir -p $(@D)
 	$(msg) HOSTCC $(notdir $@)
 	$(Q)$(HOST_CC) -std=gnu11 -D_GNU_SOURCE -DEOK=0 \
 	    -DSH_TEST_AWAIT_WINDOW=sh_test_await_window \
 	    '-DSH_SELF_PATH="$(abspath $@)"' -I../../userland/include -I$(SH_DIR) \
 	    $(HOST_CFLAGS) -Wno-format-truncation -o $@ \
-	    $(TEST_DIR)/sh-host-shim.c $(SH_DIR)/sh.c $(SH_DIR)/sh-scan.c
+	    $(TEST_DIR)/sh-host-shim.c $(SH_DIR)/sh.c $(SH_DIR)/sh-scan.c $(SH_DIR)/sh-parse.c
 
 cap-table-test: $(BUILD_BASE)/cap-table-test
 	$(Q)$<
@@ -421,14 +433,14 @@ host-tests: $(BUILD_BASE)/path-normalize-test $(BUILD_BASE)/cap-table-test \
             $(BUILD_BASE)/bootstrap-manifest-test $(BUILD_BASE)/elf-range-test \
             $(BUILD_BASE)/ldso-hash-test $(BUILD_BASE)/ldso-page-test \
             $(BUILD_BASE)/ldso-parse-test $(BUILD_BASE)/ldso-path-test \
-            $(BUILD_BASE)/tty-ldisc-test $(BUILD_BASE)/spawn-search-test $(BUILD_BASE)/cpio-parser-test $(BUILD_BASE)/spawn-fd-policy-test \
+            $(BUILD_BASE)/ticket-lock-test $(BUILD_BASE)/tty-ldisc-test $(BUILD_BASE)/spawn-search-test $(BUILD_BASE)/cpio-parser-test $(BUILD_BASE)/spawn-fd-policy-test \
             $(BUILD_BASE)/serial-reply-test $(BUILD_BASE)/open-bind-test $(BUILD_BASE)/outcomes-test \
             $(BUILD_BASE)/sv39-lookup-test $(BUILD_BASE)/sv39-manip-test \
             $(BUILD_BASE)/strftime-test $(BUILD_BASE)/strftime-asan-test \
             $(BUILD_BASE)/sh-scan-test $(BUILD_BASE)/libc-algorithms-test \
             $(BUILD_BASE)/tz-test $(BUILD_BASE)/tz-asan-test $(TZ_ZONES)/.stamp \
             $(BUILD_BASE)/malloc-stats-test $(BUILD_BASE)/pci-args-test \
-            $(BUILD_BASE)/pgrp-table-test $(BUILD_BASE)/process-slot-test $(BUILD_BASE)/heap-arena-test \
+            $(BUILD_BASE)/pgrp-table-test $(BUILD_BASE)/process-slot-test $(BUILD_BASE)/heap-arena-test $(BUILD_BASE)/kernel-alloc-test \
             $(BUILD_BASE)/sh-host $(BUILD_BASE)/iodir-test
 	$(Q)$<
 	$(Q)$(BUILD_BASE)/iodir-test
@@ -442,6 +454,7 @@ host-tests: $(BUILD_BASE)/path-normalize-test $(BUILD_BASE)/cap-table-test \
 	$(Q)$(BUILD_BASE)/cpio-parser-test
 	$(Q)$(BUILD_BASE)/tty-ldisc-test
 	$(Q)$(BUILD_BASE)/spawn-search-test
+	$(Q)$(BUILD_BASE)/ticket-lock-test
 	$(Q)$(BUILD_BASE)/spawn-fd-policy-test
 	$(Q)$(BUILD_BASE)/pgrp-table-test
 	$(Q)$(BUILD_BASE)/process-slot-test
@@ -463,6 +476,7 @@ host-tests: $(BUILD_BASE)/path-normalize-test $(BUILD_BASE)/cap-table-test \
 	$(Q)RTMUX_TZDIR=$(abspath $(TZ_ZONES))/ $(BUILD_BASE)/tz-asan-test
 	$(Q)$(BUILD_BASE)/malloc-stats-test
 	$(Q)$(BUILD_BASE)/heap-arena-test
+	$(Q)$(BUILD_BASE)/kernel-alloc-test
 	$(Q)$(BUILD_BASE)/pci-args-test
 	$(Q)out=$$($(BUILD_BASE)/libc-algorithms-test) || { printf '%s\n' "$$out"; exit 1; }
 	$(Q)$(PYTHON) $(TEST_DIR)/test-capability-namespace-doc.py

@@ -27,27 +27,28 @@ static inline void cap_cpu_relax(void)
  * join the list. framac-verify:
  * cap_cpu_relax,cap_lock,cap_unlock,cap_last_denied,cap_lookup_pin_typed,rtmux_cap_slot,rtmux_cap_generation,rtmux_cap_lookup_pin,rtmux_cap_lookup_pin_context,rtmux_cap_lookup_pin_typed
  * framac-scan: kernel/cap/table.c kernel/include/cap-table.h framac-min-goals:
- * 135
+ * 139
  */
 /*@ requires \valid(lock);
-    assigns *lock;
+    assigns lock->next;
+    ensures lock->next == (unsigned int)(\old(lock->next) + 1);
  */
-static void cap_lock(atomic_uint *lock)
+static void cap_lock(rtmux_cap_lock_t *lock)
 {
-    /*@ loop assigns *lock; */
-    while (atomic_exchange_explicit(lock, 1, memory_order_acquire) != 0) {
-        /*@ loop assigns \nothing; */
-        while (atomic_load_explicit(lock, memory_order_relaxed) != 0)
-            cap_cpu_relax();
-    }
+    unsigned ticket = atomic_fetch_add_explicit(&lock->next, 1u, memory_order_relaxed);
+    /*@ loop assigns \nothing; */
+    while (atomic_load_explicit(&lock->owner, memory_order_acquire) != ticket)
+        cap_cpu_relax();
 }
 
 /*@ requires \valid(lock);
-    assigns *lock;
+    assigns lock->owner;
+    ensures lock->owner == (unsigned int)(\old(lock->owner) + 1);
  */
-static void cap_unlock(atomic_uint *lock)
+static void cap_unlock(rtmux_cap_lock_t *lock)
 {
-    atomic_store_explicit(lock, 0, memory_order_release);
+    unsigned owner = atomic_load_explicit(&lock->owner, memory_order_relaxed);
+    atomic_store_explicit(&lock->owner, owner + 1u, memory_order_release);
 }
 
 static void cap_lock_pair(rtmux_cap_table_t *a, rtmux_cap_table_t *b)
@@ -181,7 +182,8 @@ int rtmux_cap_table_init(rtmux_cap_table_t *table,
     table->nslots = (uint32_t) nslots;
     table->next_group = 0;
     table->group_wrapped = false;
-    atomic_store_explicit(&table->lock, 0, memory_order_relaxed);
+    atomic_init(&table->lock.next, 0);
+    atomic_init(&table->lock.owner, 0);
     table->alloc_count = 0;
     table->delegate_count = 0;
     table->transfer_count = 0;

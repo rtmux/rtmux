@@ -197,8 +197,8 @@ where it is reachable in IST thread context:
 
 - the `RTMUX_FLG_THR_INTR_PENDING` fast path (IRQ already pending when
   `interrupt_wait()` is entered);
-- the race-close re-check that happens after the `STATE_INTR` commit but before
-  `block()`;
+- the pending-bit check under the local dispatch lock. The lock masks local
+  interrupts from that check through the switch away from the pinned IST;
 - the normal blocked return after an IRQ wakes a `STATE_INTR` thread and the IST
   resumes from `block()`.
 
