@@ -147,8 +147,8 @@ static int idle_unlink_ready(kdispatch_t *dpp, thread_t *thp, unsigned cpu)
  * IPI_RESCHED for a thread readied onto this hart after the local scan was then
  * taken and cleared here, the remote scans found nothing, and cpu_idle slept in
  * wfi on the queued thread until the IDLE_MAX_SLEEP_NS backstop
- * (nanosleep_1ns_storm lost about one wakeup in 30 that way). With SIE left
- * off the IPI stays pending and wakes the wfi.
+ * (nanosleep_1ns_storm lost about one wakeup in 30 that way). With SIE left off
+ * the IPI stays pending and wakes the wfi.
  *
  * The lock window ends inside this function — the dispatch lock is a leaf
  * spinlock and cannot straddle a context switch. The per-CPU bookkeeping

@@ -68,8 +68,9 @@ bool smp_inject(unsigned cpu, const char *opt)
 
 /* CPUs 3 and 4 enter crash handling after committing to join and before
  * publishing pc_alive. CPU 2 has accepted PARKIT and the last hart is absent.
- * Both crashers must know the other's join has committed before either
- * takes the first rendezvous snapshot. */
+ * Both crashers must know the other's join has committed before either takes
+ * the first rendezvous snapshot.
+ */
 void smp_inject_ap_crash(unsigned cpu)
 {
     if ((cpu != 3 && cpu != 4) || num_processors != 6 ||
@@ -78,11 +79,14 @@ void smp_inject_ap_crash(unsigned cpu)
     unsigned peer = 7 - cpu;
     uint64_t start = cpu_clock_ticks();
     uint64_t ticks = qtimeptr->cycles_per_sec / 1000 * SMP_START_WAIT_MS;
-    while (!cpu_online(1) ||
-           cpu_in_mask(__atomic_load_n(&legal_cpu_bitmask, __ATOMIC_ACQUIRE), 2) ||
-           __atomic_load_n(&smp_slot[peer], __ATOMIC_ACQUIRE) != SMP_SLOT_JOINED) {
+    while (
+        !cpu_online(1) ||
+        cpu_in_mask(__atomic_load_n(&legal_cpu_bitmask, __ATOMIC_ACQUIRE), 2) ||
+        __atomic_load_n(&smp_slot[peer], __ATOMIC_ACQUIRE) != SMP_SLOT_JOINED) {
         if (cpu_clock_ticks() - start >= ticks)
-            crash("early crash fixture missing online cpu 1, parked cpu 2 or committed peer");
+            crash(
+                "early crash fixture missing online cpu 1, parked cpu 2 or "
+                "committed peer");
         MEM_BARRIER_RW();
     }
     crash("injected crash on cpu %u before online", cpu);
@@ -205,7 +209,8 @@ void kext_smp_bringup(void *unused)
             MEM_BARRIER_RW();
         }
 #ifdef CONFIG_DEBUG_INJECT
-        if (cpu == 2 && num_processors == 6 && smp_cmdline_has("rtmux.inject=ap-crash-early")) {
+        if (cpu == 2 && num_processors == 6 &&
+            smp_cmdline_has("rtmux.inject=ap-crash-early")) {
             SENDIPI(cpu, IPI_PARKIT);
             continue;
         }

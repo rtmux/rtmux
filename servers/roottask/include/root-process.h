@@ -169,8 +169,8 @@ typedef struct root_process_entry {
      */
     unsigned char execed;
 
-    /* proc_exit_begin_locked has started this process's exit: the status
-     * wait() reports is decided and nobody starts a second one. Under
+    /* proc_exit_begin_locked has started this process's exit: the status wait()
+     * reports is decided and nobody starts a second one. Under
      * root_proc_lock(pid).
      */
     unsigned char exit_begun;
@@ -181,9 +181,9 @@ typedef struct root_process_entry {
      */
     uint32_t tty_hold;
 
-    /* Signals sent to the process before its libc registered the system
-     * channel they are delivered on (_PROC_SYSCHAN, early in crt0): bit signo
-     * of early_sigs is set, and early_sender is the last sender. proc_syschan
+    /* Signals sent to the process before its libc registered the system channel
+     * they are delivered on (_PROC_SYSCHAN, early in crt0): bit signo of
+     * early_sigs is set, and early_sender is the last sender. proc_syschan
      * delivers them once the channel exists. Under root_proc_lock(pid).
      * early_sender comes first so that it shares a word with tty_hold.
      */

@@ -319,8 +319,8 @@ int rdecl interrupt_attach_event(unsigned level,
 
     /* Reserve one notification soul so SIGEV_NOTIFICATION delivery from the
      * trap handler is allocation-free (§15). Only this event kind queues a
-     * notification; SIGEV_UNBLOCK does not. Fail the attach rather
-     * than risk a dropped wakeup under memory pressure later.
+     * notification; SIGEV_UNBLOCK does not. Fail the attach rather than risk a
+     * dropped wakeup under memory pressure later.
      */
     itp->nresv = 0;
     if (SIGEV_GET_TYPE(event) == SIGEV_NOTIFICATION) {

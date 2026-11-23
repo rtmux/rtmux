@@ -16,21 +16,20 @@
  * grows (kernel/ext/query.c, root_phys_map_va), so one can never be returned:
  * each is kept for reuse by its size class. Each is also one contiguous run of
  * physical memory. So that clients cannot make roottask keep ever more of it
- *, a class has a limit on how many contexts it may ever have, and a
- * spawn that finds its class used up waits for one to come back.
+ *, a class has a limit on how many contexts it may ever have, and a spawn
+ * that finds its class used up waits for one to come back.
  */
 static pthread_mutex_t loader_context_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-/* Largest loader context: a spawn needing more is refused rather than kept.
- * No request that passes the checks of proc_pspawn() and
- * proc_spawn_with_actions() needs more. A native request's context holds the
- * head (descriptor map, search path, cwd and path) without the arguments,
- * unless the whole request fit the receive buffer, which is far smaller.
- * A message rebuilt from a posix_spawn request is kept whole: with legacy file
- * actions it has a full descriptor map, a cwd, a path and ARG_MAX of
- * arguments; with packed ones the path, the arguments and the action records
- * all come out of one PSPAWN_MSG_MAX, and a bitmap of source descriptors
- * follows.
+/* Largest loader context: a spawn needing more is refused rather than kept. No
+ * request that passes the checks of proc_pspawn() and proc_spawn_with_actions()
+ * needs more. A native request's context holds the head (descriptor map, search
+ * path, cwd and path) without the arguments, unless the whole request fit the
+ * receive buffer, which is far smaller. A message rebuilt from a posix_spawn
+ * request is kept whole: with legacy file actions it has a full descriptor map,
+ * a cwd, a path and ARG_MAX of arguments; with packed ones the path, the
+ * arguments and the action records all come out of one PSPAWN_MSG_MAX, and a
+ * bitmap of source descriptors follows.
  */
 #define LOADER_CLASS_MAX (512u * 1024u)
 #define LOADER_CONTEXT_HEAD \
@@ -57,9 +56,9 @@ _Static_assert(LOADER_CONTEXT_HEAD + PSPAWN_MSG_MAX + UINT16_MAX / 8u + 1u <=
  * class only, so small spawns cannot use up the few large ones.
  *
  * `limit` is the most contexts the class may ever have: enough standard ones
- * for a storm of concurrent spawns, and a few of each larger class, whose
- * users (large argument lists, long descriptor maps) are rare and can queue.
- * All classes together can come to 4,653,056 bytes (docs/kstats.md,
+ * for a storm of concurrent spawns, and a few of each larger class, whose users
+ * (large argument lists, long descriptor maps) are rare and can queue. All
+ * classes together can come to 4,653,056 bytes (docs/kstats.md,
  * roottask.loader_context_bytes).
  */
 #define LOADER_CLASSES 6
@@ -69,7 +68,7 @@ _Static_assert(LOADER_CONTEXT_HEAD + PSPAWN_MSG_MAX + UINT16_MAX / 8u + 1u <=
 #define LOADER_LIMIT_3 4
 #define LOADER_LIMIT_4 2
 #define LOADER_LIMIT_5 2
-#define LOADER_CONTEXTS_MAX                                         \
+#define LOADER_CONTEXTS_MAX                                              \
     (LOADER_LIMIT_0 + LOADER_LIMIT_1 + LOADER_LIMIT_2 + LOADER_LIMIT_3 + \
      LOADER_LIMIT_4 + LOADER_LIMIT_5)
 static struct {
@@ -87,8 +86,8 @@ static struct {
  * the spawner itself; without a share, one client whose loaders block on its
  * own server held every standard context, and every other spawn in the system
  * waited out LOADER_CONTEXT_WAIT_S and failed. A spawn over its share waits as
- * one over the class limit does. Each in-use context is counted in the entry
- * of its owner, so LOADER_CONTEXTS_MAX entries always suffice; an entry with
+ * one over the class limit does. Each in-use context is counted in the entry of
+ * its owner, so LOADER_CONTEXTS_MAX entries always suffice; an entry with
  * nothing held is free.
  */
 static struct loader_owner {
@@ -109,8 +108,8 @@ static bool loader_owner_idle(const struct loader_owner *o)
     return true;
 }
 
-/* The entry of `pid`, or with `make` a free one for it; NULL if there is
- * none. Called with loader_context_mutex held.
+/* The entry of `pid`, or with `make` a free one for it; NULL if there is none.
+ * Called with loader_context_mutex held.
  */
 static struct loader_owner *loader_owner_of(pid_t pid, bool make)
 {
@@ -149,12 +148,12 @@ _Static_assert((sizeof(struct loader_context) << (LOADER_CLASSES - 2)) <
                        LOADER_CLASS_MAX,
                "LOADER_CLASSES must end exactly at LOADER_CLASS_MAX");
 
-/* A spawn may wait for a context of its class, on a pool thread, while those
- * in use are given back by the loaders that hold them, in arrival order among
- * the waiters of its class (a root_ticket keyed by the class; one that finds
- * no wait left takes a free context rather than fail). No more than
- * LOADER_CONTEXT_WAITERS wait at once (see PSPAWN_GATE_WAITERS for the share
- * of the pool) and none for longer than LOADER_CONTEXT_WAIT_S seconds; beyond
+/* A spawn may wait for a context of its class, on a pool thread, while those in
+ * use are given back by the loaders that hold them, in arrival order among the
+ * waiters of its class (a root_ticket keyed by the class; one that finds no
+ * wait left takes a free context rather than fail). No more than
+ * LOADER_CONTEXT_WAITERS wait at once (see PSPAWN_GATE_WAITERS for the share of
+ * the pool) and none for longer than LOADER_CONTEXT_WAIT_S seconds; beyond
  * either the spawn fails with EAGAIN. All classes share the wait: a context
  * given back wakes every waiter, each to look at its own class.
  */
@@ -195,10 +194,12 @@ static unsigned loader_all_n;
  */
 #define LOADER_HOLD_MAX_S 10
 
-/* Interrupt the loader of pid, thread tid, if pid is still loading with
- * the context lcp.
+/* Interrupt the loader of pid, thread tid, if pid is still loading with the
+ * context lcp.
  */
-static void loader_interrupt(pid_t pid, int tid, const struct loader_context *lcp)
+static void loader_interrupt(pid_t pid,
+                             int tid,
+                             const struct loader_context *lcp)
 {
     root_proc_info_t qinfo;
     process_t *prp;
@@ -213,22 +214,26 @@ static void loader_interrupt(pid_t pid, int tid, const struct loader_context *lc
         rc = kext_thread_ctl_call(prp, tid, RTMUX_TCTL_INTERRUPT,
                                   (void *) (intptr_t) tid);
         if ((n = root_warn_due(&nnote)))
-            root_warn("spawn: loader of pid %d held its context over %d s; "
-                      "interrupted (%u, status %d)\n",
-                      (int) pid, LOADER_HOLD_MAX_S, n, rc);
+            root_warn(
+                "spawn: loader of pid %d held its context over %d s; "
+                "interrupted (%u, status %d)\n",
+                (int) pid, LOADER_HOLD_MAX_S, n, rc);
     }
     root_proc_unlock(pid);
 }
 
-/* Wait on w for a context of class k, until *until (ns, set on the first
- * call), holding loader_context_mutex. Before waiting, interrupt the loaders
- * that have held a context of class k past LOADER_HOLD_MAX_S (only those
- * counted against `owner` when it is not 0: a wait for a share ends only when
- * one of its own comes back), and wait no longer than until the next one gets
- * there. Returns 0 to look again, ETIMEDOUT at the deadline, or EAGAIN with
- * the wait full.
+/* Wait on w for a context of class k, until *until (ns, set on the first call),
+ * holding loader_context_mutex. Before waiting, interrupt the loaders that have
+ * held a context of class k past LOADER_HOLD_MAX_S (only those counted against
+ * `owner` when it is not 0: a wait for a share ends only when one of its own
+ * comes back), and wait no longer than until the next one gets there.
+ *
+ * Returns 0 to look again, ETIMEDOUT at the deadline, or EAGAIN with the wait
+ * full.
  */
-static int loader_wait(struct root_wait *w, unsigned k, pid_t owner,
+static int loader_wait(struct root_wait *w,
+                       unsigned k,
+                       pid_t owner,
                        uint64_t *until)
 {
     const uint64_t hold = (uint64_t) LOADER_HOLD_MAX_S * 1000000000u;
@@ -246,15 +251,18 @@ static int loader_wait(struct root_wait *w, unsigned k, pid_t owner,
     slice = *until;
     for (unsigned i = 0; i < loader_all_n; i++) {
         struct loader_context *lcp = loader_all[i];
-        uint64_t since = __atomic_load_n(&lcp->ctx.held_since, __ATOMIC_ACQUIRE);
-        /* Written by the spawner and the loader without this mutex: a value
-         * not there yet is seen at the next look.
+        uint64_t since =
+            __atomic_load_n(&lcp->ctx.held_since, __ATOMIC_ACQUIRE);
+
+        /* Written by the spawner and the loader without this mutex: a value not
+         * there yet is seen at the next look.
          */
         pid_t pid = __atomic_load_n(&lcp->ctx.pid, __ATOMIC_RELAXED);
         int tid = __atomic_load_n(&lcp->ctx.tid, __ATOMIC_RELAXED);
         uint64_t due;
 
-        if (!since || loader_class_of(lcp->ctx.size) != k || pid <= 0 || tid <= 0)
+        if (!since || loader_class_of(lcp->ctx.size) != k || pid <= 0 ||
+            tid <= 0)
             continue;
         if (owner && lcp->ctx.owner != owner)
             continue;
@@ -262,9 +270,8 @@ static int loader_wait(struct root_wait *w, unsigned k, pid_t owner,
         if (lcp->ctx.interrupt_after > due)
             due = lcp->ctx.interrupt_after;
         if (now >= due) {
-            /* Not again within a second (the interrupt may also have found
-             * it between waits): one that still holds it then is tried
-             * again.
+            /* Not again within a second (the interrupt may also have found it
+             * between waits): one that still holds it then is tried again.
              */
             lcp->ctx.interrupt_after = now + 1000000000u;
             stuck[nstuck].lcp = lcp;
@@ -288,8 +295,8 @@ static int loader_wait(struct root_wait *w, unsigned k, pid_t owner,
     return r;
 }
 
-/* A context came back or a claim was given up: both kinds of waiter look
- * again. Called with loader_context_mutex held.
+/* A context came back or a claim was given up: both kinds of waiter look again.
+ * Called with loader_context_mutex held.
  */
 static void loader_context_wake(void)
 {
@@ -357,11 +364,14 @@ static void loader_context_note(size_t size, const char *why)
  *   state   : initial loader-context state
  *   lcpp    : out — the context
  * Return value: EOK; E2BIG for a message no class holds (the request checks
- * rule that out); EAGAIN when the class, or the owner's share of it, is used
- * up and stays so, or the physical memory for a new context could not be had.
+ * rule that out); EAGAIN when the class, or the owner's share of it, is used up
+ * and stays so, or the physical memory for a new context could not be had.
  */
-int loader_context_alloc(pid_t owner, unsigned msgsize, int state,
-                         struct loader_context **lcpp, int *share_class)
+int loader_context_alloc(pid_t owner,
+                         unsigned msgsize,
+                         int state,
+                         struct loader_context **lcpp,
+                         int *share_class)
 {
     struct loader_context *lcp = NULL;
     struct loader_owner *o;
@@ -427,7 +437,8 @@ int loader_context_alloc(pid_t owner, unsigned msgsize, int state,
             root_ticket_join(&loader_context_wait, &t, k);
             queued = true;
         }
-        if ((r = loader_wait(w, k, w == &loader_share_wait ? owner : 0, &until)))
+        if ((r = loader_wait(w, k, w == &loader_share_wait ? owner : 0,
+                             &until)))
             r = EAGAIN;
     }
     if (queued)
@@ -442,9 +453,10 @@ int loader_context_alloc(pid_t owner, unsigned msgsize, int state,
     if (r != EOK && share_class && *share_class >= 0)
         return r; /* the caller waits for the share, and asks again */
     if (r != EOK) {
-        loader_context_note(size, "its class, or the spawner's share of it, "
-                                  "stayed used up, or too many spawns waited "
-                                  "already");
+        loader_context_note(size,
+                            "its class, or the spawner's share of it, "
+                            "stayed used up, or too many spawns waited "
+                            "already");
         return r;
     }
 
@@ -502,10 +514,12 @@ int loader_context_alloc(pid_t owner, unsigned msgsize, int state,
     return EOK;
 }
 
-/* Wait, without anything else held, until `owner` is under its share of
- * class k (loader_context_alloc told the class). *until carries the whole
- * spawn's deadline across tries. Returns EOK to ask again, EAGAIN at the
- * deadline, or EBUSY when LOADER_SHARE_WAITERS wait already.
+/* Wait, without anything else held, until `owner` is under its share of class k
+ * (loader_context_alloc told the class). *until carries the whole spawn's
+ * deadline across tries.
+ *
+ * Returns EOK to ask again, EAGAIN at the deadline, or EBUSY when
+ * LOADER_SHARE_WAITERS wait already.
  */
 int loader_share_await(pid_t owner, int k, uint64_t *until)
 {
@@ -514,8 +528,9 @@ int loader_share_await(pid_t owner, int k, uint64_t *until)
 
     if (k < 0 || k >= LOADER_CLASSES)
         return EINVAL;
-    /* The deadline is the whole spawn's: a share won back only to be lost
-     * again cannot keep it trying for longer.
+
+    /* The deadline is the whole spawn's: a share won back only to be lost again
+     * cannot keep it trying for longer.
      */
     if (root_deadline_ns(until, LOADER_CONTEXT_WAIT_S))
         return EAGAIN;

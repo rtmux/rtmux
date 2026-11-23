@@ -274,8 +274,10 @@ static int sh_enable_raw(struct termios *saved)
     raw.c_oflag &= (tcflag_t) ~(OPOST);
     raw.c_cflag |= CS8;
     raw.c_lflag &= (tcflag_t) ~(ECHO | ICANON | IEXTEN);
+
     /* The editor consumes VINTR itself while it owns the terminal. Restore
-     * normal signal generation before executing a command. */
+     * normal signal generation before executing a command.
+     */
     raw.c_cc[VINTR] = _POSIX_VDISABLE;
     raw.c_cc[VMIN] = 1;
     raw.c_cc[VTIME] = 0;
@@ -297,8 +299,10 @@ static int sh_read_key(void)
         return (unsigned char) c;
     if (read(STDIN_FILENO, &c, 1) != 1 || (c != '[' && c != 'O'))
         return SH_KEY_ESC;
+
     /* CSI and SS3 end with a byte in 0x40..0x7e. Consume parameter and
-     * intermediate bytes even when this editor has no binding for them. */
+     * intermediate bytes even when this editor has no binding for them.
+     */
     for (;;) {
         r = read(STDIN_FILENO, &c, 1);
         if (r != 1)
@@ -675,7 +679,9 @@ static int sh_read_line_body(struct sh *sh,
         if (saved.c_cc[VINTR] != _POSIX_VDISABLE && c == saved.c_cc[VINTR]) {
             sh_write_all("^C\r\n");
             tcsetattr(STDIN_FILENO, TCSANOW, &saved);
-            /* An installed INT trap receives the same signal as during a job. */
+
+            /* An installed INT trap receives the same signal as during a job.
+             */
             raise(SIGINT);
             sh->last_status = 128 + SIGINT;
             return 1;
@@ -782,7 +788,8 @@ static int words_add(struct sh_words *w, const char *s)
 
 /* Entries are unexported NAME=value pairs. A bare NAME records an export
  * declaration made before the variable was assigned. Exported values live in
- * environ, which can be passed straight through to an external command. */
+ * environ, which can be passed straight through to an external command.
+ */
 static struct sh_words sh_locals;
 
 static int local_index(const char *name)
@@ -922,7 +929,8 @@ static int append_str(char **buf, size_t *len, size_t *cap, const char *s)
 }
 
 /* A quoted expansion can contain any non-NUL byte, including control bytes.
- * Keep quotation separate from the text passed to builtins and exec. */
+ * Keep quotation separate from the text passed to builtins and exec.
+ */
 static int mark_quoted(struct sh_quoted *q, size_t from, size_t end)
 {
     if (end == from)
@@ -944,16 +952,22 @@ static int mark_quoted(struct sh_quoted *q, size_t from, size_t end)
     return 0;
 }
 
-static int append_quoted_char(struct sh_quoted *q, char **buf, size_t *len,
-                              size_t *cap, int c)
+static int append_quoted_char(struct sh_quoted *q,
+                              char **buf,
+                              size_t *len,
+                              size_t *cap,
+                              int c)
 {
     if (append_char(buf, len, cap, c) != 0)
         return -1;
     return mark_quoted(q, *len - 1, *len);
 }
 
-static int append_quoted_str(struct sh_quoted *q, char **buf, size_t *len,
-                             size_t *cap, const char *text)
+static int append_quoted_str(struct sh_quoted *q,
+                             char **buf,
+                             size_t *len,
+                             size_t *cap,
+                             const char *text)
 {
     size_t from = *len;
     if (append_str(buf, len, cap, text) != 0)
@@ -1437,8 +1451,9 @@ static void token_free(struct sh_token *tok, int ntok)
         free(tok[i].s);
 }
 
-/* Keep internal descriptors out of stdio slots that the calling script
- * closed. Otherwise a later child could inherit an internal pipe as stdout. */
+/* Keep internal descriptors out of stdio slots that the calling script closed.
+ * Otherwise a later child could inherit an internal pipe as stdout.
+ */
 static int move_above_stdio(int fd)
 {
     if (fd < 0 || fd > STDERR_FILENO)
@@ -1578,7 +1593,8 @@ static int capture_command(struct sh *sh, const char *inner, char **out)
     return 0;
 }
 
-static int emit_field(struct sh_quoted *q, struct sh_token *tok,
+static int emit_field(struct sh_quoted *q,
+                      struct sh_token *tok,
                       int *ntok,
                       const char *s,
                       bool glob);
@@ -1596,7 +1612,8 @@ static int emit_field(struct sh_quoted *q, struct sh_token *tok,
  *
  * Returns 0, or -1 on allocation failure.
  */
-static int emit_sub_result(struct sh_quoted *q, struct sh_token *tok,
+static int emit_sub_result(struct sh_quoted *q,
+                           struct sh_token *tok,
                            int *ntok,
                            char **buf,
                            size_t *len,
@@ -2013,7 +2030,9 @@ static long arith_lor(struct arith_ctx *a)
 }
 
 /* Evaluate $(( ... )) into nb (32 bytes). On an arithmetic error, abort the
- * expansion and set the command status. Return -1 on error.
+ * expansion and set the command status.
+ *
+ * Return -1 on error.
  */
 static int unit_arith(struct sh *sh, const struct sh_unit *u, char *nb)
 {
@@ -2259,9 +2278,13 @@ static int glob_word(const char *pat, struct sh_words *out)
 }
 
 /* Add a literal field or all matching names. Escape pattern syntax only when
- * its byte was quoted, including the special characters inside brackets. */
-static int emit_field(struct sh_quoted *q, struct sh_token *tok, int *ntok,
-                      const char *s, bool glob)
+ * its byte was quoted, including the special characters inside brackets.
+ */
+static int emit_field(struct sh_quoted *q,
+                      struct sh_token *tok,
+                      int *ntok,
+                      const char *s,
+                      bool glob)
 {
     size_t quoted_len = q->len;
     q->len = 0;
@@ -2626,8 +2649,8 @@ static int tokenize(struct sh *sh, const char *line, struct sh_token *tok)
                     dq_bare = 0;
                     for (int k = 0; k < sh->nparams; k++) {
                         if (k > 0) {
-                            if (emit_field(&quoted, tok, &ntok, buf ? buf : "", false) !=
-                                0) {
+                            if (emit_field(&quoted, tok, &ntok, buf ? buf : "",
+                                           false) != 0) {
                                 free(buf);
                                 goto fail;
                             }
@@ -2662,8 +2685,8 @@ static int tokenize(struct sh *sh, const char *line, struct sh_token *tok)
                             word_has_content = 0;
                             word_may_glob = 0;
                         }
-                        if (emit_sub_result(&quoted, tok, &ntok, &buf, &len, &cap, 0,
-                                            sh->params[k], false,
+                        if (emit_sub_result(&quoted, tok, &ntok, &buf, &len,
+                                            &cap, 0, sh->params[k], false,
                                             &word_has_content,
                                             &word_may_glob) != 0) {
                             free(buf);
@@ -2689,8 +2712,8 @@ static int tokenize(struct sh *sh, const char *line, struct sh_token *tok)
                 } else {
                     rc = expand_dollar(sh, &p, &val, &vlen, &vcap, XF_SPLIT);
                     if (rc == 0 && val)
-                        rc = emit_sub_result(&quoted, tok, &ntok, &buf, &len, &cap, 0,
-                                             val, u.kind == SH_U_BRACE,
+                        rc = emit_sub_result(&quoted, tok, &ntok, &buf, &len,
+                                             &cap, 0, val, u.kind == SH_U_BRACE,
                                              &word_has_content, &word_may_glob);
                     free(val);
                 }
@@ -2718,7 +2741,8 @@ static int tokenize(struct sh *sh, const char *line, struct sh_token *tok)
                 buf = strdup("");
             if (!buf)
                 goto fail;
-            if (emit_field(&quoted, tok, &ntok, buf, word_may_glob && !unsplit) != 0) {
+            if (emit_field(&quoted, tok, &ntok, buf,
+                           word_may_glob && !unsplit) != 0) {
                 free(buf);
                 goto fail;
             }
@@ -4126,8 +4150,9 @@ static int sh_redir_apply(int in_fd, int out_fd, int err_fd, int saved[3])
         }
     }
     for (int k = 0; k < 3; k++) {
-        if (want[k] == SH_FD_CLOSED ? (close(k) < 0 && errno != EBADF)
-                                    : want[k] >= 0 && want[k] != k && dup2(want[k], k) < 0)
+        if (want[k] == SH_FD_CLOSED
+                ? (close(k) < 0 && errno != EBADF)
+                : want[k] >= 0 && want[k] != k && dup2(want[k], k) < 0)
             return -1;
     }
     return 0;
@@ -5044,7 +5069,9 @@ static int loop_consume(struct sh *sh)
 
 static int run_nodes(struct sh *sh, const struct sh_node *n);
 
-static int run_for(struct sh *sh, const char *header, const struct sh_node *body)
+static int run_for(struct sh *sh,
+                   const char *header,
+                   const struct sh_node *body)
 {
     struct sh_token tok[SH_MAX_TOKENS];
     struct sh_words vals = {0};
@@ -5053,8 +5080,7 @@ static int run_for(struct sh *sh, const char *header, const struct sh_node *body
     bool in;
     int rc = 0;
 
-    ntok = line_is_complete(sh, header) ? tokenize(sh, header, tok)
-                                              : -1;
+    ntok = line_is_complete(sh, header) ? tokenize(sh, header, tok) : -1;
 
     /* tok[1] (loop var) must be a word: an operator token carries s == NULL, so
      * strcmp/strdup on it would dereference NULL. Without `in`, the loop goes
@@ -5124,10 +5150,15 @@ static bool case_pattern_matches(struct sh *sh,
     return hit;
 }
 
-/* Expansion happens as each command is executed, including a loop condition
- * on every pass and case patterns only until an arm matches. */
-static int run_heredoc(struct sh *sh, struct sh_script *sc, int *ip, int to,
-                       char *line, char *hh);
+/* Expansion happens as each command is executed, including a loop condition on
+ * every pass and case patterns only until an arm matches.
+ */
+static int run_heredoc(struct sh *sh,
+                       struct sh_script *sc,
+                       int *ip,
+                       int to,
+                       char *line,
+                       char *hh);
 
 static int run_node_doc(struct sh *sh, const struct sh_node *n)
 {
@@ -5146,7 +5177,8 @@ static int run_node_doc(struct sh *sh, const struct sh_node *n)
         p += len;
         p += (*p != 0);
     }
-    rc = run_heredoc(sh, &sc, &ip, sc.count, sc.line[0], sh_heredoc_find(sc.line[0]));
+    rc = run_heredoc(sh, &sc, &ip, sc.count, sc.line[0],
+                     sh_heredoc_find(sc.line[0]));
 out:
     script_free(&sc);
     return rc;
@@ -5184,7 +5216,8 @@ static int run_node_pipeline(struct sh *sh, const struct sh_node *stage)
     }
     int saved[3];
     if (sh_redir_apply(input, -1, -1, saved) == 0)
-        rc = stage->redirects ? run_redirected_node(sh, stage) : run_node(sh, stage);
+        rc = stage->redirects ? run_redirected_node(sh, stage)
+                              : run_node(sh, stage);
     sh_redir_restore(saved);
 out:
     close_if_needed(input);
@@ -5246,8 +5279,8 @@ static int run_node(struct sh *sh, const struct sh_node *n)
             }
             if (part->next)
                 sh->errexit_suppress--;
-            if (sh->exit_requested || sh->return_requested ||
-                sh->loop_break || sh->loop_continue)
+            if (sh->exit_requested || sh->return_requested || sh->loop_break ||
+                sh->loop_continue)
                 break;
         }
         break;
@@ -5296,8 +5329,9 @@ static int run_node(struct sh *sh, const struct sh_node *n)
     return rc;
 }
 
-static __attribute__((noinline)) int run_redirected_node(struct sh *sh,
-                                                        const struct sh_node *n)
+static __attribute__((noinline)) int run_redirected_node(
+    struct sh *sh,
+    const struct sh_node *n)
 {
     struct sh_token tok[SH_MAX_TOKENS];
     int pass[3] = {-1, -1, -1}, own[3] = {-1, -1, -1}, saved[3];
@@ -5328,7 +5362,8 @@ static int run_nodes(struct sh *sh, const struct sh_node *n)
 {
     int rc = 0;
     for (; n && !sh->exit_requested && !sh->return_requested &&
-           !sh->loop_break && !sh->loop_continue; n = n->next) {
+           !sh->loop_break && !sh->loop_continue;
+         n = n->next) {
         rc = n->redirects ? run_redirected_node(sh, n) : run_node(sh, n);
         sh->last_status = rc;
     }

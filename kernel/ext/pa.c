@@ -1965,8 +1965,8 @@ struct kcall_args_pa_sizes {
  * of its block: runs shorter than PA_FREE_QUEUES quanta on the queue of their
  * length, all others on the default queue (PA_DEFAULT_QUEUE, 0). The walk is
  * under pa_slock, with interrupts off, and anyone may cause it by reading
- * /sys/kstats, so it visits at most PA_LARGEST_RUN_VISITS default-queue runs
- * in all. It passes over a block whose cached max_free_run (an upper bound:
+ * /sys/kstats, so it visits at most PA_LARGEST_RUN_VISITS default-queue runs in
+ * all. It passes over a block whose cached max_free_run (an upper bound:
  * enqueue_run raises it, a carve does not lower it) cannot beat the best so
  * far, and stops in a block at a run that meets the bound; enqueue_run puts a
  * run that raises the bound first. So the result is exact unless memory is

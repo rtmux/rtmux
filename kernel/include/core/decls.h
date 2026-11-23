@@ -181,6 +181,7 @@ int rdecl interrupt_unmask(unsigned level, interrupt_t *itp);
 int rdecl get_interrupt_level(thread_t *act, unsigned vector);
 
 unsigned(xferiov_pos)(CPU_REGISTERS *regs);
+
 /* The work a stepped transfer has done since it last looked at the clock (see
  * XFER_STEP_*). When the step ends is kept on the thread (xfer_deadline).
  */
@@ -432,13 +433,13 @@ void inject_steal_stall(thread_t *thp);
 void inject_reprio_stall(thread_t *thp);
 extern atomic_uint inject_empty_steal_locks;
 extern atomic_uint inject_as_slock_takes;
-#define inject_note_as_slock()                                                \
+#define inject_note_as_slock() \
     atomic_fetch_add_explicit(&inject_as_slock_takes, 1, memory_order_relaxed)
-#define inject_note_empty_steal_lock(dpp)                                     \
-    do {                                                                      \
-        if (!DISPATCH_ANY(dpp))                                               \
-            atomic_fetch_add_explicit(&inject_empty_steal_locks, 1,           \
-                                      memory_order_relaxed);                  \
+#define inject_note_empty_steal_lock(dpp)                           \
+    do {                                                            \
+        if (!DISPATCH_ANY(dpp))                                     \
+            atomic_fetch_add_explicit(&inject_empty_steal_locks, 1, \
+                                      memory_order_relaxed);        \
     } while (0)
 void inject_ready_stall(thread_t *thp);
 void inject_switch_stall(thread_t *thp);
@@ -471,7 +472,10 @@ static inline void inject_mutex_lock_propagated(process_t *prp)
 {
     (void) prp;
 }
-static inline void inject_intr_before_switch(thread_t *thp) { (void) thp; }
+static inline void inject_intr_before_switch(thread_t *thp)
+{
+    (void) thp;
+}
 static inline void inject_intr_after_select(thread_t *thp,
                                             const thread_t *chosen)
 {

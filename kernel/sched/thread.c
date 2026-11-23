@@ -642,9 +642,9 @@ int kdecl ksys_thread_cancel(thread_t *act,
  * blocks act: that hart cannot read act's TLS (it holds the dispatch lock, and
  * an IPC send may already have switched to the receiver's address space). So
  * the bit must not outlive the cancel. act may have acted on it or disabled
- * cancellation in user mode since; here, in its own address space, it reads
- * the TLS again. Clear first, then read: a canceller publishes PENDING before
- * the bit, so a post that the clear wiped is seen by the read.
+ * cancellation in user mode since; here, in its own address space, it reads the
+ * TLS again. Clear first, then read: a canceller publishes PENDING before the
+ * bit, so a post that the clear wiped is seen by the read.
  *
  * Only called while the bit is set. Parameters:
  *   act : the calling (active) thread
@@ -669,12 +669,12 @@ void rdecl thread_cancel_posted_refresh(thread_t *act)
  * nobody would end.
  *
  * So the hart that blocks a thread looks once more after it has displaced it
- * (block_recheck_arm), and kernel_exit calls this for a thread it noted.
- * Either the requester saw the blocked, displaced thread and unblocked it, or
- * the blocking hart sees the request: each side has a full fence between its
- * store and its load. force_ready claims the wait under the wait's own lock, so
- * both doing it is harmless, and the kernel call has finished queueing by now
- * (its WAIT_PENDING bridge is closed).
+ * (block_recheck_arm), and kernel_exit calls this for a thread it noted. Either
+ * the requester saw the blocked, displaced thread and unblocked it, or the
+ * blocking hart sees the request: each side has a full fence between its store
+ * and its load. force_ready claims the wait under the wait's own lock, so both
+ * doing it is harmless, and the kernel call has finished queueing by now (its
+ * WAIT_PENDING bridge is closed).
  *
  * CANCEL_POSTED was true at the start of the kernel call that blocked thp or
  * was set during it, and thp cannot change its cancel state inside a kernel

@@ -58,13 +58,13 @@ static int proc_may_signal(const struct _cred_info *s,
  * registers early in crt0. A process can be named by kill from the moment its
  * spawn returns, which is before that, and an exec leaves it without one from
  * the end of the old image to the start of the new, so a signal for a live
- * process with no channel is kept in its slot and proc_syschan delivers it
- * when the channel appears. Like libc's own pending set, the kept set holds one
+ * process with no channel is kept in its slot and proc_syschan delivers it when
+ * the channel appears. Like libc's own pending set, the kept set holds one
  * instance of a signal, and one sender, the last, for all of them. A process
  * that never registers a channel (it is not linked with this libc, or its
- * start-up failed) never gets them; a SIGKILL is kept only while the process
- * is loading (signal_one ends the process itself otherwise, and signal_loaded
- * does when loading is over).
+ * start-up failed) never gets them; a SIGKILL is kept only while the process is
+ * loading (signal_one ends the process itself otherwise, and signal_loaded does
+ * when loading is over).
  *
  * The kernel finds the channel from the pid at the moment of delivery and says
  * when there is none; no channel pointer is held here, as a process may destroy
@@ -142,9 +142,9 @@ int signal_flush_early_locked(pid_t pid)
  * signals still queued on the old system channel, which its system thread never
  * received, and the ones the old image's libc held pending when it asked for
  * the exec (blocked, or received while the exec was being prepared). The
- * process has no system channel from here until the new image registers one,
- * so every later signal is kept as well, and proc_syschan delivers them all, to
- * a libc that starts with the old image's blocked and ignored sets. Parameters:
+ * process has no system channel from here until the new image registers one, so
+ * every later signal is kept as well, and proc_syschan delivers them all, to a
+ * libc that starts with the old image's blocked and ignored sets. Parameters:
  *   pid     : the process that execs
  *   pending : libc's pending set as a sigset_t word, signal n at bit n-1
  */
@@ -241,8 +241,7 @@ static int signal_one(const struct signal_sender *snd,
              * skipped and the SIGKILL is kept for signal_loaded.
              */
             if (!(qinfo.flags & PROC_DEAD_FLAGS))
-                killed =
-                    proc_exit_begin_locked(target_pid, SIGKILL, 1);
+                killed = proc_exit_begin_locked(target_pid, SIGKILL, 1);
         } else if (signo != 0) {
             signal_post_locked(target_pid, signo, snd->pid);
         }

@@ -167,11 +167,11 @@ void intrevent_flush(void)
 /* sigevent_exe — execute a sigevent against a target thread.
  *
  * Dispatches on sigev_notify kind (SIGEV_NONE / SIGEV_THREAD /
- * SIGEV_NOTIFICATION / SIGEV_UNBLOCK; signal kinds and SIGEV_INTR are
- * rejected: an interrupt thread is woken by interrupt_attach_thread's inline
- * wake in the trap handler, and nothing sends it SIGEV_INTR as an event),
- * either delivering the event or just validating it. May be called directly
- * from an interrupt handler. Parameters:
+ * SIGEV_NOTIFICATION / SIGEV_UNBLOCK; signal kinds and SIGEV_INTR are rejected:
+ * an interrupt thread is woken by interrupt_attach_thread's inline wake in the
+ * trap handler, and nothing sends it SIGEV_INTR as an event), either delivering
+ * the event or just validating it. May be called directly from an interrupt
+ * handler. Parameters:
  *   evp      : the sigevent to execute
  *   thp      : target thread
  *   deliver  : non-zero to actually deliver, zero to validate only

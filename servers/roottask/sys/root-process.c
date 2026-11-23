@@ -51,9 +51,9 @@ static void root_process_clear(root_process_t *tmp)
     memset((char *) tmp + tail, 0, sizeof(*tmp) - tail);
 }
 
-/* Transfer the old generation's session reference to the caller while
- * slot_lock still protects the tag. Terminal release may send IPC and runs
- * after the caller unlocks.
+/* Transfer the old generation's session reference to the caller while slot_lock
+ * still protects the tag. Terminal release may send IPC and runs after the
+ * caller unlocks.
  */
 static session_t *root_process_release(root_process_t *tmp)
 {

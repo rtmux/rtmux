@@ -35,7 +35,8 @@ extern void _longjmp(jmp_buf __env, int __val) __attribute__((__noreturn__));
 extern void longjmp(jmp_buf __env, int __val) __attribute__((__noreturn__));
 
 extern int setjmp(jmp_buf) __attribute__((__returns_twice__));
-extern int sigsetjmp(jmp_buf __env, int __msk) __attribute__((__returns_twice__));
+extern int sigsetjmp(jmp_buf __env, int __msk)
+    __attribute__((__returns_twice__));
 
 typedef jmp_buf sigjmp_buf;
 extern void siglongjmp(sigjmp_buf __env, int __val)

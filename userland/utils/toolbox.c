@@ -156,7 +156,8 @@ static const struct toolbox_applet applets[] = {
      "stall-sync-waker PID MS | sync-wake-claims | "
      "intr-before-switch PID | intr-after-select PID | intr-select-seen [TID] "
      "| "
-     "stall-block PID TID [MS] | stall-ready PID TID MS | stall-steal PID TID MS | "
+     "stall-block PID TID [MS] | stall-ready PID TID MS | stall-steal PID TID "
+     "MS | "
      "stall-reprio PID TID MS | "
      "poke PID TID ready|stop | sched-stats | as-lock-stats | serve | "
      "hold-exit-destroy PID MS | "
@@ -3242,8 +3243,10 @@ static int applet_inject(int argc, char **argv)
         rc = inject_call(INJECT_OP_STALL_MUTEX_PROPAGATED,
                          strtoul(argv[2], NULL, 0), strtoul(argv[3], NULL, 0));
     } else if (argc == 3 && !strcmp(argv[1], "intr-before-switch")) {
-        rc = inject_call(INJECT_OP_INTR_BEFORE_SWITCH, strtoul(argv[2], NULL, 0), 0);
-    } else if ((argc == 2 || argc == 3) && !strcmp(argv[1], "intr-select-seen")) {
+        rc = inject_call(INJECT_OP_INTR_BEFORE_SWITCH,
+                         strtoul(argv[2], NULL, 0), 0);
+    } else if ((argc == 2 || argc == 3) &&
+               !strcmp(argv[1], "intr-select-seen")) {
         rc = inject_call(INJECT_OP_INTR_SELECT_SEEN, 0, 0);
         printf("intr-select-seen=%d tid=%d\n", rc & 0xff, rc >> 8);
         if (rc < 0)
@@ -3254,7 +3257,8 @@ static int applet_inject(int argc, char **argv)
             return 13;
         return (rc & 0xff) + 10;
     } else if (argc == 3 && !strcmp(argv[1], "intr-after-select")) {
-        rc = inject_call(INJECT_OP_INTR_AFTER_SELECT, strtoul(argv[2], NULL, 0), 0);
+        rc = inject_call(INJECT_OP_INTR_AFTER_SELECT, strtoul(argv[2], NULL, 0),
+                         0);
     } else if (argc == 2 && !strcmp(argv[1], "sync-wake-claims")) {
         rc = inject_call(INJECT_OP_SYNC_WAKE_CLAIMS, 0, 0);
         printf("sync-wake-claims=%d\n", rc);
@@ -3275,23 +3279,23 @@ static int applet_inject(int argc, char **argv)
         rc = inject_call(INJECT_OP_CRASH, INJECT_CRASH_SHUTDOWN, 0);
     } else if (argc == 5 && (!strcmp(argv[1], "stall-steal") ||
                              !strcmp(argv[1], "stall-reprio"))) {
-        rc = inject_call(!strcmp(argv[1], "stall-steal") ? INJECT_OP_STALL_STEAL
-                                                         : INJECT_OP_STALL_REPRIO,
-                         strtoul(argv[2], NULL, 0),
-                         strtoul(argv[3], NULL, 0) << 32 |
-                             strtoul(argv[4], NULL, 0));
+        rc = inject_call(
+            !strcmp(argv[1], "stall-steal") ? INJECT_OP_STALL_STEAL
+                                            : INJECT_OP_STALL_REPRIO,
+            strtoul(argv[2], NULL, 0),
+            strtoul(argv[3], NULL, 0) << 32 | strtoul(argv[4], NULL, 0));
     } else if ((argc == 4 || argc == 5) && !strcmp(argv[1], "stall-block")) {
-        rc = inject_call(INJECT_OP_STALL_BLOCK, strtoul(argv[2], NULL, 0),
-                         strtoul(argv[3], NULL, 0) << 32 |
-                             (argc == 5 ? strtoul(argv[4], NULL, 0)
-                                        : INJECT_SPIN_MAX_MS));
+        rc = inject_call(
+            INJECT_OP_STALL_BLOCK, strtoul(argv[2], NULL, 0),
+            strtoul(argv[3], NULL, 0) << 32 |
+                (argc == 5 ? strtoul(argv[4], NULL, 0) : INJECT_SPIN_MAX_MS));
     } else if (argc == 5 && (!strcmp(argv[1], "stall-ready") ||
                              !strcmp(argv[1], "stall-switch"))) {
-        rc = inject_call(!strcmp(argv[1], "stall-ready") ? INJECT_OP_STALL_READY
-                                                         : INJECT_OP_STALL_SWITCH,
-                         strtoul(argv[2], NULL, 0),
-                         strtoul(argv[3], NULL, 0) << 32 |
-                             strtoul(argv[4], NULL, 0));
+        rc = inject_call(
+            !strcmp(argv[1], "stall-ready") ? INJECT_OP_STALL_READY
+                                            : INJECT_OP_STALL_SWITCH,
+            strtoul(argv[2], NULL, 0),
+            strtoul(argv[3], NULL, 0) << 32 | strtoul(argv[4], NULL, 0));
     } else if (argc == 4 && (!strcmp(argv[1], "stall-claim-held") ||
                              !strcmp(argv[1], "stall-force-claimed"))) {
         rc = inject_call(argv[1][6] == 'c' ? INJECT_OP_STALL_CLAIM_HELD
@@ -3317,8 +3321,8 @@ static int applet_inject(int argc, char **argv)
         return rc >= 0 ? 0 : 1;
     } else if (argc == 2 && !strcmp(argv[1], "serve")) {
         /* One inject command per stdin line, answered with "0" or the exit
-         * status, for tests that need injection while a hart is held and no
-         * new process can be spawned.
+         * status, for tests that need injection while a hart is held and no new
+         * process can be spawned.
          */
         char line[256];
 
@@ -3326,7 +3330,8 @@ static int applet_inject(int argc, char **argv)
             char *av[8] = {"inject"};
             int ac = 1;
 
-            for (char *t = strtok(line, " \n"); t && ac < 7; t = strtok(NULL, " \n"))
+            for (char *t = strtok(line, " \n"); t && ac < 7;
+                 t = strtok(NULL, " \n"))
                 av[ac++] = t;
             av[ac] = NULL;
             printf("%d\n", ac > 1 ? applet_inject(ac, av) : 2);
@@ -3353,8 +3358,8 @@ static int applet_inject(int argc, char **argv)
         rc = inject_call(INJECT_OP_SLOW_KPAGE_ZERO, strtoul(argv[2], NULL, 0),
                          us << 32 | count);
     } else if (argc == 4 && !strcmp(argv[1], "stall-unblock-race")) {
-        rc = inject_call(INJECT_OP_STALL_UNBLOCK_RACE, strtoul(argv[2], NULL, 0),
-                         strtoul(argv[3], NULL, 0));
+        rc = inject_call(INJECT_OP_STALL_UNBLOCK_RACE,
+                         strtoul(argv[2], NULL, 0), strtoul(argv[3], NULL, 0));
     } else if (argc == 3 && !strcmp(argv[1], "preempt-reply-unblock")) {
         rc = inject_call(INJECT_OP_PREEMPT_REPLY_UNBLOCK,
                          strtoul(argv[2], NULL, 0), 0);
@@ -3420,24 +3425,29 @@ static int applet_inject(int argc, char **argv)
             return rc == 1 && !strcmp(argv[2], "consumed") ? 0 : 3;
         return rc < 0 ? 1 : 0;
     } else {
-        fprintf(stderr,
-                "usage: inject spin-irqoff HART MS | spin-console HART MS | "
-                "hang-hart HART | fail-alloc POOL PID | fail-turnstile PID | "
-                "alloc-status [consumed] | fail-sched-set PID COUNT | "
-                "sched-set-status | "
-                "sched-set-displaced MIN | stall-lock PID MS | "
-                "stall-force-ready PID MS | stall-cancel PID MS | stall-sync-waker PID MS | sync-wake-claims | intr-before-switch PID | intr-after-select PID | intr-select-seen [TID] | "
-                "stall-block PID TID [MS] | stall-ready PID TID MS | "
-                "stall-steal PID TID MS | stall-reprio PID TID MS | "
-                "poke PID TID ready|stop | "
-                "hold-exit-destroy PID MS | "
-                "sched-stats | serve | "
-                "stall-switch PID TID MS | crash [shutdown] | pte-superpage PID VA | "
-                "pte-clear-superpage PID VA | pte-probe PID VA | "
-                "fail-pte-map PID PAGES | manip-partial MIN | "
-                "stall-lock-early PID MS | stall-lock-propagated PID MS | "
-                "prio-settle-thread MIN | prio-settle-idle MIN | prio-settle-departure MAX | "
-                "prio-settle-reset | grant-ipc-cap PID\n");
+        fprintf(
+            stderr,
+            "usage: inject spin-irqoff HART MS | spin-console HART MS | "
+            "hang-hart HART | fail-alloc POOL PID | fail-turnstile PID | "
+            "alloc-status [consumed] | fail-sched-set PID COUNT | "
+            "sched-set-status | "
+            "sched-set-displaced MIN | stall-lock PID MS | "
+            "stall-force-ready PID MS | stall-cancel PID MS | stall-sync-waker "
+            "PID MS | sync-wake-claims | intr-before-switch PID | "
+            "intr-after-select PID | intr-select-seen [TID] | "
+            "stall-block PID TID [MS] | stall-ready PID TID MS | "
+            "stall-steal PID TID MS | stall-reprio PID TID MS | "
+            "poke PID TID ready|stop | "
+            "hold-exit-destroy PID MS | "
+            "sched-stats | serve | "
+            "stall-switch PID TID MS | crash [shutdown] | pte-superpage PID VA "
+            "| "
+            "pte-clear-superpage PID VA | pte-probe PID VA | "
+            "fail-pte-map PID PAGES | manip-partial MIN | "
+            "stall-lock-early PID MS | stall-lock-propagated PID MS | "
+            "prio-settle-thread MIN | prio-settle-idle MIN | "
+            "prio-settle-departure MAX | "
+            "prio-settle-reset | grant-ipc-cap PID\n");
         return 2;
     }
     return rc == 0 ? 0 : 1;

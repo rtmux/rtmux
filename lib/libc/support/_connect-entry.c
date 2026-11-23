@@ -36,10 +36,11 @@ int _connect_entry(int base,
     memset(&ctrl, 0x00, sizeof ctrl);
     ctrl.base = base;
     ctrl.extra = extra;
+
     /* A caller that asks for the cancellation point is open(), by way of
      * _vopen, and nobody else today: it also gets EINTR from a signal (see
-     * connect_send()). One that wants the first without the second needs a
-     * way to say so.
+     * connect_send()). One that wants the first without the second needs a way
+     * to say so.
      */
     if (testcancel) {
         ctrl.send = msg_sendv;

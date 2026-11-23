@@ -80,9 +80,10 @@ void proc_exit_finish(pid_t pid)
         if (rc != EAGAIN)
             return;
         if (tries % 1000 == 0)
-            root_warn("exit: pid %d: threads still being destroyed after %u "
-                      "passes\n",
-                      (int) pid, tries);
+            root_warn(
+                "exit: pid %d: threads still being destroyed after %u "
+                "passes\n",
+                (int) pid, tries);
         (void) nanosleep(&ts, NULL);
     }
 }
@@ -247,6 +248,7 @@ int proc_terminate(message_context_t *ctp,
             fault_info.siginfo.si_signo != 0) {
             tmp->siginfo = fault_info.siginfo;
             tmp->siginfo.si_pid = pid;
+
             /* The kernel's record keeps the fault address where the status
              * goes; this copy is read as an exit record.
              */

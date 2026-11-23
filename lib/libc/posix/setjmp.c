@@ -13,11 +13,13 @@
 enum { JMP_SAVED_SIGMASK = 2 };
 
 /* The assembly entry saves the caller's frame after this helper returns. */
-void __jmp_save_mask(jmp_buf env, int save) __attribute__((visibility("hidden")));
+void __jmp_save_mask(jmp_buf env, int save)
+    __attribute__((visibility("hidden")));
 void __jmp_save_mask(jmp_buf env, int save)
 {
     sigset_t mask;
-    _Static_assert(sizeof(mask) <= sizeof(env[0].__msk), "jmp_buf mask storage");
+    _Static_assert(sizeof(mask) <= sizeof(env[0].__msk),
+                   "jmp_buf mask storage");
     env[0].__flg = 0;
     if (save && sigprocmask(SIG_SETMASK, NULL, &mask) == 0) {
         memcpy(env[0].__msk, &mask, sizeof(mask));

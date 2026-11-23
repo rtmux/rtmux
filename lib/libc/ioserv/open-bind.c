@@ -13,8 +13,8 @@
 #include "api.h"
 #include "internal.h"
 
-/* A serial for each new binding, so that one freed and another made at the
- * same address are not taken for each other.
+/* A serial for each new binding, so that one freed and another made at the same
+ * address are not taken for each other.
  */
 static unsigned binding_serial(void)
 {

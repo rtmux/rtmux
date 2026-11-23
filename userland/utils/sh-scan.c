@@ -41,8 +41,8 @@ static bool word_is(const struct group *g, const char *kw)
 /* Reserved words after which the grammar expects another command. */
 bool sh_command_prefix(const char *word, size_t len)
 {
-    static const char *const lead[] = {"then", "do", "else", "elif", "if",
-                                       "while", "until", "!", "{"};
+    static const char *const lead[] = {"then",  "do",    "else", "elif", "if",
+                                       "while", "until", "!",    "{"};
 
     for (size_t i = 0; i < sizeof lead / sizeof *lead; i++)
         if (len == strlen(lead[i]) && !memcmp(word, lead[i], len))
@@ -347,10 +347,10 @@ char *sh_heredoc_find(char *line)
  * `<<EOF >out` keeps `>out` in the remainder.
  */
 char *sh_heredoc_delim(char *hh,
-                           char *delim,
-                           size_t dsize,
-                           bool *strip,
-                           bool *quoted)
+                       char *delim,
+                       size_t dsize,
+                       bool *strip,
+                       bool *quoted)
 {
     size_t dn = 0;
     char *q = hh + 2;

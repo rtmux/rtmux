@@ -92,8 +92,9 @@ void ioserv_ldisc_feed(struct ioserv_ldisc *ld,
     }
 }
 
-/* Inspect a read without removing input. The service commits consume only
- * after a successful reply, so cancellation leaves the next reader its data. */
+/* Inspect a read without removing input. The service commits consume only after
+ * a successful reply, so cancellation leaves the next reader its data.
+ */
 int ioserv_ldisc_read(const struct ioserv_ldisc *ld,
                       const struct termios *t,
                       struct tty_read_clock *clock,
@@ -117,12 +118,12 @@ int ioserv_ldisc_read(const struct ioserv_ldisc *ld,
         if (!avail)
             return -EAGAIN;
     } else {
-        /* POSIX XBD 11.1.7: with TIME=0 (cases B and D) there is no timer,
-         * and with MIN>0 (case A) TIME is an inter-byte timer that runs only
-         * once a byte is there and restarts with each new one. With MIN=0
-         * (case C) it is a read timer, started once. Whatever this read ran
-         * before (another termios, bytes another reader took) is dropped
-         * rather than left to end the read early.
+        /* POSIX XBD 11.1.7: with TIME=0 (cases B and D) there is no timer, and
+         * with MIN>0 (case A) TIME is an inter-byte timer that runs only once a
+         * byte is there and restarts with each new one. With MIN=0 (case C) it
+         * is a read timer, started once. Whatever this read ran before (another
+         * termios, bytes another reader took) is dropped rather than left to
+         * end the read early.
          */
         if (!interval || (min && !avail))
             clock->deadline = 0;

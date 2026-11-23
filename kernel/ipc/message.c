@@ -120,6 +120,7 @@ static int msg_current_take(thread_t *act, struct kcall_args_msg_current *kap)
         kspinlock_unlock(&cop->lock);
         return ESRCH;
     }
+
     /* A channel destroy clears cop->channel under neither lock; the rcvid
      * lookup's RCU-sched section keeps a channel read here allocated.
      */
@@ -130,9 +131,10 @@ static int msg_current_take(thread_t *act, struct kcall_args_msg_current *kap)
     }
 
     rcu_read_lock(&tthread_rcu);
-    thread_t *previous = __atomic_load_n(&thp->args.ms.server, __ATOMIC_ACQUIRE);
-    bool settle_previous = previous && previous != act &&
-                           thread_client_departed(previous, thp);
+    thread_t *previous =
+        __atomic_load_n(&thp->args.ms.server, __ATOMIC_ACQUIRE);
+    bool settle_previous =
+        previous && previous != act && thread_client_departed(previous, thp);
 
     thp->args.ms.server = act;
     act->client = thp;
@@ -181,8 +183,8 @@ static int msg_current_take(thread_t *act, struct kcall_args_msg_current *kap)
 }
 
 /* A msg_readv or msg_writev that is over drops the restart link of its copy.
- * The checked vector and the cursor need no dropping here: they do not
- * outlive the next kernel entry that is not a restart (xfer_begin_call).
+ * The checked vector and the cursor need no dropping here: they do not outlive
+ * the next kernel entry that is not a restart (xfer_begin_call).
  */
 static void msg_resume_drop(thread_t *act)
 {
@@ -192,12 +194,11 @@ static void msg_resume_drop(thread_t *act)
 /* Check the caller's own iov (the destination of msg_readv, the source of
  * msg_writev) against the process boundary, before the client is claimed.
  *
- * It runs first, ahead of lookup_rcvid(), so that there is nothing to undo
- * when the check restarts the call, and so that every later path, the remote
- * one included, sees a vector that is in range and no longer than
- * XFER_IOV_LIMIT. A negative count is one flat buffer, which has no entries
- * to read; the entries of an array are read by xfer_iov_sum(), a step per
- * kernel entry.
+ * It runs first, ahead of lookup_rcvid(), so that there is nothing to undo when
+ * the check restarts the call, and so that every later path, the remote one
+ * included, sees a vector that is in range and no longer than XFER_IOV_LIMIT. A
+ * negative count is one flat buffer, which has no entries to read; the entries
+ * of an array are read by xfer_iov_sum(), a step per kernel entry.
  *
  * Returns 0, EFAULT, or XFER_CALL_RESTART when the call was restarted.
  */
@@ -248,10 +249,10 @@ static int msg_readv_body(thread_t *act, struct kcall_args_msg_readv *kap)
     act->args.ms.rparts = kap->rparts;
 
     /* Claim the client under its channel's lock, against ksys_msg_replyv,
-     * ksys_msg_error and force_ready. ESRCH if it is no longer reply-blocked
-     * on this connection or the connection was detached; a claim another
-     * path holds (a reply, an error, another follow-up copy) is waited out
-     * by restarting the call.
+     * ksys_msg_error and force_ready. ESRCH if it is no longer reply-blocked on
+     * this connection or the connection was detached; a claim another path
+     * holds (a reply, an error, another follow-up copy) is waited out by
+     * restarting the call.
      */
     status = reply_client_claim(act, &cop, thp, &chp);
     if (status)
@@ -380,8 +381,8 @@ static int msg_writev_body(thread_t *act, struct kcall_args_msg_writev *kap)
         return ENOERROR;
     }
 
-    /* Claim the client as ksys_msg_readv does. thp->args.ri.{rmsg,rparts},
-     * the destination below, stay as they are while thp is reply-blocked and
+    /* Claim the client as ksys_msg_readv does. thp->args.ri.{rmsg,rparts}, the
+     * destination below, stay as they are while thp is reply-blocked and
      * claimed; a reply would overwrite them.
      */
     status = reply_client_claim(act, &cop, thp, &chp);
@@ -484,11 +485,11 @@ int kdecl ksys_msg_readiov(thread_t *act, struct kcall_args_msg_readiov *kap)
         return ENOERROR;
     }
 
-    /* Claim the client as ksys_msg_readv does, keeping the channel lock for
-     * the checks below. The claim comes first: a reply that holds it rewrites
+    /* Claim the client as ksys_msg_readv does, keeping the channel lock for the
+     * checks below. The claim comes first: a reply that holds it rewrites
      * thp->flags and thp->args.ms.* outside the lock, so they are only read
-     * once the claim is ours. It then keeps a reply off thp while
-     * viov_to_piov walks them.
+     * once the claim is ours. It then keeps a reply off thp while viov_to_piov
+     * walks them.
      */
     cop = reply_client_lock(cop, thp, &chp);
     if (!cop)

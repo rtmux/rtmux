@@ -17,7 +17,11 @@
 #include <stddef.h>
 
 char *sh_heredoc_find(char *line);
-char *sh_heredoc_delim(char *hh, char *delim, size_t dsize, bool *strip, bool *quoted);
+char *sh_heredoc_delim(char *hh,
+                       char *delim,
+                       size_t dsize,
+                       bool *strip,
+                       bool *quoted);
 bool sh_command_prefix(const char *word, size_t len);
 
 enum sh_unit_kind {

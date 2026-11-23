@@ -573,10 +573,12 @@ void kext_process_destroy(void *data)
     if (prp->alarm)
         crash();
     if (prp->nfds) {
-        kprintf("process destroy: pid %d nfds %u fd slots %u channel/connection slots %u\n",
-                pid, (unsigned) prp->nfds,
-                (unsigned) (prp->fdcons.nentries - prp->fdcons.nfree),
-                (unsigned) (prp->chancons.nentries - prp->chancons.nfree));
+        kprintf(
+            "process destroy: pid %d nfds %u fd slots %u channel/connection "
+            "slots %u\n",
+            pid, (unsigned) prp->nfds,
+            (unsigned) (prp->fdcons.nentries - prp->fdcons.nfree),
+            (unsigned) (prp->chancons.nentries - prp->chancons.nfree));
         crash();
     }
     if (prp->chancons.vector) {
@@ -829,8 +831,8 @@ void kext_process_startup(void *data)
 /* kext_proc_set_spawn — publish a child's entry point and spawn flags.
  *
  * Writes initial_ip / initial_sp on the child's prp and applies the NOZOMBIE
- * rule of the spawn flags. The kernel heap is mapped PTE_U=0, so
- * U-mode roottask cannot touch prp->initial_ip / prp->flags directly.
+ * rule of the spawn flags. The kernel heap is mapped PTE_U=0, so U-mode
+ * roottask cannot touch prp->initial_ip / prp->flags directly.
  *
  * The (possibly-augmented) caller-side spawn flags are returned via
  * spawn_flags_out so the loader can keep its lcp->ctx.flags in sync.
@@ -1134,7 +1136,8 @@ static void exec_commit(thread_t *act,
     }
 
     /* Take a reference to the final credentials before moving the image.
-     * Allocation failure leaves the caller and shell owning their originals. */
+     * Allocation failure leaves the caller and shell owning their originals.
+     */
     credential_t *new_cred = NULL;
     kspinlock_lock(&cred_slock);
     info = shell->cred->info;
@@ -1391,20 +1394,20 @@ static void process_as_release_harts(process_t *prp)
     /* Force every remote hart still pointing at the dying as to swap to the
      * roottask as before we free prp->memory. Once the dying pgdir PA is
      * returned to pa_alloc, the next caller (e.g. loader_elf mapping an ELF
-     * segment) will write module bytes over it, and a remote hart with a
-     * stale SATP will walk those bytes as PTEs on the very next TLB miss —
-     * infinite double-fault in trap.S trying to save registers to a
-     * now-unmapped kernel stack.
+     * segment) will write module bytes over it, and a remote hart with a stale
+     * SATP will walk those bytes as PTEs on the very next TLB miss — infinite
+     * double-fault in trap.S trying to save registers to a now-unmapped kernel
+     * stack.
      *
      * IPI_TLB_SAFE's handler calls set_safe_as(cpu) on the remote hart,
      * atomically updating both pcpu_array[i].pc_as_prp AND the SATP CSR via
      * vm_ops->as(). We loop until no remote hart still matches: per remote,
      * send IPI, wait for ipicmds[] bit to clear, then drain any in-flight
-     * message delivery so we don't pull the as out from under an xfer. The
-     * ack wait used to live in the U-mode wrapper, which worked when
-     * roottask shared the kernel address space (S-mode); a U-mode roottask
-     * cannot read ipicmds[] / get_active_thread() so the wait must happen
-     * here in the kernel body.
+     * message delivery so we don't pull the as out from under an xfer. The ack
+     * wait used to live in the U-mode wrapper, which worked when roottask
+     * shared the kernel address space (S-mode); a U-mode roottask cannot read
+     * ipicmds[] / get_active_thread() so the wait must happen here in the
+     * kernel body.
      */
 #if CONFIG_PROCESSORS_MAX > 1
     {
@@ -1433,15 +1436,14 @@ static void process_as_release_harts(process_t *prp)
                 /* Wait for the remote hart to process the IPI.
                  *
                  * Briefly enable interrupts each iteration so a sibling's
-                 * IPI_CRASH can deliver and yank us into
-                 * crash_quiesce_self() instead of leaving us 100% stuck
-                 * here. Same pattern as the acquire_kernel BKL spin and
-                 * intrevent_flush.
+                 * IPI_CRASH can deliver and yank us into crash_quiesce_self()
+                 * instead of leaving us 100% stuck here. Same pattern as the
+                 * acquire_kernel BKL spin and intrevent_flush.
                  *
-                 * Re-issue the IPI every ~1024 spins: a single initial
-                 * SENDIPI can be lost to a sip.SSIP-vs- sie.SSIE race (the
-                 * remote hart's SSIE briefly cleared during a transition,
-                 * so the SBI-injected SSIP never fires a trap). Re-sending
+                 * Re-issue the IPI every ~1024 spins: a single initial SENDIPI
+                 * can be lost to a sip.SSIP-vs- sie.SSIE race (the remote
+                 * hart's SSIE briefly cleared during a transition, so the
+                 * SBI-injected SSIP never fires a trap). Re-sending
                  * periodically converts that into a self-healing wait at
                  * negligible cost: the remote hart processes whichever IPI
                  * lands first, the rest are no-op TAS clears of 0.
@@ -1455,10 +1457,10 @@ static void process_as_release_harts(process_t *prp)
                         interrupt_enable();
                         interrupt_disable();
                         if ((++spins & 0x3ff) == 0) {
-                            /* Re-fire the SBI ECALL — atomic_or 0 is a
-                             * no-op on the command bits but send_ipi
-                             * unconditionally calls sbi_send_ipi, which
-                             * sets fresh sip.SSIP on the target.
+                            /* Re-fire the SBI ECALL — atomic_or 0 is a no-op on
+                             * the command bits but send_ipi unconditionally
+                             * calls sbi_send_ipi, which sets fresh sip.SSIP on
+                             * the target.
                              */
                             SENDIPI(i, 0);
                         }
@@ -1468,13 +1470,13 @@ static void process_as_release_harts(process_t *prp)
                 /* Drain in-flight message delivery on the remote hart so we
                  * don't free the as under an xfer.
                  *
-                 * RTMUX_ITF_MSG_DELIVERY is in "internal_flags", NOT
-                 * "flags". The two enum spaces overlap at bit 0
+                 * RTMUX_ITF_MSG_DELIVERY is in "internal_flags", NOT "flags".
+                 * The two enum spaces overlap at bit 0
                  * (RTMUX_ITF_MSG_DELIVERY=0x01 /
                  * RTMUX_FLG_THR_KILLSELF=0x01), so testing the wrong field
                  * would turn this into a "spin while the remote thread has
-                 * KILLSELF set" loop — which never terminates once the
-                 * process is exiting.
+                 * KILLSELF set" loop — which never terminates once the process
+                 * is exiting.
                  */
                 for (;;) {
                     thread_t *thp;

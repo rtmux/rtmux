@@ -212,8 +212,8 @@ static void fastmsg_native_cap_rollback(thread_t *receiver,
 
 /* How many entries of a vector the header peek, and the write of the header
  * back, may step over. A message whose first sizeof(struct _io_native_hdr)
- * bytes are spread wider than this, or lie behind that many empty entries,
- * is refused: the walk is made in one kernel entry, with the peer claimed.
+ * bytes are spread wider than this, or lie behind that many empty entries, is
+ * refused: the walk is made in one kernel entry, with the peer claimed.
  */
 #define NATIVE_HDR_ENTRIES_MAX 64
 
@@ -221,11 +221,11 @@ static void fastmsg_native_cap_rollback(thread_t *receiver,
 _Static_assert(XFER_STEP_ENTRIES == NATIVE_HDR_ENTRIES_MAX,
                "one step of a vector is the header's entry bound");
 
-/* Read up to want bytes from the head of the active sender's own message
- * into a kernel buffer.
+/* Read up to want bytes from the head of the active sender's own message into a
+ * kernel buffer.
  *
- * Returns EOK with the bytes read in *copied, XFER_SRC_FAULT, or E2BIG when
- * the bytes are not within the first NATIVE_HDR_ENTRIES_MAX entries.
+ * Returns EOK with the bytes read in *copied, XFER_SRC_FAULT, or E2BIG when the
+ * bytes are not within the first NATIVE_HDR_ENTRIES_MAX entries.
  */
 static int fastmsg_copy_source_prefix(thread_t *sender,
                                       void *dst,
@@ -274,13 +274,13 @@ static int fastmsg_copy_source_prefix(thread_t *sender,
 
 /* Move a few bytes between the head of a message and a kernel buffer through
  * xfermsg_peek, with one side's vector swapped for the buffer: the receiver's
- * to read the head of the sender's message (to_receiver false), the sender's
- * to write over the head of the receiver's buffers. The copy proper is over
- * by now, but its restart links and byte count are the transfer's result, so
- * they are saved around the borrowed transfer and put back.
+ * to read the head of the sender's message (to_receiver false), the sender's to
+ * write over the head of the receiver's buffers. The copy proper is over by
+ * now, but its restart links and byte count are the transfer's result, so they
+ * are saved around the borrowed transfer and put back.
  *
- * Returns 0 with the bytes moved in *moved, XFER_SRC_FAULT, XFER_DST_FAULT,
- * or XFER_YIELD when the user side's vector is too sparse (see
+ * Returns 0 with the bytes moved in *moved, XFER_SRC_FAULT, XFER_DST_FAULT, or
+ * XFER_YIELD when the user side's vector is too sparse (see
  * NATIVE_HDR_ENTRIES_MAX).
  */
 static int fastmsg_head_xfer(thread_t *sender,
@@ -322,8 +322,8 @@ static int fastmsg_head_xfer(thread_t *sender,
 }
 
 /* Make the active thread's own address space the current one. A transfer may
- * leave another one current, and the active thread's memory is read and
- * written directly after it.
+ * leave another one current, and the active thread's memory is read and written
+ * directly after it.
  */
 static void fastmsg_own_as(thread_t *active)
 {
@@ -337,8 +337,8 @@ static void fastmsg_own_as(thread_t *active)
 /* Write len bytes over the head of the active receiver's own buffers, whose
  * address space is current.
  *
- * Returns 0, XFER_DST_FAULT, or XFER_YIELD when the bytes do not fit within
- * the first NATIVE_HDR_ENTRIES_MAX entries of its vector.
+ * Returns 0, XFER_DST_FAULT, or XFER_YIELD when the bytes do not fit within the
+ * first NATIVE_HDR_ENTRIES_MAX entries of its vector.
  */
 static int fastmsg_write_own_head(thread_t *receiver,
                                   const void *buf,
@@ -361,14 +361,14 @@ static int fastmsg_write_own_head(thread_t *receiver,
 
 /* What fastmsg_native_cap_finish_long() found wrong: a fault on one side
  * (XFER_SRC_FAULT, XFER_DST_FAULT), or an errno for a message that is refused
- * with nothing at fault (a bad header, a capability that cannot be
- * transferred, a header spread too wide in the sender's vector).
+ * with nothing at fault (a bad header, a capability that cannot be transferred,
+ * a header spread too wide in the sender's vector).
  *
  * With XFER_DST_FAULT, rcv_err is the receiver's errno: EFAULT for memory it
  * cannot be written through, EINVAL for a vector whose head lies behind more
  * entries than the kernel walks. That one names no bad address, so it is the
- * error a sender gets for the same shape and not the one that sends its
- * owner looking for a wild pointer.
+ * error a sender gets for the same shape and not the one that sends its owner
+ * looking for a wild pointer.
  */
 struct native_cap_status {
     int fault;
@@ -381,19 +381,20 @@ struct native_cap_status {
  * head of the message for a native capability header and install the
  * capabilities it names.
  *
- * The head is read once more from the sender, into a kernel snapshot, and it
- * is the snapshot that is parsed, has the installed ids put into it, and is
- * then written over the head of what the receiver was given. So the header
- * the receiver sees is the one the kernel examined, whatever a sibling of the
- * sender did to the original between the copy and now: no rewrite of nxfers
- * or of an id can reach the receiver as if the kernel had installed it.
- * It comes after the copy so that the copy can restart at will (an install
- * ahead of it would be repeated), and after the last point at which the call
- * can be abandoned, so that nothing is installed for a message that is not
- * delivered.
+ * The head is read once more from the sender, into a kernel snapshot, and it is
+ * the snapshot that is parsed, has the installed ids put into it, and is then
+ * written over the head of what the receiver was given. So the header the
+ * receiver sees is the one the kernel examined, whatever a sibling of the
+ * sender did to the original between the copy and now: no rewrite of nxfers or
+ * of an id can reach the receiver as if the kernel had installed it. It comes
+ * after the copy so that the copy can restart at will (an install ahead of it
+ * would be repeated), and after the last point at which the call can be
+ * abandoned, so that nothing is installed for a message that is not delivered.
  *
  * tx records what was installed, for fastmsg_native_cap_rollback() if the
- * delivery still fails. Returns true when all is well.
+ * delivery still fails.
+ *
+ * Returns true when all is well.
  */
 static bool fastmsg_native_cap_finish_long(thread_t *sender,
                                            thread_t *receiver,
@@ -416,8 +417,8 @@ static bool fastmsg_native_cap_finish_long(thread_t *sender,
     st->rcv_err = EFAULT;
 
     /* The first bytes say whether this is a native message at all; only one
-     * that is has a header worth reading whole. Any other message is held to
-     * no more than that its first few bytes are near the front.
+     * that is has a header worth reading whole. Any other message is held to no
+     * more than that its first few bytes are near the front.
      */
     inject_cap_peek_window(active);
     for (size_t want = sizeof(hdr.msg);; want = sizeof(hdr)) {
@@ -436,11 +437,11 @@ static bool fastmsg_native_cap_finish_long(thread_t *sender,
                 (ret & XFER_DST_FAULT) ? XFER_DST_FAULT : XFER_SRC_FAULT;
             return false;
         }
-        /* The receiver holds `delivered` bytes of the message as it was when
-         * it was copied. A head that is shorter now than what was delivered
-         * of it cannot be vouched for: the sender's vector was cut down
-         * since, and what the receiver holds past the cut was never looked
-         * at.
+
+        /* The receiver holds `delivered` bytes of the message as it was when it
+         * was copied. A head that is shorter now than what was delivered of it
+         * cannot be vouched for: the sender's vector was cut down since, and
+         * what the receiver holds past the cut was never looked at.
          */
         if (copied < min_size(delivered, want)) {
             st->err = EINVAL;
@@ -462,8 +463,8 @@ static bool fastmsg_native_cap_finish_long(thread_t *sender,
                 return false;
             }
         } else if (delivered < sizeof(hdr)) {
-            /* The receiver was given less than the header: nothing is
-             * installed for it, and the part it holds must not name ids.
+            /* The receiver was given less than the header: nothing is installed
+             * for it, and the part it holds must not name ids.
              */
             hdr.nxfers = 0;
         } else {
@@ -480,8 +481,8 @@ static bool fastmsg_native_cap_finish_long(thread_t *sender,
         }
     }
 
-    /* The receiver's own address space is current when it is the active
-     * thread; otherwise the write goes through the transfer machinery.
+    /* The receiver's own address space is current when it is the active thread;
+     * otherwise the write goes through the transfer machinery.
      */
     if (copied > delivered)
         copied = delivered;
@@ -577,8 +578,8 @@ static thread_t *receive_candidate(channel_t *chp, int notification_only)
 #endif
 
 /* The copy of a message between a thread and its peer, for send, receive and
- * reply: a step per kernel entry (xfermsg_bounded), XFER_RESTART when the
- * step is over. A native capability header in it is dealt with afterwards
+ * reply: a step per kernel entry (xfermsg_bounded), XFER_RESTART when the step
+ * is over. A native capability header in it is dealt with afterwards
  * (fastmsg_native_cap_finish_long), so the copy itself can always restart.
  */
 static inline int fastmsg_xfer(thread_t *dthp, thread_t *sthp)
@@ -587,8 +588,8 @@ static inline int fastmsg_xfer(thread_t *dthp, thread_t *sthp)
 }
 
 /* A stepped copy used its step up and arranged for the call to run again
- * (xfer_yield did the KCALL_RESTART): give up our own side of the transfer
- * and the claim on the peer, so that another thread can use the peer in the
+ * (xfer_yield did the KCALL_RESTART): give up our own side of the transfer and
+ * the claim on the peer, so that another thread can use the peer in the
  * meantime, and honor a wake that was deferred while the claim was held. The
  * caller returns ENOERROR. The cursor and the restart links stay for the
  * restarted call to resume from.
@@ -622,11 +623,11 @@ static bool fastmsg_iov_array_ok(const iov_t *iov,
  */
 #define SHORT_IOV_MAX 16
 
-/* Copy the bytes of the caller's iov array, which xfer_iov_sum() totalled,
- * into a kernel buffer of exactly that many. Each entry is read once, into a
+/* Copy the bytes of the caller's iov array, which xfer_iov_sum() totalled, into
+ * a kernel buffer of exactly that many. Each entry is read once, into a
  * snapshot, and checked against the boundary and against the room left: a
- * sibling thread can rewrite the array after the total was taken, and an
- * entry that grew must not run past the buffer.
+ * sibling thread can rewrite the array after the total was taken, and an entry
+ * that grew must not run past the buffer.
  *
  * Returns EOK, or EFAULT when an entry cannot be read, lies outside the
  * boundary, or the array no longer adds up to bytes.
@@ -828,10 +829,10 @@ static int sendv_body(thread_t *act,
     /* Store incoming args */
     if (cop->flags & COF_NETCON) {
         /* Nothing creates a virtual thread yet, so this lookup fails and the
-         * send ends here with EINVAL. What follows for sender != act has
-         * never run: it checks the caller's addresses against the virtual
-         * thread's process, and the long message's header would be read
-         * through it too. That is to be settled with whatever adds them.
+         * send ends here with EINVAL. What follows for sender != act has never
+         * run: it checks the caller's addresses against the virtual thread's
+         * process, and the long message's header would be read through it too.
+         * That is to be settled with whatever adds them.
          */
         RD_PROBE_INT(act, kap->rmsg, sizeof(struct _vtid_info) / sizeof(int));
         sender = (thread_t *) (void *) remote_ipc_vthread(
@@ -993,14 +994,14 @@ static int sendv_body(thread_t *act,
     }
 #endif
 
-    /* Whether thp takes this message is settled here, under the lock, and
-     * thp is not looked at again unless it is claimed. A receiver that waits
-     * for notifications only is not claimed, and whoever wakes it (a
-     * notification, its timeout) clears RTMUX_ITF_RCVNOTIFICATION as it does:
-     * a second look at the flag once the lock is dropped took such a thread,
-     * by then running or waiting on something else, for a receiver this send
-     * had claimed, copied the message into its buffers, unlinked it again and
-     * made it ready a second time.
+    /* Whether thp takes this message is settled here, under the lock, and thp
+     * is not looked at again unless it is claimed. A receiver that waits for
+     * notifications only is not claimed, and whoever wakes it (a notification,
+     * its timeout) clears RTMUX_ITF_RCVNOTIFICATION as it does: a second look
+     * at the flag once the lock is dropped took such a thread, by then running
+     * or waiting on something else, for a receiver this send had claimed,
+     * copied the message into its buffers, unlinked it again and made it ready
+     * a second time.
      */
     if (thp && (thp->internal_flags & RTMUX_ITF_RCVNOTIFICATION))
         thp = NULL;
@@ -1016,9 +1017,9 @@ static int sendv_body(thread_t *act,
         while (thp->internal_flags & RTMUX_ITF_WAIT_PENDING) {
             /* Tight spin: a normal in-flight wait-state transition clears
              * within a handful of iterations. If it never clears (the hang
-             * caught at this line under gdb), count spin marks so the wedge
-             * is visible in a crash or hang dump. Gated so the normal
-             * transient case counts nothing.
+             * caught at this line under gdb), count spin marks so the wedge is
+             * visible in a crash or hang dump. Gated so the normal transient
+             * case counts nothing.
              */
             if ((++__wp_spins & 0xFFFFFU) == 0)
                 MARK_POTN_INF_LOOP();
@@ -1118,8 +1119,9 @@ static int sendv_body(thread_t *act,
                     rcv_errno = capst.rcv_err;
                     goto rcv_fault;
                 }
-                /* The receiver stays queued for another sender; a wake that
-                 * was deferred to this claim meanwhile is delivered.
+
+                /* The receiver stays queued for another sender; a wake that was
+                 * deferred to this claim meanwhile is delivered.
                  */
                 msg_claim_release(chp, thp);
                 return capst.err;
@@ -1204,10 +1206,11 @@ static int sendv_body(thread_t *act,
         }
 
         /* The destroyer drains receive_queue before reply_queue. Publish the
-         * sender in the same locked transition that removes the receiver,
-         * or the destroyer can observe both queues empty and leave the sender
+         * sender in the same locked transition that removes the receiver, or
+         * the destroyer can observe both queues empty and leave the sender
          * waiting on a detached connection. WAIT_PENDING holds off reply and
-         * forced wake until block_and_ready has displaced the sender. */
+         * forced wake until block_and_ready has displaced the sender.
+         */
         ITF_SET(sender, RTMUX_ITF_WAIT_PENDING);
         kspinlock_lock(&chp->lock);
         LINKPRIL_REM(thp);
@@ -1215,9 +1218,9 @@ static int sendv_body(thread_t *act,
         sender->state = STATE_REPLY;
         LINKPRIL_BEG(chp->reply_queue, sender, thread_t);
 
-        /* The delivery completes the receive, so it supersedes a wake that
-         * was deferred to this claim, as a reply supersedes one for its
-         * client. The receiver's status is stored here, under the lock that
+        /* The delivery completes the receive, so it supersedes a wake that was
+         * deferred to this claim, as a reply supersedes one for its client. The
+         * receiver's status is stored here, under the lock that
          * force_ready_msgxfer writes its own under, so a deferred wake cannot
          * leave its error where the rcvid belongs.
          */
@@ -1264,13 +1267,14 @@ static int sendv_body(thread_t *act,
             /* Direct sender->receiver switch: bill the sender (still this
              * hart's active thread), stamp its timestamp_last_block, and start
              * the receiver's stretch at the same time. Interrupts off, as on
-             * every billing path: a tick nested in the bill would bill the
-             * same stretch again.
+             * every billing path: a tick nested in the bill would bill the same
+             * stretch again.
              */
             {
                 unsigned long sie = interrupt_save();
 
                 sched_account_switch(thp);
+
                 /* A wakeup like block_and_ready's: end the RECEIVE wait for
                  * force_ready_wait.
                  */
@@ -1553,8 +1557,8 @@ send_fault:
     return EFAULT;
 
 rcv_fault:
-    /* The receiver is failed: it keeps none of the capabilities installed
-     * for this message.
+    /* The receiver is failed: it keeps none of the capabilities installed for
+     * this message.
      */
     fastmsg_native_cap_rollback(thp, &captx);
     atomic_clr(&sender->flags, RTMUX_FLG_THR_BUFF_MSG);
@@ -1928,8 +1932,8 @@ int kdecl ksys_msg_receivev(thread_t *act, struct kcall_args_msg_receivev *kap)
     if (kap->rparts >= 0) {
         size_t len = 0;
 
-        /* The array must lie inside the caller's space, entries included;
-         * its total is the room the receive has, used for msginfo.
+        /* The array must lie inside the caller's space, entries included; its
+         * total is the room the receive has, used for msginfo.
          */
         int rc =
             xfer_iov_sum(act, kap->rmsg, kap->rparts, XFER_SCAN_ARRAY, &len);
@@ -2039,11 +2043,10 @@ restart_recv:
         cpu_smp_mb();
 
         /* A sender that is claimed and on the send queue is blocked on its
-         * connection, so a NULL here is not expected; it was seen once all
-         * the same (a load fault on cop->flags in fastmsg_fill_rcvinfo).
-         * Nothing is delivered from a sender in that state: give it up,
-         * before anything is copied or installed, and look at the queue
-         * again.
+         * connection, so a NULL here is not expected; it was seen once all the
+         * same (a load fault on cop->flags in fastmsg_fill_rcvinfo). Nothing is
+         * delivered from a sender in that state: give it up, before anything is
+         * copied or installed, and look at the queue again.
          */
         if (!__atomic_load_n(&thp->blocked_on, __ATOMIC_ACQUIRE)) {
             fastmsg_step_yield(chp, act, thp);
@@ -2079,8 +2082,8 @@ restart_recv:
         if (xferstat)
             kcall_err(act, EFAULT);
         else {
-            /* What act holds now is this notification: the request an
-             * unblock notification was made for, and no rcvid otherwise.
+            /* What act holds now is this notification: the request an unblock
+             * notification was made for, and no rcvid otherwise.
              */
             msg_notification_received(act, notification_code,
                                       (int) notification_value,
@@ -2223,8 +2226,8 @@ restart_recv:
         }
         cop = thp->blocked_on;
         if (!cop) {
-            /* It went since the check after the claim: undo what the
-             * delivery did for the receiver and start again.
+            /* It went since the check after the claim: undo what the delivery
+             * did for the receiver and start again.
              */
             fastmsg_native_cap_rollback(act, &captx);
             fastmsg_step_yield(chp, act, thp);
@@ -2294,9 +2297,9 @@ restart_recv:
         LINKPRIL_BEG(chp->reply_queue, thp, thread_t);
 
         /* A wake that was deferred to this claim (a timeout, a signal, a
-         * teardown) still stands for the sender, which waits for a reply
-         * now: take it over here, in the window that drops the claim, and
-         * deliver it below.
+         * teardown) still stands for the sender, which waits for a reply now:
+         * take it over here, in the window that drops the claim, and deliver it
+         * below.
          */
         deferred = (thp->internal_flags & RTMUX_ITF_MSG_FORCE_RDY) != 0;
         if (deferred) {
@@ -2540,12 +2543,13 @@ static int msg_replyv_body(thread_t *act,
         NULL) {
         return ENOERROR;
     }
+
     /* Claim thp with MSG_DELIVERY, under chp->lock, once it is known to be
-     * reply-blocked on this connection and free of any other claim. From
-     * here, with CONFIG_SMP_MSGOPT, force_ready on thp defers to this call
-     * (dispatch.c's STATE_REPLY arm), so the unlinks at the success and
-     * error tails cannot race a ConnectDetach or channel-destroy wake. Every
-     * path that leaves before those tails must give the claim up with
+     * reply-blocked on this connection and free of any other claim. From here,
+     * with CONFIG_SMP_MSGOPT, force_ready on thp defers to this call
+     * (dispatch.c's STATE_REPLY arm), so the unlinks at the success and error
+     * tails cannot race a ConnectDetach or channel-destroy wake. Every path
+     * that leaves before those tails must give the claim up with
      * msg_claim_release().
      */
     status = reply_client_claim(act, &cop, thp, &chp);
@@ -2559,9 +2563,10 @@ static int msg_replyv_body(thread_t *act,
 
     if (thp->internal_flags & RTMUX_ITF_UNBLOCK_QUEUED) {
         remove_unblock(thp, cop, kap->rcvid);
-        /* The queue walk above is as long as the send queue. A restart
-         * leaves the kernel, so it may not keep the claim: the restarted
-         * call takes it again, and so may whoever runs in between.
+
+        /* The queue walk above is as long as the send queue. A restart leaves
+         * the kernel, so it may not keep the claim: the restarted call takes it
+         * again, and so may whoever runs in between.
          */
         if (NEED_PREEMPT(act) || inject_reply_unblock_preempt()) {
             msg_claim_release(chp, thp);
@@ -2688,8 +2693,9 @@ static int msg_replyv_body(thread_t *act,
                 return ENOERROR;
             }
 #endif
-            /* The bytes are across and nothing restarts the call from here.
-             * A reply the kernel cannot vouch for fails as a bad source does.
+
+            /* The bytes are across and nothing restarts the call from here. A
+             * reply the kernel cannot vouch for fails as a bad source does.
              */
             if (!xferstat && native_reply &&
                 !fastmsg_native_cap_finish_long(act, thp, true, &captx,
@@ -2774,6 +2780,7 @@ static int msg_replyv_body(thread_t *act,
         thp->blocked_on = NULL;
         IPC_BLK(thp);
     }
+
     /* The reply completes the exchange, so it supersedes an abort a channel
      * destroy deferred to us; drop that flag with the claim, in the same lock
      * window, so it cannot linger on a healthy client.
@@ -2906,9 +2913,10 @@ static int msg_error_body(thread_t *act,
     kspinlock_lock(&chp->lock);
     LINKPRIL_REM(thp);
     reply_pending_loan_locked(act, chp, changedp);
+
     /* Complete the exchange under the lock; see ksys_msg_replyv. The error
-     * supersedes a deferred abort as a reply does: a MSG_FORCE_RDY left on
-     * the readied client would make a later force_ready ready it twice.
+     * supersedes a deferred abort as a reply does: a MSG_FORCE_RDY left on the
+     * readied client would make a later force_ready ready it twice.
      */
     if (thp->blocked_on == cop) {
         thp->blocked_on = NULL;

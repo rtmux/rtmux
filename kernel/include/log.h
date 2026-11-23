@@ -200,11 +200,11 @@ void crash_quiesce_self(void) __attribute__((noreturn));
 #ifndef NDEBUG
 extern unsigned long potn_inf_loop_marks; /* kernel/core/globals.c */
 extern const char *potn_inf_loop_site;
-#define MARK_POTN_INF_LOOP()                                                   \
-    do {                                                                       \
-        __atomic_fetch_add(&potn_inf_loop_marks, 1UL, __ATOMIC_RELAXED);       \
-        __atomic_store_n(&potn_inf_loop_site,                                  \
-                         __FILE__ ":" STRINGIZE(__LINE__), __ATOMIC_RELAXED);  \
+#define MARK_POTN_INF_LOOP()                                                  \
+    do {                                                                      \
+        __atomic_fetch_add(&potn_inf_loop_marks, 1UL, __ATOMIC_RELAXED);      \
+        __atomic_store_n(&potn_inf_loop_site,                                 \
+                         __FILE__ ":" STRINGIZE(__LINE__), __ATOMIC_RELAXED); \
     } while (0)
 #else
 #define MARK_POTN_INF_LOOP() ((void) 0)

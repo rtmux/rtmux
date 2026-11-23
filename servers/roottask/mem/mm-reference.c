@@ -89,9 +89,8 @@ static int pq_init_run(void *dst, size_t len, void *d)
             endp = (uint8_t *) dst + len;
             do {
                 if (!(pa_pq_flags(pq) & PAQ_FLAG_ZEROED)) {
-                    (void) kernel_page_zero(
-                        (paddr_t) VA_TO_PA(dst),
-                        QUANTUM_SIZE);
+                    (void) kernel_page_zero((paddr_t) VA_TO_PA(dst),
+                                            QUANTUM_SIZE);
 
                     /* RUSH3: If we set PAQ_FLAG_ZEROED here and maintained
                      * RUSH3: it properly (e.g. turned it off when setting
@@ -144,8 +143,7 @@ static int pq_init_run(void *dst, size_t len, void *d)
              * above; route through kernel_page_zero.
              */
             uintptr_t pad = (uintptr_t) dst + got;
-            (void) kernel_page_zero((paddr_t) VA_TO_PA(pad),
-                                    len - got);
+            (void) kernel_page_zero((paddr_t) VA_TO_PA(pad), len - got);
         }
         data->icache_check = 1;
         break;
@@ -727,15 +725,16 @@ int memory_reference(struct mm_map **mmp,
     data.off_end = mm->offset + (off64_t) (end - mm->start);
     data.off_start = mm->offset + (off64_t) (start - mm->start);
     if (flags & MR_TRUNC) {
-        /* Truncate the reference to the limit of the object. The pages past
-         * it are marked so that touching one is SIGBUS; vm_grow_drain maps them
-         * if the object grows to cover them.
+        /* Truncate the reference to the limit of the object. The pages past it
+         * are marked so that touching one is SIGBUS; vm_grow_drain maps them if
+         * the object grows to cover them.
          */
         if (data.off_end >= obp->mem.mm.size) {
             uintptr_t past = start;
 
             if (data.off_start < obp->mem.mm.size) {
-                data.off_end = (obp->mem.mm.size - 1) | (off64_t) (__PAGESIZE - 1);
+                data.off_end =
+                    (obp->mem.mm.size - 1) | (off64_t) (__PAGESIZE - 1);
                 past += (uintptr_t) (data.off_end + 1 - data.off_start);
             }
             if (past <= end) {
@@ -834,6 +833,7 @@ int memory_reference(struct mm_map **mmp,
                          data.off_end, pq_map, &data);
     if (r != EOK)
         goto fail1;
+
     /* A process that can now reach these pages (and store into them, now or
      * after an mprotect) voids a failed write's undo of a growth
      * (vm_undo_grow); roottask's own copy mapping does not.

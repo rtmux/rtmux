@@ -422,8 +422,8 @@ static void drain(void);
  * roottask moves the signals still queued on the system channel over to the new
  * image. What that leaves is a signal the system thread has taken off the
  * channel and not finished with, and the pending set, both of which live in
- * this table and die with the image. So a thread asks for an exec only once
- * the system thread can hold no such signal:
+ * this table and die with the image. So a thread asks for an exec only once the
+ * system thread can hold no such signal:
  *
  *   - exec_hold is raised; from then on a signal the system thread receives is
  *     left pending instead of delivered, and the system thread parks before
@@ -527,6 +527,7 @@ void __libc_signal_exec_begin(sigset_t *ignored,
         if (state.handlers[signo].sa_handler == SIG_IGN)
             sigset_set(ignored, signo);
     }
+
     /* A handler on the system thread has its own blocks in the mask; an exec
      * from another thread meanwhile keeps the mask without them, but with what
      * any thread has blocked since the handler began. One from the handler
@@ -554,9 +555,9 @@ void __libc_signal_exec_end(void)
 
 static void tty_hold_report(void);
 
-/* Start the table the way an exec left it, from the two words the loader
- * passes (see AT_RTMUX_SIGMASK): bit n-1 of a word is signal n. Called once,
- * right after __libc_signal_init(), before any thread but the first exists.
+/* Start the table the way an exec left it, from the two words the loader passes
+ * (see AT_RTMUX_SIGMASK): bit n-1 of a word is signal n. Called once, right
+ * after __libc_signal_init(), before any thread but the first exists.
  * Parameters:
  *   ignored : signals to start with SIG_IGN
  *   blocked : signals to start blocked
@@ -805,10 +806,10 @@ int __libc_signal_raise(int signo)
 
     pthread_mutex_lock(&state.lock);
     if (state.exec_hold) {
-        /* An exec is being asked for, and the pending set it sends may be
-         * read already: send the signal through roottask instead, which keeps
-         * it for the new image (or the old one's system thread takes it if
-         * the exec fails).
+        /* An exec is being asked for, and the pending set it sends may be read
+         * already: send the signal through roottask instead, which keeps it for
+         * the new image (or the old one's system thread takes it if the exec
+         * fails).
          */
         pthread_mutex_unlock(&state.lock);
         return post_via_roottask(signo);

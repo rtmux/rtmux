@@ -25,8 +25,8 @@ struct open_entry {
     int unlink;   /* an unlink: owns NODE_FLAG_UNLINKING while pending */
     ioserv_context_t *ctp; /* context of the request this entry stands for */
     /* The object the open works on, referenced from the time it was chosen
-     * under path_mutex until the reply is sent (the reply can point into it,
-     * as a symlink's does): a detach can come at any point once the mutex is
+     * under path_mutex until the reply is sent (the reply can point into it, as
+     * a symlink's does): a detach can come at any point once the mutex is
      * released, and would otherwise free it under the open.
      */
     path_object_t *held;
@@ -39,6 +39,7 @@ static struct open_entry *pending_opens;
 struct node_ocb {
     struct node_entry *node;
     off_t offset;
+
     /* What the open found on the node, for node_stat: the object can be
      * unlinked, or replaced, while the descriptor stays open.
      */
@@ -209,8 +210,8 @@ static void debug_stall(const node_t *nop, const char *tag)
 }
 
 /* A node named <tag>* fails each such request on it with err, so a test can
- * have a combined message fail after its open bound an OCB:
- * rtmux-stat-fail-* fails each stat of an opened node with EIO.
+ * have a combined message fail after its open bound an OCB: rtmux-stat-fail-*
+ * fails each stat of an opened node with EIO.
  */
 static int debug_fail(const node_t *nop, const char *tag, int err, int ret)
 {
@@ -234,10 +235,10 @@ static int node_stat(ioserv_context_t *ctp, io_stat_t *msg, void *vocb)
 
     debug_stall(ocb->node, "rtmux-stat-stall-");
 
-    /* The file is what the open found, as for any open descriptor: an unlink
-     * of the node (or of its entries) is not held back once the open is
-     * complete, and can come before this stat (a combined one too) or while
-     * the descriptor is open.
+    /* The file is what the open found, as for any open descriptor: an unlink of
+     * the node (or of its entries) is not held back once the open is complete,
+     * and can come before this stat (a combined one too) or while the
+     * descriptor is open.
      */
     if (ocb->is_dir) {
         msg->o.st_nlink = 2;
@@ -272,10 +273,9 @@ static const ioserv_ops_t node_funcs = {
  * returns, so restarting a parked operation from the open ran it between the
  * open and its combined messages. A finished open's own entry waits there too
  * while it holds its object, which is released once the reply is out. Only the
- * thread that owns the context touches the list, and it needs no allocation,
- * so nothing can fail between taking an entry off pending_opens and its
- * restart. A restarted operation can park others in turn; the loop drains
- * those too.
+ * thread that owns the context touches the list, and it needs no allocation, so
+ * nothing can fail between taking an entry off pending_opens and its restart. A
+ * restarted operation can park others in turn; the loop drains those too.
  */
 void path_open_resume(ioserv_context_t *ctp)
 {
@@ -293,8 +293,8 @@ void path_open_resume(ioserv_context_t *ctp)
             } else {
                 /* The pool reservation is a latency aid, not a requirement: on
                  * failure (low memory) the parked operations are restarted all
-                 * the same. Without one, unrelated operations may wait for
-                 * this thread if no other is free.
+                 * the same. Without one, unrelated operations may wait for this
+                 * thread if no other is free.
                  */
                 if (!tried) {
                     tried = true;
@@ -497,6 +497,7 @@ again:
         }
         path_node_access(nop);
         o = nop->object;
+
         /* What node_stat reports if this open binds a node OCB: a node with no
          * object is a directory (one with no entries is refused below), one
          * with an object is while it has entries, unless it is a symlink. An
@@ -564,8 +565,8 @@ again:
             debug_stall(nop, "rtmux-open-stall-");
 #ifdef CONFIG_DEBUG_INJECT
         /* A guard for the hold above: object_done marks what it frees in this
-         * image, so an object freed under the open shows here instead of
-         * being used (ns_open_detach).
+         * image, so an object freed under the open shows here instead of being
+         * used (ns_open_detach).
          */
         if (o && o->hdr.type == OBJECT_POISONED) {
             root_log("path_open: object %p freed under the open of %s\n",

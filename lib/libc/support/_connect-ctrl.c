@@ -31,11 +31,11 @@
 /* Send a connect message. For open() (FLAG_INTERRUPTIBLE, set where _vopen
  * comes in) the send is a registered wait, like read()'s: POSIX lets open()
  * fail with EINTR, and a service may hold an open for as long as it likes (a
- * FIFO with no peer, a device that is not ready), so a signal whose handler
- * was installed without SA_RESTART breaks it. The connects libc makes for
- * other calls (stat, access, opendir, the pieces of a path walk) are not:
- * their callers do not expect EINTR. After an EINTR nothing more is sent on
- * that connection: the server may still hold the open.
+ * FIFO with no peer, a device that is not ready), so a signal whose handler was
+ * installed without SA_RESTART breaks it. The connects libc makes for other
+ * calls (stat, access, opendir, the pieces of a path walk) are not: their
+ * callers do not expect EINTR. After an EINTR nothing more is sent on that
+ * connection: the server may still hold the open.
  */
 static int connect_send(const struct _connect_ctrl *ctrl,
                         int fd,
@@ -465,10 +465,11 @@ static int _connect_request(struct _connect_ctrl *ctrl,
                         msg2.i.combine_len = sizeof msg2.i;
                         SETIOV(siov2 + 0, &msg2.i, sizeof msg2.i);
                         save_errno = errno;
-                        /* Not after a signal broke the open: the close
-                         * would wait for the server that still holds it.
-                         * Its reply to the open is lost, and the detach
-                         * below ends the connection.
+
+                        /* Not after a signal broke the open: the close would
+                         * wait for the server that still holds it. Its reply to
+                         * the open is lost, and the detach below ends the
+                         * connection.
                          */
                         if (ctrl->status != -1 || save_errno != EINTR)
                             (void) ctrl->send(fd, siov2, 1, 0, 0);

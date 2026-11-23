@@ -100,28 +100,31 @@ extern void *_mmap2(void *addr,
  * that was killed. A client can provoke EINVAL at will with a raw request, so
  * it has a rate limit of its own and cannot use up the other's.
  */
-static void loader_exit_note(const struct loader_context *lcp, pid_t pid,
-                             int signo, int error)
+static void loader_exit_note(const struct loader_context *lcp,
+                             pid_t pid,
+                             int signo,
+                             int error)
 {
     static atomic_uint nfail, ninval;
     unsigned n;
 
     if (signo) {
         if ((n = root_warn_due(&nfail)))
-            root_warn("spawn: loader of pid %d (parent %d) %s %d (failure "
-                      "%u): reported as %s\n",
-                      (int) pid, (int) lcp->ctx.ppid,
-                      signo > 0 ? "died of signal" : "left no exit record,",
-                      signo, n, strerror(error));
+            root_warn(
+                "spawn: loader of pid %d (parent %d) %s %d (failure "
+                "%u): reported as %s\n",
+                (int) pid, (int) lcp->ctx.ppid,
+                signo > 0 ? "died of signal" : "left no exit record,", signo, n,
+                strerror(error));
         return;
     }
     if ((error != ENOMEM && error != EINVAL) ||
         !(n = root_warn_due(error == EINVAL ? &ninval : &nfail)))
         return;
-    root_warn("spawn: loader of pid %d (parent %d) gave up at "
-              "proc-loader.c:%d (failure %u): %s\n",
-              (int) pid, (int) lcp->ctx.ppid, lcp->ctx.exit_line, n,
-              strerror(error));
+    root_warn(
+        "spawn: loader of pid %d (parent %d) gave up at "
+        "proc-loader.c:%d (failure %u): %s\n",
+        (int) pid, (int) lcp->ctx.ppid, lcp->ctx.exit_line, n, strerror(error));
 }
 
 /* loader_exit — runs when a child died during loading (failed to exec, fault,
@@ -294,7 +297,8 @@ static int loader_fd(struct loader_context *lcp)
             if (info.flags & RTMUX_FLG_COF_DEAD) {
                 continue;
             }
-            if ((info.flags & RTMUX_FLG_COF_CLOEXEC) && !loader_action_source(lcp, fd)) {
+            if ((info.flags & RTMUX_FLG_COF_CLOEXEC) &&
+                !loader_action_source(lcp, fd)) {
                 continue;
             }
             if (RTMUX_NODE_CMP(info.nd, RTMUX_LOCAL_NODE) != 0)
@@ -335,8 +339,9 @@ static int loader_fd(struct loader_context *lcp)
     }
 }
 
-/* Apply actions on the child's descriptors while its requested credentials
- * and working directory are active. No file is opened in the parent. */
+/* Apply actions on the child's descriptors while its requested credentials and
+ * working directory are active. No file is opened in the parent.
+ */
 static int action_chdir(int fd, const char *path)
 {
     char dir[PATH_MAX + 1], resolved[PATH_MAX + 1];
@@ -363,8 +368,9 @@ static int action_chdir(int fd, const char *path)
     return EOK;
 }
 
-/* Only this loader thread owns the child's fd table. close() can report
- * the service's error after detaching, but EINTR can leave it attached. */
+/* Only this loader thread owns the child's fd table. close() can report the
+ * service's error after detaching, but EINTR can leave it attached.
+ */
 static int action_close(int fd)
 {
     for (;;) {
@@ -398,7 +404,8 @@ static int action_dup(int source, int target, unsigned flags)
 
 static int loader_actions(struct loader_context *lcp, const char *image)
 {
-    const unsigned char *records = (const unsigned char *) &lcp->msg + lcp->ctx.msgsize;
+    const unsigned char *records =
+        (const unsigned char *) &lcp->msg + lcp->ctx.msgsize;
     const unsigned char *cursor = records;
     size_t left = lcp->ctx.action_bytes;
     int has_open = 0, changes_dir = 0;
@@ -434,11 +441,13 @@ static int loader_actions(struct loader_context *lcp, const char *image)
             err = action_close(r.target);
             if (err)
                 return err;
-            int fd = __loader_open(path, (int) r.flags | O_NOCTTY, (mode_t) r.mode);
+            int fd =
+                __loader_open(path, (int) r.flags | O_NOCTTY, (mode_t) r.mode);
             if (fd < 0)
                 return errno;
             if (fd != r.target) {
-                err = action_dup(fd, r.target, (r.flags & O_CLOEXEC) ? FD_CLOEXEC : 0);
+                err = action_dup(fd, r.target,
+                                 (r.flags & O_CLOEXEC) ? FD_CLOEXEC : 0);
                 int closed = action_close(fd);
                 if (!err)
                     err = closed;
@@ -649,8 +658,8 @@ static void loader_args(struct loader_context *lcp,
     /* The request must hold a NUL-terminated string for every argument and
      * environment entry it counts. The walk below hands out one pointer per
      * count and does not look at the last string, so with fewer strings than
-     * that a pointer would lead into the executable path above them, past
-     * what ARG_MAX counted.
+     * that a pointer would lead into the executable path above them, past what
+     * ARG_MAX counted.
      */
     {
         const char *q = strings + interplen;
@@ -840,8 +849,8 @@ static int try_hash_bang(int fd,
 
 #ifdef CONFIG_DEBUG_INJECT
 /* A spawn of a path that ends in rtmux-loader-fault makes its loader store
- * through a null pointer, so a test can see what a faulting loader reports
- * to the spawner. Only a CONFIG_DEBUG_INJECT image has this.
+ * through a null pointer, so a test can see what a faulting loader reports to
+ * the spawner. Only a CONFIG_DEBUG_INJECT image has this.
  */
 static void loader_debug_fault(const char *path)
 {
@@ -934,9 +943,9 @@ static uint64_t loader_sigset_word(const sigset_t *set)
 }
 
 /* Publish the signals the spawn asks the new image to start blocked or ignored
- * as auxiliary vector entries; the new image's libc takes them up before main().
- * This is how an exec passes the two sets on. Appended to the entries the ELF
- * loader made, before the argument block is laid out.
+ * as auxiliary vector entries; the new image's libc takes them up before
+ * main(). This is how an exec passes the two sets on. Appended to the entries
+ * the ELF loader made, before the argument block is laid out.
  */
 static void loader_signal_aux(struct loader_context *lcp)
 {
@@ -960,9 +969,9 @@ static void loader_signal_aux(struct loader_context *lcp)
     auxv[n].a_un.a_val = 0;
 }
 
-/* The loader has temporary bootstrap authority. Apply a scheduling request
- * only after resolving the image grant, with the limits of the parent and
- * the final image. Returning the error here wakes the blocked spawner.
+/* The loader has temporary bootstrap authority. Apply a scheduling request only
+ * after resolving the image grant, with the limits of the parent and the final
+ * image. Returning the error here wakes the blocked spawner.
  */
 static int loader_schedule(struct loader_context *lcp)
 {
@@ -1262,20 +1271,21 @@ void *loader_load(void *parm)
     if (lcp->ctx.start.stacksize < lcp->ctx.start.stackalloc) {
         lcp->ctx.start.stacksize = lcp->ctx.start.stackalloc;
     }
+
     /* The argument and environment strings and their vectors are laid out at
      * the top of this stack (loader_args). Add their size, in whole pages, to
      * the mapping and to its populated part, so that they do not come out of
-     * the stack the program asked for: ARG_MAX of them would otherwise use up
-     * a small stack_max before main() runs. (The executable path, the aux
-     * vector and the TLS block are small and still come out of it.)
+     * the stack the program asked for: ARG_MAX of them would otherwise use up a
+     * small stack_max before main() runs. (The executable path, the aux vector
+     * and the TLS block are small and still come out of it.)
      */
-    argspace = lcp->msg.spawn.i.nbytes +
-               spawn_arg_pointers(lcp->msg.spawn.i.nargv,
-                                  lcp->msg.spawn.i.narge);
+    argspace =
+        lcp->msg.spawn.i.nbytes +
+        spawn_arg_pointers(lcp->msg.spawn.i.nargv, lcp->msg.spawn.i.narge);
     if (interp_name) {
         /* a script: its interpreter, the optional argument and its own path */
-        argspace += strlen(interp_name) + 1 + strlen(buffer) + 1 +
-                    2 * sizeof(char *);
+        argspace +=
+            strlen(interp_name) + 1 + strlen(buffer) + 1 + 2 * sizeof(char *);
         if (interp_arg)
             argspace += strlen(interp_arg) + 1 + sizeof(char *);
     }

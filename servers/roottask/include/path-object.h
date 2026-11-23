@@ -99,10 +99,10 @@ struct mm_object {
         union path_object *grow_next;
         unsigned grow_busy; /* queue entries not yet drained, grow_mutex */
 
-        /* Bumped by every vm_grow (every write calls it), every size change
-         * and every mapping a process other than roottask gets, under the
-         * object lock: a failed write undoes its growth only if nothing could
-         * have put bytes in the grown range since (vm_undo_grow).
+        /* Bumped by every vm_grow (every write calls it), every size change and
+         * every mapping a process other than roottask gets, under the object
+         * lock: a failed write undoes its growth only if nothing could have put
+         * bytes in the grown range since (vm_undo_grow).
          */
         uint64_t wgen; /* 64 bits: it does not wrap while a write is out */
     } mm;

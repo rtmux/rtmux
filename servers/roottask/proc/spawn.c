@@ -68,7 +68,8 @@ static int spawn_fd_permitted(struct loader_context *lcp,
         return connect_server_info(lcp->ctx.ppid, (uint64_t) parent_fd, &si) ==
                    parent_fd &&
                (spawn_fd_scan_ok(si.flags) ||
-                (!(si.flags & RTMUX_FLG_COF_DEAD) && loader_action_source(lcp, parent_fd)));
+                (!(si.flags & RTMUX_FLG_COF_DEAD) &&
+                 loader_action_source(lcp, parent_fd)));
     default:
         return 0;
     }
@@ -189,9 +190,11 @@ int proc_spawn(ioserv_context_t *ctp, void *vmsg)
     return proc_spawn_with_actions(ctp, vmsg, NULL, 0, NULL);
 }
 
-/* libc recognizes /proc/self/fd/N as an open through an existing fd.
- * Such a pathname names an input just as explicitly as a dup action. */
-static int action_source_fd(const struct spawn_action_record *r, const char *path)
+/* libc recognizes /proc/self/fd/N as an open through an existing fd. Such a
+ * pathname names an input just as explicitly as a dup action.
+ */
+static int action_source_fd(const struct spawn_action_record *r,
+                            const char *path)
 {
     static const char prefix[] = "/proc/self/fd/";
     if (r->type == posix_file_action_type_DUP ||
@@ -213,9 +216,12 @@ static int action_source_fd(const struct spawn_action_record *r, const char *pat
 }
 
 /* Validate the entire byte stream before creating a child. The second pass
- * fills the descriptor bitmap next to the immutable action records. */
-static int action_sources(const unsigned char *actions, unsigned bytes,
-                          unsigned char *bits, unsigned *size)
+ * fills the descriptor bitmap next to the immutable action records.
+ */
+static int action_sources(const unsigned char *actions,
+                          unsigned bytes,
+                          unsigned char *bits,
+                          unsigned *size)
 {
     size_t left = bytes;
     while (left) {
@@ -236,11 +242,13 @@ static int action_sources(const unsigned char *actions, unsigned bytes,
     return EOK;
 }
 
-/* share_class: NULL, or where loader_context_alloc says which class the
- * spawner is over its share of, instead of waiting (see proc_pspawn).
+/* share_class: NULL, or where loader_context_alloc says which class the spawner
+ * is over its share of, instead of waiting (see proc_pspawn).
  */
-int proc_spawn_with_actions(ioserv_context_t *ctp, void *vmsg,
-                            const unsigned char *actions, unsigned bytes,
+int proc_spawn_with_actions(ioserv_context_t *ctp,
+                            void *vmsg,
+                            const unsigned char *actions,
+                            unsigned bytes,
                             int *share_class)
 {
     struct loader_context *lcp;
@@ -303,9 +311,9 @@ int proc_spawn_with_actions(ioserv_context_t *ctp, void *vmsg,
         if (ctp->info.msglen < sizeof(struct _proc_spawn))
             return EMSGSIZE;
 
-        /* ARG_MAX, before anything is sized from the request: this is the
-         * only bound on a native request's arguments, which the loader
-         * copies to the child's stack.
+        /* ARG_MAX, before anything is sized from the request: this is the only
+         * bound on a native request's arguments, which the loader copies to the
+         * child's stack.
          */
         if (!spawn_args_fit(msg->spawn.i.nbytes, msg->spawn.i.nargv,
                             msg->spawn.i.narge))
@@ -344,9 +352,9 @@ int proc_spawn_with_actions(ioserv_context_t *ctp, void *vmsg,
         /* EAGAIN when no context can be had; the cause is logged there. */
         status = loader_context_alloc(
             ctp->info.pid, msgsize + bytes + bitmap,
-            LC_SPAWN | ((ctp->info.flags & RTMUX_MI_ENDIAN_DIFF)
-                            ? LC_CROSS_ENDIAN
-                            : 0),
+            LC_SPAWN |
+                ((ctp->info.flags & RTMUX_MI_ENDIAN_DIFF) ? LC_CROSS_ENDIAN
+                                                          : 0),
             &lcp, share_class);
         if (status != EOK)
             return status;
@@ -426,9 +434,10 @@ int proc_spawn_with_actions(ioserv_context_t *ctp, void *vmsg,
             unsigned n = root_warn_due(&nfail);
 
             if (n)
-                root_warn("spawn: no loader thread for pid %d (failure %u): "
-                          "%s\n",
-                          (int) lcp->ctx.pid, n, strerror(-status));
+                root_warn(
+                    "spawn: no loader thread for pid %d (failure %u): "
+                    "%s\n",
+                    (int) lcp->ctx.pid, n, strerror(-status));
             (void) msg_send_notification_r(ROOTTASK_COID,
                                            attr.sched_param.sched_priority,
                                            PROC_CODE_TERM, lcp->ctx.pid);
@@ -586,8 +595,8 @@ int proc_spawn_with_actions(ioserv_context_t *ctp, void *vmsg,
             break;
         spawn_key_revoke(ctp->rcvid);
 
-        /* The loader context names the process that called exec; it exists
-         * only while this process is still loading.
+        /* The loader context names the process that called exec; it exists only
+         * while this process is still loading.
          */
         lcp = process_startup(ctp->info.pid, 0, 0);
         if (!lcp || (uintptr_t) lcp >= (uintptr_t) -256L ||
@@ -630,9 +639,9 @@ int proc_spawn_with_actions(ioserv_context_t *ctp, void *vmsg,
             break;
         }
 
-        /* The start is committed and the loader has handed over: a SIGKILL
-         * kept meanwhile acts now. Not after a failed commit, when the thread
-         * is still the loader.
+        /* The start is committed and the loader has handed over: a SIGKILL kept
+         * meanwhile acts now. Not after a failed commit, when the thread is
+         * still the loader.
          */
         signal_loaded(ctp->info.pid);
         /* SignalProcmask removed - signals eliminated */

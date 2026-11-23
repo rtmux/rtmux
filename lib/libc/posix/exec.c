@@ -30,16 +30,15 @@ static int exec_spawn(const char *path,
                       int search)
 {
     struct inheritance inherit = {
-        .flags = SPAWN_EXEC | SPAWN_SETSIGMASK | SPAWN_SETSIGIGN |
-                 SPAWN_SETSIGPEND,
+        .flags =
+            SPAWN_EXEC | SPAWN_SETSIGMASK | SPAWN_SETSIGIGN | SPAWN_SETSIGPEND,
     };
     pid_t pid;
     int err;
 
-    /* The new image keeps what is ignored, what is blocked and what is
-     * pending; a caught signal goes back to its default, so only the sets are
-     * sent. No signal is delivered to this image from here on, unless the exec
-     * fails.
+    /* The new image keeps what is ignored, what is blocked and what is pending;
+     * a caught signal goes back to its default, so only the sets are sent. No
+     * signal is delivered to this image from here on, unless the exec fails.
      */
     __libc_signal_exec_begin(&inherit.sigignore, &inherit.sigmask,
                              &inherit.sigpending);

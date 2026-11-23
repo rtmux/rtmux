@@ -93,9 +93,9 @@ static void *root_heartbeat_thread(void *arg)
 int roottask_main(int argc, char **argv)
 {
     /* Parse the boot command line for roottask's tunables. We accept the same
-     * short options the kernel parses for kopt ("-v", "-u") so a single
-     * boot command line drives both sides. kopt itself is kernel-only now;
-     * roottask owns its own scalars.
+     * short options the kernel parses for kopt ("-v", "-u") so a single boot
+     * command line drives both sides. kopt itself is kernel-only now; roottask
+     * owns its own scalars.
      *
      *   -v / -vv / -vvv ...  → roottask_loglevel = number of 'v's
      *   -u <umask> / -u<umask>  → roottask_procfs_umask (octal/auto)
@@ -150,7 +150,8 @@ int roottask_main(int argc, char **argv)
         root_process_boot_session(ROOTTASK_PID);
         root_proc_info_t boot_info;
         if (process_query_info(ROOTTASK_PID, &boot_info) == EOK)
-            roottask_max_fds = (unsigned) boot_info.rlimit_vals_hard[RLIMIT_NOFILE];
+            roottask_max_fds =
+                (unsigned) boot_info.rlimit_vals_hard[RLIMIT_NOFILE];
         root_proc(ROOTTASK_PID)->debug_name = strdup("roottask");
 
         /* Cache the adp pointer too. process_create's kcall_args adp_out

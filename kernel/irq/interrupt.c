@@ -348,13 +348,14 @@ int kdecl ksys_interrupt_wait(thread_t *act,
     _TRACE_TH_EMIT_STATE(act, INTR);
 
     /* The final pending-bit check and the switch away must exclude the
-     * same-hart PLIC handler throughout. */
+     * same-hart PLIC handler throughout.
+     */
     block_interrupt_wait();
     _TRACE_IST_DISPATCH(NULL, act);
 
-    /* The status is already stored. Leave through kernel_exit also when the
-     * IST kept the hart: block_current may have put a thread back on the run
-     * list with a reschedule request, which only kernel_exit honours.
+    /* The status is already stored. Leave through kernel_exit also when the IST
+     * kept the hart: block_current may have put a thread back on the run list
+     * with a reschedule request, which only kernel_exit honours.
      */
     return ENOERROR;
 }

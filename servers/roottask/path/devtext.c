@@ -140,7 +140,8 @@ static pthread_cond_t text_watch_cond;
 static alignas(16) char text_watcher_stack[TEXT_WATCHER_STACK];
 
 /* Drain available console input through the line discipline. Deliver signal
- * characters to the foreground group and emit echo outside text_mutex. */
+ * characters to the foreground group and emit echo outside text_mutex.
+ */
 static void text_pump(void)
 {
     for (;;) {
@@ -228,7 +229,8 @@ static void *text_watcher(void *arg)
 }
 
 /* A blocked console read periodically pumps input and checks for cancellation,
- * hangup and the per-read termios deadline. */
+ * hangup and the per-read termios deadline.
+ */
 static int text_read(ioserv_context_t *ctp, io_read_t *msg, void *ocb)
 {
     unsigned ioflag = (unsigned) (uintptr_t) ocb;
@@ -484,11 +486,11 @@ static int text_devctl(ioserv_context_t *ctp, io_devctl_t *msg, void *ocb)
         break;
 
     case DEVCTL_TTY_FLUSH:
-        /* Discard the edited line, queued records and
-         * whatever bytes are already available from the hardware. Output is
-         * written synchronously, so an output flush has nothing to discard.
-         * nbytes is caller-supplied, so reject a payload too short to hold the
-         * queue selector rather than reading past it.
+        /* Discard the edited line, queued records and whatever bytes are
+         * already available from the hardware. Output is written synchronously,
+         * so an output flush has nothing to discard. nbytes is caller-supplied,
+         * so reject a payload too short to hold the queue selector rather than
+         * reading past it.
          */
         if (msg->i.nbytes < (int32_t) sizeof data->qsel)
             return EINVAL;

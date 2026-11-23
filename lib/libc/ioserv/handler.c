@@ -13,15 +13,15 @@
 #include "internal.h"
 #include "dispatch/state.h"
 
-/* The request bound the client's id, but its call failed: it answered an
- * error, or its reply could not be delivered because the client left first
- * (timed out, or its unblock notice was lost). Either way the client detached
- * the id without a close. Close the binding here, as a close from the client
- * would: kept, it would fail every later open given that id (EBUSY in the
- * handle table). Only the binding this request set is closed, so one that a
- * later request set on the same id is left alone. A client that left early can
- * be given the id again before its failed reply is seen here; a connect of it
- * in that window still fails, and the ones after it do not.
+/* The request bound the client's id, but its call failed: it answered an error,
+ * or its reply could not be delivered because the client left first (timed out,
+ * or its unblock notice was lost). Either way the client detached the id
+ * without a close. Close the binding here, as a close from the client would:
+ * kept, it would fail every later open given that id (EBUSY in the handle
+ * table). Only the binding this request set is closed, so one that a later
+ * request set on the same id is left alone. A client that left early can be
+ * given the id again before its failed reply is seen here; a connect of it in
+ * that window still fails, and the ones after it do not.
  */
 static void _ioserv_close_lost_binding(ioserv_context_t *ctp, ioserv_msg_t *msg)
 {

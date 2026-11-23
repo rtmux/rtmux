@@ -512,8 +512,9 @@ again:
     }
 
     obp->mem.mm.size = sbuf.st_size;
-    /* Sticky while the file's mode says so: a file that has lost S_ISVTX is
-     * no longer kept past its last mapping.
+
+    /* Sticky while the file's mode says so: a file that has lost S_ISVTX is no
+     * longer kept past its last mapping.
      */
     if (sbuf.st_mode & S_ISVTX)
         obp->mem.mm.flags |= MM_FDMEM_STICKY;
@@ -717,9 +718,11 @@ static int vm_fd_cleanup(message_context_t *ctp,
                 fdmem_cleaner_object = NULL;
                 if (r) {
                     VM_FD_TALLY(vm_fd_freed);
-                    /* close may send _IO_CLOSE to this same worker pool.
-                     * Let exit handlers enqueue their objects and get back
-                     * to receive. Keep opens out until the old fd is gone. */
+
+                    /* close may send _IO_CLOSE to this same worker pool. Let
+                     * exit handlers enqueue their objects and get back to
+                     * receive. Keep opens out until the old fd is gone.
+                     */
                     atomic_add(&fdmem_close_lock, 1);
                     pthread_mutex_unlock(&fdmem_mutex);
                     close(fd);

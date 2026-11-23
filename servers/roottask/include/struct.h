@@ -80,7 +80,7 @@ struct loader_context_base {
     siginfo_t info;
     pid_t pid;
     pid_t ppid;
-    pid_t owner;  /* the spawner whose share of its class this counts against */
+    pid_t owner; /* the spawner whose share of its class this counts against */
     uint64_t held_since; /* CLOCK_MONOTONIC ns it was handed out, 0 when free */
     /* ns before which its loader is not interrupted again for holding it too
      * long (a second after the last time)
@@ -94,6 +94,7 @@ struct loader_context_base {
     unsigned action_source_bytes;
     int state;
     struct loader_startup start;
+
     /* The proc-loader.c line of the LOADER_EXIT that gave the load up, so the
      * log can say which step failed (see loader_exit).
      */

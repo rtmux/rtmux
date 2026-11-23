@@ -471,8 +471,8 @@ done:
 
 /* Take a vthread off the queue of cop's channel, the send queue or the reply
  * queue by its state, under the channel's lock. The channel is read once: a
- * channel destroy clears cop->channel at any moment, after it has drained
- * both queues, so a vthread found without a channel is on neither.
+ * channel destroy clears cop->channel at any moment, after it has drained both
+ * queues, so a vthread found without a channel is on neither.
  */
 static void remote_ipc_unqueue(connect_t *cop, thread_t *thp)
 {
@@ -738,13 +738,13 @@ void rdecl remove_unblock(thread_t *thp, connect_t *cop, int rcvid)
 
 /* Request identity.
  *
- * An rcvid is the client's thread number and the slot of its connection in
- * the server's table. Both are reused, by the client's next request at once,
- * so a server thread that acts late on an rcvid (a reply for a client that
- * was killed meanwhile, an unblock notification handled after the request was
+ * An rcvid is the client's thread number and the slot of its connection in the
+ * server's table. Both are reused, by the client's next request at once, so a
+ * server thread that acts late on an rcvid (a reply for a client that was
+ * killed meanwhile, an unblock notification handled after the request was
  * answered) would reach whatever request is blocked under the same number by
- * then. No bit of the rcvid is free to tell them apart, so the identity is
- * kept beside it:
+ * then. No bit of the rcvid is free to tell them apart, so the identity is kept
+ * beside it:
  *
  * - every send takes a new identity (req_gen);
  * - a server thread's receive records the rcvid it returned together with the
@@ -761,34 +761,34 @@ void rdecl remove_unblock(thread_t *thp, connect_t *cop, int rcvid)
  * leave room for servers that park a request and answer it from whichever
  * thread comes by: the kernel cannot tell a thread acting late on the request
  * it once received from one that was handed the next request under the same
- * rcvid. So a thread whose request was answered by another thread is taken
- * to have handed it on and is released from its record, and a stale holder
- * is refused only while the present request still has a server of its own
- * (the client's server link, which that server's next receive clears). What
- * stays refused is what the bug was: the late use of an rcvid, by the thread
- * that received it or its unblock notification, while another thread is at
- * work on the request that took its place.
+ * rcvid. So a thread whose request was answered by another thread is taken to
+ * have handed it on and is released from its record, and a stale holder is
+ * refused only while the present request still has a server of its own (the
+ * client's server link, which that server's next receive clears). What stays
+ * refused is what the bug was: the late use of an rcvid, by the thread that
+ * received it or its unblock notification, while another thread is at work on
+ * the request that took its place.
  *
- * The record is one word, the rcvid in the low 31 bits and the identity
- * above. That is 33 bits of it: a thread that held a record across 2^33
- * sends, days of all harts doing nothing else, could meet a request with
- * the same word, and would then not be refused. One word is so that the
- * thread's own receive, a sender on another hart delivering to it while it
- * waits, and another thread's reply releasing it each make one atomic store or
- * exchange. 0 is no rcvid: a connection slot is never 0.
+ * The record is one word, the rcvid in the low 31 bits and the identity above.
+ * That is 33 bits of it: a thread that held a record across 2^33 sends, days of
+ * all harts doing nothing else, could meet a request with the same word, and
+ * would then not be refused. One word is so that the thread's own receive, a
+ * sender on another hart delivering to it while it waits, and another thread's
+ * reply releasing it each make one atomic store or exchange. 0 is no rcvid: a
+ * connection slot is never 0.
  */
 static uint64_t msg_request_seq;
 
 /* One counter for all harts: an identity must differ from every other one a
  * server can still hold, whichever thread object or hart it came from.
  *
- * The unblock state of the last request goes with it. Only a reply or an
- * error removes a queued unblock notification and its mark; a request that
- * ends any other way (a channel destroy drain, a ConnectDetach, a server that
- * is terminating) leaves them set, and a mark left set makes force_ready send
- * no notification for the next request. A force_ready still at work on
- * the last request checks the identity under the channel lock before it
- * marks, so the new identity is published first.
+ * The unblock state of the last request goes with it. Only a reply or an error
+ * removes a queued unblock notification and its mark; a request that ends any
+ * other way (a channel destroy drain, a ConnectDetach, a server that is
+ * terminating) leaves them set, and a mark left set makes force_ready send no
+ * notification for the next request. A force_ready still at work on the
+ * last request checks the identity under the channel lock before it marks, so
+ * the new identity is published first.
  */
 void msg_request_begin(thread_t *sender)
 {
@@ -826,8 +826,8 @@ void msg_request_received(thread_t *server,
                      __ATOMIC_RELEASE);
 }
 
-/* server is given a notification. An unblock notification names rcvid and
- * was made for the request gen; any other one names no request.
+/* server is given a notification. An unblock notification names rcvid and was
+ * made for the request gen; any other one names no request.
  */
 void msg_notification_received(thread_t *server,
                                int code,
@@ -841,9 +841,9 @@ void msg_notification_received(thread_t *server,
 }
 
 /* replier has answered client's request (a reply or an error), with client
- * claimed. What replier held of it is spent. If another thread is down as
- * its server, that one handed it on: release it too, if this request is
- * still what it holds.
+ * claimed. What replier held of it is spent. If another thread is down as its
+ * server, that one handed it on: release it too, if this request is still what
+ * it holds.
  */
 void msg_request_answered(thread_t *replier,
                           const thread_t *client,
@@ -872,9 +872,9 @@ void msg_request_answered(thread_t *replier,
     rcu_read_unlock(&tthread_rcu);
 }
 
-/* Whether the active thread may act on client's request under its rcvid:
- * not when it holds that rcvid for another request and somebody else is
- * serving this one.
+/* Whether the active thread may act on client's request under its rcvid: not
+ * when it holds that rcvid for another request and somebody else is serving
+ * this one.
  */
 static bool msg_request_current(const thread_t *client, const connect_t *bound)
 {
@@ -900,20 +900,20 @@ static bool msg_request_current(const thread_t *client, const connect_t *bound)
  *
  * The rcvid lookup keeps received and client allocated, and its RCU-sched
  * section (open until the kcall leaves the kernel) keeps a channel that was
- * read from received->channel allocated: ksys_channel_destroy clears that
- * field before its rcu_sched_synchronize() and object_free(). It does not
- * keep the connection attached: a destroy on another hart drains the reply
- * queue, unpublishes the connection and clears the field at any moment, so
- * the field is read once and a NULL fails the call. A client found here in
- * STATE_REPLY and blocked on the connection is on chp's reply queue, since
- * the sender links itself under chp->lock and the destroy drain unlinks it
- * under the same lock before it detaches the connection. That holds for a
- * client blocked on a virtual connection of received as well: it is attached
- * to the channel of its master (ksys_connect_attach) and detached with it.
+ * read from received->channel allocated: ksys_channel_destroy clears that field
+ * before its rcu_sched_synchronize() and object_free(). It does not keep the
+ * connection attached: a destroy on another hart drains the reply queue,
+ * unpublishes the connection and clears the field at any moment, so the field
+ * is read once and a NULL fails the call. A client found here in STATE_REPLY
+ * and blocked on the connection is on chp's reply queue, since the sender links
+ * itself under chp->lock and the destroy drain unlinks it under the same lock
+ * before it detaches the connection. That holds for a client blocked on a
+ * virtual connection of received as well: it is attached to the channel of its
+ * master (ksys_connect_attach) and detached with it.
  *
- * A sender stores STATE_REPLY, its queue link and blocked_on in separate
- * steps bracketed by WAIT_PENDING, and its receiver can run and use the rcvid
- * on another hart before the last one, so wait the bracket out first.
+ * A sender stores STATE_REPLY, its queue link and blocked_on in separate steps
+ * bracketed by WAIT_PENDING, and its receiver can run and use the rcvid on
+ * another hart before the last one, so wait the bracket out first.
  */
 connect_t *reply_client_lock(connect_t *received,
                              thread_t *client,
@@ -945,8 +945,8 @@ connect_t *reply_client_lock(connect_t *received,
  * the channel lock still held. A client some other path has claimed is not
  * taken: the bit has one owner, and setting it twice lets the first release
  * expose the second owner's copy. The bit is set in every configuration, so
- * that it excludes the claimers from each other even where force_ready does
- * not read it (no CONFIG_SMP_MSGOPT).
+ * that it excludes the claimers from each other even where force_ready does not
+ * read it (no CONFIG_SMP_MSGOPT).
  */
 bool reply_client_claim_locked(thread_t *client)
 {
@@ -958,17 +958,17 @@ bool reply_client_claim_locked(thread_t *client)
 
 /* Claim the reply-blocked client an rcvid named, for a reply, an error or a
  * follow-up copy: reply_client_lock(), the claim, and the unlock. While the
- * claim is held force_ready defers to the claimer and the channel cannot
- * finish its destroy drain, so *chpp and *copp stay usable until
- * msg_claim_release() or the caller's own unlink.
+ * claim is held force_ready defers to the claimer and the channel cannot finish
+ * its destroy drain, so *chpp and *copp stay usable until msg_claim_release()
+ * or the caller's own unlink.
  *
  * Returns EOK with *copp the connection the client is blocked on; ESRCH when
  * the rcvid no longer names a reply-blocked client; or EAGAIN when the client
  * is there but another thread's reply, error or follow-up copy holds it. That
  * claim lasts no longer than one kernel entry of its holder, and failing the
  * call would lose a reply that is still deliverable, so act's call has been
- * restarted (KCALL_RESTART) to find the client free, or gone, on a later
- * entry: the caller only returns.
+ * restarted (KCALL_RESTART) to find the client free, or gone, on a later entry:
+ * the caller only returns.
  */
 int reply_client_claim(thread_t *act,
                        connect_t **copp,
@@ -990,10 +990,10 @@ int reply_client_claim(thread_t *act,
     return EOK;
 }
 
-/* Give up a MSG_DELIVERY claim on a peer without completing the exchange,
- * and deliver a wake that force_ready deferred to the claimer meanwhile.
- * force_ready takes the scheduler lock, which ranks below the channel lock,
- * so it runs after the unlock.
+/* Give up a MSG_DELIVERY claim on a peer without completing the exchange, and
+ * deliver a wake that force_ready deferred to the claimer meanwhile.
+ * force_ready takes the scheduler lock, which ranks below the channel lock, so
+ * it runs after the unlock.
  */
 void msg_claim_release(channel_t *chp, thread_t *peer)
 {
@@ -1012,9 +1012,9 @@ void msg_claim_release(channel_t *chp, thread_t *peer)
         force_ready(peer, status);
 }
 
-/* A receiving server can disown its previous client as that client times out
- * or is taken over by another server. Read the link inside the lifetime
- * guard and clear only a reverse link that still names this server.
+/* A receiving server can disown its previous client as that client times out or
+ * is taken over by another server. Read the link inside the lifetime guard and
+ * clear only a reverse link that still names this server.
  */
 bool rdecl thread_disown_client(thread_t *srv)
 {
@@ -1026,8 +1026,8 @@ bool rdecl thread_disown_client(thread_t *srv)
     if (client) {
         thread_t *expect = srv;
         (void) __atomic_compare_exchange_n(&client->args.ms.server, &expect,
-                                            NULL, false, __ATOMIC_ACQ_REL,
-                                            __ATOMIC_RELAXED);
+                                           NULL, false, __ATOMIC_ACQ_REL,
+                                           __ATOMIC_RELAXED);
         ended = thread_client_departed(srv, client);
     }
     rcu_read_unlock(&tthread_rcu);

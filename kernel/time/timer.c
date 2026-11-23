@@ -99,8 +99,8 @@ int kdecl ksys_timer_create(thread_t *act, struct kcall_args_timer_create *kap)
         return EINVAL;
     }
 
-    /* Reject signal-based timer events — use SIGEV_NOTIFICATION. SIGEV_INTR
-     * is not an event kind sigevent_exe delivers.
+    /* Reject signal-based timer events — use SIGEV_NOTIFICATION. SIGEV_INTR is
+     * not an event kind sigevent_exe delivers.
      *
      * SIGEV_THREAD is also rejected: the fire path runs from trap context
      * (STIMER) via sigevent_deliver_inline, which cannot safely call

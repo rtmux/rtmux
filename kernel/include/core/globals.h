@@ -285,8 +285,8 @@ static inline void sched_lock(kspinlock_t *l)
     get_pcpu()->pc_sched_depth++;
 }
 
-/* The outermost dispatch unlock sends the IPIs queued under it, once the
- * lock is free: a target that takes the IPI at once finds the queue unlocked.
+/* The outermost dispatch unlock sends the IPIs queued under it, once the lock
+ * is free: a target that takes the IPI at once finds the queue unlocked.
  */
 static inline void sched_unlock(kspinlock_t *l)
 {
@@ -302,11 +302,11 @@ static inline void sched_unlock(kspinlock_t *l)
         send_ipi_deferred(defer);
 }
 
-/* Whether thp is still the current thread of a hart other than cpu. A thread
- * is current on one hart at a time: the pickers leave such a thread queued
- * until that hart has switched away from it (dispatch_unlink_ready,
- * idle_unlink_ready; docs/smp-contract.md).
- * runcpu names the only hart it can be current on.
+/* Whether thp is still the current thread of a hart other than cpu. A thread is
+ * current on one hart at a time: the pickers leave such a thread queued until
+ * that hart has switched away from it (dispatch_unlink_ready,
+ * idle_unlink_ready; docs/smp-contract.md). runcpu names the only hart it can
+ * be current on.
  */
 static inline bool thread_current_elsewhere(const thread_t *thp, unsigned cpu)
 {

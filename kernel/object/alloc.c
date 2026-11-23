@@ -190,11 +190,12 @@ addmem:
         if (!new) {
             size_t size;
 
-            /* A moving realloc cannot retain the old block's insertion
-             * position across an unlocked VM callback. Finish the new
-             * allocation independently, then return the old block through
-             * a fresh, locked search of its own heap tier. On failure the
-             * caller continues to own the old block. */
+            /* A moving realloc cannot retain the old block's insertion position
+             * across an unlocked VM callback. Finish the new allocation
+             * independently, then return the old block through a fresh, locked
+             * search of its own heap tier. On failure the caller continues to
+             * own the old block.
+             */
             if (data) {
                 kspinlock_unlock(&alloc_slock);
                 new = _sreallocfunc(NULL, 0, new_size, alloc,

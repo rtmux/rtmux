@@ -38,12 +38,14 @@ static int span_vaddrs(const struct mm_map *mm,
 
 /* Map the pages of process pid's mappings of obp in span, with pid's address
  * space and the object locked, as mmap's setup_mappings does: a writable
- * MAP_PRIVATE mapping is privatized here, which changes pid's map list.
- * Pages past the object's current end (it may have shrunk again since the
- * growth) are marked instead (MR_TRUNC). A failure leaves the rest of a range
- * marked, so touching it is SIGBUS.
+ * MAP_PRIVATE mapping is privatized here, which changes pid's map list. Pages
+ * past the object's current end (it may have shrunk again since the growth) are
+ * marked instead (MR_TRUNC). A failure leaves the rest of a range marked, so
+ * touching it is SIGBUS.
  */
-static void map_grown_in(pid_t pid, path_object_t *obp, const struct resize_span *grown)
+static void map_grown_in(pid_t pid,
+                         path_object_t *obp,
+                         const struct resize_span *grown)
 {
     root_process_t *tmp = root_proc(pid);
     struct resize_span span = *grown;
@@ -58,7 +60,8 @@ static void map_grown_in(pid_t pid, path_object_t *obp, const struct resize_span
         uintptr_t end;
         unsigned flags;
 
-        if (!mm->obj_ref || mm->obj_ref->obp != obp || mm->obj_ref->adp != tmp->adp ||
+        if (!mm->obj_ref || mm->obj_ref->obp != obp ||
+            mm->obj_ref->adp != tmp->adp ||
             !span_vaddrs(mm, &span, &start, &end))
             continue;
         flags = (mm->mmap_flags & PROT_WRITE) ? MR_WRITE | MR_TRUNC : MR_TRUNC;
@@ -82,8 +85,8 @@ static pthread_cond_t grow_done = PTHREAD_COND_INITIALIZER;
 static path_object_t *grow_queue;
 
 /* Record that obp grew from oldsize bytes (page aligned) and needs its existing
- * mappings made over the new pages. Called by as_resize with the object
- * locked; only an object some mapping marked past its end needs it.
+ * mappings made over the new pages. Called by as_resize with the object locked;
+ * only an object some mapping marked past its end needs it.
  */
 static void grow_pending(path_object_t *obp, uint64_t oldsize)
 {
@@ -118,12 +121,12 @@ static pid_t next_mapper(path_object_t *obp, pid_t after)
 
 /* Map the pending growth of one object into every existing mapping of it, so
  * that a mapping made while those pages were past the end (marked by
- * memory_reference with MR_TRUNC, or by a shrink) reaches them without a
- * remap, as POSIX expects once the object covers the page. The mapping
- * processes are visited one at a time in pid order, each found under the
- * object lock and then mapped with its own address-space lock taken first
- * (mmap's order); the order makes the walk end however the mappings change
- * meanwhile, and it needs no memory.
+ * memory_reference with MR_TRUNC, or by a shrink) reaches them without a remap,
+ * as POSIX expects once the object covers the page. The mapping processes are
+ * visited one at a time in pid order, each found under the object lock and then
+ * mapped with its own address-space lock taken first (mmap's order); the order
+ * makes the walk end however the mappings change meanwhile, and it needs no
+ * memory.
  */
 static void map_grown(path_object_t *obp)
 {
@@ -144,18 +147,19 @@ static void map_grown(path_object_t *obp)
 
 /* vm_grow_drain — make the mappings of every pending growth (see grow_pending).
  * When grown is not NULL, also wait until grown has no growth left whose
- * mappings another drain is still making, so the caller that grew it can
- * answer its client knowing every mapping reaches the new pages. The caller
- * holds no object or address-space lock; every path that resizes with such a
- * lock held drains once it has dropped them, and keeps a reference on grown.
+ * mappings another drain is still making, so the caller that grew it can answer
+ * its client knowing every mapping reaches the new pages. The caller holds no
+ * object or address-space lock; every path that resizes with such a lock held
+ * drains once it has dropped them, and keeps a reference on grown.
  */
 void vm_grow_drain(path_object_t *grown)
 {
-    /* Most calls find nothing to do: skip the mutex then. A growth queued
-     * after this check is drained by the thread that queued it.
+    /* Most calls find nothing to do: skip the mutex then. A growth queued after
+     * this check is drained by the thread that queued it.
      */
     if (!__atomic_load_n(&grow_queue, __ATOMIC_ACQUIRE) &&
-        (!grown || !__atomic_load_n(&grown->mem.mm.grow_busy, __ATOMIC_ACQUIRE)))
+        (!grown ||
+         !__atomic_load_n(&grown->mem.mm.grow_busy, __ATOMIC_ACQUIRE)))
         return;
     pthread_mutex_lock(&grow_mutex);
     for (;;) {
@@ -171,7 +175,8 @@ void vm_grow_drain(path_object_t *grown)
         pthread_mutex_unlock(&grow_mutex);
         map_grown(obp);
         pthread_mutex_lock(&grow_mutex);
-        if (__atomic_sub_fetch(&obp->mem.mm.grow_busy, 1, __ATOMIC_RELEASE) == 0)
+        if (__atomic_sub_fetch(&obp->mem.mm.grow_busy, 1, __ATOMIC_RELEASE) ==
+            0)
             pthread_cond_broadcast(&grow_done);
         pthread_mutex_unlock(&grow_mutex);
         path_object_done(obp);
@@ -186,8 +191,9 @@ void vm_grow_drain(path_object_t *grown)
  * g are one hold of the object lock, so a concurrent change cannot turn the
  * call into a shrink. When g is not NULL it receives the size before the call
  * (from), the size it left (to), and the object's write generation, which every
- * call bumps (gen). Called with no object or address-space lock held. Returns
- * EOK or an errno from the resize.
+ * call bumps (gen). Called with no object or address-space lock held.
+ *
+ * Returns EOK or an errno from the resize.
  */
 int vm_grow(path_object_t *obp, size_t size, struct vm_growth *g)
 {
@@ -205,8 +211,9 @@ int vm_grow(path_object_t *obp, size_t size, struct vm_growth *g)
         g->gen = obp->mem.mm.wgen;
     }
     memobj_unlock(obp);
-    /* Also when this call did not grow it: another growth may still be
-     * having its mappings made, and the caller answers a client next.
+
+    /* Also when this call did not grow it: another growth may still be having
+     * its mappings made, and the caller answers a client next.
      */
     vm_grow_drain(obp);
     return r;
@@ -264,7 +271,8 @@ static int do_zero(path_object_t *obp,
     (void) off;
     (void) num;
     if (pa_pq_flags(pq) & PAQ_FLAG_MODIFIED)
-        return kernel_page_zero(pa_quantum_to_paddr(pq) + pg_off, QUANTUM_SIZE - pg_off);
+        return kernel_page_zero(pa_quantum_to_paddr(pq) + pg_off,
+                                QUANTUM_SIZE - pg_off);
     return EOK;
 }
 
@@ -335,9 +343,10 @@ int as_resize(path_object_t *obp, size_t size)
     has_lock = proc_mux_haslock(&obp->mem.mm.mux, 0);
     if (!has_lock)
         memobj_lock(obp);
-    if (((size & (QUANTUM_SIZE - 1)) != 0) && ((off64_t) size < obp->mem.mm.size)) {
-        /* non quantum aligned new size and we're shrinking. We need to zero
-         * the piece of the last page (if it's already been initialized).
+    if (((size & (QUANTUM_SIZE - 1)) != 0) &&
+        ((off64_t) size < obp->mem.mm.size)) {
+        /* non quantum aligned new size and we're shrinking. We need to zero the
+         * piece of the last page (if it's already been initialized).
          */
         r = zero_tail(obp, size);
         if (r != EOK)
@@ -359,6 +368,7 @@ int as_resize(path_object_t *obp, size_t size)
             r = memobj_pmem_add(obp, (off64_t) oldsize, newsize - oldsize,
                                 (int) flags);
         }
+
         /* The mappings of the new pages are made by vm_grow_drain, once the
          * caller has dropped its locks.
          */
@@ -380,7 +390,8 @@ int as_resize(path_object_t *obp, size_t size)
         goto fail2;
 
     obp->mem.mm.size = (off64_t) size;
-    obp->mem.mm.wgen++; /* any size change voids a pending undo (vm_undo_grow) */
+    obp->mem.mm
+        .wgen++; /* any size change voids a pending undo (vm_undo_grow) */
     if (!has_lock)
         memobj_unlock(obp);
     return EOK;

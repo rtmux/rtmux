@@ -22,9 +22,11 @@ extern char **environ;
 
 /* Flatten actions without looking up paths or changing descriptors in the
  * parent. A pathname is copied with its terminator immediately after its
- * record. Both passes use the same action decoding. */
+ * record. Both passes use the same action decoding.
+ */
 static int pack_actions(const _posix_spawn_file_actions_t *fact,
-                        unsigned char **packed, uint32_t *bytes)
+                        unsigned char **packed,
+                        uint32_t *bytes)
 {
     *packed = NULL;
     *bytes = 0;
@@ -144,13 +146,14 @@ int posix_spawn(pid_t *restrict pid,
 
     /* Hold the environment lock from here until argv and envp are copied: a
      * concurrent setenv may edit environ, or rewrite in place a value that any
-     * vector the caller built can point at, which would change a length
-     * between measuring and copying.
+     * vector the caller built can point at, which would change a length between
+     * measuring and copying.
      */
     __env_lock();
     env_locked = true;
     if (!envp)
         envp = environ;
+
     /* ARG_MAX, then the whole request: roottask refuses either with E2BIG, so
      * do not send it.
      */

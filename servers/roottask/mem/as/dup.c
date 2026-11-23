@@ -318,8 +318,8 @@ int as_dup(pid_t pprp_pid, process_t *pprp, pid_t prp_pid, process_t *prp)
                     goto fail2;
 
                 if ((mm->mmap_flags & MAP_TYPE) == MAP_SHARED) {
-                    /* MR_TRUNC: the child's pages past the object's end get
-                     * the PTE_SW_BUS mark the parent's have (SIGBUS).
+                    /* MR_TRUNC: the child's pages past the object's end get the
+                     * PTE_SW_BUS mark the parent's have (SIGBUS).
                      */
                     r = memory_reference(&mm, mm->start, mm->end,
                                          MR_NOINIT | MR_TRUNC, NULL);

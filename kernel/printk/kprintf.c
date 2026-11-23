@@ -914,10 +914,12 @@ static void crash_enter_self(void)
      */
     uint64_t set = 0, mine = cpu_online_snapshot() | (1ULL << me);
 
-    /* A committed AP will reach its interrupt handler even if its online
-     * bit has not been published yet. Dropped and parked CPUs cannot. */
+    /* A committed AP will reach its interrupt handler even if its online bit
+     * has not been published yet. Dropped and parked CPUs cannot.
+     */
     for (unsigned cpu = 0; cpu < num_processors; ++cpu)
-        if (__atomic_load_n(&smp_slot[cpu], __ATOMIC_ACQUIRE) == SMP_SLOT_JOINED)
+        if (__atomic_load_n(&smp_slot[cpu], __ATOMIC_ACQUIRE) ==
+            SMP_SLOT_JOINED)
             mine |= 1ULL << cpu;
     mine &= __atomic_load_n(&legal_cpu_bitmask, __ATOMIC_ACQUIRE);
     mine |= 1ULL << me;
@@ -1033,12 +1035,13 @@ void crash_quiesce_self(void)
     /* NOTREACHED */
 }
 
-/* The CPUs the rendezvous waits for: those online or committed to join when the first CPU began
- * crash handling and still eligible to run, plus every CPU that has entered
- * crash handling. The two sets differ: a CPU that crashes before it joins was
- * never online, and one that joins after the first crash is never signalled and
- * not waited for. Each CPU records itself in crash_entered_mask before it
- * signals a sibling or joins, so a waiter sees every CPU that can arrive.
+/* The CPUs the rendezvous waits for: those online or committed to join when the
+ * first CPU began crash handling and still eligible to run, plus every CPU that
+ * has entered crash handling. The two sets differ: a CPU that crashes before it
+ * joins was never online, and one that joins after the first crash is never
+ * signalled and not waited for. Each CPU records itself in crash_entered_mask
+ * before it signals a sibling or joins, so a waiter sees every CPU that can
+ * arrive.
  */
 static uint64_t crash_participants(void)
 {

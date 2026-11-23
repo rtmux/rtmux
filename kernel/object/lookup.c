@@ -169,9 +169,10 @@ connect_t *rdecl lookup_rcvid(kcall_args_t *kap, int rcvid, thread_t **thpp)
             kcall_err(act, EBADF);
             return NULL;
         }
-        /* A channel destroy clears cop->channel at any moment: read it once.
-         * A detached connection has no server process to look the thread up
-         * in, and is not the remote IPC service's own.
+
+        /* A channel destroy clears cop->channel at any moment: read it once. A
+         * detached connection has no server process to look the thread up in,
+         * and is not the remote IPC service's own.
          */
         channel_t *chp = __atomic_load_n(&cop->channel, __ATOMIC_ACQUIRE);
 

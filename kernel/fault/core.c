@@ -68,11 +68,11 @@ void rdecl deliver_fault(thread_t *thp, siginfo_t *info)
          * delivery.
          *
          * Read each slot (and nentries) UNDER vec_slock so we always see the
-         * current buffer. We must NOT hold vec_slock across
-         * thread_destroy — thread_destroy takes it itself to vector_rem
-         * (lifecycle.c). "t" stays valid after the lock drops because a reaper
-         * frees a thread only after an RCU-sched grace period, and this loop
-         * does not block before thread_destroy.
+         * current buffer. We must NOT hold vec_slock across thread_destroy —
+         * thread_destroy takes it itself to vector_rem (lifecycle.c). "t" stays
+         * valid after the lock drops because a reaper frees a thread only after
+         * an RCU-sched grace period, and this loop does not block before
+         * thread_destroy.
          */
         for (tid = 0;; ++tid) {
             int got;
@@ -127,9 +127,10 @@ void rdecl usr_fault(int code_signo, thread_t *thp, uintptr_t addr)
     info.si_bdslot = (code_signo & SIGCODE_BDSLOT) ? 1 : 0;
     info.si_addr = (void *) addr;
     info.si_fltip = (void *) KIP(thp);
+
     /* No si_status: it shares storage with si_addr, so setting it made every
-     * fault report the signal number as its address. The wait status is
-     * derived from si_signo (proc_wait_check).
+     * fault report the signal number as its address. The wait status is derived
+     * from si_signo (proc_wait_check).
      */
 
     /* Faults should always be faults */

@@ -165,6 +165,7 @@ extern void rdecl memobj_unlock(path_object_t *);
 
 #define MM_MEM_SKIPLOCKCHECK 0x20000000
 #define MM_MEM_RDB 0x08000000
+
 /* A mapping of the object has had pages marked past its end (PTE_SW_BUS), so a
  * growth must look for them (grow_pending in as/resize.c). A one-way hint:
  * never cleared.

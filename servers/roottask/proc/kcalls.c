@@ -92,8 +92,8 @@ static int teardown_call(int op, void *arg, const char *what)
  *   prp : opaque kernel-VA pointer to the target process, valid under
  *         root_proc_lock
  * Return value: EOK, or EAGAIN when a thread could not be destroyed yet (see
- * teardown_call) and the pass must be made again later; proc_exit_finish
- * makes it, without the process lock.
+ * teardown_call) and the pass must be made again later; proc_exit_finish makes
+ * it, without the process lock.
  */
 int process_threads_destroy(process_t *prp)
 {
@@ -171,9 +171,10 @@ static process_t *process_create_locked(pid_t parent_pid,
     data.pid_out = 0;
 
     prp = (process_t *) syscall_priv(__KSYS_PRIV_PROCESS_CREATE, &data);
-    /* The raw kcall returns -errno on failure. A valid process pointer is
-     * also in the high half, so test the errno range before using pid_out.
-     * pid 0 in thread_create would start the loader inside roottask.
+
+    /* The raw kcall returns -errno on failure. A valid process pointer is also
+     * in the high half, so test the errno range before using pid_out. pid 0 in
+     * thread_create would start the loader inside roottask.
      */
     if (!prp || (uintptr_t) prp >= (uintptr_t) -256L) {
         errno = prp ? (int) -(intptr_t) prp : ENOMEM;

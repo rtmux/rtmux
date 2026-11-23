@@ -31,13 +31,12 @@ static atomic_int sched_armed_pid = -1;
 static atomic_int sched_left;
 static atomic_int sched_consumed;
 static atomic_int sched_displaced;
-static thread_t * _Atomic sched_failed_thr; /* the caller just failed */
+static thread_t *_Atomic sched_failed_thr; /* the caller just failed */
 
 static inline bool inject_op_is_status(unsigned op)
 {
-    return op == INJECT_OP_SCHED_STATS ||
-           op == INJECT_OP_SYNC_WAKE_CLAIMS || op == INJECT_OP_SITE_STATUS ||
-           op == INJECT_OP_INTR_SELECT_SEEN ||
+    return op == INJECT_OP_SCHED_STATS || op == INJECT_OP_SYNC_WAKE_CLAIMS ||
+           op == INJECT_OP_SITE_STATUS || op == INJECT_OP_INTR_SELECT_SEEN ||
            op == INJECT_OP_ALLOC_STATUS || op == INJECT_OP_SCHED_SET_STATUS ||
            op == INJECT_OP_SCHED_SET_DISPLACED || op == INJECT_OP_PTE_PROBE ||
            op == INJECT_OP_MANIP_PARTIAL || op == INJECT_OP_PRIO_SETTLE_STATS ||
@@ -206,8 +205,9 @@ static atomic_int wake_claims;
 static atomic_int intr_before_switch_pid;
 static atomic_int intr_after_select_pid;
 static atomic_int intr_select_seen;
-static atomic_uint stall_block_tid; /* pthread_t the STALL_BLOCK site waits for */
-static atomic_uint stall_steal_tid; /* and the STALL_STEAL site */
+static atomic_uint
+    stall_block_tid; /* pthread_t the STALL_BLOCK site waits for */
+static atomic_uint stall_steal_tid;   /* and the STALL_STEAL site */
 static atomic_uint stall_reprio_tid;  /* and the STALL_REPRIO site */
 atomic_uint inject_empty_steal_locks; /* SCHED_STATS 0 */
 atomic_uint inject_as_slock_takes;    /* SCHED_STATS 1 */
@@ -241,16 +241,17 @@ static atomic_uint stall_ready_tid;  /* and the STALL_READY site */
 static atomic_uint stall_switch_tid; /* and the STALL_SWITCH site */
 
 /* Stand in for the PLIC handler finding thp as its hart's active thread: set
- * PENDING once for the process armed in *armed. Returns whether it did.
+ * PENDING once for the process armed in *armed.
+ *
+ * Returns whether it did.
  */
 static bool inject_intr_pending(atomic_int *armed, thread_t *thp)
 {
     if (thp->state != STATE_INTR)
         return false;
     int pid = thp->process->pid;
-    if (!atomic_compare_exchange_strong_explicit(armed, &pid, 0,
-                                                 memory_order_relaxed,
-                                                 memory_order_relaxed))
+    if (!atomic_compare_exchange_strong_explicit(
+            armed, &pid, 0, memory_order_relaxed, memory_order_relaxed))
         return false;
     atomic_or(&thp->flags, RTMUX_FLG_THR_INTR_PENDING);
     return true;
@@ -386,11 +387,10 @@ void inject_sync_waker_stall(thread_t *thp)
     inject_stall_once(STALL_SYNC_WAKER, thp->process, thp);
 }
 
-/* Called by a thread about to publish a blocked state, after the pending
- * checks of its kernel call. Callers may hold a sync chain lock.
- */
-/* Called by a hart that has taken thp off another hart's run queue, between
- * the two dispatch locks. Holds no lock.
+/* Called by a thread about to publish a blocked state, after the pending checks
+ * of its kernel call. Callers may hold a sync chain lock. Called by a hart that
+ * has taken thp off another hart's run queue, between the two dispatch locks.
+ * Holds no lock.
  */
 void inject_steal_stall(thread_t *thp)
 {
@@ -419,9 +419,9 @@ void inject_block_stall(thread_t *thp)
 /* Called by a reply, an error or a follow-up copy after the rcvid lookup,
  * before it reads received->channel: hold the caller there until a channel
  * destroy on another hart has detached the connection (or the armed time
- * passes), so the caller reads the cleared field every time, not once in a
- * long soak. The caller's RCU-sched section keeps the destroyer from freeing
- * the channel meanwhile, as it does without the stall.
+ * passes), so the caller reads the cleared field every time, not once in a long
+ * soak. The caller's RCU-sched section keeps the destroyer from freeing the
+ * channel meanwhile, as it does without the stall.
  */
 static atomic_bool reply_claim_detached; /* the last stall ended on a detach */
 
@@ -488,8 +488,8 @@ bool inject_exit_destroy_held(const process_t *prp)
 }
 
 /* Called by force_ready when it finds thp claimed, before it hands its wake
- * over: let the claimer that inject_claim_held() holds go, and give it time
- * to release the claim.
+ * over: let the claimer that inject_claim_held() holds go, and give it time to
+ * release the claim.
  */
 void inject_force_ready_claimed(thread_t *thp)
 {
@@ -516,9 +516,8 @@ void inject_force_ready_claimed(thread_t *thp)
     inject_spin_end();
 }
 
-/* Claim the one-shot stall armed at site for prp and spin until thp has one
- * of the internal flags in bits set, the site is released, or its time
- * passes.
+/* Claim the one-shot stall armed at site for prp and spin until thp has one of
+ * the internal flags in bits set, the site is released, or its time passes.
  */
 static void inject_stall_for_flags(enum inject_site site,
                                    const process_t *prp,
@@ -539,9 +538,9 @@ static void inject_stall_for_flags(enum inject_site site,
     inject_spin_end();
 }
 
-/* Called by force_ready on a reply-blocked thp before it takes the channel
- * lock to test the claim and decide on thp's unblock notification: wait for a
- * reply to claim thp (at once, if one already has).
+/* Called by force_ready on a reply-blocked thp before it takes the channel lock
+ * to test the claim and decide on thp's unblock notification: wait for a reply
+ * to claim thp (at once, if one already has).
  */
 void inject_unblock_force_window(thread_t *thp)
 {
@@ -561,7 +560,8 @@ void inject_unblock_reply_window(const thread_t *client)
                                RTMUX_ITF_UNBLOCK_QUEUED);
 }
 
-/* SLOW_KPAGE_ZERO: the roottask thread it caught, its delay and the pages left. */
+/* SLOW_KPAGE_ZERO: the roottask thread it caught, its delay and the pages left.
+ */
 static _Atomic(const thread_t *) kpage_zero_thr;
 static atomic_uint kpage_zero_us, kpage_zero_left;
 
@@ -575,7 +575,8 @@ void inject_kpage_zero_slow(const thread_t *act)
     if (!thr) {
         int pid = atomic_load_explicit(&stall_site[STALL_KPAGE_ZERO].pid,
                                        memory_order_acquire);
-        const thread_t *client = __atomic_load_n(&act->client, __ATOMIC_ACQUIRE);
+        const thread_t *client =
+            __atomic_load_n(&act->client, __ATOMIC_ACQUIRE);
 
         if (pid < 0 || !client || client->process->pid != pid ||
             !atomic_compare_exchange_strong_explicit(
@@ -604,9 +605,9 @@ void inject_kpage_zero_slow(const thread_t *act)
     inject_spin_end();
 }
 
-/* Whether the reply that just removed an unblock notification restarts as if
- * a preemption were pending: once, for the armed pid, after the 1 ms stall
- * that arming a stall site costs.
+/* Whether the reply that just removed an unblock notification restarts as if a
+ * preemption were pending: once, for the armed pid, after the 1 ms stall that
+ * arming a stall site costs.
  */
 bool inject_reply_unblock_preempt(void)
 {
@@ -655,13 +656,13 @@ void inject_ready_stall(thread_t *thp)
         inject_stall_once(STALL_READY, thp->process, NULL);
 }
 
-/* Called on the hart of thp, still its current thread, before the hart
- * switches away from it. Callers may hold the dispatch lock; thp may be NULL.
+/* Called on the hart of thp, still its current thread, before the hart switches
+ * away from it. Callers may hold the dispatch lock; thp may be NULL.
  */
 void inject_switch_stall(thread_t *thp)
 {
-    if (thp && thp->tid + 1 ==
-        atomic_load_explicit(&stall_switch_tid, memory_order_acquire))
+    if (thp && thp->tid + 1 == atomic_load_explicit(&stall_switch_tid,
+                                                    memory_order_acquire))
         inject_stall_once(STALL_SWITCH, thp->process, NULL);
 }
 
@@ -918,9 +919,10 @@ void kext_debug_inject(void *data)
              * __KSYS_PRIV_REBOOT): report, then the abnormal reboot, which
              * shuts the machine down through the SBI.
              */
-            kprintf("FATAL: power-off crash requested by debug-inject on "
-                    "hart %u\n",
-                    self);
+            kprintf(
+                "FATAL: power-off crash requested by debug-inject on "
+                "hart %u\n",
+                self);
             system_reboot(1);
         } else if (kap->arg0 != 0) {
             ret = EINVAL;
@@ -952,10 +954,10 @@ void kext_debug_inject(void *data)
             ret = EINVAL;
             break;
         }
-        atomic_store_explicit(&exit_hold_end,
-                              r_time() + kap->arg1 *
-                                             (qtimeptr->cycles_per_sec / 1000),
-                              memory_order_relaxed);
+        atomic_store_explicit(
+            &exit_hold_end,
+            r_time() + kap->arg1 * (qtimeptr->cycles_per_sec / 1000),
+            memory_order_relaxed);
         atomic_store_explicit(&exit_hold_pid, (int) kap->arg0,
                               memory_order_release);
         ret = EOK;
@@ -1095,7 +1097,8 @@ void kext_debug_inject(void *data)
             atomic_store_explicit(&prio_departure_work, 0,
                                   memory_order_relaxed);
         } else if (kap->arg0 == 3) {
-            ret = (int) atomic_load_explicit(&prio_idle_runs, memory_order_relaxed);
+            ret = (int) atomic_load_explicit(&prio_idle_runs,
+                                             memory_order_relaxed);
         } else if (kap->arg0 <= 1) {
             ret = (int) atomic_load_explicit(
                 kap->arg0 ? &prio_departure_work : &prio_thread_runs,

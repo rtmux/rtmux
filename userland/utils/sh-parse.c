@@ -269,8 +269,9 @@ static void conditional(struct parser *p, struct sh_node *n)
     take(p, "fi");
 }
 
-/* Retain the spelling of the redirection list. Its operands expand when
- * the compound command actually runs, including on successive loop passes. */
+/* Retain the spelling of the redirection list. Its operands expand when the
+ * compound command actually runs, including on successive loop passes.
+ */
 static void redirects(struct parser *p, struct sh_node *n)
 {
     const char *start = p->token.begin, *end = start;
@@ -347,8 +348,10 @@ static struct sh_node *command(struct parser *p)
                 end = p->token.end;
                 advance(p);
             } while (p->token.kind == WORD);
-            /* A line break before "in" is a separator in the grammar,
-             * but whitespace in the header passed to word expansion. */
+
+            /* A line break before "in" is a separator in the grammar, but
+             * whitespace in the header passed to word expansion.
+             */
             n->text = span(p, start, end);
             if (n->text)
                 for (size_t i = 0; i < (size_t) (in - start); i++)
@@ -447,7 +450,8 @@ static struct sh_node *command(struct parser *p)
 }
 
 /* A pipeline of simple commands still uses the job-control pipeline runner.
- * Keep its source intact so expansion and descriptor setup see all stages. */
+ * Keep its source intact so expansion and descriptor setup see all stages.
+ */
 static struct sh_node *pipeline(struct parser *p)
 {
     const char *start = p->token.begin;

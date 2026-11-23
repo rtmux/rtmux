@@ -114,8 +114,8 @@ int pte_map(address_t *adp,
         manip.data.start = start;
         manip.data.op = PTE_OP_UNMAP;
         if (pte_manipulate(&manip) == EOK)
-            __atomic_fetch_add(&rolled_back_pages, (mapped - start) / __PAGESIZE,
-                               __ATOMIC_RELAXED);
+            __atomic_fetch_add(&rolled_back_pages,
+                               (mapped - start) / __PAGESIZE, __ATOMIC_RELAXED);
     }
     return r;
 }
@@ -221,9 +221,9 @@ int pte_prealloc(address_t *adp, uintptr_t start, uintptr_t end)
 /* Mark a virtual address range past the end of the object it maps.
  *
  * The pages get an invalid PTE with the PTE_SW_BUS mark, so an access faults
- * with SIGBUS instead of SIGSEGV (POSIX mmap, for whole pages following the
- * end of an object), until a growth of the object maps them or an unmap
- * clears the mark. Parameters:
+ * with SIGBUS instead of SIGSEGV (POSIX mmap, for whole pages following the end
+ * of an object), until a growth of the object maps them or an unmap clears the
+ * mark. Parameters:
  *   adp   : address space
  *   start : range start VA (page aligned)
  *   end   : range end VA (inclusive)

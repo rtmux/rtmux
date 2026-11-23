@@ -203,12 +203,12 @@ int xfer_memcpy(void *dst, const void *src, size_t len)
     d = dst;
     s = src;
 
-    /* Words where both ends share their alignment: an aligned word lies in
-     * one page, so a fault still stops the copy at a page boundary, with
-     * every byte before it moved. Bytes for the unaligned head, the tail,
-     * and a pair of buffers that cannot be aligned together. The accesses
-     * are volatile so that the loops stay loops: a call to memcpy here would
-     * be the byte loop again.
+    /* Words where both ends share their alignment: an aligned word lies in one
+     * page, so a fault still stops the copy at a page boundary, with every byte
+     * before it moved. Bytes for the unaligned head, the tail, and a pair of
+     * buffers that cannot be aligned together. The accesses are volatile so
+     * that the loops stay loops: a call to memcpy here would be the byte loop
+     * again.
      */
     if ((((uintptr_t) d ^ (uintptr_t) s) & (sizeof(xfer_word_t) - 1)) == 0) {
         while (len && ((uintptr_t) d & (sizeof(xfer_word_t) - 1))) {
@@ -227,8 +227,8 @@ int xfer_memcpy(void *dst, const void *src, size_t len)
         *(volatile uint8_t *) d++ = *(const volatile uint8_t *) s++;
     }
 
-    /* A standalone copy armed its own env above: put the old one back with
-     * the handler, so that no later fault can longjmp into this dead frame.
+    /* A standalone copy armed its own env above: put the old one back with the
+     * handler, so that no later fault can longjmp into this dead frame.
      */
     SET_XFER_HANDLER(old_handler);
     if (!old_handler)

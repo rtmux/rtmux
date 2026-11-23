@@ -10,11 +10,11 @@
 
 
 /* The identity of the request an unblock notification is being made for
- * (force_ready names it for the length of its notification_deliver call), or
- * 0 for any other notification. An unblock notification names an
- * rcvid, which the client's next request has too: the identity goes with the
- * notification to the server thread that takes it, and two notifications for
- * different requests are not folded into one.
+ * (force_ready names it for the length of its notification_deliver call), or 0
+ * for any other notification. An unblock notification names an rcvid, which the
+ * client's next request has too: the identity goes with the notification to the
+ * server thread that takes it, and two notifications for different requests are
+ * not folded into one.
  */
 static uint64_t notification_request(int code)
 {
@@ -297,9 +297,9 @@ int rdecl notification_deliver(channel_t *chp,
         if (status) {
             kcall_err(thp, EFAULT);
         } else {
-            /* What thp holds now is this notification, unless the copy
-             * failed and its receive with it. (A copy put off to its
-             * special return is taken as made.)
+            /* What thp holds now is this notification, unless the copy failed
+             * and its receive with it. (A copy put off to its special return is
+             * taken as made.)
              */
             msg_notification_received(thp, code, (int) value,
                                       notification_request(code));

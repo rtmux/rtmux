@@ -30,9 +30,11 @@ static inline int spawn_measure_vector(char *const *vec,
 }
 
 /* Measure argv and envp for a spawn request: the two counts and the bytes of
- * all strings with their NULs. Returns E2BIG when spawn_args_fit() refuses
- * them. The caller holds the environment lock, which also covers argv entries
- * that point into the environment.
+ * all strings with their NULs.
+ *
+ * Returns E2BIG when spawn_args_fit() refuses them. The caller holds the
+ * environment lock, which also covers argv entries that point into the
+ * environment.
  */
 static inline int spawn_measure_args(char *const *argv,
                                      char *const *envp,
@@ -53,10 +55,11 @@ static inline int spawn_measure_args(char *const *argv,
 }
 
 /* Copy the strings of argv, then envp, into the `size` bytes at dst that
- * spawn_measure_args() counted for them. Returns EOK when they fill the buffer
- * exactly. A caller's thread that changes a string between the two passes can
- * make them differ; the copy never runs past the buffer, and the spawn fails
- * with E2BIG.
+ * spawn_measure_args() counted for them.
+ *
+ * Returns EOK when they fill the buffer exactly. A caller's thread that changes
+ * a string between the two passes can make them differ; the copy never runs
+ * past the buffer, and the spawn fails with E2BIG.
  */
 static inline int spawn_copy_args(char *dst,
                                   size_t size,

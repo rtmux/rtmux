@@ -14,6 +14,7 @@
 
 static struct sysfs_ocb ocb_pool[SYSFS_MAX_OCBS];
 static int ocb_inuse[SYSFS_MAX_OCBS];
+
 /* Guards ocb_inuse: opens and closes run on different pool threads, and two
  * opens that both saw a slot free would share one OCB and free its buffer
  * twice. Held only for the scan and the release.

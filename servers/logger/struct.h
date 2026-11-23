@@ -31,7 +31,7 @@ struct slogdev {
         dev_t device;
         ino_t inode;
     } identity[2]; /* slog, console */
-    int id;       /* Contains id of /dev/slog */
+    int id;        /* Contains id of /dev/slog */
 };
 
 struct slog_ocb {

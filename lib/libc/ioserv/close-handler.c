@@ -13,8 +13,8 @@
 #include <sys/ioserv-private.h>
 #include "internal.h"
 
-/* Close binding as a close message from its client would, with no reply:
- * msg (the request just handled) is rewritten into that close.
+/* Close binding as a close message from its client would, with no reply: msg
+ * (the request just handled) is rewritten into that close.
  */
 void _ioserv_close_binding(ioserv_context_t *ctp,
                            ioserv_msg_t *msg,

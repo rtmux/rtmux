@@ -31,12 +31,12 @@
 #define DISPATCH_THP(dpp, pri) link3_to_thread((dpp)->ready[pri].head)
 #define DISPATCH_LST(dpp, pri) ((dpp)->ready[pri])
 
-/* Queue a thread at the head or the tail of priority list pri, recording pri
- * as its queue priority (thread_t.qprio). Its removal, and the ready bits, go
- * by qprio, not by its priority: that can change while the thread is queued
- * (a waker reads it, then the thread's priority moves before the enqueue), and
- * a removal from the list named by the new priority leaves the old list's
- * head, tail and bit wrong.
+/* Queue a thread at the head or the tail of priority list pri, recording pri as
+ * its queue priority (thread_t.qprio). Its removal, and the ready bits, go by
+ * qprio, not by its priority: that can change while the thread is queued (a
+ * waker reads it, then the thread's priority moves before the enqueue), and a
+ * removal from the list named by the new priority leaves the old list's head,
+ * tail and bit wrong.
  */
 #define DISPATCH_LINK_END(dpp, pri, thp)                \
     {                                                   \
@@ -50,8 +50,9 @@
         (thp)->qprio = (uint8_t) (pri);                 \
         LINK3_BEG(*_dlq, &(thp)->link3_link, thread_t); \
     }
-/* Take thp off the list it is queued on, clearing that list's ready bit when
- * it empties.
+
+/* Take thp off the list it is queued on, clearing that list's ready bit when it
+ * empties.
  */
 #define DISPATCH_UNLINK(dpp, thp)                                      \
     {                                                                  \
@@ -68,6 +69,7 @@
  * lock_debug doesn't enforce ordering across same-class locks.
  */
 #define LOCAL_DPP (get_pcpu()->pc_dispatch)
+
 /* Dispatch locks. sched_lock/sched_unlock (core/globals.h) also count the
  * nesting, so IPIs sent under a dispatch lock reach SBI after the outermost
  * unlock (send_ipi).
@@ -121,6 +123,7 @@
     byte_log2[(dpp)->lo[DISPATCH_HI(dpp)][DISPATCH_MID(dpp)]]
 #define DISPATCH_HIGHEST_PRI(dpp) \
     ((DISPATCH_HI(dpp) << 6) | (DISPATCH_MID(dpp) << 3) | DISPATCH_LO(dpp))
+
 /* Lock-free: whether anything is queued at all, for a stealer to skip an empty
  * remote queue without taking its lock. Racy by design: a thread queued just
  * after the peek is found by the kick that queueing sends, or the next scan.
@@ -552,10 +555,10 @@ static __inline__ void __attribute__((__unused__)) atomic_boundary()
 /* Maximum number of iov entries in one message vector */
 #define XFER_IOV_LIMIT ((4 * 1024 * 1024) / 8)
 
-/* How long one kernel entry of a stepped transfer may spend on its vectors
- * and its copy before it saves where it stands and restarts the call. The
- * prelude of the call (lookup, claim) and two pieces of work come on top, so
- * the budget is well under the 250 us a path may take (docs/rt-budgets.md).
+/* How long one kernel entry of a stepped transfer may spend on its vectors and
+ * its copy before it saves where it stands and restarts the call. The prelude
+ * of the call (lookup, claim) and two pieces of work come on top, so the budget
+ * is well under the 250 us a path may take (docs/rt-budgets.md).
  */
 #define XFER_BUDGET_US 100
 
@@ -606,12 +609,12 @@ static __inline__ void __attribute__((__unused__)) atomic_boundary()
 #define RTMUX_ITF_MSG_DELIVERY 0x01U
 #define RTMUX_ITF_MSG_FORCE_RDY 0x02U
 
-/* A deliverer (a send, a notification) that has just unlinked receiver thp
- * from its channel's receive queue, under the channel lock, says so here:
- * from then until the deliverer readies it, with the lock dropped, thp is
- * still in STATE_RECEIVE but on no queue. force_ready takes a receiver's
- * blocked_on for the channel whose queue it is on, so it must stop naming
- * one in the step that unlinks it.
+/* A deliverer (a send, a notification) that has just unlinked receiver thp from
+ * its channel's receive queue, under the channel lock, says so here: from then
+ * until the deliverer readies it, with the lock dropped, thp is still in
+ * STATE_RECEIVE but on no queue. force_ready takes a receiver's blocked_on for
+ * the channel whose queue it is on, so it must stop naming one in the step that
+ * unlinks it.
  */
 #define RECEIVER_TAKEN(thp)                                           \
     do {                                                              \
@@ -667,10 +670,9 @@ static __inline__ void __attribute__((__unused__)) atomic_boundary()
 
 /* CANCEL_POSTED: a cancel this thread can act on is pending in its TLS. Set by
  * the canceller, and brought up to date from the TLS by the thread itself at
- * the start of each kernel call while it is set
- * (thread_cancel_posted_refresh). The TLS is user memory, which the hart that
- * blocks the thread cannot read, so this bit is what it tests once the thread
- * is displaced (block_recheck_arm).
+ * the start of each kernel call while it is set (thread_cancel_posted_refresh).
+ * The TLS is user memory, which the hart that blocks the thread cannot read, so
+ * this bit is what it tests once the thread is displaced (block_recheck_arm).
  */
 #define RTMUX_ITF_CANCEL_POSTED 0x1000U
 

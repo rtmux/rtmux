@@ -995,14 +995,20 @@ extern paddr_t pa_quantum_to_paddr(struct pa_quantum *pq);
 extern struct pa_restrict *restrict_user;
 
 /* root_map_all — map [va_lo, va_hi] of adp to paddr.. with prot, all or
- * nothing: a MAP that stops part of the way (a page table could not be had)
- * has the pages it did unmapped again, so a failure leaves no PTE of the range
+ * nothing: a MAP that stops part of the way (a page table could not be had) has
+ * the pages it did unmapped again, so a failure leaves no PTE of the range
  * behind. Called with as_slock held; the caller completes the TLB flush after
- * dropping it when *flushp is set. Returns cpu_pte_manipulate's error. The
- * UNMAP walks only tables the MAP just used, and allocates none.
+ * dropping it when *flushp is set.
+ *
+ * Returns cpu_pte_manipulate's error. The UNMAP walks only tables the MAP just
+ * used, and allocates none.
  */
-static int root_map_all(address_t *adp, uintptr_t va_lo, uintptr_t va_hi,
-                        paddr_t paddr, int prot, unsigned *flushp)
+static int root_map_all(address_t *adp,
+                        uintptr_t va_lo,
+                        uintptr_t va_hi,
+                        paddr_t paddr,
+                        int prot,
+                        unsigned *flushp)
 {
     struct mm_pte_manipulate manip;
     int r;
@@ -1200,8 +1206,9 @@ void kext_root_mmap_anon_user(void *data)
     if (va_lo + size_aligned < va_lo ||
         va_lo + size_aligned > RTMUX_ROOTTASK_UADDR_END) {
         kspinlock_unlock(&as_slock);
-        /* Nothing is mapped yet. Roottask asks again for each spawn that
-         * needs a new loader context, so keeping pq would leak it each time.
+
+        /* Nothing is mapped yet. Roottask asks again for each spawn that needs
+         * a new loader context, so keeping pq would leak it each time.
          */
         pa_free(pq, LEN_TO_NQUANTUM(size_aligned), 0);
         kap->ret = EINVAL;
@@ -1210,9 +1217,9 @@ void kext_root_mmap_anon_user(void *data)
     }
     va_hi = va_lo + size_aligned - 1;
 
-    /* All or nothing: roottask asks again for the next loader context it
-     * needs, at the same address, so a run kept after a partial MAP would leak
-     * each time.
+    /* All or nothing: roottask asks again for the next loader context it needs,
+     * at the same address, so a run kept after a partial MAP would leak each
+     * time.
      */
     r = root_map_all(adp, va_lo, va_hi, paddr, kap->prot, &flush_pending);
     if (r == EOK)

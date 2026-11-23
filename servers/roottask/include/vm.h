@@ -17,8 +17,8 @@ extern const struct object_funcs mem_funcs;
 
 /* mem/as/resize.c, each called with no object or address-space lock held.
  * vm_grow grows an object and makes its existing mappings reach the new pages;
- * vm_undo_grow takes back the growth of a write that failed; vm_grow_drain makes
- * the mappings of the growths that paths holding locks queued.
+ * vm_undo_grow takes back the growth of a write that failed; vm_grow_drain
+ * makes the mappings of the growths that paths holding locks queued.
  */
 struct vm_growth {
     uint64_t from; /* size before vm_grow */

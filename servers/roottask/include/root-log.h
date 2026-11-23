@@ -52,8 +52,8 @@ void root_dbg(const char *fmt, ...);
 void root_trace(const char *fmt, ...);
 
 /* Rate limit for a warning a client can provoke at will, so that it cannot
- * flood the ring: counts one occurrence in *seen and returns its number
- * (from 1) for the first eight and every 64th after, else 0.
+ * flood the ring: counts one occurrence in *seen and returns its number (from
+ * 1) for the first eight and every 64th after, else 0.
  */
 static inline unsigned root_warn_due(atomic_uint *seen)
 {

@@ -2,8 +2,8 @@
  * RTMux is freely redistributable under the Apache License. See the file
  * "LICENSE" for information on usage and redistribution of this file.
  *
- * The pool of /sys open-file state (sysfs-ocb.c), apart from sysfs.c so that
- * a host test can drive it from many threads.
+ * The pool of /sys open-file state (sysfs-ocb.c), apart from sysfs.c so that a
+ * host test can drive it from many threads.
  *
  * SPDX-License-Identifier: Apache-2.0
  */

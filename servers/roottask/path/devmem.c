@@ -201,9 +201,9 @@ static int mem_read_write(ioserv_context_t *ctp,
         }
     }
     if (obp && writing) {
-        /* Every write bumps the write generation, a growing one under the
-         * same lock as its growth, so a failed write's undo sees any writer
-         * that came after it.
+        /* Every write bumps the write generation, a growing one under the same
+         * lock as its growth, so a failed write's undo sees any writer that
+         * came after it.
          */
         int status = vm_grow(obp, *pos + nbytes, &growth);
 
@@ -211,6 +211,7 @@ static int mem_read_write(ioserv_context_t *ctp,
             return status;
         grown = growth.to > growth.from;
         size = (size_t) growth.to;
+
         /* A test can hold a growing write here, before its copy, so that
          * another write lands in the grown range first.
          */

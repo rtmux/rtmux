@@ -69,10 +69,9 @@
  *
  * * The "ksync_t" struct (objects.h) is no longer instantiated.
  * "thp->blocked_on" stays NULL for all sync waits so force-ready paths skip
- * ksync_t hold-list surgery. "thp->sync_wait_key" records the exact user
- * sync_t key while a thread is chain-queued. Wakers filter by that key, so
- * unrelated primitives that collide in the same hash chain do not share wait
- * queues.
+ * ksync_t hold-list surgery. "thp->sync_wait_key" records the exact user sync_t
+ * key while a thread is chain-queued. Wakers filter by that key, so unrelated
+ * primitives that collide in the same hash chain do not share wait queues.
  *
  * Locking discipline:
  *
@@ -292,8 +291,9 @@ static void sync_turnstile_ref(turnstile_t *ts)
     kspinlock_unlock(&sync_pi_slock);
 }
 
-/* The priority list skips between priority levels. Updating a loan visits
- * at most NUM_PRI levels regardless of how many mutexes an owner holds. */
+/* The priority list skips between priority levels. Updating a loan visits at
+ * most NUM_PRI levels regardless of how many mutexes an owner holds.
+ */
 static void sync_pi_loan_set_locked(turnstile_t *ts, unsigned priority)
 {
     if (ts->owner_loan.priority == priority)
@@ -425,9 +425,11 @@ static bool prio_apply(thread_t *thp,
         changed = true;
         cpu_smp_mb();
     }
-    /* A PI contender can still be running in the unlocked propagation
-     * window. Its turnstile already includes its effective priority. Copy
-     * the immutable key while the binding is protected by the PI lock. */
+
+    /* A PI contender can still be running in the unlocked propagation window.
+     * Its turnstile already includes its effective priority. Copy the immutable
+     * key while the binding is protected by the PI lock.
+     */
     sync_key_t key = 0;
     if (changed && thp->blocked_on_turnstile)
         key = thp->blocked_on_turnstile->key;
@@ -759,15 +761,15 @@ static void sync_pi_recompute_chain(thread_t *owner)
 }
 
 /* The contending thread holds the chain lock while marking the owner. Exit
- * either finds a mark and waits on this chain, or closes registration first
- * and the contender handles a dead owner itself. */
+ * either finds a mark and waits on this chain, or closes registration first and
+ * the contender handles a dead owner itself.
+ */
 enum { SYNC_OWNER_TRACKED = 1, SYNC_OWNER_CLOSED = 2 };
 
 static bool sync_track_owner(thread_t *thp)
 {
-    unsigned old = atomic_fetch_or_explicit(&thp->sync_owner_flags,
-                                            SYNC_OWNER_TRACKED,
-                                            memory_order_acq_rel);
+    unsigned old = atomic_fetch_or_explicit(
+        &thp->sync_owner_flags, SYNC_OWNER_TRACKED, memory_order_acq_rel);
     return !(old & SYNC_OWNER_CLOSED);
 }
 
@@ -999,9 +1001,8 @@ void sync_chains_assert_not_queued(const thread_t *thp, const char *what)
                 "sync chain %u still holds thread %p (%s): tid %d state %u "
                 "wait_key %#lx prev %p next %p ra %p\n",
                 i, (const void *) thp, what, thp->tid, (unsigned) thp->state,
-                (unsigned long) thp->sync_wait_key,
-                (void *) thp->prev.thread, (void *) thp->next.thread,
-                __builtin_return_address(0));
+                (unsigned long) thp->sync_wait_key, (void *) thp->prev.thread,
+                (void *) thp->next.thread, __builtin_return_address(0));
             thr_trace_dump(thp);
             crash();
         }
@@ -1175,17 +1176,18 @@ static thread_t *sync_dequeue_head(struct sync_chain *c, sync_key_t key)
     return best;
 }
 
-/* Claim the wait under its owning lock. A zero key means the waker
- * already owns the transition to READY. The key lives outside the kcall
- * argument union and cannot be overwritten by a subsequent message. A woken
- * waiter that waits on the same object again has the same key, so a caller
- * that names one wait passes its wake count (force_ready_wait): the wait is
- * that one only if the count is unchanged under the chain lock, as a waker
- * dequeues under it before ready() counts the wakeup. NULL claims any wait.
+/* Claim the wait under its owning lock. A zero key means the waker already owns
+ * the transition to READY. The key lives outside the kcall argument union and
+ * cannot be overwritten by a subsequent message. A woken waiter that waits on
+ * the same object again has the same key, so a caller that names one wait
+ * passes its wake count (force_ready_wait): the wait is that one only if the
+ * count is unchanged under the chain lock, as a waker dequeues under it before
+ * ready() counts the wakeup. NULL claims any wait.
  */
 bool rdecl sync_chain_force_ready(thread_t *thp, const uint32_t *wake_seq)
 {
-    sync_key_t key = atomic_load_explicit(&thp->sync_wait_key, memory_order_acquire);
+    sync_key_t key =
+        atomic_load_explicit(&thp->sync_wait_key, memory_order_acquire);
     struct sync_chain *c;
     turnstile_t *ts;
     thread_t *owner;
@@ -1200,9 +1202,10 @@ bool rdecl sync_chain_force_ready(thread_t *thp, const uint32_t *wake_seq)
         kspinlock_unlock(&c->lock);
         return false;
     }
-    /* Stable under the chain lock; see sync_turnstile_unbind_waiter_locked().
-     * A waiter bound to no turnstile lends nothing and has no owner to
-     * recompute, so it leaves without touching the PI lock.
+
+    /* Stable under the chain lock; see sync_turnstile_unbind_waiter_locked(). A
+     * waiter bound to no turnstile lends nothing and has no owner to recompute,
+     * so it leaves without touching the PI lock.
      */
     ts = thp->blocked_on_turnstile;
     owner = ts ? sync_turnstile_owner_pin(ts) : NULL;
@@ -1248,11 +1251,11 @@ static int sync_probe(thread_t *act, sync_t *sync)
     if (xfer_atomic_or_user((volatile unsigned *) &sync->count, 0))
         return EFAULT;
 
-    /* count and owner are two aligned words, so they share a page, its
-     * mapping and its access rights unless the object straddles a page
-     * boundary: the write probe of count then answers for owner too. Only a
-     * straddling object, which the alignment check above still admits, needs
-     * the second probe.
+    /* count and owner are two aligned words, so they share a page, its mapping
+     * and its access rights unless the object straddles a page boundary: the
+     * write probe of count then answers for owner too. Only a straddling
+     * object, which the alignment check above still admits, needs the second
+     * probe.
      */
     if (sync_straddles_page((uintptr_t) sync) &&
         xfer_atomic_or_user((volatile unsigned *) &sync->owner, 0))
@@ -1900,8 +1903,9 @@ static void robust_owner_died(thread_t *thp)
     struct robust_hold *rec;
     struct robust_hold *next;
 
-    /* Registration is closed. Wait for any earlier attach to publish
-     * its record under the same lock, then take the complete list. */
+    /* Registration is closed. Wait for any earlier attach to publish its record
+     * under the same lock, then take the complete list.
+     */
     kspinlock_lock(&sync_pi_slock);
     rec = thp->robust_held;
     thp->robust_held = NULL;
@@ -1923,7 +1927,8 @@ static void robust_owner_died(thread_t *thp)
  * that, both run under the mutex's chain lock against a thread already stamped
  * STATE_DEAD, which is set before sync_thread_cleanup runs:
  *
- * - exit closes registration and scans waiters if any owner state was registered;
+ * - exit closes registration and scans waiters if any owner state was
+ * registered;
  * - a locker publishes WAITING, then registers the owner under the chain
  *   lock. A thread already closed for exit is treated as a dead owner.
  *
@@ -2038,14 +2043,15 @@ static int mutex_try_acquire_locked(thread_t *act,
 
         if (rc != MUTEX_BUSY)
             return rc;
-        /* Once WAITING is visible, a user unlock must enter this chain
-         * before handing the mutex to a new owner. Register the owner
-         * only after publication, including after the PI walk relocks. */
+
+        /* Once WAITING is visible, a user unlock must enter this chain before
+         * handing the mutex to a new owner. Register the owner only after
+         * publication, including after the PI walk relocks.
+         */
         inject_mutex_lock_early(act->process);
         atomic_or_64((volatile unsigned long *) &sync->owner,
                      RTMUX_SYNC_WAITING);
-        if (mutex_robust(sync) ||
-            !mutex_owner_gone(sync, &owner))
+        if (mutex_robust(sync) || !mutex_owner_gone(sync, &owner))
             return rc;
         if (mutex_fail_dead_owner(sync, owner)) {
             mutex_fail_all_locked(c, key);
@@ -2088,9 +2094,8 @@ static void mutex_owner_died_waiters(thread_t *thp, struct sync_chain *c)
 
 void rdecl sync_thread_cleanup(thread_t *thp)
 {
-    unsigned old = atomic_fetch_or_explicit(&thp->sync_owner_flags,
-                                            SYNC_OWNER_CLOSED,
-                                            memory_order_acq_rel);
+    unsigned old = atomic_fetch_or_explicit(
+        &thp->sync_owner_flags, SYNC_OWNER_CLOSED, memory_order_acq_rel);
     if (old & SYNC_OWNER_TRACKED)
         robust_owner_died(thp);
     if (thp->robust_spare) {
@@ -2250,10 +2255,12 @@ retry_contended:
         rc = sync_pi_propagate(act, ts);
         inject_mutex_lock_propagated(act->process);
         kspinlock_lock(&c->lock);
-        /* An explicit lock can report a PI cycle. A condition wait has
-         * already given up its mutex and must regain it before returning.
-         * Stop propagation at the same bound, but keep this waiter queued:
-         * a timeout or release elsewhere in the chain can break the cycle. */
+
+        /* An explicit lock can report a PI cycle. A condition wait has already
+         * given up its mutex and must regain it before returning. Stop
+         * propagation at the same bound, but keep this waiter queued: a timeout
+         * or release elsewhere in the chain can break the cycle.
+         */
         if (rc == EDEADLK && (act->flags & RTMUX_FLG_THR_ACQUIRE_MUTEX))
             rc = EOK;
         if (rc != EOK) {
@@ -2312,7 +2319,8 @@ retry_contended:
     }
 
     /* Handoff can make this waiter the owner of a mutex with other waiters.
-     * Register it now. Keep its own mutex address for robust handoff. */
+     * Register it now. Keep its own mutex address for robust handoff.
+     */
     (void) sync_track_owner(act);
     act->debug_sync_mutex = (uintptr_t) sync;
     act->args.mu.mutex = sync;
@@ -2390,8 +2398,10 @@ retry_contended:
      */
     extern void unready_release(thread_t *, int, kspinlock_t *);
     unready_release(act, STATE_MUTEX, &c->lock);
-    /* The replacement owner can itself be bound on a different chain.
-     * Refresh its effective priority only after dropping this chain lock. */
+
+    /* The replacement owner can itself be bound on a different chain. Refresh
+     * its effective priority only after dropping this chain lock.
+     */
     if (changed_owner) {
         sync_pi_recompute_owner(changed_owner);
         tthread_unpin(changed_owner);
@@ -3221,8 +3231,8 @@ int kdecl ksys_sync_mutex_revive(thread_t *act,
         sync->owner == RTMUX_SYNC_MUTEX_FREE ||
         sync->owner == RTMUX_SYNC_INITIALIZER) {
         /* The word may already have waiters (a stale DEAD word reads as an
-         * owner to a locker, which queues): register the new owner, so that
-         * its death finds them.
+         * owner to a locker, which queues): register the new owner, so that its
+         * death finds them.
          */
         (void) sync_track_owner(act);
         sync->owner = SYNC_OWNER(act);

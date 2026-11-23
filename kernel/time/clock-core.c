@@ -39,9 +39,9 @@ static uint64_t clock_boot_unbilled;
  * call: advance the clock and expire the timers that are due. The reprogram
  * there pushes an overdue timer out by a whole tick (arch_timer_program_next),
  * so without this the timer fires up to a tick after the call. Called from
- * kernel_exit on the boot hart, outside any lock. Dynamic-tick mode only:
- * there the advance is the real time passed, so the next tick bills nothing
- * twice; with fixed ticks the advance belongs to the next tick.
+ * kernel_exit on the boot hart, outside any lock. Dynamic-tick mode only: there
+ * the advance is the real time passed, so the next tick bills nothing twice;
+ * with fixed ticks the advance belongs to the next tick.
  */
 void rdecl clock_catch_up(void)
 {
@@ -61,9 +61,10 @@ void rdecl clock_catch_up(void)
             *nssptr = qtp->nsec;
         }
     }
-    /* Interrupts stay off throughout, as in the tick: hold the nesting depth
-     * so the wakeups' own lock pairs do not turn them back on (kernel_exit
-     * may have no active thread for a nested trap to run on).
+
+    /* Interrupts stay off throughout, as in the tick: hold the nesting depth so
+     * the wakeups' own lock pairs do not turn them back on (kernel_exit may
+     * have no active thread for a nested trap to run on).
      */
     get_pcpu()->pc_kspin_depth++;
     timer_expiry(qtp);
@@ -117,9 +118,10 @@ const struct sigevent *clock_handler(void *dummy, int id)
         uint64_t now_nsec = arch_timer_now_ns(qtp);
         elapsed_nsec = now_nsec > qtp->nsec ? now_nsec - qtp->nsec : 0;
     }
-    /* What clock_catch_up advanced the clock by is billed with this tick:
-     * the thread that ran meanwhile is charged for it (rr_ticks, system
-     * time), but the clock is not advanced twice.
+
+    /* What clock_catch_up advanced the clock by is billed with this tick: the
+     * thread that ran meanwhile is charged for it (rr_ticks, system time), but
+     * the clock is not advanced twice.
      */
     uint64_t carried = 0;
 

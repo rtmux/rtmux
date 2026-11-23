@@ -31,8 +31,9 @@ struct sh_node {
     struct sh_node *condition, *body, *otherwise, *next;
 };
 
-/* Parse a command list, retaining shell words in their original spelling.
- * On success *out owns the list. */
+/* Parse a command list, retaining shell words in their original spelling. On
+ * success *out owns the list.
+ */
 bool sh_parse_list(const char *text, struct sh_node **out);
 struct sh_node *sh_nodes_ref(struct sh_node *node);
 void sh_nodes_free(struct sh_node *node);

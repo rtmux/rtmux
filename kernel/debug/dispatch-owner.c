@@ -5,7 +5,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/* Dispatch-owner tripwire (CONFIG_DEBUG_DISPATCH_OWNER).
+/*
+ * Dispatch-owner tripwire (CONFIG_DEBUG_DISPATCH_OWNER).
  *
  * A thread is current on at most one hart. Two harts that both resume it share
  * its saved registers, and since kernel_exit stamps the thread's trap_aux with
@@ -13,20 +14,20 @@
  * runs on the second hart's stack: the failure shows up much later, as a stack
  * or register corruption with no trace of the dispatch that caused it.
  *
- * Every pc_curthread store goes through set_active_thread on the hart that
- * owns the slot. Before the store the hart claims the incoming thread with a
- * compare-and-swap of dbg_owner.oncpu from 0 to 1 + its number; after the
- * store it gives the outgoing one back the same way. A hart that makes a
- * thread current while another still has it fails the claim and crashes on
- * the spot, naming both harts, the thread's wait state, and its last dispatch
- * and last wakeup with their call sites; with CONFIG_DEBUG_INJECT it adds the
- * thread's lifecycle trace.
+ * Every pc_curthread store goes through set_active_thread on the hart that owns
+ * the slot. Before the store the hart claims the incoming thread with a
+ * compare-and-swap of dbg_owner.oncpu from 0 to 1 + its number; after the store
+ * it gives the outgoing one back the same way. A hart that makes a thread
+ * current while another still has it fails the claim and crashes on the spot,
+ * naming both harts, the thread's wait state, and its last dispatch and last
+ * wakeup with their call sites; with CONFIG_DEBUG_INJECT it adds the thread's
+ * lifecycle trace.
  *
- * ready_default also reports a thread queued by another hart while it is
- * still current there, rate limited and without stopping: the pickers hold
- * such a thread back until its hart switches away (thread_current_elsewhere),
- * so it is a late dispatch, not a double one, but it means that a waker beat
- * the switch by more than ready() waits for.
+ * ready_default also reports a thread queued by another hart while it is still
+ * current there, rate limited and without stopping: the pickers hold such a
+ * thread back until its hart switches away (thread_current_elsewhere), so it is
+ * a late dispatch, not a double one, but it means that a waker beat the switch
+ * by more than ready() waits for.
  *
  * Only real threads carry the fields (a vthread soul is shorter), and a hart's
  * idle thread is current only on that hart, so neither needs an exemption
@@ -38,8 +39,8 @@
 #ifdef CONFIG_DEBUG_DISPATCH_OWNER
 
 /* The caller of mark_running on each hart, recorded just before its
- * set_active_thread, so the report names the dispatch path and not
- * mark_running itself. Owner hart only.
+ * set_active_thread, so the report names the dispatch path and not mark_running
+ * itself. Owner hart only.
  */
 static void *run_site[CONFIG_PROCESSORS_MAX];
 
@@ -56,32 +57,37 @@ static void owner_hart(const char *what, unsigned cpu)
             (const void *) pc->pc_curthread, pc->pc_syscall, in_kcall[cpu]);
 }
 
-static void __attribute__((noreturn))
-owner_fire(thread_t *thp, unsigned cpu, unsigned other, void *ra)
+static void __attribute__((noreturn)) owner_fire(thread_t *thp,
+                                                 unsigned cpu,
+                                                 unsigned other,
+                                                 void *ra)
 {
     kprintf_crash_mode_on();
     if (other == ~0U)
-        kprintf("dispatch-owner: thread %d.%d (%p) taken off a run queue on "
-                "cpu %u by %p in state %u: it was queued twice\n",
-                thp->process ? (int) thp->process->pid : -1, (int) thp->tid,
-                (void *) thp, cpu, ra, (unsigned) thp->state);
+        kprintf(
+            "dispatch-owner: thread %d.%d (%p) taken off a run queue on "
+            "cpu %u by %p in state %u: it was queued twice\n",
+            thp->process ? (int) thp->process->pid : -1, (int) thp->tid,
+            (void *) thp, cpu, ra, (unsigned) thp->state);
     else
-        kprintf("dispatch-owner: thread %d.%d (%p) made current on cpu %u by "
-                "%p while current on cpu %u\n",
-                thp->process ? (int) thp->process->pid : -1, (int) thp->tid,
-                (void *) thp, cpu, ra, other);
-    kprintf("  state %u flags %#x itf %#x blocked_on %p runcpu %u syscall %d "
-            "prio %u\n",
-            (unsigned) thp->state, (unsigned) thp->flags,
-            (unsigned) thp->internal_flags, thp->blocked_on,
-            (unsigned) thp->runcpu, (int) thp->syscall,
-            (unsigned) thp->priority);
+        kprintf(
+            "dispatch-owner: thread %d.%d (%p) made current on cpu %u by "
+            "%p while current on cpu %u\n",
+            thp->process ? (int) thp->process->pid : -1, (int) thp->tid,
+            (void *) thp, cpu, ra, other);
+    kprintf(
+        "  state %u flags %#x itf %#x blocked_on %p runcpu %u syscall %d "
+        "prio %u\n",
+        (unsigned) thp->state, (unsigned) thp->flags,
+        (unsigned) thp->internal_flags, thp->blocked_on, (unsigned) thp->runcpu,
+        (int) thp->syscall, (unsigned) thp->priority);
     kprintf("  last dispatch: cpu %u by %p at t=%lu\n",
             (unsigned) thp->dbg_owner.run_cpu, thp->dbg_owner.run_ra,
             (unsigned long) thp->dbg_owner.run_t);
     for (unsigned k = 0; k < 2; k++)
         kprintf("  wakeup -%u: cpu %u by %p from state %u at t=%lu\n", k,
-                (unsigned) thp->dbg_owner.wake[k].cpu, thp->dbg_owner.wake[k].ra,
+                (unsigned) thp->dbg_owner.wake[k].cpu,
+                thp->dbg_owner.wake[k].ra,
                 (unsigned) thp->dbg_owner.wake[k].state,
                 (unsigned long) thp->dbg_owner.wake[k].t);
     owner_hart("this", cpu);
@@ -110,8 +116,8 @@ void dispatch_owner_claim(unsigned cpu, thread_t *old, thread_t *new, void *ra)
 
     uint32_t seen = 0;
 
-    /* A hart that has stored its next thread but not yet given new back is
-     * no longer running it, only about to drop the claim: wait for that.
+    /* A hart that has stored its next thread but not yet given new back is no
+     * longer running it, only about to drop the claim: wait for that.
      */
     while (!__atomic_compare_exchange_n(&new->dbg_owner.oncpu, &seen, cpu + 1,
                                         false, __ATOMIC_ACQ_REL,
@@ -166,11 +172,11 @@ void dispatch_owner_ready(thread_t *thp, void *ra)
     thp->dbg_owner.wake[0].t = r_time();
     on = __atomic_load_n(&thp->dbg_owner.oncpu, __ATOMIC_ACQUIRE);
     if (on && on - 1 != get_cpunum())
-        KPRINTF_RATELIMITED("dispatch-owner: thread %d.%d queued on cpu %u by "
-                            "%p while current on cpu %u (state %u)\n",
-                            thp->process ? (int) thp->process->pid : -1,
-                            (int) thp->tid, get_cpunum(), ra, on - 1,
-                            (unsigned) thp->state);
+        KPRINTF_RATELIMITED(
+            "dispatch-owner: thread %d.%d queued on cpu %u by "
+            "%p while current on cpu %u (state %u)\n",
+            thp->process ? (int) thp->process->pid : -1, (int) thp->tid,
+            get_cpunum(), ra, on - 1, (unsigned) thp->state);
 }
 
 #endif /* CONFIG_DEBUG_DISPATCH_OWNER */

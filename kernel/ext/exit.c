@@ -326,10 +326,12 @@ void kext_exit_destroy_threads(void *arg)
     process_t *prp = arg;
     thread_t *act = get_active_thread(get_cpunum());
     exit_destroy_threads(prp, NULL);
-    /* A running sibling can pass its return-to-user KILLSELF check and enter
-     * a blocking call as another hart asks it to die. The reschedule IPI then
+
+    /* A running sibling can pass its return-to-user KILLSELF check and enter a
+     * blocking call as another hart asks it to die. The reschedule IPI then
      * sees a blocked thread. Retry from roottask until every sibling has
-     * self-reaped, including one that just joined a receive or sync queue. */
+     * self-reaped, including one that just joined a receive or sync queue.
+     */
     if (prp->pid != ROOTTASK_PID && (int) KSTATUS(act) == EOK &&
         (__atomic_load_n(&prp->num_active_threads, __ATOMIC_ACQUIRE) != 0 ||
          inject_exit_destroy_held(prp)))

@@ -38,10 +38,8 @@ static inline int spawn_add_size(size_t *sum, size_t add)
  * consistent with each other. fg and fd belong to the session that every member
  * shares and are changed under pgrp_mutex and another member's slot lock, so
  * they are only a reading at one moment: a caller that needs them to hold
- * across a decision takes pgrp_mutex, as setpgid does.
- */
-/* A process that is ending or has ended: it takes no signal and starts no
- * second exit.
+ * across a decision takes pgrp_mutex, as setpgid does. A process that is ending
+ * or has ended: it takes no signal and starts no second exit.
  */
 #define PROC_DEAD_FLAGS                                  \
     (RTMUX_FLG_PROC_TERMING | RTMUX_FLG_PROC_ZOMBIE |    \

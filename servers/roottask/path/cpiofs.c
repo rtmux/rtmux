@@ -357,8 +357,9 @@ static int cpiofs_read(ioserv_context_t *ctp, io_read_t *msg, void *handle)
     return IOSERV_NPARTS(1);
 }
 
-/* The offset of the payload identifies its entry for the archive lifetime.
- * Even an empty entry has its own header before the next payload. */
+/* The offset of the payload identifies its entry for the archive lifetime. Even
+ * an empty entry has its own header before the next payload.
+ */
 static ino_t cpiofs_inode(const uint8_t *data)
 {
     return data ? (ino_t) (data - cpio_base) : 1;

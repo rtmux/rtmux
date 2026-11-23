@@ -328,8 +328,9 @@ void set_active_thread(unsigned cpu, thread_t *thp)
         kprintf("BAD set_active_thread: cpu=%u thp=%p\n", cpu, (void *) thp);
         crash();
     }
-    /* The tripwire claims thp before it is published and gives the old
-     * thread back after (no code without CONFIG_DEBUG_DISPATCH_OWNER).
+
+    /* The tripwire claims thp before it is published and gives the old thread
+     * back after (no code without CONFIG_DEBUG_DISPATCH_OWNER).
      */
     thread_t *old = pcpu_array[cpu].pc_curthread;
 

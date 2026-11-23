@@ -79,11 +79,10 @@ struct kcall_args_debug_process {
 };
 
 /* kext_thread_ctl_call packs (prp, tid, cmd, data) — layout MUST match the
- * kernel-side definition (kernel/ext/debug.c's kcall_args_tctl_args): the
- * (cmd, data) pair is the nested kcall_args_thread_ctl of
- * kernel/core/args.h, which is 8-byte aligned, so it starts after the padding
- * that follows tid. Flattened here, cmd landed in that padding, and the
- * kernel read tid as the command.
+ * kernel-side definition (kernel/ext/debug.c's kcall_args_tctl_args): the (cmd,
+ * data) pair is the nested kcall_args_thread_ctl of kernel/core/args.h, which
+ * is 8-byte aligned, so it starts after the padding that follows tid. Flattened
+ * here, cmd landed in that padding, and the kernel read tid as the command.
  */
 struct kcall_args_tctl_args {
     process_t *prp;
@@ -1012,8 +1011,8 @@ struct kcall_args_proc_syschan_detach {
  * collect the signals queued on it that nobody received. Parameters:
  *   pid    : the process
  *   sender : out — the sender of the last queued signal, 0 if none
- * Return value: the queued signals, bit n for signal n; 0 if there were none
- * or the process is gone.
+ * Return value: the queued signals, bit n for signal n; 0 if there were none or
+ * the process is gone.
  */
 uint64_t process_syschan_detach(pid_t pid, pid_t *sender)
 {

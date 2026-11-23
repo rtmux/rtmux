@@ -682,7 +682,8 @@ int kdecl ksys_connect_detach(thread_t *act,
         return EINVAL;
     }
     bool server_side = vec == &prp->chancons && chp && chp->process == prp &&
-                       !(cop->flags & RTMUX_FLG_COF_GLOBAL) && coid == cop->scoid;
+                       !(cop->flags & RTMUX_FLG_COF_GLOBAL) &&
+                       coid == cop->scoid;
     vector_rem(vec, (unsigned) coid);
     if (!server_side)
         process_nfds_dec_locked(prp);
@@ -835,7 +836,6 @@ int kdecl ksys_connect_detach(thread_t *act,
                 connect_soul_free(cop->process, cop);
             }
         }
-
     }
 
     SETKSTATUS(act, 0);

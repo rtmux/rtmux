@@ -65,9 +65,8 @@ static void __systhrd_entry(void)
     for (;;) {
         int rcvid, err;
 
-        /* An exec that is being prepared holds this thread here, and breaks
-         * the receive with EINTR to bring it here (see
-         * __libc_signal_exec_begin).
+        /* An exec that is being prepared holds this thread here, and breaks the
+         * receive with EINTR to bring it here (see __libc_signal_exec_begin).
          */
         __libc_signal_recv_enter();
         notification.code = 0; /* no notification has that code */
@@ -75,9 +74,10 @@ static void __systhrd_entry(void)
                                          sizeof(notification), NULL);
         err = errno;
         __libc_signal_recv_exit();
-        /* The interrupt can meet a signal being delivered to this receive:
-         * the receive then fails with EINTR, but the notification was copied
-         * here, and must not be dropped.
+
+        /* The interrupt can meet a signal being delivered to this receive: the
+         * receive then fails with EINTR, but the notification was copied here,
+         * and must not be dropped.
          */
         if (rcvid == -1) {
             if (err != EINTR) {
@@ -136,8 +136,8 @@ void __rtmux_syschan_init(void)
         __libc_auxv = (const uint64_t *) (ep + 1);
     }
 
-    /* An image started by exec begins with the signals its predecessor
-     * ignored and blocked, as the loader passes them on.
+    /* An image started by exec begins with the signals its predecessor ignored
+     * and blocked, as the loader passes them on.
      */
     if (__libc_auxv_get(AT_RTMUX_SIGMASK) || __libc_auxv_get(AT_RTMUX_SIGIGN))
         __libc_signal_exec_inherit(__libc_auxv_get(AT_RTMUX_SIGIGN),

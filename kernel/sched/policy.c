@@ -396,7 +396,9 @@ int kdecl ksys_sched_yield(thread_t *act, struct kcall_args_null *kap)
     (void) kap;
     SETKSTATUS(act, EOK);
     yield();
+
     /* FIFO may already have switched. Other policies set TIMESLICE and
-     * kernel_exit handles that flag before returning to the caller. */
+     * kernel_exit handles that flag before returning to the caller.
+     */
     return ENOERROR;
 }

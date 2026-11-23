@@ -272,10 +272,10 @@ typedef struct process_entry {
     struct kdebug_entry kdebug;
     thread_t *valid_thp;
 
-    /* The thread that called exec while its swap is under way (set by the
-     * begin step, cleared by the commit), compared and never dereferenced: it
-     * tells a retry of the begin step from a second exec of another thread.
-     * Guarded by vec_slock.
+    /* The thread that called exec while its swap is under way (set by the begin
+     * step, cleared by the commit), compared and never dereferenced: it tells a
+     * retry of the begin step from a second exec of another thread. Guarded by
+     * vec_slock.
      */
     thread_t *exec_thp;
 
@@ -575,9 +575,12 @@ typedef struct thread_entry { /* Also used for vthread_entry */
     } un;
     thread_t *client; /* the client that the server thread works on behalf */
     void *blocked_on; /* blocked wait object */
-    thread_t *short_msg_source; /* special return can outlive a scheduler wait */
-    atomic_uint sync_owner_flags; /* contended/robust ownership, closed at exit */
-    _Atomic sync_key_t sync_wait_key; /* zero once the waker has unlinked this wait */
+    thread_t
+        *short_msg_source; /* special return can outlive a scheduler wait */
+    atomic_uint
+        sync_owner_flags; /* contended/robust ownership, closed at exit */
+    _Atomic sync_key_t
+        sync_wait_key; /* zero once the waker has unlinked this wait */
     turnstile_t *blocked_on_turnstile; /* PI/PC wait-chain object, not
                                         * blocked_on channel state
                                         */
@@ -599,15 +602,15 @@ typedef struct thread_entry { /* Also used for vthread_entry */
     unsigned robust_nheld; /* length of robust_held (under sync_pi_slock) */
     thread_t *restart;
 
-    /* Resume points of xfer_iov_sum(), which totals and checks an iov array
-     * of the caller a step at a time: the array, its part count, how many
-     * entries are done and the bytes they add up to. A send checks two
-     * arrays before it can rendezvous, hence two. Together with xcur below
-     * they live from a KCALL_RESTART to the entry it leads to and no longer:
-     * xfer_resume is that call's number plus one, or 0, xfer_resume_sp the
-     * caller's stack pointer (a signal handler that runs before the restart
-     * and makes the same call is on a deeper frame), and xfer_begin_call()
-     * drops them at any other kernel entry.
+    /* Resume points of xfer_iov_sum(), which totals and checks an iov array of
+     * the caller a step at a time: the array, its part count, how many entries
+     * are done and the bytes they add up to. A send checks two arrays before it
+     * can rendezvous, hence two. Together with xcur below they live from a
+     * KCALL_RESTART to the entry it leads to and no longer: xfer_resume is that
+     * call's number plus one, or 0, xfer_resume_sp the caller's stack pointer
+     * (a signal handler that runs before the restart and makes the same call is
+     * on a deeper frame), and xfer_begin_call() drops them at any other kernel
+     * entry.
      */
     struct xfer_iov_scan {
         const iov_t *vector;
@@ -617,9 +620,9 @@ typedef struct thread_entry { /* Also used for vthread_entry */
     uintptr_t xfer_resume_sp;
     uint16_t xfer_resume;
 
-    /* When the step of this kernel entry ends (xfer_piece_done), or 0 while
-     * no stepped transfer has looked at the clock in it: the scans and the
-     * copy of one entry share one budget.
+    /* When the step of this kernel entry ends (xfer_piece_done), or 0 while no
+     * stepped transfer has looked at the clock in it: the scans and the copy of
+     * one entry share one budget.
      */
     uint64_t xfer_deadline;
 
@@ -684,7 +687,7 @@ typedef struct thread_entry { /* Also used for vthread_entry */
         struct { /* Used while acquiring a mutex or waiting on a condvar */
             sync_t *mutex;
             uint32_t saved_timeout_flags;
-            long incr;      /* saved sync_t.count (same type) */
+            long incr; /* saved sync_t.count (same type) */
         } mu;
         struct { /* Used by async_flags processing in an SMP machine */
             uint32_t save_ip;
@@ -878,8 +881,8 @@ typedef struct thread_entry { /* Also used for vthread_entry */
      * forward from that entry (an offset still to be skipped is kept whole), so
      * a restart neither rescans the entries it passed nor trusts them. Valid
      * while armed, for the thread pair, vectors, offsets and message length of
-     * the transfer that saved it, and dropped with the iov scan state.
-     * Appended at the tail like the fields above it.
+     * the transfer that saved it, and dropped with the iov scan state. Appended
+     * at the tail like the fields above it.
      */
     struct {
         thread_t *sthp, *dthp;

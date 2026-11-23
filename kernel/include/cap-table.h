@@ -69,16 +69,17 @@ typedef struct rtmux_cap_table {
     uint32_t nslots;
     bool group_wrapped; /* next_group has wrapped: ids may alias a live group */
     uint64_t next_group; /* monotonic group-id source; 0 means unassigned */
-    /* Per-table FIFO ticket lock, deliberately outside the kspinlock_t
-     * LOCK framework so this table stays self-contained and embeddable. It is
+    /* Per-table FIFO ticket lock, deliberately outside the kspinlock_t LOCK
+     * framework so this table stays self-contained and embeddable. It is
      * therefore NOT covered by CONFIG_LOCK_DEBUG cycle detection. Invariant
      * that keeps it deadlock-free: a cap_lock() is always a LEAF acquire — no
      * kspinlock_t or other cap_lock may be taken while one is held (transfer's
      * cap_lock_pair takes two cap_locks, but always in pointer order, which is
      * the only nesting permitted). Callers take their kspinlock_t (e.g.
      * process_vector_slock) FIRST, then the cap_lock. Cap ops run in thread
-     * context only. Keeping interrupts enabled lets device interrupts run during
-     * bulk capability operations. A preempted ticket holder can delay waiters.
+     * context only. Keeping interrupts enabled lets device interrupts run
+     * during bulk capability operations. A preempted ticket holder can delay
+     * waiters.
      */
     rtmux_cap_lock_t lock;
     uint64_t alloc_count;

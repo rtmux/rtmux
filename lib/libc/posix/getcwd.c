@@ -68,7 +68,8 @@ static char *process_directory(char *buf, size_t size, int root)
     }
 
     /* Services report descriptor paths in the global namespace. The loader
-     * needs the global root prefix to interpret such a path in the child. */
+     * needs the global root prefix to interpret such a path in the child.
+     */
     if (root)
         return buf;
     /* Return path relative to last chroot */

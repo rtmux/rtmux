@@ -57,8 +57,8 @@ void kext_stack_cont(void *data)
         return;
     }
 
-    /* A thread of a process whose exit has begun does not start: its
-     * address space goes with the exit. It dies instead.
+    /* A thread of a process whose exit has begun does not start: its address
+     * space goes with the exit. It dies instead.
      */
     if (kap->err ||
         (prp->flags & (RTMUX_FLG_PROC_TERMING | RTMUX_FLG_PROC_DESTROYALL))) {

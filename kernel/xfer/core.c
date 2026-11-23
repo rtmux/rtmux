@@ -124,24 +124,23 @@ void xfer_async_restart(thread_t *thp, CPU_REGISTERS *regs)
 /* xfer_skip() went past every entry of the vector. */
 #define XFER_SKIP_ALL (-1)
 
-/* Start a stepped transfer's count of work in this kernel entry. The clock
- * is not read yet: it costs a trap to the SBI on some targets, and most
- * transfers are over before their first piece of work is.
+/* Start a stepped transfer's count of work in this kernel entry. The clock is
+ * not read yet: it costs a trap to the SBI on some targets, and most transfers
+ * are over before their first piece of work is.
  */
 void xfer_step_begin(struct xfer_spent *sp)
 {
     sp->ents = sp->bytes = sp->unclocked_ents = sp->unclocked_bytes = 0;
 }
 
-/* A stepped transfer has finished a piece of work (XFER_STEP_*). Whether it
- * is to save where it stands and restart its call: another thread is to have
- * this hart, or the kernel entry has used its budget. Neither is looked at
- * per entry: a restart costs the prelude of the call again, and the clock
- * costs a read, so it is consulted less often still (XFER_CLOCK_ENTRIES). The
- * budget is the kernel entry's, shared by the
- * scans and the copy it makes (act->xfer_deadline, cleared at every entry),
- * and runs from the end of its first piece, so an entry works for two pieces
- * and XFER_BUDGET_US at most.
+/* A stepped transfer has finished a piece of work (XFER_STEP_*). Whether it is
+ * to save where it stands and restart its call: another thread is to have this
+ * hart, or the kernel entry has used its budget. Neither is looked at per
+ * entry: a restart costs the prelude of the call again, and the clock costs a
+ * read, so it is consulted less often still (XFER_CLOCK_ENTRIES). The budget is
+ * the kernel entry's, shared by the scans and the copy it makes
+ * (act->xfer_deadline, cleared at every entry), and runs from the end of its
+ * first piece, so an entry works for two pieces and XFER_BUDGET_US at most.
  */
 bool xfer_piece_done(struct xfer_spent *sp)
 {
@@ -153,9 +152,9 @@ bool xfer_piece_done(struct xfer_spent *sp)
     sp->ents = sp->bytes = 0;
 
     /* NEED_PREEMPT sees a wake made on this hart. One made on another hart
-     * arrives as a reschedule IPI, which marks the running thread and is
-     * acted on at the next kernel exit, as the end of a timeslice is: take
-     * that exit now.
+     * arrives as a reschedule IPI, which marks the running thread and is acted
+     * on at the next kernel exit, as the end of a timeslice is: take that exit
+     * now.
      */
     if (NEED_PREEMPT(act) ||
         (atomic_load_explicit(&act->async_flags, memory_order_relaxed) &
@@ -182,9 +181,9 @@ bool xfer_piece_done(struct xfer_spent *sp)
  * restart of the call that saved it: KCALL_RESTART leaves that call's number
  * and the caller's stack pointer on the thread, and this entry is that restart
  * only if it finds both. Any other entry drops the lot, so a call that was
- * abandoned (it failed, was cancelled, or a signal handler ran first, whose
- * own calls come from a deeper frame) leaves nothing a later call that
- * happens to look the same could resume from.
+ * abandoned (it failed, was cancelled, or a signal handler ran first, whose own
+ * calls come from a deeper frame) leaves nothing a later call that happens to
+ * look the same could resume from.
  */
 void xfer_begin_call(thread_t *act, unsigned num)
 {
@@ -204,8 +203,8 @@ void xfer_begin_call(thread_t *act, unsigned num)
 /* Step *iovp forward over the *offp bytes still to be skipped, an entry at a
  * time, leaving *offp the offset into the entry it stops at. A bounded transfer
  * (sp set) stops with XFER_YIELD when its step is over, the position left in
- * place. Each entry's length is read once, under the fault handlers the
- * caller armed, so another thread cannot change it between the test and the
+ * place. Each entry's length is read once, under the fault handlers the caller
+ * armed, so another thread cannot change it between the test and the
  * subtraction.
  *
  * Returns 0, XFER_SKIP_ALL, XFER_YIELD or a fault.
@@ -279,11 +278,10 @@ static int xfer_yield(thread_t *act,
 }
 
 /* The restart point of every loop of a stepped transfer: the end of its step
- * (budget used, or a preemption request) saves the cursor and restarts. It
- * does not stop here before it has moved anything in this kernel entry: a
- * preemption pending at every entry would otherwise restart it for ever from
- * the same cursor. A peek does not stop here at all. It names the locals of
- * xfermsg_run.
+ * (budget used, or a preemption request) saves the cursor and restarts. It does
+ * not stop here before it has moved anything in this kernel entry: a preemption
+ * pending at every entry would otherwise restart it for ever from the same
+ * cursor. A peek does not stop here at all. It names the locals of xfermsg_run.
  */
 #define XFER_CHECKPOINT(src, soff, dst, doff)                                \
     do {                                                                     \
@@ -310,8 +308,8 @@ static int xfer_yield(thread_t *act,
         }                                                                    \
     } while (0)
 
-/* A peek that reached its limit on entries stops for good: it has no cursor
- * and does not restart.
+/* A peek that reached its limit on entries stops for good: it has no cursor and
+ * does not restart.
  */
 #define XFER_PEEK_STOP()           \
     do {                           \
@@ -719,12 +717,12 @@ static int xfermsg_run(thread_t *dthp,
     return status;
 }
 
-/* xfermsg for the head of a message, a few bytes to or from a kernel buffer:
- * it runs to its end whatever is pending, since its caller borrows the
- * restart links and the byte count of the transfer proper and must put them
- * back. So that it stays short it steps over max_entries vector entries at
- * most and returns XFER_YIELD, with the bytes moved so far counted, when the
- * vector is sparser than that.
+/* xfermsg for the head of a message, a few bytes to or from a kernel buffer: it
+ * runs to its end whatever is pending, since its caller borrows the restart
+ * links and the byte count of the transfer proper and must put them back. So
+ * that it stays short it steps over max_entries vector entries at most and
+ * returns XFER_YIELD, with the bytes moved so far counted, when the vector is
+ * sparser than that.
  */
 int xfermsg_peek(thread_t *dthp, thread_t *sthp, unsigned max_entries)
 {

@@ -35,7 +35,8 @@ static inline void cap_cpu_relax(void)
  */
 static void cap_lock(rtmux_cap_lock_t *lock)
 {
-    unsigned ticket = atomic_fetch_add_explicit(&lock->next, 1u, memory_order_relaxed);
+    unsigned ticket =
+        atomic_fetch_add_explicit(&lock->next, 1u, memory_order_relaxed);
     /*@ loop assigns \nothing; */
     while (atomic_load_explicit(&lock->owner, memory_order_acquire) != ticket)
         cap_cpu_relax();

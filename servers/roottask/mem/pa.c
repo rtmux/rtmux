@@ -343,8 +343,8 @@ memsize_t pa_free_size(void)
  */
 memsize_t pa_free_sizes(memsize_t *largest_run)
 {
-    struct kcall_args_pa_sizes s = {
-        .flags = largest_run ? PA_SIZES_LARGEST_RUN : 0};
+    struct kcall_args_pa_sizes s = {.flags =
+                                        largest_run ? PA_SIZES_LARGEST_RUN : 0};
 
     syscall_priv(__KSYS_PRIV_PA_GET_SIZES, &s);
     if (largest_run)

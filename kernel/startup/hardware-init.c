@@ -113,21 +113,21 @@ int hardware_init(int argc, char **argv, char **envv)
     /* Pre-allocate a heap region for the kernel to use before as (pa_init)
      * takes over. calloc_ram removes this region from the ram_list, so it won't
      * appear in sysram asinfo entries — preventing pa_init from double-managing
-     * the same memory.
-     */
-    /* The original 8 MiB reserve covers the default 256 MiB machine.
-     * Larger systems also need kernel objects and page tables for their
-     * residents. Try the same fraction of available RAM there, retaining
+     * the same memory. The original 8 MiB reserve covers the default 256 MiB
+     * machine. Larger systems also need kernel objects and page tables for
+     * their residents. Try the same fraction of available RAM there, retaining
      * the original minimum on small or fragmented machines.
      */
-    boot_heap_size = max_size(BOOT_HEAP_MIN, TRUNC(ram_bytes() / 32, __PAGESIZE));
+    boot_heap_size =
+        max_size(BOOT_HEAP_MIN, TRUNC(ram_bytes() / 32, __PAGESIZE));
     for (;;) {
         boot_heap_paddr = calloc_ram(boot_heap_size, __PAGESIZE);
         if (boot_heap_paddr != NULL_PADDR)
             break;
         if (boot_heap_size == BOOT_HEAP_MIN)
             crash("failed to allocate boot heap\n");
-        boot_heap_size = max_size(BOOT_HEAP_MIN, TRUNC(boot_heap_size / 2, __PAGESIZE));
+        boot_heap_size =
+            max_size(BOOT_HEAP_MIN, TRUNC(boot_heap_size / 2, __PAGESIZE));
     }
 
     /* Initialize CPU sections in the syspage. This must be done before

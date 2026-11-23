@@ -64,9 +64,9 @@ static int session_setsid(ioserv_context_t *ctp, session_t **old)
     return EOK;
 }
 
-/* A binding is reserved by server pid before sending OPENFD. Keep it on
- * this list through the final unbind reply, even after the last process slot
- * has disappeared. Only short list operations hold the mutex.
+/* A binding is reserved by server pid before sending OPENFD. Keep it on this
+ * list through the final unbind reply, even after the last process slot has
+ * disappeared. Only short list operations hold the mutex.
  */
 static pthread_mutex_t tty_bind_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t tty_changed = PTHREAD_COND_INITIALIZER;
@@ -89,8 +89,8 @@ static void tty_unlist(session_t *sep)
 }
 
 /* One queued operation per session permits a normal detach followed by a
- * rebind, without parking the dispatch pool behind an unresponsive server.
- * A reference held by the caller keeps sep alive across the timed wait.
+ * rebind, without parking the dispatch pool behind an unresponsive server. A
+ * reference held by the caller keeps sep alive across the timed wait.
  */
 static int tty_claim(session_t *sep, pid_t server)
 {
@@ -195,8 +195,9 @@ static int session_tcsetsid(ioserv_context_t *ctp, proc_session_t *msg)
     int status = EOK;
     root_proc_info_t qinfo;
 
-    /* Pin the session while the group lock excludes setsid and the slot
-     * lock still protects the reference from a departing process. */
+    /* Pin the session while the group lock excludes setsid and the slot lock
+     * still protects the reference from a departing process.
+     */
     proc_pgrp_lock();
     sep = root_session_link_of(ctp->info.pid, &sid, &pgid);
     if (!sep || sid != ctp->info.pid || sid != msg->i.sid) {

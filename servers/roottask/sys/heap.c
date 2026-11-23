@@ -48,9 +48,9 @@ static size_t roottask_heap_used;
 /* The table cannot overflow. Every block taken or given back is a whole number
  * of pages (malloc asks for page multiples and the arena is page aligned), an
  * extent is merged with any extent it touches, and one that reaches the bump
- * pointer is given to the bump region. So each extent is at least a page and
- * is followed by at least one live page below the bump pointer: n extents need
- * 2n pages, and the arena holds no more than half its page count.
+ * pointer is given to the bump region. So each extent is at least a page and is
+ * followed by at least one live page below the bump pointer: n extents need 2n
+ * pages, and the arena holds no more than half its page count.
  * test_extent_limit (tests/host/test-heap-arena.c) fills the table.
  */
 #define FREE_EXTENTS (CONFIG_ROOTTASK_HEAP_SIZE / (2 * ROOTTASK_HEAP_PAGE))

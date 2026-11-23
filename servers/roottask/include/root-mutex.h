@@ -9,8 +9,9 @@
 #include <stdint.h>
 #include <time.h>
 
-/* A PI mutex can run out of turnstiles. Sleep so a lower-priority owner
- * can release one. Callers may only proceed with ownership. */
+/* A PI mutex can run out of turnstiles. Sleep so a lower-priority owner can
+ * release one. Callers may only proceed with ownership.
+ */
 static inline void root_mutex_lock(pthread_mutex_t *mutex)
 {
     int err;
@@ -26,11 +27,10 @@ static inline void root_mutex_lock(pthread_mutex_t *mutex)
  * caller holds for every use: at most `max` threads wait at once, and each
  * until a deadline on CLOCK_MONOTONIC, which no one can set back. A waiter
  * takes a pool thread, so `max` keeps a share of the pool free for the work
- * that ends the wait.
- */
-/* A place in the arrival order of a root_wait (root_ticket_join): it lives on
- * its waiter's stack, and `key` names what the waiter waits for, so that
- * waiters for different things do not queue behind each other.
+ * that ends the wait. A place in the arrival order of a root_wait
+ * (root_ticket_join): it lives on its waiter's stack, and `key` names what the
+ * waiter waits for, so that waiters for different things do not queue behind
+ * each other.
  */
 struct root_ticket {
     struct root_ticket *next;
@@ -38,13 +38,14 @@ struct root_ticket {
 };
 
 struct root_wait {
-    pthread_cond_t cond; /* set up by the first root_wait_until() */
-    unsigned waiting;    /* threads in root_wait_until() */
-    unsigned max;        /* the most that may be */
-    int ready;           /* cond is set up */
+    pthread_cond_t cond;       /* set up by the first root_wait_until() */
+    unsigned waiting;          /* threads in root_wait_until() */
+    unsigned max;              /* the most that may be */
+    int ready;                 /* cond is set up */
     struct root_ticket *queue; /* tickets, oldest first */
-    struct root_ticket **tail; /* the last next pointer; NULL until the first join */
-    unsigned tickets;          /* tickets queued, waiting or not */
+    struct root_ticket *
+        *tail;        /* the last next pointer; NULL until the first join */
+    unsigned tickets; /* tickets queued, waiting or not */
 };
 #define ROOT_WAIT_INITIALIZER(n) {.max = (n)}
 
@@ -52,7 +53,8 @@ struct root_wait {
  * ETIMEDOUT at the deadline, EAGAIN when `max` threads wait already or the wait
  * failed.
  */
-static inline int root_wait_until(struct root_wait *w, pthread_mutex_t *mutex,
+static inline int root_wait_until(struct root_wait *w,
+                                  pthread_mutex_t *mutex,
                                   const struct timespec *deadline)
 {
     int r;
@@ -84,9 +86,9 @@ static inline uint64_t root_now_ns(void)
     return timespec2nsec(&ts);
 }
 
-/* A wait's deadline in ns of CLOCK_MONOTONIC, *until, kept by its caller
- * across waits: set to s seconds from now when still 0. EAGAIN once it has
- * passed, else 0.
+/* A wait's deadline in ns of CLOCK_MONOTONIC, *until, kept by its caller across
+ * waits: set to s seconds from now when still 0. EAGAIN once it has passed,
+ * else 0.
  */
 static inline int root_deadline_ns(uint64_t *until, unsigned s)
 {
@@ -98,7 +100,8 @@ static inline int root_deadline_ns(uint64_t *until, unsigned s)
 }
 
 /* root_wait_until with the deadline in ns of CLOCK_MONOTONIC. */
-static inline int root_wait_until_ns(struct root_wait *w, pthread_mutex_t *mutex,
+static inline int root_wait_until_ns(struct root_wait *w,
+                                     pthread_mutex_t *mutex,
                                      uint64_t ns)
 {
     struct timespec ts = {.tv_sec = (time_t) (ns / 1000000000u),
@@ -114,13 +117,12 @@ static inline void root_wake(struct root_wait *w)
         (void) pthread_cond_broadcast(&w->cond);
 }
 
-/* Arrival order. A waiter that must not be overtaken joins the queue before
- * its first wait, takes what it waits for only once
- * root_ticket_first() says no older ticket of its key is queued, and leaves
- * the queue on every way out. A newcomer that finds root_ticket_queued() for
- * its key joins behind them instead of taking. The queue holds one ticket per
- * waiter, so its walks are bounded by `max` (plus the caller). All under the
- * mutex of the wait.
+/* Arrival order. A waiter that must not be overtaken joins the queue before its
+ * first wait, takes what it waits for only once root_ticket_first() says no
+ * older ticket of its key is queued, and leaves the queue on every way out. A
+ * newcomer that finds root_ticket_queued() for its key joins behind them
+ * instead of taking. The queue holds one ticket per waiter, so its walks are
+ * bounded by `max` (plus the caller). All under the mutex of the wait.
  */
 static inline bool root_ticket_queued(const struct root_wait *w, unsigned key)
 {
@@ -130,7 +132,8 @@ static inline bool root_ticket_queued(const struct root_wait *w, unsigned key)
     return false;
 }
 
-static inline void root_ticket_join(struct root_wait *w, struct root_ticket *t,
+static inline void root_ticket_join(struct root_wait *w,
+                                    struct root_ticket *t,
                                     unsigned key)
 {
     if (!w->tail)
@@ -166,7 +169,8 @@ static inline void root_ticket_leave(struct root_wait *w, struct root_ticket *t)
     if (w->tail == &t->next)
         w->tail = pp;
     w->tickets--;
-    for (const struct root_ticket *u = t->next; u && first && !next; u = u->next)
+    for (const struct root_ticket *u = t->next; u && first && !next;
+         u = u->next)
         next = u->key == t->key;
     if (next)
         root_wake(w);

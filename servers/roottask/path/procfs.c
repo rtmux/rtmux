@@ -425,9 +425,9 @@ static int procfs_read(ioserv_context_t *ctp, io_read_t *msg, void *vocb)
         if (!ocb->stale && ocb->pid != -1 &&
             process_query_info(ocb->pid, &qinfo) == EOK) {
             if (qinfo.flags & RTMUX_FLG_PROC_WAITINFO) {
-                /* A SIGCHLD record holds the status. The kernel's record of
-                 * a fault holds an address where the status would be: the
-                 * process ended with the fault's signal.
+                /* A SIGCHLD record holds the status. The kernel's record of a
+                 * fault holds an address where the status would be: the process
+                 * ended with the fault's signal.
                  */
                 const siginfo_t *si = &qinfo.siginfo;
 
