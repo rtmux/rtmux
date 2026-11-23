@@ -34,6 +34,7 @@ extern void __sfp_release(FILE *) __hidden;
 extern void _cleanup(void) __hidden;
 extern void __smakebuf(FILE *) __hidden;
 extern unsigned __swhatbuf(FILE *, size_t *, int *) __hidden;
+#define FWALK_EXIT 2 /* _fwalk mode for exit(): skip a held read-mode stream */
 extern int _fwalk(int (*)(FILE *), int trylock) __hidden;
 extern int __swsetup(FILE *) __hidden;
 extern int __sflags(const char *, int *) __hidden;

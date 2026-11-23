@@ -45,7 +45,7 @@ int process_exec(unsigned op,
                  uint64_t priv_caps);
 int process_shutdown(process_t *prp, int exec);
 int process_reparent(pid_t pid);
-void signal_kill(channel_t *chp, int signo, pid_t sender_pid);
+int signal_kill(pid_t pid, int signo, pid_t sender_pid);
 int process_threads_destroy(process_t *prp);
 int process_timer_destroy(process_t *prp, int id);
 int process_connect_detach(process_t *prp, int coid);

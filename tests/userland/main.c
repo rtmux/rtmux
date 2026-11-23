@@ -67,6 +67,7 @@ static const struct test_suite test_suites[] = {
     TEST_SUITE_NAMED("user-ptr-negative", user_ptr_negative),
     TEST_SUITE(vfs),
     TEST_SUITE(exec),
+    TEST_SUITE_NAMED("exec-signal", exec_signal),
     TEST_SUITE_NAMED("posix-options", posix_options),
     TEST_SUITE(sysconf),
     TEST_SUITE(gauges),
@@ -893,6 +894,10 @@ static void test_fault_recovery_subset(void)
                              "--fault-sigsegv", SIGSEGV);
     FAULT_RECOVERY_SPAWN_SIG(readonly_write_fault, "user-page-fault",
                              "--fault-mprotect-ro", SIGSEGV);
+    /* RLIMIT_CPU: the kernel ends the spinning child with SIGXCPU. Its report
+     * names no address (the harness checks addr=0).
+     */
+    FAULT_RECOVERY_SPAWN_SIG(cpu_limit, "cpu-limit", "--rlimit-cpu-child", SIGXCPU);
 
     test_bad_syscall_enosys();
     test_crash_loop();
@@ -1038,6 +1043,8 @@ int main(int argc, char *argv[])
         return pthread_cancel_child(argv[2]);
     if (argc == 3 && !strcmp(argv[1], "--killspawn-child"))
         return killspawn_child(argv[2]);
+    if (argc == 3 && !strcmp(argv[1], "--stdio-exit-child"))
+        return stdio_exit_child(argv[2]);
     if (argc == 2 && !strcmp(argv[1], "--rlimit-cpu-child"))
         return rlimit_cpu_child();
     if (argc == 2 && !strcmp(argv[1], "--rlimit-inherit-child"))
@@ -1209,6 +1216,11 @@ int main(int argc, char *argv[])
             test_skip("condvar_reacquire_alloc_failure", "fault injection unavailable");
         return finish(1);
     }
+    if (argc == 2 && !strcmp(argv[1], "--cputime")) {
+        printf("[cputime]\n");
+        test_cputime();
+        return finish(1);
+    }
     if (argc == 2 && !strcmp(argv[1], "--sync-path-cost")) {
         sync_path_cost();
         return finish(1);
@@ -1243,9 +1255,7 @@ int main(int argc, char *argv[])
     }
     if (argc == 2 && !strcmp(argv[1], "--boot-tick-catch-up")) { /* opt-in */
         printf("[boot_tick_catch_up]\n");
-        if (boot_tick_catch_up() == TC_EXIT_SKIP)
-            test_skip("boot tick catch-up",
-                      "two harts and fault injection required");
+        (void) boot_tick_catch_up(); /* says why it skips */
         return finish(1);
     }
     if (argc == 2 && !strcmp(argv[1], "--dispatch-window")) {
@@ -1385,6 +1395,19 @@ int main(int argc, char *argv[])
     }
     if (argc == 3 && !strcmp(argv[1], "--shm-past-end-child"))
         return shm_past_end_child(argv[2]);
+    if (argc == 2 && !strcmp(argv[1], "--write-undo")) {
+        printf("[write_undo]\n");
+        if (test_write_undo() == TC_EXIT_SKIP)
+            test_skip("write_undo", "no write window in this roottask");
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--sticky-reload")) {
+        printf("[sticky_reload]\n");
+        test_sticky_reload();
+        return finish(1);
+    }
+    if (argc == 3 && !strcmp(argv[1], "--sticky-reload-child"))
+        return sticky_reload_child(argv[2]);
     if (argc == 2 && !strcmp(argv[1], "--pgrp-tty-other"))
         return pgrp_tty_other();
     if (argc == 2 && !strcmp(argv[1], "--pgrp-debug-access"))
@@ -1397,6 +1420,12 @@ int main(int argc, char *argv[])
     }
     if (argc == 3 && !strcmp(argv[1], "--exec-child"))
         return exec_swap_child(argv[2]);
+    if (argc == 3 && !strcmp(argv[1], "--xsig-child"))
+        return exec_signal_child(argv[2]);
+    if (argc == 3 && !strcmp(argv[1], "--xsig-chain"))
+        return exec_signal_chain(argv[2]);
+    if (argc == 3 && !strcmp(argv[1], "--xsig-loop"))
+        return exec_signal_loop(argv[2]);
     if (argc == 3 && !strcmp(argv[1], "--exec-chain"))
         return exec_swap_chain(argv[2]);
     if (argc == 3 && !strcmp(argv[1], "--exec-report"))
@@ -1718,8 +1747,20 @@ int main(int argc, char *argv[])
             ;
         return EXIT_SUCCESS;
     }
-    if (argc == 2 && !strcmp(argv[1], "--loader-share-child"))
-        return loader_share_child();
+    if ((argc == 2 || argc == 3) && !strcmp(argv[1], "--loader-share-child"))
+        return loader_share_child(argc == 3 ? strtoul(argv[2], NULL, 0) : 0);
+    if (argc == 3 && !strcmp(argv[1], "--loader-hold-child"))
+        return loader_hold_child(atoi(argv[2]));
+    if (argc == 2 && !strcmp(argv[1], "--loader-context-hold")) {
+        printf("[loader_context_hold]\n");
+        test_loader_context_hold();
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--loader-share-gate")) {
+        printf("[loader_share_gate]\n");
+        test_loader_share_gate();
+        return finish(1);
+    }
     if (argc == 2 && !strcmp(argv[1], "--loader-context-share")) {
         printf("[loader_context_share]\n");
         test_loader_context_share();
@@ -1888,10 +1929,25 @@ int main(int argc, char *argv[])
     }
     if (argc == 2 && !strcmp(argv[1], "--stuck-handler-child"))
         return kill_stuck_handler_child();
+    if (argc == 2 && !strcmp(argv[1], "--exec-signal")) {
+        /* signals sent to a process that is exec'ing */
+        printf("=== RTMux signals across exec ===\n\n[exec-signal]\n");
+        test_exec_signal();
+        return finish(1);
+    }
     if (argc == 2 && !strcmp(argv[1], "--busy-map-child"))
         return kill_busy_child();
     if (argc == 2 && !strcmp(argv[1], "--resolve-loop-child"))
         return kill_resolve_child();
+    if (argc == 2 && !strcmp(argv[1], "--big-map-child"))
+        return kill_map_child();
+    if (argc == 2 && !strcmp(argv[1], "--map-kill")) {
+        printf("[kill_during_map]\n");
+        test_kill_map();
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--thread-loop-child"))
+        return kill_thread_loop_child();
     if (argc == 2 && !strcmp(argv[1], "--gauges")) { /* opt-in: just the gauge regressions */
         printf("=== RTMux gauge regressions ===\n\n[gauges]\n");
         test_gauges();

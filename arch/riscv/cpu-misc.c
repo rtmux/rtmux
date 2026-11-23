@@ -519,7 +519,7 @@ static bool idle_claim(unsigned cpu, thread_t *thp)
     bool ours = thp->state == STATE_RUNNING;
 
     if (ours) {
-        sched_account_restart(); /* idle time is billed to nobody */
+        sched_account_restart(thp); /* idle time is billed to nobody */
         set_active_thread(cpu, thp);
     }
     kspinlock_unlock_irqrestore(&LOCAL_DPP->lock, sie);

@@ -319,6 +319,22 @@ void test_leak(void)
 
 enum { GAUGE_PAIRS = 100, GAUGE_CHILDREN = 10, GAUGE_FAILED_SPAWNS = 8 };
 
+/* A gauge as the checks compare it. soul.timer.used counts the timeout timer
+ * every thread keeps from its first timed wait on: a roottask or pipe-server
+ * pool thread that first times out during a batch adds one that belongs to a
+ * live thread, and the raw count then stayed one above its baseline although
+ * nothing leaked. Compare the timers no live thread owns (pool_adjust); a
+ * leaked timer is one of those.
+ */
+static long gauge_value(const char *snap, const char *key)
+{
+    long v = kstats_get(snap, key);
+
+    if (v < 0 || strcmp(key, "soul.timer.used"))
+        return v;
+    return kstats_get(snap, "timeout.live") < 0 ? -1 : pool_adjust(snap, key, v);
+}
+
 /* Value of "key" once it equals base, or the last value seen after
  * KS_SETTLE_MS: process, thread and connection teardown is asynchronous.
  */
@@ -330,7 +346,7 @@ static long gauge_settle(int fd, const char *key, long base)
     for (int waited = 0; waited <= KS_SETTLE_MS; waited += KS_POLL_MS) {
         if (kstats_read(fd, snap, sizeof snap) <= 0)
             return -1;
-        if ((v = kstats_get(snap, key)) == base)
+        if ((v = gauge_value(snap, key)) == base)
             break;
         ms_sleep(KS_POLL_MS);
     }
@@ -346,7 +362,7 @@ static long gauge_stable(int fd, const char *key)
     for (int waited = 0; waited <= KS_SETTLE_MS; waited += KS_POLL_MS) {
         if (kstats_read(fd, snap, sizeof snap) <= 0)
             return -1;
-        v = kstats_get(snap, key);
+        v = gauge_value(snap, key);
         if (v == prev)
             break;
         prev = v;
@@ -357,12 +373,13 @@ static long gauge_stable(int fd, const char *key)
 
 static void gauge_check(int fd, const char *what, const char *key, long base)
 {
-    char name[64], detail[64];
+    char name[64], detail[96];
     long now = gauge_settle(fd, key, base);
 
     snprintf(name, sizeof name, "%s keeps %s at baseline", what, key);
-    snprintf(detail, sizeof detail, "base=%ld now=%ld", base, now);
-    check(now == base, name, detail);
+    snprintf(detail, sizeof detail, "base=%ld now=%ld%s", base, now,
+             strcmp(key, "soul.timer.used") ? "" : " (timers no live thread owns)");
+    check(base >= 0 && now == base, name, detail);
 }
 
 /* GAUGE_PAIRS pipe()/close() pairs. Every pair used to leave one connect to the

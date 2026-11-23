@@ -95,12 +95,6 @@ static void mem_flock_release(path_object_t *obj, pid_t pid);
 static void mem_flock_wake(path_object_t *obj);
 static void mem_flock_purge(int scoid, int coid);
 
-static void mem_undo_grow(path_object_t *obp, uint64_t from, uint64_t to)
-{
-    if ((uint64_t) OBJECT_SIZE(obp) == to)
-        (void) root_vm_ops.resize(obp, (size_t) from);
-}
-
 static int mem_read_write(ioserv_context_t *ctp,
                           ioserv_msg_t *msg,
                           struct mem_ocb *ocb)
@@ -117,7 +111,7 @@ static int mem_read_write(ioserv_context_t *ctp,
     int combined;
     int client_locked = 0;
     int grown = 0;
-    uint64_t grown_from = 0, grown_to = 0;
+    struct vm_growth growth;
 
     if (!ocb) {
         nbytes = 0;
@@ -206,20 +200,24 @@ static int mem_read_write(ioserv_context_t *ctp,
             return EPERM;
         }
     }
-    if (*pos > size || nbytes > size - *pos) {
-        if (obp && msg->type == _IO_WRITE) {
-            int status;
+    if (obp && writing) {
+        /* Every write bumps the write generation, a growing one under the
+         * same lock as its growth, so a failed write's undo sees any writer
+         * that came after it.
+         */
+        int status = vm_grow(obp, *pos + nbytes, &growth);
 
-            status = vm_grow(obp, *pos + nbytes, &grown_from);
-            if (status != EOK) {
-                if (client_locked)
-                    proc_unlock_adp(ctp->info.pid);
-                return status;
-            }
-            grown = 1;
-            grown_to = (uint64_t) OBJECT_SIZE(obp);
-            size = (size_t) grown_to;
-        }
+        if (status != EOK)
+            return status;
+        grown = growth.to > growth.from;
+        size = (size_t) growth.to;
+        /* A test can hold a growing write here, before its copy, so that
+         * another write lands in the grown range first.
+         */
+        if (grown)
+            proc_pgrp_window(PGRP_WINDOW_WRITE_GROWN);
+    }
+    if (*pos > size || nbytes > size - *pos) {
         if (*pos >= size) {
             nbytes = 0;
         } else {
@@ -235,7 +233,7 @@ static int mem_read_write(ioserv_context_t *ctp,
             if (client_locked)
                 proc_unlock_adp(ctp->info.pid);
             if (grown)
-                mem_undo_grow(obp, grown_from, grown_to);
+                vm_undo_grow(obp, &growth);
             return EAGAIN;
         }
         process_bind(ROOTTASK_PID);
@@ -259,7 +257,7 @@ static int mem_read_write(ioserv_context_t *ctp,
             if (client_locked)
                 proc_unlock_adp(ctp->info.pid);
             if (grown)
-                mem_undo_grow(obp, grown_from, grown_to);
+                vm_undo_grow(obp, &growth);
             return status;
         }
 
@@ -286,7 +284,7 @@ static int mem_read_write(ioserv_context_t *ctp,
             if (client_locked)
                 proc_unlock_adp(ctp->info.pid);
             if (grown)
-                mem_undo_grow(obp, grown_from, grown_to);
+                vm_undo_grow(obp, &growth);
             return status == -1 ? err : EIO;
         }
 

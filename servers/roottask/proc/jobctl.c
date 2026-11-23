@@ -119,7 +119,7 @@ static int jc_signal_group(pid_t pgrp, pid_t sid, int signo, pid_t sender)
             if (process_query_info(pid, &qinfo) == EOK &&
                 !(qinfo.flags & JC_DEAD) && qinfo.pgrp == pgrp &&
                 qinfo.sess_leader == sid) {
-                signal_post_locked(pid, qinfo.sys_chp, signo, sender);
+                signal_post_locked(pid, signo, sender);
                 n++;
             }
             root_proc_unlock(pid);
@@ -286,7 +286,7 @@ static void jc_notify_parent(pid_t pid)
          */
         if (process_query_info(c.ppid, &qinfo) == EOK &&
             !(qinfo.flags & JC_DEAD))
-            signal_post_locked(c.ppid, qinfo.sys_chp, SIGCHLD, pid);
+            signal_post_locked(c.ppid, SIGCHLD, pid);
         root_proc_unlock(c.ppid);
     }
 }

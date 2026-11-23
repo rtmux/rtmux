@@ -145,6 +145,17 @@ static void exec_release_old_image(process_t *prp, pid_t pid)
     hwres_destroy_process(pid);
 }
 
+/* The signals the caller's libc held pending when it asked for the exec, as a
+ * sigset_t word (signal n at bit n-1); none when it sent no set.
+ */
+static uint64_t exec_pending(const struct inheritance *parms)
+{
+    if (!(parms->flags & SPAWN_SETSIGPEND))
+        return 0;
+    return ((uint64_t) parms->sigpending.bits[1] << 32) |
+           parms->sigpending.bits[0];
+}
+
 /* Unmap the old image and shut its address space down, as the end of a process
  * does. The process keeps a thread, which has no address space until the
  * commit.
@@ -324,6 +335,12 @@ int proc_exec_swap(ioserv_context_t *ctp, struct loader_context *lcp)
             return IOSERV_NOREPLY;
         }
     }
+
+    /* The old image's threads are gone and its system channel goes next. What
+     * was sent to it and not delivered, and what is sent from here until the
+     * new image has a channel, is kept for the new image.
+     */
+    signal_exec_keep_locked(pid, exec_pending(&lcp->msg.spawn.i.parms));
     exec_release_old_image(prp, pid);
     if ((rc = exec_drop_old_address_space(prp, pid)) == EOK)
         rc = exec_install(lcp, pid, shell, lrcvid);

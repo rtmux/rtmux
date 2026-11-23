@@ -297,6 +297,12 @@ fi
 # If the initramfs file exists, use it
 [[ -e $INITRD ]] && add_qemu_opts -initrd "$INITRD"
 
+# A guest test whose bound only an instruction-count clock can resolve reads
+# rtmux.icount= from /sys/cmdline (see EMU_ICOUNT below).
+if [[ -n "${EMU_ICOUNT:-}" ]]; then
+    EXTRA_CMDLINE+=" rtmux.icount=${EMU_ICOUNT}"
+fi
+
 # Append the command line for the system. Default: INFO level. Use -v for DEBUG,
 # -vv for TRACE. mainfs= is read by /sbin/init from /sys/cmdline.
 CMDLINE="-Dsbi $EXTRA_CMDLINE mainfs=$MAINFS_DEV"

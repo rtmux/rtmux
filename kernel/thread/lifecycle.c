@@ -967,7 +967,8 @@ static void thread_as_unbind(thread_t *thp)
         thp->as_borrow_pprev = NULL;
         process_unpin(prp);
     }
-    thp->as_prp = NULL;
+    /* thread_set_as_prp reads it without the lock. */
+    __atomic_store_n(&thp->as_prp, NULL, __ATOMIC_RELEASE);
 }
 
 /* Set the address space thp runs in. A borrow of another process's address
@@ -976,6 +977,15 @@ static void thread_as_unbind(thread_t *thp)
  *
  * Returns ESRCH if prp's teardown has already released its borrowers: mdestroy
  * is next, and a borrow now would outlive it.
+ *
+ * Setting thp's own process when it is already set changes nothing and needs
+ * no lock (every return of a roottask thread to user mode makes this
+ * call). Only thp itself makes thp's as_prp a borrow (and thread_create,
+ * before thp first runs), and the other writers only clear it:
+ * thread_as_release_borrowers clears a borrower of another process, which thp
+ * is not while as_prp is its own, and thread_clear_as_prp_if clears it for
+ * thp's own process's teardown, which may as well come right after this call
+ * as right before it.
  */
 int rdecl thread_set_as_prp(thread_t *thp, process_t *prp)
 {
@@ -984,6 +994,10 @@ int rdecl thread_set_as_prp(thread_t *thp, process_t *prp)
 
     if (!thp)
         return ESRCH;
+    if (!thread_as_is_borrow(thp, prp) &&
+        __atomic_load_n(&thp->as_prp, __ATOMIC_ACQUIRE) == prp)
+        return EOK;
+    inject_note_as_slock();
     kspinlock_lock(&thread_as_slock);
     if (thp->as_prp == prp)
         goto out;
@@ -995,7 +1009,7 @@ int rdecl thread_set_as_prp(thread_t *thp, process_t *prp)
     thread_as_unbind(thp);
     if (borrow)
         thread_as_link(thp, prp);
-    thp->as_prp = prp;
+    __atomic_store_n(&thp->as_prp, prp, __ATOMIC_RELEASE);
 out:
     kspinlock_unlock(&thread_as_slock);
     return status;
@@ -1328,15 +1342,31 @@ int rdecl thread_create(thread_t *act,
      * iteration walks in kext_process_shutdown / *_destroyall.
      */
     kspinlock_lock(&prp->vec_slock);
-    tid = vector_add(&prp->threads, thp, 0);
-    if (tid != -1 && !prp->valid_thp) {
+    /* A process whose exit has begun gets no new thread: the exit's destroy
+     * pass may have walked the vector already, and a thread added after it
+     * would start, and run, in an address space the exit then frees. The exit
+     * marks the process under this lock, so a thread added before the mark
+     * is seen by the pass.
+     */
+    if (prp->flags & (RTMUX_FLG_PROC_TERMING | RTMUX_FLG_PROC_DESTROYALL))
+        tid = -2;
+    else
+        tid = vector_add(&prp->threads, thp, 0);
+    if (tid >= 0 && !prp->valid_thp) {
         prp->valid_thp = thp;
     }
     kspinlock_unlock(&prp->vec_slock);
-    if (tid == -1) {
+    if (tid < 0) {
+        /* Never published, so no reader can hold the sporadic state: free it
+         * here, or a refused or failed create leaks it.
+         */
+        if (IS_SCHED_SS(thp) && thp->schedinfo.ss_info) {
+            object_free(prp, &ssinfo_souls, thp->schedinfo.ss_info);
+            thp->schedinfo.ss_info = NULL;
+        }
         (void) thread_set_as_prp(thp, NULL);
         object_free(prp, &thread_souls, thp);
-        return EAGAIN;
+        return tid == -2 ? ESRCH : EAGAIN;
     }
     thp->tid = (uint32_t) tid; /* always >= 0 after vector_add succeeds */
 
@@ -1363,6 +1393,10 @@ int rdecl thread_create(thread_t *act,
             (void) thread_set_as_prp(thp, NULL);
             rcu_sched_synchronize();
             (void) tthread_wait_unpinned(thp);
+            if (IS_SCHED_SS(thp) && thp->schedinfo.ss_info) {
+                object_free(prp, &ssinfo_souls, thp->schedinfo.ss_info);
+                thp->schedinfo.ss_info = NULL;
+            }
             thread_soul_free(prp, thp);
             return r;
         }
@@ -1639,7 +1673,15 @@ void rdecl thread_destroy(thread_t *thp)
     if (thread_state_load_acquire(thp) != STATE_DEAD) {
         /* Remove thread from any queues. */
         if (!force_ready(thp, _FORCE_KILL_SELF)) {
-            /* Couldn't kill this thread right now, do it later */
+            /* Couldn't kill this thread right now, do it later. A self-reap
+             * came here from its KILLSELF special return, which cleared the
+             * flag: set it again, or the thread goes back to user mode alive,
+             * in a process whose exit may already have freed its address
+             * space, and runs (or faults) there for ever.
+             */
+            if (self_reap)
+                atomic_or(&thp->flags,
+                          (RTMUX_FLG_THR_KILLSELF | RTMUX_FLG_THR_ONLYME));
             __atomic_store_n(&thp->destroy_claim, 0, __ATOMIC_RELEASE);
             return;
         }

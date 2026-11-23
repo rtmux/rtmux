@@ -512,8 +512,13 @@ again:
     }
 
     obp->mem.mm.size = sbuf.st_size;
+    /* Sticky while the file's mode says so: a file that has lost S_ISVTX is
+     * no longer kept past its last mapping.
+     */
     if (sbuf.st_mode & S_ISVTX)
         obp->mem.mm.flags |= MM_FDMEM_STICKY;
+    else
+        obp->mem.mm.flags &= ~(unsigned) MM_FDMEM_STICKY;
 
     return 0;
 }

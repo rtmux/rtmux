@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <sched.h>
+#include <semaphore.h>
 #include <signal.h>
 #include <spawn.h>
 #include <stdatomic.h>
@@ -25,6 +26,7 @@
 #include <sys/resource.h>
 #include <sys/rtmux-core.h>
 #include <sys/siginfo.h>
+#include <sys/states.h>
 #include <sys/wait.h>
 
 #include "test.h"
@@ -698,6 +700,7 @@ static int64_t median_i64(int64_t *v, int n)
  * repeats a whole round if a stall hit enough pairs to move the median.
  */
 #define CPUTIME_MAX_PAIRS 50
+#define CPUTIME_SPIN_NS 10000 /* one short burst */
 
 struct cputime_round {
     int64_t med_err, med_dcpu, med_dbusy;
@@ -721,7 +724,8 @@ static void cputime_round_run(struct cputime_round *r, int pairs, int per_block)
     for (int i = 0; i < pairs; i++) {
         uint64_t cb = 0, sb = 0, cw = 0;
         uint64_t cc = cputime_block(per_block, 0, &cb, &cw);
-        uint64_t sc = cputime_block(per_block, 10000, &sb, &r->spin_wall);
+        uint64_t sc =
+            cputime_block(per_block, CPUTIME_SPIN_NS, &sb, &r->spin_wall);
         int64_t dcpu = (int64_t) sc - (int64_t) cc;
         int64_t dbusy = (int64_t) sb - (int64_t) cb;
 
@@ -743,6 +747,55 @@ static void cputime_round_run(struct cputime_round *r, int pairs, int per_block)
     r->med_dbusy = median_i64(dbusy_v, pairs);
 }
 
+/* Read the first line of a /sys entry into buf; false if it cannot be read. */
+static bool sys_file_line(const char *file, char *buf, size_t len)
+{
+    FILE *f = fopen(file, "r");
+    bool got;
+
+    if (!f)
+        return false;
+    got = fgets(buf, (int) len, f) != NULL;
+    fclose(f);
+    return got;
+}
+
+/* Whether the kernel command line carries rtmux.icount=<shift> as a token. */
+static bool cmdline_has_icount(void)
+{
+    static const char key[] = "rtmux.icount=";
+    const size_t klen = sizeof key - 1;
+    char buf[512];
+    const char *p = buf;
+
+    if (!sys_file_line("/sys/cmdline", buf, sizeof buf))
+        return false;
+    while ((p = strstr(p, key)) != NULL) {
+        if ((p == buf || p[-1] == ' ') && p[klen] >= '0' && p[klen] <= '9')
+            return true;
+        p += klen;
+    }
+    return false;
+}
+
+/* Whether this guest's clock can resolve a 10 us burst against a 1% bound.
+ * Hardware can, and so can QEMU on its instruction-count clock (EMU_ICOUNT,
+ * which puts rtmux.icount= on the command line). QEMU on the host's wall clock
+ * cannot: a CLOCK_MONOTONIC read there costs more than the burst, so a spin
+ * burst and a control burst both bracket one read and differ by ~0 ns, and host
+ * scheduling moves the unbracketed kernel time of a pair by milliseconds. A
+ * board that cannot be read or is unknown counts as QEMU's.
+ */
+static bool cputime_clock_resolves_bursts(void)
+{
+    char board[128];
+
+    if (cmdline_has_icount())
+        return true;
+    return sys_file_line("/sys/board", board, sizeof board) &&
+           strcmp(board, "unknown\n") != 0 && !strstr(board, "riscv-virtio");
+}
+
 static void test_cputime_short_bursts(void)
 {
     enum { PAIRS = 50, PER_BLOCK = 100, ROUNDS = 3 }; /* 10^4 spin bursts */
@@ -751,6 +804,7 @@ static void test_cputime_short_bursts(void)
     uint64_t res_ns = 0, tol = 0, c0, c1;
     int64_t noise = 0, limit = 0;
     int round, ok_pair = 0, ok_totals = 0, ok_dcpu = 0, ok_ctl = 0;
+    bool resolves = cputime_clock_resolves_bursts();
     char detail[400], hist[100] = "";
 
     if (clock_getres(CLOCK_MONOTONIC, &res) == 0)
@@ -826,7 +880,7 @@ static void test_cputime_short_bursts(void)
          * timer and wake work is charged) and never more than the wall time.
          */
         ok_ctl = r.ctl_cpu != 0 && r.ctl_cpu <= r.ctl_wall + 2 * res_ns;
-        if (ok_pair && ok_totals && ok_dcpu && ok_ctl)
+        if ((!resolves || (ok_pair && ok_dcpu)) && ok_totals && ok_ctl)
             break;
     }
     if (round > ROUNDS)
@@ -841,17 +895,34 @@ static void test_cputime_short_bursts(void)
              (unsigned long long) r.dbusy_total, (unsigned long long) res_ns,
              hist, (long long) r.err_min, (long long) r.err_q1,
              (long long) r.err_q3, (long long) r.err_max);
-    check(ok_pair, "cputime_short_bursts", detail);
+    if (resolves) {
+        check(ok_pair, "cputime_short_bursts", detail);
+    } else {
+        /* The per-pair checks need a clock that resolves the burst (see
+         * cputime_clock_resolves_bursts); the totals and the fixed cost below
+         * hold on any clock.
+         */
+        snprintf(
+            detail, sizeof detail,
+            "QEMU wall clock cannot resolve a 10 us burst (median per-pair "
+            "bracketed delta %lld ns for a nominal %d ns); run with "
+            "EMU_ICOUNT=1 or on hardware",
+            (long long) r.med_dbusy, PER_BLOCK * CPUTIME_SPIN_NS);
+        test_skip("cputime_short_bursts", detail);
+        test_skip("cputime_short_bursts dcpu_total sanity", detail);
+    }
     snprintf(detail, sizeof detail,
              "attempt %d: spin cpu=%llu busy=%llu wall=%llu", round,
              (unsigned long long) r.spin_cpu, (unsigned long long) r.spin_busy,
              (unsigned long long) r.spin_wall);
     check(ok_totals, "cputime_short_bursts totals bound busy <= cpu <= wall",
           detail);
-    snprintf(detail, sizeof detail,
-             "attempt %d: median dcpu=%lld dbusy=%lld", round,
-             (long long) r.med_dcpu, (long long) r.med_dbusy);
-    check(ok_dcpu, "cputime_short_bursts dcpu_total sanity", detail);
+    if (resolves) {
+        snprintf(detail, sizeof detail,
+                 "attempt %d: median dcpu=%lld dbusy=%lld", round,
+                 (long long) r.med_dcpu, (long long) r.med_dbusy);
+        check(ok_dcpu, "cputime_short_bursts dcpu_total sanity", detail);
+    }
     snprintf(detail, sizeof detail,
              "attempt %d: control cpu=%llu wall=%llu (fixed cost billed, "
              "sleeps not)", round, (unsigned long long) r.ctl_cpu,
@@ -928,12 +999,13 @@ struct cpumono {
     atomic_uint_fast64_t *seen;
     atomic_int *stop;
     uint64_t reads, back, worst;
+    clockid_t clk;
 };
 
 static void cpumono_step(struct cpumono *m)
 {
     uint64_t floor = atomic_load(m->seen);
-    uint64_t v = clock_ns(CLOCK_PROCESS_CPUTIME_ID);
+    uint64_t v = clock_ns(m->clk);
 
     if (v < floor) {
         m->back++;
@@ -957,8 +1029,10 @@ static void test_cputime_process_monotonic(void)
 {
     atomic_uint_fast64_t seen;
     atomic_int stop;
-    struct cpumono solo = {&seen, &stop, 0, 0, 0};
-    struct cpumono pair[2] = {{&seen, &stop, 0, 0, 0}, {&seen, &stop, 0, 0, 0}};
+    struct cpumono solo = {&seen, &stop, 0, 0, 0, CLOCK_PROCESS_CPUTIME_ID};
+    struct cpumono pair[2] = {
+        {&seen, &stop, 0, 0, 0, CLOCK_PROCESS_CPUTIME_ID},
+        {&seen, &stop, 0, 0, 0, CLOCK_PROCESS_CPUTIME_ID}};
     pthread_t t[2];
     uint64_t end, prev, back = 0, worst = 0, reads = 0;
     int made = 0;
@@ -1014,6 +1088,79 @@ static void test_cputime_process_monotonic(void)
           "cputime: process clock is monotonic across threads", detail);
 }
 
+/* A thread's CPU clock read from other harts never goes backwards. The target
+ * and its siblings yield in a tight loop, so many reads land while the
+ * target's hart is switching away from it. The switch bills the target before
+ * the hart stops showing it as current, and a read in between used to add the
+ * next stretch to it as well, then lose it once the switch completed.
+ */
+enum { REMOTE_READERS = 2, REMOTE_MAX_YIELDERS = 8 };
+
+static void *cpuremote_yielder(void *arg)
+{
+    atomic_int *stop = arg;
+    const struct timespec nap = {.tv_sec = 0, .tv_nsec = 50000};
+
+    for (unsigned i = 0; !atomic_load_explicit(stop, memory_order_relaxed);
+         i++) {
+        if ((i & 255) == 255)
+            (void) nanosleep(&nap, NULL);
+        else
+            (void) sched_yield();
+    }
+    return NULL;
+}
+
+static void test_cputime_remote_monotonic(void)
+{
+    atomic_uint_fast64_t seen;
+    atomic_int stop, ystop; /* readers stop first: the target must outlive them */
+    pthread_t yt[REMOTE_MAX_YIELDERS], rt[REMOTE_READERS];
+    struct cpumono r[REMOTE_READERS];
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    int ny = 0, nr = 0, want;
+    uint64_t reads = 0, back = 0, worst = 0;
+    clockid_t cid;
+    char detail[200];
+
+    want = ncpu < 2 ? 2
+                    : (ncpu > REMOTE_MAX_YIELDERS ? REMOTE_MAX_YIELDERS
+                                                  : (int) ncpu);
+    atomic_init(&seen, 0);
+    atomic_init(&stop, 0);
+    atomic_init(&ystop, 0);
+    for (; ny < want; ny++)
+        if (pthread_create(&yt[ny], NULL, cpuremote_yielder, &ystop) != 0)
+            break;
+    if (ny > 0 && pthread_getcpuclockid(yt[0], &cid) == 0) {
+        for (; nr < REMOTE_READERS; nr++) {
+            r[nr] = (struct cpumono) {&seen, &stop, 0, 0, 0, cid};
+            if (pthread_create(&rt[nr], NULL, cpumono_reader, &r[nr]) != 0)
+                break;
+        }
+    }
+    sleep_ms(300);
+    atomic_store(&stop, 1);
+    for (int i = 0; i < nr; i++) {
+        (void) pthread_join(rt[i], NULL);
+        reads += r[i].reads;
+        back += r[i].back;
+        if (r[i].worst > worst)
+            worst = r[i].worst;
+    }
+    atomic_store(&ystop, 1);
+    for (int i = 0; i < ny; i++)
+        (void) pthread_join(yt[i], NULL);
+    snprintf(
+        detail, sizeof detail,
+        "yielders=%d/%d readers=%d reads=%llu backwards=%llu worst=%llu ns", ny,
+        want, nr, (unsigned long long) reads, (unsigned long long) back,
+        (unsigned long long) worst);
+    check(ny == want && nr == REMOTE_READERS && reads > 0 && back == 0,
+          "cputime: another thread's clock is monotonic across its switches",
+          detail);
+}
+
 /* Q63(c): yield/steal stress for the Q25 switch-time billing. N = 2 x harts
  * threads call sched_yield() in a tight loop (every 256th round they nap 50 us
  * instead, so a hart can go idle and steal another's just-yielded thread) for
@@ -1024,13 +1171,23 @@ static void test_cputime_process_monotonic(void)
  * <= wall x harts (never over-billed) and, since busy harts bill nearly
  * everything, >= half of it (nothing lost); the process clock must equal the
  * sum of its threads' clocks. At CPUS=1 it is a plain yield-rotation check.
+ *
+ * Both exact checks compare clocks over the same interval. A worker's own
+ * check runs from its first clock read, not from its creation, so thread
+ * start-up the host stalled is not counted against its lifetime. The workers
+ * then park before they exit, and the sum takes each parked worker's clock
+ * from this thread once the worker has blocked: a worker's exit path used to
+ * be billed to the process
+ * after the worker's last read of its own clock, and a host stall in eight
+ * exit paths made the process clock tens of milliseconds larger than the sum.
  */
 enum { STRESS_MAX_THREADS = 16 };
 
 struct yield_stress {
     uint64_t end;
-    uint64_t cpu;
-    uint64_t life; /* wall time from the worker's first line to its last */
+    uint64_t cpu;  /* CPU time from the worker's first clock read to its last */
+    uint64_t life; /* wall time over at least that stretch */
+    sem_t *parked, *release;
 };
 
 static void *yield_stress_worker(void *arg)
@@ -1038,6 +1195,7 @@ static void *yield_stress_worker(void *arg)
     struct yield_stress *ys = arg;
     const struct timespec nap = {.tv_sec = 0, .tv_nsec = 50000};
     uint64_t t0 = clock_ns(CLOCK_MONOTONIC);
+    uint64_t c0 = clock_ns(CLOCK_THREAD_CPUTIME_ID);
 
     for (unsigned i = 0; clock_ns(CLOCK_MONOTONIC) < ys->end; i++) {
         if ((i & 255) == 255)
@@ -1045,48 +1203,100 @@ static void *yield_stress_worker(void *arg)
         else
             (void) sched_yield();
     }
-    ys->cpu = clock_ns(CLOCK_THREAD_CPUTIME_ID);
+    ys->cpu = clock_ns(CLOCK_THREAD_CPUTIME_ID) - c0;
     ys->life = clock_ns(CLOCK_MONOTONIC) - t0;
+    (void) sem_post(ys->parked);
+    (void) sem_wait(ys->release);
     return NULL;
+}
+
+/* Sum the CPU clocks of n parked workers once each is blocked on its
+ * semaphore, so none still accrues. Returns false when one does not block or
+ * its clock cannot be read.
+ */
+static bool yield_stress_parked_sum(const pthread_t *tid, int n, uint64_t *sum)
+{
+    uint64_t total = 0;
+
+    for (int i = 0; i < n; i++) {
+        clockid_t cid;
+        struct timespec ts;
+
+        if (!wait_thread_state(tid[i], STATE_SEM) ||
+            pthread_getcpuclockid(tid[i], &cid) != 0 ||
+            clock_gettime(cid, &ts) != 0)
+            return false;
+        total += ts_ns(&ts);
+    }
+    *sum = total;
+    return true;
 }
 
 static void test_cputime_yield_steal_stress(void)
 {
-    struct yield_stress ys[STRESS_MAX_THREADS] = {{0, 0, 0}};
+    struct yield_stress ys[STRESS_MAX_THREADS] = {{0}};
     pthread_t tid[STRESS_MAX_THREADS];
     long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
     int n, created = 0;
-    uint64_t p0, p1, m0, m1, w0, w1, sum = 0, pd, wall, tol;
+    sem_t parked, release;
+    int nparked = 0;
+    bool settled = false;
+    uint64_t p0, p1, m0, m1, w0, w1, sum = 0, run = 0, pd, wall, tol;
     uint64_t over = 0;
-    char detail[200];
+    char detail[240];
 
     if (ncpu < 1)
         ncpu = 1;
     n = ncpu * 2 > STRESS_MAX_THREADS ? STRESS_MAX_THREADS : (int) ncpu * 2;
     if (n < 2)
         n = 2;
+    if (sem_init(&parked, 0, 0) != 0 || sem_init(&release, 0, 0) != 0) {
+        test_fail("cputime yield stress: threads created", "sem_init failed");
+        return;
+    }
 
     p0 = clock_ns(CLOCK_PROCESS_CPUTIME_ID);
     m0 = clock_ns(CLOCK_THREAD_CPUTIME_ID);
     w0 = clock_ns(CLOCK_MONOTONIC);
     for (int i = 0; i < n; i++) {
         ys[i].end = w0 + 400000000ULL;
+        ys[i].parked = &parked;
+        ys[i].release = &release;
         if (pthread_create(&tid[i], NULL, yield_stress_worker, &ys[i]) != 0)
             break;
         created++;
     }
-    for (int i = 0; i < created; i++)
-        pthread_join(tid[i], NULL);
+    /* The workers run for 400 ms; give up well past that rather than hang. */
+    {
+        struct timespec dl;
+
+        clock_gettime(CLOCK_REALTIME, &dl);
+        dl.tv_sec += 30;
+        while (nparked < created) {
+            if (sem_timedwait(&parked, &dl) == 0)
+                nparked++;
+            else if (errno != EINTR)
+                break;
+        }
+    }
     w1 = clock_ns(CLOCK_MONOTONIC);
+    settled = nparked == created && yield_stress_parked_sum(tid, created, &sum);
     m1 = clock_ns(CLOCK_THREAD_CPUTIME_ID);
     p1 = clock_ns(CLOCK_PROCESS_CPUTIME_ID);
+    for (int i = 0; i < created; i++)
+        (void) sem_post(&release);
+    for (int i = 0; i < created; i++)
+        pthread_join(tid[i], NULL);
+    (void) sem_destroy(&parked);
+    (void) sem_destroy(&release);
 
     for (int i = 0; i < created; i++) {
-        sum += ys[i].cpu;
+        run += ys[i].cpu;
 
-        /* A thread runs on one hart at a time, so its clock cannot exceed its
-         * own lifetime; a stolen stretch billed from both harts would show here
-         * even when the all-thread sum stays under wall x harts.
+        /* A thread runs on one hart at a time, so its clock cannot advance
+         * faster than the wall clock; a stolen stretch billed from both harts
+         * would show here even when the all-thread sum stays under wall x
+         * harts.
          */
         if (ys[i].cpu > ys[i].life && ys[i].cpu - ys[i].life > over)
             over = ys[i].cpu - ys[i].life;
@@ -1096,19 +1306,21 @@ static void test_cputime_yield_steal_stress(void)
     wall = w1 - w0;
     tol = wall / 100 > 2000000 ? wall / 100 : 2000000;
     snprintf(detail, sizeof detail,
-             "threads=%d/%d sum=%llu proc=%llu wall=%llu ncpu=%ld tol=%llu over=%llu",
-             created, n, (unsigned long long) sum, (unsigned long long) pd,
+             "threads=%d/%d settled=%d sum=%llu run=%llu proc=%llu wall=%llu "
+             "ncpu=%ld tol=%llu over=%llu",
+             created, n, settled, (unsigned long long) sum,
+             (unsigned long long) run, (unsigned long long) pd,
              (unsigned long long) wall, ncpu, (unsigned long long) tol,
              (unsigned long long) over);
     check(created == n, "cputime yield stress: threads created", detail);
     check(sum <= wall * (uint64_t) ncpu + tol,
           "cputime yield stress: per-thread sum <= wall x harts", detail);
-    check(over <= tol, "cputime yield stress: no thread clock exceeds its lifetime",
-          detail);
+    check(over <= tol,
+          "cputime yield stress: no thread clock exceeds its lifetime", detail);
     check(sum >= wall * (uint64_t) ncpu / 2,
           "cputime yield stress: busy harts bill at least half of wall x harts",
           detail);
-    check(pd + tol >= sum && pd <= sum + tol + 5000000,
+    check(settled && pd + tol >= sum && pd <= sum + tol + 5000000,
           "cputime yield stress: sum of thread clocks == process clock",
           detail);
 }
@@ -1807,6 +2019,16 @@ void test_nanosleep_1ns_storm(void)
     }
 }
 
+/* CPU-time billing, also run alone by syscall_testing --cputime. */
+void test_cputime(void)
+{
+    test_cputime_short_bursts();
+    test_cputime_two_threads();
+    test_cputime_process_monotonic();
+    test_cputime_remote_monotonic();
+    test_cputime_yield_steal_stress();
+}
+
 /* Entry point */
 
 void test_timers(void)
@@ -1844,11 +2066,7 @@ void test_timers(void)
     test_timer_create_exhaust();
     test_timer_id_reuse();
 
-    /* CPU-time billing */
-    test_cputime_short_bursts();
-    test_cputime_two_threads();
-    test_cputime_process_monotonic();
-    test_cputime_yield_steal_stress();
+    test_cputime();
     test_rlimit_negative();
     test_rlimit_cpu_kill();
     test_rlimit_inherit();

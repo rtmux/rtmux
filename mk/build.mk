@@ -66,14 +66,34 @@ OBJDIR     = $(BUILD_BASE)
 # dependency tracking existed (no .d file) is older than it and rebuilds exactly
 # once, gaining its .d. -MP (in DEPFLAGS) keeps a deleted header harmless. The
 # stamp is not re-keyed on later flag changes: delete it (or make -B) to force one.
+# A config change is tracked by CONFIG_STAMP below.
 #
 # The stamp rule is defined inside the macro, not at file scope: this file is
 # included before each Makefile's own first target, and a rule here would become
 # the default goal.
 DEPSTAMP = $(BUILD_BASE)/.deps
 
+# Config stamp: the configuration this OUT was last built with, the CONFIG_*
+# words of .config plus any CONFIG_* given on the make command line (the
+# lkl-regress builds pass CONFIG_LKL_SERVERS=y that way) or taken from the
+# environment (CI runs `CONFIG_LKL_SERVERS=y make ...`). Every make, sub-makes
+# too, compares it at parse time and rewrites it only when it differs, and
+# every object depends on it (dep-include). A config switch therefore rebuilds
+# every object of this OUT whatever the file times say: one that tests a
+# CONFIG_* -D flag from mk/toolchain.mk without including autoconf.h, one that a
+# .config older than autoconf.h (a restored copy) would have left, and the
+# objects of an OUT last built with another config. The shared autoconf.h is
+# kept in step with .config by mk/kconfig.mk.
+CONFIG_STAMP = $(OUT)/.config-stamp
+RTMUX_CONFIG_NOW := $(filter CONFIG_%,$(file <$(TOPDIR)/.config)) \
+    $(foreach v,$(sort $(filter CONFIG_%,$(.VARIABLES))),$(if $(filter command line environment environment override,$(origin $(v))),$(v)=$($(v))))
+ifneq ($(strip $(file <$(CONFIG_STAMP))),$(strip $(RTMUX_CONFIG_NOW)))
+$(shell mkdir -p $(OUT))
+$(file >$(CONFIG_STAMP),$(strip $(RTMUX_CONFIG_NOW)))
+endif
+
 define dep-include
-$(1): $$(DEPSTAMP)
+$(1): $$(DEPSTAMP) $$(CONFIG_STAMP)
 $$(DEPSTAMP):
 	@mkdir -p $$(@D)
 	@touch $$@

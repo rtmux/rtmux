@@ -104,43 +104,63 @@ static inline pte_t *sv39_lookup_leaf(pagetable_t pgdir,
     return NULL;
 }
 
+/* sv39_is_mark — whether e is an invalid entry carrying the PTE_SW_BUS mark
+ * (pages past the end of their object: SIGBUS).
+ */
+static inline int sv39_is_mark(pte_t e)
+{
+    return (e & (PTE_V | PTE_SW_BUS)) == PTE_SW_BUS;
+}
+
 /* sv39_alloc_fn — returns the PTE value that links a new, zeroed table (valid
  * bit, the table's PPN and any caller flags), or 0 when none can be had.
  */
 typedef pte_t (*sv39_alloc_fn)(void);
 
-/* sv39_walk_slot — walk pgdir down to the L0 slot for va.
+/* sv39_walk_to — walk pgdir down to the entry at level target (1 or 0) for va.
  *
- * Returns a pointer to the L0 PTE, which may itself be invalid, or NULL with
+ * Returns a pointer to that entry, which may itself be invalid, or NULL with
  * *errp (when non-NULL) set. A missing interior table is created through alloc
- * when it is non-NULL, otherwise the walk ends with ENOENT. A superpage leaf at
- * L2 or L1 already covers va, and its PPN names mapped memory, not a table, so
+ * when it is non-NULL, otherwise the walk ends with ENOENT. A table created
+ * under an invalid entry that carries the PTE_SW_BUS mark (a whole 2 MiB past
+ * the end of its object) starts with every entry marked, so splitting the mark
+ * keeps it on the pages the caller does not change. A superpage leaf above
+ * target already covers va, and its PPN names mapped memory, not a table, so
  * the walk stops there instead of descending, with EEXIST whether or not alloc
  * is set, so a caller that unmaps or re-protects tells a covering superpage
  * apart from a missing table (ENOENT). ENOMEM when alloc returns 0.
  */
-static inline pte_t *sv39_walk_slot(pagetable_t pgdir,
-                                    uintptr_t va,
-                                    sv39_alloc_fn alloc,
-                                    int *errp)
+static inline pte_t *sv39_walk_to(pagetable_t pgdir,
+                                  uintptr_t va,
+                                  int target,
+                                  sv39_alloc_fn alloc,
+                                  int *errp)
 {
-    for (int level = 2; level > 0; level--) {
+    for (int level = 2; level > target; level--) {
         pte_t *pte = &pgdir[PX(level, va)];
         pte_t e = *pte; /* one load: the checks and the descent agree */
 
         if (!(e & PTE_V)) {
+            pte_t t;
+
             if (!alloc) {
                 if (errp)
                     *errp = ENOENT;
                 return NULL;
             }
-            e = alloc();
-            if (!e) {
+            t = alloc();
+            if (!t) {
                 if (errp)
                     *errp = ENOMEM;
                 return NULL;
             }
-            *pte = e;
+            if (e & PTE_SW_BUS) {
+                pagetable_t table = (pagetable_t) PA_TO_VA(PTE2PA(t));
+
+                for (int i = 0; i <= PXMASK; i++)
+                    table[i] = PTE_SW_BUS;
+            }
+            *pte = e = t;
         } else if (sv39_is_leaf(e)) {
             if (errp)
                 *errp = EEXIST;
@@ -148,7 +168,16 @@ static inline pte_t *sv39_walk_slot(pagetable_t pgdir,
         }
         pgdir = (pagetable_t) PA_TO_VA(PTE2PA(e));
     }
-    return &pgdir[PX(0, va)];
+    return &pgdir[PX(target, va)];
+}
+
+/* sv39_walk_slot — sv39_walk_to the level-zero slot for va. */
+static inline pte_t *sv39_walk_slot(pagetable_t pgdir,
+                                    uintptr_t va,
+                                    sv39_alloc_fn alloc,
+                                    int *errp)
+{
+    return sv39_walk_to(pgdir, va, 0, alloc, errp);
 }
 
 /* sv39_manip_pages — apply op to the 4 KiB pages in pgdir that start between
@@ -161,12 +190,15 @@ static inline pte_t *sv39_walk_slot(pagetable_t pgdir,
  * skipped, but EEXIST over a superpage is reported, since neither can act on
  * part of one. PROT keeps the PPN and the attribute bits above it (Svpbmt,
  * Svnapot) and replaces bits 0..9 with bits. BAD creates tables like MAP and
- * writes the invalid PTE_SW_BUS mark over whatever each slot held; UNMAP clears
- * that mark too, and PROT leaves it as it is.
+ * writes the invalid PTE_SW_BUS mark over whatever each slot held, or, for a
+ * whole empty 2 MiB region, into its level-one slot; UNMAP clears the mark at
+ * either level (splitting a level-one mark it covers in part), and PROT leaves
+ * it as it is.
  *
- * Progress is kept in the caller's variables after each level-zero table run: *startp is the
- * first page not done and, for MAP, *paddrp the frame it gets, so on an error
- * they name what was done and a caller can undo [first, *startp) or resume.
+ * Progress is kept in the caller's variables after each level-zero table run or
+ * level-one mark: *startp is the first page not done and, for MAP, *paddrp the
+ * frame it gets, so on an error they name what was done and a caller can undo
+ * [first, *startp) or resume.
  * *changedp is set to 1 once a PTE has been written.
  */
 static inline int sv39_manip_pages(pagetable_t pgdir,
@@ -180,10 +212,63 @@ static inline int sv39_manip_pages(pagetable_t pgdir,
 {
     int create = op == PTE_OP_MAP || op == PTE_OP_BAD || op == PTE_OP_PREALLOC;
 
+    const uintptr_t mib2 = (uintptr_t) sv39_leaf_size(1);
     uintptr_t va = *startp;
     while (va < end) {
+        /* A whole 2 MiB region: every page of it starts below end, whether end
+         * is one past the range or its last byte.
+         */
+        int whole = !(va & (mib2 - 1)) && end - va > mib2 - PGSIZE;
         int err = 0;
-        pte_t *pte = sv39_walk_slot(pgdir, va, create ? alloc : NULL, &err);
+        pte_t *pte;
+
+        /* BAD over a whole empty 2 MiB region: one mark in its level-one
+         * slot, and no level-zero table, so marking costs at most one table
+         * per 2 MiB (the partial regions at the ends). An invalid entry
+         * rewritten needs no TLB flush.
+         */
+        if (op == PTE_OP_BAD && whole) {
+            pte = sv39_walk_to(pgdir, va, 1, alloc, &err);
+            if (!pte)
+                return err;
+            if (!(*pte & PTE_V)) {
+                *pte = PTE_SW_BUS;
+                va += mib2;
+                *startp = va;
+                continue;
+            }
+            if (sv39_is_leaf(*pte))
+                return EEXIST;
+            /* A table is there: mark its entries below. */
+        } else if (op == PTE_OP_BAD) {
+            /* Part of a region its level-one mark covers already: nothing to
+             * split, since the pages are marked.
+             */
+            pte = sv39_walk_to(pgdir, va, 1, NULL, NULL);
+            if (pte && sv39_is_mark(*pte)) {
+                va = (va | (mib2 - 1)) + 1;
+                *startp = va;
+                continue;
+            }
+        }
+        pte = sv39_walk_slot(pgdir, va, create ? alloc : NULL, &err);
+        if (!pte && err == ENOENT && op == PTE_OP_UNMAP) {
+            /* No table, but a level-one mark may cover va: an unmap clears
+             * it, whole when the range covers its region, else by splitting
+             * it into a table of marks; with no table to be had, the whole
+             * mark goes (the rest of its region then faults SIGSEGV, not
+             * SIGBUS).
+             */
+            pte_t *l1 = sv39_walk_to(pgdir, va, 1, NULL, NULL);
+
+            if (l1 && sv39_is_mark(*l1) &&
+                (whole || !(pte = sv39_walk_slot(pgdir, va, alloc, NULL)))) {
+                *l1 = 0;
+                va = (va | (mib2 - 1)) + 1;
+                *startp = va;
+                continue;
+            }
+        }
         if (!pte && (create || err == EEXIST))
             return err;
         /* The remaining slots in this level-zero table are contiguous. */
@@ -220,15 +305,22 @@ static inline int sv39_manip_pages(pagetable_t pgdir,
 }
 
 /* sv39_past_end — whether va lies on a page marked PTE_SW_BUS: part of a
- * mapping, but past the end of the object it maps. Only an invalid level-zero
- * entry carries the mark, so a superpage or a missing table on the way says
- * no.
+ * mapping, but past the end of the object it maps. The mark sits in the first
+ * invalid entry of the walk, at level zero or, for a whole 2 MiB region, at
+ * level one; a superpage or an unmarked invalid entry says no.
  */
 static inline int sv39_past_end(pagetable_t pgdir, uintptr_t va)
 {
-    pte_t *pte = sv39_walk_slot(pgdir, va, NULL, NULL);
+    for (int level = 2; level >= 0; level--) {
+        pte_t e = pgdir[PX(level, va)];
 
-    return pte && (*pte & (PTE_V | PTE_SW_BUS)) == PTE_SW_BUS;
+        if (!(e & PTE_V))
+            return (e & PTE_SW_BUS) != 0;
+        if (sv39_is_leaf(e))
+            return 0;
+        pgdir = (pagetable_t) PA_TO_VA(PTE2PA(e));
+    }
+    return 0;
 }
 
 /* Kernel entry point for sv39_lookup_leaf (arch/riscv/cpu-pte.c). */

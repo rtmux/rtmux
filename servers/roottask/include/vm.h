@@ -15,10 +15,19 @@ void vm_init(void);
 int vm_resize(path_object_t *obp, size_t size);
 extern const struct object_funcs mem_funcs;
 
-/* mem/as/resize.c: grow an object and map what the growth made reachable in
- * existing mappings; called with no object or address-space lock held.
+/* mem/as/resize.c, each called with no object or address-space lock held.
+ * vm_grow grows an object and makes its existing mappings reach the new pages;
+ * vm_undo_grow takes back the growth of a write that failed; vm_grow_drain makes
+ * the mappings of the growths that paths holding locks queued.
  */
-int vm_grow(path_object_t *obp, size_t size, uint64_t *oldp);
+struct vm_growth {
+    uint64_t from; /* size before vm_grow */
+    uint64_t to;   /* size after it */
+    uint64_t gen;  /* the object's write generation it set */
+};
+int vm_grow(path_object_t *obp, size_t size, struct vm_growth *g);
+void vm_undo_grow(path_object_t *obp, const struct vm_growth *g);
+void vm_grow_drain(path_object_t *grown);
 
 /* vm-map.c */
 int vm_find_object(ioserv_context_t *ctp,
@@ -30,7 +39,8 @@ int vm_find_object(ioserv_context_t *ctp,
 int vm_map(ioserv_context_t *ctp,
            pid_t prp_pid,
            process_t *prp,
-           mem_map_t *msg);
+           mem_map_t *msg,
+           path_object_t **grownp);
 int vm_handle(ioserv_context_t *ctp,
               pid_t prp_pid,
               process_t *prp,

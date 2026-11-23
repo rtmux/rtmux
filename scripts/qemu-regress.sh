@@ -3171,13 +3171,18 @@ run_one()
         # not the signal number.
         require_log_patterns "$log" "fault address" \
             'user fault: pid=[0-9]+ tid=0 signo=11 code=1 fltno=11 addr=0000000000000001 ' || return 1
+        # A CPU-limit kill (SIGXCPU, 30) is no memory fault: its report names no
+        # address.
+        require_log_patterns "$log" "cpu limit" \
+            '^  PASS  fault-recovery cpu_limit[[:space:]]*$' \
+            'user fault: pid=[0-9]+ tid=[0-9]+ signo=30 code=[0-9]+ fltno=0 addr=0000000000000000 ' || return 1
         require_log_patterns_in_order "$log" "fault recovery report floods" \
             '^  PASS  fault-recovery bad_syscall_enosys[[:space:]]*$' \
             '^fault-event event_id=illegal-syscall severity=deny subject=self cause=out-of-range-call action=return-ENOSYS authority_delta=none[[:space:]]*$' \
             '^  PASS  fault-recovery crash_loop[[:space:]]*$' || return 1
         check_fault_report_bound "$log" 'ecall: invalid syscall' 100000 || return 1
-        # Two single faults above, then the crash loop's forty children.
-        check_fault_report_bound "$log" 'user fault: ' 42 || return 1
+        # Three single faults above, then the crash loop's forty children.
+        check_fault_report_bound "$log" 'user fault: ' 43 || return 1
     fi
 
     if [ "$MODE" = "rcu-lookup-measure" ]; then

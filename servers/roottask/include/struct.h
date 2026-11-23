@@ -81,6 +81,11 @@ struct loader_context_base {
     pid_t pid;
     pid_t ppid;
     pid_t owner;  /* the spawner whose share of its class this counts against */
+    uint64_t held_since; /* CLOCK_MONOTONIC ns it was handed out, 0 when free */
+    /* ns before which its loader is not interrupted again for holding it too
+     * long (a second after the last time)
+     */
+    uint64_t interrupt_after;
     int fds_done; /* fd inheritance closed: no more _PROC_SPAWN_FD keys */
     int tid;
     unsigned long flags;

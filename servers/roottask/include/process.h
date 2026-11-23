@@ -33,7 +33,8 @@ void proc_dispatch_init(void);
 
 /* loader-context.c */
 int loader_context_alloc(pid_t owner, unsigned msgsize, int state,
-                         struct loader_context **lcpp);
+                         struct loader_context **lcpp, int *share_class);
+int loader_share_await(pid_t owner, int k, uint64_t *until);
 size_t loader_context_bytes(void);
 void loader_context_free(struct loader_context *lcp);
 void loader_thread_attr(struct _thread_attr *attr,
@@ -44,7 +45,7 @@ void loader_thread_attr(struct _thread_attr *attr,
 int proc_setpgid(ioserv_context_t *ctp, proc_setpgid_t *msg);
 
 /* spawn.c */
-int proc_spawn_with_actions(ioserv_context_t *ctp, void *msg, const unsigned char *actions, unsigned bytes);
+int proc_spawn_with_actions(ioserv_context_t *ctp, void *msg, const unsigned char *actions, unsigned bytes, int *share_class);
 int proc_spawn(ioserv_context_t *ctp, void *vmsg);
 
 /* exec.c */

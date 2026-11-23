@@ -165,7 +165,8 @@ def dump_runq(thp):
     not hide the thread's PRIO line."""
     try:
         link = thp["link3_link"]
-        prio = int(thp["priority"])
+        # The list it was queued on (qprio): its priority can differ meanwhile.
+        prio = int(thp["qprio"])
         head = thp["dpp"]["ready"][prio]["head"]
         off = int(gdb.parse_and_eval(
             "(unsigned long) &((thread_t *) 0)->link3_link"))
@@ -177,8 +178,17 @@ def dump_runq(thp):
             q = qt["link3_link"]["next"]
             n += 1
         more = " (truncated after %d)" % RUNQ_MAX if int(q) != 0 else ""
-        print("  READYQ list at prio %d: %s%s" %
-              (prio, " ".join(order) or "(empty)", more))
+        dpp = thp["dpp"]
+        # The three-level ready bitmap (NUM_PRI > 64): hi, mid[hi], lo[hi][mid].
+        try:
+            bit = (int(dpp["lo"][prio >> 6][(prio >> 3) & 7]) >> (prio & 7)) & 1
+            bits = "bit %d hi %#x mid %#x" % (
+                bit, int(dpp["hi"]), int(dpp["mid"][prio >> 6]))
+        except gdb.error:
+            bits = "bit ?"
+        print("  READYQ list at prio %d (priority %d, %s): %s%s" %
+              (prio, int(thp["priority"]), bits,
+               " ".join(order) or "(empty)", more))
         # prev points at whatever holds the pointer to this node: the list head
         # or the previous node's next. LINK3_REM leaves prev behind, so a stale
         # prev proves nothing; the node is linked only if that holder names it.

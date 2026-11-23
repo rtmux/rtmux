@@ -26,6 +26,7 @@
 #include <stdalign.h>
 #include <unistd.h>
 #include <sys/procfs.h>
+#include <sys/procmsg.h>
 #include <sys/rtmux-core.h>
 
 #include "test.h"
@@ -307,6 +308,19 @@ int test_chan_open(unsigned flags, int *chid, int *coid)
     if (*chid != -1)
         *coid = connect_attach(0, getpid(), *chid, RTMUX_SIDE_CHANNEL, 0);
     return *coid != -1;
+}
+
+/* Arm a roottask debug window; see test.h. */
+int test_window_arm(unsigned where, unsigned ms)
+{
+    struct _proc_jobctl msg;
+
+    memset(&msg, 0, sizeof msg);
+    msg.type = _PROC_JOBCTL;
+    msg.subtype = _PROC_JOBCTL_DEBUG;
+    msg.arg = (int32_t) where;
+    msg.arg2 = (int32_t) ms;
+    return msg_sendnc(ROOTTASK_COID, &msg, sizeof msg, 0, 0) == 0;
 }
 
 /* Wait, for ms milliseconds at most, until *flag is at least want. Returns

@@ -166,9 +166,12 @@ extern void rdecl memobj_unlock(path_object_t *);
 #define MM_MEM_SKIPLOCKCHECK 0x20000000
 #define MM_MEM_RDB 0x08000000
 /* A mapping of the object has had pages marked past its end (PTE_SW_BUS), so a
- * growth must look for them (as_map_grown). A one-way hint: never cleared.
+ * growth must look for them (grow_pending in as/resize.c). A one-way hint:
+ * never cleared.
  */
 #define MM_MEM_HAS_BAD_PAGE 0x04000000
+/* A growth is queued for vm_grow_drain (mm.grow_from, mm.grow_next). */
+#define MM_MEM_GROW_PENDING 0x02000000
 
 /* Shared memory flags reuse SHMCTL_FLAG_* bits */
 #define MM_SHMEM_SPECIAL (SHMCTL_FLAG_MASK + 1)

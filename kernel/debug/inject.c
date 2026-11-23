@@ -198,6 +198,7 @@ static struct {
     [STALL_SEND_PICK] = {.pid = -1},
     [STALL_UNBLOCK_FORCE] = {.pid = -1},
     [STALL_UNBLOCK_REPLY] = {.pid = -1},
+    [STALL_KPAGE_ZERO] = {.pid = -1},
 };
 
 static _Atomic(thread_t *) stalled_waiter;
@@ -209,6 +210,7 @@ static atomic_uint stall_block_tid; /* pthread_t the STALL_BLOCK site waits for 
 static atomic_uint stall_steal_tid; /* and the STALL_STEAL site */
 static atomic_uint stall_reprio_tid;  /* and the STALL_REPRIO site */
 atomic_uint inject_empty_steal_locks; /* SCHED_STATS 0 */
+atomic_uint inject_as_slock_takes;    /* SCHED_STATS 1 */
 
 /* POKE: find thread tid (pthread_t) of pid, pinned, and wake or stop it. */
 static int inject_poke(uint64_t pid, uint64_t arg)
@@ -361,8 +363,8 @@ void inject_mutex_lock_propagated(process_t *prp)
     inject_stall_once(STALL_LOCK_PROPAGATED, prp, NULL);
 }
 
-/* Called from sync_chain_force_ready after it read the waiter's key, before it
- * takes the chain lock.
+/* Called from force_ready before it takes a sync waiter's chain lock or a
+ * receiver's channel lock.
  */
 void inject_force_ready_stall(thread_t *thp)
 {
@@ -557,6 +559,49 @@ void inject_unblock_reply_window(const thread_t *client)
     if (act)
         inject_stall_for_flags(STALL_UNBLOCK_REPLY, act->process, client,
                                RTMUX_ITF_UNBLOCK_QUEUED);
+}
+
+/* SLOW_KPAGE_ZERO: the roottask thread it caught, its delay and the pages left. */
+static _Atomic(const thread_t *) kpage_zero_thr;
+static atomic_uint kpage_zero_us, kpage_zero_left;
+
+/* Called by kext_kpage_zero, on the roottask thread that zeroes a page. */
+void inject_kpage_zero_slow(const thread_t *act)
+{
+    const thread_t *thr =
+        atomic_load_explicit(&kpage_zero_thr, memory_order_acquire);
+    uint64_t end;
+
+    if (!thr) {
+        int pid = atomic_load_explicit(&stall_site[STALL_KPAGE_ZERO].pid,
+                                       memory_order_acquire);
+        const thread_t *client = __atomic_load_n(&act->client, __ATOMIC_ACQUIRE);
+
+        if (pid < 0 || !client || client->process->pid != pid ||
+            !atomic_compare_exchange_strong_explicit(
+                &stall_site[STALL_KPAGE_ZERO].pid, &pid, -1,
+                memory_order_acq_rel, memory_order_relaxed))
+            return;
+        atomic_store_explicit(&kpage_zero_thr, act, memory_order_release);
+        atomic_store_explicit(&stall_site[STALL_KPAGE_ZERO].taken, true,
+                              memory_order_release);
+    } else if (thr != act) {
+        return;
+    }
+    if (atomic_load_explicit(&stall_site[STALL_KPAGE_ZERO].release,
+                             memory_order_acquire) ||
+        !atomic_load_explicit(&kpage_zero_left, memory_order_relaxed)) {
+        atomic_store_explicit(&kpage_zero_thr, NULL, memory_order_release);
+        return;
+    }
+    atomic_fetch_sub_explicit(&kpage_zero_left, 1, memory_order_relaxed);
+    end = r_time() + (uint64_t) atomic_load_explicit(&kpage_zero_us,
+                                                     memory_order_relaxed) *
+                         (qtimeptr->cycles_per_sec / 1000000);
+    inject_spin_begin();
+    while (r_time() < end)
+        __asm__ volatile("" ::: "memory");
+    inject_spin_end();
 }
 
 /* Whether the reply that just removed an unblock notification restarts as if
@@ -887,6 +932,20 @@ void kext_debug_inject(void *data)
     case INJECT_OP_POKE:
         ret = inject_poke(kap->arg0, kap->arg1);
         break;
+    case INJECT_OP_SLOW_KPAGE_ZERO: {
+        unsigned us = (unsigned) (kap->arg1 >> 32);
+        unsigned count = (unsigned) (kap->arg1 & 0xffffffffU);
+
+        if (kap->arg0 > INT32_MAX || us == 0 || us > 100000 || count == 0) {
+            ret = EINVAL;
+            break;
+        }
+        atomic_store_explicit(&kpage_zero_thr, NULL, memory_order_relaxed);
+        atomic_store_explicit(&kpage_zero_us, us, memory_order_relaxed);
+        atomic_store_explicit(&kpage_zero_left, count, memory_order_relaxed);
+        ret = inject_stall_arm(STALL_KPAGE_ZERO, kap->arg0, 1);
+        break;
+    }
     case INJECT_OP_HOLD_EXIT_DESTROY:
         if (kap->arg0 > INT32_MAX || kap->arg1 == 0 ||
             kap->arg1 > INJECT_SPIN_MAX_MS) {
@@ -902,10 +961,15 @@ void kext_debug_inject(void *data)
         ret = EOK;
         break;
     case INJECT_OP_SCHED_STATS:
-        ret = kap->arg0 == 0
-                  ? (int) atomic_load_explicit(&inject_empty_steal_locks,
-                                               memory_order_relaxed)
-                  : -EINVAL;
+        if (kap->arg0 == 0)
+            ret = (int) atomic_load_explicit(&inject_empty_steal_locks,
+                                             memory_order_relaxed);
+        else if (kap->arg0 == 1)
+            ret = (int) (atomic_load_explicit(&inject_as_slock_takes,
+                                              memory_order_relaxed) &
+                         INT32_MAX);
+        else
+            ret = -EINVAL;
         break;
     case INJECT_OP_STALL_STEAL:
         atomic_store_explicit(&stall_steal_tid, (unsigned) (kap->arg1 >> 32),

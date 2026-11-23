@@ -53,14 +53,7 @@
 /* Arm a window in roottask; false when this roottask has none. */
 static bool pgw_arm(unsigned where, unsigned ms)
 {
-    struct _proc_jobctl msg;
-
-    memset(&msg, 0, sizeof msg);
-    msg.type = _PROC_JOBCTL;
-    msg.subtype = _PROC_JOBCTL_DEBUG;
-    msg.arg = (int32_t) where;
-    msg.arg2 = (int32_t) ms;
-    return msg_sendnc(ROOTTASK_COID, &msg, sizeof msg, 0, 0) == 0;
+    return test_window_arm(where, ms);
 }
 
 /* Wait up to five seconds for a byte on fd (non-blocking read); false when

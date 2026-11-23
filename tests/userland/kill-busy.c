@@ -26,6 +26,9 @@
  * pause, so that roottask often takes a victim's lookup up after the victim is
  * gone.
  *
+ * kill_during_map (--map-kill, debug-inject kernels) kills a victim in
+ * the middle of a MAP that roottask is zeroing pages for.
+ *
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -44,6 +47,8 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <sys/memmsg.h>
+#include <sys/rtmux-core.h>
 
 #include "test.h"
 
@@ -55,6 +60,8 @@
 #define KILL_BUSY_OUTLIVE_NS 25000000000ULL
 #define KILL_RESOLVE_THREADS 6
 #define KILL_RESOLVE_ROUNDS 24
+#define KILL_MAP_BYTES (8UL * 1024 * 1024)
+#define KILL_MAP_SLOW "2000/2048" /* 2 ms more for each of its 2048 pages */
 
 static uint64_t kb_now_ns(void)
 {
@@ -463,10 +470,165 @@ static void test_kill_resolving(void)
     check(failed == 0 && stuck == 0 && wrong == 0, name, detail);
 }
 
+/* --thread-loop-child: create short threads without a pause, for ever. */
+static void *kb_thread_noop(void *arg)
+{
+    return arg;
+}
+
+int kill_thread_loop_child(void)
+{
+    for (;;) {
+        pthread_t t;
+
+        if (pthread_create(&t, NULL, kb_thread_noop, NULL) == 0)
+            (void) pthread_detach(t);
+    }
+}
+
+/* Kill a process while it creates threads. The exit marks the process and then
+ * destroys its threads in a pass of its own; a thread created after that pass
+ * used to be started anyway, in an address space the exit then freed, where it
+ * faulted for ever and the process was never reaped. Every victim must be
+ * reaped as SIGKILL within the usual limit.
+ */
+static void test_kill_creating(void)
+{
+    const char *name = "kill_while_creating_threads";
+    char *argv[] = {"syscall_testing", "--thread-loop-child", NULL};
+    int wrong = 0, stuck = 0, failed = 0, last = 0;
+    char detail[160];
+
+    for (int i = 0; i < KILL_RESOLVE_ROUNDS; i++) {
+        pid_t pid;
+        int status = 0;
+
+        if (posix_spawn(&pid, "/bin/syscall_testing", NULL, NULL, argv,
+                        NULL) != 0) {
+            failed++;
+            continue;
+        }
+        sleep_ms(5 + (i * 7) % 31);
+        (void) kill(pid, SIGKILL);
+        if (!kb_reap(pid, &status, KILL_BUSY_LIMIT_NS)) {
+            stuck++;
+            (void) kill(pid, SIGKILL);
+            (void) kb_reap(pid, &status, KILL_BUSY_GIVE_UP_NS);
+        } else if (!(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL)) {
+            wrong++;
+            last = status;
+        }
+    }
+    (void) snprintf(detail, sizeof detail,
+                    "%d kills: %d spawns failed, %d not reaped in %llu ms, %d "
+                    "not SIGKILL (last status 0x%x)",
+                    KILL_RESOLVE_ROUNDS, failed, stuck,
+                    (unsigned long long) (KILL_BUSY_LIMIT_NS / 1000000), wrong,
+                    last);
+    printf("  INFO  %s: %s\n", name, detail);
+    check(failed == 0 && stuck == 0 && wrong == 0, name, detail);
+}
+
 void test_kill_busy(void)
 {
     kb_kill_rounds("kill_busy");
     test_kill_deaf();
     test_kill_busy_under_spawn();
     test_kill_resolving();
+    test_kill_creating();
+}
+
+/* --big-map-child: say so on fd 4, wait for a byte on fd 3, then make one MAP
+ * of KILL_MAP_BYTES whose pages roottask zeroes before it answers (preload is
+ * the whole length), and wait for the kill.
+ */
+int kill_map_child(void)
+{
+    mem_map_t msg;
+    char go;
+
+    if (write(4, "R", 1) != 1 || read(3, &go, 1) != 1)
+        return 4;
+    memset(&msg, 0, sizeof msg);
+    msg.i.type = _MEM_MAP;
+    msg.i.len = KILL_MAP_BYTES;
+    msg.i.prot = PROT_READ | PROT_WRITE;
+    msg.i.flags = MAP_PRIVATE | MAP_ANON;
+    msg.i.fd = NOFD;
+    msg.i.preload = KILL_MAP_BYTES;
+    (void) msg_sendnc(VM_COID, &msg.i, sizeof msg.i, &msg.o, sizeof msg.o);
+    for (;;)
+        (void) sleep(1000);
+}
+
+/* A SIGKILL that lands while roottask zeroes the pages of a large MAP for the
+ * victim must still reap the victim within the usual limit. The MAP holds the
+ * victim's address space lock, which the exit's unmap needs; zeroing on to
+ * the end of the run kept the exit waiting for as long as the MAP took.
+ * The debug fault-injection call makes each page of that MAP take 2 ms longer,
+ * so the MAP lasts about 4 s and the kill lands in the middle of it.
+ */
+static void test_kill_during_map(void)
+{
+    const char *name = "kill_during_map";
+    char *argv[] = {"syscall_testing", "--big-map-child", NULL};
+    posix_spawn_file_actions_t fa;
+    int to_child[2], from_child[2], status = 0, reaped;
+    char pidarg[16], ready = 0, detail[128];
+    uint64_t t0, waited;
+    pid_t pid;
+
+    if (inject_run("alloc-status", NULL, NULL) != 0) {
+        test_skip(name, "fault injection unavailable");
+        return;
+    }
+    if (pipe(to_child) != 0 || pipe(from_child) != 0 ||
+        posix_spawn_file_actions_init(&fa) != 0 ||
+        posix_spawn_file_actions_adddup2(&fa, to_child[0], 3) != 0 ||
+        posix_spawn_file_actions_adddup2(&fa, from_child[1], 4) != 0 ||
+        posix_spawn(&pid, "/bin/syscall_testing", &fa, NULL, argv, NULL) != 0) {
+        test_fail(name, "pipe or spawn failed");
+        return;
+    }
+    (void) posix_spawn_file_actions_destroy(&fa);
+    (void) close(to_child[0]);
+    (void) close(from_child[1]);
+    (void) snprintf(pidarg, sizeof pidarg, "%d", (int) pid);
+    if (read(from_child[0], &ready, 1) != 1 ||
+        inject_run("slow-kpage-zero", pidarg, KILL_MAP_SLOW) != 0 ||
+        write(to_child[1], "G", 1) != 1 ||
+        inject_run("site-wait", "kpage-zero", NULL) != 0) {
+        test_fail(name, "the victim's MAP never reached the slowed zeroing");
+        (void) kill(pid, SIGKILL);
+        (void) kb_reap(pid, &status, KILL_BUSY_OUTLIVE_NS);
+        goto out;
+    }
+    sleep_ms(100); /* well inside the MAP */
+    t0 = kb_now_ns();
+    (void) kill(pid, SIGKILL);
+    reaped = kb_reap(pid, &status, KILL_BUSY_LIMIT_NS);
+    waited = kb_now_ns() - t0;
+    if (!reaped) {
+        (void) inject_run("site-release", "kpage-zero", NULL);
+        reaped = kb_reap(pid, &status, KILL_BUSY_OUTLIVE_NS);
+        waited = kb_now_ns() - t0;
+    }
+    (void) snprintf(detail, sizeof detail,
+                    "reaped=%d after %llu ms (limit %llu), status 0x%x", reaped,
+                    (unsigned long long) (waited / 1000000),
+                    (unsigned long long) (KILL_BUSY_LIMIT_NS / 1000000), status);
+    printf("  INFO  %s: %s\n", name, detail);
+    check(reaped && waited <= KILL_BUSY_LIMIT_NS && WIFSIGNALED(status) &&
+              WTERMSIG(status) == SIGKILL,
+          name, detail);
+out:
+    (void) inject_run("site-release", "kpage-zero", NULL);
+    (void) close(to_child[1]);
+    (void) close(from_child[0]);
+}
+
+/* --map-kill: the debug-inject stage's case alone. */
+void test_kill_map(void)
+{
+    test_kill_during_map();
 }

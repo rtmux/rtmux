@@ -728,7 +728,7 @@ int memory_reference(struct mm_map **mmp,
     data.off_start = mm->offset + (off64_t) (start - mm->start);
     if (flags & MR_TRUNC) {
         /* Truncate the reference to the limit of the object. The pages past
-         * it are marked so that touching one is SIGBUS; as_map_grown maps them
+         * it are marked so that touching one is SIGBUS; vm_grow_drain maps them
          * if the object grows to cover them.
          */
         if (data.off_end >= obp->mem.mm.size) {
@@ -834,6 +834,12 @@ int memory_reference(struct mm_map **mmp,
                          data.off_end, pq_map, &data);
     if (r != EOK)
         goto fail1;
+    /* A process that can now reach these pages (and store into them, now or
+     * after an mprotect) voids a failed write's undo of a growth
+     * (vm_undo_grow); roottask's own copy mapping does not.
+     */
+    if (or->pid != ROOTTASK_PID)
+        obp->mem.mm.wgen++;
 
 fail1:
     if (data.unlock_obp)

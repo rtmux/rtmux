@@ -418,6 +418,7 @@ void inject_cap_peek_window(const thread_t *act);
 void inject_send_pick_window(const thread_t *act);
 void inject_force_ready_claimed(thread_t *thp);
 void inject_unblock_force_window(thread_t *thp);
+void inject_kpage_zero_slow(const thread_t *act);
 void inject_unblock_reply_window(const thread_t *client);
 bool inject_reply_unblock_preempt(void);
 void inject_xfer_start(const thread_t *act);
@@ -430,6 +431,9 @@ void inject_block_stall(thread_t *thp);
 void inject_steal_stall(thread_t *thp);
 void inject_reprio_stall(thread_t *thp);
 extern atomic_uint inject_empty_steal_locks;
+extern atomic_uint inject_as_slock_takes;
+#define inject_note_as_slock()                                                \
+    atomic_fetch_add_explicit(&inject_as_slock_takes, 1, memory_order_relaxed)
 #define inject_note_empty_steal_lock(dpp)                                     \
     do {                                                                      \
         if (!DISPATCH_ANY(dpp))                                               \
@@ -487,6 +491,7 @@ static inline void inject_reprio_stall(thread_t *thp)
     (void) thp;
 }
 #define inject_note_empty_steal_lock(dpp) ((void) 0)
+#define inject_note_as_slock() ((void) 0)
 static inline void inject_ready_stall(thread_t *thp)
 {
     (void) thp;
@@ -532,6 +537,10 @@ static inline void inject_force_ready_claimed(thread_t *thp)
 static inline void inject_unblock_force_window(thread_t *thp)
 {
     (void) thp;
+}
+static inline void inject_kpage_zero_slow(const thread_t *act)
+{
+    (void) act;
 }
 static inline void inject_unblock_reply_window(const thread_t *client)
 {

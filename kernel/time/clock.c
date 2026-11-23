@@ -86,9 +86,8 @@ int kdecl ksys_clock_time(thread_t *act, struct kcall_args_clock_time *kap)
         if (thp) {
             /* Add the live, not-yet-billed stretch of a running thread, read
              * under the owner hart's pc_account_seq seqcount
-             * (sched_account_read falls back to the banked value after three
-             * torn attempts). Read-only, so the owner-hart-writes invariant of
-             * sched_account_current() holds.
+             * (sched_account_read). Read-only, so the owner-hart-writes
+             * invariant of sched_account_switch() holds.
              */
             uint64_t now;
 
@@ -107,12 +106,9 @@ int kdecl ksys_clock_time(thread_t *act, struct kcall_args_clock_time *kap)
              * one just had.
              */
             unsigned long sie = interrupt_save();
-            uint64_t now;
 
-            if (act == get_active_thread(get_cpunum())) {
-                snap_time(&now, 0);
-                sched_account_current(now);
-            }
+            if (act == get_active_thread(get_cpunum()))
+                sched_account_current();
             old = __atomic_load_n(rtp, __ATOMIC_RELAXED);
             interrupt_restore(sie);
         }

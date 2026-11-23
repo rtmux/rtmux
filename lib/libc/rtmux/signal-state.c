@@ -112,10 +112,26 @@ static struct {
     int stopped;
     int stop_req; /* a default stop picked by drain() on the system thread */
     unsigned tty_hold;
-    pthread_t sys_tid; /* the system thread, once it has received a signal */
+    pthread_t sys_tid; /* the system thread, once it runs */
+
+    /* Exec (see __libc_signal_exec_begin). `exec_hold` counts the threads that
+     * are asking roottask for an exec; while it is non-zero no signal is
+     * delivered, each one stays pending. The other three say where the system
+     * thread is: `sys_idle` at its receive, where it may be interrupted;
+     * `sys_parked` waiting on `exec_wait` for the exec to fail, having received
+     * nothing it has not accounted for; `sys_handling` inside a handler. All
+     * guarded by lock.
+     */
+    int exec_hold;
+    int sys_idle;
+    int sys_parked;
+    int sys_handling;
+    sigset_t sys_added; /* what such handlers added to the mask */
+    pthread_cond_t exec_wait;
 } state = {
     .lock = PTHREAD_MUTEX_INITIALIZER,
     .wait = PTHREAD_COND_INITIALIZER,
+    .exec_wait = PTHREAD_COND_INITIALIZER,
     .pselect_coid = -1,
 };
 
@@ -168,14 +184,16 @@ static void jobctl_report(int event, int arg2)
     (void) msg_sendnc(ROOTTASK_COID, &msg, sizeof msg, 0, 0);
 }
 
-/* Hand a stop or continue request that came in on an application thread (raise,
- * kill of oneself, a sigprocmask that unblocked a stop signal) to the system
- * thread through roottask: only it may hold the others, as it is the one thread
- * that must stay runnable to take SIGCONT.
+/* Send signo to this process through roottask, as a kill of another process
+ * would. For a stop or continue request that came in on an application thread
+ * (raise, kill of oneself, a sigprocmask that unblocked a stop signal): only
+ * the system thread may hold the others, as it is the one thread that must stay
+ * runnable to take SIGCONT. And for a signal raised while an exec is being
+ * asked for, which must reach the new image.
  *
  * Returns 0 when posted.
  */
-static int jobctl_post(int signo)
+static int post_via_roottask(int signo)
 {
     proc_kill_t msg;
 
@@ -326,6 +344,15 @@ static int waiter_present(const libc_waiter_t *w, unsigned seq)
     return 0;
 }
 
+/* Pause the calling thread for ns nanoseconds. Raw timer, not nanosleep(): that
+ * wrapper would register the caller as an interruptible waiter.
+ */
+static void signal_nap(uint64_t ns)
+{
+    (void) __timer_timeout_r(CLOCK_MONOTONIC, RTMUX_TIMEOUT_NANOSLEEP, NULL,
+                             &ns, NULL);
+}
+
 /* After a handler without SA_RESTART ran: break the lowest-tid registered
  * waiter out of its blocked call with EINTR. One waiter per signal. Caller
  * holds state.lock; it is dropped only for the retry pauses and is held on
@@ -352,7 +379,6 @@ static void interrupt_one_waiter(void)
     seq = w->seq;
 
     for (i = 0; i < LIBC_INTR_RETRY_MAX; i++) {
-        uint64_t ns = LIBC_INTR_RETRY_NS;
         int r = thread_ctl_r(RTMUX_TCTL_INTERRUPT, (void *) (intptr_t) tid);
 
         if ((r < 0 ? -r : r) != EAGAIN)
@@ -360,12 +386,7 @@ static void interrupt_one_waiter(void)
 
         /* Registered but not blocked in the kernel yet: pause and re-offer. */
         pthread_mutex_unlock(&state.lock);
-
-        /* Raw timer, not nanosleep(): that wrapper would register the signal
-         * thread itself as a waiter.
-         */
-        (void) __timer_timeout_r(CLOCK_MONOTONIC, RTMUX_TIMEOUT_NANOSLEEP, NULL,
-                                 &ns, NULL);
+        signal_nap(LIBC_INTR_RETRY_NS);
         pthread_mutex_lock(&state.lock);
         if (!waiter_present(w, seq))
             return; /* the call ended on its own */
@@ -393,23 +414,141 @@ void __libc_signal_init(void)
     intr_rearm();
 }
 
-/* The signal state an exec carries into the new image: the signals that are
- * ignored, and the ones that are blocked. Handlers do not survive an exec, so
- * they are not in either set. Parameters:
+static void drain(void);
+
+/* Exec and signals
+ *
+ * An exec ends the old image's threads, the system thread among them, and
+ * roottask moves the signals still queued on the system channel over to the new
+ * image. What that leaves is a signal the system thread has taken off the
+ * channel and not finished with, and the pending set, both of which live in
+ * this table and die with the image. So a thread asks for an exec only once
+ * the system thread can hold no such signal:
+ *
+ *   - exec_hold is raised; from then on a signal the system thread receives is
+ *     left pending instead of delivered, and the system thread parks before
+ *     its next receive, so it takes nothing more off the channel;
+ *   - the caller waits until the system thread is parked, breaking it out of
+ *     its receive if that is where it is. A system thread inside a handler is
+ *     not waited for (the handler may be waiting for the caller): the signal it
+ *     is handling is delivered, and it parks when the handler returns. One on
+ *     its way to end the process for a default action is waited for, and the
+ *     wait ends with the process;
+ *   - the pending set read after that is complete, and goes to roottask with
+ *     the request.
+ *
+ * If the exec fails the hold is dropped, the system thread goes back to its
+ * receive, and what was held is delivered.
+ */
+
+/* The system thread calls this before every receive on the system channel. */
+void __libc_signal_recv_enter(void)
+{
+    /* While the process is stopped the system thread keeps the lock, and no
+     * other thread runs to ask for an exec.
+     */
+    if (state.stopped)
+        return;
+    pthread_mutex_lock(&state.lock);
+    state.sys_tid = pthread_self();
+    if (state.exec_hold) {
+        state.sys_parked = 1;
+        while (state.exec_hold)
+            (void) sync_condvar_wait_r((sync_t *) &state.exec_wait,
+                                       (sync_t *) &state.lock);
+        state.sys_parked = 0;
+    }
+    state.sys_idle = 1;
+    pthread_mutex_unlock(&state.lock);
+}
+
+/* The system thread calls this when it stops receiving for good (its receive
+ * failed): an exec must not wait for a thread that will never park.
+ */
+void __libc_signal_recv_gone(void)
+{
+    if (state.stopped)
+        return;
+    pthread_mutex_lock(&state.lock);
+    state.sys_tid = 0;
+    state.sys_idle = 0;
+    pthread_mutex_unlock(&state.lock);
+}
+
+/* The system thread calls this when its receive returns, whatever it returned:
+ * past this point it is not interrupted.
+ */
+void __libc_signal_recv_exit(void)
+{
+    if (state.stopped)
+        return;
+    pthread_mutex_lock(&state.lock);
+    state.sys_idle = 0;
+    pthread_mutex_unlock(&state.lock);
+}
+
+/* Prepare for an exec and report the signal state it carries into the new
+ * image: the signals that are ignored, the ones that are blocked, and the ones
+ * that are pending. Handlers do not survive an exec, so a caught signal is in
+ * none of the first two. Every call is paired with __libc_signal_exec_end() if
+ * the exec returns. Parameters:
  *   ignored : out — the signals whose disposition is SIG_IGN
  *   blocked : out — the blocked set
+ *   pending : out — the signals received and not delivered
  */
-void __libc_signal_exec_state(sigset_t *ignored, sigset_t *blocked)
+void __libc_signal_exec_begin(sigset_t *ignored,
+                              sigset_t *blocked,
+                              sigset_t *pending)
 {
     int signo;
 
     sigemptyset(ignored);
     pthread_mutex_lock(&state.lock);
+    state.exec_hold++;
+
+    /* No system thread has run (sys_tid is 0): it parks at its first receive.
+     * The caller is the system thread, in a handler: it is receiving nothing.
+     */
+    while (state.sys_tid && pthread_self() != state.sys_tid &&
+           !state.sys_parked && !state.sys_handling) {
+        /* With the lock held and sys_idle set, the system thread is in its
+         * receive or on its way in or out of it, and nowhere else that an
+         * interrupt could break.
+         */
+        if (state.sys_idle)
+            (void) thread_ctl_r(RTMUX_TCTL_INTERRUPT,
+                                (void *) (intptr_t) state.sys_tid);
+        pthread_mutex_unlock(&state.lock);
+        signal_nap(LIBC_INTR_RETRY_NS);
+        pthread_mutex_lock(&state.lock);
+    }
+
     for (signo = 1; signo <= LIBC_NSIG; signo++) {
         if (state.handlers[signo].sa_handler == SIG_IGN)
             sigset_set(ignored, signo);
     }
+    /* A handler on the system thread has its own blocks in the mask; an exec
+     * from another thread meanwhile keeps the mask without them, but with what
+     * any thread has blocked since the handler began. One from the handler
+     * itself keeps the mask it runs with.
+     */
     *blocked = state.mask;
+    if (state.sys_handling && pthread_self() != state.sys_tid) {
+        blocked->bits[0] &= ~state.sys_added.bits[0];
+        blocked->bits[1] &= ~state.sys_added.bits[1];
+    }
+    *pending = state.pending;
+    pthread_mutex_unlock(&state.lock);
+}
+
+/* The exec failed: let signals through again, and deliver what was held. */
+void __libc_signal_exec_end(void)
+{
+    pthread_mutex_lock(&state.lock);
+    if (--state.exec_hold == 0) {
+        (void) pthread_cond_broadcast(&state.exec_wait);
+        drain();
+    }
     pthread_mutex_unlock(&state.lock);
 }
 
@@ -452,6 +591,7 @@ static int deliver_one(int signo)
     struct sigaction sa;
     sigset_t saved_mask;
     pid_t sender;
+    int on_sys;
 
     if (sigset_test(&state.mask, signo)) {
         /* blocked — leave it pending */
@@ -480,7 +620,7 @@ static int deliver_one(int signo)
                 state.stop_req = signo;
             } else {
                 pthread_mutex_unlock(&state.lock);
-                (void) jobctl_post(signo);
+                (void) post_via_roottask(signo);
                 pthread_mutex_lock(&state.lock);
             }
             return 0;
@@ -515,6 +655,13 @@ static int deliver_one(int signo)
         intr_rearm();
     }
 
+    on_sys = pthread_self() == state.sys_tid;
+    if (on_sys) {
+        if (!state.sys_handling++)
+            sigemptyset(&state.sys_added);
+        state.sys_added.bits[0] |= state.mask.bits[0] & ~saved_mask.bits[0];
+        state.sys_added.bits[1] |= state.mask.bits[1] & ~saved_mask.bits[1];
+    }
     pthread_mutex_unlock(&state.lock);
     if (sa.sa_flags & SA_SIGINFO) {
         /* No interrupted-thread context exists (handlers run on the system
@@ -531,6 +678,7 @@ static int deliver_one(int signo)
         sa.sa_handler(signo);
     }
     pthread_mutex_lock(&state.lock);
+    state.sys_handling -= on_sys;
 
     /* Restore mask. If anything became pending and is now unblocked, the
      * caller's drain loop will pick it up.
@@ -558,6 +706,11 @@ static void drain(void)
     do {
         progress = 0;
         for (signo = 1; signo <= LIBC_NSIG; signo++) {
+            /* An exec is being asked for: what is pending goes to the new
+             * image, or is delivered when the exec fails.
+             */
+            if (state.exec_hold)
+                return;
             if (!sigset_test(&state.pending, signo))
                 continue;
             if (sigset_test(&state.mask, signo))
@@ -648,9 +801,18 @@ int __libc_signal_raise(int signo)
      * thread takes them like any other process's.
      */
     if ((signo == SIGSTOP || signo == SIGCONT) && getpid() != ROOTTASK_PID)
-        return jobctl_post(signo);
+        return post_via_roottask(signo);
 
     pthread_mutex_lock(&state.lock);
+    if (state.exec_hold) {
+        /* An exec is being asked for, and the pending set it sends may be
+         * read already: send the signal through roottask instead, which keeps
+         * it for the new image (or the old one's system thread takes it if
+         * the exec fails).
+         */
+        pthread_mutex_unlock(&state.lock);
+        return post_via_roottask(signo);
+    }
     sigset_set(&state.pending, signo);
     state.pending_pid[signo] = getpid();
     drain();

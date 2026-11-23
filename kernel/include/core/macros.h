@@ -31,6 +31,36 @@
 #define DISPATCH_THP(dpp, pri) link3_to_thread((dpp)->ready[pri].head)
 #define DISPATCH_LST(dpp, pri) ((dpp)->ready[pri])
 
+/* Queue a thread at the head or the tail of priority list pri, recording pri
+ * as its queue priority (thread_t.qprio). Its removal, and the ready bits, go
+ * by qprio, not by its priority: that can change while the thread is queued
+ * (a waker reads it, then the thread's priority moves before the enqueue), and
+ * a removal from the list named by the new priority leaves the old list's
+ * head, tail and bit wrong.
+ */
+#define DISPATCH_LINK_END(dpp, pri, thp)                \
+    {                                                   \
+        LINK3_HDR *_dlq = &DISPATCH_LST(dpp, pri);      \
+        (thp)->qprio = (uint8_t) (pri);                 \
+        LINK3_END(*_dlq, &(thp)->link3_link, thread_t); \
+    }
+#define DISPATCH_LINK_BEG(dpp, pri, thp)                \
+    {                                                   \
+        LINK3_HDR *_dlq = &DISPATCH_LST(dpp, pri);      \
+        (thp)->qprio = (uint8_t) (pri);                 \
+        LINK3_BEG(*_dlq, &(thp)->link3_link, thread_t); \
+    }
+/* Take thp off the list it is queued on, clearing that list's ready bit when
+ * it empties.
+ */
+#define DISPATCH_UNLINK(dpp, thp)                                      \
+    {                                                                  \
+        LINK3_REM(DISPATCH_LST(dpp, (thp)->qprio), &(thp)->link3_link, \
+                  thread_t);                                           \
+        if (!DISPATCH_THP(dpp, (thp)->qprio))                          \
+            DISPATCH_CLR(dpp, thp);                                    \
+    }
+
 /* Per-CPU sched-lock helpers. Each per-CPU dispatch instance carries its own
  * kspinlock_t lock. Same-CPU dispatch ops use the _LOCAL form; cross-CPU ops
  * pass the target dpp explicitly. Multi-dpp sequences must acquire locks in
@@ -52,13 +82,13 @@
 #define DISPATCH_HIGHEST_PRI(dpp) (byte_log2[(dpp)->lo])
 #define DISPATCH_ANY(dpp) __atomic_load_n(&(dpp)->lo, __ATOMIC_RELAXED)
 #define DISPATCH_ISSET(dpp, pri) ((dpp)->lo & (1 << pri))
-#define DISPATCH_SET(dpp, thp)             \
-    {                                      \
-        (dpp)->lo |= 1 << (thp)->priority; \
+#define DISPATCH_SET(dpp, thp)          \
+    {                                   \
+        (dpp)->lo |= 1 << (thp)->qprio; \
     }
-#define DISPATCH_CLR(dpp, thp)                \
-    {                                         \
-        (dpp)->lo &= ~(1 << (thp)->priority); \
+#define DISPATCH_CLR(dpp, thp)             \
+    {                                      \
+        (dpp)->lo &= ~(1 << (thp)->qprio); \
     }
 
 #elif NUM_PRI <= 8 * 8
@@ -69,18 +99,18 @@
 #define DISPATCH_ANY(dpp) __atomic_load_n(&(dpp)->hi, __ATOMIC_RELAXED)
 #define DISPATCH_ISSET(dpp, pri) ((dpp)->lo[pri >> 3] & (1 << (pri & 7)))
 
-#define DISPATCH_SET(dpp, thp)                       \
-    {                                                \
-        register unsigned hi = (thp)->priority >> 3; \
-        (dpp)->hi |= 1 << hi;                        \
-        (dpp)->lo[hi] |= 1 << ((thp)->priority & 7); \
+#define DISPATCH_SET(dpp, thp)                    \
+    {                                             \
+        register unsigned hi = (thp)->qprio >> 3; \
+        (dpp)->hi |= 1 << hi;                     \
+        (dpp)->lo[hi] |= 1 << ((thp)->qprio & 7); \
     }
 
-#define DISPATCH_CLR(dpp, thp)                                     \
-    {                                                              \
-        register unsigned hi = (thp)->priority >> 3;               \
-        if (((dpp)->lo[hi] &= ~(1 << ((thp)->priority & 7))) == 0) \
-            (dpp)->hi &= ~(1 << hi);                               \
+#define DISPATCH_CLR(dpp, thp)                                  \
+    {                                                           \
+        register unsigned hi = (thp)->qprio >> 3;               \
+        if (((dpp)->lo[hi] &= ~(1 << ((thp)->qprio & 7))) == 0) \
+            (dpp)->hi &= ~(1 << hi);                            \
     }
 
 #elif NUM_PRI <= 8 * 8 * 8
@@ -99,23 +129,23 @@
 #define DISPATCH_ISSET(dpp, pri) \
     ((dpp)->lo[pri >> 6][(pri >> 3) & 7] & (1 << (pri & 7)))
 
-#define DISPATCH_SET(dpp, thp)                              \
-    {                                                       \
-        register unsigned hi = (thp)->priority >> 6;        \
-        register unsigned mid = ((thp)->priority >> 3) & 7; \
-        (dpp)->hi |= 1 << hi;                               \
-        (dpp)->mid[hi] |= 1 << mid;                         \
-        (dpp)->lo[hi][mid] |= 1 << ((thp)->priority & 7);   \
+#define DISPATCH_SET(dpp, thp)                           \
+    {                                                    \
+        register unsigned hi = (thp)->qprio >> 6;        \
+        register unsigned mid = ((thp)->qprio >> 3) & 7; \
+        (dpp)->hi |= 1 << hi;                            \
+        (dpp)->mid[hi] |= 1 << mid;                      \
+        (dpp)->lo[hi][mid] |= 1 << ((thp)->qprio & 7);   \
     }
 
-#define DISPATCH_CLR(dpp, thp)                                   \
-    {                                                            \
-        register unsigned hi = (thp)->priority >> 6;             \
-        register unsigned mid = ((thp)->priority >> 3) & 7;      \
-        if (((dpp)->lo[hi][mid] &=                               \
-             (uint8_t) ~(1u << ((thp)->priority & 7))) == 0)     \
-            if (((dpp)->mid[hi] &= (uint8_t) ~(1u << mid)) == 0) \
-                (dpp)->hi &= (uint8_t) ~(1u << hi);              \
+#define DISPATCH_CLR(dpp, thp)                                               \
+    {                                                                        \
+        register unsigned hi = (thp)->qprio >> 6;                            \
+        register unsigned mid = ((thp)->qprio >> 3) & 7;                     \
+        if (((dpp)->lo[hi][mid] &= (uint8_t) ~(1u << ((thp)->qprio & 7))) == \
+            0)                                                               \
+            if (((dpp)->mid[hi] &= (uint8_t) ~(1u << mid)) == 0)             \
+                (dpp)->hi &= (uint8_t) ~(1u << hi);                          \
     }
 
 #else

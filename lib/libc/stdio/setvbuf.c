@@ -57,6 +57,10 @@ int setvbuf(FILE *__restrict fp, char *__restrict buf, int mode, size_t size)
     fp->_r = 0;
     fp->_lbfsize = (flags & __SLBF) ? -(int) size : 0;
     fp->_w = (flags & __SWR) && mode == _IOFBF ? (int) size : 0;
+    /* A buffer set here means a write never reaches __smakebuf, which is
+     * what tells exit() there may be output to flush (__sdidinit).
+     */
+    __sdidinit = 1;
     FUNLOCKFILE(fp);
     return ret;
 }

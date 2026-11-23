@@ -69,10 +69,10 @@
 #define INJECT_OP_STALL_MUTEX_LOCK 10
 
 /* STALL_FORCE_READY(pid, ms): the next force_ready of a thread of that process
- * that read it as a condvar, semaphore or mutex waiter stalls for ms
- * milliseconds before it takes the wait chain lock, the window in which the
- * waiter can be woken and block elsewhere. SITE_STATUS(STALL_FORCE_READY)
- * reports whether the stall was taken.
+ * that read it as a condvar, semaphore or mutex waiter, or as a receiver,
+ * stalls for ms milliseconds before it takes the wait chain or channel lock,
+ * the window in which the waiter can be woken and block again.
+ * SITE_STATUS(STALL_FORCE_READY) reports whether the stall was taken.
  */
 #define INJECT_OP_STALL_FORCE_READY 11
 
@@ -263,7 +263,8 @@ enum {
 #define INJECT_POKE_STOP 1
 
 /* SCHED_STATS(what): what 0, ret is how many remote dispatch locks a steal
- * scan took on a queue it then found empty, since boot.
+ * scan took on a queue it then found empty, since boot; what 1, how many
+ * times thread_set_as_prp took thread_as_slock (mod 2^31).
  */
 #define INJECT_OP_SCHED_STATS 42
 
@@ -300,6 +301,15 @@ enum {
  */
 #define INJECT_OP_STALL_UNBLOCK_RACE 46
 
+/* SLOW_KPAGE_ZERO(pid, us << 32 | count): the roottask thread that next zeroes
+ * a page while serving a request of process pid (kext_kpage_zero, the zeroing
+ * of a MAP) takes us microseconds longer for that page and each of the next
+ * count - 1 pages it zeroes, so a MAP of a few MiB lasts seconds and a kill
+ * lands in the middle of it. SITE_STATUS(STALL_KPAGE_ZERO) reports whether it
+ * began; SITE_RELEASE ends it.
+ */
+#define INJECT_OP_SLOW_KPAGE_ZERO 47
+
 enum inject_site {
     STALL_LOCK,
     STALL_LOCK_EARLY,
@@ -320,6 +330,7 @@ enum inject_site {
     STALL_REPRIO,
     STALL_UNBLOCK_FORCE,
     STALL_UNBLOCK_REPLY,
+    STALL_KPAGE_ZERO,
     STALL_SITES,
     INJECT_SITE_TURNSTILE = STALL_SITES,
     INJECT_SITE_REPLY_DETACHED

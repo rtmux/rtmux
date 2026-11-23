@@ -727,22 +727,26 @@ int kdecl ksys_thread_ctl(thread_t *act, struct kcall_args_thread_ctl *kap)
  * usual reschedule IPI, so a target blocked on another hart needs no extra
  * cross-hart step and no register rewrite (unlike cancel).
  *
+ * Roottask reaches a thread of another process the same way, through
+ * kext_thread_ctl, which names the process by the target it looked up (op):
+ * that is how it interrupts a loader that holds its context too long.
+ *
  * Parameters:
- *   act : calling thread (selects the process)
+ *   act : calling thread
+ *   prp : the process of the target (the caller's own from ThreadCtl)
  *   tid : 1-based tid of the target
  * Return value: EOK when the wait was broken (or a server unblock was queued),
  *               EAGAIN when the target is not in an interruptible wait, ESRCH
  *               for an unknown tid, EINVAL for a bad tid.
  */
-static int thread_interrupt(thread_t *act, int tid)
+static int thread_interrupt(thread_t *act, process_t *prp, int tid)
 {
-    process_t *prp = act->process;
     thread_t *thp;
     int r = EAGAIN;
 
     if (tid <= 0)
         return EINVAL;
-    if (tid == (int) (act->tid + 1))
+    if (prp == act->process && tid == (int) (act->tid + 1))
         return EAGAIN; /* the caller is running, not blocked */
 
     rcu_read_lock(&tthread_rcu);
@@ -866,7 +870,7 @@ int kcall_op_thread_ctl(thread_t *act,
         break;
 
     case RTMUX_TCTL_INTERRUPT:
-        return thread_interrupt(act, (int) (intptr_t) kap->data);
+        return thread_interrupt(act, op->process, (int) (intptr_t) kap->data);
 
     case RTMUX_TCTL_ONE_THREAD_HOLD:
         if (!stop_one_thread(op->process, (int) (intptr_t) kap->data - 1,

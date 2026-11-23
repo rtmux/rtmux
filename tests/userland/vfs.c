@@ -9844,125 +9844,322 @@ static void spawn_concurrent_arg_max(bool held)
     free(buf);
 }
 
-/* One client's stuck spawns must not fail another's. Each of
- * LOADER_SHARE_THREADS spawns here has a file action that opens a path this
- * process serves and never answers, so its loader blocks holding a standard
- * loader context; there are 64 of those in all. A child started before them,
- * a different spawner, then spawns /bin/true: with a per-spawner share it gets
- * a context at once, without one it waits out the 30 s timeout behind the
- * stuck loaders and fails with EAGAIN.
+/* Stuck loaders. A spawn whose file action opens a path this process
+ * serves on a channel nobody receives on has its loader block in that open,
+ * holding its loader context, until the channel goes away.
  */
-#define LOADER_SHARE_PATH "/loader-share-hold"
 #define LOADER_SHARE_THREADS 66
 #define LOADER_SHARE_WAIT_MS 10000
 
-static void *loader_share_stuck(void *arg)
+struct loader_hold {
+    char path[48];
+    dispatch_t *dpp;
+    int id, started;
+    size_t arg;            /* bytes of argument each spawn takes, or 0 */
+    atomic_int eintr;      /* spawns that ended with EINTR */
+    pthread_t th[LOADER_SHARE_THREADS];
+};
+
+/* A NUL-terminated string of n - 1 copies of c, or NULL. */
+static char *loader_arg(size_t n, char c)
 {
-    char *argv[] = {"true", NULL};
+    char *a = malloc(n);
+
+    if (a) {
+        memset(a, c, n - 1);
+        a[n - 1] = '\0';
+    }
+    return a;
+}
+
+static void *loader_hold_spawn(void *arg)
+{
+    struct loader_hold *h = arg;
+    char *argv[] = {"true", NULL, NULL};
     char *envp[] = {NULL};
     posix_spawn_file_actions_t fa;
+    char at[64];
     pid_t pid;
+    int rc = ENOMEM;
 
-    (void) arg;
-    if (posix_spawn_file_actions_init(&fa))
-        return NULL;
-    if (!posix_spawn_file_actions_addopen(&fa, 3, LOADER_SHARE_PATH "/x", O_RDONLY, 0) &&
-        !posix_spawn(&pid, "/bin/true", &fa, NULL, argv, envp))
-        (void) waitpid(pid, NULL, 0);
-    (void) posix_spawn_file_actions_destroy(&fa);
+    snprintf(at, sizeof at, "%s/x", h->path);
+    if (h->arg)
+        argv[1] = loader_arg(h->arg, 'h');
+    if ((!h->arg || argv[1]) && !posix_spawn_file_actions_init(&fa)) {
+        rc = posix_spawn_file_actions_addopen(&fa, 3, at, O_RDONLY, 0);
+        if (!rc)
+            rc = posix_spawn(&pid, "/bin/true", &fa, NULL, argv, envp);
+        if (!rc)
+            (void) waitpid(pid, NULL, 0);
+        (void) posix_spawn_file_actions_destroy(&fa);
+    }
+    if (rc == EINTR)
+        atomic_fetch_add(&h->eintr, 1);
+    free(argv[1]);
     return NULL;
 }
 
-/* --loader-share-child: once stdin has a byte, spawn /bin/true; exit with the
- * spawn's error, 0 when it ran and exited 0.
- */
-int loader_share_child(void)
+/* Serve h->path without receiving, and start n stuck spawns on it. */
+static bool loader_hold_start(struct loader_hold *h, int n)
 {
-    char *argv[] = {"true", NULL};
+    snprintf(h->path, sizeof h->path, "/loader-hold-%d", (int) getpid());
+    h->started = 0;
+    atomic_store(&h->eintr, 0);
+    h->id = -1;
+    if (!(h->dpp = dispatch_create()))
+        return false;
+    h->id = ioserv_attach(h->dpp, NULL, h->path, _FTYPE_ANY, IOSERV_FLAG_DIR,
+                          &lost_reply_connect_ops, &lost_reply_io_ops, NULL);
+    if (h->id == -1) {
+        (void) dispatch_destroy(h->dpp);
+        h->dpp = NULL;
+        return false;
+    }
+    for (; h->started < n; h->started++)
+        if (pthread_create(&h->th[h->started], NULL, loader_hold_spawn, h))
+            break;
+    return h->started == n;
+}
+
+/* Let the stuck loaders go: their opens fail once the channel is gone. */
+static void loader_hold_stop(struct loader_hold *h)
+{
+    if (h->dpp) {
+        (void) ioserv_detach(h->dpp, h->id, 0);
+        (void) dispatch_destroy(h->dpp);
+        h->dpp = NULL;
+    }
+    for (int i = 0; i < h->started; i++)
+        (void) pthread_join(h->th[i], NULL);
+    h->started = 0;
+}
+
+/* --loader-hold-child N: hold N stuck spawns, say 'r' on stdout, and keep them
+ * until stdin reaches EOF.
+ */
+int loader_hold_child(int n)
+{
+    static struct loader_hold h;
+    char c;
+
+    if (n < 1 || n > LOADER_SHARE_THREADS || !loader_hold_start(&h, n))
+        return 2;
+    sleep_ms(2000); /* the loaders reach the open */
+    if (write(STDOUT_FILENO, "r", 1) != 1)
+        return 3;
+    while (read(STDIN_FILENO, &c, 1) == 1)
+        ;
+    loader_hold_stop(&h);
+    return 0;
+}
+
+/* --loader-share-child [BYTES]: once stdin has a byte, spawn /bin/true, with
+ * one argument of BYTES bytes if given; exit with the spawn's error, 0 when it
+ * ran and exited 0.
+ */
+int loader_share_child(size_t bytes)
+{
+    char *argv[] = {"true", NULL, NULL};
     char *envp[] = {NULL};
     char c;
     int rc, code;
 
     if (read(STDIN_FILENO, &c, 1) != 1)
         return 120;
+    if (bytes && !(argv[1] = loader_arg(bytes, 'p')))
+        return 122;
     rc = spawn_wait_code("/bin/true", NULL, NULL, argv, envp, NULL, &code);
+    free(argv[1]);
     return rc ? rc : code ? 121 : 0;
 }
 
-void test_loader_context_share(void)
+/* Start a child of this binary with args, its stdin the read end of *go (the
+ * write end stays here) and, if out, its stdout the write end of *out. */
+static pid_t loader_child(char *const args[], int go[2], int out[2])
 {
-    char *argv[] = {"syscall_testing", "--loader-share-child", NULL};
-    pthread_t th[LOADER_SHARE_THREADS];
     posix_spawn_file_actions_t fa;
-    struct timespec t0;
-    char detail[128];
-    dispatch_t *dpp;
-    int go[2], started = 0, id, st = 0, done = 0;
-    pid_t helper = -1;
-    long ms;
+    pid_t pid = -1;
 
-    /* The other spawner first: its own spawn must not wait behind the stuck
-     * ones below.
-     */
-    if (pipe(go)) {
-        test_fail("loader context share fixture", strerror(errno));
-        return;
+    if (pipe(go))
+        return -1;
+    if (out && pipe(out)) {
+        (void) close(go[0]);
+        (void) close(go[1]);
+        return -1;
     }
     (void) fcntl(go[1], F_SETFD, FD_CLOEXEC);
     (void) posix_spawn_file_actions_init(&fa);
     (void) posix_spawn_file_actions_adddup2(&fa, go[0], STDIN_FILENO);
     (void) posix_spawn_file_actions_addclose(&fa, go[0]);
-    if (posix_spawn(&helper, "/bin/syscall_testing", &fa, NULL, argv, NULL))
-        helper = -1;
+    if (out) {
+        (void) fcntl(out[0], F_SETFD, FD_CLOEXEC);
+        (void) posix_spawn_file_actions_adddup2(&fa, out[1], STDOUT_FILENO);
+        (void) posix_spawn_file_actions_addclose(&fa, out[1]);
+    }
+    if (posix_spawn(&pid, "/bin/syscall_testing", &fa, NULL, args, NULL))
+        pid = -1;
     (void) posix_spawn_file_actions_destroy(&fa);
     (void) close(go[0]);
-    if (helper == -1) {
-        test_fail("loader context share fixture", "helper spawn");
+    if (out)
+        (void) close(out[1]);
+    if (pid == -1) {
         (void) close(go[1]);
-        return;
+        if (out)
+            (void) close(out[0]);
     }
+    return pid;
+}
 
-    /* A service nobody receives on: every open of it blocks. */
-    if (!(dpp = dispatch_create())) {
-        test_fail("loader context share fixture", strerror(errno));
-        goto out_helper;
-    }
-    id = ioserv_attach(dpp, NULL, LOADER_SHARE_PATH, _FTYPE_ANY, IOSERV_FLAG_DIR,
-                       &lost_reply_connect_ops, &lost_reply_io_ops, NULL);
-    if (id == -1) {
-        test_skip("loader context share", "cannot attach a test path");
-        (void) dispatch_destroy(dpp);
-        goto out_helper;
-    }
-    for (; started < LOADER_SHARE_THREADS; started++)
-        if (pthread_create(&th[started], NULL, loader_share_stuck, NULL))
-            break;
-    sleep_ms(3000); /* the loaders reach the open and block in it */
+/* Tell the probe child to spawn, and wait up to ms for it: its exit status, or
+ * -1 if it is still running. *elapsed gets the time taken.
+ */
+static int loader_probe(pid_t probe, int go, int ms, long *elapsed)
+{
+    struct timespec t0;
+    int st = 0, done = 0;
 
     (void) clock_gettime(CLOCK_MONOTONIC, &t0);
-    if (write(go[1], "g", 1) == 1) {
-        for (int i = 0; i < LOADER_SHARE_WAIT_MS / 20 && !done; i++) {
-            done = waitpid(helper, &st, WNOHANG) == helper;
+    if (write(go, "g", 1) == 1)
+        for (int i = 0; i < ms / 20 && !done; i++) {
+            done = waitpid(probe, &st, WNOHANG) == probe;
             if (!done)
                 sleep_ms(20);
         }
-    }
-    ms = nsd_ms_since(&t0);
-    snprintf(detail, sizeof detail, "%d stuck spawns; other spawner %s %d after %ld ms",
-             started, done ? "exited" : "still waiting", done ? WEXITSTATUS(st) : -1, ms);
-    printf("  note  loader context share: %s\n", detail);
-    check(started == LOADER_SHARE_THREADS && done && WIFEXITED(st) && !WEXITSTATUS(st),
-          "stuck spawns of one client leave loader contexts for another", detail);
+    *elapsed = nsd_ms_since(&t0);
+    return done && WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+}
 
-    /* Let the stuck loaders go: their opens fail once the channel is gone. */
-    (void) ioserv_detach(dpp, id, 0);
-    (void) dispatch_destroy(dpp);
-    for (int i = 0; i < started; i++)
-        (void) pthread_join(th[i], NULL);
-out_helper:
+/* One client's stuck spawns must not fail another's. LOADER_SHARE_THREADS
+ * spawns here get stuck holding standard loader contexts (64 in all); a child
+ * started before them, a different spawner, then spawns /bin/true: with a
+ * per-spawner share it gets a context at once, without one it waits out the
+ * 30 s timeout behind the stuck loaders and fails with EAGAIN.
+ */
+void test_loader_context_share(void)
+{
+    static struct loader_hold h;
+    char *argv[] = {"syscall_testing", "--loader-share-child", NULL};
+    char detail[128];
+    int go[2], code = -1;
+    pid_t probe;
+    long ms = -1;
+
+    if ((probe = loader_child(argv, go, NULL)) == -1) {
+        test_fail("loader context share fixture", "helper spawn");
+        return;
+    }
+    if (!loader_hold_start(&h, LOADER_SHARE_THREADS)) {
+        test_fail("loader context share fixture", "stuck spawns");
+    } else {
+        sleep_ms(3000); /* the loaders reach the open and block in it */
+        code = loader_probe(probe, go[1], LOADER_SHARE_WAIT_MS, &ms);
+        snprintf(detail, sizeof detail, "%d stuck spawns; other spawner %s %d after %ld ms",
+                 h.started, code >= 0 ? "exited" : "still waiting", code, ms);
+        printf("  note  loader context share: %s\n", detail);
+        check(code == 0, "stuck spawns of one client leave loader contexts for another",
+              detail);
+    }
+    loader_hold_stop(&h);
     (void) close(go[1]);
-    if (!done)
-        (void) waitpid(helper, &st, 0);
+    if (code < 0)
+        (void) waitpid(probe, NULL, 0);
+}
+
+/* A loader that holds its context past LOADER_HOLD_MAX_S (10 s) while another
+ * spawn waits for one of its class is interrupted. Two clients, this
+ * process and a child, each hold their share of the standard contexts, 32, in
+ * stuck spawns, which is all 64; a third spawner's spawn must then get a
+ * context once the stuck ones pass the bound, within 25 s, where it used to
+ * wait out its 30 s and fail with EAGAIN. The loaders interrupted fail their
+ * spawns, with EINTR.
+ */
+#define LOADER_HOLD_SHARE 32
+#define LOADER_HOLD_WAIT_MS 25000
+
+void test_loader_context_hold(void)
+{
+    static struct loader_hold h;
+    char *pargs[] = {"syscall_testing", "--loader-share-child", NULL};
+    char *hargs[] = {"syscall_testing", "--loader-hold-child", "32", NULL};
+    char detail[128], c;
+    int go[2], hgo[2], hout[2], code = -1;
+    pid_t probe, holder;
+    long ms = -1;
+
+    if ((probe = loader_child(pargs, go, NULL)) == -1) {
+        test_fail("loader context hold fixture", "helper spawn");
+        return;
+    }
+    if ((holder = loader_child(hargs, hgo, hout)) == -1) {
+        test_fail("loader context hold fixture", "helper spawn");
+        (void) close(go[1]);
+        (void) waitpid(probe, NULL, 0);
+        return;
+    }
+    if (read(hout[0], &c, 1) != 1 || !loader_hold_start(&h, LOADER_HOLD_SHARE)) {
+        test_fail("loader context hold fixture", "stuck spawns");
+    } else {
+        sleep_ms(2000);
+        code = loader_probe(probe, go[1], LOADER_HOLD_WAIT_MS, &ms);
+        snprintf(detail, sizeof detail,
+                 "third spawner %s %d after %ld ms; %d of %d stuck here ended EINTR",
+                 code >= 0 ? "exited" : "still waiting", code, ms,
+                 atomic_load(&h.eintr), h.started);
+        printf("  note  loader context hold: %s\n", detail);
+        check(code == 0, "a loader stuck on a server gives its context back", detail);
+    }
+    loader_hold_stop(&h);
+    (void) close(hgo[1]);
+    (void) close(hout[0]);
+    (void) waitpid(holder, NULL, 0);
+    (void) close(go[1]);
+    if (code < 0)
+        (void) waitpid(probe, NULL, 0);
+}
+
+/* A large spawn the heap gate charged does not wait for its spawner's loader
+ * context share while it holds the charge. This process holds the two
+ * contexts of the ARG_MAX class its share allows in stuck spawns, and starts
+ * two more large stuck spawns, which are over its share; together those would
+ * hold 2 x ~190 KiB of the gate's 512 KiB while waiting. A child's large
+ * spawn must then pass the gate within 5 s, where it used to wait until the
+ * waiters gave up.
+ */
+#define LOADER_GATE_ARG (ARG_MAX - 4096)
+#define LOADER_GATE_STUCK 4 /* its class holds 4, half of them its share */
+#define LOADER_GATE_WAIT_MS 5000
+
+void test_loader_share_gate(void)
+{
+    static struct loader_hold h;
+    char bytes[16];
+    char *pargs[] = {"syscall_testing", "--loader-share-child", bytes, NULL};
+    char detail[128];
+    int go[2], code = -1;
+    pid_t probe;
+    long ms = -1;
+
+    snprintf(bytes, sizeof bytes, "%d", LOADER_GATE_ARG);
+    if ((probe = loader_child(pargs, go, NULL)) == -1) {
+        test_fail("loader share gate fixture", "helper spawn");
+        return;
+    }
+    h.arg = LOADER_GATE_ARG;
+    if (!loader_hold_start(&h, LOADER_GATE_STUCK)) {
+        test_fail("loader share gate fixture", "stuck spawns");
+    } else {
+        sleep_ms(2000);
+        code = loader_probe(probe, go[1], LOADER_GATE_WAIT_MS, &ms);
+        snprintf(detail, sizeof detail, "large spawn of another client %s %d after %ld ms",
+                 code >= 0 ? "exited" : "still waiting", code, ms);
+        printf("  note  loader share gate: %s\n", detail);
+        check(code == 0, "spawns waiting for their share leave the heap gate to others",
+              detail);
+    }
+    loader_hold_stop(&h);
+    (void) close(go[1]);
+    if (code < 0)
+        (void) waitpid(probe, NULL, 0);
 }
 
 void test_spawn_concurrent_arg_max(void)
@@ -13271,6 +13468,7 @@ void test_vfs(void)
     test_posix_msync_contract();
     test_memobj_stale_mapping_faults_after_munmap();
     test_shm_past_end();
+    test_sticky_reload();
     test_ioserv_reply_status_taxonomy();
     test_ioserv_accounting_sysfs();
     test_ioserv_accounting_create_destroy();
@@ -13305,6 +13503,8 @@ void test_vfs(void)
     test_spawn_loader_einval_log();
     test_spawn_concurrent_arg_max();
     test_loader_context_share();
+    test_loader_share_gate();
+    test_loader_context_hold();
     test_getsid_cases();
     test_pgrp_model();
     test_proc_lifecycle_burst_wait();

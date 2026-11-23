@@ -12,6 +12,7 @@
 
 #include <pthread.h>
 #include <stdatomic.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include "outcome.h"
 
@@ -41,6 +42,11 @@ void test_gap(const char *name, const char *anchor, const char *expected, const 
 void test_skip(const char *name, const char *reason);
 
 void test_timers(void);
+void test_stdio_exit(void);
+int stdio_exit_child(const char *what);
+void test_cputime(void);
+/* Wait (up to 3 s) until thread tid is in state (a STATE_* of sys/states.h). */
+bool wait_thread_state(pthread_t tid, int state);
 void test_nanosleep_1ns_storm(void);
 int rlimit_cpu_child(void);
 int rlimit_inherit_child(void);
@@ -99,6 +105,11 @@ int inject_run(const char *a1, const char *a2, const char *a3);
 int test_thread_blocked(pthread_t tid, int state);
 int test_chan_open(unsigned flags, int *chid, int *coid);
 int test_wait_flag(atomic_int *flag, int want, int ms);
+/* Arm a roottask debug window (_PROC_JOBCTL_DEBUG, CONFIG_DEBUG_INJECT): where
+ * is a PGRP_WINDOW_* site, ms how long the next operation there is held; with
+ * PGRP_WINDOW_ACTIVE, whether window ms is open now. 1 on success.
+ */
+int test_window_arm(unsigned where, unsigned ms);
 void test_receive_within(uint64_t ns);
 int test_reply_claim(void);
 int test_kill_slow_reap(void);
@@ -132,8 +143,14 @@ int test_ioserv_lost_reply_unblock(void);
 int pte_partial_map(void);
 void test_shm_past_end(void);
 int shm_past_end_child(const char *what);
+void test_sticky_reload(void);
+int test_write_undo(void);
+int sticky_reload_child(const char *what);
 int anon_map_failure(void);
-int loader_share_child(void);
+int loader_share_child(size_t bytes);
+int loader_hold_child(int n);
+void test_loader_context_hold(void);
+void test_loader_share_gate(void);
 void test_loader_context_share(void);
 long kstats_value(const char *key);
 int pgrp_races(void);
@@ -192,8 +209,15 @@ void test_orphan_exit(void);
 int orphan_exit_mid(void);
 void test_spawn_storm(unsigned residents);
 void test_kill_busy(void);
+void test_exec_signal(void);
+int exec_signal_child(const char *what);
+int exec_signal_chain(const char *count);
+int exec_signal_loop(const char *count);
 int kill_busy_child(void);
 int kill_resolve_child(void);
+int kill_map_child(void);
+void test_kill_map(void);
+int kill_thread_loop_child(void);
 int kill_stuck_handler_child(void);
 void test_user_ptr_negative(void);
 int capgate_child_connect(const char *chid_arg);

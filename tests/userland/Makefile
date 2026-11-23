@@ -8,12 +8,12 @@ include ../../mk/def.mk
 include ../../mk/recurse.mk
 include ../../userland/lib/common.mk
 
-SRCS = main.c timers.c sync.c prio-loan.c printf-test.c setjmp-test.c signals-test.c time-test.c \
+SRCS = main.c timers.c sync.c prio-loan.c printf-test.c stdio-exit.c setjmp-test.c signals-test.c time-test.c \
        strftime-test.c \
        notifications.c vfs.c posix-options.c capgate.c trace-negative.c \
        user-ptr-negative.c serial-unblock.c leak.c native-io-boundaries.c \
        qsort-test.c report.c getopt-test.c env-test.c sysconf-test.c malloc-stats-test.c \
-       pte-partial.c pgrp-races.c exec-swap.c kill-busy.c kill-slow-reap.c reply-claim.c xfer-resume.c cap-step.c rcvid-reuse.c remote-ipc.c reply-fault.c shm-past-end.c
+       pte-partial.c pgrp-races.c exec-swap.c exec-signal.c kill-busy.c kill-slow-reap.c reply-claim.c xfer-resume.c cap-step.c rcvid-reuse.c remote-ipc.c reply-fault.c shm-past-end.c sticky-reload.c write-undo.c
 OBJS = $(SRCS:%.c=$(OBJDIR)/%.o)
 # Single-file helper programs built by the rules below, outside the main binary.
 PROBE_OBJS = $(addprefix $(OBJDIR)/, crypttest.o setuid-probe.o preload-probe.o \

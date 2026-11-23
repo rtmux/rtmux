@@ -2896,7 +2896,7 @@ if ! awk '
     in_set && /prp->as_borrow_closed \? ESRCH : process_pin\(prp\)/ { saw_pin = NR }
     in_set && /thread_as_unbind\(thp\);/ { saw_unbind = NR }
     in_set && /thread_as_link\(thp, prp\);/ { saw_link = NR }
-    in_set && /thp->as_prp = prp;/ { saw_assign = NR }
+    in_set && /thp->as_prp = prp;|__atomic_store_n\(&thp->as_prp, prp, __ATOMIC_RELEASE\);/ { saw_assign = NR }
     in_set && /kspinlock_unlock\(&thread_as_slock\);/ { saw_unlock = NR }
     in_set && /^}/ { in_set = 0 }
     END {
@@ -2933,7 +2933,7 @@ if ! awk '
     /static void thread_as_unbind\(thread_t \*thp\)/ { in_unb = 1 }
     in_unb && /\*thp->as_borrow_pprev = thp->as_borrow_next;/ { saw_unlink = NR }
     in_unb && /process_unpin\(prp\);/ { saw_unpin = NR }
-    in_unb && /thp->as_prp = NULL;/ { saw_null = NR }
+    in_unb && /thp->as_prp = NULL;|__atomic_store_n\(&thp->as_prp, NULL, __ATOMIC_RELEASE\);/ { saw_null = NR }
     in_unb && /^}/ { in_unb = 0 }
     END {
         exit !(saw_unlink && saw_unpin && saw_null &&

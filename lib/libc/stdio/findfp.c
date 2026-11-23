@@ -106,9 +106,31 @@ void __sfp_release(FILE *fp)
     pthread_mutex_unlock(&pool_lock);
 }
 
+/* Whether fp is in write mode. Read without the stream lock, by exit() only,
+ * to decide whether a held stream is worth waiting for. The buffer pointers
+ * cannot say whether the holder has output: __sflush rewinds _p before its
+ * write(), and __sfvwrite writes a large request straight from the caller's
+ * buffer with _p at the base, so a holder in the middle of either looks empty
+ * while its output is still on the way. A stream in read mode holds no
+ * output; one in write mode is waited for, as exit() did before.
+ */
+static int write_mode(const FILE *fp)
+{
+    return (__atomic_load_n(&fp->_flags, __ATOMIC_RELAXED) & __SWR) != 0;
+}
+
+/* trylock: 0 waits for the stream's lock, 1 skips a held stream, and
+ * FWALK_EXIT waits only for a held stream in write mode.
+ */
 static int visit(FILE *fp, int (*func)(FILE *), int trylock)
 {
-    if (trylock) {
+    if (trylock == FWALK_EXIT) {
+        if (ftrylockfile(fp)) {
+            if (!write_mode(fp))
+                return 0;
+            FLOCKFILE(fp);
+        }
+    } else if (trylock) {
         if (ftrylockfile(fp))
             return 0;
     } else {
@@ -137,8 +159,16 @@ int _fwalk(int (*func)(FILE *), int trylock)
     return rc;
 }
 
+/* Flush every stream at exit(). A stream another thread holds is waited for
+ * only when it is in write mode, so output POSIX requires exit() to flush is
+ * not lost; one in read mode has none and is left alone. Its holder may be
+ * blocked for good (a read of a terminal or a pipe holds the lock until input
+ * arrives), and waiting for every lock used to hang exit() behind such a
+ * reader before it had flushed anything. A holder that keeps a stream in
+ * write mode locked for good still blocks exit(), as before.
+ */
 void _cleanup(void)
 {
     if (__sdidinit)
-        (void) _fwalk(__sflush, 0);
+        (void) _fwalk(__sflush, FWALK_EXIT);
 }

@@ -4132,7 +4132,7 @@ static void *cbb_target(void *arg)
 
 /* Wait for a specific thread state. TIDSTATUS may report the next thread
  * when this slot has gone away, so also compare the returned TID. */
-static bool wait_thread_state(pthread_t tid, int state)
+bool wait_thread_state(pthread_t tid, int state)
 {
     char path[32];
     snprintf(path, sizeof(path), "/proc/%d", (int) getpid());
@@ -4775,30 +4775,93 @@ out:
 
 /* wait_rewait: a cancel or an interrupt reads its target's wait without a lock
  * and acts on it later, by when the target may have been woken and blocked
- * again on the same semaphore. That later wait is not the one it saw and must
- * run its course. The fixture stalls the interrupt between its read and the
- * wait chain lock (stall-force-ready) and the cancel between its read and the
- * cancel it posts (stall-cancel), posts the semaphore once meanwhile, and lets
- * either go once the target waits again. The canceled target has disabled
- * cancellation before its second wait: the cancel stays pending until it
- * enables cancellation again. Needs /bin/inject and two harts.
+ * again on the same object. That later wait is not the one it saw and must run
+ * its course. The fixture stalls the interrupt between its read and the lock
+ * that claims the wait (stall-force-ready: a semaphore's chain lock, a
+ * receive's channel lock) and the cancel between its read and the cancel it
+ * posts (stall-cancel), wakes the target once meanwhile (a semaphore post, a
+ * message), and lets either go once the target waits again. The canceled
+ * target has disabled cancellation before its second wait: the cancel stays
+ * pending until it enables cancellation again. Needs /bin/inject and two
+ * harts.
  */
+enum rewait_kind { REWAIT_INTERRUPT, REWAIT_CANCEL, REWAIT_RECEIVE };
+
 struct rewait {
+    enum rewait_kind kind;
     sem_t sem;
+    sem_t go; /* a receive target's sender: one message per post */
+    int chid, coid;
     pthread_t target;
     atomic_int woken;  /* the first wait has returned */
     atomic_int passed; /* the second wait has returned */
     int first_rc, second_rc, second_errno;
 };
 
+/* One wait of the target: 0 when it ended normally, else -1 with errno. */
+static int rewait_wait(struct rewait *r)
+{
+    char buf[8];
+    int rcvid;
+
+    if (r->kind != REWAIT_RECEIVE)
+        return sem_wait(&r->sem);
+    rcvid = msg_receive(r->chid, buf, sizeof buf, NULL);
+    if (rcvid == 0)
+        errno = ENOMSG; /* a pulse, not the message */
+    if (rcvid <= 0)
+        return -1;
+    (void) msg_reply(rcvid, 0, NULL, 0);
+    return 0;
+}
+
+/* A receive target's sender, started before the stall: a thread created
+ * while a hart is stalled with interrupts off waits for it (its stack's TLB
+ * shootdown). A send blocks until the reply, hence a thread of its own; it
+ * sends once per post of go, and a failed send (the channel destroyed to end
+ * a receive left waiting) ends it.
+ */
+static void *rewait_send(void *arg)
+{
+    struct rewait *r = arg;
+    char out[8] = "ping";
+
+    for (int i = 0; i < 2; i++) {
+        (void) sem_wait(&r->go);
+        if (msg_send(r->coid, out, sizeof out, NULL, 0) == -1)
+            break;
+    }
+    return NULL;
+}
+
+/* Let a receive target's sender go: with destroy, its pending or later sends
+ * fail (and a receive left waiting ends); either way it gets its two posts.
+ */
+static void rewait_stop_sender(struct rewait *r, pthread_t sender, bool destroy)
+{
+    if (destroy) {
+        (void) channel_destroy(r->chid);
+        r->chid = -1;
+    }
+    (void) sem_post(&r->go);
+    (void) sem_post(&r->go);
+    (void) pthread_join(sender, NULL);
+}
+
+/* End one wait of the target. */
+static void rewait_wake(struct rewait *r)
+{
+    (void) sem_post(r->kind != REWAIT_RECEIVE ? &r->sem : &r->go);
+}
+
 static void *rewait_target(void *arg)
 {
     struct rewait *r = arg;
 
-    r->first_rc = sem_wait(&r->sem);
+    r->first_rc = rewait_wait(r);
     (void) pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
     atomic_store(&r->woken, 1);
-    r->second_rc = sem_wait(&r->sem);
+    r->second_rc = rewait_wait(r);
     r->second_errno = r->second_rc ? errno : 0;
     atomic_store(&r->passed, 1);
     (void) pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
@@ -4819,27 +4882,58 @@ static void *rewait_interrupt(void *arg)
     struct rewait *r = arg;
 
     (void) test_pin_mask(2U);
-    return (void *) (intptr_t) thread_ctl(RTMUX_TCTL_INTERRUPT,
-                                          (void *) (long) r->target);
+    return (void *) (intptr_t) (thread_ctl(RTMUX_TCTL_INTERRUPT,
+                                           (void *) (long) r->target)
+                                    ? errno
+                                    : 0);
 }
 
-static void wait_rewait_case(bool cancel)
+static void wait_rewait_case(enum rewait_kind kind)
 {
-    const char *name = cancel ? "cancel" : "interrupt";
+    static const char *const names[] = {
+        [REWAIT_INTERRUPT] = "interrupt",
+        [REWAIT_CANCEL] = "cancel",
+        [REWAIT_RECEIVE] = "receive interrupt",
+    };
+    const char *name = names[kind];
+    bool cancel = kind == REWAIT_CANCEL;
+    int state = kind == REWAIT_RECEIVE ? STATE_RECEIVE : STATE_SEM;
     struct stall_watch watch = {.pid = -1};
-    struct rewait r = {.first_rc = -1, .second_rc = -1};
-    pthread_t waker;
+    struct rewait r = {
+        .kind = kind, .chid = -1, .coid = -1, .first_rc = -1, .second_rc = -1};
+    pthread_t waker, sender = 0;
     bool started = false, entered = false, rewaited = false, held = false;
     void *waker_rc = (void *) -1, *target_rc = NULL;
     char pid[16], what[96], d[96];
 
     snprintf(pid, sizeof pid, "%d", (int) getpid());
-    if (sem_init(&r.sem, 0, 0) ||
-        pthread_create(&r.target, NULL, rewait_target, &r)) {
-        test_fail("wait rewait fixture", "cannot create the target");
+    if (sem_init(&r.sem, 0, 0)) {
+        test_fail("wait rewait fixture", "sem_init");
         return;
     }
-    if (wait_thread_state(r.target, STATE_SEM) &&
+    if (sem_init(&r.go, 0, 0)) {
+        test_fail("wait rewait fixture", "sem_init");
+        (void) sem_destroy(&r.sem);
+        return;
+    }
+    /* A side channel (test_chan_open): a connection in the fd space would be
+     * inherited by the /bin/inject children, whose exit closes it with a
+     * message to this channel that would end the target's receive.
+     */
+    if (kind == REWAIT_RECEIVE &&
+        (!test_chan_open(0, &r.chid, &r.coid) ||
+         pthread_create(&sender, NULL, rewait_send, &r))) {
+        test_fail("wait rewait fixture", "cannot start the sender");
+        sender = 0;
+        goto out;
+    }
+    if (pthread_create(&r.target, NULL, rewait_target, &r)) {
+        test_fail("wait rewait fixture", "cannot create the target");
+        if (sender)
+            rewait_stop_sender(&r, sender, true);
+        goto out;
+    }
+    if (wait_thread_state(r.target, state) &&
         !inject_run(cancel ? "stall-cancel" : "stall-force-ready", pid,
                     "10000") &&
         !stall_watch_start(&watch, cancel ? "cancel" : "force-ready") &&
@@ -4848,14 +4942,12 @@ static void wait_rewait_case(bool cancel)
         started = true;
         entered = stall_watch_entered(&watch);
     }
-    snprintf(what, sizeof what, "%s stalls on the first semaphore wait", name);
+    snprintf(what, sizeof what, "%s stalls on the first wait", name);
     check(entered, what, "the stall was not reached");
-    (void) sem_post(&r.sem);
+    rewait_wake(&r);
     if (entered) {
-        for (int i = 0; i < 300 && !atomic_load(&r.woken); i++)
-            sleep_ms(10);
-        rewaited =
-            atomic_load(&r.woken) && wait_thread_state(r.target, STATE_SEM);
+        (void) test_wait_flag(&r.woken, 1, 3000);
+        rewaited = atomic_load(&r.woken) && wait_thread_state(r.target, state);
         snprintf(what, sizeof what, "target waits again before the %s resumes",
                  name);
         check(rewaited, what, "the second wait was not observed");
@@ -4866,12 +4958,27 @@ static void wait_rewait_case(bool cancel)
         (void) pthread_join(waker, &waker_rc);
     if (rewaited) {
         sleep_ms(200);
-        held = wait_thread_state(r.target, STATE_SEM);
+        held = wait_thread_state(r.target, state);
     }
-    (void) sem_post(&r.sem);
+    rewait_wake(&r);
+    /* A receive that ended early (the second, or the first when the stall was
+     * not reached) leaves a message nobody takes, and a failed send a receive
+     * nobody ends: destroying the channel ends both. Once the target has
+     * passed it no longer receives, so the channel always goes.
+     */
+    if (sender) {
+        (void) test_wait_flag(&r.passed, 1, 3000);
+        rewait_stop_sender(&r, sender, true);
+    }
     (void) pthread_join(r.target, &target_rc);
+out:
     stall_watch_finish(&watch);
+    if (r.coid >= 0)
+        (void) __connect_detach((uint64_t) r.coid);
+    if (r.chid >= 0)
+        (void) channel_destroy(r.chid);
     (void) sem_destroy(&r.sem);
+    (void) sem_destroy(&r.go);
     if (!rewaited)
         return;
     snprintf(what, sizeof what, "a stale %s leaves the new wait intact", name);
@@ -4894,8 +5001,9 @@ int wait_rewait(void)
         inject_run("alloc-status", NULL, NULL) != 0)
         return TC_EXIT_SKIP;
     (void) test_pin_mask(1U);
-    wait_rewait_case(false);
-    wait_rewait_case(true);
+    wait_rewait_case(REWAIT_INTERRUPT);
+    wait_rewait_case(REWAIT_RECEIVE);
+    wait_rewait_case(REWAIT_CANCEL);
     (void) test_pin_mask(~0U);
     return 0;
 }
@@ -5415,9 +5523,11 @@ static void dw_sleep_past(void)
 
 struct dw_yield {
     atomic_int ready;
-    sem_t go, peer_go;
+    sem_t go, peer_go, done;
     pthread_t peer;
     bool made;
+    bool hold; /* wait on done after the yield, so the thread stays readable */
+    atomic_int yielding, yielded; /* hold: entering the yield, back from it */
 };
 
 static void *dw_peer(void *raw)
@@ -5460,7 +5570,12 @@ static void *dw_yielder(void *raw)
     (void) sem_wait(&y->go);
     (void) test_pin_mask(~0U); /* now any hart may take this thread */
     (void) sem_post(&y->peer_go); /* queued on this hart, behind us */
+    atomic_store(&y->yielding, 1);
     (void) sched_yield();
+    if (y->hold) {
+        atomic_store(&y->yielded, 1);
+        (void) sem_wait(&y->done);
+    }
     return NULL;
 }
 
@@ -5552,9 +5667,25 @@ int boot_tick_catch_up(void)
     long worst = -1000000L;
     int rounds = 0, outside = 0;
 
-    if (sysconf(_SC_NPROCESSORS_ONLN) < 2 ||
-        inject_run("alloc-status", NULL, NULL) != 0)
-        return TC_EXIT_SKIP;
+    if (sysconf(_SC_NPROCESSORS_ONLN) < 2) {
+        test_skip("boot tick catch-up", "two harts required");
+        return 0;
+    }
+    int inj = inject_run("alloc-status", NULL, NULL);
+
+    if (inj != 0) {
+        /* /bin/inject printed why above: "call refused: Function not
+         * implemented" is a kernel whose priv table has no DEBUG_INJECT
+         * entry, e.g. a build dir whose kernel/core/priv.o predates
+         * CONFIG_DEBUG_INJECT=y in .config.
+         */
+        snprintf(d, sizeof d,
+                 "fault injection unavailable: /bin/inject alloc-status "
+                 "exited %d",
+                 inj);
+        test_skip("boot tick catch-up", d);
+        return 0;
+    }
     b = (struct btc) {0};
     snprintf(pid, sizeof pid, "%d", (int) getpid());
     snprintf(ms, sizeof ms, "%d", BTC_CALL_MS);
@@ -5617,6 +5748,169 @@ out:
     return 0;
 }
 
+/* The same held yield, read through the yielder's CPU clock from another hart.
+ * The yield bills the thread before it is queued, and the hart then shows it
+ * as current for the whole hold. Such a read used to add the held time to the
+ * banked value and to lose it once the hart switched, so the clock stepped
+ * back by the hold. The reads must cover most of the hold (from the yielder's
+ * entry into the yield until it returns, at least half of DW_STALL_MS) and the
+ * time after it.
+ */
+static uint64_t dw_now_ns(clockid_t id, bool *ok)
+{
+    struct timespec ts;
+
+    if (clock_gettime(id, &ts) != 0) {
+        *ok = false;
+        return 0;
+    }
+    return (uint64_t) ts.tv_sec * 1000000000ULL + (uint64_t) ts.tv_nsec;
+}
+
+/* The reader: pinned off the held hart, so the hold cannot keep it from
+ * running, and started before the hold is armed. It samples from the yielder's
+ * entry into the yield for DW_STALL_MS + 400 ms.
+ */
+struct dw_clock_read {
+    struct dw_yield *y;
+    clockid_t cid;
+    atomic_int started, go; /* reader running; hold armed and yield let go */
+    bool ok, entered;
+    uint64_t during, after, back, worst, t_go, t_last;
+};
+
+static void *dw_clock_reader(void *raw)
+{
+    struct dw_clock_read *r = raw;
+    uint64_t hi = 0, end, t;
+
+    r->ok = test_pin_mask(~(1U << DW_RECV_HART)) == EOK;
+    atomic_store(&r->started, 1);
+    while (r->ok && !atomic_load(&r->go))
+        sleep_ms(1);
+    if (!r->ok || atomic_load(&r->go) < 0)
+        return NULL;
+    t = dw_now_ns(CLOCK_MONOTONIC, &r->ok);
+    end = t + 3000 * 1000000ULL;
+    while (r->ok && !atomic_load(&r->y->yielding) && t < end)
+        t = dw_now_ns(CLOCK_MONOTONIC, &r->ok);
+    r->entered = atomic_load(&r->y->yielding) != 0;
+    if (!r->entered)
+        return NULL;
+    r->t_go = t;
+    end = t + (DW_STALL_MS + 400) * 1000000ULL;
+    while (r->ok) {
+        bool returned = atomic_load(&r->y->yielded) != 0;
+        uint64_t v = dw_now_ns(r->cid, &r->ok);
+
+        if (!r->ok)
+            break;
+        if (v < hi) {
+            r->back++;
+            if (hi - v > r->worst)
+                r->worst = hi - v;
+        } else {
+            hi = v;
+        }
+        t = dw_now_ns(CLOCK_MONOTONIC, &r->ok);
+        if (returned) {
+            r->after++;
+        } else {
+            r->during++;
+            r->t_last = t;
+        }
+        if (t >= end)
+            break;
+    }
+    return NULL;
+}
+
+/* One held yield with the reader running. Returns the fixture steps done (of
+ * 5) and fills *r; *taken says whether the site was held.
+ */
+static int dw_yield_clock_round(struct dw_clock_read *r, bool *taken)
+{
+    static struct dw_yield y;
+    pthread_t th, rt;
+    int stage = 0;
+
+    *taken = false;
+    y = (struct dw_yield) {.hold = true};
+    *r = (struct dw_clock_read) {.y = &y};
+    if (sem_init(&y.go, 0, 0) != 0 || sem_init(&y.peer_go, 0, 0) != 0 ||
+        sem_init(&y.done, 0, 0) != 0)
+        return 0;
+    if (pthread_create(&th, NULL, dw_yielder, &y) == EOK) {
+        bool reading = false;
+
+        for (int i = 0; i < 300 && !atomic_load(&y.ready); i++)
+            sleep_ms(10);
+        stage = atomic_load(&y.ready) == 1 ? 1 : 0;
+        if (stage == 1 && wait_thread_state(th, STATE_SEM))
+            stage = 2;
+        if (stage == 2 && pthread_getcpuclockid(th, &r->cid) == 0)
+            stage = 3;
+        if (stage == 3 && pthread_create(&rt, NULL, dw_clock_reader, r) == EOK) {
+            reading = true;
+            for (int i = 0; i < 3000 && !atomic_load(&r->started); i++)
+                sleep_ms(1);
+            if (atomic_load(&r->started) && r->ok)
+                stage = 4;
+        }
+        if (stage == 4 && dw_inject("stall-switch", th, DW_STALL_MS) == 0)
+            stage = 5;
+        /* The reader gives up 3 s after this if the yield never comes. */
+        atomic_store(&r->go, stage == 5 ? 1 : -1);
+        (void) sem_post(&y.go);
+        if (reading)
+            (void) pthread_join(rt, NULL);
+        *taken = stage == 5 && inject_run("site-wait", "switch", NULL) == 0;
+        (void) sem_post(&y.done);
+        if (atomic_load(&y.ready) != 1)
+            (void) sem_post(&y.peer_go);
+        (void) pthread_join(th, NULL);
+        if (y.made)
+            (void) pthread_join(y.peer, NULL);
+    }
+    (void) sem_destroy(&y.go);
+    (void) sem_destroy(&y.peer_go);
+    (void) sem_destroy(&y.done);
+    return stage;
+}
+
+/* Up to DW_CLOCK_ROUNDS rounds until one covers the hold: reads during at
+ * least half of DW_STALL_MS, and after it. A step back fails at once.
+ */
+enum { DW_CLOCK_ROUNDS = 3 };
+
+static void dw_yield_clock(void)
+{
+    const char *what = "CPU clock of a thread held before its hart switches";
+    struct dw_clock_read r;
+    bool taken = false, covered = false;
+    int stage = 0, round;
+    char detail[240];
+
+    for (round = 1; round <= DW_CLOCK_ROUNDS; round++) {
+        stage = dw_yield_clock_round(&r, &taken);
+        covered = stage == 5 && taken && r.ok && r.entered && r.after > 0 &&
+                  r.t_last >= r.t_go + DW_STALL_MS / 2 * 1000000ULL;
+        if (covered || r.back)
+            break;
+    }
+    if (round > DW_CLOCK_ROUNDS)
+        round = DW_CLOCK_ROUNDS;
+    snprintf(detail, sizeof detail,
+             "round %d: step %d of 5, held=%d, reads during=%llu (for %llu ms) "
+             "after=%llu backwards=%llu worst=%llu ns",
+             round, stage, taken, (unsigned long long) r.during,
+             (unsigned long long) (r.t_last > r.t_go ? (r.t_last - r.t_go) / 1000000
+                                                     : 0),
+             (unsigned long long) r.after, (unsigned long long) r.back,
+             (unsigned long long) r.worst);
+    check(covered && r.back == 0, what, detail);
+}
+
 int dispatch_window(void)
 {
     if (sysconf(_SC_NPROCESSORS_ONLN) < 3 ||
@@ -5626,6 +5920,7 @@ int dispatch_window(void)
     dw_sleep_switch();
     dw_sleep_past();
     dw_yield_switch();
+    dw_yield_clock();
     return 0;
 }
 
@@ -5777,6 +6072,17 @@ static void *kw_s1(void *raw)
     return NULL;
 }
 
+/* Hart 1's high spinner without a target of its own. */
+static void *kw_s1_spin(void *raw)
+{
+    struct kw *w = raw;
+
+    (void) kw_pin(1U << 1, 1U << 1);
+    while (!atomic_load(&w->stop_s1))
+        ;
+    return NULL;
+}
+
 /* Hart 2's high spinner: blocks on request, so that hart steals. */
 static void *kw_s2(void *raw)
 {
@@ -5859,6 +6165,131 @@ static void kw_reprio_stop(struct kw_serve *k)
     (void) pthread_join(s1, NULL);
 }
 
+/* A priority change that lands while a waker readies the thread: ready() read
+ * the priority, then the thread moved to another one before it was queued.
+ * It was queued on the list of the priority read but with the ready bit, and
+ * later its removal, by the new one: the list kept a stale tail, and the next
+ * thread queued at that priority hung off it where no hart looks (the
+ * lost READY thread). The waker of T is held by STALL_READY after its read and
+ * the change is made meanwhile; once T has run, U is queued at T's old
+ * priority on the same hart, and U must run once the hart is free.
+ */
+struct kw_rr {
+    sem_t sem;
+    atomic_int ran;
+    pthread_t tid;
+};
+
+static void *kw_rr_target(void *raw)
+{
+    struct kw_rr *r = raw;
+
+    (void) sem_wait(&r->sem);
+    atomic_store(&r->ran, 1);
+    return NULL;
+}
+
+static void *kw_rr_waker(void *raw)
+{
+    struct kw_rr *r = raw;
+
+    (void) kw_pin(1U << 2, 1U << 2);
+    (void) sem_post(&r->sem);
+    return NULL;
+}
+
+/* Start hart 1's spinner (stopped by kw_rr_free); the threads of this case
+ * queue behind it.
+ */
+static bool kw_rr_spin(struct kw *w, pthread_t *s1)
+{
+    atomic_store(&w->stop_s1, 0);
+    if (kw_make(s1, KW_HIGH, kw_s1_spin, w) != EOK)
+        return false;
+    sleep_ms(50);
+    return true;
+}
+
+static void kw_rr_free(struct kw *w, pthread_t s1)
+{
+    atomic_store(&w->stop_s1, 1);
+    (void) pthread_join(s1, NULL);
+}
+
+static void kw_ready_reprio(struct kw_serve *k)
+{
+    static struct kw w;
+    static struct kw_rr t, u;
+    const char *what = "priority change while the thread is being readied";
+    pthread_t s1, waker;
+    bool spun = false, held = false, waked = false, changed = false;
+    struct sched_param sp = {.sched_priority = KW_LOW + 1};
+
+    w = (struct kw) {0};
+    t = (struct kw_rr) {0};
+    u = (struct kw_rr) {0};
+    if (sem_init(&t.sem, 0, 0) || sem_init(&u.sem, 0, 0)) {
+        test_fail(what, "sem_init");
+        return;
+    }
+    (void) kw_pin(1U, 1U << 1); /* both live on hart 1 */
+    if (kw_make(&t.tid, KW_LOW, kw_rr_target, &t) != EOK ||
+        kw_make(&u.tid, KW_LOW, kw_rr_target, &u) != EOK) {
+        (void) kw_pin(1U, ~0U);
+        test_fail(what, "fixture: threads");
+        return;
+    }
+    (void) kw_pin(1U, ~0U);
+    if (!wait_thread_state(t.tid, STATE_SEM) ||
+        !wait_thread_state(u.tid, STATE_SEM) || !(spun = kw_rr_spin(&w, &s1))) {
+        test_fail(what, "fixture: threads did not block, or no spinner");
+        goto out;
+    }
+    /* Hart 1 is busy above T and U: each is queued, not run, when readied. */
+    waked = kw_cmd(k, "stall-ready %d %d %d", (int) getpid(), (int) t.tid,
+                   KW_HOLD_MS) == 0 &&
+            pthread_create(&waker, NULL, kw_rr_waker, &t) == 0;
+    held = waked && kw_cmd(k, "site-wait ready") == 0;
+    if (held) {
+        changed = pthread_setschedparam(t.tid, SCHED_FIFO, &sp) == 0;
+        (void) kw_cmd(k, "site-release ready");
+    }
+    if (waked)
+        (void) pthread_join(waker, NULL);
+    check(held && changed, what,
+          "fixture: the wakeup was not held, or the change refused");
+    kw_rr_free(&w, s1);
+    spun = false;
+    if (!held || !test_wait_flag(&t.ran, 1, 2000)) {
+        test_fail(what, "fixture: T did not run");
+        goto out;
+    }
+    if (!(spun = kw_rr_spin(&w, &s1)))
+        goto out;
+    (void) sem_post(&u.sem); /* U is queued at T's old priority */
+    (void) wait_thread_state(u.tid, STATE_READY);
+    kw_rr_free(&w, s1);
+    spun = false;
+    check(test_wait_flag(&u.ran, 1, 2000), what,
+          "the next thread queued at its old priority never ran");
+out:
+    if (spun)
+        kw_rr_free(&w, s1);
+    /* An extra post is harmless: each waits once. A lost thread is left. */
+    (void) sem_post(&t.sem);
+    (void) sem_post(&u.sem);
+    if (test_wait_flag(&t.ran, 1, 2000))
+        (void) pthread_join(t.tid, NULL);
+    else
+        (void) pthread_detach(t.tid);
+    if (test_wait_flag(&u.ran, 1, 2000))
+        (void) pthread_join(u.tid, NULL);
+    else
+        (void) pthread_detach(u.tid); /* lost: no hart runs it */
+    (void) sem_destroy(&t.sem);
+    (void) sem_destroy(&u.sem);
+}
+
 /* A steal held between its two dispatch locks (STALL_STEAL), and a stop in
  * that window: the stealer must not run a thread stopped in transit.
  */
@@ -5914,10 +6345,54 @@ static int kw_steal_locks(struct kw_serve *k)
     int n = -1;
 
     kw_send(k, "sched-stats\n");
-    if (kw_line(k, line, sizeof line) && !strncmp(line, key, sizeof key - 1))
+    /* A failed read prints only the status line: do not wait for another. */
+    if (kw_line(k, line, sizeof line) && !strncmp(line, key, sizeof key - 1)) {
         n = atoi(line + sizeof key - 1);
-    (void) kw_line(k, line, sizeof line); /* the status line */
+        (void) kw_line(k, line, sizeof line); /* the status line */
+    }
     return n;
+}
+
+/* SCHED_STATS 1 through the helper, or -1. */
+static int kw_as_locks(struct kw_serve *k)
+{
+    static const char key[] = "as-slock-takes=";
+    char line[64];
+    int n = -1;
+
+    kw_send(k, "as-lock-stats\n");
+    /* A failed read prints only the status line: do not wait for another. */
+    if (kw_line(k, line, sizeof line) && !strncmp(line, key, sizeof key - 1)) {
+        n = atoi(line + sizeof key - 1);
+        (void) kw_line(k, line, sizeof line); /* the status line */
+    }
+    return n;
+}
+
+/* A request roottask serves in its own address space takes no global lock on
+ * the way back to user mode: each of KW_AS_CALLS getppid() calls is one
+ * roottask reply and one return of its thread to user mode, and they all run
+ * with as_prp already roottask's.
+ */
+#define KW_AS_CALLS 1000
+
+static void kw_as_lock_free(struct kw_serve *k)
+{
+    int c0 = kw_as_locks(k), c1, taken;
+
+    for (int i = 0; i < KW_AS_CALLS; i++)
+        (void) getppid();
+    c1 = kw_as_locks(k);
+    /* The count is kept mod 2^31. */
+    taken = (int) ((unsigned) (c1 - c0) & 0x7fffffffU);
+    printf("k91: thread_as_slock taken %d times over %d roottask requests\n",
+           taken, KW_AS_CALLS);
+    /* The helper's own reads and the other processes' requests meanwhile
+     * still bind roottask threads to their address spaces: a few.
+     */
+    check(c0 >= 0 && c1 >= 0 && taken <= KW_AS_CALLS / 10,
+          "roottask returns to user mode take no global lock",
+          "thread_as_slock taken on unchanged returns");
 }
 
 /* An idle system: the harts' steal scans take no lock of an empty queue. */
@@ -5950,6 +6425,8 @@ int k65_windows(void)
     }
     (void) kw_pin(1U, ~0U); /* stay off harts 1 and 2 */
     kw_empty_peek(&k);
+    kw_ready_reprio(&k);
+    kw_as_lock_free(&k);
     kw_reprio_stop(&k);
     kw_steal(&k, true);
     (void) kw_pin(~0U, ~0U);

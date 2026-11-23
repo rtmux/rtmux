@@ -112,7 +112,7 @@ struct idle_stack {
  */
 static int idle_unlink_ready(kdispatch_t *dpp, thread_t *thp, unsigned cpu)
 {
-    LINK3_HDR *queue = &DISPATCH_LST(dpp, thp->priority);
+    LINK3_HDR *queue = &DISPATCH_LST(dpp, thp->qprio);
 
     /* Leave a thread another hart still has current (thread_current_elsewhere):
      * that hart has not switched away from it yet.
@@ -127,9 +127,7 @@ static int idle_unlink_ready(kdispatch_t *dpp, thread_t *thp, unsigned cpu)
         thp->link3_link.prev = &queue->head;
     }
 
-    LINK3_REM(*queue, &thp->link3_link, thread_t);
-    if (!DISPATCH_THP(dpp, thp->priority))
-        DISPATCH_CLR(dpp, thp);
+    DISPATCH_UNLINK(dpp, thp);
     return 1;
 }
 

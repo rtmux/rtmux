@@ -40,12 +40,16 @@
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <devctl.h>
+#include <devctl/proc.h>
 
 #include "test.h"
 
 #define SPE_PAGE 4096UL
 #define SPE_NAME "/rtmux-shm-past-end"
 #define SPE_WAIT_MS 20000
+#define SPE_CTL_NAME "/rtmux-shm-past-end-ctl"
+#define SPE_SHMCTL_ANON 0x1 /* SHMCTL_ANON: give the object anonymous memory */
 
 /* The handshake lives in the object's first page, which every mapping of it
  * covers all along.
@@ -55,6 +59,9 @@ struct spe_shared {
     atomic_int parent; /* parent progress: 1 grown, 2 shrunk */
     atomic_int priv;   /* private holder: 1 mapped, 2 wrote and read page 1 */
     unsigned seen;     /* what the holder read from page 1 */
+    atomic_int ctl;    /* shm_ctl holder: 1 mapped, 2 read and wrote */
+    atomic_int sized;  /* parent: the shm_ctl object has its size */
+    unsigned ctl_seen; /* what the shm_ctl holder read */
 };
 
 #define SPE_PARENT_WORD 0x4b383250U /* the parent writes this into page 1 */
@@ -118,6 +125,28 @@ int shm_past_end_child(const char *what)
         return 20;
     if (!strcmp(what, "private"))
         return spe_private(fd);
+    if (!strcmp(what, "ctl")) {
+        /* Maps a page of the size-0 object, past its end, then reads and
+         * writes it once shm_ctl has given the object its size.
+         */
+        int cfd = shm_open(SPE_CTL_NAME, O_RDWR, 0600);
+        volatile unsigned *q;
+
+        sh = spe_map(fd, SPE_PAGE);
+        if (cfd == -1 || !sh)
+            return 50;
+        q = spe_map(cfd, SPE_PAGE);
+        (void) close(cfd);
+        if (!q)
+            return 51;
+        atomic_store(&sh->ctl, 1);
+        if (!test_wait_flag(&sh->sized, 1, SPE_WAIT_MS))
+            return 52;
+        sh->ctl_seen = *q; /* a fault here is the failure */
+        *q = SPE_HOLDER_WORD;
+        atomic_store(&sh->ctl, 2);
+        return 0;
+    }
     if (!strcmp(what, "unmapped")) {
         /* A mapping wholly past the end, unmapped again: the range is no
          * mapping at all, so a touch is SIGSEGV, not SIGBUS.
@@ -188,6 +217,100 @@ static void spe_report(const char *name, int how, int want)
     check(how == want, name, detail);
 }
 
+/* The cost of the marks: a 64 MiB mapping of the one-page object marks 16383
+ * pages past its end. Whole 2 MiB regions are marked in their level-one slot,
+ * so the mapping takes a few page-table pages, not one per 2 MiB (32 here,
+ * 128 KiB). Another process can allocate meanwhile, so the best of three
+ * tries is judged; the mappings stay until the end, so each try lands on
+ * fresh addresses (an unmap leaves its page tables in place).
+ */
+#define SPE_BIG (64UL << 20)
+#define SPE_BIG_TRIES 3
+#define SPE_BIG_TABLE_MAX (8 * SPE_PAGE)
+
+static void spe_mark_cost(int fd)
+{
+    void *big[SPE_BIG_TRIES];
+    char detail[96];
+    long best = -1;
+    int n = 0;
+
+    while (n < SPE_BIG_TRIES) {
+        long before = kstats_value("pa.free_bytes");
+        void *m = mmap(NULL, SPE_BIG, PROT_READ, MAP_SHARED, fd, 0);
+        long after = kstats_value("pa.free_bytes");
+
+        if (m == MAP_FAILED || before < 0 || after < 0) {
+            if (m != MAP_FAILED)
+                (void) munmap(m, SPE_BIG);
+            test_fail("shm past end large mapping fixture", "mmap or kstats failed");
+            break;
+        }
+        big[n++] = m;
+        if (best < 0 || before - after < best)
+            best = before - after;
+    }
+    while (n > 0)
+        (void) munmap(big[--n], SPE_BIG);
+    if (best < 0)
+        return;
+    snprintf(detail, sizeof detail, "a 64 MiB mapping took %ld bytes, want <= %lu", best,
+             SPE_BIG_TABLE_MAX);
+    check(best <= (long) SPE_BIG_TABLE_MAX, "shm past end large mapping costs few tables",
+          detail);
+}
+
+/* The other locked growth path: shm_ctl (DEVCTL_MEM_OBJECT_SET) gives a size-0
+ * object its size, holding the object lock, while a holder has a page of it
+ * mapped (marked past the end). The holder must then read and write that page
+ * through the mapping it had.
+ */
+static void spe_shmctl(struct spe_shared *sh)
+{
+    devctl_mem_object obj = {.size = SPE_PAGE, .flags = SPE_SHMCTL_ANON};
+    volatile unsigned *q = NULL;
+    char detail[96];
+    int info = 0;
+    pid_t pid;
+    int fd;
+    int rc;
+
+    (void) shm_unlink(SPE_CTL_NAME);
+    fd = shm_open(SPE_CTL_NAME, O_RDWR | O_CREAT | O_EXCL, 0600);
+    if (fd == -1) {
+        snprintf(detail, sizeof detail, "shm_open errno %d", errno);
+        test_fail("shm past end shm_ctl fixture", detail);
+        return;
+    }
+    pid = spe_spawn("ctl");
+    if (pid == -1 || !test_wait_flag(&sh->ctl, 1, SPE_WAIT_MS)) {
+        test_fail("shm past end shm_ctl fixture", "the holder did not map the object");
+        goto out;
+    }
+    rc = devctl(fd, DEVCTL_MEM_OBJECT_SET, &obj, sizeof obj, &info);
+    if (rc != EOK || info != 0 || !(q = spe_map(fd, SPE_PAGE))) {
+        snprintf(detail, sizeof detail, "shm_ctl rc %d info %d errno %d", rc, info, errno);
+        test_fail("shm past end shm_ctl size", detail);
+        goto out;
+    }
+    *q = SPE_PARENT_WORD;
+    atomic_store(&sh->sized, 1);
+    spe_report("shm past end page works after shm_ctl sizes the object", spe_reap(pid), 1000);
+    pid = -1;
+    check(sh->ctl_seen == SPE_PARENT_WORD && *q == SPE_HOLDER_WORD,
+          "shm past end shm_ctl page is shared",
+          "the holder must read the parent's word and the parent the holder's");
+out:
+    if (pid != -1) {
+        (void) kill(pid, SIGKILL);
+        (void) spe_reap(pid);
+    }
+    if (q)
+        (void) munmap((void *) q, SPE_PAGE);
+    (void) close(fd);
+    (void) shm_unlink(SPE_CTL_NAME);
+}
+
 void test_shm_past_end(void)
 {
     struct spe_shared *sh = NULL;
@@ -212,6 +335,8 @@ void test_shm_past_end(void)
         goto out;
     }
     memset(sh, 0, sizeof *sh);
+    spe_mark_cost(fd);
+    spe_shmctl(sh);
 
     holder = spe_spawn("hold");
     priv = spe_spawn("private");

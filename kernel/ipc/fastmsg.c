@@ -1250,7 +1250,6 @@ static int sendv_body(thread_t *act,
             thp->dpp = sender->dpp;
             CRITICAL_INHERIT(thp, sender);
 
-            snap_time(&sender->timestamp_last_block, 0);
             _TRACE_TH_EMIT_STATE(sender, REPLY);
 #if defined(INLINE_BLOCKANDREADY)
 
@@ -1263,14 +1262,22 @@ static int sendv_body(thread_t *act,
             /* thp->restart = NULL; */
 
             /* Direct sender->receiver switch: bill the sender (still this
-             * hart's active thread) up to the timestamp just taken above.
+             * hart's active thread), stamp its timestamp_last_block, and start
+             * the receiver's stretch at the same time. Interrupts off, as on
+             * every billing path: a tick nested in the bill would bill the
+             * same stretch again.
              */
-            sched_account_current(sender->timestamp_last_block);
-            /* A wakeup like block_and_ready's: end the RECEIVE wait for
-             * force_ready_wait.
-             */
-            thread_note_wakeup(thp);
-            set_active_thread(get_cpunum(), thp);
+            {
+                unsigned long sie = interrupt_save();
+
+                sched_account_switch(thp);
+                /* A wakeup like block_and_ready's: end the RECEIVE wait for
+                 * force_ready_wait.
+                 */
+                thread_note_wakeup(thp);
+                set_active_thread(get_cpunum(), thp);
+                interrupt_restore(sie);
+            }
             thp->state = STATE_RUNNING;
 
             /* @@@ Hmm. This inline version of block_and_ready() may cause a

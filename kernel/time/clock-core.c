@@ -190,13 +190,9 @@ const struct sigevent *clock_handler(void *dummy, int id)
         thread_t *act = get_active_thread(my_cpu);
         if (act && act->state == STATE_RUNNING) {
             /* Bill the stretch since the last switch/tick. Owner-hart write
-             * (this hart's active thread); see sched_account_current().
+             * (this hart's active thread); see sched_account_switch().
              */
-            {
-                uint64_t now;
-                snap_time(&now, 0);
-                sched_account_current(now);
-            }
+            sched_account_current();
 
             if (kcall_op_clock_handler_hook) {
                 kcall_op_clock_handler_hook(act);

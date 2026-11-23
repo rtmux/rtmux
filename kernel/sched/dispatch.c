@@ -125,30 +125,15 @@ static void chk_dispatch(int chkstate)
 
 static void rdecl mark_running_default(thread_t *new);
 
-/* Bill this hart's active thread up to now (see sched_account_current).
- *
- * snap_time() is arch_timer_now_ns(), free-running at ns resolution, because
- * RISC-V arch-init always sets qtp->timer_scale = -9. A port with another
- * timer_scale would get tick-granular qtp->nsec here and billing would degrade
- * to tick resolution (still correct in total, never double counted).
- */
-static inline void sched_account_now(void)
-{
-    uint64_t now;
-
-    snap_time(&now, 0);
-    sched_account_current(now);
-}
-
 /* Bill the active thread before it is enqueued STATE_READY and the dispatch
  * lock dropped: once act is on a ready queue another (idle) hart may steal and
- * run it, after which this hart must not write its running_time. The following
- * mark_running() sees pc_account_billed and only restarts the stamp.
+ * run it, after which this hart must not write its running_time. The stretch
+ * is closed here, so the following mark_running() bills nobody and only
+ * starts the next thread's stretch.
  */
 static inline void sched_account_expose(void)
 {
-    sched_account_now();
-    get_pcpu()->pc_account_billed = 1;
+    sched_account_switch(NULL);
 }
 
 #if CONFIG_PROCESSORS_MAX > 1 /* PDB condition is true */
@@ -161,7 +146,7 @@ static inline void sched_account_expose(void)
 
 static int dispatch_unlink_ready(kdispatch_t *dpp, thread_t *thp)
 {
-    LINK3_HDR *queue = &DISPATCH_LST(dpp, thp->priority);
+    LINK3_HDR *queue = &DISPATCH_LST(dpp, thp->qprio);
 
     /* Every picker takes a thread off its queue here, so this is where a
      * thread another hart still has current is left alone.
@@ -176,10 +161,8 @@ static int dispatch_unlink_ready(kdispatch_t *dpp, thread_t *thp)
         thp->link3_link.prev = &queue->head;
     }
 
-    LINK3_REM(*queue, &thp->link3_link, thread_t);
+    DISPATCH_UNLINK(dpp, thp);
     THR_EV(thp);
-    if (!DISPATCH_THP(dpp, thp->priority))
-        DISPATCH_CLR(dpp, thp);
     return 1;
 }
 
@@ -321,10 +304,11 @@ static thread_t *rdecl select_thread_default(int cpu, int prio)
         for (thp = DISPATCH_THP(dpp, hipri); thp;
              thp = link3_to_thread(thp->link3_link.next)) {
             if ((thp->runmask & runmask) == 0) {
-                if ((int) (unsigned) thp->priority >= prio) {
-                    if (!dispatch_unlink_ready(dpp, thp))
-                        continue;
-                }
+                /* By the list it is on (qprio), at or above prio: its
+                 * priority may differ, and a thread returned must be off it.
+                 */
+                if (!dispatch_unlink_ready(dpp, thp))
+                    continue;
                 return thp;
             }
         }
@@ -469,13 +453,8 @@ static thread_t *rdecl select_thread_default(int cpu, int prio)
         return NULL;
     }
 
-    LINK3_REM(DISPATCH_LST(dpp, (thp)->priority), &(thp)->link3_link, thread_t);
+    DISPATCH_UNLINK(dpp, thp);
     THR_EV(thp);
-
-    /* If that list is now empty, clear the readybit.   */
-    if (!DISPATCH_THP(dpp, (thp)->priority)) {
-        DISPATCH_CLR(dpp, (thp));
-    }
 
     return thp;
 }
@@ -507,13 +486,13 @@ static void rdecl mark_running_default(thread_t *new)
 
     /* Switch-time billing: charge old for its stretch and start new's. Must
      * precede rcu_sched_quiescent() (the sporadic ss_info deref in
-     * sched_account_current is only protected until this hart reports a
+     * sched_account_switch is only protected until this hart reports a
      * quiescent state) and set_active_thread() (so the stamp already belongs to
      * new when a remote seqcount reader first sees new as this hart's active
-     * thread). If old was billed earlier, before being enqueued READY, the flag
-     * makes this call only restart the stamp.
+     * thread). If old was billed earlier, before being enqueued READY, its
+     * stretch is already closed and this call only starts new's.
      */
-    sched_account_now();
+    sched_account_switch(new);
     if (old != new)
         rcu_sched_quiescent();
     /* runcpu before the store: thread_current_elsewhere reads it to find the
@@ -561,46 +540,78 @@ static void rdecl mark_running_default(thread_t *new)
  * SMP invariant (Standing Gate): the active thread's running_time (and the
  * sporadic ss_info consumed/curr_budget it drives) is written ONLY by the hart
  * that owns it, i.e. the hart whose pc_curthread it is, and only from
- * sched_account_current() on that hart; no cross-hart writer exists. The owning
+ * sched_account_switch() on that hart; no cross-hart writer exists. The owning
  * process's running_time is shared by that process's threads on every hart, so
- * it is updated with atomic_fetch_add. pc_account_stamp is likewise owner-hart
- * written; pc_account_seq is its seqcount (odd while an update is in flight) so
- * a remote clock read can add the live, not-yet-billed stretch to a running
- * thread without taking a lock (sched_account_live). Idle time and time spent
- * on a hart with no active thread are billed to nobody.
+ * it is updated with atomic_fetch_add. pc_account_stamp and pc_account_thp are
+ * likewise owner-hart written; pc_account_seq is their seqcount (odd while an
+ * update is in flight) so a remote clock read can add the live, not-yet-billed
+ * stretch to a running thread without taking a lock (sched_account_read). Idle
+ * time and time spent on a hart with no active thread are billed to nobody.
+ *
+ * pc_account_thp names the thread whose stretch began at pc_account_stamp. A
+ * switch bills the outgoing thread and names the incoming one in the same
+ * seqcount update, before set_active_thread(): a reader that still sees the
+ * outgoing thread as current then finds its stretch closed and returns the
+ * banked value, which already holds the whole stretch. Matching pc_curthread
+ * alone let such a reader add the next thread's stretch to it, and its clock
+ * stepped back once the switch completed.
  *
  * Every path that changes this hart's active thread calls
- * sched_account_current() (thread->thread via mark_running_default, thread->
- * idle via block/block_release/yield-to-none) or sched_account_restart()
+ * sched_account_switch() (thread->thread via mark_running_default and the
+ * inline IPC handoff, thread->idle via block/block_release/yield-to-none,
+ * thread->queue via sched_account_expose) or sched_account_restart()
  * (idle->thread via cpu_idle) BEFORE set_active_thread(), so the outgoing
- * thread is charged exactly its own stretch. The tick also bills, so RLIMIT_CPU
- * and sporadic budgets are enforced against live consumption. A thread being
- * destroyed on its own hart is billed on its way off the CPU (unready ->
- * block); a dead or reaped pc_curthread that is abandoned in kernel_exit is not
- * billed, since its process may already be gone.
+ * thread is charged exactly its own stretch. The tick also bills
+ * (sched_account_current), so RLIMIT_CPU and sporadic budgets are enforced
+ * against live consumption. A thread being destroyed on its own hart is billed
+ * on its way off the CPU (unready -> block); a dead or reaped pc_curthread that
+ * is abandoned in kernel_exit is not billed, since its process may already be
+ * gone: pc_account_thp then no longer matches pc_curthread, and nothing bills
+ * or reads through it until the next thread's stretch begins.
+ *
+ * Callers have interrupts off (a dispatch lock, the tick, interrupt_save), so
+ * the tick never nests in a bill. The clock is read inside the seqcount
+ * update. A reader takes its own time
+ * first and then finds the stretch open, so the bill that closes it must end
+ * no earlier: a time taken before the update could precede the reader's, and
+ * the bill then banked less than the reader had already returned. A switch
+ * away from a thread that is leaving in a wait state also stamps its
+ * timestamp_last_block with the same read, so blocking reads the clock once;
+ * that thread is still this hart's current thread here. A thread that leaves
+ * READY or RUNNING (a yield, a preemption) keeps its last block time.
+ *
+ * snap_time() is arch_timer_now_ns(), free-running at ns resolution, because
+ * RISC-V arch-init always sets qtp->timer_scale = -9. A port with another
+ * timer_scale would get tick-granular qtp->nsec here and billing would degrade
+ * to tick resolution (still correct in total, never double counted).
  */
-void rdecl sched_account_current(uint64_t now)
+void rdecl sched_account_switch(thread_t *next)
 {
     struct pcpu *pc = get_pcpu();
-    thread_t *act = pc->pc_curthread;
-    uint64_t stamp = pc->pc_account_stamp;
-    uint64_t delta = now > stamp ? now - stamp : 0;
+    thread_t *act = pc->pc_account_thp;
+    uint64_t stamp = __atomic_load_n(&pc->pc_account_stamp, __ATOMIC_RELAXED);
+    uint64_t now, end, delta;
     unsigned seq =
         atomic_load_explicit(&pc->pc_account_seq, memory_order_relaxed);
 
     atomic_store_explicit(&pc->pc_account_seq, seq + 1, memory_order_relaxed);
     atomic_thread_fence(memory_order_release);
+    snap_time(&now, 0);
+    end = now > stamp ? now : stamp;
+    delta = end - stamp;
 
-    /* act was already billed and enqueued (sched_account_expose); it may be
-     * running on another hart now, so it is not ours to write.
+    /* Only the current thread is ours to bill. A closed stretch names nobody,
+     * and one whose thread kernel_exit abandoned names a thread that may be
+     * freed: compare the pointer, never dereference it.
      */
-    if (pc->pc_account_billed) {
-        pc->pc_account_billed = 0;
+    if (act != pc->pc_curthread || act == pc->pc_idle_thp)
         act = NULL;
-    }
 
-    if (delta && act && act != pc->pc_idle_thp && act->process) {
-        act->running_time += delta;
+    if (delta && act && act->process) {
+        __atomic_store_n(
+            &act->running_time,
+            __atomic_load_n(&act->running_time, __ATOMIC_RELAXED) + delta,
+            __ATOMIC_RELAXED);
         __atomic_fetch_add(&act->process->running_time, delta,
                            __ATOMIC_RELAXED);
 
@@ -632,56 +643,91 @@ void rdecl sched_account_current(uint64_t now)
             }
         }
     }
-    if (now > stamp)
-        pc->pc_account_stamp = now;
+    if (act && act != next) {
+        uint8_t st = act->state;
+
+        if (st != STATE_RUNNING && st != STATE_READY)
+            act->timestamp_last_block = end;
+    }
+    __atomic_store_n(&pc->pc_account_stamp, end, __ATOMIC_RELAXED);
+    __atomic_store_n(&pc->pc_account_thp, next, __ATOMIC_RELAXED);
 
     atomic_store_explicit(&pc->pc_account_seq, seq + 2, memory_order_release);
 }
 
-/* A thread is about to start on this hart from idle (or the hart has just come
+/* Bill the current stretch up to now without ending it (the tick, and a
+ * process-clock read banking the caller's own stretch).
+ */
+void rdecl sched_account_current(void)
+{
+    sched_account_switch(get_pcpu()->pc_account_thp);
+}
+
+/* next is about to start on this hart from idle (or the hart has just come
  * up): begin its stretch now without billing the idle time.
  */
-void rdecl sched_account_restart(void)
+void rdecl sched_account_restart(thread_t *next)
 {
     struct pcpu *pc = get_pcpu();
     uint64_t now;
     unsigned seq =
         atomic_load_explicit(&pc->pc_account_seq, memory_order_relaxed);
 
-    snap_time(&now, 0);
     atomic_store_explicit(&pc->pc_account_seq, seq + 1, memory_order_relaxed);
     atomic_thread_fence(memory_order_release);
-    pc->pc_account_stamp = now;
+    snap_time(&now, 0);
+    if (now > pc->pc_account_stamp)
+        __atomic_store_n(&pc->pc_account_stamp, now, __ATOMIC_RELAXED);
+    __atomic_store_n(&pc->pc_account_thp, next, __ATOMIC_RELAXED);
     atomic_store_explicit(&pc->pc_account_seq, seq + 2, memory_order_release);
 }
 
 /* Return thp's running_time including, when thp is running on some hart, the
- * not-yet-billed ns of its current stretch. The banked value and the stamp are
- * sampled under the owner hart's pc_account_seq seqcount, so they are a
- * consistent pair. After three torn attempts return the banked value alone. A
- * caller on thp's own hart should bill with sched_account_current() first.
+ * not-yet-billed ns of its current stretch. The banked value, the stamp and
+ * the stretch's owner are sampled under the owner hart's pc_account_seq
+ * seqcount, so they are a consistent set. A torn sample is taken again, like
+ * arch_timer_now_ns() does: the writer's section is short, has interrupts off
+ * and takes no lock. Falling back to the banked value after a few torn samples
+ * lost the live stretch whenever the bill that banks it was still in flight,
+ * and the clock stepped back by it. A caller on thp's own hart should bill
+ * with sched_account_current() first.
  */
 uint64_t rdecl sched_account_read(thread_t *thp, uint64_t now)
 {
-    for (int tries = 0; tries < 3; tries++) {
+    for (;;) {
         unsigned cpu = __atomic_load_n(&thp->runcpu, __ATOMIC_ACQUIRE);
         if (!cpu_online(cpu))
             break;
         struct pcpu *pc = &pcpu_array[cpu];
-        unsigned seq = atomic_load_explicit(&pc->pc_account_seq, memory_order_acquire);
-        uint64_t stamp = pc->pc_account_stamp;
-        uint64_t banked = thp->running_time;
+
+        /* Not current there, and not moved since: every stretch it ran is
+         * banked, by a bill that precedes the hart's switch away from it.
+         */
+        if (__atomic_load_n(&pc->pc_curthread, __ATOMIC_ACQUIRE) != thp) {
+            if (cpu == __atomic_load_n(&thp->runcpu, __ATOMIC_RELAXED))
+                break;
+            continue;
+        }
+        unsigned seq =
+            atomic_load_explicit(&pc->pc_account_seq, memory_order_acquire);
+        uint64_t stamp =
+            __atomic_load_n(&pc->pc_account_stamp, __ATOMIC_RELAXED);
+        thread_t *owner =
+            __atomic_load_n(&pc->pc_account_thp, __ATOMIC_RELAXED);
+        uint64_t banked = __atomic_load_n(&thp->running_time, __ATOMIC_RELAXED);
         thread_t *cur = __atomic_load_n(&pc->pc_curthread, __ATOMIC_ACQUIRE);
 
         atomic_thread_fence(memory_order_acquire);
-        if (!(seq & 1u) && cur == thp &&
-            cpu == __atomic_load_n(&thp->runcpu, __ATOMIC_RELAXED) &&
-            seq == atomic_load_explicit(&pc->pc_account_seq, memory_order_relaxed))
+        if ((seq & 1u) ||
+            seq != atomic_load_explicit(&pc->pc_account_seq,
+                                        memory_order_relaxed) ||
+            cpu != __atomic_load_n(&thp->runcpu, __ATOMIC_RELAXED))
+            continue; /* the hart is billing, or thp moved: sample again */
+        if (owner == thp && cur == thp)
             return banked + (now > stamp ? now - stamp : 0);
-        if (cur != thp && cpu == __atomic_load_n(&thp->runcpu, __ATOMIC_RELAXED))
-            break;
+        return banked;
     }
-    return thp->running_time;
+    return __atomic_load_n(&thp->running_time, __ATOMIC_RELAXED);
 }
 
 /*** Sporadic scheduler policy functions ***/
@@ -1008,13 +1054,14 @@ int rdecl sched_thread(thread_t *thp, int policy, struct sched_param *param)
             return EINVAL;
         }
 
-        LINK3_REM(DISPATCH_LST(dpp, thp->priority), &thp->link3_link, thread_t);
+        /* Within the list it is on (qprio), whose ready bit stays set. */
+        LINK3_REM(DISPATCH_LST(dpp, thp->qprio), &thp->link3_link, thread_t);
         if (policy == RTMUX_SCHED_ADJTOHEAD) {
-            LINK3_BEG(DISPATCH_LST(dpp, thp->priority), &thp->link3_link,
+            LINK3_BEG(DISPATCH_LST(dpp, thp->qprio), &thp->link3_link,
                       thread_t);
         } else {
             RR_RESET_TICK(thp);
-            LINK3_END(DISPATCH_LST(dpp, thp->priority), &thp->link3_link,
+            LINK3_END(DISPATCH_LST(dpp, thp->qprio), &thp->link3_link,
                       thread_t);
         }
 
@@ -1048,9 +1095,9 @@ int rdecl sched_thread(thread_t *thp, int policy, struct sched_param *param)
 
         /* If we lowered priority, ensure we will be head of priority list */
         if (thp->priority < old_prio && thp->state == STATE_READY) {
-            LINK3_REM(DISPATCH_LST(thp->dpp, thp->priority), &thp->link3_link,
+            LINK3_REM(DISPATCH_LST(thp->dpp, thp->qprio), &thp->link3_link,
                       thread_t);
-            LINK3_BEG(DISPATCH_LST(thp->dpp, thp->priority), &thp->link3_link,
+            LINK3_BEG(DISPATCH_LST(thp->dpp, thp->qprio), &thp->link3_link,
                       thread_t);
         }
         return EOK;
@@ -1366,9 +1413,10 @@ int rdecl force_ready(thread_t *thp, unsigned err)
 
 /* force_ready for the one wait the caller saw: wake_seq is thp->wake_seq as it
  * read it while thp waited. A thread woken since is in a later wait, or none,
- * and is left alone (returns 1). A sync wait is tested again under its chain
- * lock (sync_chain_force_ready), where a waiter woken and queued again on the
- * same object looks unchanged otherwise; the other waits only here, at entry.
+ * and is left alone (returns 1). A sync wait and a receive are tested again
+ * under the lock that claims them (the chain lock, sync_chain_force_ready; the
+ * channel lock), where a thread woken and waiting again on the same object
+ * looks unchanged otherwise; the other waits only here, at entry.
  */
 int rdecl force_ready_wait(thread_t *thp, unsigned err, uint32_t wake_seq)
 {
@@ -1753,9 +1801,17 @@ reread_state:
         if (unlinked) {
             /* The STATE_REPLY arm unlinked thp under fr_chp->lock already. */
         } else if (fr_chp) {
+            if (!from_reply)
+                inject_force_ready_stall(thp);
             kspinlock_lock(&fr_chp->lock);
+            /* A receiver woken since and receiving on fr_chp again looks the
+             * same here but for its wake count (force_ready_wait): a sender
+             * or a notification takes it off the queue under this lock before
+             * it is readied and counted.
+             */
             if (!from_reply &&
-                (thp->state != STATE_RECEIVE || thp->blocked_on != fr_chp)) {
+                (thp->state != STATE_RECEIVE || thp->blocked_on != fr_chp ||
+                 (seq && thread_wake_seq(thp) != *seq))) {
                 /* Moved on between the lock-free checks and the lock. */
                 kspinlock_unlock(&fr_chp->lock);
                 return 1;
@@ -2061,10 +2117,11 @@ static inline void block_timeout_drain(const thread_t *thp)
 }
 
 /* block takes sched_slock around the dispatch mutation (FIND_HIGHEST,
- * mark_running, set_active_thread). The pre-mutation snap_time/ timeout_start
- * touch per-thread fields only and stay outside the lock. Callers MUST NOT hold
- * sched_slock on entry; cross-callers (unready, block_and_ready_default) drop
- * it before calling.
+ * mark_running, set_active_thread). The pre-mutation timeout_start touches
+ * per-thread fields only and stays outside the lock; timestamp_last_block is
+ * stamped by the switch's own bill (sched_account_switch). Callers MUST NOT
+ * hold sched_slock on entry; cross-callers (unready, block_and_ready_default)
+ * drop it before calling.
  */
 /* Put back, at the head of its list, a thread select_thread took for this hart
  * that will not run now. Caller holds the local dispatch lock.
@@ -2082,7 +2139,7 @@ static void dispatch_requeue_head(thread_t *thp)
         return;
     thp->dpp = dpp;
     thp->state = STATE_READY;
-    LINK3_BEG(DISPATCH_LST(dpp, thp->priority), &thp->link3_link, thread_t);
+    DISPATCH_LINK_BEG(dpp, thp->priority, thp);
     DISPATCH_SET(dpp, thp);
 }
 
@@ -2108,8 +2165,6 @@ static void block_current(bool interrupt_wait)
     thread_t *act = get_active_thread(get_cpunum()), *thp = act;
 
     chk_dispatch(0);
-
-    snap_time(&(act->timestamp_last_block), 0);
 
     /* Check for timeout timer. A deadline already past fires at once, and its
      * wakeup must not run before the switch below: act would be queued while
@@ -2169,7 +2224,8 @@ static void block_current(bool interrupt_wait)
          * kernel_exit → cpu_idle.
          */
         unsigned cpu = get_cpunum();
-        sched_account_now(); /* bill before reporting the quiescent state */
+        /* bill before reporting the quiescent state */
+        sched_account_switch(NULL);
         rcu_sched_quiescent();
         set_active_thread(cpu, NULL);
 #if CONFIG_PROCESSORS_MAX > 1
@@ -2250,8 +2306,6 @@ static void rdecl block_release(int newstate, kspinlock_t *to_release)
 
     chk_dispatch(0);
 
-    snap_time(&(act->timestamp_last_block), 0);
-
     inject_block_stall(thp);
     SCHED_LOCK_LOCAL();
     thp->state = (uint8_t) newstate;
@@ -2268,7 +2322,8 @@ static void rdecl block_release(int newstate, kspinlock_t *to_release)
 
     if (!act) {
         unsigned cpu = get_cpunum();
-        sched_account_now(); /* bill before reporting the quiescent state */
+        /* bill before reporting the quiescent state */
+        sched_account_switch(NULL);
         rcu_sched_quiescent();
         set_active_thread(cpu, NULL);
 #if CONFIG_PROCESSORS_MAX > 1
@@ -2385,12 +2440,12 @@ static inline void ready_enqueue_client(kdispatch_t *dpp,
     if (was_sendvnc && IS_SCHED_RR(thp)) {
         RR_ADD_PREEMPT_TICK(thp);
         if (RR_GET_TICKS(thp) < RR_MAXTICKS) {
-            LINK3_BEG(DISPATCH_LST(dpp, prio), &thp->link3_link, thread_t);
+            DISPATCH_LINK_BEG(dpp, prio, thp);
             return;
         }
     }
     RR_RESET_TICK(thp);
-    LINK3_END(DISPATCH_LST(dpp, prio), &thp->link3_link, thread_t);
+    DISPATCH_LINK_END(dpp, prio, thp);
 }
 
 #if CONFIG_PROCESSORS_MAX > 1
@@ -2588,7 +2643,7 @@ static void rdecl ready_default(thread_t *thp)
         _TRACE_TH_EMIT_STATE(thp, READY);
         thp->dpp = pcpu_array[get_cpunum()].pc_dispatch;
         dpp = thp->dpp;
-        LINK3_END(DISPATCH_LST(dpp, prio), &thp->link3_link, thread_t);
+        DISPATCH_LINK_END(dpp, prio, thp);
         DISPATCH_SET(dpp, thp);
 #if CONFIG_PROCESSORS_MAX > 1
         kick_idle_hart(thp);
@@ -2719,8 +2774,7 @@ static void rdecl ready_default(thread_t *thp)
                 }
                 RR_ADD_PREEMPT_TICK(act);
                 act->state = STATE_READY;
-                LINK3_BEG(DISPATCH_LST(dpp, act->priority), &act->link3_link,
-                          thread_t);
+                DISPATCH_LINK_BEG(dpp, act->priority, act);
 
                 SS_STOP_RUNNING(act, 1);
                 goto enqueue_done;
@@ -2769,7 +2823,7 @@ static void rdecl ready_default(thread_t *thp)
          */
         RR_ADD_PREEMPT_TICK(act);
         act->state = STATE_READY;
-        LINK3_BEG(DISPATCH_LST(dpp, act->priority), &act->link3_link, thread_t);
+        DISPATCH_LINK_BEG(dpp, act->priority, act);
 
         SS_STOP_RUNNING(act, 1);
     } else {
@@ -2842,8 +2896,6 @@ static void rdecl block_and_ready_switch(thread_t *thp)
     thp->link3_link.next = NULL;
     thp->link3_link.prev = NULL;
 
-    SNAP_TIME_INLINE(act->timestamp_last_block, 0);
-
     /* Queue on this hart's instance, the one SCHED_LOCK_LOCAL() holds, as
      * ready_default does. thp->dpp may be another hart's (a thread created for
      * another process gets that process's default); linking into it under our
@@ -2897,16 +2949,16 @@ static void rdecl block_and_ready_switch(thread_t *thp)
          * cause this thread to run before any other FIFO threads that are
          * runnable at this priority
          */
-        LINK3_END(DISPATCH_LST(dpp, prio), &thp->link3_link, thread_t);
+        DISPATCH_LINK_END(dpp, prio, thp);
     } else {
-        LINK3_BEG(DISPATCH_LST(dpp, prio), &thp->link3_link, thread_t);
+        DISPATCH_LINK_BEG(dpp, prio, thp);
     }
     DISPATCH_SET(dpp, thp);
     thp->state = STATE_READY;
     _TRACE_TH_EMIT_STATE(thp, READY);
     FIND_HIGHEST(act);
     if (!act) {
-        sched_account_now();
+        sched_account_switch(NULL);
         rcu_sched_quiescent();
         set_active_thread(get_cpunum(), NULL);
 #if CONFIG_PROCESSORS_MAX > 1
@@ -3004,11 +3056,7 @@ void rdecl unready(thread_t *thp, int newstate)
 
     /* Only remove from dispatch list if READY */
     if (thp->state == STATE_READY) {
-        LINK3_REM(DISPATCH_LST(thp_dpp, thp->priority), &thp->link3_link,
-                  thread_t);
-        if (!DISPATCH_THP(thp_dpp, thp->priority)) {
-            DISPATCH_CLR(thp_dpp, thp);
-        }
+        DISPATCH_UNLINK(thp_dpp, thp);
     }
 
     SNAP_TIME_INLINE(thp->timestamp_last_block, 0);
@@ -3090,8 +3138,8 @@ static void rdecl yield_default(void)
             SCHED_UNLOCK_LOCAL();
             return;
         }
-        LINK3_REM(DISPATCH_LST(dpp, prio), &thp->link3_link, thread_t);
-        LINK3_END(DISPATCH_LST(dpp, prio), &act->link3_link, thread_t);
+        LINK3_REM(DISPATCH_LST(dpp, thp->qprio), &thp->link3_link, thread_t);
+        DISPATCH_LINK_END(dpp, prio, act);
         RR_RESET_TICK(act);
         sched_account_expose(); /* single-writer: bill before idle_pick can
                                    steal act
@@ -3215,7 +3263,9 @@ static void rdecl resched_default(void)
             memset(&info, 0, sizeof info);
             info.si_signo = SIGXCPU;
             info.si_code = CLD_KILLED;
-            info.si_status = SIGXCPU;
+            /* No si_status: it shares storage with si_addr, which the fault
+             * report prints. The exit status is taken from si_signo.
+             */
             deliver_fault(act, &info);
 
             /* The kernel-exit loop only re-reads the thread's flags when the
@@ -3262,12 +3312,10 @@ static void rdecl resched_default(void)
         if (yield_tail ||
             (IS_SCHED_RR(act) && RR_GET_TICKS(act) >= RR_MAXTICKS)) {
             RR_RESET_TICK(act);
-            LINK3_END(DISPATCH_LST(dpp, act->priority), &act->link3_link,
-                      thread_t);
+            DISPATCH_LINK_END(dpp, act->priority, act);
         } else {
             /* otherwise keep active at the head of the queue */
-            LINK3_BEG(DISPATCH_LST(dpp, act->priority), &act->link3_link,
-                      thread_t);
+            DISPATCH_LINK_BEG(dpp, act->priority, act);
         }
         DISPATCH_SET(dpp, act);
 
@@ -3373,10 +3421,7 @@ static void rdecl adjust_priority_default(thread_t *thp,
         chk_thread(thp);
 
         /* Unlink from the ready queue */
-        LINK3_REM(DISPATCH_LST(dpp, thp->priority), &thp->link3_link, thread_t);
-        if (!DISPATCH_THP(dpp, thp->priority)) {
-            DISPATCH_CLR(dpp, thp);
-        }
+        DISPATCH_UNLINK(dpp, thp);
 
         bool boost = prio > thp->priority;
 
@@ -3416,8 +3461,7 @@ static void rdecl adjust_priority_default(thread_t *thp,
 
             /* This guy should go to the head of the priority list, not the tail
              */
-            LINK3_BEG(DISPATCH_LST(dpp, thp->priority), &thp->link3_link,
-                      thread_t);
+            DISPATCH_LINK_BEG(dpp, thp->priority, thp);
 
             SS_STOP_RUNNING(act, 1);
         } else {
@@ -3425,8 +3469,7 @@ static void rdecl adjust_priority_default(thread_t *thp,
              * priority
              */
             RR_RESET_TICK(thp);
-            LINK3_END(DISPATCH_LST(dpp, thp->priority), &thp->link3_link,
-                      thread_t);
+            DISPATCH_LINK_END(dpp, thp->priority, thp);
         }
 
         DISPATCH_SET(dpp, thp);
@@ -3501,12 +3544,10 @@ static void rdecl adjust_priority_default(thread_t *thp,
                 act->priority = (uint8_t) prio;
                 if (priority_inherit) {
                     RR_ADD_PREEMPT_TICK(act);
-                    LINK3_BEG(DISPATCH_LST(dpp, act->priority),
-                              &act->link3_link, thread_t);
+                    DISPATCH_LINK_BEG(dpp, act->priority, act);
                 } else {
                     RR_RESET_TICK(act);
-                    LINK3_END(DISPATCH_LST(dpp, act->priority),
-                              &act->link3_link, thread_t);
+                    DISPATCH_LINK_END(dpp, act->priority, act);
                 }
 
                 DISPATCH_SET(dpp, act);
@@ -3539,24 +3580,17 @@ static void rdecl adjust_priority_default(thread_t *thp,
             _TRACE_TH_EMIT_STATE(act, READY);
             if (priority_inherit) {
                 RR_ADD_PREEMPT_TICK(act);
-                LINK3_BEG(DISPATCH_LST(dpp, act->priority), &act->link3_link,
-                          thread_t);
+                DISPATCH_LINK_BEG(dpp, act->priority, act);
             } else {
                 RR_RESET_TICK(act);
-                LINK3_END(DISPATCH_LST(dpp, act->priority), &act->link3_link,
-                          thread_t);
+                DISPATCH_LINK_END(dpp, act->priority, act);
             }
 
             DISPATCH_SET(dpp, act);
 
             /* Get highest priority thread. */
             act = DISPATCH_THP(dpp, DISPATCH_HIGHEST_PRI(dpp));
-            LINK3_REM(DISPATCH_LST(dpp, act->priority), &act->link3_link,
-                      thread_t);
-            /* If that list is now empty, clear the readybit.   */
-            if (!DISPATCH_THP(dpp, act->priority)) {
-                DISPATCH_CLR(dpp, act);
-            }
+            DISPATCH_UNLINK(dpp, act);
 
             mark_running(act);
 
@@ -3709,11 +3743,11 @@ int rdecl set_runmask(thread_t *thp, unsigned runmask)
              * ready() queues act on a hart its runmask allows. act stays
              * STATE_RUNNING throughout, so SIGCONT, a debugger resume or
              * teardown only flag and kick it and never ready it a second time.
-             * block() updates timestamp_last_block and charges the sporadic
-             * budget when it hands the hart to another thread (not when the
-             * hart goes idle, as for any block). ready_default skips the new
-             * sporadic activation for a RUNNING thread, so start it here, as a
-             * block and ready through any other state would.
+             * block() charges the sporadic budget when it hands the hart to
+             * another thread (not when the hart goes idle, as for any block).
+             * ready_default skips the new sporadic activation for a RUNNING
+             * thread, so start it here, as a block and ready through any other
+             * state would.
              */
             block();
 

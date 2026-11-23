@@ -186,7 +186,7 @@ static int get_fdinfo(int rcvid,
  */
 int proc_spawn(ioserv_context_t *ctp, void *vmsg)
 {
-    return proc_spawn_with_actions(ctp, vmsg, NULL, 0);
+    return proc_spawn_with_actions(ctp, vmsg, NULL, 0, NULL);
 }
 
 /* libc recognizes /proc/self/fd/N as an open through an existing fd.
@@ -236,8 +236,12 @@ static int action_sources(const unsigned char *actions, unsigned bytes,
     return EOK;
 }
 
+/* share_class: NULL, or where loader_context_alloc says which class the
+ * spawner is over its share of, instead of waiting (see proc_pspawn).
+ */
 int proc_spawn_with_actions(ioserv_context_t *ctp, void *vmsg,
-                            const unsigned char *actions, unsigned bytes)
+                            const unsigned char *actions, unsigned bytes,
+                            int *share_class)
 {
     struct loader_context *lcp;
     struct _thread_attr attr;
@@ -268,6 +272,8 @@ int proc_spawn_with_actions(ioserv_context_t *ctp, void *vmsg,
             ENDIAN_SWAP32(&msg->spawn.i.parms.sigdefault.bits[1]);
             ENDIAN_SWAP32(&msg->spawn.i.parms.sigignore.bits[0]);
             ENDIAN_SWAP32(&msg->spawn.i.parms.sigignore.bits[1]);
+            ENDIAN_SWAP32(&msg->spawn.i.parms.sigpending.bits[0]);
+            ENDIAN_SWAP32(&msg->spawn.i.parms.sigpending.bits[1]);
             ENDIAN_SWAP32(&msg->spawn.i.parms.stack_max);
             ENDIAN_SWAP32(&msg->spawn.i.parms.policy);
             ENDIAN_SWAP32(&msg->spawn.i.parms.runmask);
@@ -341,7 +347,7 @@ int proc_spawn_with_actions(ioserv_context_t *ctp, void *vmsg,
             LC_SPAWN | ((ctp->info.flags & RTMUX_MI_ENDIAN_DIFF)
                             ? LC_CROSS_ENDIAN
                             : 0),
-            &lcp);
+            &lcp, share_class);
         if (status != EOK)
             return status;
 

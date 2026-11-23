@@ -61,7 +61,7 @@ int proc_pgrp_window_arm(unsigned where, unsigned ms)
 {
     if (where == PGRP_WINDOW_ACTIVE)
         return ms && atomic_load(&pgrp_window_active) == ms ? EOK : EAGAIN;
-    if (where > PGRP_WINDOW_DETACH || ms > 5000)
+    if (where > PGRP_WINDOW_WRITE_GROWN || ms > 5000)
         return EINVAL;
     atomic_store(&pgrp_window_ms, ms);
     atomic_store(&pgrp_window_where, where);

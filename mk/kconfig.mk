@@ -60,11 +60,21 @@ kconfig_sources = $(foreach f,$(1),$(f) $(call kconfig_sources,$(wildcard \
     $(shell sed -n 's/^[[:space:]]*source[[:space:]]*"\([^"]*\)".*/\1/p' $(f)))))
 KCONFIG_SOURCES := $(call kconfig_sources,$(KCONFIG_SCHEMA))
 
-# Regenerate autoconf.h whenever .config or any Kconfig file changes.
+# Regenerate autoconf.h whenever .config or any Kconfig file changes. Beside
+# it, record the .config words it was made from: a .config whose content differs
+# from them gets autoconf.h regenerated even when it is older than autoconf.h
+# (a copy restored with its time, a checkout), which the time rule misses.
+# The mismatch makes the header out of date through FORCE (Makefile) rather
+# than by deleting it while the makefiles are read, so make -n leaves it be.
+AUTOCONF_SRC := $(AUTOCONF_H:.h=.config)
+ifneq ($(strip $(file <$(AUTOCONF_SRC))),$(strip $(filter CONFIG_%,$(file <.config))))
+$(AUTOCONF_H): FORCE
+endif
 $(AUTOCONF_H): .config $(KCONFIG_SOURCES) $(KCONFIG_DIR)/menuconfig.py
 	$(Q)mkdir -p $(dir $@)
 	$(msg) KCFG $@
 	$(Q)$(KCONFIG_ENV) python3 $(KCONFIG_DIR)/genconfig.py \
 		--header-path $@ $(KCONFIG_SCHEMA)
+	$(Q)tr -s ' \t' '\n\n' <.config | grep '^CONFIG_' | tr '\n' ' ' >$(AUTOCONF_SRC)
 
 endif # _MK_KCONFIG_INCLUDED

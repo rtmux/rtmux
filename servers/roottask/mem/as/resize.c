@@ -69,63 +69,127 @@ static void map_grown_in(pid_t pid, path_object_t *obp, const struct resize_span
     proc_unlock_adp(pid);
 }
 
-/* as_map_grown — after obp grew from oldsize bytes, map the newly covered pages
- * of every existing mapping of it, so that a mapping made while they were past
- * the end (marked by memory_reference with MR_TRUNC, or by a shrink) reaches
- * them without a remap, as POSIX expects once the object covers the page.
- *
- * as_resize cannot do it: it runs with the object locked, and an address space
- * is locked before an object (mmap's order), so the mapping processes are
- * collected under the object lock and then visited one at a time, each with
- * its own address-space lock taken first. Called by vm_grow, which holds
- * neither the object nor any address-space lock.
+/* Objects with a growth whose mappings are not made yet (MM_MEM_GROW_PENDING):
+ * as_resize queues one, under its object lock, and vm_grow_drain makes the
+ * mappings once the caller holds no lock. Each queue entry holds a clone of the
+ * object, which the drain drops, and counts in mm.grow_busy until its mappings
+ * are made, so that the thread that grew an object can wait for them whichever
+ * thread makes them. grow_mutex guards the queue and grow_busy, and is held
+ * only to change or wait on them, with no other lock taken under it.
  */
-static void as_map_grown(path_object_t *obp, uint64_t oldsize)
-{
-    struct resize_span grown;
-    struct mm_object_ref * or ;
-    pid_t *pids;
-    unsigned n = 0;
-    unsigned cap = 0;
+static pthread_mutex_t grow_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t grow_done = PTHREAD_COND_INITIALIZER;
+static path_object_t *grow_queue;
 
-    memobj_lock(obp);
-    grown.lo = (uint64_t) ROUNDUP(oldsize, __PAGESIZE);
-    grown.hi = (uint64_t) ROUNDUP(obp->mem.mm.size, __PAGESIZE);
-    if (grown.lo >= grown.hi || !(obp->mem.mm.flags & MM_MEM_HAS_BAD_PAGE) ||
-        !obp->mem.mm.refs) {
-        memobj_unlock(obp);
+/* Record that obp grew from oldsize bytes (page aligned) and needs its existing
+ * mappings made over the new pages. Called by as_resize with the object
+ * locked; only an object some mapping marked past its end needs it.
+ */
+static void grow_pending(path_object_t *obp, uint64_t oldsize)
+{
+    if (!(obp->mem.mm.flags & MM_MEM_HAS_BAD_PAGE) || !obp->mem.mm.refs)
+        return;
+    if (obp->mem.mm.flags & MM_MEM_GROW_PENDING) {
+        obp->mem.mm.grow_from = min(obp->mem.mm.grow_from, (off64_t) oldsize);
         return;
     }
-    for (or = obp->mem.mm.refs; or ; or = or->next)
-        cap++;
-    pids = malloc(cap * sizeof *pids);
-    for (or = obp->mem.mm.refs; pids && or ; or = or->next) {
-        unsigned i;
+    obp->mem.mm.flags |= MM_MEM_GROW_PENDING;
+    obp->mem.mm.grow_from = (off64_t) oldsize;
+    (void) path_object_clone(obp);
+    pthread_mutex_lock(&grow_mutex);
+    obp->mem.mm.grow_next = grow_queue;
+    __atomic_add_fetch(&obp->mem.mm.grow_busy, 1, __ATOMIC_RELAXED);
+    __atomic_store_n(&grow_queue, obp, __ATOMIC_RELEASE);
+    pthread_mutex_unlock(&grow_mutex);
+}
 
-        for (i = 0; i < n && pids[i] != or->pid; i++)
-            ;
-        if (or->pid != 0 && i == n)
-            pids[n++] = or->pid;
+/* The lowest pid above after that has a mapping of obp, or 0 when none has. */
+static pid_t next_mapper(path_object_t *obp, pid_t after)
+{
+    struct mm_object_ref * or ;
+    pid_t next = 0;
+
+    for (or = obp->mem.mm.refs; or ; or = or->next) {
+        if (or->pid > after && (!next || or->pid < next))
+            next = or->pid;
+    }
+    return next;
+}
+
+/* Map the pending growth of one object into every existing mapping of it, so
+ * that a mapping made while those pages were past the end (marked by
+ * memory_reference with MR_TRUNC, or by a shrink) reaches them without a
+ * remap, as POSIX expects once the object covers the page. The mapping
+ * processes are visited one at a time in pid order, each found under the
+ * object lock and then mapped with its own address-space lock taken first
+ * (mmap's order); the order makes the walk end however the mappings change
+ * meanwhile, and it needs no memory.
+ */
+static void map_grown(path_object_t *obp)
+{
+    struct resize_span grown;
+    pid_t pid = 0;
+
+    memobj_lock(obp);
+    obp->mem.mm.flags &= ~(unsigned) MM_MEM_GROW_PENDING;
+    grown.lo = (uint64_t) obp->mem.mm.grow_from;
+    grown.hi = (uint64_t) ROUNDUP(obp->mem.mm.size, __PAGESIZE);
+    while (grown.lo < grown.hi && (pid = next_mapper(obp, pid))) {
+        memobj_unlock(obp);
+        map_grown_in(pid, obp, &grown);
+        memobj_lock(obp);
     }
     memobj_unlock(obp);
-    if (!pids)
-        root_warn("as_map_grown: no memory: mappings past the old end stay SIGBUS\n");
+}
 
-    for (unsigned i = 0; i < n; i++)
-        map_grown_in(pids[i], obp, &grown);
-    free(pids);
+/* vm_grow_drain — make the mappings of every pending growth (see grow_pending).
+ * When grown is not NULL, also wait until grown has no growth left whose
+ * mappings another drain is still making, so the caller that grew it can
+ * answer its client knowing every mapping reaches the new pages. The caller
+ * holds no object or address-space lock; every path that resizes with such a
+ * lock held drains once it has dropped them, and keeps a reference on grown.
+ */
+void vm_grow_drain(path_object_t *grown)
+{
+    /* Most calls find nothing to do: skip the mutex then. A growth queued
+     * after this check is drained by the thread that queued it.
+     */
+    if (!__atomic_load_n(&grow_queue, __ATOMIC_ACQUIRE) &&
+        (!grown || !__atomic_load_n(&grown->mem.mm.grow_busy, __ATOMIC_ACQUIRE)))
+        return;
+    pthread_mutex_lock(&grow_mutex);
+    for (;;) {
+        path_object_t *obp = grow_queue;
+
+        if (!obp) {
+            if (!grown || !grown->mem.mm.grow_busy)
+                break;
+            pthread_cond_wait(&grow_done, &grow_mutex);
+            continue;
+        }
+        __atomic_store_n(&grow_queue, obp->mem.mm.grow_next, __ATOMIC_RELAXED);
+        pthread_mutex_unlock(&grow_mutex);
+        map_grown(obp);
+        pthread_mutex_lock(&grow_mutex);
+        if (__atomic_sub_fetch(&obp->mem.mm.grow_busy, 1, __ATOMIC_RELEASE) == 0)
+            pthread_cond_broadcast(&grow_done);
+        pthread_mutex_unlock(&grow_mutex);
+        path_object_done(obp);
+        pthread_mutex_lock(&grow_mutex);
+    }
+    pthread_mutex_unlock(&grow_mutex);
 }
 
 
 /* vm_grow — grow obp to at least size bytes and map what the growth made
- * reachable in existing mappings. The size check, the old size and the resize
- * are one hold of the object lock, so a concurrent change cannot turn the call
- * into a shrink; a shrink that comes before the mappings are made is caught
- * there (map_grown_in stops at the current size). When oldp is not NULL it
- * receives the size before the call. Called with no object or address-space
- * lock held. Returns EOK or an errno from the resize.
+ * reachable in existing mappings. The size check, the resize and the record in
+ * g are one hold of the object lock, so a concurrent change cannot turn the
+ * call into a shrink. When g is not NULL it receives the size before the call
+ * (from), the size it left (to), and the object's write generation, which every
+ * call bumps (gen). Called with no object or address-space lock held. Returns
+ * EOK or an errno from the resize.
  */
-int vm_grow(path_object_t *obp, size_t size, uint64_t *oldp)
+int vm_grow(path_object_t *obp, size_t size, struct vm_growth *g)
 {
     uint64_t oldsize;
     int r = EOK;
@@ -134,12 +198,34 @@ int vm_grow(path_object_t *obp, size_t size, uint64_t *oldp)
     oldsize = (uint64_t) obp->mem.mm.size;
     if (size > oldsize)
         r = root_vm_ops.resize(obp, size);
+    ++obp->mem.mm.wgen; /* a write that does not grow is still a writer */
+    if (g) {
+        g->from = oldsize;
+        g->to = (uint64_t) obp->mem.mm.size;
+        g->gen = obp->mem.mm.wgen;
+    }
     memobj_unlock(obp);
-    if (oldp)
-        *oldp = oldsize;
-    if (r == EOK && size > oldsize)
-        as_map_grown(obp, oldsize);
+    /* Also when this call did not grow it: another growth may still be
+     * having its mappings made, and the caller answers a client next.
+     */
+    vm_grow_drain(obp);
     return r;
+}
+
+
+/* vm_undo_grow — a write that grew obp (vm_grow, g) failed: take the growth
+ * back, unless anything since could have put bytes in the grown range. The
+ * write generation moves on with every write and size change, and with every
+ * page a process other than roottask gets mapped (memory_reference): a store
+ * through a mapping leaves no other trace, so a mapping made over the new
+ * pages, by the growth's own drain or a later mmap, keeps the growth.
+ */
+void vm_undo_grow(path_object_t *obp, const struct vm_growth *g)
+{
+    memobj_lock(obp);
+    if ((uint64_t) obp->mem.mm.size == g->to && obp->mem.mm.wgen == g->gen)
+        (void) root_vm_ops.resize(obp, (size_t) g->from);
+    memobj_unlock(obp);
 }
 
 
@@ -161,6 +247,11 @@ static int shrink_ref(struct mm_object_ref * or, struct mm_map *mm, void *d)
     return EOK;
 }
 
+/* memobj_pmem_walk callback for zero_tail: zero the quantum from *d's offset
+ * within it to its end, if the quantum has been written. The zeroing goes
+ * through kernel_page_zero on the physical page, so it needs no mapping and no
+ * address-space lock and runs under the object lock.
+ */
 static int do_zero(path_object_t *obp,
                    off64_t off,
                    struct pa_quantum *pq,
@@ -168,47 +259,25 @@ static int do_zero(path_object_t *obp,
                    void *d)
 {
     size_t pg_off = *(size_t *) d & (QUANTUM_SIZE - 1);
-    void *vaddr;
-    size_t size;
-    int r;
 
-    /* If the quantum's been modified, we have to zero the portion beyond end of
-     * the object so that accesses don't pick up whatever content was there
-     * before.
-     */
-    if (pa_pq_flags(pq) & PAQ_FLAG_MODIFIED) {
-        r = as_mmap(ROOTTASK_PID, roottask_prp, 0, QUANTUM_SIZE,
-                    PROT_READ | PROT_WRITE, MAP_SHARED, obp, (uint64_t) off, 0,
-                    QUANTUM_SIZE, NOFD, &vaddr, &size);
-        if (r != EOK)
-            return r;
-        memset((uint8_t *) vaddr + pg_off, 0, QUANTUM_SIZE - pg_off);
-        (void) as_munmap(ROOTTASK_PID, roottask_prp, (uintptr_t) vaddr, size,
-                         0);
-    }
+    (void) obp;
+    (void) off;
+    (void) num;
+    if (pa_pq_flags(pq) & PAQ_FLAG_MODIFIED)
+        return kernel_page_zero(pa_quantum_to_paddr(pq) + pg_off, QUANTUM_SIZE - pg_off);
     return EOK;
 }
 
 
+/* Zero the part of the last page past size, so that a later growth over it
+ * reads zeros (a shrink to a size inside a page keeps that page). Called with
+ * the object locked.
+ */
 static int zero_tail(path_object_t *obp, size_t size)
 {
-    pid_t old;
-    size_t pg_off;
-    int r;
+    off64_t pg = (off64_t) (size & ~(size_t) (QUANTUM_SIZE - 1));
 
-    old = process_bind(-1);
-    if (old != 0)
-        process_bind(0);
-    process_bind(ROOTTASK_PID);
-    proc_wlock_adp(ROOTTASK_PID);
-    memobj_lock(obp);
-    pg_off = size & ~(size_t) (QUANTUM_SIZE - 1);
-    r = memobj_pmem_walk(MPW_SYSRAM, obp, (off64_t) pg_off, (off64_t) pg_off,
-                         do_zero, &size);
-    memobj_unlock(obp);
-    proc_unlock_adp(ROOTTASK_PID);
-    process_bind(old);
-    return r;
+    return memobj_pmem_walk(MPW_SYSRAM, obp, pg, pg, do_zero, &size);
 }
 
 
@@ -264,16 +333,15 @@ int as_resize(path_object_t *obp, size_t size)
     }
 
     has_lock = proc_mux_haslock(&obp->mem.mm.mux, 0);
-    if (!has_lock) {
-        if (((size & (QUANTUM_SIZE - 1)) != 0) && (size < obp->mem.mm.size)) {
-            /* non quantum aligned new size and we're shrinking. We need to zero
-             * the piece of the last page (if it's already been initialized).
-             */
-            r = zero_tail(obp, size);
-            if (r != EOK)
-                goto fail1;
-        }
+    if (!has_lock)
         memobj_lock(obp);
+    if (((size & (QUANTUM_SIZE - 1)) != 0) && ((off64_t) size < obp->mem.mm.size)) {
+        /* non quantum aligned new size and we're shrinking. We need to zero
+         * the piece of the last page (if it's already been initialized).
+         */
+        r = zero_tail(obp, size);
+        if (r != EOK)
+            goto fail2;
     }
 
     oldsize = (uint64_t) ROUNDUP(obp->mem.mm.size, __PAGESIZE);
@@ -291,9 +359,11 @@ int as_resize(path_object_t *obp, size_t size)
             r = memobj_pmem_add(obp, (off64_t) oldsize, newsize - oldsize,
                                 (int) flags);
         }
-        /* The mappings of the new pages are made by as_map_grown, once the
-         * object lock is dropped.
+        /* The mappings of the new pages are made by vm_grow_drain, once the
+         * caller has dropped its locks.
          */
+        if (r == EOK)
+            grow_pending(obp, oldsize);
     } else if (newsize < oldsize) {
         /* shrinking... */
         span.lo = newsize;
@@ -310,6 +380,7 @@ int as_resize(path_object_t *obp, size_t size)
         goto fail2;
 
     obp->mem.mm.size = (off64_t) size;
+    obp->mem.mm.wgen++; /* any size change voids a pending undo (vm_undo_grow) */
     if (!has_lock)
         memobj_unlock(obp);
     return EOK;
@@ -317,7 +388,5 @@ int as_resize(path_object_t *obp, size_t size)
 fail2:
     if (!has_lock)
         memobj_unlock(obp);
-
-fail1:
     return r;
 }

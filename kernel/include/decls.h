@@ -281,8 +281,9 @@ void rdecl remove_unblock(thread_t *thp, connect_t *cop, int rcvid);
 
 /* Add support for sporatic cleanup */
 void rdecl sched_ss_cleanup(thread_t *thp);
-void rdecl sched_account_current(uint64_t now);
-void rdecl sched_account_restart(void);
+void rdecl sched_account_current(void);
+void rdecl sched_account_switch(thread_t *next);
+void rdecl sched_account_restart(thread_t *next);
 uint64_t rdecl sched_account_read(thread_t *thp, uint64_t now);
 int rdecl sched_ss_adjust(void);
 void rdecl sched_ss_update(thread_t *thp,

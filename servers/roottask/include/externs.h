@@ -177,14 +177,20 @@ extern const char os_version_string[];
 #include <sys/calls.h>
 #include <private/priv-calls.h>
 
-/* Defined in servers/roottask/proc/kext-wrappers.c. Re-declared here because
- * the matching prototype lives in kernel/include/priv.h, which is kernel-
- * internal and unreachable from roottask.
+/* Defined in servers/roottask/proc/kext-wrappers.c. signal_kill is declared
+ * here again because its prototype in kernel/include/priv.h is kernel-internal
+ * and unreachable from roottask.
  */
-void signal_kill(channel_t *chp, int signo, pid_t sender_pid);
-void signal_post_locked(pid_t pid, channel_t *chp, int signo, pid_t sender);
+int signal_kill(pid_t pid, int signo, pid_t sender_pid);
+uint64_t process_syschan_detach(pid_t pid, pid_t *sender);
+
+/* Defined in servers/roottask/proc/signal.c. */
+void signal_post_locked(pid_t pid, int signo, pid_t sender);
+void signal_exec_keep_locked(pid_t pid, uint64_t pending);
 int signal_flush_early_locked(pid_t pid);
 void signal_loaded(pid_t pid);
+
+/* Defined in servers/roottask/proc/exit.c. */
 int proc_exit_begin_locked(pid_t pid, int status, int by_signal);
 void proc_exit_finish(pid_t pid);
 

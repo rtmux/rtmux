@@ -187,6 +187,9 @@ if test "$rtmux_run" = "debug-inject"; then
     # A MAP that meets a superpage half way must report its progress, so the
     # pages it already mapped are unmapped, and must leave no page behind.
     stage /bin/syscall_testing --pte-partial-map
+    # A write that fails after growing its object must not give back a growth
+    # another write has used meanwhile.
+    stage /bin/syscall_testing --write-undo
     # A loader context whose mapping fails part of the way must give its
     # physical memory back, every time.
     stage /bin/syscall_testing --anon-map-failure
@@ -243,6 +246,9 @@ if test "$rtmux_run" = "debug-inject"; then
     # Sixteen large posix_spawn requests held inside roottask's handler at
     # once must queue for its heap, not fail with ENOMEM.
     stage /bin/syscall_testing --spawn-heap-gate
+    # A SIGKILL in the middle of a large MAP for the victim must not wait for
+    # the MAP to finish zeroing its pages.
+    stage /bin/syscall_testing --map-kill
     if test -z "$failed"; then
         echo "RTMux debug-inject: PASS"
     else

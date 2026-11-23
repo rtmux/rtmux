@@ -1399,4 +1399,7 @@ void test_printf(void)
     test_setvbuf_failure(0);
     test_setvbuf_failure(1);
     test_strerror_text();
+
+    /* exit() and the streams it flushes. */
+    test_stdio_exit();
 }

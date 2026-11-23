@@ -30,16 +30,24 @@ static int exec_spawn(const char *path,
                       int search)
 {
     struct inheritance inherit = {
-        .flags = SPAWN_EXEC | SPAWN_SETSIGMASK | SPAWN_SETSIGIGN,
+        .flags = SPAWN_EXEC | SPAWN_SETSIGMASK | SPAWN_SETSIGIGN |
+                 SPAWN_SETSIGPEND,
     };
     pid_t pid;
+    int err;
 
-    /* The new image keeps what is ignored and what is blocked; a caught signal
-     * goes back to its default, so only the two sets are sent.
+    /* The new image keeps what is ignored, what is blocked and what is
+     * pending; a caught signal goes back to its default, so only the sets are
+     * sent. No signal is delivered to this image from here on, unless the exec
+     * fails.
      */
-    __libc_signal_exec_state(&inherit.sigignore, &inherit.sigmask);
+    __libc_signal_exec_begin(&inherit.sigignore, &inherit.sigmask,
+                             &inherit.sigpending);
     pid = search ? rtmux_spawnp(path, 0, NULL, &inherit, argv, envp)
                  : rtmux_spawn(path, 0, NULL, &inherit, argv, envp);
+    err = errno;
+    __libc_signal_exec_end();
+    errno = err;
     if (pid == -1)
         return -1;
 

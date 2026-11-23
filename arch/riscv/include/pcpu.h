@@ -138,15 +138,17 @@ struct pcpu {
     volatile uint32_t pc_inject_spin_ms; /* IPI_DEBUG_SPIN: ms, UINT32_MAX = hang */
     volatile uint32_t pc_inject_hold_console; /* IPI_DEBUG_SPIN: spin under the console lock */
 
-    /* CPU-time billing (sched_account_current in kernel/sched/dispatch.c).
-     * pc_account_stamp is the snap_time() ns at which the active thread's
-     * unbilled stretch began. Written only by the owner hart; pc_account_seq is
-     * the seqcount (odd = update in flight) that lets another hart's clock read
-     * add the live stretch to a running thread's banked running_time.
+    /* CPU-time billing (sched_account_switch in kernel/sched/dispatch.c).
+     * pc_account_stamp is the snap_time() ns at which the unbilled stretch of
+     * pc_account_thp began; pc_account_thp is NULL once that stretch is closed
+     * (billed for the last time before a switch) and no new one has begun.
+     * Both are written only by the owner hart; pc_account_seq is the seqcount
+     * (odd = update in flight) that lets another hart's clock read add the
+     * live stretch to a running thread's banked running_time.
      */
     uint64_t pc_account_stamp;
+    struct thread_entry *pc_account_thp;
     atomic_uint pc_account_seq;
-    uint8_t pc_account_billed; /* active thread already billed before enqueue */
 
     /* pc_timer_progress — supervisor timer interrupts this hart has taken.
      * Written only by the owner hart (relaxed fetch_add at timer-trap entry,
@@ -180,7 +182,7 @@ struct pcpu {
      */
     uint64_t pc_ipi_defer;
     uint8_t pc_sched_depth;
-    uint8_t pc_pad[39]; /* keep sizeof(struct pcpu) power-of-two */
+    uint8_t pc_pad[31]; /* keep sizeof(struct pcpu) power-of-two */
 };
 
 #ifndef __cplusplus

@@ -899,6 +899,11 @@ typedef struct thread_entry { /* Also used for vthread_entry */
      */
     uint32_t wake_seq;
 
+    /* The priority list this thread is queued on while READY (DISPATCH_LINK_*),
+     * under that run queue's lock; its priority may differ meanwhile.
+     */
+    uint8_t qprio;
+
 #ifdef CONFIG_DEBUG_DISPATCH_OWNER
     /* Dispatch-owner tripwire (kernel/debug/dispatch-owner.c): 1 + the hart
      * whose pc_curthread this is, or 0, claimed and released with a

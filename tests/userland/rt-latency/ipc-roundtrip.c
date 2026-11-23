@@ -1448,7 +1448,13 @@ static int path_round(int chid, int receiver_first, int parts, int entry)
             (unsigned long long) p50, (unsigned long long) p99,
             (unsigned long long) smax, (unsigned long long) path_base_ns);
     } else if (timed) {
-        ok = ok && path_p99(rcv, &rmax) == 0 && path_p99(rep, &pmax) == 0;
+        /* Both sides are sorted before either is judged: a short-circuit
+         * left the reply side unsorted and its max unset, and printed both.
+         */
+        int rcv_over = path_p99(rcv, &rmax);
+        int rep_over = path_p99(rep, &pmax);
+
+        ok = ok && !rcv_over && !rep_over;
         printf(
             "ipc-roundtrip: iov-receive-reply %s receive-p99-ns=%llu "
             "receive-max-ns=%llu reply-p99-ns=%llu reply-max-ns=%llu\n",

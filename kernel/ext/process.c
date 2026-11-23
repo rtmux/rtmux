@@ -1738,24 +1738,36 @@ void kext_reparent(void *data)
 
 
 struct kext_signal_args {
-    channel_t *chp;
+    pid_t pid;
     int signo;
     pid_t sender_pid;
 };
 
-/* kext_signal_deliver — deliver a signal notification to a channel.
+/* kext_signal_deliver — deliver a signal notification to a process.
  *
  * Packs the signal number and sender pid into the 64-bit notification value
- * (signo in the low 32 bits, sender pid in the high 32) and delivers it.
+ * (signo in the low 32 bits, sender pid in the high 32) and delivers it on the
+ * process's system channel. The channel is found from the pid here, inside one
+ * connection-object RCU section with the delivery, and never from a pointer the
+ * caller read earlier: a process may destroy its own system channel at any
+ * moment, and the channel is freed only after that section's grace period.
  * Parameters:
- *   arg : struct kext_signal_args * (chp, signo, sender_pid)
+ *   arg : struct kext_signal_args * (pid, signo, sender_pid)
+ * Return value (kcall status): EOK when the notification was delivered or
+ * queued, ESRCH for no such process or a channel being destroyed, ENXIO when
+ * the process has no system channel or is ending, EAGAIN when no notification
+ * could be allocated. The caller keeps a signal it could not deliver.
  */
 void kext_signal_deliver(void *arg)
 {
     struct kext_signal_args *kap = arg;
+    thread_t *act = get_active_thread(get_cpunum());
     /* signo in the low 32 bits, sender pid in the high 32 (0 if none). */
     uint32_t spid = kap->sender_pid > 0 ? (uint32_t) kap->sender_pid : 0;
     uint64_t value = ((uint64_t) spid << 32) | (uint32_t) kap->signo;
+    process_t *prp;
+    channel_t *chp;
+    int status;
 
     /* Terminal-generated signals carry the dispatcher's receive priority
      * through to the process. Ordinary signals leave the receiver at base.
@@ -1763,14 +1775,35 @@ void kext_signal_deliver(void *arg)
     unsigned prio = RTMUX_PRIO_SERVER;
     if (!spid && (kap->signo == SIGINT || kap->signo == SIGQUIT ||
                   kap->signo == SIGTSTP)) {
-        thread_t *act = get_active_thread(get_cpunum());
         unsigned limit = min(kopt.priv_prio - 1U, RTMUX_PRIO_DEVICE_IST);
         if (limit)
             prio = min((unsigned) act->priority, limit) |
                    _NOTIFICATION_PRIO_SIGNAL;
     }
-    notification_deliver(kap->chp, prio, _NOTIFICATION_CODE_SIGNAL,
-                         (uintptr_t) value, 0, 0);
+
+    if (!(prp = lookup_pid_rcu(kap->pid))) {
+        rcu_read_unlock(&process_rcu);
+        kcall_err(act, ESRCH);
+        return;
+    }
+    status = process_pin(prp);
+    rcu_read_unlock(&process_rcu);
+    if (status != EOK) {
+        kcall_err(act, status);
+        return;
+    }
+
+    rcu_read_lock(&connobj_rcu);
+    chp = __atomic_load_n(&prp->sys_chp, __ATOMIC_ACQUIRE);
+    status = chp ? notification_deliver(chp, prio, _NOTIFICATION_CODE_SIGNAL,
+                                        (uintptr_t) value, 0, 0)
+                 : ENXIO;
+    rcu_read_unlock(&connobj_rcu);
+    process_unpin(prp);
+    if (status == EOK)
+        SETKSTATUS(act, EOK);
+    else
+        kcall_err(act, status);
 }
 
 

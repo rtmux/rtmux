@@ -158,9 +158,11 @@ static const struct toolbox_applet applets[] = {
      "| "
      "stall-block PID TID [MS] | stall-ready PID TID MS | stall-steal PID TID MS | "
      "stall-reprio PID TID MS | "
-     "poke PID TID ready|stop | sched-stats | serve | hold-exit-destroy PID MS | "
+     "poke PID TID ready|stop | sched-stats | as-lock-stats | serve | "
+     "hold-exit-destroy PID MS | "
      "stall-switch PID TID MS | crash [shutdown] | stall-reply-claim PID MS | "
      "preempt-reply-unblock PID | stall-unblock-race PID MS | "
+     "slow-kpage-zero PID US/COUNT | "
      "xfer-trace PID | xfer-stats N | "
      "stall-claim-held PID MS | stall-force-claimed PID MS | "
      "stall-cap-peek PID TID | stall-send-pick PID TID | grant-ipc-cap PID | "
@@ -3199,6 +3201,7 @@ static int applet_inject(int argc, char **argv)
             [STALL_REPRIO] = "reprio",
             [STALL_UNBLOCK_FORCE] = "unblock-force",
             [STALL_UNBLOCK_REPLY] = "unblock-reply",
+            [STALL_KPAGE_ZERO] = "kpage-zero",
             [INJECT_SITE_TURNSTILE] = "turnstile",
             [INJECT_SITE_REPLY_DETACHED] = "reply-detached",
         };
@@ -3307,6 +3310,11 @@ static int applet_inject(int argc, char **argv)
         if (rc >= 0)
             printf("empty-steal-locks=%d\n", rc);
         return rc >= 0 ? 0 : 1;
+    } else if (argc == 2 && !strcmp(argv[1], "as-lock-stats")) {
+        rc = inject_call(INJECT_OP_SCHED_STATS, 1, 0);
+        if (rc >= 0)
+            printf("as-slock-takes=%d\n", rc);
+        return rc >= 0 ? 0 : 1;
     } else if (argc == 2 && !strcmp(argv[1], "serve")) {
         /* One inject command per stdin line, answered with "0" or the exit
          * status, for tests that need injection while a hart is held and no
@@ -3336,6 +3344,14 @@ static int applet_inject(int argc, char **argv)
     } else if (argc == 4 && !strcmp(argv[1], "stall-reply-claim")) {
         rc = inject_call(INJECT_OP_STALL_REPLY_CLAIM, strtoul(argv[2], NULL, 0),
                          strtoul(argv[3], NULL, 0));
+    } else if (argc == 4 && !strcmp(argv[1], "slow-kpage-zero")) {
+        /* US/COUNT: the delay per page and how many pages it applies to. */
+        char *end;
+        unsigned long us = strtoul(argv[3], &end, 0);
+        unsigned long count = *end == '/' ? strtoul(end + 1, NULL, 0) : 0;
+
+        rc = inject_call(INJECT_OP_SLOW_KPAGE_ZERO, strtoul(argv[2], NULL, 0),
+                         us << 32 | count);
     } else if (argc == 4 && !strcmp(argv[1], "stall-unblock-race")) {
         rc = inject_call(INJECT_OP_STALL_UNBLOCK_RACE, strtoul(argv[2], NULL, 0),
                          strtoul(argv[3], NULL, 0));

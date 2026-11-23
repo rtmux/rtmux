@@ -446,9 +446,10 @@ static int parse_pspawn_msg(pid_t ppid,
  * PSPAWN_GATE_WAITERS wait, each on a pool thread, and for at most
  * PSPAWN_GATE_WAIT_S seconds; beyond either the spawn fails with EAGAIN, which
  * posix_spawn may return for a shortage that passes, unless it fits, when it
- * is let in. PSPAWN_GATE_WAITERS, LOADER_CONTEXT_WAITERS and
- * LOADER_SHARE_WAITERS together leave most of roottask's pool threads (75 at
- * most, sys/message.c) to the handlers and loaders that end the waits.
+ * is let in. PSPAWN_GATE_WAITERS, LOADER_CONTEXT_WAITERS and twice
+ * LOADER_SHARE_WAITERS (one wait inside the gate, one outside) together, 48,
+ * leave most of roottask's pool threads (75 at most, sys/message.c) to the
+ * handlers and loaders that end the waits.
  */
 #define PSPAWN_GATE_BUDGET (CONFIG_ROOTTASK_HEAP_SIZE / 2)
 #define PSPAWN_GATE_FREE (8U * 1024U)
@@ -460,32 +461,10 @@ static struct root_wait pspawn_gate_wait =
     ROOT_WAIT_INITIALIZER(PSPAWN_GATE_WAITERS);
 static size_t pspawn_gate_used; /* bytes charged to admitted requests */
 
-/* Waiting requests, in arrival order: only the oldest may be admitted, so a
- * stream of smaller requests cannot keep one that needs more room out until
- * its PSPAWN_GATE_WAIT_S timeout. Each entry lives on its waiter's
- * stack; the queue holds at most PSPAWN_GATE_WAITERS + 1 of them.
+/* Waiting requests are admitted in arrival order (a root_ticket each, all of
+ * one key), so a stream of smaller requests cannot keep one that needs more
+ * room out until its PSPAWN_GATE_WAIT_S timeout.
  */
-struct pspawn_gate_ticket {
-    struct pspawn_gate_ticket *next;
-};
-static struct pspawn_gate_ticket *pspawn_gate_head, **pspawn_gate_tail =
-                                                        &pspawn_gate_head;
-
-/* Take `t` out of the queue, wherever it is. A new head is woken to look at
- * the room again. Called with pspawn_gate_mutex held.
- */
-static void pspawn_gate_dequeue(struct pspawn_gate_ticket *t)
-{
-    struct pspawn_gate_ticket **pp = &pspawn_gate_head;
-
-    while (*pp != t)
-        pp = &(*pp)->next;
-    *pp = t->next;
-    if (pspawn_gate_tail == &t->next)
-        pspawn_gate_tail = pp;
-    if (pp == &pspawn_gate_head && pspawn_gate_head)
-        root_wake(&pspawn_gate_wait);
-}
 
 /* The most heap the request in `msg`, `len` bytes long, can hold: its copy
  * when it did not arrive whole, the rebuilt message, which is no longer than
@@ -512,12 +491,12 @@ static bool pspawn_gate_fits(size_t charge)
 
 /* Admit a request that will hold `charge` bytes, after every request that
  * arrived waiting before it. Returns EOK, or EAGAIN when it would have to wait
- * behind too many others or for too long.
+ * behind too many others or past *until (ns; set to PSPAWN_GATE_WAIT_S from
+ * now by the first wait, and kept across a request's tries).
  */
-static int pspawn_gate_enter(size_t charge)
+static int pspawn_gate_enter(size_t charge, uint64_t *until)
 {
-    struct pspawn_gate_ticket t = {NULL};
-    struct timespec until = {0};
+    struct root_ticket t;
     int r = EOK;
 
     if (!charge)
@@ -527,15 +506,17 @@ static int pspawn_gate_enter(size_t charge)
      * that fits is let in rather than refused: the order is kept for those
      * that can wait.
      */
-    if ((pspawn_gate_head &&
+    if ((root_ticket_queued(&pspawn_gate_wait, 0) &&
          pspawn_gate_wait.waiting < pspawn_gate_wait.max) ||
         !pspawn_gate_fits(charge)) {
-        *pspawn_gate_tail = &t;
-        pspawn_gate_tail = &t.next;
-        while (r == EOK && (pspawn_gate_head != &t || !pspawn_gate_fits(charge)))
-            r = root_wait(&pspawn_gate_wait, &pspawn_gate_mutex, &until,
-                          PSPAWN_GATE_WAIT_S);
-        pspawn_gate_dequeue(&t);
+        root_ticket_join(&pspawn_gate_wait, &t, 0);
+        r = root_deadline_ns(until, PSPAWN_GATE_WAIT_S);
+        while (r == EOK && (!root_ticket_first(&pspawn_gate_wait, &t) ||
+                            !pspawn_gate_fits(charge)))
+            r = root_wait_until_ns(&pspawn_gate_wait, &pspawn_gate_mutex, *until)
+                    ? EAGAIN
+                    : EOK;
+        root_ticket_leave(&pspawn_gate_wait, &t);
     }
     if (r == EOK)
         pspawn_gate_used += charge;
@@ -582,7 +563,8 @@ int proc_pspawn(ioserv_context_t *ctp, void *vmsg)
     proc_spawn_t *spawn_msg = NULL;
     void *whole = NULL;
     const char *path;
-    uint64_t len;
+    uint64_t until = 0, len;
+    bool share_nowait = true;
     size_t charge;
     bool copied;
     int r;
@@ -618,7 +600,16 @@ int proc_pspawn(ioserv_context_t *ctp, void *vmsg)
 
     copied = len > ctp->info.msglen;
     charge = pspawn_heap_charge(msg, (size_t) len, copied);
-    if ((r = pspawn_gate_enter(charge)) != EOK)
+    /* A request the gate charged does not wait for its spawner's loader
+     * context share while it holds the charge: it gives the charge and its
+     * buffers back, waits for the share, and comes in again. The
+     * request is still in the sender's buffer, and the deadline is one for
+     * all the tries.
+     */
+retry:;
+    int share_class = -1;
+
+    if ((r = pspawn_gate_enter(charge, &until)) != EOK)
         return r;
     if (copied) {
         int head = (int) ctp->info.msglen, tail;
@@ -664,11 +655,25 @@ int proc_pspawn(ioserv_context_t *ctp, void *vmsg)
         pspawn_debug_hold(path);
         const unsigned char *actions = (const unsigned char *) (msg + 1) + msg->i.attr_bytes;
         r = proc_spawn_with_actions(&ctp2, spawn_msg, actions,
-                                    msg->i.reserved[0] ? msg->i.filact_bytes : 0);
+                                    msg->i.reserved[0] ? msg->i.filact_bytes : 0,
+                                    charge && share_nowait ? &share_class : NULL);
     }
 out:
     free(whole);
     free(spawn_msg);
+    whole = NULL;
+    spawn_msg = NULL;
     pspawn_gate_leave(charge); /* every exit once admitted comes here */
+    if (r == EAGAIN && share_class >= 0) {
+        /* With the share wait full, the request waits for its share as it
+         * did before, inside the gate, rather than fail.
+         */
+        r = loader_share_await(ctp->info.pid, share_class, &until);
+        if (r == EOK || r == EBUSY) {
+            share_nowait = r == EOK;
+            msg = vmsg;
+            goto retry;
+        }
+    }
     return r;
 }

@@ -193,6 +193,7 @@ void kext_kpage_zero(void *data)
         SETKSTATUS(act, EINVAL);
         return;
     }
+    inject_kpage_zero_slow(act);
 
     memset((void *) ((uintptr_t) kap->paddr + KERNEL_VIRT_BASE), 0, kap->len);
     SETKSTATUS(act, EOK);

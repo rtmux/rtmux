@@ -161,9 +161,15 @@ int vm_find_object(ioserv_context_t *ctp,
  *   prp_pid : pid of the target process
  *   prp     : target process (kernel-side handle)
  *   msg     : the mmap request / reply buffer
+ *   grownp  : OUT — set to a reference on the object when a growth of it may
+ *             still have mappings to make (vm_grow_drain), else left alone
  * Return value: a IOSERV_PTR reply on success, or an errno on failure.
  */
-int vm_map(ioserv_context_t *ctp, pid_t prp_pid, process_t *prp, mem_map_t *msg)
+int vm_map(ioserv_context_t *ctp,
+           pid_t prp_pid,
+           process_t *prp,
+           mem_map_t *msg,
+           path_object_t **grownp)
 {
     void *addr;
     size_t size;
@@ -250,6 +256,15 @@ check_again:
         status = vm_find_object(ctp, prp_pid, prp, msg->i.fd, msg, &object);
         if (status != EOK)
             return status;
+
+        /* A growth of the object, such as the sticky-file reload in vm_open_fd,
+         * counts in grow_busy until its mappings are made, which needs the
+         * object lock still held here. Hand it to the caller to wait for once
+         * its locks are dropped.
+         */
+        if (object &&
+            __atomic_load_n(&object->mem.mm.grow_busy, __ATOMIC_ACQUIRE))
+            *grownp = path_object_clone(object);
     }
 
     /* DMA/MMIO containment: once an address space has self-restricted

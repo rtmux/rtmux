@@ -225,9 +225,18 @@ uint64_t get_nsec_since_block(thread_t *thp)
     if (thp->state == STATE_READY || thp->state == STATE_RUNNING)
         return 0ULL;
 
-    uint64_t snapshot;
+    /* A thread still current on its hart has published its wait but not
+     * switched away, and the switch stamps timestamp_last_block
+     * (sched_account_switch): it has not been blocked for any time yet.
+     */
+    unsigned cpu = __atomic_load_n(&thp->runcpu, __ATOMIC_RELAXED);
+    if (cpu < CONFIG_PROCESSORS_MAX &&
+        __atomic_load_n(&pcpu_array[cpu].pc_curthread, __ATOMIC_ACQUIRE) == thp)
+        return 0ULL;
+
+    uint64_t snapshot, ts = thp->timestamp_last_block;
     snap_time(&snapshot, 0);
-    return snapshot - thp->timestamp_last_block;
+    return snapshot > ts ? snapshot - ts : 0ULL;
 }
 
 
