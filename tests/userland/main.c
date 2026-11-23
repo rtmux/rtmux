@@ -1371,6 +1371,11 @@ int main(int argc, char *argv[])
             test_skip("ns_open_detach", "fault injection unavailable");
         return finish(1);
     }
+    if (argc == 2 && !strcmp(argv[1], "--nanosleep-1ns-storm-hog")) {
+        printf("[nanosleep_1ns_storm_hog]\n");
+        test_nanosleep_1ns_storm_hog();
+        return finish(1);
+    }
     if (argc == 2 && !strcmp(argv[1], "--nanosleep-1ns-storm")) {
         printf("[nanosleep_1ns_storm]\n");
         test_nanosleep_1ns_storm();
@@ -1948,6 +1953,18 @@ int main(int argc, char *argv[])
     }
     if (argc == 2 && !strcmp(argv[1], "--thread-loop-child"))
         return kill_thread_loop_child();
+    if (argc == 2 && !strcmp(argv[1], "--version-child"))
+        return 0; /* a bare start of this binary, for the spawn timings */
+    if (argc == 2 && !strcmp(argv[1], "--spawn-exec-time")) {
+        printf("[spawn_exec_time]\n");
+        test_spawn_exec_time();
+        return 0; /* measurements only: nothing to pass or fail */
+    }
+    if (argc == 2 && !strcmp(argv[1], "--create-kill")) {
+        printf("[kill_during_thread_create]\n");
+        test_kill_create();
+        return finish(1);
+    }
     if (argc == 2 && !strcmp(argv[1], "--gauges")) { /* opt-in: just the gauge regressions */
         printf("=== RTMux gauge regressions ===\n\n[gauges]\n");
         test_gauges();

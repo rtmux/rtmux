@@ -15,9 +15,9 @@
 /* Loader contexts come from the roottask_mmap_anon_user window, which only
  * grows (kernel/ext/query.c, root_phys_map_va), so one can never be returned:
  * each is kept for reuse by its size class. Each is also one contiguous run of
- * physical memory. So that clients cannot make roottask keep ever more of it
- *, a class has a limit on how many contexts it may ever have, and a spawn
- * that finds its class used up waits for one to come back.
+ * physical memory. So that clients cannot make roottask keep ever more of it *,
+ * a class has a limit on how many contexts it may ever have, and a spawn that
+ * finds its class used up waits for one to come back.
  */
 static pthread_mutex_t loader_context_mutex = PTHREAD_MUTEX_INITIALIZER;
 
@@ -81,10 +81,10 @@ static struct {
     {.limit = LOADER_LIMIT_4}, {.limit = LOADER_LIMIT_5},
 };
 
-/* A spawner may hold at most half of a class's contexts, rounded up. A
- * loader can block for as long as some server does not answer it, which may be
- * the spawner itself; without a share, one client whose loaders block on its
- * own server held every standard context, and every other spawn in the system
+/* A spawner may hold at most half of a class's contexts, rounded up. A loader
+ * can block for as long as some server does not answer it, which may be the
+ * spawner itself; without a share, one client whose loaders block on its own
+ * server held every standard context, and every other spawn in the system
  * waited out LOADER_CONTEXT_WAIT_S and failed. A spawn over its share waits as
  * one over the class limit does. Each in-use context is counted in the entry of
  * its owner, so LOADER_CONTEXTS_MAX entries always suffice; an entry with
@@ -157,7 +157,6 @@ _Static_assert((sizeof(struct loader_context) << (LOADER_CLASSES - 2)) <
  * either the spawn fails with EAGAIN. All classes share the wait: a context
  * given back wakes every waiter, each to look at its own class.
  */
-#define LOADER_CONTEXT_WAITERS 16
 #define LOADER_CONTEXT_WAIT_S 30
 static struct root_wait loader_context_wait =
     ROOT_WAIT_INITIALIZER(LOADER_CONTEXT_WAITERS);
@@ -165,7 +164,6 @@ static struct root_wait loader_context_wait =
 /* Spawns over their spawner's share wait apart, LOADER_SHARE_WAITERS at most,
  * so that one spawner's backlog cannot take the waits of the others.
  */
-#define LOADER_SHARE_WAITERS 8
 static struct root_wait loader_share_wait =
     ROOT_WAIT_INITIALIZER(LOADER_SHARE_WAITERS);
 
@@ -185,12 +183,12 @@ static unsigned loader_all_n;
 
 /* A loader may block for as long as a server does not answer it, holding its
  * context all the while. A context held longer than LOADER_HOLD_MAX_S while
- * another spawn waits for one of its class has its loader interrupted:
- * the call it is blocked in fails with EINTR, the loader gives up, and the
- * context comes back. Loading takes milliseconds; a loader that has held one
- * this long is stuck, most likely on a server that does not answer. The
- * interrupt breaks a send, a receive and a reply wait (STATE_INTERRUPT_BITS),
- * but a server that holds a reply and ignores the unblock still holds it.
+ * another spawn waits for one of its class has its loader interrupted: the call
+ * it is blocked in fails with EINTR, the loader gives up, and the context comes
+ * back. Loading takes milliseconds; a loader that has held one this long is
+ * stuck, most likely on a server that does not answer. The interrupt breaks a
+ * send, a receive and a reply wait (STATE_INTERRUPT_BITS), but a server that
+ * holds a reply and ignores the unblock still holds it.
  */
 #define LOADER_HOLD_MAX_S 10
 

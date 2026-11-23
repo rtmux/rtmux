@@ -249,6 +249,9 @@ if test "$rtmux_run" = "debug-inject"; then
     # A SIGKILL in the middle of a large MAP for the victim must not wait for
     # the MAP to finish zeroing its pages.
     stage /bin/syscall_testing --map-kill
+    # A SIGKILL while a thread create is held between publishing the thread and
+    # its first run must reap the victim.
+    stage /bin/syscall_testing --create-kill
     if test -z "$failed"; then
         echo "RTMux debug-inject: PASS"
     else

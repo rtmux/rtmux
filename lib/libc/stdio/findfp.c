@@ -107,34 +107,30 @@ void __sfp_release(FILE *fp)
     pthread_mutex_unlock(&pool_lock);
 }
 
-/* Whether fp is in write mode. Read without the stream lock, by exit() only, to
- * decide whether a held stream is worth waiting for. The buffer pointers cannot
- * say whether the holder has output: __sflush rewinds _p before its write(),
- * and __sfvwrite writes a large request straight from the caller's buffer with
- * _p at the base, so a holder in the middle of either looks empty while its
- * output is still on the way. A stream in read mode holds no output; one in
- * write mode is waited for, as exit() did before.
+/* Whether fp has every flag in mask. Read without the stream lock, to decide
+ * whether a held stream is worth waiting for. The buffer pointers cannot say
+ * whether the holder has output: __sflush rewinds _p before its write(), and
+ * __sfvwrite writes a large request straight from the caller's buffer with _p
+ * at the base, so a holder in the middle of either looks empty while its output
+ * is still on the way. A stream in read mode holds no output; one in write mode
+ * is waited for.
  */
-static int write_mode(const FILE *fp)
+static int has_flags(const FILE *fp, unsigned mask)
 {
-    return (__atomic_load_n(&fp->_flags, __ATOMIC_RELAXED) & __SWR) != 0;
+    return (__atomic_load_n(&fp->_flags, __ATOMIC_RELAXED) & mask) == mask;
 }
 
-/* trylock: 0 waits for the stream's lock, 1 skips a held stream, and FWALK_EXIT
- * waits only for a held stream in write mode.
+/* mode: FWALK_WAIT waits for the stream's lock, FWALK_EXIT waits only for a
+ * held stream in write mode, and FWALK_LBF only for a held line-buffered one in
+ * write mode.
  */
-static int visit(FILE *fp, int (*func)(FILE *), int trylock)
+static int visit(FILE *fp, int (*func)(FILE *), int mode)
 {
-    if (trylock == FWALK_EXIT) {
-        if (ftrylockfile(fp)) {
-            if (!write_mode(fp))
-                return 0;
-            FLOCKFILE(fp);
-        }
-    } else if (trylock) {
-        if (ftrylockfile(fp))
+    if (mode == FWALK_WAIT) {
+        FLOCKFILE(fp);
+    } else if (ftrylockfile(fp)) {
+        if (!has_flags(fp, mode == FWALK_LBF ? __SLBF | __SWR : __SWR))
             return 0;
-    } else {
         FLOCKFILE(fp);
     }
     int rc = fp->_flags && !(fp->_flags & __SIGN) ? func(fp) : 0;
@@ -142,18 +138,18 @@ static int visit(FILE *fp, int (*func)(FILE *), int trylock)
     return rc;
 }
 
-int _fwalk(int (*func)(FILE *), int trylock)
+int _fwalk(int (*func)(FILE *), int mode)
 {
     int rc = 0;
     for (unsigned i = 0; i < 3; i++)
-        rc |= visit(&__sF[i], func, trylock);
+        rc |= visit(&__sF[i], func, mode);
     pthread_mutex_lock(&pool_lock);
     for (struct stream_block *b = blocks; b; b = b->next) {
         unsigned used = b->used;
         pthread_mutex_unlock(&pool_lock);
         for (unsigned i = 0; used; used >>= 1, i++)
             if (used & 1u)
-                rc |= visit(&b->streams[i], func, trylock);
+                rc |= visit(&b->streams[i], func, mode);
         pthread_mutex_lock(&pool_lock);
     }
     pthread_mutex_unlock(&pool_lock);

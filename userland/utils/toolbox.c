@@ -163,7 +163,7 @@ static const struct toolbox_applet applets[] = {
      "hold-exit-destroy PID MS | "
      "stall-switch PID TID MS | crash [shutdown] | stall-reply-claim PID MS | "
      "preempt-reply-unblock PID | stall-unblock-race PID MS | "
-     "slow-kpage-zero PID US/COUNT | "
+     "slow-kpage-zero PID US/COUNT | stall-thread-create PID MS | "
      "xfer-trace PID | xfer-stats N | "
      "stall-claim-held PID MS | stall-force-claimed PID MS | "
      "stall-cap-peek PID TID | stall-send-pick PID TID | grant-ipc-cap PID | "
@@ -3135,6 +3135,19 @@ static int inject_call(unsigned op, unsigned long a0, unsigned long a1)
     return args.ret;
 }
 
+/* The kernel refuses to stall the hart its caller runs on, and a spawned
+ * process may start on any hart: move off the target before asking.
+ */
+static unsigned long inject_off_hart(const char *arg)
+{
+    unsigned long hart = strtoul(arg, NULL, 0);
+
+    if (hart < 32)
+        (void) thread_ctl(RTMUX_TCTL_RUNMASK,
+                          (void *) (uintptr_t) ~(1u << (unsigned) hart));
+    return hart;
+}
+
 static int applet_inject(int argc, char **argv)
 {
     static const char *const pools[] = {
@@ -3145,13 +3158,13 @@ static int applet_inject(int argc, char **argv)
     int rc;
 
     if (argc == 4 && !strcmp(argv[1], "spin-irqoff")) {
-        rc = inject_call(INJECT_OP_SPIN_IRQOFF, strtoul(argv[2], NULL, 0),
+        rc = inject_call(INJECT_OP_SPIN_IRQOFF, inject_off_hart(argv[2]),
                          strtoul(argv[3], NULL, 0));
     } else if (argc == 4 && !strcmp(argv[1], "spin-console")) {
-        rc = inject_call(INJECT_OP_SPIN_CONSOLE, strtoul(argv[2], NULL, 0),
+        rc = inject_call(INJECT_OP_SPIN_CONSOLE, inject_off_hart(argv[2]),
                          strtoul(argv[3], NULL, 0));
     } else if (argc == 3 && !strcmp(argv[1], "hang-hart")) {
-        rc = inject_call(INJECT_OP_HANG_HART, strtoul(argv[2], NULL, 0), 0);
+        rc = inject_call(INJECT_OP_HANG_HART, inject_off_hart(argv[2]), 0);
     } else if (argc == 4 && !strcmp(argv[1], "fail-alloc")) {
         unsigned id;
 
@@ -3167,6 +3180,16 @@ static int applet_inject(int argc, char **argv)
     } else if (argc == 4 && !strcmp(argv[1], "fail-sched-set")) {
         rc = inject_call(INJECT_OP_FAIL_NEXT_SCHED_SET,
                          strtoul(argv[2], NULL, 0), strtoul(argv[3], NULL, 0));
+    } else if ((argc == 3 || argc == 4) &&
+               !strcmp(argv[1], "rcu-stall-waits")) {
+        /* inject rcu-stall-waits HART [reset]: exit with that hart's count (at
+         * most 254; 255 for an error), cleared after it with reset.
+         */
+        rc = inject_call(INJECT_OP_RCU_STALL_WAITS, strtoul(argv[2], NULL, 0),
+                         argc == 4 && !strcmp(argv[3], "reset"));
+        if (rc >= 0)
+            printf("rcu-stall-waits=%d\n", rc);
+        return rc < 0 ? 255 : (rc > 254 ? 254 : rc);
     } else if (argc == 2 && !strcmp(argv[1], "sched-set-status")) {
         rc = inject_call(INJECT_OP_SCHED_SET_STATUS, 0, 0);
         if (rc >= 0)
@@ -3203,6 +3226,7 @@ static int applet_inject(int argc, char **argv)
             [STALL_UNBLOCK_FORCE] = "unblock-force",
             [STALL_UNBLOCK_REPLY] = "unblock-reply",
             [STALL_KPAGE_ZERO] = "kpage-zero",
+            [STALL_THREAD_CREATE] = "thread-create",
             [INJECT_SITE_TURNSTILE] = "turnstile",
             [INJECT_SITE_REPLY_DETACHED] = "reply-detached",
         };
@@ -3357,6 +3381,9 @@ static int applet_inject(int argc, char **argv)
 
         rc = inject_call(INJECT_OP_SLOW_KPAGE_ZERO, strtoul(argv[2], NULL, 0),
                          us << 32 | count);
+    } else if (argc == 4 && !strcmp(argv[1], "stall-thread-create")) {
+        rc = inject_call(INJECT_OP_STALL_THREAD_CREATE,
+                         strtoul(argv[2], NULL, 0), strtoul(argv[3], NULL, 0));
     } else if (argc == 4 && !strcmp(argv[1], "stall-unblock-race")) {
         rc = inject_call(INJECT_OP_STALL_UNBLOCK_RACE,
                          strtoul(argv[2], NULL, 0), strtoul(argv[3], NULL, 0));

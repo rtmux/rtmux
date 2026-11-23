@@ -138,4 +138,25 @@ int main(void)
     ld.tail = mark;
     assert(ioserv_ldisc_read(&ld, &et, &clock, 0, 0, big, sizeof big, &used) == 3 &&
            !memcmp(big, "abc", 3));
+
+    /* Canonical markers must not count as raw input or end raw reads, even
+     * when compaction crosses the end of the queue. */
+    ld = (struct ioserv_ldisc) {.head = TTY_QUEUE - 2, .tail = TTY_QUEUE - 2};
+    for (const char *p = "\004a\n\004b\n\004c"; *p; p++)
+        ioserv_ldisc_feed(&ld, &et, (unsigned char) *p, &echo);
+    rt.c_cc[VMIN] = 6;
+    rt.c_cc[VTIME] = 0;
+    ioserv_ldisc_set(&ld, &et, &rt, 0);
+    assert(ld.head - ld.tail == 5);
+    assert(ioserv_ldisc_read(&ld, &rt, &clock, 0, 0, bytes, sizeof bytes, &used) ==
+           -EAGAIN);
+    ioserv_ldisc_feed(&ld, &rt, 'd', &echo);
+    assert(ioserv_ldisc_read(&ld, &rt, &clock, 0, 0, bytes, sizeof bytes, &used) == 6 &&
+           used == 6 && !memcmp(bytes, "a\nb\ncd", 6));
+    ld.tail += used;
+    ioserv_ldisc_set(&ld, &rt, &et, 0);
+    ioserv_ldisc_feed(&ld, &et, 4, &echo);
+    ioserv_ldisc_set(&ld, &et, &rt, 0);
+    assert(ioserv_ldisc_read(&ld, &rt, &clock, 0, 1, bytes, sizeof bytes, &used) ==
+           -EAGAIN);
 }

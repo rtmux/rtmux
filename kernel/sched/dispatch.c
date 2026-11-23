@@ -1323,9 +1323,9 @@ enum {
  * the lock too. A claim test made without the lock can be overtaken by such a
  * reply; a mark made after its look outlives the exchange, and the client's
  * next request, under the same rcvid, then finds a notification "queued" and
- * gets none, so a server that parks it never hears of its timeout. Made
- * here, the mark is seen by any later claimer, and a claim found here gets the
- * wake as force_ready_deferred() hands it over.
+ * gets none, so a server that parks it never hears of its timeout. Made here,
+ * the mark is seen by any later claimer, and a claim found here gets the wake
+ * as force_ready_deferred() hands it over.
  */
 static int force_ready_unblock_mark(thread_t *thp,
                                     channel_t *chp,
@@ -1427,6 +1427,8 @@ int rdecl force_ready_wait(thread_t *thp, unsigned err, uint32_t wake_seq)
 
 static int force_ready_body(thread_t *thp, unsigned err, const uint32_t *seq)
 {
+    uint32_t wait_seq;
+
 #if CONFIG_PROCESSORS_MAX > 1 && defined(CONFIG_SMP_MSGOPT)
 #ifndef NDEBUG
     if (thp->internal_flags & RTMUX_ITF_MSG_DELIVERY) {
@@ -1475,6 +1477,12 @@ static int force_ready_body(thread_t *thp, unsigned err, const uint32_t *seq)
     }
 
 reread_state:
+    /* The wait this call ends, named before the state that says which. A
+     * vthread soul ends before wake_seq; the lockless waits are real threads'.
+     */
+    wait_seq = seq                                   ? *seq
+               : TYPE_MASK(thp->type) == TYPE_THREAD ? thread_wake_seq(thp)
+                                                     : 0;
     switch (thp->state) {
     case STATE_READY:
 #if CONFIG_PROCESSORS_MAX > 1 && defined(CONFIG_SMP_MSGOPT)
@@ -2018,6 +2026,18 @@ reread_state:
     case STATE_SIGWAITINFO:
     case STATE_NANOSLEEP:
     case STATE_INTR:
+        /* No lock decides who ends these waits: claim this one, or leave it to
+         * the waker that did (thread_wake_claim). That waker is in the kernel
+         * and readies the thread within its own path. A caller naming a wait
+         * (force_ready_wait) ends only that one. Any other wants the thread
+         * awake whatever wait it is in: if it lost because the thread has since
+         * moved on to another wait, look again.
+         */
+        if (thread_wake_claim(thp, wait_seq))
+            break;
+        if (seq || thread_wake_seq(thp) == wait_seq)
+            return 1;
+        goto reread_state;
         break;
 
     default:

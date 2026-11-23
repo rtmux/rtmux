@@ -269,8 +269,10 @@ static int text_read(ioserv_context_t *ctp, io_read_t *msg, void *ocb)
         return c;
     }
 
+    /* At most the receive buffer, so it fits an unsigned. */
     unsigned size =
-        msg->i.nbytes < ctp->msg_max_size ? msg->i.nbytes : ctp->msg_max_size;
+        (unsigned) (msg->i.nbytes < ctp->msg_max_size ? msg->i.nbytes
+                                                      : ctp->msg_max_size);
     struct tty_read_clock clock = {0};
     (void) text_attr(&hangups);
     for (;;) {

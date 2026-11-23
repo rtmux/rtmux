@@ -35,7 +35,7 @@ PROGS = $(BUILD_BASE)/mkasmoff $(BUILD_BASE)/mkromfs $(BUILD_BASE)/treeromfs \
         $(BUILD_BASE)/bootstrap-manifest-test $(BUILD_BASE)/elf-range-test \
         $(BUILD_BASE)/ldso-hash-test $(BUILD_BASE)/ldso-page-test \
         $(BUILD_BASE)/ldso-parse-test $(BUILD_BASE)/ldso-path-test \
-        $(BUILD_BASE)/ticket-lock-test $(BUILD_BASE)/tty-ldisc-test $(BUILD_BASE)/spawn-search-test $(BUILD_BASE)/cpio-parser-test $(BUILD_BASE)/spawn-fd-policy-test $(BUILD_BASE)/loader-end-test \
+        $(BUILD_BASE)/ticket-lock-test $(BUILD_BASE)/tty-ldisc-test $(BUILD_BASE)/spawn-search-test $(BUILD_BASE)/cpio-parser-test $(BUILD_BASE)/startup-strtoul-test $(BUILD_BASE)/spawn-fd-policy-test $(BUILD_BASE)/loader-end-test \
         $(BUILD_BASE)/serial-reply-test $(BUILD_BASE)/open-bind-test $(BUILD_BASE)/outcomes-test \
         $(BUILD_BASE)/sv39-lookup-test $(BUILD_BASE)/sv39-manip-test \
         $(BUILD_BASE)/strftime-test $(BUILD_BASE)/sh-scan-test $(BUILD_BASE)/tz-test \
@@ -447,11 +447,18 @@ $(BUILD_BASE)/cpio-parser-test: $(TEST_DIR)/test-cpio-parser.c ../../kernel/star
 	    -idirafter ../../internal/include -o $@ \
 	    $(TEST_DIR)/test-cpio-parser.c ../../kernel/startup/lib/cpio.c
 
+$(BUILD_BASE)/startup-strtoul-test: $(TEST_DIR)/test-startup-strtoul.c \
+                                    ../../kernel/startup/lib/strtoul.c
+	@mkdir -p $(@D)
+	$(msg) HOSTCC $(notdir $@)
+	$(Q)$(HOST_CC) $(HOST_CFLAGS) -I../../kernel/include -o $@ \
+	    $(TEST_DIR)/test-startup-strtoul.c
+
 host-tests: $(BUILD_BASE)/path-normalize-test $(BUILD_BASE)/cap-table-test \
             $(BUILD_BASE)/bootstrap-manifest-test $(BUILD_BASE)/elf-range-test \
             $(BUILD_BASE)/ldso-hash-test $(BUILD_BASE)/ldso-page-test \
             $(BUILD_BASE)/ldso-parse-test $(BUILD_BASE)/ldso-path-test \
-            $(BUILD_BASE)/ticket-lock-test $(BUILD_BASE)/tty-ldisc-test $(BUILD_BASE)/spawn-search-test $(BUILD_BASE)/cpio-parser-test $(BUILD_BASE)/spawn-fd-policy-test $(BUILD_BASE)/loader-end-test \
+            $(BUILD_BASE)/ticket-lock-test $(BUILD_BASE)/tty-ldisc-test $(BUILD_BASE)/spawn-search-test $(BUILD_BASE)/cpio-parser-test $(BUILD_BASE)/startup-strtoul-test $(BUILD_BASE)/spawn-fd-policy-test $(BUILD_BASE)/loader-end-test \
             $(BUILD_BASE)/serial-reply-test $(BUILD_BASE)/open-bind-test $(BUILD_BASE)/outcomes-test \
             $(BUILD_BASE)/sv39-lookup-test $(BUILD_BASE)/sv39-manip-test \
             $(BUILD_BASE)/strftime-test $(BUILD_BASE)/strftime-asan-test \
@@ -470,6 +477,7 @@ host-tests: $(BUILD_BASE)/path-normalize-test $(BUILD_BASE)/cap-table-test \
 	$(Q)$(BUILD_BASE)/ldso-parse-test
 	$(Q)$(BUILD_BASE)/ldso-path-test
 	$(Q)$(BUILD_BASE)/cpio-parser-test
+	$(Q)$(BUILD_BASE)/startup-strtoul-test
 	$(Q)$(BUILD_BASE)/tty-ldisc-test
 	$(Q)$(BUILD_BASE)/spawn-search-test
 	$(Q)$(BUILD_BASE)/ticket-lock-test

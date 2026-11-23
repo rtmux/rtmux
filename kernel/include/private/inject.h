@@ -311,6 +311,24 @@ enum {
  */
 #define INJECT_OP_SLOW_KPAGE_ZERO 47
 
+/* STALL_THREAD_CREATE(pid, ms): the next thread_create in process pid, once it
+ * has published the new thread and counted it active and before the thread
+ * first runs, spins for ms milliseconds (STALL_THREAD_CREATE), so a kill of pid
+ * lands while the thread is half made. SITE_STATUS reports whether it was
+ * taken.
+ */
+#define INJECT_OP_STALL_THREAD_CREATE 48
+
+/* RCU_STALL_WAITS(hart, reset): ret is how many RCU-sched grace-period waits on
+ * hart had to wait for a hart held in an injected stall (inject_stall_until) to
+ * leave its kernel call; reset clears the count after it is read. The waiter
+ * spins its own hart all that time, so a stall of seconds holds that hart too,
+ * whatever thread a test expected to run there. A test that sees the count of
+ * its thread's hart rise during its window knows its setup was spoiled by that,
+ * not by the code under test.
+ */
+#define INJECT_OP_RCU_STALL_WAITS 49
+
 enum inject_site {
     STALL_LOCK,
     STALL_LOCK_EARLY,
@@ -332,6 +350,7 @@ enum inject_site {
     STALL_UNBLOCK_FORCE,
     STALL_UNBLOCK_REPLY,
     STALL_KPAGE_ZERO,
+    STALL_THREAD_CREATE,
     STALL_SITES,
     INJECT_SITE_TURNSTILE = STALL_SITES,
     INJECT_SITE_REPLY_DETACHED

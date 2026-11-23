@@ -465,6 +465,7 @@ int kdecl ksys_timer_timeout(thread_t *act,
         act->args.to.timeptr = kap->otime; /* Save return time ptr. */
         SETKSTATUS(act, 0);
         inject_block_stall(act);
+        thread_wake_open(act); /* one waker may now end this sleep */
         act->state = STATE_NANOSLEEP;
         _TRACE_TH_EMIT_STATE(act, NANOSLEEP);
         /* block() is sched_slock-internal; drop preempt fence first. */

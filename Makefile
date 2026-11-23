@@ -311,7 +311,7 @@ check: check-posix-matrix-options check-pse51 check-posix-profile-header
 check: check-posix-profile-config check-posix-profile-surface check-lkl-profile
 check: check-syscall-abi check-libc-abi check-config-rebuild check-kcall-layouts check-make-target-names check-trace-export check-rt-budgets check-irq-contract
 check: check-platform-boundary-contracts
-check: check-serial-priority check-lock-rank check-driver-priorities check-prio-writes check-preempt-inventory check-loader-negative check-fu740-smoke-scripts check-crash-signatures
+check: check-serial-priority check-lock-rank check-driver-priorities check-prio-writes check-proc-flags check-preempt-inventory check-loader-negative check-fu740-smoke-scripts check-crash-signatures
 check: driver-gate $(LKL_CHECK_DEP) check-emu-headless check-rt check-qemu-deps
 check: $(AUTOCONF_H) $(VER_FILE) startup initramfs
 ifeq ($(CONFIG_LKL_SERVERS),y)
@@ -974,6 +974,11 @@ check-prio-writes:
 	$(msg) CHECK base and loan priority writes go through the accessors
 	$(Q)scripts/check-prio-writes.sh
 .PHONY: check-prio-writes
+
+check-proc-flags:
+	$(msg) CHECK process flag writes go through the atomic helpers
+	$(Q)scripts/check-proc-flags.sh
+.PHONY: check-proc-flags
 
 # Preemption-checkpoint inventory: every long or unbounded loop in the
 # scheduling-critical kernel subsystems must be classified in

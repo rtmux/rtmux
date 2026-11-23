@@ -21,11 +21,13 @@
 #include <limits.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <sys/mallocstats.h>
 #include <sys/resource.h>
 #include <unistd.h>
@@ -163,6 +165,69 @@ static void test_flockfile(void)
     } else {
         test_fail("flockfile pipe", "pipe() failed");
     }
+}
+
+/* Reading a line-buffered stream flushes pending line-buffered output even
+ * while another thread holds that output stream: the read waits for the holder
+ * instead of skipping its stream. The holder keeps the lock for a while after
+ * the reader starts, so a walk that skips held streams reads with "x" still
+ * buffered.
+ */
+static volatile int held_out;
+
+static void *hold_output(void *arg)
+{
+    FILE *out = arg;
+    flockfile(out);
+    __atomic_store_n(&held_out, 1, __ATOMIC_RELEASE);
+    (void) nanosleep(&(struct timespec){.tv_nsec = 50000000L}, NULL);
+    funlockfile(out);
+    return NULL;
+}
+
+static void test_refill_waits_held_output(void)
+{
+    const char *name = "line-buffered read flushes a held output stream";
+    int ofd[2], ifd[2];
+    char got = 0;
+    pthread_t holder;
+
+    if (pipe(ofd) != 0) {
+        test_fail(name, "pipe failed");
+        return;
+    }
+    if (pipe(ifd) != 0) {
+        close(ofd[0]);
+        close(ofd[1]);
+        test_fail(name, "pipe failed");
+        return;
+    }
+    FILE *out = fdopen(ofd[1], "w");
+    FILE *in = fdopen(ifd[0], "r");
+    int ok = out && in && setvbuf(out, NULL, _IOLBF, 64) == 0 &&
+             setvbuf(in, NULL, _IOLBF, 64) == 0 && fputs("x", out) >= 0 &&
+             write(ifd[1], "y", 1) == 1 &&
+             fcntl(ofd[0], F_SETFL, O_NONBLOCK) == 0;
+    __atomic_store_n(&held_out, 0, __ATOMIC_RELAXED);
+    if (ok && pthread_create(&holder, NULL, hold_output, out) == 0) {
+        while (!__atomic_load_n(&held_out, __ATOMIC_ACQUIRE))
+            sched_yield();
+        ok = fgetc(in) == 'y' && read(ofd[0], &got, 1) == 1 && got == 'x';
+        pthread_join(holder, NULL);
+    } else {
+        ok = 0;
+    }
+    if (out)
+        fclose(out);
+    else
+        close(ofd[1]);
+    if (in)
+        fclose(in);
+    else
+        close(ifd[0]);
+    close(ofd[0]);
+    close(ifd[1]);
+    check(ok, name, "output was still buffered when the read returned");
 }
 
 /* getchar_unlocked()/putchar_unlocked() are the stdin/stdout-bound _unlocked
@@ -1394,6 +1459,7 @@ void test_printf(void)
     test_printf_table();
     test_printf_special();
     test_flockfile();
+    test_refill_waits_held_output();
     test_char_unlocked_stdio();
     test_stdio_locked_ops();
     test_setvbuf_failure(0);

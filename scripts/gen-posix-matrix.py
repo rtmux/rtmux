@@ -1544,7 +1544,7 @@ def validate_sysconf_claims():
 
     bad = []
     for rel, sc, value in claims:
-        opt = "_POSIX_" + sc.removeprefix("_SC_")
+        opt = "_POSIX_" + (sc[len("_SC_"):] if sc.startswith("_SC_") else sc)
         if value == "-1" and opt in advertised:
             bad.append((rel, sc, "runtime -1 for advertised " + opt))
         elif value.startswith("_POSIX_") and value not in advertised:

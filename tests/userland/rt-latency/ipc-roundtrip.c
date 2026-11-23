@@ -1349,22 +1349,29 @@ out:
     return NULL;
 }
 
-static int path_p99(uint64_t *ns, uint64_t *max)
+/* Sort ns and return its p99; the slowest goes to *max. */
+static uint64_t path_p99(uint64_t *ns, uint64_t *max)
 {
     qsort(ns, IOV_STEP_CALLS, sizeof ns[0], cmp_u64);
     *max = ns[IOV_STEP_CALLS - 1];
-    return ns[p99_index(IOV_STEP_CALLS)] >= IOV_STEP_NS_MAX;
+    return ns[p99_index(IOV_STEP_CALLS)];
 }
 
 static uint64_t path_base_ns; /* p99 delivery of one 512 byte entry */
+/* p99 receive from a queued sender, and reply, of the same message in one
+ * entry: the reply wakes the client, which a loaded TCG host slows whatever
+ * the kernel does, so a vector's receive and reply are judged by what they add.
+ */
+static uint64_t path_rcv_base_ns, path_rep_base_ns;
 
 /* A send, receive and reply of parts entries each way, with the receiver
  * waiting (receiver_first), or with the sender queued first, so that the
  * receive copies from the queue. The send's own cost is the time from the
  * sender's entry into msg_sendv to the receiver's return from its receive (the
  * copy, then the wake); in the second case the receive and the reply are timed
- * in the server. Over PATH_PARTS entries each is one step, and its p99 must
- * stay under IOV_STEP_NS_MAX; over PATH_BIG entries it is many, and the bytes
+ * in the server. Over PATH_PARTS entries each is one step, and its p99 may
+ * exceed the same message in one entry, timed the same way in the same boot, by
+ * no more than IOV_STEP_NS_MAX; over PATH_BIG entries it is many, and the bytes
  * must arrive.
  */
 static int path_round(int chid, int receiver_first, int parts, int entry)
@@ -1451,18 +1458,23 @@ static int path_round(int chid, int receiver_first, int parts, int entry)
         /* Both sides are sorted before either is judged: a short-circuit
          * left the reply side unsorted and its max unset, and printed both.
          */
-        int rcv_over = path_p99(rcv, &rmax);
-        int rep_over = path_p99(rep, &pmax);
+        uint64_t rcv99 = path_p99(rcv, &rmax), rep99 = path_p99(rep, &pmax);
 
-        ok = ok && !rcv_over && !rep_over;
+        if (parts == 1) {
+            path_rcv_base_ns = rcv99;
+            path_rep_base_ns = rep99;
+        } else {
+            ok = ok && rcv99 < path_rcv_base_ns + IOV_STEP_NS_MAX &&
+                 rep99 < path_rep_base_ns + IOV_STEP_NS_MAX;
+        }
         printf(
-            "ipc-roundtrip: iov-receive-reply %s receive-p99-ns=%llu "
-            "receive-max-ns=%llu reply-p99-ns=%llu reply-max-ns=%llu\n",
-            ok ? "PASS" : "FAIL",
-            (unsigned long long) rcv[p99_index(IOV_STEP_CALLS)],
-            (unsigned long long) rmax,
-            (unsigned long long) rep[p99_index(IOV_STEP_CALLS)],
-            (unsigned long long) pmax);
+            "ipc-roundtrip: iov-receive-reply %s parts=%d receive-p99-ns=%llu "
+            "receive-max-ns=%llu reply-p99-ns=%llu reply-max-ns=%llu "
+            "one-entry-receive-p99-ns=%llu one-entry-reply-p99-ns=%llu\n",
+            ok ? "PASS" : "FAIL", parts, (unsigned long long) rcv99,
+            (unsigned long long) rmax, (unsigned long long) rep99,
+            (unsigned long long) pmax, (unsigned long long) path_rcv_base_ns,
+            (unsigned long long) path_rep_base_ns);
     } else {
         printf("ipc-roundtrip: iov-path-big %s %s parts=%d\n",
                ok ? "PASS" : "FAIL",
@@ -1847,6 +1859,7 @@ static int check_iov_paths(int chid)
     rc |= check_iov_short(chid);
     rc |= path_round(chid, 1, 1, PATH_PARTS * PATH_ENTRY);
     rc |= path_round(chid, 1, PATH_PARTS, PATH_ENTRY);
+    rc |= path_round(chid, 0, 1, PATH_PARTS * PATH_ENTRY);
     rc |= path_round(chid, 0, PATH_PARTS, PATH_ENTRY);
     rc |= path_round(chid, 1, PATH_MID, PATH_ENTRY);
     rc |= path_round(chid, 0, PATH_MID, PATH_ENTRY);

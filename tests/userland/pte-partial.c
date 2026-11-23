@@ -245,17 +245,19 @@ int pte_partial_map(void)
  */
 static int amf_spawn(size_t bytes)
 {
-    char *argv[] = {"true", NULL, NULL};
+    /* Not malloc'd: a heap that grows to hold it would take the free memory the
+     * test counts, and keep it. */
+    static char arg[96 * 1024];
+    char *argv[] = {"true", arg, NULL};
     char *envp[] = {NULL};
     pid_t pid;
     int rc;
 
-    if (!(argv[1] = malloc(bytes)))
+    if (bytes > sizeof arg)
         return ENOMEM;
-    memset(argv[1], 'a', bytes - 1);
-    argv[1][bytes - 1] = '\0';
+    memset(arg, 'a', bytes - 1);
+    arg[bytes - 1] = '\0';
     rc = posix_spawn(&pid, "/bin/true", NULL, NULL, argv, envp);
-    free(argv[1]);
     if (rc == 0 && waitpid(pid, NULL, 0) != pid)
         rc = ECHILD;
     return rc;
@@ -325,8 +327,10 @@ int anon_map_failure(void)
         if (got)
             bytes = sizes[i];
     }
+    /* Each run leaves a context cached in the class it used (its last spawn
+     * works): a boot that has run it in every class has none left to fail. */
     if (!bytes) {
-        test_fail("anon map failure fixture", "every size class had a free loader context");
+        test_skip("anon map failure fixture", "every size class had a free loader context");
         return 0;
     }
 

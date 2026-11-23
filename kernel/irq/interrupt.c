@@ -344,6 +344,7 @@ int kdecl ksys_interrupt_wait(thread_t *act,
     }
 
     SETKSTATUS(act, 0);
+    thread_wake_open(act); /* one waker may now end this wait */
     act->state = STATE_INTR;
     _TRACE_TH_EMIT_STATE(act, INTR);
 

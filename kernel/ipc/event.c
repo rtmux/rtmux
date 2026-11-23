@@ -303,8 +303,15 @@ int rdecl sigevent_exe(const struct sigevent *evp,
             if (evp->sigev_notify & SIGEV_FLAG_CRITICAL)
                 CRITICAL_MARK_THREAD(thp);
 
+            uint32_t wait_seq = thread_wake_seq(thp);
+
             if (thp->state == STATE_NANOSLEEP) {
-                ready(thp);
+                /* force_ready may end the same sleep on another hart. A claim
+                 * lost to an older sequence means the sleep this timer was for
+                 * has ended already.
+                 */
+                if (thread_wake_claim(thp, wait_seq))
+                    ready(thp);
             } else {
                 force_ready(thp, ETIMEDOUT);
             }

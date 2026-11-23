@@ -288,7 +288,9 @@ static int ser_read(ioserv_context_t *ctp, io_read_t *msg, void *ocb)
     if ((c = ser_jobctl_gate(ctp->info.pid, 0)) != 0)
         return c;
 
-    unsigned size = msg->i.nbytes < TTY_QUEUE ? msg->i.nbytes : TTY_QUEUE;
+    /* At most TTY_QUEUE bytes, so it fits an unsigned. */
+    unsigned size =
+        (unsigned) (msg->i.nbytes < TTY_QUEUE ? msg->i.nbytes : TTY_QUEUE);
     if (size > ctp->msg_max_size)
         size = (unsigned) ctp->msg_max_size;
     struct tty_read_clock clock = {0};

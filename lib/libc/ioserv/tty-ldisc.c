@@ -40,6 +40,16 @@ void ioserv_ldisc_set(struct ioserv_ldisc *ld,
         ld->tail = ld->head;
         ld->editing = 0;
     } else if ((old->c_lflag & ICANON) && !(next->c_lflag & ICANON)) {
+        unsigned count = ld->head - ld->tail;
+        unsigned head = ld->tail;
+
+        /* EOF is an event, not a byte; line ends retain their byte only. */
+        for (unsigned i = 0; i < count; i++) {
+            unsigned v = ld->queue[(ld->tail + i) % TTY_QUEUE];
+            if (v != TTY_EOF)
+                ld->queue[head++ % TTY_QUEUE] = (uint16_t) (v & 0xff);
+        }
+        ld->head = head;
         for (unsigned i = 0; i < ld->editing; i++)
             append(ld, ld->line[i]);
         ld->editing = 0;

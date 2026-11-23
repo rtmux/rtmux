@@ -725,7 +725,27 @@ void strap_handler_c(CPU_REGISTERS *regs)
                              * interrupt_wait returns to U-mode), not trap entry
                              * to ready().
                              */
-                            if (target == here || target->state != STATE_INTR) {
+                            /* A remote force_ready may be ending this wait: the
+                             * loser keeps the interrupt pending. If the IST has
+                             * moved on to a new wait meanwhile, claim that one,
+                             * or it could sleep with the interrupt pending.
+                             */
+                            bool claimed = false;
+
+                            for (;;) {
+                                uint32_t wait_seq = thread_wake_seq(target);
+
+                                if (target == here ||
+                                    target->state != STATE_INTR)
+                                    break;
+                                if (thread_wake_claim(target, wait_seq)) {
+                                    claimed = true;
+                                    break;
+                                }
+                                if (thread_wake_seq(target) == wait_seq)
+                                    break;
+                            }
+                            if (!claimed) {
                                 atomic_or((volatile unsigned *) &target->flags,
                                           RTMUX_FLG_THR_INTR_PENDING);
                             } else {

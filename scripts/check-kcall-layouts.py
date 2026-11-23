@@ -58,19 +58,21 @@ def dump(gdb, elves, names):
     try:
         runs = [subprocess.Popen([gdb, "-batch", "-nx", "-ex", f"source {DUMP}", elf],
                                  env=env, stdout=subprocess.PIPE,
-                                 stderr=subprocess.DEVNULL, text=True)
+                                 stderr=subprocess.PIPE, text=True)
                 for elf in elves]
     except FileNotFoundError:
         fail(f"no {gdb} (set GDB to a gdb with Python for this target)")
     layouts = []
     for elf, run in zip(elves, runs):
-        out = run.communicate()[0]
+        out, err = run.communicate()
         for line in out.splitlines():
             if line.startswith("KCALLJSON"):
                 layouts.append(json.loads(line[len("KCALLJSON"):]))
                 break
         else:
-            fail(f"{gdb} gave no layouts for {elf} (a gdb with Python is needed)")
+            tail = "\n".join(err.strip().splitlines()[-5:])
+            fail(f"{gdb} gave no layouts for {elf} (a gdb with Python is needed)"
+                 + (f":\n{tail}" if tail else ""))
     return layouts
 
 

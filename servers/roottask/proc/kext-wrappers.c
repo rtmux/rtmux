@@ -459,7 +459,9 @@ struct kcall_args_kpage_zero {
 };
 
 /* kernel_page_zero — zero kernel-direct-map memory backing a physical range.
- * Wraps __KSYS_PRIV_KPAGE_ZERO; see the struct comment above. Parameters:
+ * Wraps __KSYS_PRIV_KPAGE_ZERO, calling it until the whole range is zeroed:
+ * each call stops at its time budget and leaves paddr and len at the rest.
+ * Parameters:
  *   paddr : physical base of the region to zero
  *   len   : number of bytes to zero
  * Return value: EOK on success, errno on failure.
@@ -468,9 +470,21 @@ int kernel_page_zero(paddr_t paddr, size_t len)
 {
     struct kcall_args_kpage_zero data;
 
+    /* The kernel takes at most 16 MiB a call and refuses more. */
+    const size_t max = (size_t) 16 << 20;
+
     data.paddr = paddr;
-    data.len = len;
-    return (int) syscall_priv(__KSYS_PRIV_KPAGE_ZERO, &data);
+    while (len) {
+        data.len = len < max ? len : max;
+        len -= data.len;
+        do { /* each call leaves paddr and len at what it did not reach */
+            int rc = (int) syscall_priv(__KSYS_PRIV_KPAGE_ZERO, &data);
+
+            if (rc != EOK)
+                return rc;
+        } while (data.len);
+    }
+    return EOK;
 }
 
 /* kernel_icache_sync_all — broadcast fence.i to every hart (slot

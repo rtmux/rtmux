@@ -518,6 +518,6 @@ void process_destroy(process_t *prp, pid_t killer_pid)
     if (!thp)
         return;
 
-    prp->flags |= RTMUX_FLG_PROC_DESTROYALL;
+    PROC_FLG_SET(prp, RTMUX_FLG_PROC_DESTROYALL);
     atomic_or(&thp->flags, RTMUX_FLG_THR_DETACHED | RTMUX_FLG_THR_KILLSELF);
 }

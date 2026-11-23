@@ -37,6 +37,26 @@ struct root_ticket {
     unsigned key;
 };
 
+/* roottask's message pool has at most ROOT_POOL_THREADS threads
+ * (sys/message.c), and each root_wait waiter holds one. The waits that use it,
+ * with their own limits: the posix_spawn heap gate (PSPAWN_GATE_WAITERS),
+ * loader contexts (LOADER_CONTEXT_WAITERS), and a spawner's share, inside and
+ * outside the gate (LOADER_SHARE_WAITERS each). Together they may hold at most
+ * two thirds of the pool (ROOT_WAIT_POOL_MAX), checked here when a limit
+ * changes. That bounds the root_wait waiters only: pool threads also block
+ * elsewhere (condition waits in the memory code, lock retries, sends to other
+ * servers), uncounted.
+ */
+#define ROOT_POOL_THREADS 75
+#define ROOT_WAIT_POOL_MAX (ROOT_POOL_THREADS * 2 / 3)
+#define PSPAWN_GATE_WAITERS 16
+#define LOADER_CONTEXT_WAITERS 16
+#define LOADER_SHARE_WAITERS 8
+_Static_assert(PSPAWN_GATE_WAITERS + LOADER_CONTEXT_WAITERS +
+                       2 * LOADER_SHARE_WAITERS <=
+                   ROOT_WAIT_POOL_MAX,
+               "root_wait limits exceed their share of the message pool");
+
 struct root_wait {
     pthread_cond_t cond;       /* set up by the first root_wait_until() */
     unsigned waiting;          /* threads in root_wait_until() */
@@ -83,7 +103,7 @@ static inline uint64_t root_now_ns(void)
     struct timespec ts;
 
     (void) clock_gettime(CLOCK_MONOTONIC, &ts);
-    return timespec2nsec(&ts);
+    return (uint64_t) ts.tv_sec * 1000000000u + (uint64_t) ts.tv_nsec;
 }
 
 /* A wait's deadline in ns of CLOCK_MONOTONIC, *until, kept by its caller across

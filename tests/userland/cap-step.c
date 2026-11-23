@@ -8,7 +8,7 @@
  * with afterwards, from a snapshot the kernel takes of the sender's copy and
  * then writes over the head of what the receiver was given.
  *
- * - cap_long_stepped: a 256 KiB message that names an endpoint capability
+ * - cap_long_stepped: a 4 MiB message that names an endpoint capability
  *   arrives whole, with the capability installed (the id rewritten), after
  *   more than one kernel entry.
  * - cap_header_snapshot: the sender's header is rewritten by a sibling after
@@ -35,6 +35,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/mman.h>
 #include <sys/iomsg.h>
 #include <sys/states.h>
 #include <sys/rtmux-core.h>
@@ -42,12 +43,16 @@
 #include "../../kernel/include/private/inject.h"
 #include "test.h"
 
-#define CS_BYTES (256 * 1024)
+/* Large enough that the long copy outlasts one step's time budget on any host:
+ * 256 KiB could go in one step on a fast one, and then nothing was stepped to
+ * check. Mapped when the suite runs, not in the binary's bss.
+ */
+#define CS_BYTES (4 * 1024 * 1024)
 #define CS_WAIT_MS 10000
 #define CS_SPARSE 100 /* empty entries ahead of the data: over the limit */
 #define CS_BOGUS_CAP 0x7ead00000badULL
 
-static unsigned char cs_out[CS_BYTES], cs_in[CS_BYTES];
+static unsigned char *cs_out, *cs_in;
 
 struct cs_send {
     int coid;
@@ -129,7 +134,7 @@ static void cap_long_stepped(int chid, int coid, uint64_t cap, const char *pid)
     int rcvid, yields;
 
     cs_fill(cap);
-    memset(cs_in, 0, sizeof cs_in);
+    memset(cs_in, 0, CS_BYTES);
     if (inject_run("xfer-trace", pid, NULL) != 0 ||
         pthread_create(&ts, NULL, cs_sender, &snd) != 0) {
         test_fail(name, "arm or sender thread failed");
@@ -173,7 +178,7 @@ static void cap_header_snapshot(int chid, int coid, const char *pid)
      * hold. Nothing may hand that id to the receiver as an installed one.
      */
     cs_fill(CS_BOGUS_CAP);
-    memset(cs_in, 0, sizeof cs_in);
+    memset(cs_in, 0, CS_BYTES);
     if (test_pin_mask(1) != 0 ||
         pthread_create(&tr, NULL, cs_receiver, &rcv) != 0 ||
         pthread_create(&ts, NULL, cs_sender, &snd) != 0 ||
@@ -453,11 +458,19 @@ int test_cap_step(void)
     int chid, coid;
     bool inject = inject_run("alloc-status", NULL, NULL) == 0;
 
+    cs_out = mmap(NULL, 2 * (size_t) CS_BYTES, PROT_READ | PROT_WRITE,
+                  MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (cs_out == MAP_FAILED) {
+        test_fail("cap_step setup", "could not map the buffers");
+        return 0;
+    }
+    cs_in = cs_out + CS_BYTES;
     memset(&info, 0, sizeof info);
     if (!test_chan_open(0, &chid, &coid) ||
         connect_server_info(0, (uint64_t) coid, &info) != coid ||
         info.endpoint_cap == 0) {
         test_fail("cap_step setup", "channel, connection or endpoint cap");
+        (void) munmap(cs_out, 2 * (size_t) CS_BYTES);
         return 0;
     }
     snprintf(pid, sizeof pid, "%d", (int) getpid());
@@ -472,5 +485,6 @@ int test_cap_step(void)
     }
     (void) __connect_detach((uint64_t) coid);
     (void) channel_destroy(chid);
+    (void) munmap(cs_out, 2 * (size_t) CS_BYTES);
     return 0;
 }

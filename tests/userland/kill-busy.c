@@ -62,6 +62,9 @@
 #define KILL_RESOLVE_ROUNDS 24
 #define KILL_MAP_BYTES (8UL * 1024 * 1024)
 #define KILL_MAP_SLOW "2000/2048" /* 2 ms more for each of its 2048 pages */
+/* How long a held thread create spins, and how often the case runs. */
+#define KILL_CREATE_STALL_MS "300"
+#define KILL_CREATE_ROUNDS 5
 
 static uint64_t kb_now_ns(void)
 {
@@ -625,6 +628,65 @@ out:
     (void) inject_run("site-release", "kpage-zero", NULL);
     (void) close(to_child[1]);
     (void) close(from_child[0]);
+}
+
+/* Kill a process while one of its pthread_create calls is held in the window
+ * where the new thread is published but has not run. The exit's destroy
+ * pass then finds a thread that is still STATE_DEAD: it used to take it for an
+ * exited zombie and free it under its creator, or finish while the thread was
+ * not yet counted active and let the address space go, so the thread started
+ * in a freed address space and the victim was never reaped.
+ */
+static void test_kill_during_create(void)
+{
+    const char *name = "kill_during_thread_create";
+    char *argv[] = {"syscall_testing", "--thread-loop-child", NULL};
+    char pidarg[16], detail[128];
+    int status = 0, reaped;
+    uint64_t t0, waited;
+    pid_t pid;
+
+    if (inject_run("alloc-status", NULL, NULL) != 0) {
+        test_skip(name, "fault injection unavailable");
+        return;
+    }
+    if (posix_spawn(&pid, "/bin/syscall_testing", NULL, NULL, argv, NULL) !=
+        0) {
+        test_fail(name, "spawn failed");
+        return;
+    }
+    (void) snprintf(pidarg, sizeof pidarg, "%d", (int) pid);
+    if (inject_run("stall-thread-create", pidarg, KILL_CREATE_STALL_MS) != 0 ||
+        inject_run("site-wait", "thread-create", NULL) != 0) {
+        test_fail(name, "the victim never reached the held thread create");
+        (void) kill(pid, SIGKILL);
+        (void) kb_reap(pid, &status, KILL_BUSY_OUTLIVE_NS);
+        goto out;
+    }
+    t0 = kb_now_ns();
+    (void) kill(pid, SIGKILL);
+    reaped = kb_reap(pid, &status, KILL_BUSY_LIMIT_NS);
+    waited = kb_now_ns() - t0;
+    (void) snprintf(detail, sizeof detail,
+                    "reaped=%d after %llu ms (limit %llu), status 0x%x", reaped,
+                    (unsigned long long) (waited / 1000000),
+                    (unsigned long long) (KILL_BUSY_LIMIT_NS / 1000000), status);
+    printf("  INFO  %s: %s\n", name, detail);
+    check(reaped && WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL, name,
+          detail);
+    if (!reaped) {
+        (void) kill(pid, SIGKILL);
+        (void) kb_reap(pid, &status, KILL_BUSY_OUTLIVE_NS);
+    }
+out:
+    (void) inject_run("site-release", "thread-create", NULL);
+}
+
+/* --create-kill: the case, as a debug-inject stage. */
+void test_kill_create(void)
+{
+    for (int i = 0; i < KILL_CREATE_ROUNDS; i++)
+        test_kill_during_create();
 }
 
 /* --map-kill: the debug-inject stage's case alone. */

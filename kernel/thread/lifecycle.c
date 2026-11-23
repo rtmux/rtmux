@@ -33,6 +33,13 @@ static void thread_recycle_reset(thread_t *thp)
 {
     memset(thp, 0, __builtin_offsetof(thread_t, real_priority));
     thp->state = STATE_DEAD;
+
+    /* wake_seq survives recycling; keep its claim closed until the new thread
+     * opens its first lockless wait (thread_wake_open), so a late waker of the
+     * old one cannot claim it.
+     */
+    __atomic_store_n(&thp->wake_claimed, thread_wake_seq(thp),
+                     __ATOMIC_RELAXED);
     thp->reserved_word = 0;
     thp->runcpu = 0;
     thp->internal_flags = 0;
@@ -191,8 +198,21 @@ static uint64_t thread_destroy_cycles_to_ns(uint64_t cycles_delta);
 void rdecl thread_destroy_stats_snapshot(struct _thread_destroy_stats *out,
                                          int reset)
 {
+    /* The joiner-woken shares are taken before the totals they are part of,
+     * with acquire against thread_destroy_stats_add's release: a share seen
+     * here then has its total add seen too, so no snapshot holds a share larger
+     * than its total.
+     */
     if (reset) {
         __atomic_store_n(&thread_destroy_stats_enabled, 0, __ATOMIC_RELEASE);
+        out->join_rcu_wait_ns = __atomic_exchange_n(
+            &thread_destroy_join_rcu_wait_ns, 0, __ATOMIC_ACQUIRE);
+        out->join_pin_wait_ns = __atomic_exchange_n(
+            &thread_destroy_join_pin_wait_ns, 0, __ATOMIC_ACQUIRE);
+        out->join_active_scan_ns = __atomic_exchange_n(
+            &thread_destroy_join_active_scan_ns, 0, __ATOMIC_ACQUIRE);
+        out->join_object_free_ns = __atomic_exchange_n(
+            &thread_destroy_join_object_free_ns, 0, __ATOMIC_ACQUIRE);
         out->rcu_wait_ns = __atomic_exchange_n(&thread_destroy_rcu_wait_ns, 0,
                                                __ATOMIC_RELAXED);
         out->rcu_enroll_ns = __atomic_exchange_n(&thread_destroy_rcu_enroll_ns,
@@ -313,20 +333,20 @@ void rdecl thread_destroy_stats_snapshot(struct _thread_destroy_stats *out,
             &thread_destroy_post_name_ns, 0, __ATOMIC_RELAXED);
         out->destroy_post_notify_ns = __atomic_exchange_n(
             &thread_destroy_post_notify_ns, 0, __ATOMIC_RELAXED);
-        out->join_rcu_wait_ns = __atomic_exchange_n(
-            &thread_destroy_join_rcu_wait_ns, 0, __ATOMIC_RELAXED);
-        out->join_pin_wait_ns = __atomic_exchange_n(
-            &thread_destroy_join_pin_wait_ns, 0, __ATOMIC_RELAXED);
-        out->join_active_scan_ns = __atomic_exchange_n(
-            &thread_destroy_join_active_scan_ns, 0, __ATOMIC_RELAXED);
-        out->join_object_free_ns = __atomic_exchange_n(
-            &thread_destroy_join_object_free_ns, 0, __ATOMIC_RELAXED);
         out->calls =
             __atomic_exchange_n(&thread_destroy_calls, 0, __ATOMIC_ACQUIRE);
         if (reset == 1)
             __atomic_store_n(&thread_destroy_stats_enabled, 1,
                              __ATOMIC_RELEASE);
     } else {
+        out->join_rcu_wait_ns =
+            __atomic_load_n(&thread_destroy_join_rcu_wait_ns, __ATOMIC_ACQUIRE);
+        out->join_pin_wait_ns =
+            __atomic_load_n(&thread_destroy_join_pin_wait_ns, __ATOMIC_ACQUIRE);
+        out->join_active_scan_ns = __atomic_load_n(
+            &thread_destroy_join_active_scan_ns, __ATOMIC_ACQUIRE);
+        out->join_object_free_ns = __atomic_load_n(
+            &thread_destroy_join_object_free_ns, __ATOMIC_ACQUIRE);
         out->calls = __atomic_load_n(&thread_destroy_calls, __ATOMIC_ACQUIRE);
         out->rcu_wait_ns =
             __atomic_load_n(&thread_destroy_rcu_wait_ns, __ATOMIC_RELAXED);
@@ -448,14 +468,6 @@ void rdecl thread_destroy_stats_snapshot(struct _thread_destroy_stats *out,
             __atomic_load_n(&thread_destroy_post_name_ns, __ATOMIC_RELAXED);
         out->destroy_post_notify_ns =
             __atomic_load_n(&thread_destroy_post_notify_ns, __ATOMIC_RELAXED);
-        out->join_rcu_wait_ns =
-            __atomic_load_n(&thread_destroy_join_rcu_wait_ns, __ATOMIC_RELAXED);
-        out->join_pin_wait_ns =
-            __atomic_load_n(&thread_destroy_join_pin_wait_ns, __ATOMIC_RELAXED);
-        out->join_active_scan_ns = __atomic_load_n(
-            &thread_destroy_join_active_scan_ns, __ATOMIC_RELAXED);
-        out->join_object_free_ns = __atomic_load_n(
-            &thread_destroy_join_object_free_ns, __ATOMIC_RELAXED);
     }
     out->reset = 0;
     out->reserved = 0;
@@ -605,14 +617,15 @@ static void thread_destroy_stats_add(uint64_t rcu_wait_ns,
                            __ATOMIC_RELAXED);
         __atomic_fetch_add(&thread_destroy_post_notify_ns, post_notify_ns,
                            __ATOMIC_RELAXED);
+        /* Release: the totals above are added before a share is seen. */
         __atomic_fetch_add(&thread_destroy_join_rcu_wait_ns,
-                           (unsigned long) rcu_wait_ns, __ATOMIC_RELAXED);
+                           (unsigned long) rcu_wait_ns, __ATOMIC_RELEASE);
         __atomic_fetch_add(&thread_destroy_join_pin_wait_ns,
-                           (unsigned long) pin_wait_ns, __ATOMIC_RELAXED);
+                           (unsigned long) pin_wait_ns, __ATOMIC_RELEASE);
         __atomic_fetch_add(&thread_destroy_join_active_scan_ns,
-                           (unsigned long) active_scan_ns, __ATOMIC_RELAXED);
+                           (unsigned long) active_scan_ns, __ATOMIC_RELEASE);
         __atomic_fetch_add(&thread_destroy_join_object_free_ns,
-                           (unsigned long) object_free_ns, __ATOMIC_RELAXED);
+                           (unsigned long) object_free_ns, __ATOMIC_RELEASE);
     }
     old_max =
         __atomic_load_n(&thread_destroy_rcu_busy_peer_max, __ATOMIC_RELAXED);
@@ -979,9 +992,9 @@ static void thread_as_unbind(thread_t *thp)
  * is next, and a borrow now would outlive it.
  *
  * Setting thp's own process when it is already set changes nothing and needs no
- * lock (every return of a roottask thread to user mode makes this call).
- * Only thp itself makes thp's as_prp a borrow (and thread_create, before thp
- * first runs), and the other writers only clear it: thread_as_release_borrowers
+ * lock (every return of a roottask thread to user mode makes this call). Only
+ * thp itself makes thp's as_prp a borrow (and thread_create, before thp first
+ * runs), and the other writers only clear it: thread_as_release_borrowers
  * clears a borrower of another process, which thp is not while as_prp is its
  * own, and thread_clear_as_prp_if clears it for thp's own process's teardown,
  * which may as well come right after this call as right before it.
@@ -1347,8 +1360,16 @@ int rdecl thread_create(thread_t *act,
      * would start, and run, in an address space the exit then frees. The exit
      * marks the process under this lock, so a thread added before the mark is
      * seen by the pass.
+     *
+     * An exec under way refuses the same way, for the same pass: EXEC_BEGIN
+     * marks the process (exec_thp) under this lock and then walks the vector
+     * without it, so a vector_add here could grow the vector and free the slots
+     * the walk is reading. The mark is cleared under this lock when the new
+     * image is committed; the exec caller itself is held in roottask's reply
+     * until then and creates nothing.
      */
-    if (prp->flags & (RTMUX_FLG_PROC_TERMING | RTMUX_FLG_PROC_DESTROYALL))
+    if ((prp->flags & (RTMUX_FLG_PROC_TERMING | RTMUX_FLG_PROC_DESTROYALL)) ||
+        prp->exec_thp)
         tid = -2;
     else
         tid = vector_add(&prp->threads, thp, 0);
@@ -1366,9 +1387,19 @@ int rdecl thread_create(thread_t *act,
         }
         (void) thread_set_as_prp(thp, NULL);
         object_free(prp, &thread_souls, thp);
-        return tid == -2 ? ESRCH : EAGAIN;
+
+        /* pthread_create in a process whose exit has begun gets EAGAIN, the
+         * code POSIX gives it for a thread that cannot be made; a creator in
+         * another process (roottask) is told the target is gone.
+         */
+        return (tid == -2 && act->process != prp) ? ESRCH : EAGAIN;
     }
     thp->tid = (uint32_t) tid; /* always >= 0 after vector_add succeeds */
+
+    /* From here the thread is published but has not run yet; debug-inject can
+     * hold this window open for a kill to land in (STALL_THREAD_CREATE).
+     */
+    inject_thread_create_published(prp);
 
 
     /* Give the vendor extension a chance to take first dibs */
@@ -2486,7 +2517,7 @@ void rdecl thread_destroyall(thread_t *thp)
         }
     }
 
-    prp->flags |= RTMUX_FLG_PROC_DESTROYALL;
+    PROC_FLG_SET(prp, RTMUX_FLG_PROC_DESTROYALL);
 }
 
 

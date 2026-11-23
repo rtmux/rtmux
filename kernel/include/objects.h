@@ -274,8 +274,8 @@ typedef struct process_entry {
 
     /* The thread that called exec while its swap is under way (set by the begin
      * step, cleared by the commit), compared and never dereferenced: it tells a
-     * retry of the begin step from a second exec of another thread. Guarded by
-     * vec_slock.
+     * retry of the begin step from a second exec of another thread, and while
+     * it is set thread_create refuses a new thread. Guarded by vec_slock.
      */
     thread_t *exec_thp;
 
@@ -902,6 +902,18 @@ typedef struct thread_entry { /* Also used for vthread_entry */
      */
     uint32_t wake_seq;
 
+    /* The wake_seq of the last lockless wait a waker claimed the right to end
+     * (thread_wake_claim). NANOSLEEP, SIGSUSPEND, SIGWAITINFO and INTR have no
+     * lock that decides who wakes the thread, and force_ready, the sleep timer
+     * and the PLIC path may each try at once on different harts; ready()'s
+     * duplicate test runs under a per-hart lock, so two of them used to queue
+     * the thread twice, and its stale entry later dispatched it after it died.
+     * thread_note_wakeup closes it past the wait it ends, however that wait
+     * ended, and the thread opens the next one as it enters it
+     * (thread_wake_open), so a late waker that saw an earlier wait loses.
+     */
+    uint32_t wake_claimed;
+
     /* The priority list this thread is queued on while READY (DISPATCH_LINK_*),
      * under that run queue's lock; its priority may differ meanwhile.
      */
@@ -936,7 +948,42 @@ static inline uint32_t thread_wake_seq(const thread_t *thp)
 
 static inline void thread_note_wakeup(thread_t *thp)
 {
-    __atomic_fetch_add(&thp->wake_seq, 1, __ATOMIC_RELEASE);
+    uint32_t ended = __atomic_fetch_add(&thp->wake_seq, 1, __ATOMIC_ACQ_REL);
+
+    /* However the wait ended, it is claimed now, and the next one stays closed
+     * until the thread opens it as it enters that wait (thread_wake_open). The
+     * count moves before the state leaves the old wait: a waker that reads the
+     * new count and the old state must not win the next wait and ready the
+     * thread a second time while this wake is still queueing it.
+     */
+    __atomic_store_n(&thp->wake_claimed, ended + 1, __ATOMIC_RELEASE);
+}
+
+/* The thread enters lockless wait wake_seq: let one waker claim it. Called by
+ * the thread itself before it publishes the wait state; the fence orders the
+ * open before that state store.
+ */
+static inline void thread_wake_open(thread_t *thp)
+{
+    __atomic_store_n(&thp->wake_claimed, thread_wake_seq(thp) - 1,
+                     __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+}
+
+/* Claim the right to end thp's lockless wait seq. While thp is in wait s,
+ * wake_claimed is s - 1 (free) or s (claimed); outside an opened wait it is
+ * neither, so a waker holding an older sequence, or one that read a newer count
+ * with a stale wait state, can neither win nor disturb a later claim. Exactly
+ * one waker of a wait gets true. The fence orders the caller's read of the wait
+ * state before the claim.
+ */
+static inline bool thread_wake_claim(thread_t *thp, uint32_t seq)
+{
+    uint32_t free_seq = seq - 1;
+
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    return __atomic_compare_exchange_n(&thp->wake_claimed, &free_seq, seq, 0,
+                                       __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
 }
 
 /* Map a dispatch-list LINK3_NODE pointer back to its enclosing thread_t. The

@@ -655,8 +655,8 @@ void kext_proc_wait_finalize(void *data)
                 prp->running_time + prp->kids_running_time;
             parent->kids_system_time +=
                 prp->system_time + prp->kids_system_time;
-            prp->flags &= ~RTMUX_FLG_PROC_WAITINFO;
-            prp->flags |= RTMUX_FLG_PROC_WAITDONE;
+            PROC_FLG_CLR(prp, RTMUX_FLG_PROC_WAITINFO);
+            PROC_FLG_SET(prp, RTMUX_FLG_PROC_WAITDONE);
         }
         if (prp->flags & RTMUX_FLG_PROC_ZOMBIE) {
             kap->send_term_notification = 1;
@@ -672,7 +672,7 @@ void kext_proc_wait_finalize(void *data)
          */
         break;
     case WCONTINUED:
-        prp->flags &= ~RTMUX_FLG_PROC_CONTINUED;
+        PROC_FLG_CLR(prp, RTMUX_FLG_PROC_CONTINUED);
         break;
     default:
         break;
@@ -721,8 +721,8 @@ void kext_proc_nozombie_mark(void *data)
     (void) kap->si_proc_pid;
     (void) kap->status;
     kspinlock_lock(&prp->vec_slock);
-    prp->flags |= RTMUX_FLG_PROC_WAITINFO;
-    prp->flags |= RTMUX_FLG_PROC_NOZOMBIE;
+    PROC_FLG_SET(prp, RTMUX_FLG_PROC_WAITINFO);
+    PROC_FLG_SET(prp, RTMUX_FLG_PROC_NOZOMBIE);
     kspinlock_unlock(&prp->vec_slock);
     rcu_read_unlock(&process_rcu);
     SETKSTATUS(act, EOK);
@@ -749,15 +749,14 @@ void kext_proc_exit_mark(void *data)
         return;
     }
     kspinlock_lock(&prp->vec_slock);
-    prp->flags |= RTMUX_FLG_PROC_TERMING;
-    prp->flags |= RTMUX_FLG_PROC_DESTROYALL;
+    PROC_FLG_SET(prp, RTMUX_FLG_PROC_TERMING | RTMUX_FLG_PROC_DESTROYALL);
     prp->boundary_addr = VM_KERN_SPACE_BOUNDARY;
 
     /* siginfo moved to root_process_t; caller stamps it via
      * root_proc(pid)->siginfo before invoking this kernel extension.
      */
     (void) kap->exit_status;
-    prp->flags |= RTMUX_FLG_PROC_WAITINFO;
+    PROC_FLG_SET(prp, RTMUX_FLG_PROC_WAITINFO);
     kspinlock_unlock(&prp->vec_slock);
     rcu_read_unlock(&process_rcu);
     SETKSTATUS(act, EOK);
@@ -871,7 +870,7 @@ void kext_proc_exit_finalize(void *data)
         return;
     }
     kspinlock_lock(&prp->vec_slock);
-    prp->flags &= ~RTMUX_FLG_PROC_TERMING;
+    PROC_FLG_CLR(prp, RTMUX_FLG_PROC_TERMING);
     prp->priv_caps = 0;
     kspinlock_unlock(&prp->vec_slock);
     rcu_read_unlock(&process_rcu);
@@ -902,9 +901,9 @@ void kext_proc_flags_op(void *data)
         return;
     }
     kspinlock_lock(&prp->vec_slock);
-    prp->flags &= ~kap->flags_clear;
-    prp->flags |= kap->flags_set;
-    kap->flags_after = prp->flags;
+    PROC_FLG_CLR(prp, kap->flags_clear);
+    PROC_FLG_SET(prp, kap->flags_set);
+    kap->flags_after = __atomic_load_n(&prp->flags, __ATOMIC_RELAXED);
     kspinlock_unlock(&prp->vec_slock);
     rcu_read_unlock(&process_rcu);
     SETKSTATUS(act, EOK);

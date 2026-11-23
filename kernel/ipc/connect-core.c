@@ -31,10 +31,13 @@ void rdecl connect_detach(connect_t *cop, unsigned prio)
                     chp, prio | _NOTIFICATION_PRIO_BOOST,
                     _NOTIFICATION_CODE_DISCONNECT, 0,
                     cop->scoid | (int) RTMUX_SIDE_CHANNEL,
-                    cop->nresv ? NOTIFICATION_DELIVER_RESERVED_FLAG : 0);
+                    __atomic_load_n(&cop->nresv, __ATOMIC_ACQUIRE)
+                        ? NOTIFICATION_DELIVER_RESERVED_FLAG
+                        : 0);
 
-                /* The reserved soul has been popped (or the server is gone);
-                 * the reservation has done its job either way.
+                /* The notice is delivered: it popped the reserved soul, merged
+                 * with a queued notice, or went straight to a receiver (or the
+                 * server is gone). The reservation has done its job.
                  */
                 connect_unreserve(cop);
 
@@ -114,11 +117,12 @@ int rdecl connect_client_drop(connect_t *cop, unsigned prio)
             _TRACE_COMM_EMIT_SNOTIFICATION_DIS(cop,
                                                cop->scoid | RTMUX_SIDE_CHANNEL,
                                                prio | _NOTIFICATION_PRIO_BOOST);
-            notification_deliver(
-                chp, prio | _NOTIFICATION_PRIO_BOOST,
-                _NOTIFICATION_CODE_DISCONNECT, 0,
-                cop->scoid | (int) RTMUX_SIDE_CHANNEL,
-                cop->nresv ? NOTIFICATION_DELIVER_RESERVED_FLAG : 0);
+            notification_deliver(chp, prio | _NOTIFICATION_PRIO_BOOST,
+                                 _NOTIFICATION_CODE_DISCONNECT, 0,
+                                 cop->scoid | (int) RTMUX_SIDE_CHANNEL,
+                                 __atomic_load_n(&cop->nresv, __ATOMIC_ACQUIRE)
+                                     ? NOTIFICATION_DELIVER_RESERVED_FLAG
+                                     : 0);
             connect_unreserve(cop);
 
             /* No longer associated with the client: lookup_rcvid() must fail.

@@ -40,11 +40,14 @@ int _connect_entry(int base,
     /* A caller that asks for the cancellation point is open(), by way of
      * _vopen, and nobody else today: it also gets EINTR from a signal (see
      * connect_send()). One that wants the first without the second needs a way
-     * to say so.
+     * to say so. An open that creates or truncates is not interruptible once
+     * sent: the server may already have done it, and EINTR would tell the
+     * caller that nothing happened. It stays a cancellation point.
      */
     if (testcancel) {
         ctrl.send = msg_sendv;
-        ctrl.flags |= FLAG_INTERRUPTIBLE;
+        if (!(oflag & (O_CREAT | O_TRUNC)))
+            ctrl.flags |= FLAG_INTERRUPTIBLE;
     } else {
         ctrl.send = msg_sendvnc;
     }

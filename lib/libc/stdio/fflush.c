@@ -14,7 +14,7 @@ int fflush(FILE *fp)
     int retval;
 
     if (!fp)
-        return _fwalk(__sflush, 0);
+        return _fwalk(__sflush, FWALK_WAIT);
 
     FLOCKFILE(fp);
     if ((fp->_flags & (__SWR | __SRW)) == 0) {

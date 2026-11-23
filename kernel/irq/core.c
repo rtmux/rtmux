@@ -229,7 +229,7 @@ int rdecl interrupt_attach(unsigned level,
         return -1;
     }
     itp->id = id;
-    act->process->flags |= RTMUX_FLG_PROC_CHECK_INTR;
+    PROC_FLG_SET(act->process, RTMUX_FLG_PROC_CHECK_INTR);
 
     itp->next = *owner;
     *owner = itp;
@@ -346,7 +346,7 @@ int rdecl interrupt_attach_event(unsigned level,
         return -1;
     }
     itp->id = id;
-    act->process->flags |= RTMUX_FLG_PROC_CHECK_INTR;
+    PROC_FLG_SET(act->process, RTMUX_FLG_PROC_CHECK_INTR);
 
     itp->next = *owner;
     *owner = itp;

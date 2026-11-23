@@ -695,6 +695,18 @@ static __inline__ void __attribute__((__unused__)) atomic_boundary()
 #define ITF_CLR(thp, bits) \
     atomic_clr((volatile unsigned *) &(thp)->internal_flags, (unsigned) (bits))
 
+/* process_t.flags is written from several paths that hold no common lock: the
+ * exit marks it under vec_slock, while the end of a load (kext_process_startup)
+ * and a debugger kill write it without. A plain read-modify-write there can
+ * undo the exit's TERMING and DESTROYALL, after which nothing stops a thread
+ * from being made or started in a process whose address space is going away.
+ * These go through the same atomic helpers as the thread flags.
+ */
+#define PROC_FLG_SET(prp, bits) \
+    atomic_or((volatile unsigned *) &(prp)->flags, (unsigned) (bits))
+#define PROC_FLG_CLR(prp, bits) \
+    atomic_clr((volatile unsigned *) &(prp)->flags, (unsigned) (bits))
+
 /* Async thread flags (set by the kernel) */
 
 #define RTMUX_ATF_TIMESLICE 0x00000001U

@@ -282,7 +282,7 @@ int rdecl debug_stop(process_t *prp)
         return EINVAL;
     }
     if (!(prp->flags & RTMUX_FLG_PROC_DEBUG_STOPPED)) {
-        prp->flags |= RTMUX_FLG_PROC_DEBUG_STOPPED;
+        PROC_FLG_SET(prp, RTMUX_FLG_PROC_DEBUG_STOPPED);
         stop_threads(prp, 0, 0);
         dep->flags |= _DEBUG_FLAG_ISTOP;
         dep->why = _DEBUG_WHY_REQUESTED;
@@ -381,7 +381,7 @@ int rdecl debug_run(process_t *prp, debug_run_t *drp)
             if ((d->brk.type & _DEBUG_BREAK_EXEC) && KIP(thp) == d->brk.addr) {
                 dep->skip_brk = d;
                 if (!(drp_flags & _DEBUG_RUN_STEP)) {
-                    prp->flags &= ~RTMUX_FLG_PROC_DEBUG_STOPPED;
+                    PROC_FLG_CLR(prp, RTMUX_FLG_PROC_DEBUG_STOPPED);
                 }
                 drp_flags = (drp_flags & ~(unsigned) _DEBUG_RUN_STEP_ALL) |
                             _DEBUG_RUN_STEP;
@@ -414,7 +414,7 @@ int rdecl debug_run(process_t *prp, debug_run_t *drp)
             }
         }
     } else {
-        prp->flags &= ~RTMUX_FLG_PROC_DEBUG_STOPPED;
+        PROC_FLG_CLR(prp, RTMUX_FLG_PROC_DEBUG_STOPPED);
         cont_threads(prp, 0);
     }
     return EOK;
@@ -595,7 +595,7 @@ static int rdecl thread_fault(thread_t *thp, siginfo_t *info)
 
     _TRACE_SYS_EMIT_ADDRESS(thp, KIP(thp));
 
-    prp->flags |= RTMUX_FLG_PROC_DEBUG_STOPPED;
+    PROC_FLG_SET(prp, RTMUX_FLG_PROC_DEBUG_STOPPED);
     stop_threads(prp, 0, 0);
 
     /* Save away fault state */

@@ -40,7 +40,7 @@ static inline bool inject_op_is_status(unsigned op)
            op == INJECT_OP_ALLOC_STATUS || op == INJECT_OP_SCHED_SET_STATUS ||
            op == INJECT_OP_SCHED_SET_DISPLACED || op == INJECT_OP_PTE_PROBE ||
            op == INJECT_OP_MANIP_PARTIAL || op == INJECT_OP_PRIO_SETTLE_STATS ||
-           op == INJECT_OP_XFER_STATS;
+           op == INJECT_OP_XFER_STATS || op == INJECT_OP_RCU_STALL_WAITS;
 }
 
 atomic_ullong inject_spin_state;
@@ -198,6 +198,7 @@ static struct {
     [STALL_UNBLOCK_FORCE] = {.pid = -1},
     [STALL_UNBLOCK_REPLY] = {.pid = -1},
     [STALL_KPAGE_ZERO] = {.pid = -1},
+    [STALL_THREAD_CREATE] = {.pid = -1},
 };
 
 static _Atomic(thread_t *) stalled_waiter;
@@ -295,6 +296,27 @@ static bool inject_stall_claim(enum inject_site site,
     return true;
 }
 
+/* Harts now spinning in inject_stall_until, and for each hart the grace-period
+ * waits on it that found one of them (INJECT_OP_RCU_STALL_WAITS).
+ */
+static atomic_ullong stall_harts;
+static atomic_uint rcu_stall_waits[CONFIG_PROCESSORS_MAX];
+
+/* Called by rcu_sched_wait() on each pass while it waits for hart cpu: counts
+ * the wait for the waiting hart once cpu is seen in a stall.
+ *
+ * Returns whether it was, so the caller stops asking.
+ */
+bool inject_note_rcu_wait(unsigned cpu)
+{
+    if (!(atomic_load_explicit(&stall_harts, memory_order_acquire) &
+          (1ULL << cpu)))
+        return false;
+    atomic_fetch_add_explicit(&rcu_stall_waits[get_cpunum()], 1,
+                              memory_order_relaxed);
+    return true;
+}
+
 static bool inject_stall_until(enum inject_site site,
                                const process_t *prp,
                                thread_t *waiter,
@@ -308,6 +330,12 @@ static bool inject_stall_until(enum inject_site site,
         atomic_store_explicit(&wake_claims, 0, memory_order_relaxed);
         atomic_store_explicit(&stalled_waiter, waiter, memory_order_release);
     }
+
+    /* Marked before it is seen taken: a grace-period wait the test starts once
+     * it sees the stall must find the mark.
+     */
+    atomic_fetch_or_explicit(&stall_harts, 1ULL << get_cpunum(),
+                             memory_order_release);
     atomic_store_explicit(&stall_site[site].taken, true, memory_order_release);
     inject_spin_begin();
     while (!atomic_load_explicit(&stall_site[site].release,
@@ -316,6 +344,8 @@ static bool inject_stall_until(enum inject_site site,
            r_time() < end)
         ;
     inject_spin_end();
+    atomic_fetch_and_explicit(&stall_harts, ~(1ULL << get_cpunum()),
+                              memory_order_release);
     if (waiter)
         atomic_store_explicit(&stalled_waiter, NULL, memory_order_release);
     return true;
@@ -603,6 +633,14 @@ void inject_kpage_zero_slow(const thread_t *act)
     while (r_time() < end)
         __asm__ volatile("" ::: "memory");
     inject_spin_end();
+}
+
+/* Called by thread_create once the new thread is published and counted active,
+ * before it first runs: hold that window open for an armed process.
+ */
+void inject_thread_create_published(const process_t *prp)
+{
+    inject_stall_once(STALL_THREAD_CREATE, prp, NULL);
 }
 
 /* Whether the reply that just removed an unblock notification restarts as if a
@@ -948,6 +986,9 @@ void kext_debug_inject(void *data)
         ret = inject_stall_arm(STALL_KPAGE_ZERO, kap->arg0, 1);
         break;
     }
+    case INJECT_OP_STALL_THREAD_CREATE:
+        ret = inject_stall_arm(STALL_THREAD_CREATE, kap->arg0, kap->arg1);
+        break;
     case INJECT_OP_HOLD_EXIT_DESTROY:
         if (kap->arg0 > INT32_MAX || kap->arg1 == 0 ||
             kap->arg1 > INJECT_SPIN_MAX_MS) {
@@ -1071,6 +1112,17 @@ void kext_debug_inject(void *data)
         break;
     case INJECT_OP_ALLOC_STATUS:
         ret = atomic_load_explicit(&consumed, memory_order_acquire);
+        break;
+    case INJECT_OP_RCU_STALL_WAITS:
+        if (kap->arg0 >= CONFIG_PROCESSORS_MAX) {
+            ret = -1;
+            break;
+        }
+        ret = (int) (kap->arg1
+                         ? atomic_exchange_explicit(&rcu_stall_waits[kap->arg0],
+                                                    0, memory_order_relaxed)
+                         : atomic_load_explicit(&rcu_stall_waits[kap->arg0],
+                                                memory_order_relaxed));
         break;
     case INJECT_OP_FAIL_NEXT_SCHED_SET:
         if (kap->arg0 > INT32_MAX || kap->arg1 > INT32_MAX) {

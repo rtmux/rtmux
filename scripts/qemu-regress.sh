@@ -2748,9 +2748,15 @@ run_one()
     local live_dumps=0 live_bad=0
     if [ "$GDB_ON_TIMEOUT" -eq 1 ]; then
 
-        # Unique per process and run, so concurrent harness loops do not
-        # collide.
-        gdb_port=$((20000 + ($$ % 20000) + idx))
+        # A port the OS reports free, so concurrent harness loops do not
+        # collide: two pids can map to the same 20000 + pid % 20000. The
+        # pid-based port stays as the fallback without python3.
+        gdb_port=$(python3 -c 'import socket
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])' 2>/dev/null) ||
+            gdb_port=
+        [ -n "$gdb_port" ] || gdb_port=$((20000 + ($$ % 20000) + idx))
         cmd+=("-gdb-live=${gdb_port}")
         wrap_timeout=$((TIMEOUT + ${HANG_DUMP_TIMEOUT:-120} + 20)) # headroom for the dump
 

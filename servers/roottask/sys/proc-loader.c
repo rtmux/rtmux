@@ -1184,7 +1184,14 @@ void *loader_load(void *parm)
     lcp->ctx.grant_caps = 0;
     lcp->ctx.grant_system = 0;
 
-    if (exec_on_boot) {
+    /* The early check, which fails a listed image whose hash does not match
+     * before it is loaded. Only a listed image can be granted anything, so only
+     * its hash is read: bootstrap_cap_manifest_listed() and _grant_for() match
+     * paths the same way (the manifest host test checks it). Hashing every
+     * other boot image would read the whole file on each spawn for nothing,
+     * most of a spawn's time under emulation.
+     */
+    if (exec_on_boot && bootstrap_cap_manifest_listed(buffer)) {
         status = boot_image_hash_fd(fd, &exec_hash);
         if (status != EOK)
             LOADER_EXIT(status);

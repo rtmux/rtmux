@@ -21,7 +21,8 @@
  * table). Only the binding this request set is closed, so one that a later
  * request set on the same id is left alone. A client that left early can be
  * given the id again before its failed reply is seen here; a connect of it in
- * that window still fails, and the ones after it do not.
+ * that window is refused EBUSY before its open runs, and libc sends it again on
+ * another id.
  */
 static void _ioserv_close_lost_binding(ioserv_context_t *ctp, ioserv_msg_t *msg)
 {

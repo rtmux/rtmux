@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Check that fixed bounds are documented in docs/assumptions.md."""
+from __future__ import annotations
 
 import argparse
 import re

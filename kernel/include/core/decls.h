@@ -420,12 +420,14 @@ void inject_send_pick_window(const thread_t *act);
 void inject_force_ready_claimed(thread_t *thp);
 void inject_unblock_force_window(thread_t *thp);
 void inject_kpage_zero_slow(const thread_t *act);
+void inject_thread_create_published(const process_t *prp);
 void inject_unblock_reply_window(const thread_t *client);
 bool inject_reply_unblock_preempt(void);
 void inject_xfer_start(const thread_t *act);
 void inject_xfer_yield(const thread_t *act);
 void inject_xfer_peek(const thread_t *act);
 void inject_xfer_budget(const thread_t *act);
+bool inject_note_rcu_wait(unsigned cpu);
 void inject_intr_before_switch(thread_t *thp);
 void inject_intr_after_select(thread_t *thp, const thread_t *chosen);
 void inject_block_stall(thread_t *thp);
@@ -546,6 +548,10 @@ static inline void inject_kpage_zero_slow(const thread_t *act)
 {
     (void) act;
 }
+static inline void inject_thread_create_published(const process_t *prp)
+{
+    (void) prp;
+}
 static inline void inject_unblock_reply_window(const thread_t *client)
 {
     (void) client;
@@ -569,6 +575,11 @@ static inline void inject_xfer_peek(const thread_t *act)
 static inline void inject_xfer_budget(const thread_t *act)
 {
     (void) act;
+}
+static inline bool inject_note_rcu_wait(unsigned cpu)
+{
+    (void) cpu;
+    return true;
 }
 #define IPC_BLK(thp) ((void) 0)
 #define THR_EV(thp) ((void) 0)

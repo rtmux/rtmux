@@ -713,7 +713,11 @@ vthread_t *rdecl remote_ipc_vthread(unsigned vtid, struct _vtid_info *vtp)
 void rdecl remove_unblock(thread_t *thp, connect_t *cop, int rcvid)
 {
     notification_t *pup, *pup2;
-    channel_t *chp = cop->channel;
+
+    /* Read once, as remote_ipc_unqueue does: a channel destroy clears it at any
+     * moment. The caller's lookup_rcvid read section keeps chp alive.
+     */
+    channel_t *chp = __atomic_load_n(&cop->channel, __ATOMIC_ACQUIRE);
 
     if (!chp) {
         return;
@@ -786,9 +790,9 @@ static uint64_t msg_request_seq;
  * removes a queued unblock notification and its mark; a request that ends any
  * other way (a channel destroy drain, a ConnectDetach, a server that is
  * terminating) leaves them set, and a mark left set makes force_ready send no
- * notification for the next request. A force_ready still at work on the
- * last request checks the identity under the channel lock before it marks, so
- * the new identity is published first.
+ * notification for the next request. A force_ready still at work on the last
+ * request checks the identity under the channel lock before it marks, so the
+ * new identity is published first.
  */
 void msg_request_begin(thread_t *sender)
 {

@@ -398,10 +398,13 @@ void __attribute__((noreturn)) kernel_exit(void)
          * fetch would fault. So for U-mode returns of ROOTTASK threads, force
          * as_prp back to act's own process so satp stays at roottask. Kexts
          * that need to operate on a bound as must do the temporary satp switch
-         * themselves (xfer paths already do this). process_bind on a
-         * U-mode-roottask thread becomes a no-op for the satp dimension; the
-         * as_prp field still carries the bind for vm_ops->FOO(prp, ...) callers
-         * that read it as a target hint.
+         * themselves (xfer paths already do this). A process_bind by a
+         * U-mode roottask thread therefore lasts only until this return: the
+         * next kernel call starts with as_prp naming roottask again. Nothing
+         * relies on more: every kernel call that works on another process takes
+         * its pid or prp as an argument, and the kernel reads a thread's as_prp
+         * only to switch into the address space a peer thread runs in (xfer,
+         * notification, trace), never as the target of roottask's own call.
          */
         if (thp->process && thp->process->pid == ROOTTASK_PID &&
             !(thp->reg.sstatus & SSTATUS_SPP)) {

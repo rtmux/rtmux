@@ -445,14 +445,13 @@ static int parse_pspawn_msg(pid_t ppid,
  * budget never refuses one outright. At most PSPAWN_GATE_WAITERS wait, each on
  * a pool thread, and for at most PSPAWN_GATE_WAIT_S seconds; beyond either the
  * spawn fails with EAGAIN, which posix_spawn may return for a shortage that
- * passes, unless it fits, when it is let in. PSPAWN_GATE_WAITERS,
- * LOADER_CONTEXT_WAITERS and twice LOADER_SHARE_WAITERS (one wait inside the
- * gate, one outside) together, 48, leave most of roottask's pool threads (75 at
- * most, sys/message.c) to the handlers and loaders that end the waits.
+ * passes, unless it fits, when it is let in. The root_wait limits together stay
+ * within their share of roottask's pool (ROOT_WAIT_POOL_MAX, checked in
+ * root-mutex.h), which leaves the rest to the handlers and loaders that end the
+ * waits.
  */
 #define PSPAWN_GATE_BUDGET (CONFIG_ROOTTASK_HEAP_SIZE / 2)
 #define PSPAWN_GATE_FREE (8U * 1024U)
-#define PSPAWN_GATE_WAITERS 16
 #define PSPAWN_GATE_WAIT_S 30
 
 static pthread_mutex_t pspawn_gate_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -607,8 +606,8 @@ int proc_pspawn(ioserv_context_t *ctp, void *vmsg)
 
     /* A request the gate charged does not wait for its spawner's loader context
      * share while it holds the charge: it gives the charge and its buffers
-     * back, waits for the share, and comes in again. The request is still
-     * in the sender's buffer, and the deadline is one for all the tries.
+     * back, waits for the share, and comes in again. The request is still in
+     * the sender's buffer, and the deadline is one for all the tries.
      */
 retry:;
     int share_class = -1;

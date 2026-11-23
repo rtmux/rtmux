@@ -965,8 +965,9 @@ static uint64_t loan_fence_batch(bool fence)
             __asm__ volatile("" ::: "memory");
     }
     clock_gettime(CLOCK_MONOTONIC, &end);
-    return (end.tv_sec - start.tv_sec) * 1000000000LL +
-           end.tv_nsec - start.tv_nsec;
+    /* A monotonic interval: never negative. */
+    return (uint64_t) ((end.tv_sec - start.tv_sec) * 1000000000LL +
+                       end.tv_nsec - start.tv_nsec);
 }
 
 int loan_settle_context(void)
@@ -1167,11 +1168,22 @@ static void *bound_locker(void *arg)
     return NULL;
 }
 
+/* How many RCU-sched waits on hart 1, where the threads these cases need to run
+ * are pinned, have waited for a hart held in an injected stall (see
+ * INJECT_OP_RCU_STALL_WAITS), or -1; reset clears the count after reading. */
+static int rcu_stall_waits(bool reset)
+{
+    int n = inject_run("rcu-stall-waits", "1", reset ? "reset" : NULL);
+
+    return n == 255 ? -1 : n;
+}
+
 /* Release the mutex with both waiters bound but neither on the wait queue.
  * The lower-priority waiter takes the free word first and must inherit the
  * other waiter's loan before that waiter resumes its walk. */
-static void mutex_bound_acquire(void)
+static bool mutex_bound_acquire(bool last)
 {
+    bool spoiled = false;
     struct bound_worker first = {.mask = 2, .priority = MHL_PRIO_W};
     struct bound_worker late = {.mask = 4, .priority = MHL_PRIO_B};
     struct stall_watch a = {.pid = -1}, b = {.pid = -1};
@@ -1179,6 +1191,7 @@ static void mutex_bound_acquire(void)
     bool ha, hb, held = true;
     char pid[16];
     snprintf(pid, sizeof pid, "%d", (int) getpid());
+    (void) rcu_stall_waits(true);
     pthread_mutex_lock(&mhl_mutex);
     ha = spawn(&wa, bound_locker, &first, "bound acquire first worker");
     hb = spawn(&wb, bound_locker, &late, "bound acquire late worker");
@@ -1201,8 +1214,13 @@ static void mutex_bound_acquire(void)
     held = false;
     stall_watch_release(&a);
     if (!wait_flag(&first.acquired)) {
-        test_fail("first bound waiter acquired",
-                  "did not return from mutex lock");
+        /* Its hart held by a grace-period wait on the stalled one. */
+        spoiled = rcu_stall_waits(false) > 0;
+        if (!spoiled || last)
+            test_fail("first bound waiter acquired",
+                      spoiled ? "did not return from mutex lock (a grace-period "
+                                "wait held its hart, every try)"
+                              : "did not return from mutex lock");
         goto out;
     }
     check(
@@ -1227,13 +1245,103 @@ out:
         (void) pthread_join(wb, NULL);
     stall_watch_finish(&a);
     stall_watch_finish(&b);
+    return spoiled && !last; /* try again */
+}
+
+/* A grace-period wait spins its hart until every other hart is out of its
+ * kernel call, so a hart held seconds in an injected stall holds every hart
+ * that waits for a grace period meanwhile: thread teardown, a connection or
+ * channel freed anywhere in a busy system. A test thread pinned to such a hart
+ * cannot run, and the setups below, which need one running during a stall,
+ * failed at random that way. They are retried when the count of those waits
+ * rose; check here that it does. */
+struct rcu_probe {
+    atomic_int done;
+    long long ns; /* how long its create and join took, once done */
+};
+
+static void *rcu_probe_child(void *arg)
+{
+    (void) arg;
+    return NULL;
+}
+
+/* On hart 1, create a thread and join it: its teardown waits for a grace
+ * period. */
+static void *rcu_probe_run(void *arg)
+{
+    struct rcu_probe *s = arg;
+    struct timespec a, b;
+    pthread_t c;
+
+    (void) test_pin_mask(2);
+    clock_gettime(CLOCK_MONOTONIC, &a);
+    if (pthread_create(&c, NULL, rcu_probe_child, NULL) == 0)
+        (void) pthread_join(c, NULL);
+    clock_gettime(CLOCK_MONOTONIC, &b);
+    s->ns = (long long) (b.tv_sec - a.tv_sec) * 1000000000LL +
+            (b.tv_nsec - a.tv_nsec);
+    set_flag(&s->done);
+    return NULL;
+}
+
+static void mutex_stall_rcu_waits(void)
+{
+    struct bound_worker waiter = {.mask = 4, .priority = MHL_PRIO_B};
+    struct rcu_probe s = {0};
+    struct stall_watch watch = {.pid = -1};
+    pthread_t tw, ts;
+    bool hw, hs = false;
+    int n0, n1 = -1;
+    char pid[16], why[128];
+
+    snprintf(pid, sizeof pid, "%d", (int) getpid());
+    n0 = rcu_stall_waits(true); /* hart 1 counts from 0, before the stall */
+    pthread_mutex_lock(&mhl_mutex);
+    hw = spawn(&tw, bound_locker, &waiter, "rcu wait waiter");
+    if (!hw || inject_run("stall-lock-propagated", pid, "10000") ||
+        stall_watch_start(&watch, "propagated")) {
+        test_fail("rcu wait setup", "the propagated stall did not arm");
+        goto out;
+    }
+    set_flag(&waiter.go);
+    if (!stall_watch_entered(&watch)) {
+        test_fail("rcu wait setup", "the waiter did not reach the stall");
+        goto out;
+    }
+    hs = spawn(&ts, rcu_probe_run, &s, "rcu wait probe");
+    /* The probe's teardown on hart 1 waits for the stalled hart. */
+    for (int i = 0; i < 300 && (n1 = rcu_stall_waits(false)) <= 0; i++)
+        sleep_ms(10);
+    /* The probe was held: still, or for longer than a create and join take.
+     * Each read of the count is a spawn, slow while the stall lasts, so the
+     * stall may have ended, and the probe with it, before one returns. */
+    bool held = hs && (!atomic_load(&s.done) || s.ns > 1000000000LL);
+
+    snprintf(why, sizeof why,
+             "hart 1 count %d (was %d before the reset), probe %s %lld ns", n1,
+             n0, atomic_load(&s.done) ? "took" : "still held after",
+             atomic_load(&s.done) ? s.ns : -1LL);
+    check(n0 >= 0 && n1 > 0 && held,
+          "a grace-period wait on a hart held in a stall is counted", why);
+out:
+    stall_watch_release(&watch);
+    set_flag(&waiter.go);
+    set_flag(&waiter.done);
+    pthread_mutex_unlock(&mhl_mutex);
+    if (hw)
+        (void) pthread_join(tw, NULL);
+    if (hs)
+        (void) pthread_join(ts, NULL);
+    stall_watch_finish(&watch);
 }
 
 /* The new owner takes a free word in user space while the only waiter
  * is paused after lending to the original owner. No handoff can supply
  * the loan: the waiter must reread the word when its walk resumes. */
-static void mutex_changed_owner(void)
+static bool mutex_changed_owner(bool last)
 {
+    bool spoiled = false;
     struct bound_worker waiter = {.mask = 4, .priority = MHL_PRIO_B};
     struct bound_worker owner = {.mask = 2, .priority = MHL_PRIO_W};
     struct stall_watch watch = {.pid = -1};
@@ -1241,28 +1349,55 @@ static void mutex_changed_owner(void)
     bool hw, ho, held = true;
     char pid[16];
     snprintf(pid, sizeof pid, "%d", (int) getpid());
+    const char *why = NULL;
+    char detail[96];
+    int got;
+
+    (void) rcu_stall_waits(true);
     pthread_mutex_lock(&mhl_mutex);
     hw = spawn(&tw, bound_locker, &waiter, "owner-change waiter");
     ho = spawn(&to, bound_locker, &owner, "owner-change replacement");
-    if (!hw || !ho || inject_run("stall-lock-propagated", pid, "10000") ||
-        stall_watch_start(&watch, "propagated"))
+    /* Each step names itself on failure: the case is rare to fail, and the
+     * one message it had covered every step. */
+    if (!hw || !ho)
+        why = "a worker did not start";
+    else if (inject_run("stall-lock-propagated", pid, "10000") ||
+             stall_watch_start(&watch, "propagated"))
+        why = "the propagated stall did not arm";
+    if (why)
         goto failed;
     set_flag(&waiter.go);
-    if (!stall_watch_entered(&watch))
+    if (!stall_watch_entered(&watch)) {
+        why = "the waiter did not reach the propagated stall";
         goto failed;
+    }
     pthread_mutex_unlock(&mhl_mutex);
     held = false;
     set_flag(&owner.go);
-    if (!wait_flag(&owner.acquired) || prio_of(to, NULL) != MHL_PRIO_W)
+    if (!wait_flag(&owner.acquired)) {
+        /* Its hart held by a grace-period wait on the stalled one. */
+        spoiled = rcu_stall_waits(false) > 0;
+        if (spoiled && !last)
+            goto out;
+        why = spoiled ? "replacement did not acquire during the stall (a "
+                        "grace-period wait held its hart, every try)"
+                      : "replacement did not acquire during the stall";
         goto failed;
+    }
+    if ((got = prio_of(to, NULL)) != MHL_PRIO_W) {
+        snprintf(detail, sizeof detail,
+                 "replacement ran at %d before the waiter resumed, not %d", got,
+                 MHL_PRIO_W);
+        why = detail;
+        goto failed;
+    }
     stall_watch_release(&watch);
     check(wait_prio(to, MHL_PRIO_B) == MHL_PRIO_B,
           "waiter lends to the owner that replaced its original owner",
           "new owner did not inherit when the waiter resumed");
     goto out;
 failed:
-    test_fail("changed owner setup",
-              "replacement did not acquire during the stall");
+    test_fail("changed owner setup", why);
 out:
     stall_watch_release(&watch);
     set_flag(&waiter.go);
@@ -1276,6 +1411,7 @@ out:
     if (ho)
         (void) pthread_join(to, NULL);
     stall_watch_finish(&watch);
+    return spoiled && !last; /* try again */
 }
 
 int mutex_handoff_loan(void)
@@ -1368,8 +1504,12 @@ out:
         (void) pthread_join(w, NULL);
     if (have_b)
         (void) pthread_join(b, NULL);
-    mutex_bound_acquire();
-    mutex_changed_owner();
+    mutex_stall_rcu_waits();
+    /* Each tried up to three times when a grace-period wait spoiled it. */
+    for (int i = 0; i < 3 && mutex_bound_acquire(i == 2); i++)
+        ;
+    for (int i = 0; i < 3 && mutex_changed_owner(i == 2); i++)
+        ;
     pthread_mutex_destroy(&mhl_mutex);
     (void) test_pin_mask(~0U);
     (void) __sched_set(0, 0, policy, &saved);

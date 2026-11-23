@@ -463,7 +463,7 @@ void kext_debug_detach(void *args)
      */
     prp->debugger = 0;
     if (prp->flags & RTMUX_FLG_PROC_DEBUG_STOPPED) {
-        prp->flags &= ~RTMUX_FLG_PROC_DEBUG_STOPPED;
+        PROC_FLG_CLR(prp, RTMUX_FLG_PROC_DEBUG_STOPPED);
         if (prp->flags & RTMUX_FLG_PROC_TERMING) {
             if (proc_hooks->proc_threads_destroyed) {
                 struct sigevent ev;

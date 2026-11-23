@@ -207,6 +207,8 @@ void rcu_sched_wait(rcu_epoch_t goal)
 
         if (cpu == self || !cpu_in_mask(online, cpu))
             continue;
+        bool noted = false; /* inject_note_rcu_wait() until it counts */
+
         for (;;) {
             if (__atomic_load_n(&pcpu_array[cpu].pc_rcu_waiting,
                                 __ATOMIC_RELAXED) != 0 &&
@@ -226,6 +228,8 @@ void rcu_sched_wait(rcu_epoch_t goal)
                                               __ATOMIC_ACQUIRE),
                               goal))
                 break;
+            if (!noted)
+                noted = inject_note_rcu_wait(cpu);
             rcu_cpu_relax();
         }
     }

@@ -12,6 +12,7 @@
 #include <sys/mman.h> /* mmap, MAP_*, PROT_*, NOFD */
 #include <errno.h>
 #include <stdatomic.h>
+#include "root-mutex.h"
 
 static pthread_attr_t thread_attr;
 
@@ -85,7 +86,7 @@ static thread_pool_attr_t pool_attr = {
     3,                      /* low water mark */
     1,                      /* increment */
     10,                     /* high water mark */
-    75,                     /* maximum threads */
+    ROOT_POOL_THREADS,      /* maximum threads */
 };
 
 /* Create roottask's system channel and I/O-service layer.

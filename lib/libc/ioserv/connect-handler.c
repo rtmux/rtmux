@@ -58,6 +58,28 @@ int _ioserv_connect_handler(ioserv_context_t *ctp, ioserv_msg_t *msg)
 
     /* msg_key_data verification goes here!!! */
 
+    /* An open on an id the client still has bound here: a binding from an open
+     * the client gave up on (a timeout or a signal) and that is still running,
+     * so its failed reply has not closed it yet. Refuse it before this open
+     * runs, so it does nothing, with EADDRINUSE, which an open does not fail
+     * with: libc sends the connect again on another id for that answer alone.
+     * If the earlier open binds after the check, this one's bind fails EINVAL
+     * with its open done, and that is not sent again (an O_EXCL or O_TRUNC open
+     * must not run twice).
+     */
+    switch (msg->open.connect.subtype) {
+    case _IO_CONNECT_OPEN:
+    case _IO_CONNECT_COMBINE:
+    case _IO_CONNECT_COMBINE_CLOSE:
+        if (_ioserv_handle(&ctp->info, 0, _IOSERV_HANDLE_FIND) != (void *) -1) {
+            _ioserv_link_return(link, 1);
+            return EADDRINUSE;
+        }
+        break;
+    default:
+        break;
+    }
+
     ctp->offset = 0;
     switch (msg->open.connect.subtype) {
     case _IO_CONNECT_COMBINE:

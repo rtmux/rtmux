@@ -70,8 +70,16 @@ Handlers do not interrupt the target thread. libc runs them on a per-process
 system thread, so a handler runs concurrently with the main thread, at the
 process's starting scheduling priority. `SA_SIGINFO` handlers receive
 `si_signo`, `si_code`, and `si_pid`, with no interrupted-context argument. A
-caught signal does not yet interrupt a blocked call with `EINTR`; code that
-relies on that needs a different wakeup (a timeout or a notification).
+caught signal whose handler was installed without `SA_RESTART` ends an
+`open()` or a `read()` that a service is holding with `EINTR`. An `open()`
+with `O_CREAT` or `O_TRUNC` is the exception: once sent it is not
+interrupted, because the server may already have created or truncated the
+file, and `EINTR` would say that nothing happened. A service that holds such an
+open for good (a FIFO opened with `O_CREAT` while no reader comes) therefore
+keeps the caller until it answers: open an existing FIFO without `O_CREAT`, or
+end the wait with `pthread_cancel`, which still applies. Other blocked calls are not
+yet interrupted; code that relies on that needs a different wakeup (a timeout
+or a notification).
 Stop and continue signals are treated as ignored: there is no job control.
 
 ## Memory

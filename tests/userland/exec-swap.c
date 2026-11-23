@@ -22,7 +22,9 @@
  *   execve arrive as given;
  * - a failed exec returns -1 with errno set and the process carries on;
  * - the call from a second thread, or with another thread waiting, replaces
- *   the whole process;
+ *   the whole process, and so does one while another thread keeps creating
+ *   threads;
+ * - the new image can start a thread of its own;
  * - setpgid on a child that has exec'd is refused with EACCES, and on one that
  *   has only been spawned it works.
  */
@@ -32,11 +34,13 @@
 #include <pthread.h>
 #include <signal.h>
 #include <spawn.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "outcome.h"
@@ -107,6 +111,31 @@ static void *exec_idle_thread(void *arg)
     return NULL;
 }
 
+static void *exec_nop_thread(void *arg)
+{
+    return arg;
+}
+
+/* Starts and joins threads for as long as it lives: the exec of the first
+ * thread takes this one down while it is creating them, and refuses a thread
+ * created in the meantime.
+ */
+static atomic_int exec_created; /* threads the creator has started and joined */
+
+static void *exec_creator_thread(void *arg)
+{
+    pthread_t th;
+
+    (void) arg;
+    for (;;) {
+        if (pthread_create(&th, NULL, exec_nop_thread, NULL) == 0) {
+            (void) pthread_join(th, NULL);
+            atomic_fetch_add(&exec_created, 1);
+        }
+    }
+    return NULL;
+}
+
 /* The mode of the child: set up, then exec according to what is asked. */
 int exec_swap_child(const char *what)
 {
@@ -152,6 +181,21 @@ int exec_swap_child(const char *what)
         if (pthread_create(&th, NULL, exec_idle_thread, NULL) != 0)
             return 95;
         sleep_ms(50);
+        (void) execve("/bin/syscall_testing", report, envp);
+        return 97;
+    }
+    if (!strcmp(what, "with-creator")) {
+        /* The first thread calls exec while another creates threads. */
+        if (exec_child_setup() != 0)
+            return 96;
+        if (pthread_create(&th, NULL, exec_creator_thread, NULL) != 0)
+            return 95;
+        /* Exec only once the creator is creating threads, for 5 s at most. */
+        for (int i = 0; atomic_load(&exec_created) < 2; i++) {
+            if (i == 5000)
+                return 94;
+            sleep_ms(1);
+        }
         (void) execve("/bin/syscall_testing", report, envp);
         return 97;
     }
@@ -213,7 +257,9 @@ int exec_swap_report(const char *arg)
     char cwd[64];
     mode_t um;
     const char *env = getenv("EXEC_TEST");
-    int usr1 = -1, usr2 = -1, hup = -1;
+    int usr1 = -1, usr2 = -1, hup = -1, thread = 0;
+    pthread_t th;
+    void *rv = NULL;
 
     if (sigaction(SIGUSR1, NULL, &sa) == 0)
         usr1 = sa.sa_handler == SIG_IGN ? 1 : sa.sa_handler == SIG_DFL ? 0 : 2;
@@ -225,13 +271,16 @@ int exec_swap_report(const char *arg)
         cwd[0] = '?', cwd[1] = '\0';
     um = umask(0);
     (void) umask(um);
+    if (pthread_create(&th, NULL, exec_nop_thread, &thread) == 0 &&
+        pthread_join(th, &rv) == 0 && rv == &thread)
+        thread = 1;
 
     printf(
         "pid=%d ppid=%d kept=%d closed=%d usr1=%d usr2=%d hup=%d "
-        "umask=%o cwd=%s arg=%s env=%s\n",
+        "umask=%o thread=%d cwd=%s arg=%s env=%s\n",
         (int) getpid(), (int) getppid(), fcntl(EXEC_FD_KEPT, F_GETFD) >= 0,
         fcntl(EXEC_FD_CLOSED, F_GETFD) >= 0, usr1, usr2, hup, (unsigned) um,
-        cwd, arg, env ? env : "(none)");
+        thread, cwd, arg, env ? env : "(none)");
     fflush(stdout);
     return 0;
 }
@@ -369,6 +418,10 @@ static void exec_check_report(const char *what, const struct exec_run *r)
     check(exec_field(r->out, "umask") == EXEC_UMASK_OCTAL &&
               exec_has(r->out, "cwd=" EXEC_DIR " "),
           name, "umask and working directory survive exec");
+    snprintf(name, sizeof name, "exec %s: the new image starts a thread",
+             what);
+    check(exec_field(r->out, "thread") == 1, name,
+          "pthread_create works in the new image");
     snprintf(name, sizeof name, "exec %s: argv and envp as passed", what);
     check(exec_has(r->out, "arg=" EXEC_ARG " ") &&
               exec_has(r->out, "env=swapped"),
@@ -563,7 +616,69 @@ void test_exec(void)
     exec_failure_case();
     exec_report_case("with-thread");
     exec_report_case("from-thread");
+    exec_report_case("with-creator");
     exec_chain_case();
     exec_concurrent_case();
     exec_setpgid_case();
+}
+
+#define SPAWN_TIME_RUNS 20
+
+static int spawn_time_cmp(const void *a, const void *b)
+{
+    uint64_t x = *(const uint64_t *) a, y = *(const uint64_t *) b;
+
+    return x < y ? -1 : x > y;
+}
+
+/* Spawn argv and wait for it; the microseconds that took, or 0 on failure. */
+static uint64_t spawn_time_once(char *const argv[])
+{
+    struct timespec t0, t1;
+    pid_t pid;
+    int st;
+
+    (void) clock_gettime(CLOCK_MONOTONIC, &t0);
+    if (posix_spawn(&pid, argv[0], NULL, NULL, argv, NULL) != 0 ||
+        waitpid(pid, &st, 0) != pid || !WIFEXITED(st) || WEXITSTATUS(st))
+        return 0;
+    (void) clock_gettime(CLOCK_MONOTONIC, &t1);
+    return (uint64_t) ((int64_t) (t1.tv_sec - t0.tv_sec) * 1000000 +
+                       ((int64_t) t1.tv_nsec - t0.tv_nsec) / 1000);
+}
+
+static void spawn_time_case(const char *name, char *const argv[])
+{
+    uint64_t us[SPAWN_TIME_RUNS];
+    int n = 0;
+
+    for (int i = 0; i < SPAWN_TIME_RUNS; i++) {
+        uint64_t t = spawn_time_once(argv);
+
+        if (t)
+            us[n++] = t;
+    }
+    if (!n) {
+        printf("  INFO  %s: every run failed\n", name);
+        return;
+    }
+    qsort(us, (size_t) n, sizeof us[0], spawn_time_cmp);
+    printf("  INFO  %s: %d runs, min %llu us, median %llu us, max %llu us\n",
+           name, n, (unsigned long long) us[0],
+           (unsigned long long) us[n / 2], (unsigned long long) us[n - 1]);
+}
+
+/* --spawn-exec-time: how long a spawn, and a spawn whose child execs, take to
+ * the parent's waitpid, as measurements only. The figures depend on the
+ * host: under QEMU TCG they show the order of magnitude, not a bound.
+ */
+void test_spawn_exec_time(void)
+{
+    char *spawn_true[] = {"/bin/true", NULL};
+    char *exec_true[] = {"/bin/syscall_testing", "--exec-child", "true", NULL};
+    char *self_true[] = {"/bin/syscall_testing", "--version-child", NULL};
+
+    spawn_time_case("spawn /bin/true", spawn_true);
+    spawn_time_case("spawn a child that execs /bin/true", exec_true);
+    spawn_time_case("spawn the dynamically linked test binary", self_true);
 }

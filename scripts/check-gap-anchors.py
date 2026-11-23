@@ -16,6 +16,7 @@ commented-out call is still checked.
   check-gap-anchors.py [--root DIR] [--tracker FILE]   check the tree
   check-gap-anchors.py --self-test                     prove the check on a temporary tree
 """
+from __future__ import annotations
 
 import re
 import sys

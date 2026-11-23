@@ -261,7 +261,7 @@ void kext_process_create(void *data)
 
     /* stop core file generation if RLIMIT_CORE is 0 */
     if (prp->rlimit_vals_soft[RLIMIT_CORE] == 0) {
-        prp->flags |= RTMUX_FLG_PROC_NOCOREDUMP;
+        PROC_FLG_SET(prp, RTMUX_FLG_PROC_NOCOREDUMP);
     }
 
     /* Inherit default dispatch queue from creating thread. */
@@ -813,7 +813,7 @@ void kext_process_startup(void *data)
                                              user_boundary_addr)
                                  ? user_boundary_addr
                                  : VM_KERN_SPACE_BOUNDARY;
-        prp->flags &= ~RTMUX_FLG_PROC_LOADING;
+        PROC_FLG_CLR(prp, RTMUX_FLG_PROC_LOADING);
         prp->priv_caps = kap->priv_caps;
         prp->lcp = 0;
         _TRACE_PR_EMIT_CREATE_NAME(prp);
@@ -874,7 +874,7 @@ void kext_proc_set_spawn(void *data)
      * flag, which the exec does not touch.
      */
     if (!(flags & (SPAWN_NOZOMBIE | SPAWN_EXEC)))
-        prp->flags &= ~RTMUX_FLG_PROC_NOZOMBIE;
+        PROC_FLG_CLR(prp, RTMUX_FLG_PROC_NOZOMBIE);
 
     prp->initial_ip = kap->initial_ip;
     prp->initial_sp = kap->initial_sp;

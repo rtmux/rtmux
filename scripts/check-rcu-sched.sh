@@ -1207,7 +1207,7 @@ if ! awk '
     in_wait && /kspinlock_lock\(&prp->vec_slock\);/ { saw_prp_lock = NR }
     in_wait && /kspinlock_lock\(&parent->vec_slock\);/ { saw_parent_lock = NR }
     in_wait && /parent->kids_running_time \+=/ { saw_parent_update = NR }
-    in_wait && /prp->flags &= ~RTMUX_FLG_PROC_WAITINFO;/ { saw_child_update = NR }
+    in_wait && /prp->flags &= ~RTMUX_FLG_PROC_WAITINFO;|PROC_FLG_CLR\(prp, RTMUX_FLG_PROC_WAITINFO\);/ { saw_child_update = NR }
     in_wait && /kspinlock_unlock\(&parent->vec_slock\);/ { saw_parent_unlock = NR }
     in_wait && /kspinlock_unlock\(&prp->vec_slock\);/ { saw_prp_unlock = NR }
     in_wait && /rcu_read_unlock\(&process_rcu\);/ { unlocks++ }
@@ -1341,7 +1341,7 @@ for fn in kext_proc_nozombie_mark kext_proc_exit_mark \
         $0 ~ "void " fn "\\(void \\*data\\)" { in_fn = 1 }
         in_fn && /lookup_pid_rcu\(kap->pid\)/ { saw_rcu = NR }
         in_fn && /kspinlock_lock\(&prp->vec_slock\);/ { saw_lock = NR }
-        in_fn && /prp->flags/ { saw_flags = NR }
+        in_fn && /prp->flags|PROC_FLG_(SET|CLR)\(prp,/ { saw_flags = NR }
         in_fn && /kspinlock_unlock\(&prp->vec_slock\);/ { saw_unlock_lock = NR }
         in_fn && /rcu_read_unlock\(&process_rcu\);/ && !saw_flags {
             saw_early_unlock = NR

@@ -9,6 +9,7 @@ check, so no image hash is ever hand-edited (docs/boot-manifest-hash-generation.
 The FNV-1a parameters match boot_image_hash_fd() in proc-loader.c and
 check-boot-manifest.py.
 """
+from __future__ import annotations
 import argparse
 import re
 import sys

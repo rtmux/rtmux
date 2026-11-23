@@ -10,6 +10,7 @@ the shipped binaries into boot-manifest.hashes and loaded by roottask at boot
     every manifest exec_path present in the image;
   * the load/verify path and the build step are wired.
 """
+from __future__ import annotations
 import re
 from pathlib import Path
 

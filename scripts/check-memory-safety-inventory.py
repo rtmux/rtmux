@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Validate the memory-safety inventory and its fail-closed fixture."""
+from __future__ import annotations
 
 import argparse
 import re

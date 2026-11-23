@@ -24,7 +24,12 @@ def size_of(t):
 def names(t):
     out = []
     for f in t.strip_typedefs().fields():
-        out += [f.name] if f.name else names(f.type)
+        if f.name:
+            out.append(f.name)
+        elif f.type.strip_typedefs().code in (gdb.TYPE_CODE_STRUCT,
+                                              gdb.TYPE_CODE_UNION):
+            out += names(f.type)
+        # else an unnamed bit field (padding): no name, and no fields to list
     return out
 
 

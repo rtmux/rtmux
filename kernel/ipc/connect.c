@@ -78,16 +78,18 @@ void endpoint_cap_revoke_if_present(connect_t *cop)
 }
 
 /* Release the notification soul reserved for cop's disconnect notice, if it
- * still holds one. Safe to repeat: nresv is cleared with the release, and every
- * caller owns cop exclusively (a fresh attach, the last-link detach, or the
- * final free), so the clear needs no lock.
+ * still holds one. Safe to repeat, and safe to race: the client's detach
+ * releases it once the notice is delivered, and the server may receive that
+ * notice, detach and reach the final free on another hart before the client's
+ * release. Only the caller that clears nresv releases the soul. Once the notice
+ * is delivered the reservation is no longer needed (it was popped, or the
+ * notice merged with a queued one or went straight to a receiver), so either
+ * caller may be the one.
  */
 void connect_unreserve(connect_t *cop)
 {
-    if (cop && cop->nresv) {
-        cop->nresv = 0;
+    if (cop && __atomic_exchange_n(&cop->nresv, 0, __ATOMIC_ACQ_REL))
         object_unreserve(&notification_souls);
-    }
 }
 
 /* Recycle a connection soul that has been unpublished from every vector it was
@@ -109,8 +111,11 @@ void connect_unreserve(connect_t *cop)
  */
 void connect_soul_free(process_t *prp, connect_t *cop)
 {
-    connect_unreserve(cop);
+    /* After the drain: a client detach still inside its read section may be
+     * about to deliver with the reservation.
+     */
     rcu_sched_synchronize();
+    connect_unreserve(cop);
     endpoint_cap_revoke_if_present(cop);
     object_free(prp, &connect_souls, cop);
 }

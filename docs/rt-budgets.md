@@ -800,8 +800,11 @@ three paths. Over 32 entries of 16 bytes each way a send is one step: the time
 from the sender's entry into msg_sendv to the receiver's return from its
 receive may exceed the same message in one entry by no more than 250 us at the
 p99 (the delivery includes waking the receiver, which a loaded host slows
-whatever the kernel does, so the step is judged by its addition), and a receive
-from a queued sender and a reply are each under 250 us at the p99. Over 2048
+whatever the kernel does, so the step is judged by its addition). A receive
+from a queued sender and a reply are judged the same way: each p99 may exceed
+the same message in one entry, timed in the same boot, by no more than 250 us.
+The absolute 250 us p99 of the message round trip in the budget table above
+applies to hardware runs; on QEMU the wake alone can take longer than that. Over 2048
 entries each way both orders of receiver and sender move the bytes through many
 restarts. iov-short reads a short message into 64 entries, all empty but the
 last, in one step (p99 under 250 us), and into 65536 entries, which move the

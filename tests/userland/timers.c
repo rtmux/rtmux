@@ -1816,7 +1816,13 @@ static void test_rlimit_data(void)
  * backstop; a few thousand of those exhaust the deadline.
  */
 enum { STORM_CALLS = 100000, STORM_WINDOW_NS = 100000000 };
-#define STORM_DEADLINE_NS 100000000000ULL /* 100 s */
+/* A relative 1 ns sleep whose deadline has passed fires at the next timer
+ * expiry. With the boot hart busy that can be a whole 1 ms tick, so the worst
+ * case for STORM_CALLS is 100 s: a deadline of exactly that has no margin.
+ * Half as much again covers a loaded host; a run that needs more than one tick
+ * per call on average still fails.
+ */
+#define STORM_DEADLINE_NS 150000000000ULL /* 150 s */
 #define STORM_INTR_SLACK 64
 
 struct storm_ctx {
@@ -1930,6 +1936,36 @@ static void *storm_sleeper(void *arg)
     c->elapsed_ns = last - t0;
     c->intr_after = storm_intr(c->sleeper_cpu);
     return NULL;
+}
+
+/* A thread that keeps hart 0, the boot hart, busy until told to stop. */
+static atomic_int storm_hog_stop;
+
+static void *storm_hog(void *arg)
+{
+    (void) arg;
+    if (storm_pin(0) != 0)
+        return NULL;
+    while (!atomic_load_explicit(&storm_hog_stop, memory_order_relaxed))
+        ;
+    return NULL;
+}
+
+/* --nanosleep-1ns-storm-hog: the storm with the boot hart busy, its worst case
+ * for the one-tick fallback.
+ */
+void test_nanosleep_1ns_storm_hog(void)
+{
+    pthread_t hog;
+
+    atomic_store(&storm_hog_stop, 0);
+    if (pthread_create(&hog, NULL, storm_hog, NULL) != 0) {
+        test_fail("nanosleep_1ns_storm with the boot hart busy", "pthread_create failed");
+        return;
+    }
+    test_nanosleep_1ns_storm();
+    atomic_store(&storm_hog_stop, 1);
+    (void) pthread_join(hog, NULL);
 }
 
 void test_nanosleep_1ns_storm(void)

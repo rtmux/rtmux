@@ -2311,13 +2311,15 @@ out:
 #define LOST_REPLY_HOLD_MS 300
 
 /* The next open waits before it binds: 1 for LOST_REPLY_HOLD_MS, 2 until
- * lost_reply_gate is cleared (5 s at most). Cleared when the open takes it.
+ * lost_reply_gate is cleared (5 s at most). 3 binds first, then waits as 2
+ * does. Cleared when the open takes it.
  */
 static atomic_int lost_reply_hold;
 static atomic_int lost_reply_gate;
 static atomic_int lost_reply_bad_iov; /* the next stat replies with a bad iov */
 static atomic_int lost_reply_held_bound; /* the held open bound and returned */
 static atomic_int lost_reply_bound, lost_reply_closed;
+static atomic_int lost_reply_opens; /* opens the service ran (not refused) */
 
 static int lost_reply_nap_chid = -1; /* nothing is ever sent on it */
 
@@ -2380,6 +2382,7 @@ static int lost_reply_open(ioserv_context_t *ctp, io_open_t *msg, void *handle,
     (void) extra;
     if (lost_reply_redirect_chid != -1 && !strcmp(msg->connect.path, "redirect"))
         return lost_reply_redirect(ctp, msg);
+    atomic_fetch_add(&lost_reply_opens, 1);
     int held = atomic_exchange(&lost_reply_hold, 0);
 
     if (held == 1)
@@ -2397,6 +2400,8 @@ static int lost_reply_open(ioserv_context_t *ctp, io_open_t *msg, void *handle,
     atomic_fetch_add(&lost_reply_bound, 1);
     if (held)
         atomic_store(&lost_reply_held_bound, 1);
+    if (held == 3) /* bound, and still running the open */
+        (void) lost_reply_await(&lost_reply_gate, 1, 5000);
     return EOK;
 }
 
@@ -2444,6 +2449,8 @@ static const ioserv_ops_t lost_reply_io_ops = {
  * with no close (what access() sends). Returns the send's errno (0 if it was
  * answered).
  */
+static int lost_reply_last_coid = -1; /* the id the last timed open used */
+
 static int lost_reply_timed_open(int chid, int id, bool combine)
 {
     union {
@@ -2457,6 +2464,7 @@ static int lost_reply_timed_open(int chid, int id, bool combine)
 
     if ((coid = connect_attach(0, getpid(), chid, 0, 0)) == -1)
         return errno;
+    lost_reply_last_coid = coid;
     memset(&msg, 0, sizeof msg);
     msg.connect.type = _IO_CONNECT;
     msg.connect.subtype = combine ? _IO_CONNECT_COMBINE : _IO_CONNECT_OPEN;
@@ -2484,6 +2492,11 @@ static int lost_reply_timed_open(int chid, int id, bool combine)
 }
 
 /* Open and close LOST_REPLY_PATH/leaf; returns open's errno, 0 if it opened. */
+/* The open flags lost_reply_try_open uses: O_RDONLY, or a create for the case
+ * that checks a create is not interrupted.
+ */
+static atomic_int lost_reply_oflags = O_RDONLY;
+
 static int lost_reply_try_open(const char *leaf)
 {
     char path[64];
@@ -2491,7 +2504,7 @@ static int lost_reply_try_open(const char *leaf)
 
     snprintf(path, sizeof path, LOST_REPLY_PATH "/%s", leaf);
     errno = 0;
-    fd = open(path, O_RDONLY);
+    fd = open(path, atomic_load(&lost_reply_oflags), 0600);
     if (fd == -1)
         return errno;
     (void) close(fd);
@@ -2648,6 +2661,60 @@ static void lost_reply_rounds(struct lost_reply_fx *fx, const char *tag, bool fa
         if (main_err || thread_err)
             break; /* the id is spoiled for the next round */
     }
+}
+
+/* A client given its id again while the server still runs an open it gave up
+ * on, and still holds that open's binding on the id: its next open must not
+ * fail on the binding. The server refuses it EBUSY before the open runs, and
+ * libc sends it again on another id; the old binding is closed once, when the
+ * held open's reply fails.
+ */
+static void lost_reply_reuse(struct lost_reply_fx *fx)
+{
+    char why[160];
+    int err, reerr = 0, fd;
+    pthread_t second;
+
+    /* A second server thread, to answer while the first holds the open. */
+    if (pthread_create(&second, NULL, poll_fault_server, fx->dpp) != 0) {
+        test_fail("lost reply second service thread", "pthread_create failed");
+        return;
+    }
+    atomic_store(&lost_reply_bound, 0);
+    atomic_store(&lost_reply_closed, 0);
+    atomic_store(&lost_reply_opens, 0);
+    atomic_store(&lost_reply_held_bound, 0);
+    atomic_store(&lost_reply_gate, 1);
+    atomic_store(&lost_reply_hold, 3);
+    err = lost_reply_timed_open(fx->chid, fx->id, false);
+    for (int i = 0; i < 400 && !atomic_load(&lost_reply_held_bound); i++)
+        sleep_ms(5);
+    snprintf(why, sizeof why, "timed open errno %d (want ETIMEDOUT), held open %s bound", err,
+             atomic_load(&lost_reply_held_bound) ? "was" : "not");
+    check(err == ETIMEDOUT && atomic_load(&lost_reply_held_bound),
+          "lost reply id given again while held: setup", why);
+
+    /* The lowest free descriptor is the id the timed open let go of: the open
+     * is given it, refused, and ends on another.
+     */
+    if ((fd = open(LOST_REPLY_PATH "/node", O_RDONLY)) == -1)
+        reerr = errno;
+    else
+        (void) close(fd);
+    snprintf(why, sizeof why, "open errno %d on id %d (the held one is %d), %d opens run", reerr,
+             fd, lost_reply_last_coid, atomic_load(&lost_reply_opens));
+    check(!reerr && fd != lost_reply_last_coid && atomic_load(&lost_reply_opens) == 2,
+          "lost reply id given again while held: the open goes to another id", why);
+
+    atomic_store(&lost_reply_gate, 0); /* the held open ends; its reply fails */
+    for (int i = 0; i < 400 && atomic_load(&lost_reply_closed) < 2; i++)
+        sleep_ms(5);
+    snprintf(why, sizeof why, "%d bound, %d closed", atomic_load(&lost_reply_bound),
+             atomic_load(&lost_reply_closed));
+    check(atomic_load(&lost_reply_bound) == 2 && atomic_load(&lost_reply_closed) == 2,
+          "lost reply id given again while held: both bindings closed once", why);
+    (void) pthread_cancel(second);
+    (void) pthread_join(second, NULL);
 }
 
 static atomic_int lost_reply_stat_err; /* -1 until the access has returned */
@@ -2822,16 +2889,16 @@ static void *lost_reply_redirect_server(void *arg)
  * open ends with EINTR while that server still holds it, and does not wait
  * there to send a close first.
  */
-static void lost_reply_open_redirect_signal(void)
+static bool lost_reply_open_redirect_signal(void)
 {
     static const char name[] = "open redirected by a service, signal without SA_RESTART";
     pthread_t server;
     char why[96];
-    int early, late;
+    int early, late = -2;
 
     if ((lost_reply_redirect_chid = channel_create(0)) == -1) {
         test_fail(name, "channel_create failed");
-        return;
+        return false;
     }
     atomic_store(&lost_reply_redirect_stop, 0);
     atomic_store(&lost_reply_redirect_held, 0);
@@ -2849,6 +2916,7 @@ static void lost_reply_open_redirect_signal(void)
     }
     (void) channel_destroy(lost_reply_redirect_chid);
     lost_reply_redirect_chid = -1;
+    return late != -1; /* no open of its own is left running */
 }
 
 /* open() of a path whose service holds the open until it is let go, on a
@@ -2895,6 +2963,7 @@ static void lost_reply_open_signal(void)
         settled = !restart;
     }
 
+
     /* The cases below share the open's result and the gate with an open that
      * is still running, and the binding check is about the open without
      * SA_RESTART: none of them runs after a case that stopped the loop.
@@ -2909,7 +2978,38 @@ static void lost_reply_open_signal(void)
                  atomic_load(&lost_reply_closed));
         check(atomic_load(&lost_reply_bound) == 1 && atomic_load(&lost_reply_closed) == 1,
               "open held by a service, interrupted open leaves no binding", why);
-        lost_reply_open_redirect_signal();
+        settled = lost_reply_open_redirect_signal();
+    }
+    /* An open that creates or truncates may already have done so by the time a
+     * signal comes, so it does not end with EINTR: it finishes once the
+     * service lets it go, though the handler has no SA_RESTART. Each case
+     * needs the one before to have left no open running.
+     */
+    static const struct {
+        int oflags;
+        const char *name;
+    } held_create[] = {
+        {O_RDWR | O_CREAT, "open with O_CREAT held by a service is not interrupted"},
+        {O_RDWR | O_TRUNC, "open with O_TRUNC held by a service is not interrupted"},
+    };
+    for (size_t i = 0; settled && i < sizeof held_create / sizeof held_create[0]; i++) {
+        int early, late;
+
+        atomic_store(&lost_reply_bound, 0);
+        atomic_store(&lost_reply_closed, 0);
+        atomic_store(&lost_reply_held_bound, 0);
+        atomic_store(&lost_reply_hold, 2);
+        atomic_store(&lost_reply_oflags, held_create[i].oflags);
+        late = lost_reply_signal_open(held_create[i].name, "node", 0, &lost_reply_hold, 2,
+                                      &early);
+        atomic_store(&lost_reply_oflags, O_RDONLY);
+        atomic_store(&lost_reply_hold, 0);
+        if (late == -2)
+            break;
+        snprintf(why, sizeof why, "while held: %d, in the end: %d (-1: no result yet)", early,
+                 late);
+        check(early == -1 && late == 0, held_create[i].name, why);
+        settled = late != -1;
     }
     (void) channel_destroy(lost_reply_nap_chid);
     lost_reply_nap_chid = -1;
@@ -2925,6 +3025,7 @@ void test_ioserv_lost_reply_binding(void)
     if (!lost_reply_start(&fx, RTMUX_FLG_CHF_DISCONNECT))
         return;
     lost_reply_rounds(&fx, "lost reply", false);
+    lost_reply_reuse(&fx);
     lost_reply_bad_reply();
     lost_reply_open_signal();
     lost_reply_stop(&fx);
@@ -8503,10 +8604,28 @@ void test_loader_fault(void)
           "a spawn after the faulting loaders succeeds", detail);
 }
 
+/* A number no other log mark of this process has, so each test's mark names
+ * only its own run.
+ */
+static unsigned log_mark_serial(void)
+{
+    static atomic_uint serial;
+
+    return atomic_fetch_add(&serial, 1);
+}
+
+/* The ring overwrote the reader's window before the count finished. */
+#define SYS_LOG_WRAPPED (-2)
+
 /* Count the lines of /sys/log after the last line that holds `mark` that
  * hold `what`. Returns -1 if the log cannot be read or the mark is not in it.
+ * A heavy test can fill the ring while this reads it: the read then fails with
+ * EOVERFLOW, and the lines between the reader and what the ring holds now are
+ * gone, so no exact count exists. That returns SYS_LOG_WRAPPED, with the
+ * matching lines already seen after the mark in *seen: enough for a caller to
+ * fail on lines it did see, never to pass on lines it could not.
  */
-static int sys_log_count_after(const char *mark, const char *what)
+static int sys_log_count_after(const char *mark, const char *what, int *seen)
 {
     static char line[512], chunk[4096]; /* the most one /sys/log read gives */
     size_t used = 0;
@@ -8532,6 +8651,14 @@ static int sys_log_count_after(const char *mark, const char *what)
                 count++;
         }
     }
+    if (n < 0 && errno == EOVERFLOW) {
+        printf("sys_log_count_after: the log ring wrapped (errno %d) after %d "
+               "lines\n",
+               errno, count < 0 ? 0 : count);
+        *seen = count < 0 ? 0 : count;
+        (void) close(fd);
+        return SYS_LOG_WRAPPED;
+    }
     if (n < 0)
         printf("sys_log_count_after: read: errno %d\n", errno);
     else if (count < 0)
@@ -8549,17 +8676,22 @@ static int sys_log_count_after(const char *mark, const char *what)
 void test_spawn_loader_einval_log(void)
 {
     static const char path[] = "/bin/true";
-    static const char mark[] = "loader-einval-flood-mark";
+    char mark[48];
     struct {
         struct _proc_spawn i;
         char data[16];
     } raw = {.i = {.type = _PROC_SPAWN, .subtype = _PROC_SPAWN_START}};
     char detail[64];
-    int bad = 0, lines;
+    int bad = 0, lines, seen = 0;
 
     raw.i.pathlen = sizeof path;
     memcpy(raw.data, path, sizeof path);
-    if (send_log_mark(mark, sizeof mark - 1) != EOK) {
+    /* A mark of its own: an earlier run's mark still in the ring must not
+     * start the count (sys_log_count_after).
+     */
+    (void) snprintf(mark, sizeof mark, "loader-einval-flood-mark-%d-%u.",
+                    (int) getpid(), log_mark_serial());
+    if (send_log_mark(mark, strlen(mark)) != EOK) {
         test_fail("spawn loader EINVAL log fixture", "no log mark");
         return;
     }
@@ -8570,7 +8702,14 @@ void test_spawn_loader_einval_log(void)
             bad++;
     snprintf(detail, sizeof detail, "%d of 64 were not EINVAL", bad);
     check(bad == 0, "a spawn with no arguments is EINVAL", detail);
-    lines = sys_log_count_after(mark, "proc-loader.c");
+    lines = sys_log_count_after(mark, "proc-loader.c", &seen);
+    if (lines == SYS_LOG_WRAPPED && seen <= 9) {
+        test_skip("the loader's EINVAL log is rate limited",
+                  "the log ring wrapped before the count finished");
+        return;
+    }
+    if (lines == SYS_LOG_WRAPPED)
+        lines = seen; /* already over the limit */
     /* The first one is logged: none at all would mean the count missed it. */
     snprintf(detail, sizeof detail, "%d log lines for 64 requests", lines);
     check(lines >= 1 && lines <= 9,
@@ -9770,7 +9909,7 @@ static void *spawn_argmax_thread(void *arg)
  */
 static void spawn_concurrent_arg_max(bool held)
 {
-    static const char mark[] = "spawn-concurrent-arg-max-mark";
+    char mark[48];
     static struct spawn_argmax_job job[SPAWN_ARGMAX_THREADS];
     char *argv[] = {"true", NULL, NULL};
     char *env[] = {"CHECK=1", NULL};
@@ -9782,7 +9921,7 @@ static void spawn_concurrent_arg_max(bool held)
     posix_spawn_file_actions_t fa;
     char *buf = malloc(len);
     long before, after;
-    int started = 0, failed = 0, first_rc = 0, nomem, rc;
+    int started = 0, failed = 0, first_rc = 0, nomem, seen = 0, rc;
 
     if (!buf || posix_spawn_file_actions_init(&fa)) {
         test_fail("spawn concurrent ARG_MAX fixture", "no memory");
@@ -9793,7 +9932,9 @@ static void spawn_concurrent_arg_max(bool held)
     for (int i = 0; !rc && !held && i < SPAWN_ARGMAX_ACTIONS; i++)
         rc = posix_spawn_file_actions_adddup2(&fa, STDOUT_FILENO,
                                               STDOUT_FILENO);
-    if (rc || send_log_mark(mark, sizeof mark - 1) != EOK) {
+    (void) snprintf(mark, sizeof mark, "spawn-concurrent-arg-max-mark-%d-%u.",
+                    (int) getpid(), log_mark_serial());
+    if (rc || send_log_mark(mark, strlen(mark)) != EOK) {
         test_fail("spawn concurrent ARG_MAX fixture", "setup failed");
         (void) posix_spawn_file_actions_destroy(&fa);
         free(buf);
@@ -9826,13 +9967,21 @@ static void spawn_concurrent_arg_max(bool held)
         failed += job[i].failed;
     }
     after = kstats_value("roottask.loader_context_bytes");
-    nomem = sys_log_count_after(mark, "nomem:");
+    nomem = sys_log_count_after(mark, "nomem:", &seen);
     snprintf(detail, sizeof detail, "%d of %d failed, first errno %d", failed,
              SPAWN_ARGMAX_THREADS * SPAWN_ARGMAX_ROUNDS, first_rc);
     check(failed == 0, "16 concurrent spawns with ARG_MAX arguments succeed",
           detail);
-    snprintf(detail, sizeof detail, "%d nomem lines", nomem);
-    check(nomem == 0, "concurrent ARG_MAX spawns leave no nomem line", detail);
+    if (nomem == SYS_LOG_WRAPPED && seen == 0) {
+        test_skip("concurrent ARG_MAX spawns leave no nomem line",
+                  "the log ring wrapped before the count finished");
+    } else {
+        if (nomem == SYS_LOG_WRAPPED)
+            nomem = seen; /* a line seen before the wrap still counts */
+        snprintf(detail, sizeof detail, "%d nomem lines", nomem);
+        check(nomem == 0, "concurrent ARG_MAX spawns leave no nomem line",
+              detail);
+    }
     snprintf(detail, sizeof detail, "loader contexts grew %ld to %ld bytes",
              before, after);
     check(before >= 0 && after >= before &&

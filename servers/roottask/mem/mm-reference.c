@@ -85,12 +85,24 @@ static int pq_init_run(void *dst, size_t len, void *d)
             }
         } else {
             void *endp;
+            void *run = NULL; /* the first page of a run still to zero */
+            int rc;
 
+            /* The run is physically contiguous, so consecutive pages that need
+             * zeroing go to the kernel as one range; it bounds each call.
+             */
             endp = (uint8_t *) dst + len;
             do {
-                if (!(pa_pq_flags(pq) & PAQ_FLAG_ZEROED)) {
-                    (void) kernel_page_zero((paddr_t) VA_TO_PA(dst),
-                                            QUANTUM_SIZE);
+                if (pa_pq_flags(pq) & PAQ_FLAG_ZEROED) {
+                    if (run &&
+                        (rc = kernel_page_zero(
+                             (paddr_t) VA_TO_PA(run),
+                             (size_t) ((uint8_t *) dst - (uint8_t *) run))))
+                        return rc; /* the run is not zero: do not expose it */
+                    run = NULL;
+                } else {
+                    if (!run)
+                        run = dst;
 
                     /* RUSH3: If we set PAQ_FLAG_ZEROED here and maintained
                      * RUSH3: it properly (e.g. turned it off when setting
@@ -104,6 +116,10 @@ static int pq_init_run(void *dst, size_t len, void *d)
                 ++pq;
                 dst = (uint8_t *) dst + QUANTUM_SIZE;
             } while (dst < endp);
+            if (run && (rc = kernel_page_zero(
+                            (paddr_t) VA_TO_PA(run),
+                            (size_t) ((uint8_t *) endp - (uint8_t *) run))))
+                return rc;
         }
         break;
     case OBJECT_MEM_FD:
