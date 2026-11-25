@@ -210,6 +210,7 @@ void test_spawn_actions(void);
 void test_orphan_exit(void);
 int orphan_exit_mid(void);
 void test_spawn_storm(unsigned residents);
+void test_spawn_ocb_storm(unsigned laps);
 void test_kill_busy(void);
 void test_exec_signal(void);
 int exec_signal_child(const char *what);

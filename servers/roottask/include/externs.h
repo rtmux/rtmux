@@ -123,6 +123,7 @@ EXT dev_t path_devno;
 
 /* Device number of the read-only boot cpio (see cpiofs.c). */
 dev_t cpiofs_boot_devno(void);
+void cpiofs_ocb_stats(unsigned *live, unsigned *mappings, unsigned *peak);
 
 extern int proc_service_scoid;
 

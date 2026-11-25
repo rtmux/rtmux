@@ -1531,6 +1531,24 @@ int main(int argc, char *argv[])
         test_spawn_storm((unsigned) residents);
         return finish(1);
     }
+    if ((argc == 2 || argc == 3) && !strcmp(argv[1], "--spawn-ocb-storm")) {
+        /* Optional lap count of spawn_concurrent, 6 by default. */
+        char *end = NULL;
+        unsigned long laps = 6;
+
+        if (argc == 3) {
+            errno = 0;
+            laps = strtoul(argv[2], &end, 10);
+            if (!isdigit((unsigned char) argv[2][0]) || *end || errno || !laps ||
+                laps > 1000) {
+                printf("--spawn-ocb-storm: bad lap count '%s'\n", argv[2]);
+                return EXIT_FAILURE;
+            }
+        }
+        printf("=== RTMux cpiofs OCB Spawn Storm ===\n\n[spawn-ocb-storm]\n");
+        test_spawn_ocb_storm((unsigned) laps);
+        return finish(1);
+    }
     if (argc == 2 && !strcmp(argv[1], "--trace-negative")) {
         printf("=== RTMux Trace Negative Test ===\n\n[trace-negative]\n");
         test_trace_negative();

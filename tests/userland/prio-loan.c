@@ -32,6 +32,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/rtmux-core.h>
+#include <sys/states.h>
 
 #include "test.h"
 
@@ -1526,6 +1527,141 @@ int sched_set_error_while_migrating(void)
     return sched_set_error_run(true);
 }
 
+/* pthread_create blocks its caller until the new thread first runs, so the new
+ * thread runs at the caller's priority until then, not at the priority it
+ * inherits. A thread of base 1 running at CS_LOAN on a notification creates a
+ * thread while a CS_SPIN spinner shares its one hart: started at the inherited
+ * 1, the new thread waited out the spinner, and so did pthread_create, as
+ * roottask's mapped-file cleaner once waited out a spawn storm for its spare
+ * worker.
+ */
+#define CS_BASE 1
+#define CS_SPIN 20
+#define CS_LOAN 30
+#define CS_SPIN_MS 1500 /* how long the spinner holds the hart at most */
+
+struct create_start {
+    int chid;
+    int rc;
+    long create_ms;
+    int child_prio, child_base; /* what the new thread runs at once started */
+    atomic_int stop;
+};
+
+static long ms_between(const struct timespec *a, const struct timespec *b)
+{
+    return (b->tv_sec - a->tv_sec) * 1000L +
+           (b->tv_nsec - a->tv_nsec) / 1000000L;
+}
+
+static void *cs_spinner(void *raw)
+{
+    struct create_start *k = raw;
+    struct timespec a, b;
+
+    clock_gettime(CLOCK_MONOTONIC, &a);
+    do
+        clock_gettime(CLOCK_MONOTONIC, &b);
+    while (!atomic_load_explicit(&k->stop, memory_order_acquire) &&
+           ms_between(&a, &b) < CS_SPIN_MS);
+    return NULL;
+}
+
+/* The loan ends once the creator is running again, so the new thread is back
+ * at the base it inherits.
+ */
+static void *cs_child(void *raw)
+{
+    struct create_start *k = raw;
+
+    k->child_prio = self_prio(&k->child_base);
+    return NULL;
+}
+
+static void *cs_creator(void *raw)
+{
+    struct create_start *k = raw;
+    struct timespec a, b;
+    char buf[64];
+    pthread_t c;
+
+    k->rc = -1;
+    if (msg_receive(k->chid, buf, sizeof buf, NULL) != 0)
+        return NULL; /* not the notification */
+    clock_gettime(CLOCK_MONOTONIC, &a);
+    k->rc = pthread_create(&c, NULL, cs_child, k);
+    clock_gettime(CLOCK_MONOTONIC, &b);
+    k->create_ms = ms_between(&a, &b);
+    set_flag(&k->stop);
+    if (k->rc == EOK)
+        (void) pthread_join(c, NULL);
+    return NULL;
+}
+
+static void test_create_starts_at_creator_prio(void)
+{
+    struct create_start k = {
+        .chid = -1, .rc = -1, .create_ms = -1, .child_prio = -1};
+    pthread_t creator, spinner;
+    int coid = -1, created = 0, sent = -1;
+    char detail[96];
+
+    if (test_pin_mask(1U) == -1 || chan_open(&k.chid, &coid) == -1) {
+        test_fail("create_start fixture", strerror(errno));
+        goto out;
+    }
+    /* The observer runs above all three on the one hart: the creator reaches
+     * its receive while the observer naps, and the spinner starts only once
+     * the observer waits, after the notification has made the creator the
+     * higher of the two.
+     */
+    if (!condloan_create(&creator, CS_BASE, cs_creator, &k)) {
+        test_fail("create_start fixture", "creator");
+        goto out;
+    }
+    created = 1;
+    if (!wait_thread_state(creator, STATE_RECEIVE)) {
+        test_fail("create_start fixture", "creator did not reach its receive");
+        goto out;
+    }
+    if (!condloan_create(&spinner, CS_SPIN, cs_spinner, &k)) {
+        test_fail("create_start fixture", "spinner");
+        goto out;
+    }
+    created = 2;
+    sent = msg_send_notification(coid, CS_LOAN, 1, 0);
+out:
+    if (created && sent != 0) {
+        /* No notification: unblock the creator's receive and the spinner. */
+        set_flag(&k.stop);
+        chan_close(k.chid, coid);
+        k.chid = coid = -1;
+    }
+    if (created)
+        (void) pthread_join(creator, NULL);
+    if (created == 2)
+        (void) pthread_join(spinner, NULL);
+    if (created == 2) {
+        snprintf(detail, sizeof detail,
+                 "pthread_create took %ld ms beside a %d ms spinner (rc %d, "
+                 "sent %d)",
+                 k.create_ms, CS_SPIN_MS, k.rc, sent);
+        check(sent == 0 && k.rc == EOK && k.create_ms >= 0 &&
+                  k.create_ms < CS_SPIN_MS / 2,
+              "create_start: a new thread runs at its blocked creator's "
+              "priority until it starts",
+              detail);
+        snprintf(detail, sizeof detail, "new thread at %d, base %d, want %d",
+                 k.child_prio, k.child_base, CS_BASE);
+        check(k.rc == EOK && k.child_prio == CS_BASE &&
+                  k.child_base == CS_BASE,
+              "create_start: the new thread then runs at the base it inherits",
+              detail);
+    }
+    chan_close(k.chid, coid);
+    (void) test_pin_mask(~0U);
+}
+
 void test_prio_loan(void)
 {
     struct sched_param saved;
@@ -1545,5 +1681,6 @@ void test_prio_loan(void)
     test_loan_ends_for_blocked_server();
     test_loan_ends_at_failed_msg_current();
     test_pending_loan_after_sender_timeout();
+    test_create_starts_at_creator_prio();
     (void) __sched_set(0, 0, policy, &saved);
 }

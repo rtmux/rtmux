@@ -89,7 +89,17 @@ struct cpiofs_ocb {
 
 static unsigned ocb_live;
 static unsigned ocb_mappings; /* of ocb_live, the ones behind VM mappings */
+static unsigned ocb_made; /* of ocb_live, the ones allocated, not reserved */
+static unsigned ocb_peak; /* the most ocb_made has been since boot */
 static unsigned ocb_failures;
+
+/* OCB use for /sys/kstats; read without a lock, so a moment old. */
+void cpiofs_ocb_stats(unsigned *live, unsigned *mappings, unsigned *peak)
+{
+    *live = __atomic_load_n(&ocb_live, __ATOMIC_RELAXED);
+    *mappings = __atomic_load_n(&ocb_mappings, __ATOMIC_RELAXED);
+    *peak = __atomic_load_n(&ocb_peak, __ATOMIC_RELAXED);
+}
 
 static void ocb_fail_note(const char *what)
 {
@@ -116,8 +126,11 @@ static void ocb_fail_note(const char *what)
 static struct cpiofs_ocb *ocb_alloc(void)
 {
     struct cpiofs_ocb *ocb;
+    unsigned live = __atomic_add_fetch(&ocb_live, 1, __ATOMIC_RELAXED);
+    unsigned made;
+    unsigned peak;
 
-    if (__atomic_add_fetch(&ocb_live, 1, __ATOMIC_RELAXED) > CPIOFS_MAX_OCBS) {
+    if (live > CPIOFS_MAX_OCBS) {
         __atomic_sub_fetch(&ocb_live, 1, __ATOMIC_RELAXED);
         ocb_fail_note("OCB limit reached");
         return NULL;
@@ -126,7 +139,18 @@ static struct cpiofs_ocb *ocb_alloc(void)
     if (!ocb) {
         __atomic_sub_fetch(&ocb_live, 1, __ATOMIC_RELAXED);
         ocb_fail_note("roottask heap exhausted allocating an OCB");
+        return NULL;
     }
+
+    /* The peak counts OCBs that exist, not reservations a failed calloc would
+     * give back.
+     */
+    made = __atomic_add_fetch(&ocb_made, 1, __ATOMIC_RELAXED);
+    peak = __atomic_load_n(&ocb_peak, __ATOMIC_RELAXED);
+    while (made > peak &&
+           !__atomic_compare_exchange_n(&ocb_peak, &peak, made, true,
+                                        __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+        ;
     return ocb;
 }
 
@@ -136,6 +160,7 @@ static void ocb_free(struct cpiofs_ocb *ocb)
         __atomic_sub_fetch(&ocb_mappings, 1, __ATOMIC_RELAXED);
     free(ocb->prefix);
     free(ocb);
+    __atomic_sub_fetch(&ocb_made, 1, __ATOMIC_RELAXED);
     __atomic_sub_fetch(&ocb_live, 1, __ATOMIC_RELAXED);
 }
 

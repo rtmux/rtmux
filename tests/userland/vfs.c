@@ -1192,7 +1192,11 @@ static void test_sys_kstats(void)
               kstats_get(snap, "timeout.live") <= kstats_get(snap, "thread.live") &&
               kstats_get(snap, "prio.reply_depth") > 0 &&
               kstats_get(snap, "prio.reply_depth_overflow") >= 0 &&
-              lines == (int) (3 * (sizeof pools / sizeof pools[0]) + 12 + (size_t) harts),
+              kstats_get(snap, "cpiofs.ocbs") > 0 &&
+              kstats_get(snap, "cpiofs.ocb_mappings") >= 0 &&
+              kstats_get(snap, "cpiofs.ocb_peak") > 0 &&
+              kstats_get(snap, "mmapfd.zombies") >= 0 &&
+              lines == (int) (3 * (sizeof pools / sizeof pools[0]) + 16 + (size_t) harts),
           "sys_kstats_format documented keys appear exactly once",
           "a documented key is missing, duplicated, or extra");
 
@@ -13308,6 +13312,62 @@ void test_spawn_concurrent(void)
         if (bad_spawn || bad_report || bad_exit)
             spawn_dump_threads(ROOTTASK_PID, true);
     }
+}
+
+/* cpiofs OCB use from one /sys/kstats read: live, peak since boot and the
+ * mapped-file zombies, each -1 when the read or the key is missing.
+ */
+static void spawn_ocb_sample(long *live, long *peak, long *zombies)
+{
+    char snap[4096];
+    int fd = open("/sys/kstats", O_RDONLY);
+
+    *live = *peak = *zombies = -1;
+    if (fd < 0)
+        return;
+    if (kstats_read(fd, snap, sizeof snap) > 0) {
+        *live = kstats_get(snap, "cpiofs.ocbs");
+        *peak = kstats_get(snap, "cpiofs.ocb_peak");
+        *zombies = kstats_get(snap, "mmapfd.zombies");
+    }
+    (void) close(fd);
+}
+
+/* Laps of spawn_concurrent back to back: thousands of short-lived dynamically
+ * linked children, each leaving cpiofs mapping OCBs behind that only the
+ * mapped-file cleaner retires. A cleaner that falls behind fills cpiofs's OCB
+ * table and later spawns fail to map libc with ENOMEM, which spawn_concurrent
+ * reports; afterwards the live count has to come back to where it started.
+ */
+void test_spawn_ocb_storm(unsigned laps)
+{
+    long base, peak, zombies, live = -1;
+    char detail[160];
+
+    spawn_ocb_sample(&base, &peak, &zombies);
+    if (base < 0) {
+        test_fail("spawn_ocb_storm kstats", "no cpiofs.ocbs key");
+        return;
+    }
+    printf("spawn_ocb_storm: base ocbs=%ld peak=%ld zombies=%ld\n", base, peak,
+           zombies);
+    for (unsigned lap = 0; lap < laps; lap++) {
+        test_spawn_concurrent();
+        spawn_ocb_sample(&live, &peak, &zombies);
+        printf("spawn_ocb_storm: lap %u ocbs=%ld peak=%ld zombies=%ld\n", lap,
+               live, peak, zombies);
+    }
+    /* Zombies under the cleaner's highwater mark wait for its next timed pass,
+     * a second or two away.
+     */
+    for (int i = 0; i < 10 && live > base; i++) {
+        sleep(1);
+        spawn_ocb_sample(&live, &peak, &zombies);
+    }
+    snprintf(detail, sizeof detail, "ocbs %ld->%ld, peak %ld, zombies %ld",
+             base, live, peak, zombies);
+    check(live >= 0 && live <= base,
+          "spawn_ocb_storm live cpiofs OCBs return to baseline", detail);
 }
 
 /* Print roottask's heap use and the free physical memory with "residents" idle

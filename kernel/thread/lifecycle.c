@@ -1201,6 +1201,7 @@ int rdecl thread_create(thread_t *act,
     thread_t *thp;
     int tid;
     int align;
+    unsigned inherit, start;
 
     /* Allocate a thread object. */
     if (!(thp = object_alloc(prp, &thread_souls))) {
@@ -1276,11 +1277,28 @@ int rdecl thread_create(thread_t *act,
         }
     }
 
-    /* Start the new thread at the current threads priority. Because we can
-     * block active, we don't want priority inversion if the new thread is a
-     * lower priority.
+    /* The new thread inherits its creator's base, or the client's priority when
+     * the creator serves a request. A creator that blocks until the new thread
+     * first runs lends it its own running priority until then. Without the
+     * loan, a creator running above its base (on a notification's or a PI
+     * waiter's loan) would wait on a thread at the base, which on a hart busy
+     * at the creator's priority does not run: roottask's mapped-file cleaner,
+     * run by a notification on a worker of base 1, waited a whole spawn storm
+     * for the spare worker it reserved. The priority is lent, as a notification
+     * lends its own, so the base stays the inherited one for a SchedSet or a
+     * sporadic drop to work on; thread_specret ends the loan once it has woken
+     * the creator.
      */
-    thread_init_prio(thp, thread_inherit_prio(act));
+    inherit = thread_inherit_prio(act);
+    start = inherit;
+    if ((thread_create_flags & THREAD_CREATE_BLOCK_FLAG) &&
+        act->priority > start)
+        start = act->priority;
+    thread_init_prio(thp, inherit);
+    if (start != inherit) {
+        thread_lend_msg(thp, start, false);
+        thp->priority = (uint8_t) start; /* on no queue yet */
+    }
     thp->policy = act->policy;
 
     /* Inherit scheduler partition.
@@ -1470,6 +1488,7 @@ int rdecl thread_create(thread_t *act,
     /* Stash some stuff for use in the WAAA special return code */
     thp->args.wa.not_sigev_thread =
         (thread_create_flags & THREAD_CREATE_BLOCK_FLAG) != 0;
+    thp->args.wa.creation_loan = start != inherit;
     if (kattr) {
         thp->args.wa.kattr = *kattr;
         thp->args.wa.attr = &thp->args.wa.kattr;
@@ -2520,6 +2539,21 @@ void rdecl thread_specret(thread_t *thp)
              * (RTMUX_FLG_THR_KILLSELF | RTMUX_FLG_THR_ONLYME)); return;
              */
         }
+    }
+
+    /* The creator is running again: end the loan it made for the wait
+     * (thread_create), after an explicit policy has set the new base, so the
+     * thread never drops below both. A SchedSet since the create ended the loan
+     * already, and the base it set stays.
+     */
+    if (thp->args.wa.creation_loan) {
+        thp->args.wa.creation_loan = 0;
+        thread_end_notification_loan(thp);
+
+        /* A loan ending under the running thread: lower it and let kernel exit
+         * reschedule, never displace it from this stack here.
+         */
+        thread_prio_update(thp);
     }
 
     /* Only done once for the first thread running */

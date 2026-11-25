@@ -168,6 +168,17 @@ static size_t synth_kstats(char *buf, size_t cap)
         if (n > 0 && (size_t) n < cap - len)
             len += (size_t) n;
     }
+    if (len < cap) {
+        unsigned live, mappings, peak;
+
+        cpiofs_ocb_stats(&live, &mappings, &peak);
+        n = snprintf(buf + len, cap - len,
+                     "cpiofs.ocbs=%u\ncpiofs.ocb_mappings=%u\n"
+                     "cpiofs.ocb_peak=%u\nmmapfd.zombies=%u\n",
+                     live, mappings, peak, vm_fd_zombie_count());
+        if (n > 0 && (size_t) n < cap - len)
+            len += (size_t) n;
+    }
     if (rc == EOK && timer_count > CONFIG_PROCESSORS_MAX)
         timer_count = CONFIG_PROCESSORS_MAX;
     for (unsigned h = 0; rc == EOK && h < timer_count && len < cap; h++) {

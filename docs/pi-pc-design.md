@@ -260,7 +260,10 @@ comparison.
 A thread created by a server while it serves a request starts at the
 request's priority, so a process spawned through roottask inherits its
 spawner's priority as POSIX requires; otherwise a new thread starts at its
-creator's base (`thread_inherit_prio`). PI loans are never inherited.
+creator's base (`thread_inherit_prio`). PI loans are never inherited. A
+creator that blocks until the new thread first runs (`pthread_create`) lends it
+its own running priority, loans included, until then, so it never waits on a
+thread below itself; the new thread's base is still the inherited priority.
 
 ### When a message loan starts and ends
 
@@ -270,6 +273,7 @@ creator's base (`thread_inherit_prio`). PI loans are never inherited.
 | `MsgCurrent` naming a client (`msg_current_take`) | `msg_loan` = that client's effective priority, new generation, request flag; on a `RTMUX_FLG_CHF_FIXED_PRIORITY` channel it lends nothing, so `msg_loan` is 0 with no request flag and an empty loan is left as it was; `pend_loan` unchanged |
 | receive of a notification, or a remote (`COF_NETCON`) message | `msg_loan` = its priority, new generation, no request flag, until the next receive |
 | receive on a `RTMUX_FLG_CHF_FIXED_PRIORITY` channel | `msg_loan` = 0 |
+| `thread_create` whose creator blocks until the new thread runs, with the creator running above the priority the new thread inherits | the new thread's `msg_loan` = the creator's running priority, no request flag; `thread_specret` ends it once it has readied the creator and applied any explicit policy, or a `SchedSet` on the new thread ends it before that |
 | send or notification queued with no receiver | `pend_loan` raised to its priority on each thread whose `last_chid` is the channel, whatever that thread's current priority |
 | `MsgReply` / `MsgError` that leaves the thread with no client | the request loan ends; if the call completed an exchange on the channel the thread serves, `pend_loan` = the send-queue head read as the client was unlinked |
 | reply to an older client while serving a newer one | unchanged: the newer client's loan stays |

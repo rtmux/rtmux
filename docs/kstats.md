@@ -43,7 +43,15 @@ Each kernel object pool `<name>` produces three live-count gauges.
 | `roottask.heap_size` | bytes | the size of that arena |
 | `roottask.heap_largest` | bytes | the largest block a request for new backing could still get: the tail above the bump pointer or the largest free extent below it |
 | `roottask.loader_context_bytes` | bytes | monotonic: memory roottask has mapped for loader contexts since boot (`servers/roottask/proc/loader-context.c`). A context is kept for reuse and never returned, so this only grows; it is bounded, because each size class may have only so many contexts (64 of 20 KiB, 8 of 40 KiB, 8 of 80 KiB, 4 of 160 KiB, 2 of 320 KiB, 2 of 512 KiB, in all 4,653,056 bytes) and a spawn whose class is used up waits for a context instead of mapping another |
+| `cpiofs.ocbs` | OCBs | live count: open control blocks of the boot cpio service (`servers/roottask/path/cpiofs.c`), one per open file and one per mapping of a file; returns to baseline once the processes that opened or mapped files are gone and the mapped-file cleaner has retired their mappings. At `CPIOFS_MAX_OCBS` (2048) opens and mappings of boot files fail with `ENOMEM` and roottask logs an `OCB limit reached` line |
+| `cpiofs.ocb_mappings` | OCBs | live count: the part of `cpiofs.ocbs` held for mappings rather than client opens |
+| `cpiofs.ocb_peak` | OCBs | monotonic: the most OCBs that have been allocated at once since boot |
+| `mmapfd.zombies` | objects | live count: mapped-file objects whose last mapping is gone and which wait for the mapped-file cleaner (`servers/roottask/mem/vm-fd.c`) to close their file; each holds an open handle of the server behind the file, a cpiofs OCB for a boot file. Past 50 the cleaner's next pass is forced, so while the cleaner keeps up this stays near 50 under a spawn storm and falls to 0 within a second or two after it; a value far above that means the cleaner is not getting to run |
 | `ioserv.disconnects` | notices | monotonic: client-disconnect notifications roottask's own I/O service has handled (`_ioserv_disconnect_handler`). Not a system counter: it is roottask's process-local libc counter, so other servers' disconnects are not included |
+
+The `cpiofs.*` and `mmapfd.zombies` values are read one at a time without a
+lock, so one read is not a consistent snapshot of them: a count may be a moment
+older than the one next to it.
 
 Pools: `notification`, `sync`, `timer`, `thread`, `connect`, `channel`,
 `process`, `global_channel`, `interrupt`, `syncevent`, `fpu`, `credential`,

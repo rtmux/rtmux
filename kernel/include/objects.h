@@ -710,6 +710,11 @@ typedef struct thread_entry { /* Also used for vthread_entry */
             const struct _thread_attr *real_attr;
             int not_sigev_thread;
 
+            /* The creator lent its priority for the wait in thread_create;
+             * thread_specret ends the loan once it has woken the creator.
+             */
+            int creation_loan;
+
             /* Caller's attr, copied at create. Like the rest of wa it lives in
              * the args union and is valid only until thread_specret finishes;
              * the new thread does not run other kcalls before that.
@@ -850,8 +855,9 @@ typedef struct thread_entry { /* Also used for vthread_entry */
      * or taking a lock.
      *
      * msg_loan: the request (a client in REPLY on this thread) or notification
-     * being served; priority, request flag and generation packed as described
-     * in <thread-prio.h>.
+     * being served, or a waiting creator's priority until a new thread first
+     * runs; priority, request flag and generation packed as described in
+     * <thread-prio.h>.
      *
      * pend_loan: the highest send or notification still queued on the channel
      * this thread serves; raised when one is queued, reset from the queue head

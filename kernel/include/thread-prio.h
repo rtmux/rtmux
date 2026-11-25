@@ -15,7 +15,9 @@
  *   - pi_loan:   the highest waiter on a PI mutex it owns, or the ceiling of a
  *                PRIO_PROTECT mutex it holds (kernel/sync/wait.c);
  *   - msg_loan:  the client whose request it is serving, or the notification
- *                it received last (kernel/ipc);
+ *                it received last (kernel/ipc), or, until a new thread first
+ *                runs, the priority of a creator waiting on it
+ *                (kernel/thread/lifecycle.c);
  *   - pend_loan: the highest send or notification still queued on the channel
  *                it serves (kernel/ipc).
  *
@@ -78,11 +80,13 @@ static inline unsigned thread_effective_prio(const thread_t *thp)
     return base > loan ? base : loan;
 }
 
-/* The priority a thread created by thp starts at: the priority thp runs its own
+/* The base a thread created by thp starts with: the priority thp runs its own
  * work at. A server serving a request creates threads on its client's behalf
  * (roottask starting a spawned process's first thread), so that is the client's
  * priority, as POSIX inheritance from the spawner requires; otherwise it is
- * thp's base. PI and pending-send loans are never inherited.
+ * thp's base. PI and pending-send loans are never inherited, though a creator
+ * that waits for the new thread lends it its running priority until it first
+ * runs (thread_create).
  */
 static inline unsigned thread_inherit_prio(const thread_t *thp)
 {
