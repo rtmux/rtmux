@@ -18,13 +18,6 @@
 #define RTMUX_LKL_NETD_STACK_SIZE (768U * 1024U)
 #define RTMUX_LKL_DEFAULT_STACK_SIZE (512U * 1024U)
 
-/* The LKL domain scheduling budget, declared here rather than left as a magic
- * number in host.c. A device IST runs SCHED_RR at this priority so hardware
- * wakeups preempt the dispatch worker; the worker itself has no fixed priority
- * -- it inherits the waiting client's priority per message (receive PI).
- */
-#define RTMUX_LKL_IST_PRIORITY 21
-
 struct rtmux_lkl_host_stats {
     unsigned long long page_current;
     unsigned long long page_high;

@@ -17,6 +17,7 @@
 #ifndef _KERNEL_OPTIONS_H
 #define _KERNEL_OPTIONS_H
 
+#include <sys/priority-bands.h>
 #include <stdbool.h>
 #include <sys/types.h>
 #include <sys/rtmux-core.h> /* LIMITS_NUM */
@@ -53,27 +54,27 @@ struct kernel_options {
 extern struct kernel_options kopt;
 
 /* Static initializer with defaults */
-#define KERNEL_OPTIONS_INIT              \
-    {                                    \
-        .timebase_freq = 0,              \
-        .timer_freq = 0,                 \
-        .reserved_size = 0,              \
-        .reserved_align = 0,             \
-        .max_cpus = ~0U,                 \
-        .loglevel = 0,                   \
-        .nohalt = 0,                     \
-        .nopreempt = 0,                  \
-        .align_fault = 0,                \
-        .auto_trace = 0,                 \
-        .disable_timer = 0,              \
-        .max_fds = 1000,                 \
-        .fd_close_timeout = 30,          \
-        .priv_prio = 64,                 \
-        .procfs_umask = 0022,            \
-        .limits_max = {0},               \
-        .heap_pregrow = 8 * 1024 * 1024, \
-        .ram_limit = 0,                  \
-        .mem_config = "",                \
+#define KERNEL_OPTIONS_INIT                           \
+    {                                                 \
+        .timebase_freq = 0,                           \
+        .timer_freq = 0,                              \
+        .reserved_size = 0,                           \
+        .reserved_align = 0,                          \
+        .max_cpus = ~0U,                              \
+        .loglevel = 0,                                \
+        .nohalt = 0,                                  \
+        .nopreempt = 0,                               \
+        .align_fault = 0,                             \
+        .auto_trace = 0,                              \
+        .disable_timer = 0,                           \
+        .max_fds = 1000,                              \
+        .fd_close_timeout = 30,                       \
+        .priv_prio = RTMUX_PRIO_USER_MAX_DEFAULT + 1, \
+        .procfs_umask = 0022,                         \
+        .limits_max = {0},                            \
+        .heap_pregrow = 8 * 1024 * 1024,              \
+        .ram_limit = 0,                               \
+        .mem_config = "",                             \
     }
 
 #endif /* _KERNEL_OPTIONS_H */

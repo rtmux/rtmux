@@ -139,6 +139,11 @@ int shmem_devctl(ioserv_context_t *ctp, io_devctl_t *msg, path_object_t *obp)
                 }
             }
             memobj_unlock(obp);
+
+            /* A size given to an object that is mapped already: make the
+             * mappings of its new pages.
+             */
+            vm_grow_drain(obp);
         }
         msg->o.ret_val = r;
         break;

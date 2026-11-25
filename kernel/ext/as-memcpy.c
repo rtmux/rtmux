@@ -163,13 +163,20 @@ void kext_as_memcpy(void *data)
  * exposing it to a user mapping.
  *
  * paddr is validated to lie within real RAM bounds (avoid using the slot to
- * scribble on MMIO). len is capped at MEG(16) as a defensive safety net — a
- * single zero op should be at most one page (QUANTUM_SIZE = 4 KiB) in practice.
+ * scribble on MMIO). len is capped at MEG(16) as a defensive safety net.
+ *
+ * A run of pages is zeroed a page at a time, for XFER_BUDGET_US per call at
+ * most, as a message transfer is: the call stops early when the budget is spent
+ * or a preemption is pending, and leaves paddr and len at the part not yet
+ * zeroed, so the caller calls again until len is 0. No call holds the kernel
+ * for more than the budget and one page.
  */
 struct kcall_args_kpage_zero {
     paddr_t paddr;
     size_t len;
 };
+
+#define KZERO_PIECE 4096u /* one page between looks at the clock */
 
 void kext_kpage_zero(void *data)
 {
@@ -194,7 +201,24 @@ void kext_kpage_zero(void *data)
         return;
     }
 
-    memset((void *) ((uintptr_t) kap->paddr + KERNEL_VIRT_BASE), 0, kap->len);
+    uint64_t deadline = r_time() + (uint64_t) XFER_BUDGET_US *
+                                       (qtimeptr->cycles_per_sec / 1000000U);
+    for (;;) {
+        size_t n = kap->len < KZERO_PIECE ? kap->len : KZERO_PIECE;
+
+        /* Debug-inject counts its delay in pages, so it runs for each one; the
+         * delay is spent from this call's budget like the zeroing is.
+         */
+        inject_kpage_zero_slow(act);
+        memset((void *) ((uintptr_t) kap->paddr + KERNEL_VIRT_BASE), 0, n);
+        kap->paddr += n;
+        kap->len -= n;
+        if (!kap->len || NEED_PREEMPT(act) ||
+            (atomic_load_explicit(&act->async_flags, memory_order_relaxed) &
+             (RTMUX_ATF_TIMESLICE | RTMUX_ATF_SMP_RESCHED)) ||
+            (int64_t) (r_time() - deadline) >= 0)
+            break;
+    }
     SETKSTATUS(act, EOK);
 }
 

@@ -29,6 +29,7 @@
 #define FLAG_TEST_ND_ONLY 0x0200
 #define FLAG_NO_RETRY 0x0400
 #define FLAG_ERR_COLLISION 0x0800
+#define FLAG_INTERRUPTIBLE 0x1000 /* open(): a signal may end the send */
 
 #define PCAST(typ, val) ((typ *) (void *) (val))
 #define FD_BUF_INCREMENT 10

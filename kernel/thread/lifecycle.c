@@ -33,6 +33,13 @@ static void thread_recycle_reset(thread_t *thp)
 {
     memset(thp, 0, __builtin_offsetof(thread_t, real_priority));
     thp->state = STATE_DEAD;
+
+    /* wake_seq survives recycling; keep its claim closed until the new thread
+     * opens its first lockless wait (thread_wake_open), so a late waker of the
+     * old one cannot claim it.
+     */
+    __atomic_store_n(&thp->wake_claimed, thread_wake_seq(thp),
+                     __ATOMIC_RELAXED);
     thp->reserved_word = 0;
     thp->runcpu = 0;
     thp->internal_flags = 0;
@@ -62,26 +69,34 @@ static void thread_recycle_reset(thread_t *thp)
     thp->prio_defer_next = NULL;
     thp->prio_defer_cpu = 0;
     thp->blocked_on = NULL;
+    atomic_store_explicit(&thp->sync_owner_flags, 0, memory_order_relaxed);
+    atomic_store_explicit(&thp->sync_wait_key, 0, memory_order_relaxed);
     thp->blocked_on_turnstile = NULL;
     thp->ts_bound_next = NULL;
-    thp->owned_turnstiles = NULL;
+    thp->owned_turnstiles.data = NULL;
     thp->robust_held = NULL;
     thp->robust_spare = NULL;
     thp->ts_spare = NULL;
     thp->robust_nheld = 0;
     thp->restart = NULL;
-    thp->iovchk_iov = NULL;
+    thp->scan[0].vector = thp->scan[1].vector = NULL;
+    thp->xfer_resume = 0;
+    thp->xfer_deadline = 0;
     thp->xcur.armed = false;
     memset(&thp->args.wa, 0, sizeof(thp->args.wa));
     thp->runmask = 0;
     thp->default_runmask = 0;
     thp->name = NULL;
     thp->key = 0;
+    memset(&thp->debug_connect, 0, sizeof thp->debug_connect);
+    thp->debug_join_tid = 0;
+    thp->debug_sync_mutex = 0;
     thp->last_chid = -1;
     thp->status = NULL;
+    thp->req_gen = 0;
+    thp->rcv_key = 0;
     thp->timeout = NULL;
     thp->join = NULL;
-    thp->mutex_holdlist = NULL;
     thp->start_time = 0;
     thp->fpudata = NULL;
     thp->ticker_using = 0;
@@ -171,6 +186,11 @@ static volatile unsigned long thread_destroy_post_vector_ns;
 static volatile unsigned long thread_destroy_post_cpu_ns;
 static volatile unsigned long thread_destroy_post_name_ns;
 static volatile unsigned long thread_destroy_post_notify_ns;
+/* The RCU, pin, scan and free totals again, over joiner-woken destroys only. */
+static volatile unsigned long thread_destroy_join_rcu_wait_ns;
+static volatile unsigned long thread_destroy_join_pin_wait_ns;
+static volatile unsigned long thread_destroy_join_active_scan_ns;
+static volatile unsigned long thread_destroy_join_object_free_ns;
 static volatile unsigned thread_destroy_stats_enabled;
 
 static uint64_t thread_destroy_cycles_to_ns(uint64_t cycles_delta);
@@ -178,8 +198,21 @@ static uint64_t thread_destroy_cycles_to_ns(uint64_t cycles_delta);
 void rdecl thread_destroy_stats_snapshot(struct _thread_destroy_stats *out,
                                          int reset)
 {
+    /* The joiner-woken shares are taken before the totals they are part of,
+     * with acquire against thread_destroy_stats_add's release: a share seen
+     * here then has its total add seen too, so no snapshot holds a share larger
+     * than its total.
+     */
     if (reset) {
         __atomic_store_n(&thread_destroy_stats_enabled, 0, __ATOMIC_RELEASE);
+        out->join_rcu_wait_ns = __atomic_exchange_n(
+            &thread_destroy_join_rcu_wait_ns, 0, __ATOMIC_ACQUIRE);
+        out->join_pin_wait_ns = __atomic_exchange_n(
+            &thread_destroy_join_pin_wait_ns, 0, __ATOMIC_ACQUIRE);
+        out->join_active_scan_ns = __atomic_exchange_n(
+            &thread_destroy_join_active_scan_ns, 0, __ATOMIC_ACQUIRE);
+        out->join_object_free_ns = __atomic_exchange_n(
+            &thread_destroy_join_object_free_ns, 0, __ATOMIC_ACQUIRE);
         out->rcu_wait_ns = __atomic_exchange_n(&thread_destroy_rcu_wait_ns, 0,
                                                __ATOMIC_RELAXED);
         out->rcu_enroll_ns = __atomic_exchange_n(&thread_destroy_rcu_enroll_ns,
@@ -306,6 +339,14 @@ void rdecl thread_destroy_stats_snapshot(struct _thread_destroy_stats *out,
             __atomic_store_n(&thread_destroy_stats_enabled, 1,
                              __ATOMIC_RELEASE);
     } else {
+        out->join_rcu_wait_ns =
+            __atomic_load_n(&thread_destroy_join_rcu_wait_ns, __ATOMIC_ACQUIRE);
+        out->join_pin_wait_ns =
+            __atomic_load_n(&thread_destroy_join_pin_wait_ns, __ATOMIC_ACQUIRE);
+        out->join_active_scan_ns = __atomic_load_n(
+            &thread_destroy_join_active_scan_ns, __ATOMIC_ACQUIRE);
+        out->join_object_free_ns = __atomic_load_n(
+            &thread_destroy_join_object_free_ns, __ATOMIC_ACQUIRE);
         out->calls = __atomic_load_n(&thread_destroy_calls, __ATOMIC_ACQUIRE);
         out->rcu_wait_ns =
             __atomic_load_n(&thread_destroy_rcu_wait_ns, __ATOMIC_RELAXED);
@@ -576,6 +617,15 @@ static void thread_destroy_stats_add(uint64_t rcu_wait_ns,
                            __ATOMIC_RELAXED);
         __atomic_fetch_add(&thread_destroy_post_notify_ns, post_notify_ns,
                            __ATOMIC_RELAXED);
+        /* Release: the totals above are added before a share is seen. */
+        __atomic_fetch_add(&thread_destroy_join_rcu_wait_ns,
+                           (unsigned long) rcu_wait_ns, __ATOMIC_RELEASE);
+        __atomic_fetch_add(&thread_destroy_join_pin_wait_ns,
+                           (unsigned long) pin_wait_ns, __ATOMIC_RELEASE);
+        __atomic_fetch_add(&thread_destroy_join_active_scan_ns,
+                           (unsigned long) active_scan_ns, __ATOMIC_RELEASE);
+        __atomic_fetch_add(&thread_destroy_join_object_free_ns,
+                           (unsigned long) object_free_ns, __ATOMIC_RELEASE);
     }
     old_max =
         __atomic_load_n(&thread_destroy_rcu_busy_peer_max, __ATOMIC_RELAXED);
@@ -603,6 +653,7 @@ static void thread_destroy_wait_inactive(thread_t *thp, process_t *prp)
 
     for (;;) {
         unsigned hi;
+        uint64_t online = cpu_online_snapshot();
         int active_hart = -1;
         unsigned depth = 0;
 
@@ -610,7 +661,7 @@ static void thread_destroy_wait_inactive(thread_t *thp, process_t *prp)
             unsigned cpu = hi;
             thread_t *cur;
 
-            if (cpu == self || !cpu_online(cpu))
+            if (cpu == self || !cpu_in_mask(online, cpu))
                 continue;
             cur = __atomic_load_n(&pcpu_array[cpu].pc_curthread,
                                   __ATOMIC_ACQUIRE);
@@ -667,10 +718,11 @@ static void thread_soul_free(process_t *prp, thread_t *thp)
  */
 int thread_active_hart(thread_t *thp)
 {
+    uint64_t online = cpu_online_snapshot();
     for (unsigned cpu = 0; cpu < num_processors; cpu++) {
         thread_t *cur;
 
-        if (!cpu_online(cpu))
+        if (!cpu_in_mask(online, cpu))
             continue;
         cur = __atomic_load_n(&pcpu_array[cpu].pc_curthread, __ATOMIC_ACQUIRE);
         if (cur == thp)
@@ -928,7 +980,8 @@ static void thread_as_unbind(thread_t *thp)
         thp->as_borrow_pprev = NULL;
         process_unpin(prp);
     }
-    thp->as_prp = NULL;
+    /* thread_set_as_prp reads it without the lock. */
+    __atomic_store_n(&thp->as_prp, NULL, __ATOMIC_RELEASE);
 }
 
 /* Set the address space thp runs in. A borrow of another process's address
@@ -937,6 +990,14 @@ static void thread_as_unbind(thread_t *thp)
  *
  * Returns ESRCH if prp's teardown has already released its borrowers: mdestroy
  * is next, and a borrow now would outlive it.
+ *
+ * Setting thp's own process when it is already set changes nothing and needs no
+ * lock (every return of a roottask thread to user mode makes this call). Only
+ * thp itself makes thp's as_prp a borrow (and thread_create, before thp first
+ * runs), and the other writers only clear it: thread_as_release_borrowers
+ * clears a borrower of another process, which thp is not while as_prp is its
+ * own, and thread_clear_as_prp_if clears it for thp's own process's teardown,
+ * which may as well come right after this call as right before it.
  */
 int rdecl thread_set_as_prp(thread_t *thp, process_t *prp)
 {
@@ -945,6 +1006,10 @@ int rdecl thread_set_as_prp(thread_t *thp, process_t *prp)
 
     if (!thp)
         return ESRCH;
+    if (!thread_as_is_borrow(thp, prp) &&
+        __atomic_load_n(&thp->as_prp, __ATOMIC_ACQUIRE) == prp)
+        return EOK;
+    inject_note_as_slock();
     kspinlock_lock(&thread_as_slock);
     if (thp->as_prp == prp)
         goto out;
@@ -956,7 +1021,7 @@ int rdecl thread_set_as_prp(thread_t *thp, process_t *prp)
     thread_as_unbind(thp);
     if (borrow)
         thread_as_link(thp, prp);
-    thp->as_prp = prp;
+    __atomic_store_n(&thp->as_prp, prp, __ATOMIC_RELEASE);
 out:
     kspinlock_unlock(&thread_as_slock);
     return status;
@@ -999,6 +1064,20 @@ unsigned rdecl thread_as_release_borrowers(process_t *prp)
     }
     kspinlock_unlock(&thread_as_slock);
     return released;
+}
+
+/* Accept borrows of prp's address space again, for an exec that has given the
+ * process a new one: kext_process_shutdown closed the list for the old address
+ * space, which is gone, and the process itself lives on. The list is empty from
+ * the close until here, so nothing needs releasing.
+ */
+void rdecl thread_as_reopen_borrowers(process_t *prp)
+{
+    kspinlock_lock(&thread_as_slock);
+    if (prp->as_borrowers)
+        crash();
+    prp->as_borrow_closed = false;
+    kspinlock_unlock(&thread_as_slock);
 }
 
 
@@ -1122,6 +1201,7 @@ int rdecl thread_create(thread_t *act,
     thread_t *thp;
     int tid;
     int align;
+    unsigned inherit, start;
 
     /* Allocate a thread object. */
     if (!(thp = object_alloc(prp, &thread_souls))) {
@@ -1135,7 +1215,7 @@ int rdecl thread_create(thread_t *act,
     thp->client = 0;
     thp->blocked_on_turnstile = NULL;
     thp->ts_bound_next = NULL;
-    thp->owned_turnstiles = NULL;
+    thp->owned_turnstiles.data = NULL;
     thp->robust_held = NULL;
     thp->robust_spare = NULL;
     thp->ts_spare = NULL;
@@ -1197,11 +1277,28 @@ int rdecl thread_create(thread_t *act,
         }
     }
 
-    /* Start the new thread at the current threads priority. Because we can
-     * block active, we don't want priority inversion if the new thread is a
-     * lower priority.
+    /* The new thread inherits its creator's base, or the client's priority when
+     * the creator serves a request. A creator that blocks until the new thread
+     * first runs lends it its own running priority until then. Without the
+     * loan, a creator running above its base (on a notification's or a PI
+     * waiter's loan) would wait on a thread at the base, which on a hart busy
+     * at the creator's priority does not run: roottask's mapped-file cleaner,
+     * run by a notification on a worker of base 1, waited a whole spawn storm
+     * for the spare worker it reserved. The priority is lent, as a notification
+     * lends its own, so the base stays the inherited one for a SchedSet or a
+     * sporadic drop to work on; thread_specret ends the loan once it has woken
+     * the creator.
      */
-    thread_init_prio(thp, thread_inherit_prio(act));
+    inherit = thread_inherit_prio(act);
+    start = inherit;
+    if ((thread_create_flags & THREAD_CREATE_BLOCK_FLAG) &&
+        act->priority > start)
+        start = act->priority;
+    thread_init_prio(thp, inherit);
+    if (start != inherit) {
+        thread_lend_msg(thp, start, false);
+        thp->priority = (uint8_t) start; /* on no queue yet */
+    }
     thp->policy = act->policy;
 
     /* Inherit scheduler partition.
@@ -1275,17 +1372,58 @@ int rdecl thread_create(thread_t *act,
      * iteration walks in kext_process_shutdown / *_destroyall.
      */
     kspinlock_lock(&prp->vec_slock);
-    tid = vector_add(&prp->threads, thp, 0);
-    if (tid != -1 && !prp->valid_thp) {
+
+    /* A process whose exit has begun gets no new thread: the exit's destroy
+     * pass may have walked the vector already, and a thread added after it
+     * would start, and run, in an address space the exit then frees. The exit
+     * marks the process under this lock, so a thread added before the mark is
+     * seen by the pass.
+     *
+     * An exec under way refuses the same way: EXEC_BEGIN marks the process
+     * (exec_thp) under this lock and then destroys every other thread, and the
+     * commit needs the caller to be the only thread left. The mark is cleared
+     * under this lock when the new image is committed, when the exec is given
+     * up in its begin step, or when the caller dies; the exec caller itself is
+     * held in roottask's reply until then and creates nothing.
+     *
+     * A thread that is added is CREATING until it is readied below:
+     * thread_destroy only flags it to kill itself once it runs, and an exit's
+     * destroy pass leaves it alone and asks to be made again.
+     */
+    if ((prp->flags & (RTMUX_FLG_PROC_TERMING | RTMUX_FLG_PROC_DESTROYALL)) ||
+        prp->exec_thp) {
+        tid = -2;
+    } else {
+        ITF_SET(thp, RTMUX_ITF_CREATING);
+        tid = vector_add(&prp->threads, thp, 0);
+    }
+    if (tid >= 0 && !prp->valid_thp) {
         prp->valid_thp = thp;
     }
     kspinlock_unlock(&prp->vec_slock);
-    if (tid == -1) {
+    if (tid < 0) {
+        /* Never published, so no reader can hold the sporadic state: free it
+         * here, or a refused or failed create leaks it.
+         */
+        if (IS_SCHED_SS(thp) && thp->schedinfo.ss_info) {
+            object_free(prp, &ssinfo_souls, thp->schedinfo.ss_info);
+            thp->schedinfo.ss_info = NULL;
+        }
         (void) thread_set_as_prp(thp, NULL);
         object_free(prp, &thread_souls, thp);
-        return EAGAIN;
+
+        /* pthread_create in a process whose exit has begun gets EAGAIN, the
+         * code POSIX gives it for a thread that cannot be made; a creator in
+         * another process (roottask) is told the target is gone.
+         */
+        return (tid == -2 && act->process != prp) ? ESRCH : EAGAIN;
     }
     thp->tid = (uint32_t) tid; /* always >= 0 after vector_add succeeds */
+
+    /* From here the thread is published but has not run yet; debug-inject can
+     * hold this window open for a kill to land in (STALL_THREAD_CREATE).
+     */
+    inject_thread_create_published(prp);
 
 
     /* Give the vendor extension a chance to take first dibs */
@@ -1310,6 +1448,10 @@ int rdecl thread_create(thread_t *act,
             (void) thread_set_as_prp(thp, NULL);
             rcu_sched_synchronize();
             (void) tthread_wait_unpinned(thp);
+            if (IS_SCHED_SS(thp) && thp->schedinfo.ss_info) {
+                object_free(prp, &ssinfo_souls, thp->schedinfo.ss_info);
+                thp->schedinfo.ss_info = NULL;
+            }
             thread_soul_free(prp, thp);
             return r;
         }
@@ -1346,6 +1488,7 @@ int rdecl thread_create(thread_t *act,
     /* Stash some stuff for use in the WAAA special return code */
     thp->args.wa.not_sigev_thread =
         (thread_create_flags & THREAD_CREATE_BLOCK_FLAG) != 0;
+    thp->args.wa.creation_loan = start != inherit;
     if (kattr) {
         thp->args.wa.kattr = *kattr;
         thp->args.wa.attr = &thp->args.wa.kattr;
@@ -1373,6 +1516,14 @@ int rdecl thread_create(thread_t *act,
     /* Make thread lookups invalid */
     vector_flag(&prp->threads, thp->tid, 1);
     _TRACE_TH_EMIT_CREATE(thp);
+
+    /* Pinned until the CREATING mark is off. Once readied the thread may run,
+     * exit and be reaped on another hart before this call goes on, and this
+     * hart may already have reported the quiescent state that reap waits for
+     * (block_and_ready can switch); the reap waits for the pin too.
+     */
+    if (tthread_pin(thp) != EOK)
+        crash();
     if (thread_create_flags & THREAD_CREATE_BLOCK_FLAG) {
         /* If the parent needs to know if the create succeeded, we block it. Set
          * join and blocked_on BEFORE block_and_ready — on single CPU,
@@ -1382,6 +1533,7 @@ int rdecl thread_create(thread_t *act,
         act->blocked_on = thp;
         SETKSTATUS(act, tid + 1);
         thp->join = act;
+        act->debug_join_tid = (pthread_t) (thp->tid + 1);
         act->state = STATE_WAITTHREAD;
         _TRACE_TH_EMIT_STATE(act, WAITTHREAD);
         block_and_ready(thp);
@@ -1389,6 +1541,10 @@ int rdecl thread_create(thread_t *act,
         ready(thp);
     }
 
+    /* Readied: a destroy pass may take the thread from here. */
+    cpu_smp_mb();
+    ITF_CLR(thp, RTMUX_ITF_CREATING);
+    tthread_unpin(thp);
     return ENOERROR;
 }
 
@@ -1398,35 +1554,16 @@ int rdecl thread_create(thread_t *act,
  */
 void fpu_drop_claims(thread_t *thp)
 {
+    uint64_t online = cpu_online_snapshot();
     for (unsigned c = 0; c < num_processors; c++) {
         struct thread_entry *me = thp;
 
-        if (!cpu_online(c))
+        if (!cpu_in_mask(online, c))
             continue;
 
         __atomic_compare_exchange_n(&pcpu_array[c].pc_active_fpu, &me, NULL, 0,
                                     __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
     }
-}
-
-/* Give up what a dying thread holds in the sync layer: its mutex hold list, the
- * robust mutexes it owns, and the waiters of mutexes it held (see
- * sync_thread_cleanup). Shared by thread_destroy and by proc_exit, which stamps
- * some threads dead without running thread_destroy's teardown. Repeating it is
- * harmless.
- */
-void rdecl thread_sync_teardown(thread_t *thp)
-{
-    ksync_t *syp;
-
-    while ((syp = thp->mutex_holdlist)) {
-        thread_t *waiting = pril_first(&syp->waiting);
-
-        CRASHCHECK(waiting->args.mu.owner == 0);
-        mutex_holdlist_rem(syp);
-        waiting->args.mu.owner = 0;
-    }
-    sync_thread_cleanup(thp);
 }
 
 /* Destroy a thread.
@@ -1549,6 +1686,16 @@ void rdecl thread_destroy(thread_t *thp)
      */
     {
         unsigned self = get_cpunum();
+
+        /* A thread thread_create has added but not yet readied (CREATING) is
+         * STATE_DEAD without being a zombie, and its creator is still setting
+         * it up: leave it to kill itself once it runs, like a blocked thread.
+         * Read before the state: the creator readies the thread before it
+         * clears the mark, so a clear mark is followed by a readied state.
+         */
+        bool creating = !self_reap && (__atomic_load_n(&thp->internal_flags,
+                                                       __ATOMIC_ACQUIRE) &
+                                       RTMUX_ITF_CREATING);
         int active_hart = thread_active_hart(thp);
         int active_remote = active_hart >= 0 && active_hart != (int) self;
         unsigned dead_active_spins = 0;
@@ -1570,9 +1717,18 @@ void rdecl thread_destroy(thread_t *thp)
         }
 
         if ((thp != get_active_thread(self) && state != STATE_DEAD) ||
-            active_remote) {
+            active_remote || creating) {
             atomic_or(&thp->flags,
                       (RTMUX_FLG_THR_KILLSELF | RTMUX_FLG_THR_ONLYME));
+
+            /* Look again now that KILLSELF is published. A thread seen running
+             * above may have blocked since, and an IPI does not wake it. One
+             * still running here finds the flag itself: at its return to user
+             * mode, or in thread_block_recheck if it blocks first.
+             */
+            cpu_smp_mb();
+            active_hart = thread_active_hart(thp);
+            state = thread_state_load_acquire(thp);
             if (active_hart >= 0) {
                 SENDIPI((unsigned) active_hart, IPI_RESCHED);
             } else if (state == STATE_RUNNING) {
@@ -1595,7 +1751,15 @@ void rdecl thread_destroy(thread_t *thp)
     if (thread_state_load_acquire(thp) != STATE_DEAD) {
         /* Remove thread from any queues. */
         if (!force_ready(thp, _FORCE_KILL_SELF)) {
-            /* Couldn't kill this thread right now, do it later */
+            /* Couldn't kill this thread right now, do it later. A self-reap
+             * came here from its KILLSELF special return, which cleared the
+             * flag: set it again, or the thread goes back to user mode alive,
+             * in a process whose exit may already have freed its address space,
+             * and runs (or faults) there for ever.
+             */
+            if (self_reap)
+                atomic_or(&thp->flags,
+                          (RTMUX_FLG_THR_KILLSELF | RTMUX_FLG_THR_ONLYME));
             __atomic_store_n(&thp->destroy_claim, 0, __ATOMIC_RELEASE);
             return;
         }
@@ -1625,7 +1789,7 @@ void rdecl thread_destroy(thread_t *thp)
             thp->args.ri.thp->restart = 0;
         }
         if (thp->flags & RTMUX_FLG_THR_SHORT_MSG) {
-            ((thread_t *) thp->blocked_on)->restart = 0;
+            thp->short_msg_source->restart = 0;
         }
 
         thp->timeout_flags = 0;
@@ -1648,7 +1812,7 @@ void rdecl thread_destroy(thread_t *thp)
             kcall_op_thread_destroy_hook(thp);
         }
 
-        thread_sync_teardown(thp);
+        sync_thread_cleanup(thp);
 
         /* clear client field */
         if (thp->client != 0) {
@@ -1900,6 +2064,12 @@ void rdecl thread_destroy(thread_t *thp)
         uint64_t t0 = stats_enabled && join_woke ? cpu_clock_ticks() : 0;
         uint64_t t1;
         kspinlock_lock(&prp->vec_slock);
+
+        /* The exec this thread called is over with it: drop its mark, which
+         * would otherwise refuse every new thread of the process for good.
+         */
+        if (prp->exec_thp == thp)
+            prp->exec_thp = NULL;
         thp = vector_rem(&prp->threads, __tid);
 
         /* "Last thread out": the thread vector is now empty. This is the single
@@ -2338,12 +2508,24 @@ void rdecl thread_specret(thread_t *thp)
      * Clear thp->join before the ready: the parent can run on another hart at
      * once, and a pthread_join it makes while the field still names it fails
      * with EBUSY.
+     *
+     * The link is taken under vec_slock, as a force_ready of the waiting parent
+     * (a kill) takes it: whoever takes it readies the parent, and only that
+     * one. Both used to: the parent was queued twice, ran and died, and its
+     * stale queue entry dispatched it again while it was being freed.
      */
-    if (thp->join && thp->join->state == STATE_WAITTHREAD) {
-        thread_t *parent = thp->join;
+    {
+        process_t *prp = thp->process;
+        thread_t *parent = NULL;
 
-        thp->join = NULL;
-        ready(parent);
+        kspinlock_lock(&prp->vec_slock);
+        if (thp->join && thp->join->state == STATE_WAITTHREAD) {
+            parent = thp->join;
+            thp->join = NULL;
+        }
+        kspinlock_unlock(&prp->vec_slock);
+        if (parent)
+            ready(parent);
     }
 
     /* Don't change priority until parent thread freed to run again
@@ -2357,6 +2539,21 @@ void rdecl thread_specret(thread_t *thp)
              * (RTMUX_FLG_THR_KILLSELF | RTMUX_FLG_THR_ONLYME)); return;
              */
         }
+    }
+
+    /* The creator is running again: end the loan it made for the wait
+     * (thread_create), after an explicit policy has set the new base, so the
+     * thread never drops below both. A SchedSet since the create ended the loan
+     * already, and the base it set stays.
+     */
+    if (thp->args.wa.creation_loan) {
+        thp->args.wa.creation_loan = 0;
+        thread_end_notification_loan(thp);
+
+        /* A loan ending under the running thread: lower it and let kernel exit
+         * reschedule, never displace it from this stack here.
+         */
+        thread_prio_update(thp);
     }
 
     /* Only done once for the first thread running */
@@ -2400,7 +2597,7 @@ void rdecl thread_destroyall(thread_t *thp)
         }
     }
 
-    prp->flags |= RTMUX_FLG_PROC_DESTROYALL;
+    PROC_FLG_SET(prp, RTMUX_FLG_PROC_DESTROYALL);
 }
 
 

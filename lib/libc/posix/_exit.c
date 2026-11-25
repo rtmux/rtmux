@@ -12,14 +12,16 @@
 #include <sys/rtmux-core.h>
 #include <sys/procmsg.h>
 
-void _exit(int status)
+#include "signal-state.h"
+
+static _Noreturn void proc_exit_message(int status, uint16_t by_signal)
 {
     struct _proc_exit msg;
     struct _proc_exit_reply reply;
     iov_t siov, riov;
 
     msg.type = _PROC_EXIT;
-    msg.zero = 0;
+    msg.by_signal = by_signal;
     msg.status = status;
 
     SETIOV(&siov, &msg, sizeof(msg));
@@ -34,6 +36,16 @@ void _exit(int status)
     /* Should not reach here — proc service destroys us */
     for (;;)
         ;
+}
+
+_Noreturn void __libc_signal_exit(int signo)
+{
+    proc_exit_message(signo, 1);
+}
+
+void _exit(int status)
+{
+    proc_exit_message(status, 0);
 }
 
 void _Exit(int status)

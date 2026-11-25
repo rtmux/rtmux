@@ -51,6 +51,20 @@ static void root_process_clear(root_process_t *tmp)
     memset((char *) tmp + tail, 0, sizeof(*tmp) - tail);
 }
 
+/* Transfer the old generation's session reference to the caller while slot_lock
+ * still protects the tag. Terminal release may send IPC and runs after the
+ * caller unlocks.
+ */
+static session_t *root_process_release(root_process_t *tmp)
+{
+    session_t *sep = tmp->session;
+    free(tmp->debug_name);
+    proc_pgrp_reap(tmp->pid);
+    memcap_process_fini(tmp);
+    root_process_clear(tmp);
+    return sep;
+}
+
 /* Claim and initialize the root_process[] slot for a pid.
  *
  * Clears any stale state left by a previous generation and records the pid and
@@ -62,18 +76,21 @@ void root_process_init(pid_t pid, pid_t parent_pid)
 {
     root_process_t *tmp = root_proc(pid);
 
+    session_t *sep = NULL;
+
     /* Wipe stale process state; the proc-mux lock belongs to the slot. A
      * previous generation whose fini has not run yet leaves its group first, or
      * its count would never end.
      */
     pthread_mutex_lock(&slot_lock);
     if (tmp->pid)
-        proc_pgrp_reap(tmp->pid);
-    root_process_clear(tmp);
+        sep = root_process_release(tmp);
     tmp->pid = pid;
     tmp->parent_pid = parent_pid;
     tmp->pgrp = pid;
     pthread_mutex_unlock(&slot_lock);
+    if (sep)
+        proc_session_unref(sep);
 }
 
 /* The process group of p. A slot starts in its own group (root_process_init),
@@ -161,13 +178,8 @@ void root_process_fini(pid_t pid)
      * stale entries belong to whoever took over the slot.
      */
     pthread_mutex_lock(&slot_lock);
-    if (tmp->pid == pid) {
-        free(tmp->debug_name); /* tolerates NULL */
-        proc_pgrp_reap(pid); /* a no-op for a child its waiter already reaped */
-        sep = tmp->session;  /* its link is dropped below, outside the lock */
-        memcap_process_fini(tmp);
-        root_process_clear(tmp);
-    }
+    if (tmp->pid == pid)
+        sep = root_process_release(tmp);
     pthread_mutex_unlock(&slot_lock);
     if (sep)
         proc_session_unref(sep);

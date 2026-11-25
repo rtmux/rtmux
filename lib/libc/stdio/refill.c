@@ -25,7 +25,7 @@ static int lflush(FILE *fp)
 int __srefill(FILE *fp)
 {
     if (!__sdidinit)
-        __sinit();
+        __sdidinit = 1;
 
     ORIENT(fp, -1);
 
@@ -61,9 +61,15 @@ int __srefill(FILE *fp)
     if (!fp->_bf._base)
         __smakebuf(fp);
 
+    /* Flush line-buffered output before reading. A stream another thread holds
+     * is waited for only while it is line-buffered in write mode, so a reader
+     * blocked on input is never waited for. This stream is skipped by __SIGN,
+     * and a stream being refilled has left write mode above, so two threads
+     * refilling at once do not wait on each other.
+     */
     if (fp->_flags & (__SLBF | __SNBF)) {
         fp->_flags |= __SIGN;
-        (void) _fwalk(lflush);
+        (void) _fwalk(lflush, FWALK_LBF);
         __sclear(fp, __SIGN);
 
         if ((fp->_flags & (__SLBF | __SWR)) == (__SLBF | __SWR))

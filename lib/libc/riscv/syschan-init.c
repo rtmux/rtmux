@@ -63,10 +63,30 @@ static void __systhrd_entry(void)
         return;
 
     for (;;) {
-        int rcvid = msg_receive_notification(
-            __rtmux_syschan_chid, &notification, sizeof(notification), NULL);
-        if (rcvid == -1)
-            return;
+        int rcvid, err;
+
+        /* An exec that is being prepared holds this thread here, and breaks the
+         * receive with EINTR to bring it here (see __libc_signal_exec_begin).
+         */
+        __libc_signal_recv_enter();
+        notification.code = 0; /* no notification has that code */
+        rcvid = msg_receive_notification(__rtmux_syschan_chid, &notification,
+                                         sizeof(notification), NULL);
+        err = errno;
+        __libc_signal_recv_exit();
+
+        /* The interrupt can meet a signal being delivered to this receive: the
+         * receive then fails with EINTR, but the notification was copied here,
+         * and must not be dropped.
+         */
+        if (rcvid == -1) {
+            if (err != EINTR) {
+                __libc_signal_recv_gone();
+                return;
+            }
+            if (notification.code != _NOTIFICATION_CODE_SIGNAL)
+                continue;
+        }
 
         if (notification.code == _NOTIFICATION_CODE_SIGNAL) {
             /* Low 32 bits: signo; high 32 bits: sender pid (see
@@ -89,6 +109,11 @@ static void __systhrd_entry(void)
 extern long SysCpupageGet_r(int index) __hidden;
 extern struct syspage_entry *_syspage_ptr;
 
+int cpuid(void)
+{
+    return (int) SysCpupageGet_r(CPUPAGE_CPU);
+}
+
 void __rtmux_syschan_init(void)
 {
     int chid, coid;
@@ -110,6 +135,13 @@ void __rtmux_syschan_init(void)
             ep++;
         __libc_auxv = (const uint64_t *) (ep + 1);
     }
+
+    /* An image started by exec begins with the signals its predecessor ignored
+     * and blocked, as the loader passes them on.
+     */
+    if (__libc_auxv_get(AT_RTMUX_SIGMASK) || __libc_auxv_get(AT_RTMUX_SIGIGN))
+        __libc_signal_exec_inherit(__libc_auxv_get(AT_RTMUX_SIGIGN),
+                                   __libc_auxv_get(AT_RTMUX_SIGMASK));
 
     /* Initialize the syspage pointer for this process. */
     if (!_syspage_ptr)

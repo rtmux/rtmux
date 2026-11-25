@@ -41,6 +41,11 @@ enum _auxv_e_at {
     /* a_val 1: the image is set-id and its spawner is not the owner, so the
      * dynamic loader must ignore LD_* overrides (issetugid()). */
     AT_RTMUX_SECURE = 50,
+    /* The signals the new image starts with blocked, and the ones it starts
+     * with ignored (a_val: bit n-1 of the 64-bit word is signal n), when the
+     * spawn asked for them: an exec passes both on. */
+    AT_RTMUX_SIGMASK = 51,
+    AT_RTMUX_SIGIGN = 52,
     AT_NUM
 };
 

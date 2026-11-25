@@ -22,3 +22,17 @@ no grant for the script path.
 Gate: `make check-loader-negative` boots QEMU and verifies malformed program
 headers, oversized load data, writable-executable load segments, and `execvp()`
 shell fallback fail before the child reaches U-mode.
+
+## Process image replacement
+
+The loader prepares the new image in a temporary process. Once preparation
+succeeds, roottask quiesces the old threads, closes descriptors marked
+close-on-exec and installs the new address space under the caller's PID.
+The new program inherits the caller's signal mask and ignored dispositions,
+and its pending signals: those queued for the old image and those its libc
+held, with any that arrive before the new image registers, are delivered to
+the new one. SIGKILL is the exception: one kept across the replacement ends
+the process once the loader has started it, and is never delivered to the
+new image. Caught dispositions return to their defaults. A failed image
+lookup leaves the caller running and its process group eligible for a
+parent's setpgid.

@@ -53,14 +53,7 @@
 /* Arm a window in roottask; false when this roottask has none. */
 static bool pgw_arm(unsigned where, unsigned ms)
 {
-    struct _proc_jobctl msg;
-
-    memset(&msg, 0, sizeof msg);
-    msg.type = _PROC_JOBCTL;
-    msg.subtype = _PROC_JOBCTL_DEBUG;
-    msg.arg = (int32_t) where;
-    msg.arg2 = (int32_t) ms;
-    return msg_sendnc(ROOTTASK_COID, &msg, sizeof msg, 0, 0) == 0;
+    return test_window_arm(where, ms);
 }
 
 /* Wait up to five seconds for a byte on fd (non-blocking read); false when
@@ -172,24 +165,13 @@ int pgrp_exec_hold(void)
 }
 
 /* setpgid on a child that has exec'd is EACCES; on one that has only been
- * spawned, it works. The child has exec'd once it says so from its new image,
- * or, where an exec does not start the new image (see below), once it has
- * gone: either way setpgid must refuse it. Only a child that has exited and
- * not been collected can be looked at without a waiter, which is not queued
- * for the exit, so the look is WNOHANG.
- *
- * In this tree a successful exec replaces the caller and the new image is
- * never started, because nothing consumes the loader state the exec leaves
- * (roottask's _PROC_SPAWN_EXEC sets it and the process is torn down): the
- * exec'd process exits with status 0 and says nothing, which is why this case
- * cannot wait for the new image.
+ * spawned, it works. The child has exec'd once it says so from its new image.
  */
-static void pgrp_exec_eacces(void)
+void pgrp_exec_eacces(void)
 {
     int h_exec, h_plain, rfd;
     pid_t c = pipe_spawn("--pgrp-exec-hold", &h_exec, &rfd);
     pid_t p = hold_spawn("--getsid-hold", &h_plain);
-    siginfo_t si;
     bool execd = false;
     char b;
     int rc, err;
@@ -197,18 +179,9 @@ static void pgrp_exec_eacces(void)
     check(c != (pid_t) -1 && p != (pid_t) -1, "pgrp exec: spawn children",
           "the case needs a spawned child and one that execs");
     if (c != (pid_t) -1) {
-        (void) fcntl(rfd, F_SETFL, O_NONBLOCK);
-        for (int i = 0; i < 250 && !execd; i++) {
-            memset(&si, 0, sizeof si);
-            execd = read(rfd, &b, 1) == 1 ||
-                    (waitid(P_PID, (id_t) c, &si,
-                            WEXITED | WNOHANG | WNOWAIT) == 0 &&
-                     si.si_pid == c);
-            if (!execd)
-                sleep_ms(20);
-        }
+        execd = wait_byte(rfd, &b);
         check(execd, "pgrp exec: the child has exec'd",
-              "the exec must have taken effect, or the child gone");
+              "the new image of the exec must start and say so");
         errno = 0;
         rc = setpgid(c, c);
         err = errno;
@@ -371,8 +344,32 @@ enum {
     TTY_NOTBOUND = 13,
     TTY_DETACH = 14,
     TTY_REBIND = 15,
+    TTY_OTHER = 17,  /* a delayed driver held up another session */
     TTY_CLEARED = 16 /* the rebind was cleared by the detach: the race */
 };
+
+/* While the first session waits for its serial driver, the text terminal
+ * must be able to bind a different session. */
+int pgrp_tty_other(void)
+{
+    pid_t sid = setsid();
+    int fd = open("/dev/text", O_RDWR | O_NOCTTY);
+    if (sid < 0 || fd < 0) {
+        fprintf(stderr, "other terminal setup: sid=%d fd=%d errno=%d\n",
+                (int) sid, fd, errno);
+        return 1;
+    }
+    char b;
+    if (write(1, "r", 1) != 1 || read(0, &b, 1) != 1 ||
+        !pgw_arm(PGRP_WINDOW_ACTIVE, PGRP_WINDOW_DETACH))
+        return 1;
+    int rc = tcsetsid(fd, sid);
+    if (rc != 0 && errno != EPERM) {
+        fprintf(stderr, "other terminal bind: errno=%d\n", errno);
+        return 1;
+    }
+    return pgw_arm(PGRP_WINDOW_ACTIVE, PGRP_WINDOW_DETACH) ? 0 : 1;
+}
 
 int pgrp_tty_child(int race)
 {
@@ -391,13 +388,31 @@ int pgrp_tty_child(int race)
         return TTY_NOTBOUND;
     if (!race)
         return TTY_OK; /* leave it bound: the last member's reap unbinds it */
-    if (!pgw_arm(PGRP_WINDOW_DETACH, PGW_MS))
+    int hold;
+    pid_t probe = hold_spawn("--pgrp-tty-other", &hold);
+    if (probe < 0)
+        return TTY_OTHER;
+    if (!pgw_arm(PGRP_WINDOW_DETACH, PGW_MS)) {
+        hold_release(probe, hold);
         return TTY_NOWINDOW;
+    }
     a.fd = fd1;
     a.rc = -2;
-    if (pthread_create(&th, NULL, detach_thread, &a) != 0)
+    if (pthread_create(&th, NULL, detach_thread, &a) != 0) {
+        hold_release(probe, hold);
         return TTY_DETACH;
-    sleep_ms(PGW_MS / 3); /* the detach has let go of the terminal, and waits */
+    }
+    for (int i = 0; i < 100 && !pgw_arm(PGRP_WINDOW_ACTIVE, PGRP_WINDOW_DETACH);
+         ++i)
+        sleep_ms(1);
+    int other = -1;
+    (void) write(hold, "g", 1);
+    (void) close(hold);
+    if (waitpid(probe, &other, 0) != probe || !WIFEXITED(other) ||
+        WEXITSTATUS(other) != 0) {
+        (void) pthread_join(th, NULL);
+        return TTY_OTHER;
+    }
     if (tcsetsid(fd2, a.sid) != 0) {
         (void) pthread_join(th, NULL);
         return TTY_REBIND;
@@ -464,8 +479,17 @@ static void pgrp_tty(void)
         return;
     }
     check(rc == TTY_OK, "tcsetsid(-1) against a rebind",
-          rc == TTY_CLEARED ? "the detach cleared the rebind's binding"
-                            : "the session leader child failed");
+          rc == TTY_OTHER     ? "the other terminal was blocked during detach"
+          : rc == TTY_CLEARED ? "the detach cleared the rebind's binding"
+                              : "the session leader child failed");
+}
+
+int pgrp_debug_access(void)
+{
+    if (setuid(1000) != 0)
+        return 1;
+    errno = 0;
+    return !pgw_arm(0, 0) && errno == EPERM ? 0 : 1;
 }
 
 int pgrp_races(void)
@@ -473,6 +497,10 @@ int pgrp_races(void)
 
     if (!pgw_arm(0, 0))
         return TC_EXIT_SKIP;
+    int status = -1;
+    check(tty_run("--pgrp-debug-access", &status) == 0 && status == 0,
+          "unprivileged job-control debug arm is denied",
+          "expected EPERM for uid 1000");
     pgrp_zombie_member();
     pgrp_join_vs_reap();
     pgrp_tty();

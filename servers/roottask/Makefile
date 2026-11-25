@@ -73,6 +73,7 @@ PROC_OBJECTS = \
 	proc/signal.o \
 	proc/jobctl.o \
 	proc/exit.o \
+	proc/exec.o \
 	proc/coredump.o \
 	proc/stack.o
 
@@ -137,6 +138,7 @@ PATH_OBJECTS = \
 	path/cpiofs.o \
 	path/capfs.o \
 	path/sysfs.o \
+	path/sysfs-ocb.o \
 	path/namedsem.o
 
 # --- namesrv/ objects ---

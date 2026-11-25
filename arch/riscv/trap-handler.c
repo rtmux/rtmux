@@ -65,6 +65,21 @@ static const char *scause_name(uint64_t cause)
     }
 }
 
+/* user_fault_past_end — whether a U-mode page fault at va hit a page that is
+ * mapped but past the end of the object it maps (PTE_SW_BUS), which POSIX mmap
+ * makes SIGBUS rather than SIGSEGV. satp still names the faulting process's
+ * page table, whose tables are freed only with the process, so the read-only
+ * walk is safe without the as lock; a mark that changes under it decides only
+ * which of the two signals a fault that has already happened gets.
+ */
+static int user_fault_past_end(uintptr_t va)
+{
+    pagetable_t pgdir =
+        (pagetable_t) PA_TO_VA((r_satp() & PTE_PPN_MASK) << PGSHIFT);
+
+    return va < MAXVA && sv39_past_end(pgdir, va);
+}
+
 /* ===================================================================== *
  * Verbose U-mode fault report — gated on CONFIG_UMODE_VERBOSE_FAULT_REPORT.
  *
@@ -240,9 +255,14 @@ static void ipi_handler(void)
     if ((cmds & IPI_CLOCK_LOAD) && !kopt.disable_timer)
         (void) arch_timer_reload(qtimeptr); /* honor the dynamic deadline */
 
-    if (cmds & IPI_PARKIT)
+    if (cmds & IPI_PARKIT) {
+        uint64_t bit = 1ULL << cpu;
+        __atomic_store_n(&pcpu_array[cpu].pc_alive, false, __ATOMIC_RELEASE);
+        __atomic_and_fetch(&online_cpu_mask, ~bit, __ATOMIC_RELEASE);
+        __atomic_and_fetch(&legal_cpu_bitmask, ~bit, __ATOMIC_RELEASE);
         for (;;)
             __asm__ volatile("wfi");
+    }
 
     if (cmds & IPI_CRASH) {
         /* A sibling CPU is crashing and IPI'd us to quiesce. Snapshot our
@@ -313,6 +333,23 @@ static void __attribute__((noreturn)) enter_dispatch_exit(void)
     in_kcall_inc();
     in_kcall_phase(IN_KCALL_PHASE_DISPATCH);
     kernel_exit();
+}
+
+/* An interrupt handler can dispatch a ready thread on this hart. In that case
+ * the interrupted frame can already belong to a thread running elsewhere.
+ * Never restore it directly or read its status after handling the interrupt.
+ */
+static void interrupt_return(CPU_REGISTERS *interrupted, bool from_user)
+{
+    if (from_user) {
+        unsigned cpu = get_cpunum();
+        thread_t *cur = get_active_thread(cpu);
+        if (!cur || &cur->reg != interrupted ||
+            pcpu_array[cpu].pc_pending_preempt_prio ||
+            (atomic_load_explicit(&cur->async_flags, memory_order_acquire) &
+             (RTMUX_ATF_TIMESLICE | RTMUX_ATF_SMP_RESCHED)))
+            enter_dispatch_exit();
+    }
 }
 
 /* smode_preempt — called when a timer interrupt sets async_flags on the active
@@ -497,6 +534,7 @@ void strap_handler_c(CPU_REGISTERS *regs)
     pcpu_array[_mon_cpu].pc_last_scause = scause;
 
     if (scause & (1UL << 63)) {
+        bool from_user = !(regs->sstatus & SSTATUS_SPP);
         unsigned long _cause_early = scause & ~(1UL << 63);
 
         /* IPIs (S-mode software interrupt) are dispatched here. ipi_handler()
@@ -516,14 +554,7 @@ void strap_handler_c(CPU_REGISTERS *regs)
              * interrupted lower-priority thread and strand the readied one.
              * S-mode returns (SPP=1) drain on their own kernel_exit.
              */
-            unsigned cpu = get_cpunum();
-            thread_t *cur = get_active_thread(cpu);
-            if (!(regs->sstatus & SSTATUS_SPP) && cur &&
-                (atomic_load_explicit(&cur->async_flags, memory_order_acquire) &
-                 (RTMUX_ATF_TIMESLICE | RTMUX_ATF_SMP_RESCHED))) {
-                enter_dispatch_exit();
-                /* never returns */
-            }
+            interrupt_return(regs, from_user);
             return;
         }
 
@@ -545,8 +576,8 @@ void strap_handler_c(CPU_REGISTERS *regs)
 
         /* Interrupt — increment nesting depth (byte 0 of inkernel). Matches
          * MIPS ADJUST_INKERNEL(k0,k1,k1,1,1) at interrupt entry. Read by
-         * INKERNEL_INTRMASK consumers in ipc/event.c, trace/core.c, ext/page.c,
-         * init/shutdown.c to detect interrupt context.
+         * INKERNEL_INTRMASK consumers in ipc/event.c, trace/core.c and
+         * ext/page.c to detect interrupt context.
          */
         atomic_add(&inkernel, 1);
 
@@ -666,9 +697,8 @@ void strap_handler_c(CPU_REGISTERS *regs)
                          * this trap context — there is no deferred-event queue.
                          */
                         if (itp->kind == INTR_KIND_THREAD && itp->thread) {
-                            /* Synthetic SIGEV_INTR to the IST. Inlined to avoid
-                             * building/copying a struct sigevent for the hot
-                             * path.
+                            /* Wake the IST inline; no sigevent is built (the
+                             * event kind SIGEV_INTR is not delivered).
                              */
                             thread_t *target = itp->thread;
 
@@ -695,7 +725,27 @@ void strap_handler_c(CPU_REGISTERS *regs)
                              * interrupt_wait returns to U-mode), not trap entry
                              * to ready().
                              */
-                            if (target == here || target->state != STATE_INTR) {
+                            /* A remote force_ready may be ending this wait: the
+                             * loser keeps the interrupt pending. If the IST has
+                             * moved on to a new wait meanwhile, claim that one,
+                             * or it could sleep with the interrupt pending.
+                             */
+                            bool claimed = false;
+
+                            for (;;) {
+                                uint32_t wait_seq = thread_wake_seq(target);
+
+                                if (target == here ||
+                                    target->state != STATE_INTR)
+                                    break;
+                                if (thread_wake_claim(target, wait_seq)) {
+                                    claimed = true;
+                                    break;
+                                }
+                                if (thread_wake_seq(target) == wait_seq)
+                                    break;
+                            }
+                            if (!claimed) {
                                 atomic_or((volatile unsigned *) &target->flags,
                                           RTMUX_FLG_THR_INTR_PENDING);
                             } else {
@@ -798,16 +848,7 @@ void strap_handler_c(CPU_REGISTERS *regs)
          * If SPP=1 (interrupt from S-mode kernel code) we do not route here;
          * the interrupted kernel extension drains on its own kernel_exit.
          */
-        unsigned cpu = get_cpunum();
-        thread_t *cur = get_active_thread(cpu);
-        if (!(regs->sstatus & SSTATUS_SPP) &&
-            (pcpu_array[cpu].pc_pending_preempt_prio != 0 ||
-             (cur &&
-              (atomic_load_explicit(&cur->async_flags, memory_order_acquire) &
-               (RTMUX_ATF_TIMESLICE | RTMUX_ATF_SMP_RESCHED))))) {
-            enter_dispatch_exit();
-            /* never returns */
-        }
+        interrupt_return(regs, from_user);
         return;
     }
 
@@ -994,20 +1035,10 @@ void strap_handler_c(CPU_REGISTERS *regs)
          */
         act->reg.pc += 4;
 
-        /* A saved msg_readv/msg_writev iov check resumes only into the same
-         * call; any other kernel call in between discards it.
+        /* What a stepped transfer saved resumes only into the restart of the
+         * call that saved it.
          */
-        if ((act->iovchk_iov || act->xcur.armed) && num != __KSYS_MSG_READV &&
-            num != __KSYS_MSG_WRITEV) {
-            act->iovchk_iov = NULL;
-
-            /* A copy cursor resumes only into the call that saved it: one of
-             * the calls that copy a message in steps.
-             */
-            if (num != __KSYS_MSG_SENDV && num != __KSYS_MSG_SENDVNC &&
-                num != __KSYS_MSG_RECEIVEV && num != __KSYS_MSG_REPLYV)
-                act->xcur.armed = false;
-        }
+        xfer_begin_call(act, num);
 
         /* Reject invalid syscall numbers AFTER advancing the PC so the faulting
          * thread resumes past the ecall instead of re-triggering it in an
@@ -1061,6 +1092,10 @@ void strap_handler_c(CPU_REGISTERS *regs)
          * after a restart re-runs this snapshot over the just-restored values,
          * which is harmless.)
          */
+        /* Keep the word a blocking hart reads about a pending cancel true. */
+        if (act->internal_flags & RTMUX_ITF_CANCEL_POSTED)
+            thread_cancel_posted_refresh(act);
+
         act->kcall_c_args[0] = kap[0];
         act->kcall_c_args[1] = kap[1];
         act->kcall_c_args[2] = kap[2];
@@ -1100,20 +1135,25 @@ void strap_handler_c(CPU_REGISTERS *regs)
              */
         }
 
-        /* Store the status before testing for a switch. SchedSet on itself
-         * defers its switch (RTMUX_ITF_DEFER_DISPLACE), so this store reaches
-         * the caller and kernel_exit switches afterwards (YIELD_TAIL). Other
-         * bodies that switch the caller out publish their status first, and
-         * this store repeats it; thread destroy (kcall 47) relies on it too.
-         */
-        SETKSTATUS(act, -(long) ret);
-
-        bool displaced = act->state != STATE_RUNNING ||
-                         get_active_thread(get_cpunum()) != act;
+        /* A displaced caller already published its status and may now be
+         * running on another hart. Check ownership before touching its frame.
+         * A deferred yield still owns the frame until kernel_exit. */
+        bool displaced = get_active_thread(get_cpunum()) != act ||
+                         act->state != STATE_RUNNING;
+        if (!displaced)
+            SETKSTATUS(act, -(long) ret);
         bool switch_pending =
             displaced || (act->internal_flags & RTMUX_ITF_YIELD_TAIL) != 0;
 
         inject_note_sched_return(act, switch_pending);
+
+        /* A timer fell due on the boot hart during this call: kernel_exit
+         * catches the clock up and expires the timers due (clock_catch_up),
+         * and dispatches a thread they woke that outranks this one. U-mode
+         * only, where act->reg is the frame kernel_exit resumes.
+         */
+        if (!from_smode && clock_catch_up_due(get_cpunum()))
+            switch_pending = true;
         if (switch_pending) {
             kernel_exit();
             /* NOTREACHED — same as above. */
@@ -1122,8 +1162,9 @@ void strap_handler_c(CPU_REGISTERS *regs)
         /* S-mode: regs is the caller's stack frame, a different copy from
          * act->reg, so it needs the return value too.
          */
+        if (from_smode)
+            regs->gpr[RISCV_REG_A0] = (uint64_t) (-(long) ret);
         in_kcall_dec();
-        regs->gpr[RISCV_REG_A0] = (uint64_t) (-(long) ret);
         return;
     }
 
@@ -1208,8 +1249,13 @@ void strap_handler_c(CPU_REGISTERS *regs)
             case RISCV_EXC_INSN_PAGE_FAULT:
             case RISCV_EXC_LOAD_PAGE_FAULT:
             case RISCV_EXC_STORE_PAGE_FAULT:
-                signo = SIGSEGV;
-                code = SEGV_MAPERR;
+                if (user_fault_past_end(r_stval())) {
+                    signo = SIGBUS;
+                    code = BUS_ADRERR;
+                } else {
+                    signo = SIGSEGV;
+                    code = SEGV_MAPERR;
+                }
                 break;
             default:
                 signo = SIGILL;

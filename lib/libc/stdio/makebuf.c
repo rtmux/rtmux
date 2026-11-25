@@ -14,8 +14,6 @@
 #include <stdlib.h>
 #include "local.h"
 
-extern void (*__cleanup)(void) __hidden;
-
 /* Allocate a file buffer, or switch to unbuffered I/O. Per the ANSI C standard,
  * ALL tty devices default to line buffered.
  */
@@ -38,7 +36,7 @@ void __smakebuf(FILE *fp)
         fp->_bf._size = 1;
         return;
     }
-    __cleanup = _cleanup;
+    __sdidinit = 1;
     flags |= __SMBF;
     fp->_bf._base = fp->_p = p;
     fp->_bf._size = (int) size;

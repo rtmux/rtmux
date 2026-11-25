@@ -9,7 +9,12 @@
  * Fault handling routines.
  *
  * RTMux has no signals — a fault either notifies an attached debugger or kills
- * the faulting thread directly.
+ * the faulting thread directly. These are user faults only: a fault taken in
+ * the kernel never comes here. strap_handler_c (arch/riscv/trap-handler.c)
+ * reports it into the per-hart crash buffer and joins crash_rendezvous()
+ * (kernel/printk/kprintf.c), which prints every hart's report and halts; a
+ * failed kernel check (crash(), CRASHCHECK) takes the same rendezvous through
+ * crash_halt(). The debug-inject crash ops exercise both ends of it.
  */
 
 #include <core/globals.h>
@@ -63,11 +68,11 @@ void rdecl deliver_fault(thread_t *thp, siginfo_t *info)
          * delivery.
          *
          * Read each slot (and nentries) UNDER vec_slock so we always see the
-         * current buffer. We must NOT hold vec_slock across force_ready /
-         * thread_destroy — thread_destroy takes it itself to vector_rem
-         * (lifecycle.c). "t" stays valid after the lock drops because a reaper
-         * frees a thread only after an RCU-sched grace period, and this loop
-         * does not block before thread_destroy.
+         * current buffer. We must NOT hold vec_slock across thread_destroy —
+         * thread_destroy takes it itself to vector_rem (lifecycle.c). "t" stays
+         * valid after the lock drops because a reaper frees a thread only after
+         * an RCU-sched grace period, and this loop does not block before
+         * thread_destroy.
          */
         for (tid = 0;; ++tid) {
             int got;
@@ -82,43 +87,10 @@ void rdecl deliver_fault(thread_t *thp, siginfo_t *info)
              */
             got = ((t = VECP2(t, &prp->threads, tid)) && t != thp);
             kspinlock_unlock(&prp->vec_slock);
-            if (got) {
-                force_ready(t, _FORCE_KILL_SELF);
+            if (got)
                 thread_destroy(t);
-            }
         }
     }
-}
-
-
-/* kdebug_enter — enter the kernel debugger (if attached).
- *
- * Invokes the registered kdebug fault entry callback; if none can handle a
- * fatal/process fault, falls through to shutdown(). Parameters:
- *   prp     : faulting process (NULL is resolved to kernel_threads_prp)
- *   sigcode : fault/signal code
- *   reg     : register context at the fault
- * Return value: the (possibly modified) sigcode the caller should act on.
- */
-unsigned kdebug_enter(process_t *prp, unsigned sigcode, CPU_REGISTERS *reg)
-{
-    struct kdebug_callback *funcs;
-    unsigned (*func)(struct kdebug_entry *entry, unsigned sigcode, void *reg);
-
-    if ((funcs = privateptr->debug_call) && (func = funcs->fault_entry)) {
-        if (!prp && pcpu_array[get_cpunum()].pc_alive) {
-            prp = kernel_threads_prp;
-        }
-        sigcode = func(prp ? &prp->kdebug : 0, sigcode, reg);
-        return sigcode;
-    }
-    if (sigcode & (SIGCODE_FATAL | SIGCODE_PROC)) {
-        /* when we *have* to have some sort of kernel debugger */
-        shutdown(sigcode, reg);
-        return 0;
-    }
-    /* when we can ignore the fault */
-    return sigcode;
 }
 
 
@@ -148,13 +120,18 @@ void rdecl usr_fault(int code_signo, thread_t *thp, uintptr_t addr)
 
     prp = thp->process;
 
+    memset(&info, 0, sizeof info);
     info.si_signo = SIGCODE_SIGNO(code_signo);
     info.si_code = SIGCODE_CODE(code_signo);
     info.si_fltno = SIGCODE_FAULT(code_signo);
     info.si_bdslot = (code_signo & SIGCODE_BDSLOT) ? 1 : 0;
     info.si_addr = (void *) addr;
     info.si_fltip = (void *) KIP(thp);
-    info.si_status = info.si_signo;
+
+    /* No si_status: it shares storage with si_addr, so setting it made every
+     * fault report the signal number as its address. The wait status is derived
+     * from si_signo (proc_wait_check).
+     */
 
     /* Faults should always be faults */
     if (info.si_code <= SI_USER) {

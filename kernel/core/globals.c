@@ -86,6 +86,12 @@ DEFINE_PER_CPU(unsigned, in_kcall);
  */
 struct pcpu pcpu_array[PROCESSORS_MAX];
 
+#ifndef NDEBUG
+/* MARK_POTN_INF_LOOP's pass count and last site (kernel/include/log.h). */
+unsigned long potn_inf_loop_marks;
+const char *potn_inf_loop_site;
+#endif
+
 /* in_kcall accessors. Wrapping the per-CPU counter behind a function boundary
  * serves two goals:
  *
@@ -322,7 +328,15 @@ void set_active_thread(unsigned cpu, thread_t *thp)
         kprintf("BAD set_active_thread: cpu=%u thp=%p\n", cpu, (void *) thp);
         crash();
     }
+
+    /* The tripwire claims thp before it is published and gives the old thread
+     * back after (no code without CONFIG_DEBUG_DISPATCH_OWNER).
+     */
+    thread_t *old = pcpu_array[cpu].pc_curthread;
+
+    dispatch_owner_claim(cpu, old, thp, __builtin_return_address(0));
     __atomic_store_n(&pcpu_array[cpu].pc_curthread, thp, __ATOMIC_RELEASE);
+    dispatch_owner_release(cpu, old, thp);
 }
 
 EXT const uint8_t byte_log2[] = {

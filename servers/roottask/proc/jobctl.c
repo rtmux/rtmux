@@ -25,10 +25,7 @@
 #include "root-process.h"
 #include <sys/procmsg.h>
 
-#define JC_DEAD                                          \
-    (RTMUX_FLG_PROC_TERMING | RTMUX_FLG_PROC_ZOMBIE |    \
-     RTMUX_FLG_PROC_WAITINFO | RTMUX_FLG_PROC_WAITDONE | \
-     RTMUX_FLG_PROC_DESTROYALL)
+#define JC_DEAD PROC_DEAD_FLAGS
 
 int proc_snapshot(pid_t pid, struct proc_snap *s)
 {
@@ -46,8 +43,6 @@ int proc_snapshot(pid_t pid, struct proc_snap *s)
     s->fg = qinfo.sess_pgrp;
     s->fd = qinfo.sess_fd;
     s->flags = qinfo.flags;
-    s->execed = root_proc(pid)->execed;
-    s->chp = qinfo.sys_chp;
     root_proc_unlock(pid);
     return EOK;
 }
@@ -108,7 +103,7 @@ static int jc_signal_group(pid_t pgrp, pid_t sid, int signo, pid_t sender)
         if (pid == 0 || pid == ROOTTASK_PID || root_proc(pid)->system ||
             proc_snapshot(pid, &m) != EOK)
             continue;
-        if (m.pgrp != pgrp || m.sid != sid || (m.flags & JC_DEAD) || !m.chp)
+        if (m.pgrp != pgrp || m.sid != sid || (m.flags & JC_DEAD))
             continue;
 
         /* Post under the lock so the channel cannot go away with the process.
@@ -116,9 +111,15 @@ static int jc_signal_group(pid_t pgrp, pid_t sid, int signo, pid_t sender)
         if (root_proc_lock(pid)) {
             root_proc_info_t qinfo;
 
-            if (process_query_info(pid, &qinfo) == EOK && qinfo.sys_chp &&
-                !(qinfo.flags & JC_DEAD)) {
-                signal_kill(qinfo.sys_chp, signo, sender);
+            /* Still a member, now that the lock is held: a signal may be kept
+             * for a process that has not registered its system channel yet
+             * (signal_post_locked), so one that left the group meanwhile must
+             * not get it.
+             */
+            if (process_query_info(pid, &qinfo) == EOK &&
+                !(qinfo.flags & JC_DEAD) && qinfo.pgrp == pgrp &&
+                qinfo.sess_leader == sid) {
+                signal_post_locked(pid, signo, sender);
                 n++;
             }
             root_proc_unlock(pid);
@@ -269,37 +270,23 @@ int proc_jobctl_setpgrp(pid_t server, pid_t pid, pid_t pgrp)
     return rc;
 }
 
-/* proc_jobctl_tty_busy — whether another live session already has the terminal
- * served by server for its controlling terminal. A terminal belongs to at most
- * one session; the leader of a session that lost every member is gone with it.
- */
-int proc_jobctl_tty_busy(pid_t server, pid_t sid)
-{
-    for (unsigned i = 0; i < ROOT_PROCESS_MAX; i++) {
-        pid_t pid = root_process[i].pid;
-        struct proc_snap m;
-
-        if (pid != 0 && proc_snapshot(pid, &m) == EOK && m.sid != 0 &&
-            m.sid != sid && !(m.flags & JC_DEAD) && m.fd >= 0 &&
-            jc_tty_server(m.fd) == server)
-            return 1;
-    }
-    return 0;
-}
-
 /* Tell the parent a child stopped or continued: SIGCHLD, as for an exit. */
 static void jc_notify_parent(pid_t pid)
 {
     struct proc_snap c, p;
 
     if (proc_snapshot(pid, &c) != EOK || c.ppid <= 0 ||
-        proc_snapshot(c.ppid, &p) != EOK || !p.chp || (p.flags & JC_DEAD))
+        proc_snapshot(c.ppid, &p) != EOK || (p.flags & JC_DEAD))
         return;
     if (root_proc_lock(c.ppid)) {
         root_proc_info_t qinfo;
 
-        if (process_query_info(c.ppid, &qinfo) == EOK && qinfo.sys_chp)
-            signal_kill(qinfo.sys_chp, SIGCHLD, pid);
+        /* A parent between images, with no system channel for the moment, gets
+         * it when it registers one (signal_post_locked).
+         */
+        if (process_query_info(c.ppid, &qinfo) == EOK &&
+            !(qinfo.flags & JC_DEAD))
+            signal_post_locked(c.ppid, SIGCHLD, pid);
         root_proc_unlock(c.ppid);
     }
 }
@@ -389,6 +376,8 @@ int proc_msg_jobctl(ioserv_context_t *ctp, proc_jobctl_t *msg)
 
 #ifdef CONFIG_DEBUG_INJECT
     case _PROC_JOBCTL_DEBUG:
+        if (!proc_isaccess(0, &ctp->info))
+            return EPERM;
         return proc_pgrp_window_arm((unsigned) arg, (unsigned) arg2);
 #endif
 

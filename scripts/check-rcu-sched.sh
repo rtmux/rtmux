@@ -61,13 +61,14 @@ if ! awk '
     in_unready_release && /thp != get_active_thread\(get_cpunum\(\)\)/ {
         saw_guard = NR
     }
-    in_unready_release && /SCHED_LOCK_LOCAL\(\);/ {
-        saw_lock = NR
+    in_unready_release && /block_release\(newstate, to_release\);/ {
+        saw_block = NR
     }
     in_unready_release && /^}/ { in_unready_release = 0 }
-    END { exit !(saw_guard && saw_lock && saw_guard < saw_lock) }
+    END { exit !(saw_guard && saw_block && saw_guard < saw_block) }
 ' kernel/sched/dispatch.c; then
     echo "RCU-sched: unready_release must fail before blocking a non-active thread" >&2
+    echo "RCU detail: unready guard" >&2
     exit 1
 fi
 
@@ -209,6 +210,7 @@ if ! awk '
     in_destroy && /RCU drain\. At this point/ { in_reap = 1 }
     in_reap && /^    if \(stats_enabled\) {$/ { stats_branch = NR }
     in_reap && stats_branch && /rcu_sched_synchronize_detail\(&stats_busy\)/ { stats_rcu = NR }
+    in_reap && stats_rcu && !in_else && /thread_prio_defer_cancel\(thp\);/ { stats_cancel = NR }
     in_reap && stats_branch && /stats_pin_waited = tthread_wait_unpinned\(thp\)/ { stats_pin = NR }
     in_destroy && /thread_destroy_wait_inactive\(thp, prp\)/ && stats_pin && !stats_active {
         stats_active = NR
@@ -219,6 +221,7 @@ if ! awk '
     in_reap && /cap_revoke_object_all_tables\(thp\);/ { stats_revoke = NR }
     in_reap && /^    } else {$/ && stats_branch { in_else = 1 }
     in_destroy && in_else && /rcu_sched_synchronize\(\);/ { saw_rcu = NR }
+    in_destroy && in_else && saw_rcu && /thread_prio_defer_cancel\(thp\);/ { saw_cancel = NR }
     in_destroy && in_else && /tthread_wait_unpinned\(thp\);/ && saw_rcu {
         saw_pin = NR
     }
@@ -229,9 +232,9 @@ if ! awk '
     }
     in_destroy && /^}/ { in_destroy = 0 }
     END { exit !(stats_branch && stats_rcu && stats_pin && stats_active && stats_revoke && stats_free &&
-                 stats_branch < stats_rcu && stats_rcu < stats_pin && stats_pin < stats_active &&
+                 stats_branch < stats_rcu && stats_rcu < stats_cancel && stats_cancel < stats_pin && stats_pin < stats_active &&
                  stats_active < stats_revoke && stats_revoke < stats_free &&
-                 saw_rcu && saw_pin && saw_active && saw_free) }
+                 saw_rcu && saw_rcu < saw_cancel && saw_cancel < saw_pin && saw_active && saw_free) }
 ' kernel/thread/lifecycle.c; then
     echo "RCU detail: sync reap" >&2
     echo "RCU-sched: thread reap must drain RCU, pins, and active harts before freeing" >&2
@@ -888,7 +891,7 @@ if ! grep -q 'thread_join_wait_ready(joiner)' kernel/sched/thread.c ||
        in_join && /RTMUX_ITF_WAIT_PENDING/ { saw_wait = NR }
        in_join && /cpu_smp_mb\(\);/ { saw_mb = NR }
        in_join && /kspinlock_lock\(&prp->vec_slock\);/ { saw_lock = NR }
-       in_join && /if \(target->join == thp\)/ { saw_guard = NR }
+       in_join && /if \(!lost && target->join == thp\)/ { saw_guard = NR }
        in_join && /target->join = NULL;/ {
            saw_clear = NR
        }
@@ -1204,7 +1207,7 @@ if ! awk '
     in_wait && /kspinlock_lock\(&prp->vec_slock\);/ { saw_prp_lock = NR }
     in_wait && /kspinlock_lock\(&parent->vec_slock\);/ { saw_parent_lock = NR }
     in_wait && /parent->kids_running_time \+=/ { saw_parent_update = NR }
-    in_wait && /prp->flags &= ~RTMUX_FLG_PROC_WAITINFO;/ { saw_child_update = NR }
+    in_wait && /prp->flags &= ~RTMUX_FLG_PROC_WAITINFO;|PROC_FLG_CLR\(prp, RTMUX_FLG_PROC_WAITINFO\);/ { saw_child_update = NR }
     in_wait && /kspinlock_unlock\(&parent->vec_slock\);/ { saw_parent_unlock = NR }
     in_wait && /kspinlock_unlock\(&prp->vec_slock\);/ { saw_prp_unlock = NR }
     in_wait && /rcu_read_unlock\(&process_rcu\);/ { unlocks++ }
@@ -1338,7 +1341,7 @@ for fn in kext_proc_nozombie_mark kext_proc_exit_mark \
         $0 ~ "void " fn "\\(void \\*data\\)" { in_fn = 1 }
         in_fn && /lookup_pid_rcu\(kap->pid\)/ { saw_rcu = NR }
         in_fn && /kspinlock_lock\(&prp->vec_slock\);/ { saw_lock = NR }
-        in_fn && /prp->flags/ { saw_flags = NR }
+        in_fn && /prp->flags|PROC_FLG_(SET|CLR)\(prp,/ { saw_flags = NR }
         in_fn && /kspinlock_unlock\(&prp->vec_slock\);/ { saw_unlock_lock = NR }
         in_fn && /rcu_read_unlock\(&process_rcu\);/ && !saw_flags {
             saw_early_unlock = NR
@@ -1622,7 +1625,7 @@ fi
 if ! awk '
     /void kext_process_destroy\(void \*data\)/ { in_destroy = 1 }
     in_destroy && /rcu_sched_synchronize\(\);/ { saw_sync = NR }
-    in_destroy && /process_wait_unpinned\(prp\);/ { saw_wait = NR }
+    in_destroy && /process_wait_unpinned\(prp, 0\);/ { saw_wait = NR }
     in_destroy && /object_free\(NULL, &process_souls, prp\);/ { saw_free = NR }
     in_destroy && /^}/ { in_destroy = 0 }
     END { exit !(saw_sync && saw_wait && saw_free && saw_sync < saw_wait && saw_wait < saw_free) }
@@ -2001,9 +2004,22 @@ if ! awk '
     in_gate && /while \(state == STATE_DEAD && active_remote\)/ {
         saw_dead_loop = NR
     }
+    # The first reload after the loop header is the one inside the loop; the
+    # recheck after KILLSELF is published reads the state again later.
     in_gate && /state = thread_state_load_acquire\(thp\)/ {
-        if (saw_dead_loop)
+        if (saw_dead_loop && !saw_reload)
             saw_reload = NR
+    }
+    # After KILLSELF is published the gate must read the state again, with an
+    # acquire load, before it picks how to steer the thread.
+    in_gate && /RTMUX_FLG_THR_KILLSELF/ { saw_killself = NR }
+    in_gate && saw_killself && !saw_recheck &&
+        /state = thread_state_load_acquire\(thp\)/ {
+        saw_recheck = NR
+    }
+    in_gate && /(^|[^_[:alnum:]])state = / &&
+        !/state = thread_state_load_acquire\(thp\)/ {
+        saw_plain = NR
     }
     in_gate && /state != STATE_DEAD/ {
         if (!saw_not_dead)
@@ -2016,33 +2032,51 @@ if ! awk '
     }
     in_destroy && /FPU buffer should be freed already/ { in_destroy = 0 }
     END {
-        exit !(saw_helper && saw_initial && saw_dead_loop && saw_reload &&
+        exit !(!saw_plain &&
+               saw_helper && saw_initial && saw_dead_loop && saw_reload &&
                saw_not_dead && saw_running && saw_final &&
                saw_helper < saw_initial && saw_initial < saw_dead_loop &&
                saw_dead_loop < saw_reload && saw_reload < saw_not_dead &&
-               saw_not_dead < saw_running && saw_running < saw_final)
+               saw_not_dead < saw_killself && saw_killself < saw_recheck &&
+               saw_recheck < saw_running && saw_running < saw_final)
     }
 ' kernel/thread/lifecycle.c; then
     echo "RCU-sched: thread_destroy quiescence gate must use acquire state loads" >&2
+    echo "RCU detail: destroy acquire" >&2
     exit 1
 fi
 
 if ! awk '
     /void rdecl thread_specret\(thread_t \*thp\)/ { in_specret = 1 }
-    # Both steps must sit inside the WAITTHREAD guard, the clear before the
-    # ready: a parent woken first can join on another hart while the field
-    # still names it, and get EBUSY.
-    in_wait && /^    }$/ { in_wait = 0 }
-    in_specret &&
-        /if \(thp->join && thp->join->state == STATE_WAITTHREAD\) {/ {
-        in_wait = 1
+    # The link is taken inside the WAITTHREAD guard under vec_slock, and the
+    # parent readied after: the capture and the clear inside the guard, the
+    # clear before the ready (a parent woken first can join on another hart
+    # while the field still names it, and get EBUSY), and under the lock a
+    # force_ready of the waiting parent takes the link under, so that only
+    # one of them readies it.
+    in_guard && /^        }$/ { in_guard = 0; guard_end = NR }
+    in_specret && !saw_lock && /kspinlock_lock\(&prp->vec_slock\);/ {
+        saw_lock = NR
     }
-    in_wait && /thread_t \*parent = thp->join;/ { saw_parent = NR }
-    in_wait && /thp->join = NULL;/ { saw_clear = NR }
-    in_wait && /ready\(parent\);/ { saw_ready = NR }
+    in_specret && saw_lock && !saw_guard &&
+        /if \(thp->join && thp->join->state == STATE_WAITTHREAD\) {/ {
+        saw_guard = NR
+        in_guard = 1
+    }
+    in_guard && !saw_parent && /parent = thp->join;/ { saw_parent = NR }
+    in_guard && saw_parent && !saw_clear && /thp->join = NULL;/ {
+        saw_clear = NR
+    }
+    in_specret && guard_end && !saw_unlock &&
+        /kspinlock_unlock\(&prp->vec_slock\);/ {
+        saw_unlock = NR
+    }
+    in_specret && saw_unlock && !saw_ready && /ready\(parent\);/ {
+        saw_ready = NR
+    }
     in_specret && /^}/ { in_specret = 0 }
     END {
-        exit !(saw_parent && saw_parent < saw_clear && saw_clear < saw_ready)
+        exit !(saw_clear && saw_ready)
     }
 ' kernel/thread/lifecycle.c; then
     echo "RCU-sched: thread birth must clear the temporary join handshake" >&2
@@ -2395,7 +2429,7 @@ fi
 if ! awk '
     /void rcu_sched_wait/ { in_wait = 1 }
     in_wait && /unsigned self = get_cpunum\(\);/ { saw_self = 1 }
-    in_wait && /if \(cpu == self\)/ { saw_skip = 1 }
+    in_wait && /if \(cpu == self \|\| !cpu_in_mask\(online, cpu\)\)/ { saw_skip = 1 }
     in_wait && /__atomic_load_n\(&in_kcall\[cpu\], __ATOMIC_RELAXED\)/ {
         saw_relaxed_counter = 1
     }
@@ -2877,7 +2911,7 @@ if ! awk '
     in_set && /prp->as_borrow_closed \? ESRCH : process_pin\(prp\)/ { saw_pin = NR }
     in_set && /thread_as_unbind\(thp\);/ { saw_unbind = NR }
     in_set && /thread_as_link\(thp, prp\);/ { saw_link = NR }
-    in_set && /thp->as_prp = prp;/ { saw_assign = NR }
+    in_set && /thp->as_prp = prp;|__atomic_store_n\(&thp->as_prp, prp, __ATOMIC_RELEASE\);/ { saw_assign = NR }
     in_set && /kspinlock_unlock\(&thread_as_slock\);/ { saw_unlock = NR }
     in_set && /^}/ { in_set = 0 }
     END {
@@ -2914,7 +2948,7 @@ if ! awk '
     /static void thread_as_unbind\(thread_t \*thp\)/ { in_unb = 1 }
     in_unb && /\*thp->as_borrow_pprev = thp->as_borrow_next;/ { saw_unlink = NR }
     in_unb && /process_unpin\(prp\);/ { saw_unpin = NR }
-    in_unb && /thp->as_prp = NULL;/ { saw_null = NR }
+    in_unb && /thp->as_prp = NULL;|__atomic_store_n\(&thp->as_prp, NULL, __ATOMIC_RELEASE\);/ { saw_null = NR }
     in_unb && /^}/ { in_unb = 0 }
     END {
         exit !(saw_unlink && saw_unpin && saw_null &&
@@ -2989,7 +3023,7 @@ fi
 if ! awk '
     /void kext_process_shutdown\(void \*data\)/ { in_shutdown = 1 }
     in_shutdown && /process_clear_as_bindings\(prp\)/ { saw_clear = NR }
-    in_shutdown && /process_wait_unpinned\(prp\)/ { saw_wait = NR }
+    in_shutdown && /process_wait_unpinned\(prp, 0\)/ { saw_wait = NR }
     in_shutdown && /vm_ops->mdestroy\(prp\)/ { saw_destroy = NR }
     in_shutdown && /^}/ { in_shutdown = 0 }
     END {

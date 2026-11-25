@@ -115,6 +115,11 @@ struct inheritance {
 #endif
     uint32_t runmask;
     struct sched_param param;
+
+    /* With SPAWN_SETSIGPEND, on an exec: the signals the old image holds
+     * pending, which stay pending for the new one.
+     */
+    sigset_t sigpending;
 };
 
 #define SPAWN_SETGROUP POSIX_SPAWN_SETPGROUP
@@ -139,6 +144,7 @@ struct inheritance {
  */
 #define SPAWN_PROC_CAP 0x00080000
 #define SPAWN_FD_SCAN_TAIL 0x00100000
+#define SPAWN_SETSIGPEND 0x00200000
 #define SPAWN_ALIGN_DEFAULT 0x00000000
 #define SPAWN_ALIGN_FAULT 0x01000000
 #define SPAWN_ALIGN_NOFAULT 0x02000000
@@ -319,7 +325,7 @@ struct _proc_posix_spawn {
     uint16_t narge;
     uint16_t cwdlen; /* bytes of the child cwd with its null, or 0 */
     uint16_t reserved[2];
-    uint32_t filact_bytes;  /* size of the _posix_spawn_file_actions_t */
+    uint32_t filact_bytes;  /* file-action bytes, format in reserved[0] */
     uint32_t filact_obytes; /* size of the _posix_spawn_file_actions_t.open */
     uint32_t argenv_bytes;  /* Number of bytes of argv + arge with nulls */
     uint32_t attr_bytes;    /* size of the _posix_spawnattr_t */
@@ -595,9 +601,12 @@ enum {
 };
 
 /* _PROC_JOBCTL_DEBUG windows (arg): where roottask holds the next operation. */
+#define PGRP_WINDOW_ACTIVE 3 /* query whether the specified window is open */
 #define PGRP_WINDOW_NONE 0
 #define PGRP_WINDOW_SETPGID 1 /* setpgid, checked and not yet changed */
 #define PGRP_WINDOW_DETACH 2  /* tcsetsid(-1), terminal let go, server not told */
+#define PGRP_WINDOW_WRITE_GROWN 4 /* a write grew its memory object, not copied */
+/* proc_pgrp_window_arm accepts the windows up to the highest, WRITE_GROWN. */
 
 /* _PROC_JOBCTL_STATE events (arg) */
 enum { _JOBCTL_STOPPED, _JOBCTL_CONTINUED, _JOBCTL_TTYMASK };
@@ -635,8 +644,8 @@ typedef union {
  */
 struct _proc_exit {
     uint16_t type; /* _PROC_EXIT */
-    uint16_t zero;
-    int32_t status; /* exit status */
+    uint16_t by_signal; /* zero for _exit, one for signal termination */
+    int32_t status; /* exit status or signal number */
 };
 
 struct _proc_exit_reply {

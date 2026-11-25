@@ -475,6 +475,26 @@ static int jc_child(int argc, char **argv);
 
 int kill_child(int argc, char **argv)
 {
+    if (argc == 3 && !strcmp(argv[1], "--kill-termination")) {
+        if (!strcmp(argv[2], "exit"))
+            _exit(128 + SIGTERM);
+        if (!strcmp(argv[2], "term")) {
+            kill_post("terminate", 0);
+            sleep(5);
+            return 2;
+        }
+        if (!strcmp(argv[2], "raise"))
+            raise(SIGUSR1);
+        if (!strcmp(argv[2], "ignore") || !strcmp(argv[2], "catch")) {
+            sigset_t set;
+            sigemptyset(&set);
+            sigaddset(&set, SIGABRT);
+            sigprocmask(SIG_BLOCK, &set, NULL);
+            signal(SIGABRT, !strcmp(argv[2], "ignore") ? SIG_IGN : catch_usr1);
+            abort();
+        }
+        return 2;
+    }
     if (argc == 2 && !strcmp(argv[1], "--kill-eintr"))
         return eintr_remote_child();
     if (argc >= 3 && !strcmp(argv[1], "--kill-jc"))
@@ -1378,6 +1398,9 @@ static int si_prio_child(void)
         si_wait(n);
         (void) sem_post(ack);
     }
+    if (si_hits != 2 || si_got_prio[0] != 20 || si_got_prio[1] != 20)
+        printf("signal priority: hits=%d observed=%d,%d\n", (int) si_hits,
+               (int) si_got_prio[0], (int) si_got_prio[1]);
     return si_hits == 2 && si_got_prio[0] == 20 && si_got_prio[1] == 20
                ? 0
                : 1 + (si_got_prio[0] != 20) + 2 * (si_got_prio[1] != 20);
@@ -1445,11 +1468,27 @@ static void test_si_pid_large(void)
           "sender pid was truncated or lost");
 }
 
-static void test_sigthread_prio_stable(void)
+void test_sigthread_prio_stable(void)
 {
     pid_t child;
     int status = -1;
 
+    int ceiling = sched_get_priority_max(SCHED_FIFO);
+    if (ceiling > 0) {
+        struct sched_param param = {.sched_priority = ceiling + 1};
+        posix_spawnattr_t attr;
+        char *argv[] = {"true", NULL};
+        posix_spawnattr_init(&attr);
+        posix_spawnattr_setschedpolicy(&attr, SCHED_FIFO);
+        posix_spawnattr_setschedparam(&attr, &param);
+        posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSCHEDULER);
+        int rc = posix_spawn(&child, "/bin/true", NULL, &attr, argv, NULL);
+        if (rc == 0)
+            (void) waitpid(child, NULL, 0);
+        posix_spawnattr_destroy(&attr);
+        check(rc == EPERM, "spawn refuses priority above the caller's ceiling",
+              "the loader must apply the final image and caller limits");
+    }
     kill_sem_create("sigready", 0);
     kill_sem_create("sigack", 0);
     child = si_spawn("--kill-sigprio", "x", 20);
@@ -2026,8 +2065,47 @@ static void test_eintr(void)
     test_eintr_stress();
 }
 
+static void test_signalled_exit(void)
+{
+    static const struct {
+        char *action;
+        int signo;
+    } cases[] = {{"term", SIGTERM}, {"raise", SIGUSR1},
+                 {"ignore", SIGABRT}, {"catch", SIGABRT}, {"exit", 0}};
+    for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        pid_t pid;
+        int status;
+        char *argv[] = {"syscall_testing", "--kill-termination", cases[i].action, NULL};
+        if (cases[i].signo == SIGTERM)
+            kill_sem_create("terminate", 0);
+        int rc = posix_spawn(&pid, "/bin/syscall_testing", NULL, NULL, argv, NULL);
+        if (rc) {
+            if (cases[i].signo == SIGTERM)
+                kill_sem_drop("terminate", 0);
+            test_fail("spawn signal termination child", strerror(rc));
+            continue;
+        }
+        if (cases[i].signo == SIGTERM) {
+            int ready = kill_wait_sem("terminate", 0, 3000);
+            check(ready && kill(pid, SIGTERM) == 0, "deliver SIGTERM to ready child", NULL);
+            kill_sem_drop("terminate", 0);
+        }
+        pid_t waited = waitpid(pid, &status, 0);
+        if (cases[i].signo) {
+            check(waited == pid && WIFSIGNALED(status) &&
+                      WTERMSIG(status) == cases[i].signo,
+                  "wait reports terminating signal", cases[i].action);
+        } else {
+            check(waited == pid && WIFEXITED(status) &&
+                      WEXITSTATUS(status) == 128 + SIGTERM,
+                  "wait preserves an ordinary high exit status", NULL);
+        }
+    }
+}
+
 void test_signals(void)
 {
+    test_signalled_exit();
     test_sigaction_roundtrip();
     test_sigaction_uncatchable();
     test_raise();

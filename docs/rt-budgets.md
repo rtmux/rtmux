@@ -740,6 +740,34 @@ reads the whole destination vector to find how much arrived (`xferlen_upto`
 stops once the entries add up to the message). `rcvmsg`, unused, and its
 unbounded boundary scans are gone.
 
+A step is a span of time, not an amount of work. `xfermsg_bounded` and the
+vector scans work for XFER_BUDGET_US (100 us) per kernel entry
+(`xfer_step_begin`, `xfer_piece_done`). They look at the clock, and at a
+pending preemption, once per piece of work (XFER_STEP_ENTRIES entries or
+XFER_STEP_BYTES bytes copied, XFER_SUM_ENTRIES entries scanned), and the budget
+runs from the first look, so a transfer that is over within one piece never
+reads the clock. A fixed step is too small where the copy is fast and too
+large where it is slow. `xfer_memcpy` moves aligned words. The pre-claim
+check and the loops that total a send, receive or reply vector are one
+function, `xfer_iov_sum` (kernel/xfer/check.c): it reads each entry once under
+a fault handler, keeps the prefix it has done and its running total on the
+thread (`scan[]`, two of them, as a send has two vectors), and restarts the
+call when its step is over. What a call saved to resume from, the scans and
+the copy cursor, lives from a KCALL_RESTART to the kernel entry it leads to:
+`xfer_begin_call`, at every kernel call entry, drops it unless the entry is
+that restart (same call number, same user stack pointer). A message of any
+number of entries is copied in steps. Where the paragraphs below name
+`xfer_iov_check`, `iovchk_*`, XFER_IOV_CHECK_STEP or XFER_STEP_PARTS_MAX, read
+`xfer_iov_sum`, `scan[]`, XFER_SUM_ENTRIES and no limit.
+
+`ipc-roundtrip` times the gap between the restarts of one long call
+(`iov-gap`): a high-priority thread is woken from another hart while its own
+hart exchanges 65536-entry messages without pause, and the wake is compared
+with the same wake over a thread spinning in user space. The wake itself has
+a tail of some 14 ms at p99 on QEMU, with or without the exchange,
+so the check is on what the exchange adds: both the median and the p99 must
+stay within 250 us of the wake alone.
+
 The other callers of `xfermsg` are stepped the same way. Send, receive and
 reply (kernel/ipc/fastmsg.c) call `xfermsg_bounded` through `fastmsg_xfer`,
 and a copy that uses its step up gives up the claim on the peer under the
@@ -756,10 +784,7 @@ stepped either. The head of a message the receive peeks at goes through
 gives them back. The short message branch of msg_readv copies into a
 destination of many entries a step at a time (`xfer_cpy_diov_step`), so a
 vector of empty entries is not walked to its end; a destination of one entry
-or none keeps the one shot copy. `xfer_preempt` closes every level of the
-rcvid lookup window (`lookup_rcvid_release_all`) and not only the outermost's
-one, which left the RCU sections open across the restart of a call that had
-looked up twice. The offsets and the cursor are `size_t`, as is the offset
+or none keeps the one shot copy. The offsets and the cursor are `size_t`, as is the offset
 `vm_ops->map_xfer` takes; the byte count of a message stays 32 bit, as the ABI
 reports it. msg_sendv checks that its send and reply arrays lie inside the
 caller's boundary and are no longer than XFER_IOV_LIMIT entries, as
@@ -775,8 +800,11 @@ three paths. Over 32 entries of 16 bytes each way a send is one step: the time
 from the sender's entry into msg_sendv to the receiver's return from its
 receive may exceed the same message in one entry by no more than 250 us at the
 p99 (the delivery includes waking the receiver, which a loaded host slows
-whatever the kernel does, so the step is judged by its addition), and a receive
-from a queued sender and a reply are each under 250 us at the p99. Over 2048
+whatever the kernel does, so the step is judged by its addition). A receive
+from a queued sender and a reply are judged the same way: each p99 may exceed
+the same message in one entry, timed in the same boot, by no more than 250 us.
+The absolute 250 us p99 of the message round trip in the budget table above
+applies to hardware runs; on QEMU the wake alone can take longer than that. Over 2048
 entries each way both orders of receiver and sender move the bytes through many
 restarts. iov-short reads a short message into 64 entries, all empty but the
 last, in one step (p99 under 250 us), and into 65536 entries, which move the
@@ -926,14 +954,93 @@ the same-hart configuration stays 35 of 35, and syscall-testing passes 934 of 93
 So the trap-exit interrupt-wake preemption rule now holds at CPUS=8 for both
 same-hart and cross-hart wakes on the authoritative host.
 
-The probe now runs the cross-hart pass as a standing guard: after the same-hart
-timer pass it checks for a fourth hart and, if present, repeats the timer
-measurement with the waiter and hog pinned to a non-boot hart so the boot-hart
-timer readies them across harts. A stall there is a hard failure (the same-hart
-pass only names the gap), so a regression of the cross-hart preemption fix fails
-the gate rather than passing silently. It is skipped cleanly below four harts.
-Validated on the reference host: CPUS=8 passes 15 of 15 runs and the four-hart-only skip path
-is correct at CPUS=3.
+The probe runs the cross-hart pass as a standing guard: given a fourth hart it
+runs the timer measurement with the waiter and hog pinned to a non-boot hart so
+the boot-hart timer readies them across harts, before and independently of the
+same-hart pass. A wake that never dispatches is a hard failure in every source
+(the watchdog reports it as FAIL; no source passes by naming a gap any more),
+and the harness requires a measured result from each of ipc, timer,
+timer-crosshart and irq, so a pass that skipped one fails. The cross-hart pass
+is skipped cleanly below four harts.
+
+#### Late wakes under TCG: host scheduling, not the kernel
+
+Hard-checking the 50 ms bound at CPUS=8 failed 23 of 30 boots on the local
+validation host while every boot completed all its wakes: maxima anywhere from
+2 to 123 ms, in every source, including the IPC reply, which involves no
+interrupt at all. The host was saturated (48 CPUs, none idle, CPU pressure
+40-99%), and QEMU runs one host thread per hart. Three independent methods
+attribute the late wakes to the host.
+
+Host attribution. `scripts/vcpu-steal.py` polls every QEMU thread's run-queue
+wait (`/proc/<pid>/task/<tid>/schedstat`) each millisecond; the probe writes an
+rdtime beacon to the goldfish-rtc after each wake, which QEMU's
+`goldfish_rtc_write` trace event stamps with host time, so each late wake has
+a window on the host clock (the beacons bound the clock offset to about
+15 us). Over 33
+boots of the unmodified kernel, 17 measured wakes were more than 50 ms late.
+In all 17 the time during which at least one QEMU thread was runnable but not
+running covers the window to within 13 ms, and in 15 the wait of the threads
+the wake depends on (the hart whose timer fires, the hart running the waiter,
+QEMU's main loop) accounts for the excess over the bound by itself. The guest's
+logical CPU numbers are not hart numbers: OpenSBI picks the boot hart, which
+becomes CPU 0, so the audit maps them through the boot log.
+
+Guest stages. With timebase stamps at the stage boundaries (timer interrupt
+due and taken, wheel expiry, spinlock acquisition, reschedule IPI sent and
+taken), the delays inside the late windows are spinlock waits: 152 waits of
+10-110 ms with interrupts off in 24 boots, all but one on a dispatch lock
+(`sched_dpp`), the other on `timer_wheel_slock`, with the vCPU thread of the
+spinning hart or of the lock's owner off the CPU for much of the wait (of the
+36 waits whose owner was known, the owner's thread was waiting for a host CPU
+for at least half of 18). That is lock-holder preemption. It reaches the wake path from
+any hart because an idle hart's steal scan (`select_thread_default`) takes
+every other hart's dispatch lock, and because `ready_on_hart` sends the
+reschedule IPI under the target's dispatch lock, which in QEMU is an MMIO
+write that waits for QEMU's own big lock. No stage showed a wake that was due,
+with the harts running, and not delivered.
+
+Deterministic time. Under QEMU's instruction-count clock (`EMU_ICOUNT=1`:
+single-threaded TCG, `-icount shift=1,sleep=off`, RTC on the virtual clock) the
+host cannot delay the guest. Over fifteen boots the same eight-hart probe then
+measured an IPC reply-to-dispatch of 16-180 us, a same-hart timer wake of
+0.14-1.1 ms, a cross-hart timer wake of 0.2-0.6 ms and an IRQ wake of
+0.08-0.23 ms: a handful of distinct values that repeat from boot to boot, none
+within a factor of 45 of the bound. What this cannot show is a race: harts interleave only at
+translation-block boundaries there.
+
+Quiet host. When the other load on the same host stopped (CPU pressure under
+2%), twelve of twelve eight-hart multi-threaded boots passed with the audit
+off and the bound checked strictly by the guest. The worst maxima over the
+twelve were 0.15 ms (ipc), 1.3 ms (timer), 4.6 ms (timer-crosshart) and 1.1 ms
+(irq), against 50-230 ms for the same binaries an hour earlier under load.
+
+What the gate proves now. The bound itself is unchanged.
+
+- `EMU_ICOUNT=1 CPUS=8 scripts/qemu-regress.sh --mode smp-invariants` checks
+  the bound in the guest, strictly, on a clock the host cannot disturb. It
+  proves that each wake path, run to completion, dispatches within the bound.
+- The multi-threaded run proves that no wake is lost or stalls with the harts
+  truly parallel, and audits every wake over the bound. A sample is INVALID,
+  excluded and reported, never passed, when the proven host wait of its
+  wake-path threads covers the excess; each phase must keep 75% of its samples
+  valid. It is a FAIL when no QEMU thread's wait covers the excess: the harts
+  were running and the wake was late. When only other QEMU threads' wait covers
+  it, lock-holder preemption is possible but schedstat cannot show who held a
+  lock, so the sample is UNDECIDED and the whole run is invalid: repeated,
+  counted, and never a pass. Without host data (no schedstat, no trace event)
+  every over-bound sample is a failure, as before.
+
+The audit under-credits by construction: a wait counts only where two polls
+prove it. On a saturated host it therefore reports invalid runs rather than
+passes, and a rare late wake caused by the guest can hide in an invalid run
+there; the icount run and a less loaded host are what catch it.
+
+The detector is tested against a real stall: on a CONFIG_DEBUG_INJECT kernel,
+`preempt-latency --inject-stall 300` holds the waiter's hart with interrupts off
+for 300 ms in the middle of the cross-hart pass and passes only if the pass
+reports the late wake (part of `--mode debug-inject`). Under the host audit the
+same stall is refused as a FAIL, because the hart's thread was running.
 
 ### Contended PRIO_INHERIT mutex wake
 
@@ -1389,6 +1496,38 @@ The block carries no `budget-ns`: the realtime deviation is characterization,
 not a gated ceiling, for the TCG reason above. The gated facts are structural
 and asserted by the probe's exit status: hog reaches ENOMEM without a crash,
 canary intact at peak pressure, realtime loop not starved.
+
+### Fence in the Blocking Path (kill and cancel recheck)
+
+Every switch away from a blocking thread runs one full fence (`cpu_smp_mb()` in
+`block_recheck_arm()`, `kernel/sched/dispatch.c`) and two flag loads, and every
+kernel call tests one bit at entry. The fence cannot be skipped when the flags
+read clear: it is what orders this hart's displacement store before the flag
+loads, against a requester that stores its flag and then reads the displacement
+(docs/smp-contract.md, kill or cancel of a blocking thread). Testing the flags
+first would reopen the lost request.
+
+Cost: not measurable on the reference setup. The kernel with the recheck and
+the same tree with that commit reverted were run in pairs at the same time on
+the same host (QEMU 11 TCG, 1 vCPU, `/proc/pressure/cpu` some avg10 between
+0.00 and 2.6 at the start of each run), `scripts/qemu-regress.sh --mode
+ipc-roundtrip`, 14 runs with the recheck and 12 without, in two batches:
+
+| p99 (ns), median of runs [min..max] | with recheck | reverted |
+| --- | --- | --- |
+| empty round trip, batch 1 (6+6) | 285000 [240300..368800] | 292650 [208000..359500] |
+| empty round trip, batch 2 (8+6) | 309550 [225900..371000] | 300750 [250400..450900] |
+| iov-send, 1 entry, batch 1 | 229500 [159100..243300] | 177450 [129400..226800] |
+| iov-send, 1 entry, batch 2 | 209350 [159300..243000] | 195050 [168800..218600] |
+| iov-send, 32 entries, batch 1 | 258950 [187700..288600] | 200550 [144500..283700] |
+| iov-send, 32 entries, batch 2 | 225150 [170100..273300] | 262400 [154800..275800] |
+
+The sign changes between batches and the run-to-run spread of one kernel is
+about 30%, far above anything a fence can cost (tens of nanoseconds against a
+round trip of 150 to 300 microseconds under TCG). Three paired `rt-check` runs
+show the same: rt-latency p99 549000, 613400, 400700 ns with the recheck and
+771400, 413300, 434100 ns without. Real hardware needs its own figure; TCG
+executes a fence as a host barrier and says little about a U74.
 
 ### Native IPC MsgSend Round Trip
 
@@ -3847,3 +3986,93 @@ capability quota on an existing process or server boundary with a named latency
 budget.  Avoid nested cgroup-style hierarchy until a measured workload shows
 that runmask, IRQ affinity, and existing process/I/O-service boundaries cannot
 isolate it.
+
+
+### Spinlock admission
+
+For an IRQ-off kernel lock, each other hart can hold or wait for at most
+one ticket. A new waiter therefore waits for at most (online CPUs minus
+one) critical sections. Holder duration and host vCPU scheduling determine elapsed
+time. The 16-bit ticket space covers the configured maximum of 64 harts.
+Capability operations run with their incoming interrupt state, so an
+interrupt or preemption can extend a queued capability operation. Console
+crash takeover uses a separate test-and-set lock.
+
+The eight-hart lock-debug fixture first queues every worker behind one owner,
+then checks 80,000 grants in ticket order across the 16-bit wrap. It uses the
+same lock observation as the monitor to check the released state. The longest acquisition took 71.86 ms and 154.50 ms in two
+eight-hart parallel TCG runs.
+
+Three paired four-hart instruction-clock TCG runs passed `rt-check`.
+FIFO wake p99 was 20.5, 17.1 and 31.3 µs with test-and-set and 17.2,
+17.2 and 20.6 µs with tickets. In a separate `mutex-uncontended` run
+the default lock/unlock p99 was 210 ns for both builds. The ceiling
+mutex measured 9.4 and 9.5 µs respectively. These measurements use
+`-icount shift=1,sleep=off -accel tcg,thread=single`.
+
+
+### Priority inheritance during mutex acquisition
+
+A contending thread lends its effective priority before joining the mutex
+wait queue. During that interval, raising or lowering its priority refreshes
+the turnstile maximum. If a waiter takes the free mutex, it inherits the
+remaining contenders' maximum. If a third thread took the mutex during the
+priority walk, the waiter updates that owner's loan after releasing the
+chain lock.
+
+The four-hart `--mutex-handoff-loan` fixture holds a waiter at each of
+these transitions. Its observer starts before contention and stays alive
+until it releases the stall. Separate injected faults cover wait-bit
+withdrawal and turnstile allocation failure.
+
+### Sync wait and exit path cost
+
+`syscall_testing --sync-path-cost` times three kernel paths on one hart under
+`-icount shift=1,sleep=off -accel tcg,thread=single`, where the monotonic
+clock advances 2 ns per guest instruction and host load does not enter the
+result. Each kernel ran the same test binary twice in one boot; the two passes
+are shown where they differ. Values are ns per operation.
+
+| Kernel | thread create+join | semaphore handoff round | raw mutex lock+unlock |
+| --- | --- | --- | --- |
+| bcef2f6 (before) | 2920253 / 2924539 | 11143 / 11134 | 3538 |
+| b812a27 (exit skips the chain scan) | 2890242 / 2894466 | 11135 / 11126 | 3538 |
+| a265932 (one SCHED lock per untimed block) | 2891301 / 2894467 | 10969 / 10977 | 3538 |
+| one probe per sync call | 2890344 / 2894316 | 10316 / 10315 | 3208 |
+| no PI lock for unbound waiters | 2890242 / 2894425 | 10168 / 10159 | 3208 |
+
+Read as instructions: an exiting thread that never owned kernel-visible sync
+state saves about 15000 (the 128 chain locks it no longer takes); a blocking
+wait saves about 40 (one SCHED lock round trip); each sync kernel call saves
+about 82 (the second fault-armed probe); each wake of a waiter bound to no
+turnstile saves about 38 (one `sync_pi_slock` round trip). The create+join
+figure is dominated by the RCU grace period the reap waits for, so its 1%
+understates the share of the exit path itself.
+
+The rows above were measured before the series was rebased onto bf98048,
+which added the K65a dispatch changes. Measured again on that base, with one
+test binary under three kernels:
+
+| Kernel | thread create+join | semaphore handoff round | raw mutex lock+unlock |
+| --- | --- | --- | --- |
+| dev bf98048 (before) | 2999908 / 3001132 | 11346 / 11347 | 3643 / 3640 |
+| this series without the PI lock change | 2999453 / 3001089 | 10693 / 10693 | 3309 / 3309 |
+| this series | 2999458 / 3001089 | 10537 / 10546 | 3309 / 3309 |
+
+The savings match in instructions: about 83 per sync call (167 per lock and
+unlock pair) for the probe, and about 78 per handoff round (two wakes) for the
+PI lock.
+
+```perf-evidence
+claim: a sync kernel call arms one fault-safe probe instead of two, and a wake, timeout or signal of a waiter bound to no PI turnstile no longer takes sync_pi_slock
+metric: instruction-clock time per operation of syscall_testing --sync-path-cost (2 ns per guest instruction): raw mutex lock+unlock (two sync calls), semaphore handoff round (four sync calls, two wakes)
+command: EMU_QEMU_OPTS="-icount shift=1,sleep=off -accel tcg,thread=single" CPUS=1 scripts/qemu-regress.sh --mode syscall-testing, on an image whose init runs syscall_testing --sync-path-cost twice
+config: local host (48 cores, saturated by other guests; the instruction clock keeps host load out of the figures), CPUS=1, QEMU 11 TCG virt, bundled OpenSBI, one test binary under each kernel
+baseline: dev bf98048: raw mutex 3643 and 3640 ns, semaphore handoff 11346 and 11347 ns per round
+result: without the PI lock change: raw mutex 3309 ns, semaphore handoff 10693 ns; with it: raw mutex 3309 ns, semaphore handoff 10537 and 10546 ns
+rollback-threshold: a raw mutex figure at or above the baseline 3640 ns, or a semaphore handoff figure at or above 11250 ns, on the same instruction-clock run withdraws the claim
+```
+
+The lock windows these paths keep are in `scripts/preempt-inventory.txt`
+(`kernel/sync/wait.c`); the PI loan update bound, 512 list steps under
+`sync_pi_slock`, is derived in `docs/pi-pc-design.md` "Exit Paths".

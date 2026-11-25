@@ -172,6 +172,7 @@ static unsigned rcu_sched_busy_peers(struct rcu_sched_busy *detail)
 {
     unsigned self = get_cpunum();
     unsigned peers = 0;
+    uint64_t online = cpu_online_snapshot();
 
     for (int i = 0; i < (int) num_processors; i++) {
         unsigned cpu = (unsigned) i;
@@ -185,7 +186,7 @@ static unsigned rcu_sched_busy_peers(struct rcu_sched_busy *detail)
         if (__atomic_load_n(&pcpu_array[cpu].pc_rcu_waiting,
                             __ATOMIC_ACQUIRE) != 0)
             continue;
-        if (!cpu_online(cpu))
+        if (!cpu_in_mask(online, cpu))
             continue;
         peers++;
         rcu_sched_busy_add_peer(detail, cpu);
@@ -197,14 +198,17 @@ static unsigned rcu_sched_busy_peers(struct rcu_sched_busy *detail)
 
 void rcu_sched_wait(rcu_epoch_t goal)
 {
+    uint64_t online = cpu_online_snapshot();
     unsigned self = get_cpunum();
 
     for (int i = 0; i < (int) num_processors; i++) {
         unsigned cpu = (unsigned) i;
         unsigned depth;
 
-        if (cpu == self)
+        if (cpu == self || !cpu_in_mask(online, cpu))
             continue;
+        bool noted = false; /* inject_note_rcu_wait() until it counts */
+
         for (;;) {
             if (__atomic_load_n(&pcpu_array[cpu].pc_rcu_waiting,
                                 __ATOMIC_RELAXED) != 0 &&
@@ -224,6 +228,8 @@ void rcu_sched_wait(rcu_epoch_t goal)
                                               __ATOMIC_ACQUIRE),
                               goal))
                 break;
+            if (!noted)
+                noted = inject_note_rcu_wait(cpu);
             rcu_cpu_relax();
         }
     }

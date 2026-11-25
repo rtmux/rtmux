@@ -57,8 +57,12 @@ void kext_stack_cont(void *data)
         return;
     }
 
-    if (kap->err) {
-        thp->status = (void *) (intptr_t) kap->err;
+    /* A thread of a process whose exit has begun does not start: its address
+     * space goes with the exit. It dies instead.
+     */
+    if (kap->err ||
+        (prp->flags & (RTMUX_FLG_PROC_TERMING | RTMUX_FLG_PROC_DESTROYALL))) {
+        thp->status = (void *) (intptr_t) (kap->err ? kap->err : ESRCH);
         atomic_or(&thp->flags, (RTMUX_FLG_THR_KILLSELF | RTMUX_FLG_THR_ONLYME));
     } else {
         struct _thread_attr *attr = kap->attr;

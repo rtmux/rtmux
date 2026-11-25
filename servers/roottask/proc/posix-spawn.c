@@ -9,12 +9,12 @@
 #include "private.h"
 #include <limits.h>
 #include <spawn.h>
-#include <sys/posix-spawn.h>
+#include <sys/spawn-action-wire.h>
+#include <sys/spawn-limits.h>
+#include "root-mutex.h"
 
 #define SPAWN_FD_TARGET_MAX (UINT16_MAX - 1)
 
-/* Largest _PROC_POSIX_SPAWN proc_pspawn() copies whole: ARG_MAX with room. */
-#define PSPAWN_MSG_MAX (256u * 1024u)
 
 /* 							Internal Support Routines */
 
@@ -78,14 +78,6 @@ static bool pspawn_region_aligned(const void *p)
     uintptr_t align = ALIGNOF(p);
 
     return align == 0 || align == 4;
-}
-
-static int pspawn_add_size(size_t *sum, size_t add)
-{
-    if (add > SIZE_MAX - *sum)
-        return E2BIG;
-    *sum += add;
-    return EOK;
 }
 
 /** fill_struct_inheritance
@@ -323,7 +315,7 @@ static int parse_pspawn_msg(pid_t ppid,
      * allocate way more space than we really need. For example, if we only want
      * to modify file descriptor 10, we need fdmap array entries 0 through 9.
      */
-    if (msg->i.filact_bytes > 0) {
+    if (msg->i.filact_bytes && !msg->i.reserved[0]) {
         void *_factp = (void *) ((char *) (msg + 1) + msg->i.attr_bytes);
         void *open_action = (void *) ((char *) _factp + msg->i.filact_bytes);
 
@@ -364,12 +356,12 @@ static int parse_pspawn_msg(pid_t ppid,
      *     - identical argv and env parameters (nbytes == argenv_bytes)
      */
     spawn_msg_len = sizeof(new_msg->i);
-    if (pspawn_add_size(&spawn_msg_len, fdmap_size) != EOK ||
-        pspawn_add_size(&spawn_msg_len, msg->i.cwdlen) != EOK ||
-        pspawn_add_size(&spawn_msg_len, msg->i.pathlen) != EOK ||
-        pspawn_add_size(&spawn_msg_len, msg->i.argenv_bytes) != EOK)
+    if (spawn_add_size(&spawn_msg_len, fdmap_size) != EOK ||
+        spawn_add_size(&spawn_msg_len, msg->i.cwdlen) != EOK ||
+        spawn_add_size(&spawn_msg_len, msg->i.pathlen) != EOK ||
+        spawn_add_size(&spawn_msg_len, msg->i.argenv_bytes) != EOK)
         return E2BIG;
-    if (spawn_msg_len > (size_t) INT_MAX)
+    if (spawn_msg_len > SPAWN_MSG_MAX)
         return E2BIG;
     if (!(new_msg = calloc(1, spawn_msg_len))) {
         roottask_heap_note_nomem("spawn message", spawn_msg_len);
@@ -437,15 +429,128 @@ static int parse_pspawn_msg(pid_t ppid,
     return EOK;
 }
 
-/* Bytes the header declares for itself and its trailing regions. 64-bit sum:
- * the uint32 byte counts could otherwise overflow.
+/* The heap a posix_spawn request may hold while its handler runs: the copy of a
+ * request too long for the receive buffer, the _PROC_SPAWN rebuilt from it, and
+ * for legacy file actions a descriptor map and the action list. One request
+ * with ARG_MAX of arguments holds about 200 KiB and a hostile one about 850
+ * KiB, of an arena that is fixed (CONFIG_ROOTTASK_HEAP_SIZE) and shared with
+ * everything else roottask allocates, so a handful at once used to fail one
+ * another, and other allocations, with ENOMEM.
+ *
+ * Requests that hold more than PSPAWN_GATE_FREE bytes are admitted against a
+ * budget of half the arena, in arrival order. One that does not fit, or that
+ * finds others waiting, waits for those ahead of it. Nothing admitted waits for
+ * a client; the most one waits for is a loader context (loader_context_alloc,
+ * bounded there). A request is always admitted when none is inside, so the
+ * budget never refuses one outright. At most PSPAWN_GATE_WAITERS wait, each on
+ * a pool thread, and for at most PSPAWN_GATE_WAIT_S seconds; beyond either the
+ * spawn fails with EAGAIN, which posix_spawn may return for a shortage that
+ * passes, unless it fits, when it is let in. The root_wait limits together stay
+ * within their share of roottask's pool (ROOT_WAIT_POOL_MAX, checked in
+ * root-mutex.h), which leaves the rest to the handlers and loaders that end the
+ * waits.
  */
-static uint64_t pspawn_declared_len(const proc_posixspawn_t *msg)
+#define PSPAWN_GATE_BUDGET (CONFIG_ROOTTASK_HEAP_SIZE / 2)
+#define PSPAWN_GATE_FREE (8U * 1024U)
+#define PSPAWN_GATE_WAIT_S 30
+
+static pthread_mutex_t pspawn_gate_mutex = PTHREAD_MUTEX_INITIALIZER;
+static struct root_wait pspawn_gate_wait =
+    ROOT_WAIT_INITIALIZER(PSPAWN_GATE_WAITERS);
+static size_t pspawn_gate_used; /* bytes charged to admitted requests */
+
+/* Waiting requests are admitted in arrival order (a root_ticket each, all of
+ * one key), so a stream of smaller requests cannot keep one that needs more
+ * room out until its PSPAWN_GATE_WAIT_S timeout.
+ */
+
+/* The most heap the request in `msg`, `len` bytes long, can hold: its copy when
+ * it did not arrive whole, the rebuilt message, which is no longer than the
+ * request but for a legacy descriptor map, and the legacy action list, whose
+ * entries are no bigger than twice their bytes in the request. 0 for a request
+ * of PSPAWN_GATE_FREE bytes or less, which the gate lets through.
+ */
+static size_t pspawn_heap_charge(const proc_posixspawn_t *msg,
+                                 size_t len,
+                                 bool copied)
 {
-    return (uint64_t) sizeof(*msg) + msg->i.attr_bytes + msg->i.filact_bytes +
-           msg->i.filact_obytes + msg->i.pathlen + msg->i.argenv_bytes +
-           msg->i.cwdlen;
+    size_t charge = len + (copied ? len : 0);
+
+    if (msg->i.filact_bytes && !msg->i.reserved[0])
+        charge += UINT16_MAX * sizeof(int32_t) +
+                  2 * ((size_t) msg->i.filact_bytes + msg->i.filact_obytes);
+    return charge > PSPAWN_GATE_FREE ? charge : 0;
 }
+
+/* Whether a request of `charge` bytes fits the budget now. */
+static bool pspawn_gate_fits(size_t charge)
+{
+    return !pspawn_gate_used || pspawn_gate_used + charge <= PSPAWN_GATE_BUDGET;
+}
+
+/* Admit a request that will hold `charge` bytes, after every request that
+ * arrived waiting before it.
+ *
+ * Returns EOK, or EAGAIN when it would have to wait behind too many others or
+ * past *until (ns; set to PSPAWN_GATE_WAIT_S from now by the first wait, and
+ * kept across a request's tries).
+ */
+static int pspawn_gate_enter(size_t charge, uint64_t *until)
+{
+    struct root_ticket t;
+    int r = EOK;
+
+    if (!charge)
+        return EOK;
+    root_mutex_lock(&pspawn_gate_mutex);
+
+    /* With no wait to be had (PSPAWN_GATE_WAITERS wait already), a request that
+     * fits is let in rather than refused: the order is kept for those that can
+     * wait.
+     */
+    if ((root_ticket_queued(&pspawn_gate_wait, 0) &&
+         pspawn_gate_wait.waiting < pspawn_gate_wait.max) ||
+        !pspawn_gate_fits(charge)) {
+        root_ticket_join(&pspawn_gate_wait, &t, 0);
+        r = root_deadline_ns(until, PSPAWN_GATE_WAIT_S);
+        while (r == EOK && (!root_ticket_first(&pspawn_gate_wait, &t) ||
+                            !pspawn_gate_fits(charge)))
+            r = root_wait_until_ns(&pspawn_gate_wait, &pspawn_gate_mutex,
+                                   *until)
+                    ? EAGAIN
+                    : EOK;
+        root_ticket_leave(&pspawn_gate_wait, &t);
+    }
+    if (r == EOK)
+        pspawn_gate_used += charge;
+    pthread_mutex_unlock(&pspawn_gate_mutex);
+    return r;
+}
+
+static void pspawn_gate_leave(size_t charge)
+{
+    if (!charge)
+        return;
+    root_mutex_lock(&pspawn_gate_mutex);
+    pspawn_gate_used -= charge;
+    root_wake(&pspawn_gate_wait);
+    pthread_mutex_unlock(&pspawn_gate_mutex);
+}
+
+#ifdef CONFIG_DEBUG_INJECT
+/* A spawn of a path that starts with "/./" is held here for 300 ms with its
+ * buffers allocated, so that a test can have many requests inside the handler
+ * at once, which the handlers are otherwise too quick for. Only a
+ * CONFIG_DEBUG_INJECT image has this.
+ */
+static void pspawn_debug_hold(const char *path)
+{
+    if (!strncmp(path, "/./", 3))
+        (void) nanosleep(&(struct timespec) {.tv_nsec = 300000000L}, NULL);
+}
+#else
+#define pspawn_debug_hold(path) ((void) 0)
+#endif
 
 /** proc_pspawn
  *
@@ -460,7 +565,11 @@ int proc_pspawn(ioserv_context_t *ctp, void *vmsg)
     proc_posixspawn_t *msg = vmsg;
     proc_spawn_t *spawn_msg = NULL;
     void *whole = NULL;
-    uint64_t len;
+    const char *path;
+    uint64_t until = 0, len;
+    bool share_nowait = true;
+    size_t charge;
+    bool copied;
     int r;
 
     /* The client declares the sizes of the attr / file-action / path / argenv
@@ -472,24 +581,47 @@ int proc_pspawn(ioserv_context_t *ctp, void *vmsg)
      */
     if (ctp->info.msglen < sizeof(*msg))
         return EMSGSIZE;
-    len = pspawn_declared_len(msg);
+    if (ctp->info.flags & RTMUX_MI_ENDIAN_DIFF)
+        return ENOTSUP; /* before the header's fields are believed */
+    /* ARG_MAX first: an oversized argument list is E2BIG whether or not the
+     * sender went on to send it, and nothing is allocated for it.
+     */
+    if (!spawn_args_fit(msg->i.argenv_bytes, msg->i.nargv, msg->i.narge))
+        return E2BIG;
+    len = pspawn_declared_len(&msg->i);
     if (len > ctp->info.srcmsglen)
         return EMSGSIZE;
-
-    if (ctp->info.flags & RTMUX_MI_ENDIAN_DIFF)
-        return ENOTSUP;
+    if (len > PSPAWN_MSG_MAX ||
+        (uint64_t) msg->i.filact_bytes + msg->i.filact_obytes >
+            PSPAWN_ACTIONS_MAX)
+        return E2BIG;
+    if (msg->i.reserved[1] || msg->i.reserved[0] > PSPAWN_CHILD_ACTIONS ||
+        (msg->i.reserved[0] && (msg->i.cwdlen || msg->i.filact_obytes)))
+        return EINVAL;
     if (msg->i.subtype != _PROC_SPAWN_START)
         return ENOSYS;
 
-    if (len > ctp->info.msglen) {
+    copied = len > ctp->info.msglen;
+    charge = pspawn_heap_charge(msg, (size_t) len, copied);
+
+    /* A request the gate charged does not wait for its spawner's loader context
+     * share while it holds the charge: it gives the charge and its buffers
+     * back, waits for the share, and comes in again. The request is still in
+     * the sender's buffer, and the deadline is one for all the tries.
+     */
+retry:;
+    int share_class = -1;
+
+    if ((r = pspawn_gate_enter(charge, &until)) != EOK)
+        return r;
+    if (copied) {
         int head = (int) ctp->info.msglen, tail;
 
-        if (len > PSPAWN_MSG_MAX)
-            return E2BIG;
         tail = (int) len - head;
         if (!(whole = malloc((size_t) len))) {
             roottask_heap_note_nomem("spawn request", (size_t) len);
-            return ENOMEM;
+            r = ENOMEM;
+            goto out;
         }
 
         /* The checked header comes from the receive buffer; only the tail is
@@ -497,15 +629,20 @@ int proc_pspawn(ioserv_context_t *ctp, void *vmsg)
          */
         memcpy(whole, msg, (size_t) head);
         if (msg_read(ctp->rcvid, (char *) whole + head, tail, head) != tail) {
-            free(whole);
-            return EFAULT;
+            r = EFAULT;
+            goto out;
         }
         msg = whole;
     }
 
-    r = parse_pspawn_msg(ctp->info.pid, msg, &spawn_msg);
-    /* spawn_msg has every byte it needs: drop the copy before the load. */
-    free(whole);
+    path = (const char *) (msg + 1) + msg->i.attr_bytes + msg->i.filact_bytes +
+           msg->i.filact_obytes;
+    if (!msg->i.pathlen ||
+        memchr(path, 0, msg->i.pathlen) != path + msg->i.pathlen - 1)
+        r = EINVAL;
+    else
+        r = parse_pspawn_msg(ctp->info.pid, msg, &spawn_msg);
+
     if (r == EOK) {
         size_t spawn_msg_len = sizeof(*spawn_msg) + spawn_msg->i.searchlen +
                                spawn_msg->i.cwdlen + spawn_msg->i.pathlen +
@@ -519,8 +656,30 @@ int proc_pspawn(ioserv_context_t *ctp, void *vmsg)
         ctp2.info.msglen = (uint32_t) spawn_msg_len;
 
         CRASHCHECK(ctp2.info.srcmsglen > ctp2.info.msglen);
-        r = proc_spawn(&ctp2, spawn_msg);
+        pspawn_debug_hold(path);
+        const unsigned char *actions =
+            (const unsigned char *) (msg + 1) + msg->i.attr_bytes;
+        r = proc_spawn_with_actions(
+            &ctp2, spawn_msg, actions,
+            msg->i.reserved[0] ? msg->i.filact_bytes : 0,
+            charge && share_nowait ? &share_class : NULL);
     }
+out:
+    free(whole);
     free(spawn_msg);
+    whole = NULL;
+    spawn_msg = NULL;
+    pspawn_gate_leave(charge); /* every exit once admitted comes here */
+    if (r == EAGAIN && share_class >= 0) {
+        /* With the share wait full, the request waits for its share as it did
+         * before, inside the gate, rather than fail.
+         */
+        r = loader_share_await(ctp->info.pid, share_class, &until);
+        if (r == EOK || r == EBUSY) {
+            share_nowait = r == EOK;
+            msg = vmsg;
+            goto retry;
+        }
+    }
     return r;
 }

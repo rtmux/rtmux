@@ -232,6 +232,38 @@ void __attribute__((noreturn)) kernel_exit(void)
     xfer_handler_check_exit();
     for (;;) {
         unsigned cpu = get_cpunum();
+        thread_t *blocked = pcpu_array[cpu].pc_block_recheck;
+
+        /* A kill or a cancel was pending on the thread this hart just blocked.
+         * Deliver it before anything is dispatched. On a hart with no active
+         * thread interrupts stay off and the nesting depth is held, as for the
+         * settle below: the delivery takes and drops kspinlocks, and a nested
+         * trap would have no thread to run on.
+         */
+        if (blocked) {
+            bool idle = !get_active_thread(cpu);
+
+            pcpu_array[cpu].pc_block_recheck = NULL;
+            if (idle) {
+                interrupt_disable();
+                pcpu_array[cpu].pc_kspin_depth++;
+#if defined(CONFIG_INSTRUMENTATION)
+                irqoff_open(LOCK_CLASS_SCHED);
+#endif
+            }
+            thread_block_recheck(blocked);
+            if (idle) {
+#if defined(CONFIG_INSTRUMENTATION)
+                irqoff_close();
+#endif
+                pcpu_array[cpu].pc_kspin_depth--;
+            }
+        }
+        /* A timer that fell due while the boot hart was in a kernel call is
+         * expired here (clock_catch_up), not a tick later.
+         */
+        if (clock_catch_up_due(cpu))
+            clock_catch_up();
         thp = get_active_thread(cpu);
         if (!thp) {
             /* A hart about to idle settles its stale servers first. Interrupts
@@ -366,10 +398,13 @@ void __attribute__((noreturn)) kernel_exit(void)
          * fetch would fault. So for U-mode returns of ROOTTASK threads, force
          * as_prp back to act's own process so satp stays at roottask. Kexts
          * that need to operate on a bound as must do the temporary satp switch
-         * themselves (xfer paths already do this). process_bind on a
-         * U-mode-roottask thread becomes a no-op for the satp dimension; the
-         * as_prp field still carries the bind for vm_ops->FOO(prp, ...) callers
-         * that read it as a target hint.
+         * themselves (xfer paths already do this). A process_bind by a
+         * U-mode roottask thread therefore lasts only until this return: the
+         * next kernel call starts with as_prp naming roottask again. Nothing
+         * relies on more: every kernel call that works on another process takes
+         * its pid or prp as an argument, and the kernel reads a thread's as_prp
+         * only to switch into the address space a peer thread runs in (xfer,
+         * notification, trace), never as the target of roottask's own call.
          */
         if (thp->process && thp->process->pid == ROOTTASK_PID &&
             !(thp->reg.sstatus & SSTATUS_SPP)) {
@@ -440,8 +475,16 @@ void __attribute__((noreturn)) kernel_exit(void)
             interrupt_enable();
             if (aflags & RTMUX_ATF_CANCEL) {
                 /* A cancel posted by another hart. Turn it into the owner-side
-                 * special return that redirects to the cancel stub. */
-                atomic_or(&thp->flags, RTMUX_FLG_THR_CANCELSELF);
+                 * special return that redirects to the cancel stub, unless the
+                 * thread has disabled cancellation since the canceller read it:
+                 * something else woke it first and it went on to disable. The
+                 * cancel stays pending in its TLS for the enable to act on.
+                 * The address space is the thread's by now (tls_flags_load),
+                 * unless it is bound to another process's: then deliver.
+                 */
+                if ((thp->as_prp && thp->as_prp != thp->process) ||
+                    !(tls_flags_load(thp) & PTHREAD_CANCEL_DISABLE))
+                    atomic_or(&thp->flags, RTMUX_FLG_THR_CANCELSELF);
                 /* Re-post the other bits we consumed (TIMESLICE/SMP_RESCHED
                  * ride the same IPI) so the next pass still reschedules. */
                 aflags &= ~(unsigned) RTMUX_ATF_CANCEL;

@@ -6,7 +6,9 @@
  */
 
 #include <limits.h>
+#ifndef KERNEL_ALLOC_HOST_TEST
 #include <core/globals.h>
+#endif
 
 #define ALIGN(x) \
     ((size_t) ((((size_t) (x)) + (_MALLOC_ALIGN - 1)) & ~(_MALLOC_ALIGN - 1)))
@@ -45,8 +47,6 @@ struct free_entry *ksys_free_list;
 struct free_entry *ksys_crit_list;
 uintptr_t crit_start = ~0UL; /* to make initial IS_CRIT() fail */
 uintptr_t crit_end = 0;
-static void *pregrow_start;
-static size_t pregrow_size;
 
 #define IS_CRIT(p) \
     (((uintptr_t) (p) >= crit_start) && ((uintptr_t) (p) <= crit_end))
@@ -190,6 +190,23 @@ addmem:
         if (!new) {
             size_t size;
 
+            /* A moving realloc cannot retain the old block's insertion position
+             * across an unlocked VM callback. Finish the new allocation
+             * independently, then return the old block through a fresh, locked
+             * search of its own heap tier. On failure the caller continues to
+             * own the old block.
+             */
+            if (data) {
+                kspinlock_unlock(&alloc_slock);
+                new = _sreallocfunc(NULL, 0, new_size, alloc,
+                                    heap_tier == 2 ? HEAP_KER_CRIT : HEAP_KER);
+                if (new) {
+                    memcpy(new, data, min(new_size, old_size));
+                    _sreallocfunc(data, old_size, 0, NULL, heap);
+                }
+                return new;
+            }
+
             /* when allocating make sure there is enough room of a new free
              * entry
              */
@@ -299,6 +316,10 @@ addmem:
     return new;
 }
 
+#ifndef KERNEL_ALLOC_HOST_TEST
+static void *pregrow_start;
+static size_t pregrow_size;
+
 /* Obtain more memory from VM for the kernel heap.
  *
  * Rounds the request up to a page, satisfying it from the pre-grown reserve set
@@ -311,13 +332,17 @@ addmem:
 static size_t _heap_alloc(size_t size, void **addr)
 {
     size = ROUNDUP(size, __PAGESIZE);
+    kspinlock_lock(&alloc_slock);
     if (size <= pregrow_size) {
         /* Can use the memory that was pre-allocated by heap_init() */
         *addr = pregrow_start;
         pregrow_size -= size;
         pregrow_start = (uint8_t *) pregrow_start + size;
+        kspinlock_unlock(&alloc_slock);
         return size;
     }
+
+    kspinlock_unlock(&alloc_slock);
 
     if (vm_ops->mmap(0, NULL, 0, size, PROT_READ | PROT_WRITE | PROT_EXEC,
                      MAP_ANON | MAP_PRIVATE, 0, 0, _MALLOC_ALIGN, 0, NOFD, addr,
@@ -569,3 +594,5 @@ int crit_sfree(void *p, size_t size)
     }
     return 0;
 }
+
+#endif /* KERNEL_ALLOC_HOST_TEST */

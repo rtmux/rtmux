@@ -5,10 +5,12 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <align.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <exec-path.h>
 #include <stdbool.h>
 #include <string.h>
 #include <termios.h>
@@ -16,10 +18,14 @@
 #include <sys/mount.h>
 #include <sys/rtmux-core.h>
 #include <sys/pathmsg.h>
+#include <sys/spawn-action-wire.h>
+#include <sys/spawn-limits.h>
+#include <sys/loader-fd.h>
 
 #include <devctl/common.h>
 
 #include "bootstrap-manifest.h"
+#include "loader-end.h"
 #include "externs.h"
 #include "root-process.h"
 #include "root-log.h"
@@ -75,6 +81,52 @@ extern void *_mmap2(void *addr,
 
 /* set_signal() removed — signal subsystem eliminated */
 
+/* Give the load up with `code`, which loader_exit hands to the spawner, and
+ * leave the line for its log. For the loader thread, with its context in a
+ * variable named lcp. Not for use once _PROC_SPAWN_DONE has been sent: the
+ * context is no longer this loader's.
+ */
+#define LOADER_EXIT(code)              \
+    do {                               \
+        lcp->ctx.exit_line = __LINE__; \
+        _exit(code);                   \
+    } while (0)
+
+/* A spawn fails after its loader started. Say why when the reason is not an
+ * ordinary one (ENOENT, EACCES, ...), which the spawner's errno tells well
+ * enough: ENOMEM and EINVAL, where the loader exits with the errno of whatever
+ * step failed (a cpiofs open or mapping at its OCB limit, the stack mapping, a
+ * malformed argument block, ...) and only the line says which, and a loader
+ * that was killed. A client can provoke EINVAL at will with a raw request, so
+ * it has a rate limit of its own and cannot use up the other's.
+ */
+static void loader_exit_note(const struct loader_context *lcp,
+                             pid_t pid,
+                             int signo,
+                             int error)
+{
+    static atomic_uint nfail, ninval;
+    unsigned n;
+
+    if (signo) {
+        if ((n = root_warn_due(&nfail)))
+            root_warn(
+                "spawn: loader of pid %d (parent %d) %s %d (failure "
+                "%u): reported as %s\n",
+                (int) pid, (int) lcp->ctx.ppid,
+                signo > 0 ? "died of signal" : "left no exit record,", signo, n,
+                strerror(error));
+        return;
+    }
+    if ((error != ENOMEM && error != EINVAL) ||
+        !(n = root_warn_due(error == EINVAL ? &ninval : &nfail)))
+        return;
+    root_warn(
+        "spawn: loader of pid %d (parent %d) gave up at "
+        "proc-loader.c:%d (failure %u): %s\n",
+        (int) pid, (int) lcp->ctx.ppid, lcp->ctx.exit_line, n, strerror(error));
+}
+
 /* loader_exit — runs when a child died during loading (failed to exec, fault,
  * etc.). Pulls prp->lcp via process_query_info (lcp is a roottask-user-VA
  * pointer that the kernel just copied through, so the deref below is safe) and
@@ -89,7 +141,6 @@ int loader_exit(ioserv_context_t *ctp, union proc_msg_union *msg, pid_t pid)
 {
     struct loader_context *lcp;
     root_proc_info_t qinfo;
-    root_process_t *tmp = root_proc(pid);
     int r, replied = 0;
 
     (void) ctp;
@@ -102,20 +153,12 @@ int loader_exit(ioserv_context_t *ctp, union proc_msg_union *msg, pid_t pid)
         return 0;
 
     if (lcp->ctx.rcvid != -1) {
-        /* siginfo lives in root_process_t now (POSIX policy moved out of the
-         * kernel-half process_t).
+        /* qinfo.siginfo is roottask's record of an exit when there is one
+         * (root_process_t), else the fault the kernel recorded.
          */
-        switch (tmp->siginfo.si_signo) {
-        case SIGCHLD:
-            r = tmp->siginfo.si_status;
-            break;
-        case SIGBUS:
-            r = (lcp->ctx.fault_errno != EOK) ? lcp->ctx.fault_errno : ENOMEM;
-            break;
-        default:
-            r = EINTR;
-            break;
-        }
+        int signo = loader_end(&qinfo.siginfo, &r);
+
+        loader_exit_note(lcp, pid, signo, r);
         msg_error(lcp->ctx.rcvid, r);
         replied = 1;
     }
@@ -254,7 +297,8 @@ static int loader_fd(struct loader_context *lcp)
             if (info.flags & RTMUX_FLG_COF_DEAD) {
                 continue;
             }
-            if (info.flags & RTMUX_FLG_COF_CLOEXEC) {
+            if ((info.flags & RTMUX_FLG_COF_CLOEXEC) &&
+                !loader_action_source(lcp, fd)) {
                 continue;
             }
             if (RTMUX_NODE_CMP(info.nd, RTMUX_LOCAL_NODE) != 0)
@@ -295,6 +339,145 @@ static int loader_fd(struct loader_context *lcp)
     }
 }
 
+/* Apply actions on the child's descriptors while its requested credentials and
+ * working directory are active. No file is opened in the parent.
+ */
+static int action_chdir(int fd, const char *path)
+{
+    char dir[PATH_MAX + 1], resolved[PATH_MAX + 1];
+    if (fd >= 0) {
+        struct stat st;
+        if (fstat(fd, &st) < 0)
+            return errno;
+        if (!S_ISDIR(st.st_mode))
+            return ENOTDIR;
+        if (__atfd_fdinfo_path(fd, dir, sizeof dir) < 0)
+            return errno;
+        if (!__loader_root(resolved, sizeof resolved))
+            return errno;
+        size_t root = strlen(resolved);
+        while (root && resolved[root - 1] == '/')
+            root--;
+        if (strncmp(dir, resolved, root) || (dir[root] && dir[root] != '/'))
+            return EACCES;
+        path = dir[root] ? dir + root : "/";
+    }
+    if (__chdir_resolve(path, resolved, sizeof resolved) < 0 ||
+        __chdir_send(resolved) < 0)
+        return errno;
+    return EOK;
+}
+
+/* Only this loader thread owns the child's fd table. close() can report the
+ * service's error after detaching, but EINTR can leave it attached.
+ */
+static int action_close(int fd)
+{
+    for (;;) {
+        if (__close_fd(fd, 0) >= 0)
+            return EOK;
+        int err = errno;
+        if (fcntl(fd, F_GETFD) < 0 && errno == EBADF)
+            return EOK;
+        if (err != EINTR)
+            return err;
+    }
+}
+
+static int action_dup(int source, int target, unsigned flags)
+{
+    if (fcntl(source, F_GETFD) < 0)
+        return errno;
+    if (source == target)
+        return fcntl(target, F_SETFD, (int) flags) < 0 ? errno : EOK;
+    int err = action_close(target);
+    if (err)
+        return err;
+    int fd = __dup_fd(source, target, flags, 0);
+    if (fd < 0)
+        return errno;
+    if (fd == target)
+        return EOK;
+    (void) __close_fd(fd, 0);
+    return EBUSY;
+}
+
+static int loader_actions(struct loader_context *lcp, const char *image)
+{
+    const unsigned char *records =
+        (const unsigned char *) &lcp->msg + lcp->ctx.msgsize;
+    const unsigned char *cursor = records;
+    size_t left = lcp->ctx.action_bytes;
+    int has_open = 0, changes_dir = 0;
+    struct spawn_action_record r;
+    const char *path;
+    while (left) {
+        int err = spawn_action_next(&cursor, &left, &r, &path);
+        if (err)
+            return err;
+        has_open |= r.type == posix_file_action_type_OPEN;
+        changes_dir |= r.type == posix_file_action_type_CHDIR ||
+                       r.type == posix_file_action_type_FCHDIR;
+    }
+    if (has_open && (*image == '/' || !changes_dir)) {
+        struct stat st;
+        if (stat(image, &st) < 0)
+            return errno;
+    }
+    cursor = records;
+    left = lcp->ctx.action_bytes;
+    while (left) {
+        int err = spawn_action_next(&cursor, &left, &r, &path);
+        if (err)
+            return err;
+        switch (r.type) {
+        case posix_file_action_type_CLOSE:
+            err = action_close(r.fd);
+            break;
+        case posix_file_action_type_DUP:
+            err = action_dup(r.fd, r.target, 0);
+            break;
+        case posix_file_action_type_OPEN: {
+            err = action_close(r.target);
+            if (err)
+                return err;
+            int fd =
+                __loader_open(path, (int) r.flags | O_NOCTTY, (mode_t) r.mode);
+            if (fd < 0)
+                return errno;
+            if (fd != r.target) {
+                err = action_dup(fd, r.target,
+                                 (r.flags & O_CLOEXEC) ? FD_CLOEXEC : 0);
+                int closed = action_close(fd);
+                if (!err)
+                    err = closed;
+            }
+            break;
+        }
+        case posix_file_action_type_CHDIR:
+            err = action_chdir(-1, path);
+            break;
+        case posix_file_action_type_FCHDIR:
+            err = action_chdir(r.fd, NULL);
+            break;
+        }
+        if (err)
+            return err;
+    }
+    struct _server_info si;
+    int fd = 0;
+    while ((fd = connect_server_info(0, (unsigned) fd, &si)) >= 0 &&
+           !((unsigned) fd & RTMUX_SIDE_CHANNEL)) {
+        if (si.flags & RTMUX_FLG_COF_CLOEXEC) {
+            int err = action_close(fd);
+            if (err)
+                return err;
+        }
+        fd++;
+    }
+    return EOK;
+}
+
 /* Test whether a path names a regular (or named) file the caller may execute.
  * Parameters:
  *   path : the pathname to check
@@ -332,44 +515,21 @@ static int searchpath(const char *name,
                       char *buffer,
                       size_t bufsize)
 {
-    char *b;
-    ssize_t n;
-    int trailing;
-
-
-    if (!name || *name == '\0' || !path || *path == '\0') {
-        errno = ENOENT;
-    } else {
-#ifndef NDEBUG
-        /* assert proper args */
-        if ((!buffer) || (bufsize < strlen(name)))
-            crash();
-#endif
-
-        bufsize -= strlen(name);
-        do {
-            for (n = (ssize_t) bufsize, *(b = buffer) = 0;
-                 *path && *path != ':'; n--, path++) {
-                if (n > 0) {
-                    *b++ = *path;
-                }
-            }
-            if (n > 0) {
-                if (*buffer && b[-1] != '/') {
-                    *b++ = '/';
-                }
-                STRLCPY(b, name, bufsize - (size_t) (b - buffer));
-                if (is_exec(buffer) != -1) {
-                    return 0;
-                }
-            } else {
-                errno = ENAMETOOLONG;
-                break;
-            }
-            trailing = (*path != ':') ? 0 : !*++path;
-        } while (*path || trailing);
+    int saved = ENOENT;
+    while (name && *name && path) {
+        int rc = exec_path_candidate(&path, name, buffer, bufsize, false);
+        if (rc == EOK) {
+            if (is_exec(buffer) == 0)
+                return 0;
+            rc = errno;
+        }
+        if (!exec_path_continue(rc, &saved)) {
+            saved = rc;
+            break;
+        }
     }
     *buffer = 0;
+    errno = saved;
     return -1;
 }
 
@@ -443,7 +603,7 @@ static void loader_args(struct loader_context *lcp,
         root_process_t *tmp = root_proc(lcp->ctx.pid);
 
         /* not a full path, tack the CWD at the front */
-        cwd_len = path_node_fullpath(tmp->cwd, NULL, 0);
+        cwd_len = tmp->cwd ? path_node_fullpath(tmp->cwd, NULL, 0) : 0;
         if (cwd_len > 0) {
             int real_len;
 
@@ -491,8 +651,24 @@ static void loader_args(struct loader_context *lcp,
         /* ipc-send: roottask-fsio -> roottask-core */
         if (msg_send(ROOTTASK_COID, &args.i, sizeof args.i, strings + interplen,
                      args.i.nbytes) == -1) {
-            _exit(errno);
+            LOADER_EXIT(errno);
         }
+    }
+
+    /* The request must hold a NUL-terminated string for every argument and
+     * environment entry it counts. The walk below hands out one pointer per
+     * count and does not look at the last string, so with fewer strings than
+     * that a pointer would lead into the executable path above them, past what
+     * ARG_MAX counted.
+     */
+    {
+        const char *q = strings + interplen;
+        size_t have = 0;
+
+        for (; q < aux_exefile; q++)
+            have += *q == '\0';
+        if (have < (size_t) lcp->msg.spawn.i.nargv + lcp->msg.spawn.i.narge)
+            LOADER_EXIT(EINVAL);
     }
 
     /* count the size of the aux vector */
@@ -516,10 +692,7 @@ static void loader_args(struct loader_context *lcp,
                            ~(STACK_ALIGNMENT - 1));
     lcp->ctx.start.start_sp = (uintptr_t) arg;
     if ((*(unsigned long *) arg = lcp->msg.spawn.i.nargv) == 0) {
-        do {
-            root_log("loader EINVAL @ %s:%d\n", __FILE__, __LINE__);
-            _exit(EINVAL);
-        } while (0);
+        LOADER_EXIT(EINVAL);
     }
 
     /* account for the interpreter and its arg if they are present */
@@ -564,17 +737,11 @@ static void loader_args(struct loader_context *lcp,
     redo:
         while (*p++ != '\0') {
             if (p > aux_exefile) {
-                do {
-                    root_log("loader EINVAL @ %s:%d\n", __FILE__, __LINE__);
-                    _exit(EINVAL);
-                } while (0);
+                LOADER_EXIT(EINVAL);
             }
         }
         if ((char *) arg > strings) {
-            do {
-                root_log("loader EINVAL @ %s:%d\n", __FILE__, __LINE__);
-                _exit(EINVAL);
-            } while (0);
+            LOADER_EXIT(EINVAL);
         }
         if (skip_arg0) { /* this makes us skip over two strings */
             skip_arg0 = 0;
@@ -680,14 +847,32 @@ static int try_hash_bang(int fd,
     return EOK;
 }
 
+#ifdef CONFIG_DEBUG_INJECT
+/* A spawn of a path that ends in rtmux-loader-fault makes its loader store
+ * through a null pointer, so a test can see what a faulting loader reports to
+ * the spawner. Only a CONFIG_DEBUG_INJECT image has this.
+ */
+static void loader_debug_fault(const char *path)
+{
+    static const char tag[] = "rtmux-loader-fault";
+    size_t len = strlen(path);
+
+    if (len >= sizeof tag - 1 && !strcmp(path + len - (sizeof tag - 1), tag))
+        *(volatile int *) (uintptr_t) 16 = 0;
+}
+#else
+#define loader_debug_fault(path) ((void) 0)
+#endif
+
 /* Open an executable for loading and stat it.
  *
  * Tries the real uid/gid first, falling back to the effective ids, and clears
  * the setuid/setgid bits if the containing filesystem is mounted nosuid. On any
- * error it _exit()s the loader thread with errno. Parameters:
+ * error it returns -1 with errno set, for the caller to give the load up.
+ * Parameters:
  *   name  : pathname of the executable
  *   statp : out — stat of the opened file
- * Return value: the open file descriptor (never returns on failure).
+ * Return value: the open file descriptor, or -1.
  */
 static int open_exe(const char *name, struct stat *statp)
 {
@@ -697,10 +882,15 @@ static int open_exe(const char *name, struct stat *statp)
     /* ipc-send: roottask-fsio -> romfs,lkl-fsd,dev-nvme,pipe */
     fd = open(name, O_RDONLY);
     if ((fd == -1) || (fstat(fd, statp) == -1)) {
-        if (errno == EBUSY) {
-            errno = ETXTBSY;
-        }
-        _exit(errno);
+        int err = errno == EBUSY ? ETXTBSY : errno;
+
+        /* The caller only sees -1, so a descriptor whose stat failed is closed
+         * here.
+         */
+        if (fd != -1)
+            (void) close(fd);
+        errno = err;
+        return -1;
     }
 
     /* Honour the MOUNT_NOSUID qualifier by knocking down these bits (affects
@@ -747,7 +937,68 @@ static int boot_image_hash_fd(int fd, uint64_t *hashp)
     return EOK;
 }
 
-#define LOADER_EXIT(code) _exit(code)
+static uint64_t loader_sigset_word(const sigset_t *set)
+{
+    return ((uint64_t) set->bits[1] << 32) | set->bits[0];
+}
+
+/* Publish the signals the spawn asks the new image to start blocked or ignored
+ * as auxiliary vector entries; the new image's libc takes them up before
+ * main(). This is how an exec passes the two sets on. Appended to the entries
+ * the ELF loader made, before the argument block is laid out.
+ */
+static void loader_signal_aux(struct loader_context *lcp)
+{
+    auxv_t *auxv = lcp->ctx.start.aux;
+    unsigned long flags = lcp->msg.spawn.i.parms.flags;
+    int n = 0;
+
+    while (auxv[n].a_type != AT_NULL)
+        n++;
+    if (flags & SPAWN_SETSIGMASK) {
+        auxv[n].a_type = AT_RTMUX_SIGMASK;
+        auxv[n++].a_un.a_val =
+            (long) loader_sigset_word(&lcp->msg.spawn.i.parms.sigmask);
+    }
+    if (flags & SPAWN_SETSIGIGN) {
+        auxv[n].a_type = AT_RTMUX_SIGIGN;
+        auxv[n++].a_un.a_val =
+            (long) loader_sigset_word(&lcp->msg.spawn.i.parms.sigignore);
+    }
+    auxv[n].a_type = AT_NULL;
+    auxv[n].a_un.a_val = 0;
+}
+
+/* The loader has temporary bootstrap authority. Apply a scheduling request only
+ * after resolving the image grant, with the limits of the parent and the final
+ * image. Returning the error here wakes the blocked spawner.
+ */
+static int loader_schedule(struct loader_context *lcp)
+{
+    struct inheritance *parms = &lcp->msg.spawn.i.parms;
+    struct _sched_info limits;
+    int policy = RTMUX_SCHED_NOCHANGE;
+    if (!(parms->flags &
+          (POSIX_SPAWN_SETSCHEDULER | POSIX_SPAWN_SETSCHEDPARAM)))
+        return EOK;
+    if (parms->flags & POSIX_SPAWN_SETSCHEDULER) {
+        policy = parms->policy;
+        if (policy < SCHED_FIFO || policy > SCHED_SPORADIC)
+            return EINVAL;
+    }
+    if (parms->param.sched_priority <= 0)
+        return EINVAL;
+    if (__sched_info(0, SCHED_RR, &limits) == -1)
+        return errno;
+    if (parms->param.sched_priority > limits.priority_priv) {
+        root_proc_info_t parent;
+        if (!(lcp->ctx.grant_caps & RTMUX_PRIV_CAP_SCHED) ||
+            process_query_info(lcp->ctx.ppid, &parent) != EOK ||
+            !parent.may_set_priv_priority)
+            return EPERM;
+    }
+    return __sched_set(0, 0, policy, &parms->param) == -1 ? errno : EOK;
+}
 
 /* Loader thread for posix_spawn(): turn a spawn request into a running process
  * image.
@@ -780,6 +1031,7 @@ void *loader_load(void *parm)
     int needs_secure;
     int resetids;
     unsigned prealloc;
+    size_t argspace;
 
     buffer[0] = '\0';
     lcp->ctx.tid = pthread_self();
@@ -860,9 +1112,25 @@ void *loader_load(void *parm)
     /* proc_spawn set saved_user_id to 0, so this will work... */
     uid = getuid();
     gid = getgid();
+
+    /* RESETIDS gives the child its real IDs before its file actions and the
+     * lookup of the executable, as an execve the child made would see them.
+     */
+    if (resetids && (setegid(gid) < 0 || seteuid(uid) < 0))
+        LOADER_EXIT(errno);
+    if (lcp->ctx.action_bytes) {
+        status = loader_fd(lcp);
+        if (!status)
+            status = loader_actions(lcp, p);
+        if (status) {
+            loader_revoke_key(lcp);
+            LOADER_EXIT(status);
+        }
+    }
     (void) setreuid(geteuid(), 0);
     (void) setregid(getegid(), getgid());
 
+    loader_debug_fault(p);
     if (lcp->msg.spawn.i.parms.flags & SPAWN_SEARCH_PATH) {
         if (searchpath(p, search, buffer, sizeof buffer) == -1) {
             LOADER_EXIT(errno);
@@ -870,12 +1138,23 @@ void *loader_load(void *parm)
     } else {
         if (is_exec(p) == -1) {
             LOADER_EXIT(errno);
+        } else if (*p != '/') {
+            if (!getcwd(buffer, sizeof buffer))
+                LOADER_EXIT(errno);
+            size_t len = strlen(buffer);
+            if (len && buffer[len - 1] == '/')
+                len--;
+            if (len + strlen(p) + 2 > sizeof buffer)
+                LOADER_EXIT(ENAMETOOLONG);
+            buffer[len++] = '/';
+            strcpy(buffer + len, p);
         } else if (!memccpy(buffer, p, '\0', sizeof(buffer))) {
             LOADER_EXIT(ENAMETOOLONG);
         }
     }
 
-    fd = open_exe(buffer, &statl);
+    if ((fd = open_exe(buffer, &statl)) == -1)
+        LOADER_EXIT(errno);
 
     /* Provenance for the bootstrap capability grant: a manifest grant is
      * honored only for an image that physically lives on the read-only boot
@@ -905,7 +1184,14 @@ void *loader_load(void *parm)
     lcp->ctx.grant_caps = 0;
     lcp->ctx.grant_system = 0;
 
-    if (exec_on_boot) {
+    /* The early check, which fails a listed image whose hash does not match
+     * before it is loaded. Only a listed image can be granted anything, so only
+     * its hash is read: bootstrap_cap_manifest_listed() and _grant_for() match
+     * paths the same way (the manifest host test checks it). Hashing every
+     * other boot image would read the whole file on each spawn for nothing,
+     * most of a spawn's time under emulation.
+     */
+    if (exec_on_boot && bootstrap_cap_manifest_listed(buffer)) {
         status = boot_image_hash_fd(fd, &exec_hash);
         if (status != EOK)
             LOADER_EXIT(status);
@@ -956,7 +1242,8 @@ void *loader_load(void *parm)
             if (is_exec(interp_name) == -1) {
                 LOADER_EXIT(errno);
             }
-            fd = open_exe(interp_name, &statl);
+            if ((fd = open_exe(interp_name, &statl)) == -1)
+                LOADER_EXIT(errno);
             status = elf_load_hook(fd, interp_name, &lcp->ctx.start, &statl,
                                    &lcp->msg.spawn.i.parms);
         }
@@ -991,10 +1278,35 @@ void *loader_load(void *parm)
     if (lcp->ctx.start.stacksize < lcp->ctx.start.stackalloc) {
         lcp->ctx.start.stacksize = lcp->ctx.start.stackalloc;
     }
+
+    /* The argument and environment strings and their vectors are laid out at
+     * the top of this stack (loader_args). Add their size, in whole pages, to
+     * the mapping and to its populated part, so that they do not come out of
+     * the stack the program asked for: ARG_MAX of them would otherwise use up a
+     * small stack_max before main() runs. (The executable path, the aux vector
+     * and the TLS block are small and still come out of it.)
+     */
+    argspace =
+        lcp->msg.spawn.i.nbytes +
+        spawn_arg_pointers(lcp->msg.spawn.i.nargv, lcp->msg.spawn.i.narge);
+    if (interp_name) {
+        /* a script: its interpreter, the optional argument and its own path */
+        argspace +=
+            strlen(interp_name) + 1 + strlen(buffer) + 1 + 2 * sizeof(char *);
+        if (interp_arg)
+            argspace += strlen(interp_arg) + 1 + sizeof(char *);
+    }
+    argspace = lib_align_up_size(argspace, root_vm_ops.pagesize);
+    if (lcp->ctx.start.stacksize > SIZE_MAX - argspace - root_vm_ops.pagesize)
+        LOADER_EXIT(E2BIG);
+    lcp->ctx.start.stacksize += argspace;
     if (lcp->ctx.flags & PROC_LF_LAZYSTACK) {
         prealloc = 0;
     } else {
-        prealloc = (unsigned) lcp->ctx.start.stackalloc;
+        /* stackalloc <= the stacksize checked above: the sum cannot wrap */
+        size_t populate = lcp->ctx.start.stackalloc + argspace;
+
+        prealloc = (unsigned) min(populate, (size_t) UINT_MAX);
     }
     if (_mmap2((void *) lcp->ctx.start.stackaddr,
                lcp->ctx.start.stacksize + root_vm_ops.pagesize,
@@ -1025,9 +1337,11 @@ void *loader_load(void *parm)
         LOADER_EXIT(errno == EFAULT ? ENOMEM : errno);
     }
 
+    loader_signal_aux(lcp);
+
     loader_args(lcp, p, buffer, interp_name, interp_arg);
 
-    if (!(lcp->ctx.flags & SPAWN_EXEC)) {
+    if (!(lcp->ctx.flags & SPAWN_EXEC) && !lcp->ctx.action_bytes) {
         status = loader_fd(lcp);
         if (status != EOK) {
             loader_revoke_key(lcp);
@@ -1061,6 +1375,10 @@ void *loader_load(void *parm)
         }
     }
 
+    status = loader_schedule(lcp);
+    if (status != EOK)
+        LOADER_EXIT(status);
+
     /* Pre-publish initial_ip and initial_sp on the child's prp so
      * kext_process_startup can read them. The kernel heap is PTE_U=0, so U-mode
      * roottask cannot write prp directly; this goes through
@@ -1081,6 +1399,6 @@ void *loader_load(void *parm)
            sizeof lcp->msg.spawn_done.i);
     /* ipc-send: roottask-fsio -> roottask-core */
     msg_sendv(ROOTTASK_COID, lcp->ctx.iov, 1, 0, 0);
-    LOADER_EXIT(errno);
+    _exit(errno); /* not LOADER_EXIT: the handler may have freed lcp */
     return 0;
 }

@@ -100,10 +100,17 @@ static int thread_destroy_stats_report(const char *label, unsigned long calls)
             break;
         (void) __sched_yield();
     }
-    post_ready_named_ns = stats.rcu_wait_ns + stats.pin_wait_ns +
-        stats.active_scan_ns + stats.object_free_ns +
-        stats.destroy_post_vector_ns + stats.destroy_post_cpu_ns +
-        stats.destroy_post_name_ns;
+    /* The post-ready interval and its vector, cpu and name parts are recorded
+     * only by a destroy that woke a joiner. A joiner that arrives after the
+     * thread has exited is not woken, so the RCU, pin, scan and free totals
+     * over every destroy cover more destroys than the interval does; the
+     * kernel keeps the same totals over the joiner-woken destroys alone, and
+     * those are what count against the interval, in every batch.
+     */
+    post_ready_named_ns = stats.destroy_post_vector_ns +
+        stats.destroy_post_cpu_ns + stats.destroy_post_name_ns +
+        stats.join_rcu_wait_ns + stats.join_pin_wait_ns +
+        stats.join_active_scan_ns + stats.join_object_free_ns;
     post_ready_residual_ns =
         post_ready_named_ns <= stats.destroy_join_post_ready_ns ?
         stats.destroy_join_post_ready_ns - post_ready_named_ns : (uint64_t) 0;
@@ -133,7 +140,16 @@ static int thread_destroy_stats_report(const char *label, unsigned long calls)
           stats.destroy_join_post_ready_ns == 0 ||
           stats.destroy_post_vector_ns == 0 ||
           stats.destroy_post_cpu_ns == 0 ||
+          stats.join_object_free_ns == 0 ||
           post_ready_named_ns > stats.destroy_join_post_ready_ns)) ||
+        stats.join_rcu_wait_ns > stats.rcu_wait_ns ||
+        stats.join_pin_wait_ns > stats.pin_wait_ns ||
+        stats.join_active_scan_ns > stats.active_scan_ns ||
+        stats.join_object_free_ns > stats.object_free_ns ||
+        (stats.destroy_join_post_ready == 0 &&
+         stats.join_rcu_wait_ns + stats.join_pin_wait_ns +
+                 stats.join_active_scan_ns + stats.join_object_free_ns !=
+             0) ||
         stats.rcu_waited + stats.rcu_skipped != calls ||
         stats.rcu_waited_ns + stats.rcu_skipped_ns != stats.rcu_wait_ns ||
         stats.rcu_enroll_ns + stats.rcu_scan_ns + stats.rcu_post_scan_ns ==
@@ -186,7 +202,9 @@ static int thread_destroy_stats_report(const char *label, unsigned long calls)
                 "join-wake=%llu join-wake-ns=%llu "
                 "join-post-ready=%llu join-post-ready-ns=%llu "
                 "post-vector-ns=%llu post-cpu-ns=%llu post-name-ns=%llu "
-                "post-notify-ns=%llu post-ready-named-ns=%llu "
+                "post-notify-ns=%llu join-rcu-wait-ns=%llu "
+                "join-pin-wait-ns=%llu join-active-scan-ns=%llu "
+                "join-object-free-ns=%llu post-ready-named-ns=%llu "
                 "post-ready-residual-ns=%llu\n",
                 label, calls, (unsigned long long) stats.calls,
                 (unsigned long long) stats.rcu_wait_ns,
@@ -249,6 +267,10 @@ static int thread_destroy_stats_report(const char *label, unsigned long calls)
                 (unsigned long long) stats.destroy_post_cpu_ns,
                 (unsigned long long) stats.destroy_post_name_ns,
                 (unsigned long long) stats.destroy_post_notify_ns,
+                (unsigned long long) stats.join_rcu_wait_ns,
+                (unsigned long long) stats.join_pin_wait_ns,
+                (unsigned long long) stats.join_active_scan_ns,
+                (unsigned long long) stats.join_object_free_ns,
                 (unsigned long long) post_ready_named_ns,
                 (unsigned long long) post_ready_residual_ns);
         errno = EINVAL;
@@ -361,6 +383,15 @@ static int thread_destroy_stats_report(const char *label, unsigned long calls)
            (unsigned long long) stats.destroy_post_cpu_ns,
            (unsigned long long) stats.destroy_post_name_ns,
            (unsigned long long) stats.destroy_post_notify_ns);
+    printf("rcu-lookup-measure: thread-destroy-join-totals label=%s "
+           "count=%llu rcu-wait-ns=%llu pin-wait-ns=%llu "
+           "active-scan-ns=%llu object-free-ns=%llu\n",
+           label,
+           (unsigned long long) stats.destroy_join_post_ready,
+           (unsigned long long) stats.join_rcu_wait_ns,
+           (unsigned long long) stats.join_pin_wait_ns,
+           (unsigned long long) stats.join_active_scan_ns,
+           (unsigned long long) stats.join_object_free_ns);
     printf("rcu-lookup-measure: thread-destroy-post-ready-residual label=%s "
            "named-ns=%llu residual-ns=%llu notify-ns=%llu\n",
            label,

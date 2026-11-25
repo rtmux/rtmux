@@ -161,15 +161,20 @@ int vm_find_object(ioserv_context_t *ctp,
  *   prp_pid : pid of the target process
  *   prp     : target process (kernel-side handle)
  *   msg     : the mmap request / reply buffer
+ *   grownp  : OUT — set to a reference on the object when a growth of it may
+ *             still have mappings to make (vm_grow_drain), else left alone
  * Return value: a IOSERV_PTR reply on success, or an errno on failure.
  */
-int vm_map(ioserv_context_t *ctp, pid_t prp_pid, process_t *prp, mem_map_t *msg)
+int vm_map(ioserv_context_t *ctp,
+           pid_t prp_pid,
+           process_t *prp,
+           mem_map_t *msg,
+           path_object_t **grownp)
 {
     void *addr;
     size_t size;
     int status;
     path_object_t *object = NULL;
-    int try_again;
     size_t pg_offset;
     pid_t pid;
     int handle_backed = 0;
@@ -251,6 +256,15 @@ check_again:
         status = vm_find_object(ctp, prp_pid, prp, msg->i.fd, msg, &object);
         if (status != EOK)
             return status;
+
+        /* A growth of the object, such as the sticky-file reload in vm_open_fd,
+         * counts in grow_busy until its mappings are made, which needs the
+         * object lock still held here. Hand it to the caller to wait for once
+         * its locks are dropped.
+         */
+        if (object &&
+            __atomic_load_n(&object->mem.mm.grow_busy, __ATOMIC_ACQUIRE))
+            *grownp = path_object_clone(object);
     }
 
     /* DMA/MMIO containment: once an address space has self-restricted
@@ -292,47 +306,17 @@ check_again:
         return EAGAIN;
     }
 
-    for (;;) {
-        int lock_status;
-        status = root_vm_ops.mmap(prp_pid, prp, msg->i.addr, msg->i.len,
-                                  (int) msg->i.prot, (int) msg->i.flags, object,
-                                  (uint64_t) msg->i.offset, msg->i.align,
-                                  msg->i.preload, msg->i.fd, &addr, &size);
-        if ((status != ENOMEM) && (status != EAGAIN))
-            break;
+    status = root_vm_ops.mmap(prp_pid, prp, msg->i.addr, msg->i.len,
+                              (int) msg->i.prot, (int) msg->i.flags, object,
+                              (uint64_t) msg->i.offset, msg->i.align,
+                              msg->i.preload, msg->i.fd, &addr, &size);
 
-        /* RUSH3: This only schedules the compaction, it doesn't actually RUSH3:
-         * do it - we really should wait until complete, or at least RUSH3:
-         * until something's been freed, and it needs to set RUSH3: try_again to
-         * TRUE if it worked (assignment below should be |=).
-         */
+    /* Out of memory: ask for compaction and report the failure. There is no
+     * swap device, so the call is not tried again, and the address-space lock
+     * is kept: the process may be ending and could not be looked up again.
+     */
+    if (status == ENOMEM || status == EAGAIN)
         (void) vm_fd_compact();
-        process_bind(0);
-        proc_unlock_adp(pid);
-        /* @@@ We have to do this some other way. */
-        try_again = 0; /* no swap device */
-        prp = root_proc_lookup(pid);
-        CRASHCHECK(!prp);
-
-        /* We always aquire the as lock first, then the underlying object
-         * (avoids deadlocks). Right now we've got the object locked and we need
-         * to get the as back again. We need to release the object lock first.
-         * The memobj_lock() that we originally did upped the reference count on
-         * the object, so no one will delete it while we've got it unlocked
-         */
-        if (object) {
-            proc_mux_unlock(&object->mem.mm.mux);
-        }
-        /* Now aquire the locks in the proper order. */
-        lock_status = proc_wlock_adp(pid);
-        CRASHCHECK(lock_status == -1);
-        process_bind(pid);
-        if (object) {
-            proc_mux_lock(&object->mem.mm.mux);
-        }
-        if (!try_again)
-            break;
-    }
 
 #if defined(CONFIG_INSTRUMENTATION)
     {

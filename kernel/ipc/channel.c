@@ -349,18 +349,24 @@ int _channel_destroy(process_t *prp, int chid_arg)
     unsigned chid = (unsigned) chid_arg;
     soul_t *souls;
     vector_t *chvec;
+    kspinlock_t *chvec_lock = &prp->vec_slock;
 
     chvec = &prp->chancons;
     if (IS_GLOBAL_CHAN_SET(chid)) {
         CLEAR_GLOBAL_CHAN(chid);
         chvec = &global_channel_vector;
+        chvec_lock = &global_channel_slock;
     }
+    kspinlock_lock(chvec_lock);
     chp = vector_lookup2(chvec, chid);
-    if (!chp || chp->type != TYPE_CHANNEL)
+    if (!chp || chp->type != TYPE_CHANNEL) {
+        kspinlock_unlock(chvec_lock);
         return EINVAL;
+    }
 
 
     vector_flag(chvec, chid, 1);
+    kspinlock_unlock(chvec_lock);
     kspinlock_lock(&chp->lock);
     chp->destroying = true;
     kspinlock_unlock(&chp->lock);
@@ -477,7 +483,7 @@ send_done:
                             connect_coid_disconnect(cop,
                                                     cop->process->death_chp,
                                                     prp->terming_priority);
-                        cop->channel = NULL;
+                        __atomic_store_n(&cop->channel, NULL, __ATOMIC_RELEASE);
                     } while ((cop = cop->next));
                 }
             }
@@ -486,13 +492,16 @@ send_done:
         cop = ((global_channel_t *) chp)->cons;
         while (cop) {
             connect_t *next = cop->next;
-            cop->channel = NULL;
+            __atomic_store_n(&cop->channel, NULL, __ATOMIC_RELEASE);
             cop->next = NULL;
             cop = next;
         }
     }
 
-    if (!(chp = vector_rem(chvec, chid)))
+    kspinlock_lock(chvec_lock);
+    chp = vector_rem(chvec, chid);
+    kspinlock_unlock(chvec_lock);
+    if (!chp)
         return EINVAL;
 
     if (chp->flags & RTMUX_FLG_CHF_GLOBAL)
@@ -806,7 +815,7 @@ int kdecl ksys_channel_destroy(thread_t *act,
                                 cop, cop->process->death_chp, act->priority);
                         }
                         /* Null channel pointer since it is gone. */
-                        cop->channel = NULL;
+                        __atomic_store_n(&cop->channel, NULL, __ATOMIC_RELEASE);
                     } while ((cop = cop->next));
                 }
             }
@@ -816,7 +825,7 @@ int kdecl ksys_channel_destroy(thread_t *act,
         cop = ((global_channel_t *) chp)->cons;
         while (cop) {
             connect_t *next = cop->next;
-            cop->channel = NULL;
+            __atomic_store_n(&cop->channel, NULL, __ATOMIC_RELEASE);
             cop->next = NULL;
             cop = next;
         }

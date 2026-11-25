@@ -51,6 +51,7 @@ struct fs_ocb {
 
 #define MAX_OCBS 64
 static struct fs_ocb ocb_pool[MAX_OCBS];
+static dev_t fs_devno;
 static char fs_mountpoint[PATH_MAX + 1];
 
 static struct fs_ocb *ocb_alloc(void)
@@ -330,6 +331,7 @@ static int fs_readdir(ioserv_context_t *ctp, io_read_t *msg, struct fs_ocb *ocb)
 static int fs_stat(ioserv_context_t *ctp, io_stat_t *msg, struct fs_ocb *ocb)
 {
     memset(&msg->o, 0, sizeof(msg->o));
+    msg->o.st_dev = fs_devno;
     msg->o.st_ino = ocb->inum;
     msg->o.st_mode = romfs_mode(&ocb->di);
     msg->o.st_nlink = ocb->di.nlink;
@@ -597,7 +599,8 @@ int main(int argc, char *argv[])
 
     int id = ioserv_attach(dpp, &rattr, mountpoint, _FTYPE_ANY, IOSERV_FLAG_DIR,
                            &fs_connect_funcs, &fs_io_funcs, NULL);
-    if (id == -1) {
+    ino_t mount_ino;
+    if (id == -1 || ioserv_devino(id, &fs_devno, &mount_ino) == -1) {
         fprintf(stderr, "romfs: ioserv_attach(\"%s\") failed: %s\n", mountpoint,
                 strerror(errno));
         return 1;

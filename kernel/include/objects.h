@@ -97,6 +97,7 @@ enum {
     TYPE_CHANNEL,
     TYPE_VNOTIFICATION,
     TYPE_SYNCEVENT,
+    TYPE_TURNSTILE,
     TYPE_TYPE_MASK = 0x0f,
     TYPE_FLAG_FIRST = 0x10
 };
@@ -271,6 +272,20 @@ typedef struct process_entry {
     struct kdebug_entry kdebug;
     thread_t *valid_thp;
 
+    /* The thread that called exec while its swap is under way (set by the begin
+     * step, cleared by the commit, by a failed begin step or when the thread
+     * dies), compared and never dereferenced: it tells a retry of the begin
+     * step from a second exec of another thread, and while it is set
+     * thread_create refuses a new thread. exec_shell is the pid of that exec's
+     * loader shell, which names the exec itself (a pid is not reused soon: it
+     * carries a generation, unlike an rcvid, whose connection and thread slots
+     * are): a late failure of an exec whose caller died must not clear the mark
+     * of a later exec by a thread that took the caller's slot. Guarded by
+     * vec_slock.
+     */
+    thread_t *exec_thp;
+    pid_t exec_shell;
+
     /* conf_table and rsrc_list previously lived here but were never read by the
      * kernel — roottask-side bookkeeping (sysconf and hwres respectively).
      * Moved into root_process_t; see servers/roottask/include/root-process.h.
@@ -305,7 +320,7 @@ typedef struct process_entry {
 
     /* Open-connection count. Owner lock: this process's vec_slock (16-bit, so
      * no sub-word AMO; locked rather than atomic). Bumped at connect_attach,
-     * dropped via process_nfds_dec.
+     * dropped via process_nfds_dec_locked.
      */
     uint16_t nfds;
     uint8_t terming_priority;
@@ -473,12 +488,13 @@ typedef struct remote_ipc_state {
 
 typedef struct notification_entry {
     PRIL_ENTRY_FIELDS
-    uint8_t spare;
+    bool terminal_signal;
     int8_t code;
     uintptr_t value;
     intptr_t id; /* scoid if TYPE_NOTIFICATION */
 
     unsigned count;
+    uint64_t gen; /* an unblock notification's request; see req_gen */
 } notification_t;
 
 /* Entries for the sporadic scheduling policy */
@@ -566,12 +582,17 @@ typedef struct thread_entry { /* Also used for vthread_entry */
     } un;
     thread_t *client; /* the client that the server thread works on behalf */
     void *blocked_on; /* blocked wait object */
+    thread_t
+        *short_msg_source; /* special return can outlive a scheduler wait */
+    atomic_uint
+        sync_owner_flags; /* contended/robust ownership, closed at exit */
+    _Atomic sync_key_t
+        sync_wait_key; /* zero once the waker has unlinked this wait */
     turnstile_t *blocked_on_turnstile; /* PI/PC wait-chain object, not
                                         * blocked_on channel state
                                         */
     thread_t *ts_bound_next; /* link in blocked_on_turnstile's bound list */
-    turnstile_t
-        *owned_turnstiles; /* turnstiles currently boosting this owner */
+    pril_head_t owned_turnstiles; /* highest inherited mutex priority first */
     /* Robust mutexes this thread holds (under sync_pi_slock), and one spare
      * record kept so a lock after an unlock does not allocate. Only the thread
      * itself touches the spare. See kernel/sync/wait.c.
@@ -588,13 +609,29 @@ typedef struct thread_entry { /* Also used for vthread_entry */
     unsigned robust_nheld; /* length of robust_held (under sync_pi_slock) */
     thread_t *restart;
 
-    /* Resume point of the msg_readv / msg_writev iov check (xfer_iov_check):
-     * the array being checked, its part count, and how many entries are done.
-     * Valid only until the thread makes any other kernel call.
+    /* Resume points of xfer_iov_sum(), which totals and checks an iov array of
+     * the caller a step at a time: the array, its part count, how many entries
+     * are done and the bytes they add up to. A send checks two arrays before it
+     * can rendezvous, hence two. Together with xcur below they live from a
+     * KCALL_RESTART to the entry it leads to and no longer: xfer_resume is that
+     * call's number plus one, or 0, xfer_resume_sp the caller's stack pointer
+     * (a signal handler that runs before the restart and makes the same call is
+     * on a deeper frame), and xfer_begin_call() drops them at any other kernel
+     * entry.
      */
-    const iov_t *iovchk_iov;
-    int32_t iovchk_parts;
-    uint32_t iovchk_done;
+    struct xfer_iov_scan {
+        const iov_t *vector;
+        uint32_t parts, done;
+        size_t bytes;
+    } scan[2];
+    uintptr_t xfer_resume_sp;
+    uint16_t xfer_resume;
+
+    /* When the step of this kernel entry ends (xfer_piece_done), or 0 while no
+     * stepped transfer has looked at the clock in it: the scans and the copy of
+     * one entry share one budget.
+     */
+    uint64_t xfer_deadline;
 
     /* The following is used to hold arguments when a thread blocks to make them
      * easy to access in another threads context. Only a very small number of
@@ -656,15 +693,8 @@ typedef struct thread_entry { /* Also used for vthread_entry */
         } jo;
         struct { /* Used while acquiring a mutex or waiting on a condvar */
             sync_t *mutex;
-            sync_key_t
-                wait_key; /* opaque wait-queue key (VA today); not a ptr */
             uint32_t saved_timeout_flags;
-            unsigned long owner; /* owner of *mutex */
-            ksync_t *next;       /* next mutex in the thread mutex hold list */
-            ksync_t **prev; /* owner, next and prev only meaningful when the
-                             thread is the first one in a mutex waiting list
-                             */
-            long incr;      /* saved sync_t.count (same type) */
+            long incr; /* saved sync_t.count (same type) */
         } mu;
         struct { /* Used by async_flags processing in an SMP machine */
             uint32_t save_ip;
@@ -680,6 +710,11 @@ typedef struct thread_entry { /* Also used for vthread_entry */
             const struct _thread_attr *real_attr;
             int not_sigev_thread;
 
+            /* The creator lent its priority for the wait in thread_create;
+             * thread_specret ends the loan once it has woken the creator.
+             */
+            int creation_loan;
+
             /* Caller's attr, copied at create. Like the rest of wa it lives in
              * the args union and is valid only until thread_specret finishes;
              * the new thread does not run other kcalls before that.
@@ -693,15 +728,25 @@ typedef struct thread_entry { /* Also used for vthread_entry */
     char *name;
     uint64_t key;      /* msg_key_data secret; 0 = unset, never verifies */
     uint32_t key_fail; /* failed VERIFYs against key since it was minted */
+    /* Procfs reads a running peer. Copy only public identifiers while the
+     * caller still owns the wait object. blocked_on changes type at wake.
+     */
+    __typeof__(((debug_thread_t *) 0)->blocked.connect) debug_connect;
+    pthread_t debug_join_tid;
+    uintptr_t debug_sync_mutex;
     int32_t last_chid;
     void *status;
+
+    /* Request identity (kernel/ipc/message-core.c). req_gen names the request
+     * this thread last sent. rcv_key is what this thread last received as a
+     * server: an rcvid and the request behind it, in one word.
+     */
+    uint64_t req_gen;
+    uint64_t rcv_key;
 #define SIZEOF_VTHREAD offsetof(struct thread_entry, timeout)
     /* Items below are not needed for type=vthread_t */
     ktimer_t *timeout;
     thread_t *join;
-    ksync_t *mutex_holdlist; /* list of holding mutexes whose waiting queue is
-                              not empty
-                              */
     uint64_t start_time;
     FPU_REGISTERS *fpudata;
     volatile unsigned ticker_using;
@@ -810,8 +855,9 @@ typedef struct thread_entry { /* Also used for vthread_entry */
      * or taking a lock.
      *
      * msg_loan: the request (a client in REPLY on this thread) or notification
-     * being served; priority, request flag and generation packed as described
-     * in <thread-prio.h>.
+     * being served, or a waiting creator's priority until a new thread first
+     * runs; priority, request flag and generation packed as described in
+     * <thread-prio.h>.
      *
      * pend_loan: the highest send or notification still queued on the channel
      * this thread serves; raised when one is queued, reset from the queue head
@@ -848,8 +894,8 @@ typedef struct thread_entry { /* Also used for vthread_entry */
      * forward from that entry (an offset still to be skipped is kept whole), so
      * a restart neither rescans the entries it passed nor trusts them. Valid
      * while armed, for the thread pair, vectors, offsets and message length of
-     * the transfer that saved it, and dropped with the iov check state.
-     * Appended at the tail like the fields above it.
+     * the transfer that saved it, and dropped with the iov scan state. Appended
+     * at the tail like the fields above it.
      */
     struct {
         thread_t *sthp, *dthp;
@@ -861,7 +907,97 @@ typedef struct thread_entry { /* Also used for vthread_entry */
         size_t soff, doff;
         bool armed;
     } xcur;
+
+    /* Wakeups of this thread so far: every path that ends a wait counts one
+     * (thread_note_wakeup). A waker that reads it while the thread waits names
+     * that wait (force_ready_wait): the same value later means the thread has
+     * not been woken since. Appended at the tail.
+     */
+    uint32_t wake_seq;
+
+    /* The wake_seq of the last lockless wait a waker claimed the right to end
+     * (thread_wake_claim). NANOSLEEP, SIGSUSPEND, SIGWAITINFO and INTR have no
+     * lock that decides who wakes the thread, and force_ready, the sleep timer
+     * and the PLIC path may each try at once on different harts; ready()'s
+     * duplicate test runs under a per-hart lock, so two of them used to queue
+     * the thread twice, and its stale entry later dispatched it after it died.
+     * thread_note_wakeup closes it past the wait it ends, however that wait
+     * ended, and the thread opens the next one as it enters it
+     * (thread_wake_open), so a late waker that saw an earlier wait loses.
+     */
+    uint32_t wake_claimed;
+
+    /* The priority list this thread is queued on while READY (DISPATCH_LINK_*),
+     * under that run queue's lock; its priority may differ meanwhile.
+     */
+    uint8_t qprio;
+
+#ifdef CONFIG_DEBUG_DISPATCH_OWNER
+    /* Dispatch-owner tripwire (kernel/debug/dispatch-owner.c): 1 + the hart
+     * whose pc_curthread this is, or 0, claimed and released with a
+     * compare-and-swap by that hart; and the thread's last dispatch and last
+     * wakeup, for the report. Real threads only: a vthread soul ends before
+     * these fields.
+     */
+    struct {
+        uint32_t oncpu;
+        uint8_t run_cpu;
+        void *run_ra;
+        uint64_t run_t;
+        struct {
+            uint8_t cpu, state;
+            void *ra;
+            uint64_t t;
+        } wake[2]; /* the last two wakeups, newest first */
+    } dbg_owner;
+#endif
 } thread_t;
+
+/* Read and count thp->wake_seq. */
+static inline uint32_t thread_wake_seq(const thread_t *thp)
+{
+    return __atomic_load_n(&thp->wake_seq, __ATOMIC_ACQUIRE);
+}
+
+static inline void thread_note_wakeup(thread_t *thp)
+{
+    uint32_t ended = __atomic_fetch_add(&thp->wake_seq, 1, __ATOMIC_ACQ_REL);
+
+    /* However the wait ended, it is claimed now, and the next one stays closed
+     * until the thread opens it as it enters that wait (thread_wake_open). The
+     * count moves before the state leaves the old wait: a waker that reads the
+     * new count and the old state must not win the next wait and ready the
+     * thread a second time while this wake is still queueing it.
+     */
+    __atomic_store_n(&thp->wake_claimed, ended + 1, __ATOMIC_RELEASE);
+}
+
+/* The thread enters lockless wait wake_seq: let one waker claim it. Called by
+ * the thread itself before it publishes the wait state; the fence orders the
+ * open before that state store.
+ */
+static inline void thread_wake_open(thread_t *thp)
+{
+    __atomic_store_n(&thp->wake_claimed, thread_wake_seq(thp) - 1,
+                     __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+}
+
+/* Claim the right to end thp's lockless wait seq. While thp is in wait s,
+ * wake_claimed is s - 1 (free) or s (claimed); outside an opened wait it is
+ * neither, so a waker holding an older sequence, or one that read a newer count
+ * with a stale wait state, can neither win nor disturb a later claim. Exactly
+ * one waker of a wait gets true. The fence orders the caller's read of the wait
+ * state before the claim.
+ */
+static inline bool thread_wake_claim(thread_t *thp, uint32_t seq)
+{
+    uint32_t free_seq = seq - 1;
+
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    return __atomic_compare_exchange_n(&thp->wake_claimed, &free_seq, seq, 0,
+                                       __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
+}
 
 /* Map a dispatch-list LINK3_NODE pointer back to its enclosing thread_t. The
  * dispatch ready queue (kdispatch_t.ready[pri].head/tail) stores LINK3_NODE*
@@ -921,7 +1057,15 @@ typedef struct timer_entry {
      * it reports.
      */
     uint64_t overruns;
-    int8_t unused;
+
+    /* A thread's timeout timer (timeout_start) is armed for one wait of its
+     * thread: wait_seq is that wait's wake_seq, set with wait_bound when it is
+     * armed. Its fire is delivered after the wheel lock is dropped, by when the
+     * wait may have ended and the thread be in a later one; the fire then ends
+     * nothing. User timers leave wait_bound clear.
+     */
+    uint32_t wait_seq;
+    uint8_t wait_bound;
 
     /* Non-zero when this timer holds one notification_souls reservation for its
      * SIGEV_NOTIFICATION delivery (object_reserve at create, object_unreserve
@@ -963,13 +1107,13 @@ struct interrupt_level {
  * dispatch delivery correctly:
  *
  *   INTR_KIND_THREAD  — interrupt_attach_thread().  Trap delivers a
- *                       synthetic SIGEV_INTR to "thread" inline:
+ *                       wake to "thread" inline:
  *                       ready() if STATE_INTR, atomic_or otherwise.
  *
  *   INTR_KIND_EVENT   — __interrupt_attach_event().  Trap calls
  *                       sigevent_deliver_inline(&event, NULL) which
  *                       dispatches on event.sigev_notify
- *                       (SIGEV_NOTIFICATION/SIGEV_INTR/SIGEV_UNBLOCK/...).
+ *                       (SIGEV_NOTIFICATION/SIGEV_UNBLOCK/...).
  *
  *   INTR_KIND_HANDLER — internal-only attach with a function-
  *                       pointer callback that runs in trap context.
@@ -1097,7 +1241,11 @@ typedef struct session_entry {
     pid_t leader;
     pid_t pgrp;
     int fd;
-    unsigned reserved[10];
+    /* Owned by roottask, protected by its terminal binding lock. */
+    pid_t tty_server;
+    bool tty_changing;
+    bool tty_waiter;
+    struct session_entry *tty_next;
 } session_t;
 
 

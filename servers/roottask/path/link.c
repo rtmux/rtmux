@@ -105,7 +105,10 @@ static int path_stat(ioserv_context_t *ctp, io_stat_t *msg, void *ocb)
 {
     memset(&msg->o, 0x00, sizeof msg->o);
     msg->o.st_ino = (uintptr_t) ocb ^ (uintptr_t) &path_stat;
-    msg->o.st_dev = (ctp->info.srcnd << RTMUX_NODE_BITS) | path_devno;
+    path_object_t *obj = ocb;
+    dev_t devno = obj->hdr.type == OBJECT_SERVER ? obj->server.devno : 0;
+    msg->o.st_dev =
+        (ctp->info.srcnd << RTMUX_NODE_BITS) | (devno ? devno : path_devno);
     return IOSERV_PTR(ctp, &msg->o, sizeof msg->o);
 }
 
@@ -201,8 +204,18 @@ int server_create(path_object_t *obp, void *data)
     obp->server.chid = extra->chid;
     obp->server.handle = extra->handle;
     obp->server.file_type = extra->file_type;
+    if (obp->hdr.type == OBJECT_SERVER && obp->hdr.creator != ROOTTASK_PID)
+        return hwres_proc_devno("ioserv", &obp->server.devno, -1, 0);
     return EOK;
 }
+
+int server_done(path_object_t *obp)
+{
+    if (obp->server.devno)
+        hwres_proc_devno(NULL, &obp->server.devno, 0, 0);
+    return 1;
+}
+
 
 static int path_service_link(ioserv_context_t *ctp,
                              io_link_t *msg,

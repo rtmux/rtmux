@@ -13,6 +13,11 @@ struct kcall_args_process_create {
     pid_t parent_pid;
     void *lcp;
 
+    /* Non-zero when the child only carries the new image of an exec to its
+     * parent, so it is no process the parent has created.
+     */
+    int exec;
+
     /* Output: the new process's adp pointer (== prp->memory). Roottask caches
      * it in root_process_t.adp so it can pass adp to kernel extensions (pte_*,
      * etc.) without a fresh lookup. Heap is PTE_U=0; the kernel writes this
@@ -49,9 +54,9 @@ void rdecl process_unpin(process_t *prp)
         crash();
 }
 
-static void process_wait_unpinned(process_t *prp)
+static void process_wait_unpinned(process_t *prp, unsigned held)
 {
-    while (__atomic_load_n(&prp->pin_count, __ATOMIC_ACQUIRE) != 0)
+    while (__atomic_load_n(&prp->pin_count, __ATOMIC_ACQUIRE) != held)
         __asm__ __volatile__("" ::: "memory");
 }
 
@@ -142,7 +147,11 @@ void kext_process_create(void *data)
         return;
     }
 
-    if (parent->num_processes >= parent->rlimit_vals_soft[RLIMIT_NPROC]) {
+    /* The child of an exec is no new process for the caller, which gets the
+     * image and keeps its pid: it must not count against RLIMIT_NPROC.
+     */
+    if (!kap->exec &&
+        parent->num_processes >= parent->rlimit_vals_soft[RLIMIT_NPROC]) {
         process_unpin(parent);
         kcall_err(act, EAGAIN);
         return;
@@ -171,6 +180,8 @@ void kext_process_create(void *data)
      */
     kspinlock_init(&prp->vec_slock, LOCK_CLASS_PROCVEC, "process_t.vec_slock");
     prp->pin_count = 0;
+    prp->exec_thp = NULL;
+    prp->exec_shell = -1;
     prp->as_borrowers = NULL;
     prp->as_borrow_closed = false;
     if (rtmux_cap_table_init(&prp->endpoint_caps, prp->endpoint_cap_slots,
@@ -251,7 +262,7 @@ void kext_process_create(void *data)
 
     /* stop core file generation if RLIMIT_CORE is 0 */
     if (prp->rlimit_vals_soft[RLIMIT_CORE] == 0) {
-        prp->flags |= RTMUX_FLG_PROC_NOCOREDUMP;
+        PROC_FLG_SET(prp, RTMUX_FLG_PROC_NOCOREDUMP);
     }
 
     /* Inherit default dispatch queue from creating thread. */
@@ -495,7 +506,7 @@ void kext_process_destroy(void *data)
      * every in-flight process_rcu read section to exit before recycling memory.
      */
     rcu_sched_synchronize();
-    process_wait_unpinned(prp);
+    process_wait_unpinned(prp, 0);
 
     prp->pid = 0; /* clear so assertion below confirms removal */
 
@@ -562,8 +573,15 @@ void kext_process_destroy(void *data)
         crash();
     if (prp->alarm)
         crash();
-    if (prp->nfds)
+    if (prp->nfds) {
+        kprintf(
+            "process destroy: pid %d nfds %u fd slots %u channel/connection "
+            "slots %u\n",
+            pid, (unsigned) prp->nfds,
+            (unsigned) (prp->fdcons.nentries - prp->fdcons.nfree),
+            (unsigned) (prp->chancons.nentries - prp->chancons.nfree));
         crash();
+    }
     if (prp->chancons.vector) {
         vector_free(&prp->chancons);
     }
@@ -796,7 +814,7 @@ void kext_process_startup(void *data)
                                              user_boundary_addr)
                                  ? user_boundary_addr
                                  : VM_KERN_SPACE_BOUNDARY;
-        prp->flags &= ~RTMUX_FLG_PROC_LOADING;
+        PROC_FLG_CLR(prp, RTMUX_FLG_PROC_LOADING);
         prp->priv_caps = kap->priv_caps;
         prp->lcp = 0;
         _TRACE_PR_EMIT_CREATE_NAME(prp);
@@ -813,9 +831,9 @@ void kext_process_startup(void *data)
 
 /* kext_proc_set_spawn — publish a child's entry point and spawn flags.
  *
- * Writes initial_ip / initial_sp on the child's prp and applies the SPAWN_EXEC
- * / SPAWN_NOZOMBIE inheritance rules. The kernel heap is mapped PTE_U=0, so
- * U-mode roottask cannot touch prp->initial_ip / prp->flags directly.
+ * Writes initial_ip / initial_sp on the child's prp and applies the NOZOMBIE
+ * rule of the spawn flags. The kernel heap is mapped PTE_U=0, so U-mode
+ * roottask cannot touch prp->initial_ip / prp->flags directly.
  *
  * The (possibly-augmented) caller-side spawn flags are returned via
  * spawn_flags_out so the loader can keep its lcp->ctx.flags in sync.
@@ -849,19 +867,15 @@ void kext_proc_set_spawn(void *data)
     kspinlock_lock(&prp->vec_slock);
     flags = kap->spawn_flags_in;
 
-    /* SPAWN_EXEC inheritance: a re-exec'd binary keeps its NOZOMBIE
-     * disposition. proc-loader.c used to read prp->flags itself; now the read
-     * happens here, where prp's heap page is mapped.
-     */
-    if ((flags & SPAWN_EXEC) && (prp->flags & RTMUX_FLG_PROC_NOZOMBIE))
-        flags |= SPAWN_NOZOMBIE;
-
     /* By default kext_process_create leaves NOZOMBIE set (so a child dying
      * inside roottask never zombies); the loader clears it for normal spawns so
-     * the parent's waitpid() works.
+     * the parent's waitpid() works. An exec's child is only a shell that
+     * carries the new image to the caller and then dies; it stays NOZOMBIE, so
+     * that nothing ever waits for it. The caller's own disposition is its own
+     * flag, which the exec does not touch.
      */
-    if (!(flags & SPAWN_NOZOMBIE))
-        prp->flags &= ~RTMUX_FLG_PROC_NOZOMBIE;
+    if (!(flags & (SPAWN_NOZOMBIE | SPAWN_EXEC)))
+        PROC_FLG_CLR(prp, RTMUX_FLG_PROC_NOZOMBIE);
 
     prp->initial_ip = kap->initial_ip;
     prp->initial_sp = kap->initial_sp;
@@ -873,83 +887,398 @@ void kext_proc_set_spawn(void *data)
 }
 
 
+static void process_as_release_harts(process_t *prp);
+static unsigned process_clear_as_bindings(process_t *target);
+
+/* exec() replaces the image of the process that calls it, and keeps the
+ * process: its pid, descriptors, parent and children stay. Roottask loads the
+ * new image into a fresh child, the loader shell, and holds that child's loader
+ * thread in a reply; the calling thread is also held in a reply, to the spawn
+ * request. The swap then goes in three kernel steps, with roottask's own
+ * bookkeeping between:
+ *
+ *   BEGIN    kill every thread of the caller but the one that called exec;
+ *   (roottask drops what the old image owned and shuts its address space down
+ *    with the ordinary process_shutdown)
+ *   QUIESCE  take the shell's address space off every hart that still has it
+ *            loaded, so that it can change owners;
+ *   COMMIT   give that address space and its entry point to the caller, and
+ *            send the surviving thread to the new image's first instruction
+ *            when roottask replies to it.
+ *
+ * The surviving thread is the exec caller: it is already a thread of the
+ * process, and holding it through the swap keeps the thread vector from ever
+ * emptying, so the process is never reported as having lost its last thread.
+ * After the commit the shell has no threads left bar the loader thread, and
+ * roottask retires it as a process that died while loading.
+ */
 struct kcall_args_process_exec {
-    void *lcp;
-    int *prcvid;
-    int rcvid;
-    pid_t ppid;
+    unsigned op;
+    pid_t ppid;         /* BEGIN, COMMIT: the process that called exec */
+    int lrcvid;         /* BEGIN, COMMIT: rcvid of the shell's loader thread */
+    int crcvid;         /* BEGIN, COMMIT: rcvid of the exec caller */
+    pid_t shell_pid;    /* BEGIN, QUIESCE: the shell */
+    uint64_t priv_caps; /* COMMIT: authority the new image is started with */
 };
 
-/* kext_process_exec — prepare a process for exec().
+/* Resolve the four parties of an exec from the two rcvids roottask holds: the
+ * loader thread of the shell (reply-blocked in _PROC_SPAWN_EXEC) and the thread
+ * that called exec (reply-blocked in the spawn request). Leaves the rcvid RCU
+ * sections open, which the caller closes with lookup_rcvid_release() when it is
+ * going to wait, and pins nothing.
  *
- * Validates the reply-blocked child thread and its parent, claims the loader
- * context, inherits the parent's run masks, and destroys the parent's existing
- * threads so the new image can take over. Parameters:
- *   data : struct kcall_args_process_exec * (lcp, prcvid, rcvid, ppid)
+ * Returns 0, ENOERROR when lookup_rcvid already set the error, or an errno.
+ */
+static int exec_parties(thread_t *act,
+                        const struct kcall_args_process_exec *kap,
+                        thread_t **loaderp,
+                        thread_t **callerp,
+                        process_t **shellp,
+                        process_t **prpp)
+{
+    thread_t *lthp, *cthp;
+    connect_t *cop, *ccop;
+    process_t *shell, *prp;
+
+    if (!(cop = lookup_rcvid(NULL, kap->lrcvid, &lthp)))
+        return ENOERROR;
+    if (lthp->state != STATE_REPLY || lthp->blocked_on != cop)
+        return ESRCH;
+
+    shell = lthp->process;
+    prp = shell->parent;
+    if (!prp || prp == shell || prp->pid != kap->ppid ||
+        !(shell->flags & RTMUX_FLG_PROC_LOADING))
+        return ESRCH;
+
+    /* The caller's rcvid names a connection in roottask's channel table and a
+     * thread slot of the process that owns the connection.
+     */
+    ccop = vector_lookup(&act->process->chancons, MCINDEX(kap->crcvid));
+    if (!ccop || ccop->type != TYPE_CONNECTION || ccop->process != prp)
+        return ESRCH;
+    cthp = vector_lookup(&prp->threads, MTINDEX(kap->crcvid));
+    if (!cthp || cthp->process != prp || cthp->state != STATE_REPLY ||
+        cthp->blocked_on != ccop ||
+        (cthp->internal_flags & RTMUX_ITF_SPECRET_PENDING))
+        return ESRCH;
+
+    *loaderp = lthp;
+    *callerp = cthp;
+    *shellp = shell;
+    *prpp = prp;
+    return EOK;
+}
+
+/* The begin step fails, and roottask gives the exec up and answers the caller
+ * with the error. An earlier call of the step may have marked the process for
+ * this caller: clear the mark, or the caller carries on in a process where
+ * thread_create refuses every thread and any other thread's exec is refused.
+ * The mark is this exec's if it names the thread in the slot the caller's rcvid
+ * names and this exec's shell, which holds even when exec_parties no longer
+ * finds the exec whole (the loader shell gone); the mark of another exec is
+ * left alone. A caller that died took its mark with it (thread_destroy).
+ */
+static void exec_begin_fail(thread_t *act,
+                            const struct kcall_args_process_exec *kap,
+                            int rc)
+{
+    process_t *prp = lookup_pid_rcu(kap->ppid);
+
+    if (prp) {
+        kspinlock_lock(&prp->vec_slock);
+        if (prp->exec_thp && prp->exec_shell == kap->shell_pid &&
+            prp->exec_thp == vector_lookup(&prp->threads, MTINDEX(kap->crcvid)))
+            prp->exec_thp = NULL;
+        kspinlock_unlock(&prp->vec_slock);
+    }
+    rcu_read_unlock(&process_rcu);
+    if (rc != ENOERROR)
+        kcall_err(act, rc);
+}
+
+/* EXEC_BEGIN: take every thread of the process but the caller down.
+ *
+ * Returns EAGAIN while one is still on its way out; roottask calls again, so
+ * that a thread held by a message-delivery claim or a stack release gets to run
+ * on this hart. A process with an exec of another thread already under way or
+ * one that is exiting refuses. Any other answer ends the exec, and a failure
+ * clears what the step marked (exec_begin_fail).
+ */
+static void exec_begin(thread_t *act, const struct kcall_args_process_exec *kap)
+{
+    thread_t *lthp, *cthp;
+    process_t *shell, *prp;
+    unsigned nthreads;
+    pid_t shell_pid;
+    int rc;
+
+    rc = exec_parties(act, kap, &lthp, &cthp, &shell, &prp);
+    if (rc == EOK && inject_exec_begin_gone(prp, shell->pid))
+        rc = ESRCH; /* debug-inject: as if the shell had gone */
+    if (rc != EOK) {
+        exec_begin_fail(act, kap, rc);
+        return;
+    }
+
+    /* Pin both, then let go of the rcvid sections: killing a thread waits for
+     * every RCU reader, this call's own among them.
+     */
+    if ((rc = process_pin(prp)) != EOK) {
+        exec_begin_fail(act, kap, rc);
+        return;
+    }
+    if ((rc = tthread_pin(cthp)) != EOK) {
+        process_unpin(prp);
+        exec_begin_fail(act, kap, rc);
+        return;
+    }
+    kspinlock_lock(&prp->vec_slock);
+    if (prp->flags & (RTMUX_FLG_PROC_TERMING | RTMUX_FLG_PROC_DESTROYALL |
+                      RTMUX_FLG_PROC_LOADING | RTMUX_FLG_PROC_ZOMBIE)) {
+        rc = ESRCH;
+    } else if (prp->exec_thp && prp->exec_thp != cthp) {
+        rc = EBUSY;
+    } else {
+        prp->exec_thp = cthp;
+        prp->exec_shell = shell->pid;
+    }
+    kspinlock_unlock(&prp->vec_slock);
+    if (rc != EOK) {
+        tthread_unpin(cthp);
+        process_unpin(prp);
+        exec_begin_fail(act, kap, rc);
+        return;
+    }
+
+    /* Read before the release: the shell is not pinned. */
+    shell_pid = shell->pid;
+    lookup_rcvid_release();
+
+    exit_destroy_threads(prp, cthp);
+    if ((int) KSTATUS(act) == EOK) {
+        kspinlock_lock(&prp->vec_slock);
+        nthreads = prp->threads.nentries - prp->threads.nfree;
+        kspinlock_unlock(&prp->vec_slock);
+        if (nthreads != 1)
+            kcall_err(act, EAGAIN);
+    }
+    if (inject_exec_begin_again(prp, shell_pid))
+        kcall_err(act, EAGAIN);
+    tthread_unpin(cthp);
+    process_unpin(prp);
+}
+
+/* EXEC_QUIESCE: detach the shell's address space from every thread and hart.
+ *
+ * The loader thread ran in it, and any hart that ran the loader thread may
+ * still have its page tables loaded. Once this returns nothing runs in it, so
+ * the commit can hand it to the caller; a hart that loaded it later would walk
+ * page tables owned by a process it does not know.
+ */
+static void exec_quiesce(thread_t *act,
+                         const struct kcall_args_process_exec *kap)
+{
+    process_t *shell;
+    int status;
+
+    if (!(shell = lookup_pid_rcu(kap->shell_pid))) {
+        rcu_read_unlock(&process_rcu);
+        kcall_err(act, ESRCH);
+        return;
+    }
+    status = process_pin(shell);
+    rcu_read_unlock(&process_rcu);
+    if (status != EOK) {
+        kcall_err(act, status);
+        return;
+    }
+
+    if (!shell->memory || !(shell->flags & RTMUX_FLG_PROC_LOADING)) {
+        process_unpin(shell);
+        kcall_err(act, ESRCH);
+        return;
+    }
+    (void) process_clear_as_bindings(shell);
+    process_wait_unpinned(shell, 1);
+    process_as_release_harts(shell);
+    process_unpin(shell);
+    SETKSTATUS(act, EOK);
+}
+
+/* EXEC_COMMIT: the caller takes over the shell's address space and entry point.
+ *
+ * Everything is checked before anything changes, under both processes'
+ * vec_slock: the caller's own address space is already shut down, the caller is
+ * the one thread left and still waiting in its spawn reply, and neither process
+ * is exiting. The pointer moves in one critical section, so no reader sees the
+ * address space in both processes or in neither once the call is past the
+ * checks. The caller's thread then gets the new image's TLS, entry and stack,
+ * and its registers (FP included) are cleared; roottask's reply is what lets it
+ * run, in the new address space, at the entry point.
+ */
+static void exec_commit(thread_t *act,
+                        const struct kcall_args_process_exec *kap)
+{
+    thread_t *lthp, *cthp;
+    process_t *shell, *prp;
+    struct _cred_info info;
+    uintptr_t start_ip, start_sp;
+    int rc;
+
+    if ((rc = exec_parties(act, kap, &lthp, &cthp, &shell, &prp)) != EOK) {
+        if (rc != ENOERROR)
+            kcall_err(act, rc);
+        return;
+    }
+    if (kap->priv_caps & ~act->process->priv_caps) {
+        kcall_err(act, EPERM);
+        return;
+    }
+    if (cthp->internal_flags & RTMUX_ITF_MSG_DELIVERY) {
+        kcall_err(act, EAGAIN);
+        return;
+    }
+
+    /* The thread-local storage the loader thread built holds the identity of
+     * the loader thread: the shell's pid, its own thread id and the owner word
+     * its mutexes carry. It is about to be the caller's, so make it the
+     * caller's: written in the shell's address space, which this hart takes up
+     * for the copy, while the shell still owns it and before anything changes.
+     */
+    {
+        unsigned cpu = get_cpunum();
+        process_t *saved_as_prp = pcpu_array[cpu].pc_as_prp;
+        struct _thread_local_storage *tls = lthp->un.lcl.tls;
+        int ids[3] = {
+            (int) prp->pid,
+            (int) (cthp->tid + 1),
+            (int) SYNC_OWNER_BITS(prp->pid, cthp->tid),
+        };
+
+        /* __pid, __tid and __owner follow one another. */
+        _Static_assert(
+            offsetof(struct _thread_local_storage, __tid) ==
+                    offsetof(struct _thread_local_storage, __pid) +
+                        sizeof(int) &&
+                offsetof(struct _thread_local_storage, __owner) ==
+                    offsetof(struct _thread_local_storage, __tid) + sizeof(int),
+            "TLS identity fields are not contiguous");
+        vm_ops->as(shell, &pcpu_array[cpu].pc_as_prp);
+        rc = xfer_memcpy(&tls->__pid, ids, sizeof ids);
+        vm_ops->as(saved_as_prp, &pcpu_array[cpu].pc_as_prp);
+        if (rc != 0) {
+            kcall_err(act, EFAULT);
+            return;
+        }
+    }
+
+    /* Take a reference to the final credentials before moving the image.
+     * Allocation failure leaves the caller and shell owning their originals.
+     */
+    credential_t *new_cred = NULL;
+    kspinlock_lock(&cred_slock);
+    info = shell->cred->info;
+    info.suid = info.euid;
+    info.sgid = info.egid;
+    rc = cred_set(&new_cred, &info);
+    kspinlock_unlock(&cred_slock);
+    if (rc != EOK) {
+        kcall_err(act, ENOMEM);
+        return;
+    }
+
+    /* PROCVEC lock instances of two processes, in pointer order. */
+    process_child_locks_lock(prp, shell);
+    if (prp->exec_thp != cthp || prp->memory || !shell->memory ||
+        prp->num_active_threads != 1 ||
+        prp->threads.nentries - prp->threads.nfree != 1 ||
+        (prp->flags & (RTMUX_FLG_PROC_TERMING | RTMUX_FLG_PROC_DESTROYALL)) ||
+        !shell->initial_ip || !shell->as_borrow_closed) {
+        process_child_locks_unlock(prp, shell);
+        kspinlock_lock(&cred_slock);
+        cred_set(&new_cred, NULL);
+        kspinlock_unlock(&cred_slock);
+        kcall_err(act, ESRCH);
+        return;
+    }
+
+    start_ip = shell->initial_ip;
+    start_sp = shell->initial_sp;
+    prp->memory = shell->memory;
+    shell->memory = NULL;
+    prp->boundary_addr = WITHIN_BOUNDARY(start_sp, start_sp, user_boundary_addr)
+                             ? user_boundary_addr
+                             : VM_KERN_SPACE_BOUNDARY;
+    prp->initial_ip = start_ip;
+    prp->initial_sp = start_sp;
+    prp->base_addr = shell->base_addr;
+    prp->pls = NULL;
+    prp->canstub = NULL;
+    prp->priv_caps = kap->priv_caps;
+    prp->valid_thp = cthp;
+    prp->exec_thp = NULL;
+    process_child_locks_unlock(prp, shell);
+
+    kspinlock_lock(&cred_slock);
+    cred_dirty(prp);
+    cred_set(&prp->cred, NULL);
+    prp->cred = new_cred;
+    kspinlock_unlock(&cred_slock);
+
+    thread_as_reopen_borrowers(prp);
+    if (thread_set_as_prp(cthp, prp) != EOK)
+        crash();
+
+    /* The new main thread's thread-local storage, set up by the loader thread
+     * on its own entry. Its old stack, if the kernel allocated one, went with
+     * the old address space.
+     */
+    cthp->un.lcl.tls = lthp->un.lcl.tls;
+    cthp->un.lcl.stackaddr = lthp->un.lcl.stackaddr;
+    cthp->un.lcl.stacksize = lthp->un.lcl.stacksize;
+    atomic_clr(&cthp->flags, RTMUX_FLG_THR_ALLOCED_STACK);
+
+    /* Don't allow anything to change the IP after this point. */
+    atomic_or(&cthp->flags, RTMUX_FLG_THR_KCALL_ERR_SET);
+    SETKIP_FUNC(cthp, start_ip);
+    SETKSP(cthp, start_sp);
+    {
+        extern void mm_roottask_view_remove(process_t *);
+
+        /* The shell's page tables carry the view of roottask's image that its
+         * loader thread ran on; the new image must not see it.
+         */
+        mm_roottask_view_remove(prp);
+    }
+    cpu_thread_enter_umode(cthp);
+    SETKSTATUS(act, EOK);
+}
+
+/* kext_process_exec — one step of the image swap of an exec (see above).
+ * Parameters:
+ *   data : struct kcall_args_process_exec * (op and the arguments it uses)
  */
 void kext_process_exec(void *data)
 {
-    struct kcall_args_process_exec *kap = data;
+    const struct kcall_args_process_exec *kap = data;
     thread_t *act = get_active_thread(get_cpunum());
-    thread_t *thp;
-    connect_t *cop;
-    process_t *child, *prp;
 
-    /* Do the lookup through the child */
-    if (!(cop = lookup_rcvid(NULL, kap->rcvid, &thp)) ||
-        thp->state != STATE_REPLY || thp->blocked_on != cop) {
-        kcall_err(act, ESRCH);
-        return;
+    switch (kap->op) {
+    case EXEC_BEGIN:
+        exec_begin(act, kap);
+        break;
+    case EXEC_QUIESCE:
+        exec_quiesce(act, kap);
+        break;
+    case EXEC_COMMIT:
+        exec_commit(act, kap);
+        break;
+    default:
+        kcall_err(act, EINVAL);
+        break;
     }
-
-    child = thp->process;
-    prp = child->parent;
-
-    if (prp->pid != kap->ppid || !prp->valid_thp) {
-        kcall_err(act, ESRCH);
-        return;
-    }
-
-    /* Lock parent and child vec_slock (PROCVEC class, distinct instances) in
-     * pointer order to avoid deadlock.
-     */
-    if ((uintptr_t) prp < (uintptr_t) child) {
-        kspinlock_lock(&prp->vec_slock);
-        kspinlock_lock(&child->vec_slock);
-    } else {
-        kspinlock_lock(&child->vec_slock);
-        kspinlock_lock(&prp->vec_slock);
-    }
-
-    if (prp->lcp) {
-        /* make exec safe for multithreaded process */
-        kspinlock_unlock(&child->vec_slock);
-        kspinlock_unlock(&prp->vec_slock);
-        kcall_err(act, EBUSY);
-        return;
-    }
-
-    /* @@@ Need to copy pending signals! */
-    if (child->lcp != kap->lcp) {
-        /* Should never happen */
-        crash();
-    }
-    child->lcp = NULL;
-
-    thp->runmask = prp->valid_thp->runmask;
-    thp->default_runmask = prp->valid_thp->default_runmask;
-
-    /* No need to force ready this thread, since we're going to reply to it in
-     * proc_spawn
-     */
-    prp->lcp = kap->lcp;
-    *kap->prcvid = kap->rcvid;
-    thread_destroyall(prp->valid_thp);
-    kspinlock_unlock(&child->vec_slock);
-    kspinlock_unlock(&prp->vec_slock);
-    SETKSTATUS(act, 0);
 }
-
 
 void rdecl set_safe_as(unsigned cpu)
 {
@@ -1090,6 +1419,124 @@ static inline void pshut_record(uint64_t t0,
 }
 #endif
 
+/* process_as_release_harts — move every hart off prp's address space.
+ *
+ * The caller has already unbound every thread from the address space
+ * (process_clear_as_bindings), so no hart takes it up again; this waits out the
+ * ones that still have it loaded. Used before the address space is freed, and
+ * before an exec hands the loader's one to another process. Parameters:
+ *   prp : process whose address space is going away or changing hands
+ */
+static void process_as_release_harts(process_t *prp)
+{
+    /* Force every remote hart still pointing at the dying as to swap to the
+     * roottask as before we free prp->memory. Once the dying pgdir PA is
+     * returned to pa_alloc, the next caller (e.g. loader_elf mapping an ELF
+     * segment) will write module bytes over it, and a remote hart with a stale
+     * SATP will walk those bytes as PTEs on the very next TLB miss — infinite
+     * double-fault in trap.S trying to save registers to a now-unmapped kernel
+     * stack.
+     *
+     * IPI_TLB_SAFE's handler calls set_safe_as(cpu) on the remote hart,
+     * atomically updating both pcpu_array[i].pc_as_prp AND the SATP CSR via
+     * vm_ops->as(). We loop until no remote hart still matches: per remote,
+     * send IPI, wait for ipicmds[] bit to clear, then drain any in-flight
+     * message delivery so we don't pull the as out from under an xfer. The ack
+     * wait used to live in the U-mode wrapper, which worked when roottask
+     * shared the kernel address space (S-mode); a U-mode roottask cannot read
+     * ipicmds[] / get_active_thread() so the wait must happen here in the
+     * kernel body.
+     */
+#if CONFIG_PROCESSORS_MAX > 1
+    {
+        for (;;) {
+            bool matched = false;
+            uint64_t online = cpu_online_snapshot();
+            for (int _hi = 0; _hi < num_processors; ++_hi) {
+                unsigned i = (unsigned) _hi;
+                process_t *prp0;
+
+                if (!cpu_in_mask(online, i))
+                    continue;
+
+                /* On RISC-V 64-bit, pointer loads are atomic. */
+                prp0 = *((process_t *volatile *) &pcpu_array[i].pc_as_prp);
+                if (prp != prp0)
+                    continue;
+                matched = true;
+
+                if (i == get_cpunum()) {
+                    set_safe_as(i);
+                    continue;
+                }
+
+                SENDIPI(i, IPI_TLB_SAFE);
+                /* Wait for the remote hart to process the IPI.
+                 *
+                 * Briefly enable interrupts each iteration so a sibling's
+                 * IPI_CRASH can deliver and yank us into crash_quiesce_self()
+                 * instead of leaving us 100% stuck here. Same pattern as the
+                 * acquire_kernel BKL spin and intrevent_flush.
+                 *
+                 * Re-issue the IPI every ~1024 spins: a single initial SENDIPI
+                 * can be lost to a sip.SSIP-vs- sie.SSIE race (the remote
+                 * hart's SSIE briefly cleared during a transition, so the
+                 * SBI-injected SSIP never fires a trap). Re-sending
+                 * periodically converts that into a self-healing wait at
+                 * negligible cost: the remote hart processes whichever IPI
+                 * lands first, the rest are no-op TAS clears of 0.
+                 */
+                {
+                    unsigned spins = 0;
+                    while (atomic_load_explicit(&pcpu_array[i].pc_ipicmds,
+                                                memory_order_acquire) &
+                           IPI_TLB_SAFE) {
+                        MEM_BARRIER_RW();
+                        interrupt_enable();
+                        interrupt_disable();
+                        if ((++spins & 0x3ff) == 0) {
+                            /* Re-fire the SBI ECALL — atomic_or 0 is a no-op on
+                             * the command bits but send_ipi unconditionally
+                             * calls sbi_send_ipi, which sets fresh sip.SSIP on
+                             * the target.
+                             */
+                            SENDIPI(i, 0);
+                        }
+                    }
+                }
+
+                /* Drain in-flight message delivery on the remote hart so we
+                 * don't free the as under an xfer.
+                 *
+                 * RTMUX_ITF_MSG_DELIVERY is in "internal_flags", NOT "flags".
+                 * The two enum spaces overlap at bit 0
+                 * (RTMUX_ITF_MSG_DELIVERY=0x01 /
+                 * RTMUX_FLG_THR_KILLSELF=0x01), so testing the wrong field
+                 * would turn this into a "spin while the remote thread has
+                 * KILLSELF set" loop — which never terminates once the process
+                 * is exiting.
+                 */
+                for (;;) {
+                    thread_t *thp;
+                    MEM_BARRIER_RW();
+                    thp = get_active_thread(i);
+                    if (!thp || !(thp->internal_flags & RTMUX_ITF_MSG_DELIVERY))
+                        break;
+                    /* SIE-toggle to admit IPI_CRASH from a sibling. */
+                    interrupt_enable();
+                    interrupt_disable();
+                }
+            }
+            if (!matched)
+                break;
+        }
+    }
+#else
+    if (prp == pcpu_array[get_cpunum()].pc_as_prp)
+        set_safe_as(get_cpunum());
+#endif
+}
+
 /* kext_process_shutdown — tear down a process's address space.
  *
  * Releases every thread bound to prp's address space (prp's borrower list, then
@@ -1127,117 +1574,10 @@ void kext_process_shutdown(void *data)
          */
         if (prp->as_borrowers || !prp->as_borrow_closed)
             crash();
-        process_wait_unpinned(prp);
+        process_wait_unpinned(prp, 0);
         uint64_t pshut_t1 = pshut_ticks();
 
-        /* Force every remote hart still pointing at the dying as to swap to the
-         * roottask as before we free prp->memory. Once the dying pgdir PA is
-         * returned to pa_alloc, the next caller (e.g. loader_elf mapping an ELF
-         * segment) will write module bytes over it, and a remote hart with a
-         * stale SATP will walk those bytes as PTEs on the very next TLB miss —
-         * infinite double-fault in trap.S trying to save registers to a
-         * now-unmapped kernel stack.
-         *
-         * IPI_TLB_SAFE's handler calls set_safe_as(cpu) on the remote hart,
-         * atomically updating both pcpu_array[i].pc_as_prp AND the SATP CSR via
-         * vm_ops->as(). We loop until no remote hart still matches: per remote,
-         * send IPI, wait for ipicmds[] bit to clear, then drain any in-flight
-         * message delivery so we don't pull the as out from under an xfer. The
-         * ack wait used to live in the U-mode wrapper, which worked when
-         * roottask shared the kernel address space (S-mode); a U-mode roottask
-         * cannot read ipicmds[] / get_active_thread() so the wait must happen
-         * here in the kernel body.
-         */
-#if CONFIG_PROCESSORS_MAX > 1
-        {
-            for (;;) {
-                bool matched = false;
-                for (int _hi = 0; _hi < num_processors; ++_hi) {
-                    unsigned i = (unsigned) _hi;
-                    process_t *prp0;
-
-                    if (!cpu_online(i))
-                        continue;
-
-                    /* On RISC-V 64-bit, pointer loads are atomic. */
-                    prp0 = *((process_t *volatile *) &pcpu_array[i].pc_as_prp);
-                    if (prp != prp0)
-                        continue;
-                    matched = true;
-
-                    if (i == get_cpunum()) {
-                        set_safe_as(i);
-                        continue;
-                    }
-
-                    SENDIPI(i, IPI_TLB_SAFE);
-                    /* Wait for the remote hart to process the IPI.
-                     *
-                     * Briefly enable interrupts each iteration so a sibling's
-                     * IPI_CRASH can deliver and yank us into
-                     * crash_quiesce_self() instead of leaving us 100% stuck
-                     * here. Same pattern as the acquire_kernel BKL spin and
-                     * intrevent_flush.
-                     *
-                     * Re-issue the IPI every ~1024 spins: a single initial
-                     * SENDIPI can be lost to a sip.SSIP-vs- sie.SSIE race (the
-                     * remote hart's SSIE briefly cleared during a transition,
-                     * so the SBI-injected SSIP never fires a trap). Re-sending
-                     * periodically converts that into a self-healing wait at
-                     * negligible cost: the remote hart processes whichever IPI
-                     * lands first, the rest are no-op TAS clears of 0.
-                     */
-                    {
-                        unsigned spins = 0;
-                        while (atomic_load_explicit(&pcpu_array[i].pc_ipicmds,
-                                                    memory_order_acquire) &
-                               IPI_TLB_SAFE) {
-                            MEM_BARRIER_RW();
-                            interrupt_enable();
-                            interrupt_disable();
-                            if ((++spins & 0x3ff) == 0) {
-                                /* Re-fire the SBI ECALL — atomic_or 0 is a
-                                 * no-op on the command bits but send_ipi
-                                 * unconditionally calls sbi_send_ipi, which
-                                 * sets fresh sip.SSIP on the target.
-                                 */
-                                SENDIPI(i, 0);
-                            }
-                        }
-                    }
-
-                    /* Drain in-flight message delivery on the remote hart so we
-                     * don't free the as under an xfer.
-                     *
-                     * RTMUX_ITF_MSG_DELIVERY is in "internal_flags", NOT
-                     * "flags". The two enum spaces overlap at bit 0
-                     * (RTMUX_ITF_MSG_DELIVERY=0x01 /
-                     * RTMUX_FLG_THR_KILLSELF=0x01), so testing the wrong field
-                     * would turn this into a "spin while the remote thread has
-                     * KILLSELF set" loop — which never terminates once the
-                     * process is exiting.
-                     */
-                    for (;;) {
-                        thread_t *thp;
-                        MEM_BARRIER_RW();
-                        thp = get_active_thread(i);
-                        if (!thp ||
-                            !(thp->internal_flags & RTMUX_ITF_MSG_DELIVERY))
-                            break;
-                        /* SIE-toggle to admit IPI_CRASH from a sibling. */
-                        interrupt_enable();
-                        interrupt_disable();
-                    }
-                }
-                if (!matched)
-                    break;
-            }
-        }
-#else
-        if (prp == pcpu_array[get_cpunum()].pc_as_prp)
-            set_safe_as(get_cpunum());
-#endif
-
+        process_as_release_harts(prp);
         vm_ops->mdestroy(prp);
         pshut_record(pshut_t0, pshut_t1, pshut_ticks(), pshut_visited);
 
@@ -1438,27 +1778,72 @@ void kext_reparent(void *data)
 
 
 struct kext_signal_args {
-    channel_t *chp;
+    pid_t pid;
     int signo;
     pid_t sender_pid;
 };
 
-/* kext_signal_deliver — deliver a signal notification to a channel.
+/* kext_signal_deliver — deliver a signal notification to a process.
  *
  * Packs the signal number and sender pid into the 64-bit notification value
- * (signo in the low 32 bits, sender pid in the high 32) and delivers it.
+ * (signo in the low 32 bits, sender pid in the high 32) and delivers it on the
+ * process's system channel. The channel is found from the pid here, inside one
+ * connection-object RCU section with the delivery, and never from a pointer the
+ * caller read earlier: a process may destroy its own system channel at any
+ * moment, and the channel is freed only after that section's grace period.
  * Parameters:
- *   arg : struct kext_signal_args * (chp, signo, sender_pid)
+ *   arg : struct kext_signal_args * (pid, signo, sender_pid)
+ * Return value (kcall status): EOK when the notification was delivered or
+ * queued, ESRCH for no such process or a channel being destroyed, ENXIO when
+ * the process has no system channel or is ending, EAGAIN when no notification
+ * could be allocated. The caller keeps a signal it could not deliver.
  */
 void kext_signal_deliver(void *arg)
 {
     struct kext_signal_args *kap = arg;
+    thread_t *act = get_active_thread(get_cpunum());
     /* signo in the low 32 bits, sender pid in the high 32 (0 if none). */
     uint32_t spid = kap->sender_pid > 0 ? (uint32_t) kap->sender_pid : 0;
     uint64_t value = ((uint64_t) spid << 32) | (uint32_t) kap->signo;
+    process_t *prp;
+    channel_t *chp;
+    int status;
 
-    notification_deliver(kap->chp, 10, _NOTIFICATION_CODE_SIGNAL,
-                         (uintptr_t) value, 0, 0);
+    /* Terminal-generated signals carry the dispatcher's receive priority
+     * through to the process. Ordinary signals leave the receiver at base.
+     */
+    unsigned prio = RTMUX_PRIO_SERVER;
+    if (!spid && (kap->signo == SIGINT || kap->signo == SIGQUIT ||
+                  kap->signo == SIGTSTP)) {
+        unsigned limit = min(kopt.priv_prio - 1U, RTMUX_PRIO_DEVICE_IST);
+        if (limit)
+            prio = min((unsigned) act->priority, limit) |
+                   _NOTIFICATION_PRIO_SIGNAL;
+    }
+
+    if (!(prp = lookup_pid_rcu(kap->pid))) {
+        rcu_read_unlock(&process_rcu);
+        kcall_err(act, ESRCH);
+        return;
+    }
+    status = process_pin(prp);
+    rcu_read_unlock(&process_rcu);
+    if (status != EOK) {
+        kcall_err(act, status);
+        return;
+    }
+
+    rcu_read_lock(&connobj_rcu);
+    chp = __atomic_load_n(&prp->sys_chp, __ATOMIC_ACQUIRE);
+    status = chp ? notification_deliver(chp, prio, _NOTIFICATION_CODE_SIGNAL,
+                                        (uintptr_t) value, 0, 0)
+                 : ENXIO;
+    rcu_read_unlock(&connobj_rcu);
+    process_unpin(prp);
+    if (status == EOK)
+        SETKSTATUS(act, EOK);
+    else
+        kcall_err(act, status);
 }
 
 

@@ -7,6 +7,7 @@
 
 #include <unistd.h>
 #include <core/globals.h>
+#include "reply-client.h"
 #include <user-slice.h>
 /* #define   MSG_XFER_CHUNK_SIZE     1024 */
 
@@ -28,8 +29,7 @@ static int msg_current_take(thread_t *act, struct kcall_args_msg_current *kap);
  */
 int kdecl ksys_msg_current(thread_t *act, struct kcall_args_msg_current *kap)
 {
-    thread_t *prior_client = act->client;
-    bool ended = false;
+    bool ended;
     int r;
 
     /* Disown act's prior client, if any, and end the loan it lent, whatever
@@ -38,12 +38,9 @@ int kdecl ksys_msg_current(thread_t *act, struct kcall_args_msg_current *kap)
      * observes server=0 with act->client cleared; eventually consistent for its
      * own ksys_msg_current.
      */
-    if (prior_client) {
-        prior_client->args.ms.server = 0;
-        ended = thread_client_departed(act, prior_client);
-        if (ended)
-            CRITICAL_CLEAR(act);
-    }
+    ended = thread_disown_client(act);
+    if (ended)
+        CRITICAL_CLEAR(act);
 
     r = kap->rcvid == 0 ? EOK : msg_current_take(act, kap);
 
@@ -53,8 +50,11 @@ int kdecl ksys_msg_current(thread_t *act, struct kcall_args_msg_current *kap)
      * only while act still runs, so publish the status first.
      */
     if (ended && (kap->rcvid == 0 || r != EOK)) {
-        if (r != EOK && r != ENOERROR) {
-            kcall_err(act, r);
+        if (r != ENOERROR) {
+            if (r == EOK)
+                SETKSTATUS(act, EOK);
+            else
+                kcall_err(act, r);
             r = ENOERROR;
         }
         thread_prio_update(act);
@@ -70,6 +70,7 @@ int kdecl ksys_msg_current(thread_t *act, struct kcall_args_msg_current *kap)
 static int msg_current_take(thread_t *act, struct kcall_args_msg_current *kap)
 {
     connect_t *cop;
+    channel_t *chp;
     thread_t *thp;
     int do_pi = 0;
     kdispatch_t *new_dpp = NULL;
@@ -95,19 +96,9 @@ static int msg_current_take(thread_t *act, struct kcall_args_msg_current *kap)
         return ESRCH;
     }
 
-    if (thp->blocked_on != cop) {
-        connect_t *cop1 = cop;
-        cop = thp->blocked_on;
-
-        /* NULL: client's blocked_on was cleared by a concurrent teardown
-         * (force_ready on a client whose process is exiting) -> ESRCH, matching
-         * the locked recheck and the guard in fastmsg.c. Without it the deref
-         * below load-faults near NULL.
-         */
-        if (!cop || (cop->flags & COF_VCONNECT) == 0 ||
-            cop->un.lcl.cop != cop1) {
-            return ESRCH;
-        }
+    cop = reply_client_connection(thp, cop);
+    if (!cop) {
+        return ESRCH;
     }
 
     /* Take cop->lock (LOCK_CLASS_CONNECT) on the *final* cop — i.e.
@@ -130,25 +121,47 @@ static int msg_current_take(thread_t *act, struct kcall_args_msg_current *kap)
         return ESRCH;
     }
 
-    if (thp->args.ms.server != 0) {
-        thp->args.ms.server->client = 0;
+    /* A channel destroy clears cop->channel under neither lock; the rcvid
+     * lookup's RCU-sched section keeps a channel read here allocated.
+     */
+    chp = __atomic_load_n(&cop->channel, __ATOMIC_ACQUIRE);
+    if (!chp) {
+        kspinlock_unlock(&cop->lock);
+        return ESRCH;
     }
+
+    rcu_read_lock(&tthread_rcu);
+    thread_t *previous =
+        __atomic_load_n(&thp->args.ms.server, __ATOMIC_ACQUIRE);
+    bool settle_previous =
+        previous && previous != act && thread_client_departed(previous, thp);
 
     thp->args.ms.server = act;
     act->client = thp;
+
+    /* act says the request under this rcvid is its to answer, whatever it
+     * received the rcvid for before.
+     */
+    msg_request_received(act, thp, cop);
 
     /* Snapshot the PI inputs while holding cop->lock; cop->lock must be dropped
      * before adjust_priority() because adjust_priority acquires sched_slock
      * (SCHED), and SCHED < CONNECT — the rank rule forbids holding cop->lock
      * while taking sched_slock.
      */
-    if ((cop->channel->flags & RTMUX_FLG_CHF_FIXED_PRIORITY) == 0) {
+    if ((chp->flags & RTMUX_FLG_CHF_FIXED_PRIORITY) == 0) {
         do_pi = 1;
         new_dpp = thp->dpp;
     }
 
     kspinlock_unlock(&cop->lock);
 
+    if (settle_previous)
+        thread_prio_defer_settle(previous);
+    rcu_read_unlock(&tthread_rcu);
+
+    /* The loan update can displace act before the dispatcher writes status. */
+    SETKSTATUS(act, EOK);
     /* PI propagation — outside cop->lock to honor SCHED-vs-CONNECT rank. */
     if (do_pi) {
         /* act now serves thp, which lends its priority until act replies. Read
@@ -158,130 +171,49 @@ static int msg_current_take(thread_t *act, struct kcall_args_msg_current *kap)
          * here would stay.
          */
         CRITICAL_INHERIT(act, thp);
-        thread_lend_msg(act, __atomic_load_n(&thp->priority, __ATOMIC_ACQUIRE),
-                        true);
-        (void) thread_end_orphan_loan(act);
-        (void) thread_prio_update_dpp(act, new_dpp, 1);
+        reply_client_priority(act, thp, new_dpp);
     } else {
         /* A fixed-priority channel lends nothing. Drop the loan an earlier
          * client left, or a REPLY propagation from thp would relend it.
          */
-        thread_lend_msg(act, 0, false);
-        thread_prio_update(act);
+        reply_client_priority(act, NULL, NULL);
     }
 
     return EOK;
 }
 
-/* Forget what a restarted msg_readv or msg_writev kept for its next entry: the
- * vector it checked, the cursor of its copy and its restart link.
+/* A msg_readv or msg_writev that is over drops the restart link of its copy.
+ * The checked vector and the cursor need no dropping here: they do not outlive
+ * the next kernel entry that is not a restart (xfer_begin_call).
  */
 static void msg_resume_drop(thread_t *act)
 {
-    act->iovchk_iov = NULL;
-    act->xcur.armed = false;
     act->restart = NULL;
-}
-
-/* Check the caller's own iov array against its boundary, at most
- * XFER_IOV_CHECK_STEP entries per kernel entry. parts is at least 1.
- *
- * msg_readv and msg_writev check their iov first of all, before they look up or
- * claim the client, so there is nothing to undo when the call restarts and
- * every return path of the call has consumed or dropped the saved prefix. The
- * checked prefix is kept on the thread (iovchk_*), keyed by the array and its
- * length, so a restart resumes where this entry stopped instead of rereading
- * from entry 0. Each entry that has more to check ends with KCALL_RESTART,
- * which returns through kernel_exit and lets a higher-priority thread run, so
- * no kernel entry spends more than one step on the check. The trap handler
- * drops the saved prefix at the next kernel call that is not msg_readv or
- * msg_writev, so this thread cannot edit the entries it has already passed
- * between the restart and the resume. Another thread sharing the array can, so
- * the transfer paths still check the entries they use. Entries are read through
- * xfer_memchk, which recovers from a fault.
- *
- * Returns 0 (all entries are inside the boundary), EFAULT (one is not, a page
- * of the array is unmapped, the array itself is not in the caller's space, or
- * it is longer than XFER_IOV_LIMIT), or XFER_CALL_RESTART (the call was
- * restarted: return ENOERROR).
- */
-static int xfer_iov_check(thread_t *act, const iov_t *iov, int parts)
-{
-    uint32_t done = 0, n;
-    int bad;
-    const iov_t *saved = act->iovchk_iov;
-    uintptr_t base = (uintptr_t) iov, last;
-
-    act->iovchk_iov = NULL;
-    if (parts > XFER_IOV_LIMIT)
-        return EFAULT;
-
-    /* The array itself must lie in the caller's space: a fault-recovering read
-     * still succeeds on a mapped kernel address.
-     */
-    last = base + (size_t) parts * sizeof(iov_t) - 1;
-    if (!base || base > last ||
-        !WITHIN_BOUNDARY(base, last, act->process->boundary_addr))
-        return EFAULT;
-    if (saved == iov && act->iovchk_parts == parts)
-        done = act->iovchk_done;
-
-    /* Checked already by an earlier entry of this call, which restarted in the
-     * copy: the copy reads and checks every entry it uses, so do not walk the
-     * vector again on each restart.
-     */
-    if (done == (uint32_t) parts) {
-        act->iovchk_iov = iov;
-        return 0;
-    }
-
-    n = (uint32_t) parts - done;
-    if (n > XFER_IOV_CHECK_STEP)
-        n = XFER_IOV_CHECK_STEP;
-    SET_XFER_HANDLER(&xfer_src_handlers);
-    bad = xfer_memchk(act->process->boundary_addr, iov + done, n);
-    SET_XFER_HANDLER(0);
-    if (bad)
-        return EFAULT;
-    done += n;
-    act->iovchk_iov = iov;
-    act->iovchk_parts = parts;
-    act->iovchk_done = done;
-    if (done == (uint32_t) parts)
-        return 0;
-    KCALL_RESTART(act);
-    return XFER_CALL_RESTART;
 }
 
 /* Check the caller's own iov (the destination of msg_readv, the source of
  * msg_writev) against the process boundary, before the client is claimed.
  *
- * It runs first, ahead of lookup_rcvid(), so that a saved xfer_iov_check()
- * prefix is always consumed or dropped by the call it belongs to, and so that
- * every later path, the remote one included, sees a vector that is in range and
- * no longer than XFER_IOV_LIMIT. A negative count is one flat buffer, which has
- * no entries to read; an entry is read only by xfer_iov_check(), which recovers
- * from a fault and does at most one step of the work per kernel entry.
+ * It runs first, ahead of lookup_rcvid(), so that there is nothing to undo when
+ * the check restarts the call, and so that every later path, the remote one
+ * included, sees a vector that is in range and no longer than XFER_IOV_LIMIT. A
+ * negative count is one flat buffer, which has no entries to read; the entries
+ * of an array are read by xfer_iov_sum(), a step per kernel entry.
  *
- * Returns 0, an errno, or XFER_CALL_RESTART when the call was restarted.
+ * Returns 0, EFAULT, or XFER_CALL_RESTART when the call was restarted.
  */
 static int msg_iov_check(thread_t *act, const iov_t *iov, int parts)
 {
     if (parts < 0) {
         uintptr_t base = (uintptr_t) iov, last;
 
-        act->iovchk_iov = NULL;
         last = base + PARTS_TO_LEN(parts) - 1;
         if (base > last ||
             !WITHIN_BOUNDARY(base, last, act->process->boundary_addr))
             return EFAULT;
         return 0;
     }
-    if (parts == 0) {
-        act->iovchk_iov = NULL;
-        return 0;
-    }
-    return xfer_iov_check(act, iov, parts);
+    return xfer_iov_sum(act, iov, parts, XFER_SCAN_ARRAY, NULL);
 }
 
 /* Read a (partially received) message from a client into the server's iov
@@ -302,15 +234,7 @@ static int msg_readv_body(thread_t *act, struct kcall_args_msg_readv *kap)
     thread_t *thp;
     int xferstat, status;
     unsigned slen;
-    int do_force_ready = 0;
-    unsigned thp_status = 0;
-
-    /* channel_slock synchronizes the state recheck and the MSG_DELIVERY claim
-     * with ksys_msg_replyv / ksys_msg_error / force_ready. The short-msg path
-     * reads thp->args.msbuff.buff under the same MSG_DELIVERY claim discipline
-     * as the long-msg path, so a concurrent replyv cannot overwrite the source
-     * buffer mid-read.
-     */
+    channel_t *chp;
 
     status = msg_iov_check(act, kap->rmsg, kap->rparts);
     if (status)
@@ -321,70 +245,22 @@ static int msg_readv_body(thread_t *act, struct kcall_args_msg_readv *kap)
         return ENOERROR;
     }
 
-    /* Make sure thread is replied blocked on a channel owned by this process.
-     */
-    if (thp->state != STATE_REPLY && thp->state != STATE_NET_REPLY) {
-        return ESRCH;
-    }
-
-    /* Verify that the message has been fully received, and that the receiving
-     * thread has completed any specialret() processing that needs to be done.
-     */
-    if (thp->internal_flags & RTMUX_ITF_SPECRET_PENDING) {
-        return ESRCH;
-    }
-
-    if (thp->blocked_on != cop) {
-        connect_t *cop1 = cop;
-        cop = thp->blocked_on;
-
-        /* NULL: client's blocked_on was cleared by a concurrent teardown
-         * (force_ready on a client whose process is exiting) -> ESRCH, matching
-         * the locked recheck and the guard in fastmsg.c. Without it the deref
-         * below load-faults near NULL.
-         */
-        if (!cop || (cop->flags & COF_VCONNECT) == 0 ||
-            cop->un.lcl.cop != cop1) {
-            return ESRCH;
-        }
-    }
-
     act->args.ms.rmsg = kap->rmsg;
     act->args.ms.rparts = kap->rparts;
 
-    /* State-recheck + MSG_DELIVERY claim under channel_slock. Synchronizes with
-     * ksys_msg_replyv (which takes the same slock for its own claim). If state
-     * has flipped or another path already holds the claim, drop and bail with
-     * ESRCH.
+    /* Claim the client under its channel's lock, against ksys_msg_replyv,
+     * ksys_msg_error and force_ready. ESRCH if it is no longer reply-blocked on
+     * this connection or the connection was detached; a claim another path
+     * holds (a reply, an error, another follow-up copy) is waited out by
+     * restarting the call.
      */
-    kspinlock_lock(&cop->channel->lock);
-    if (thp->state != STATE_REPLY && thp->state != STATE_NET_REPLY) {
-        kspinlock_unlock(&cop->channel->lock);
-        return ESRCH;
-    }
-    if (thp->internal_flags & RTMUX_ITF_SPECRET_PENDING) {
-        kspinlock_unlock(&cop->channel->lock);
-        return ESRCH;
-    }
-    if (thp->internal_flags & RTMUX_ITF_MSG_DELIVERY) {
-        /* Another path holds the claim — replyv, error, or another concurrent
-         * readv/writev/readiov. Bail; user can retry.
-         */
-        kspinlock_unlock(&cop->channel->lock);
-        return ESRCH;
-    }
-    if (thp->blocked_on != cop) {
-        /* The sender re-blocked on a different cop after the lock acquire. */
-        kspinlock_unlock(&cop->channel->lock);
-        return ESRCH;
-    }
-    ITF_SET(thp, RTMUX_ITF_MSG_DELIVERY);
-    kspinlock_unlock(&cop->channel->lock);
+    status = reply_client_claim(act, &cop, thp, &chp);
+    if (status)
+        return status == EAGAIN ? XFER_CALL_RESTART : status;
 
-    /* From here on thp is claimed: replyv / error / force_ready will defer (the
-     * MSG_DELIVERY check inside their own channel_slock windows skips claimed
-     * threads). The xfer can proceed without holding channel_slock.
-     */
+    inject_claim_held();
+
+    /* thp is claimed: the copy runs without the channel lock. */
 
     if (thp->flags & RTMUX_FLG_THR_BUFF_MSG) {
         unsigned dlen;
@@ -458,22 +334,7 @@ static int msg_readv_body(thread_t *act, struct kcall_args_msg_readv *kap)
 #endif
     }
 
-    /* Claim release + MSG_FORCE_RDY drain under channel_slock. If another path
-     * queued a force_ready against thp during this xfer (it sees MSG_DELIVERY
-     * set and defers via the MSG_FORCE_RDY bit), honor it now — outside
-     * channel_slock since force_ready takes sched_slock and SCHED < CHANNEL
-     * would be a rank inversion.
-     */
-    kspinlock_lock(&cop->channel->lock);
-    ITF_CLR(thp, RTMUX_ITF_MSG_DELIVERY);
-    if (thp->internal_flags & RTMUX_ITF_MSG_FORCE_RDY) {
-        ITF_CLR(thp, RTMUX_ITF_MSG_FORCE_RDY);
-        thp_status = (unsigned) KSTATUS(thp);
-        do_force_ready = 1;
-    }
-    kspinlock_unlock(&cop->channel->lock);
-    if (do_force_ready)
-        force_ready(thp, thp_status);
+    msg_claim_release(chp, thp);
 
     /* The copy used up its step and arranged for the call to run again; the
      * client is given up above, so another thread can reply to it, and is
@@ -509,13 +370,7 @@ static int msg_writev_body(thread_t *act, struct kcall_args_msg_writev *kap)
     connect_t *cop;
     thread_t *thp;
     int xferstat, status;
-    int do_force_ready = 0;
-    unsigned thp_status = 0;
-
-    /* Same canonical IPC-kcall shape as ksys_msg_readv: channel_slock for
-     * state-recheck + MSG_DELIVERY claim + claim-release, xfer outside the
-     * slock, force_ready outside (sched_slock-internal, SCHED < CHANNEL rank).
-     */
+    channel_t *chp;
 
     status = msg_iov_check(act, kap->smsg, kap->sparts);
     if (status)
@@ -526,59 +381,13 @@ static int msg_writev_body(thread_t *act, struct kcall_args_msg_writev *kap)
         return ENOERROR;
     }
 
-    /* Make sure thread is replied blocked on a channel owned by this process.
+    /* Claim the client as ksys_msg_readv does. thp->args.ri.{rmsg,rparts}, the
+     * destination below, stay as they are while thp is reply-blocked and
+     * claimed; a reply would overwrite them.
      */
-    if (thp->state != STATE_REPLY && thp->state != STATE_NET_REPLY) {
-        return ESRCH;
-    }
-
-    /* Verify that the message has been fully received, and that the receiving
-     * thread has completed any specialret() processing that needs to be done.
-     */
-    if (thp->internal_flags & RTMUX_ITF_SPECRET_PENDING) {
-        return ESRCH;
-    }
-
-    if (thp->blocked_on != cop) {
-        connect_t *cop1 = cop;
-        cop = thp->blocked_on;
-
-        /* NULL: client's blocked_on was cleared by a concurrent teardown
-         * (force_ready on a client whose process is exiting) -> ESRCH, matching
-         * the locked recheck and the guard in fastmsg.c. Without it the deref
-         * below load-faults near NULL.
-         */
-        if (!cop || (cop->flags & COF_VCONNECT) == 0 ||
-            cop->un.lcl.cop != cop1) {
-            return ESRCH;
-        }
-    }
-
-    /* State-recheck + MSG_DELIVERY claim under channel_slock. Synchronizes with
-     * ksys_msg_replyv / ksys_msg_error. If state has flipped or another path
-     * holds the claim, drop and bail with ESRCH. thp->args.ri.{rmsg,rparts}
-     * (the xfer destination below) stay stable while thp is STATE_REPLY +
-     * claimed; replyv would overwrite them otherwise.
-     */
-    kspinlock_lock(&cop->channel->lock);
-    if (thp->state != STATE_REPLY && thp->state != STATE_NET_REPLY) {
-        kspinlock_unlock(&cop->channel->lock);
-        return ESRCH;
-    }
-    if (thp->internal_flags & RTMUX_ITF_SPECRET_PENDING) {
-        kspinlock_unlock(&cop->channel->lock);
-        return ESRCH;
-    }
-    if (thp->internal_flags & RTMUX_ITF_MSG_DELIVERY) {
-        kspinlock_unlock(&cop->channel->lock);
-        return ESRCH;
-    }
-    if (thp->blocked_on != cop) {
-        kspinlock_unlock(&cop->channel->lock);
-        return ESRCH;
-    }
-    ITF_SET(thp, RTMUX_ITF_MSG_DELIVERY);
-    kspinlock_unlock(&cop->channel->lock);
+    status = reply_client_claim(act, &cop, thp, &chp);
+    if (status)
+        return status == EAGAIN ? XFER_CALL_RESTART : status;
 
 #if CONFIG_PROCESSORS_MAX > 1 && defined(CONFIG_SMP_MSGOPT)
     /* Per-act in-flight markers (single-writer-by-CPU). */
@@ -594,17 +403,7 @@ static int msg_writev_body(thread_t *act, struct kcall_args_msg_writev *kap)
     IPC_BLK(act);
 #endif
 
-    /* Claim release + MSG_FORCE_RDY drain under channel_slock. */
-    kspinlock_lock(&cop->channel->lock);
-    ITF_CLR(thp, RTMUX_ITF_MSG_DELIVERY);
-    if (thp->internal_flags & RTMUX_ITF_MSG_FORCE_RDY) {
-        ITF_CLR(thp, RTMUX_ITF_MSG_FORCE_RDY);
-        thp_status = (unsigned) KSTATUS(thp);
-        do_force_ready = 1;
-    }
-    kspinlock_unlock(&cop->channel->lock);
-    if (do_force_ready)
-        force_ready(thp, thp_status);
+    msg_claim_release(chp, thp);
 
     /* The copy used up its step and arranged for the call to run again; the
      * client is given up above, so another thread can reply to it, and is
@@ -674,16 +473,9 @@ int kdecl ksys_msg_readiov(thread_t *act, struct kcall_args_msg_readiov *kap)
     connect_t *cop;
     thread_t *thp;
     int n;
-    int do_force_ready = 0;
-    unsigned thp_status = 0;
+    channel_t *chp;
     iov_t *src_msg;
     int src_parts;
-
-    /* Same canonical IPC-kcall shape as ksys_msg_readv / ksys_msg_writev:
-     * channel_slock recheck + MSG_DELIVERY claim, viov_to_piov walk outside the
-     * slock with the claim held to gate replyv, claim release + MSG_FORCE_RDY
-     * drain, force_ready outside (sched_slock-internal, SCHED < CHANNEL rank).
-     */
 
     if (kap->parts <= 0)
         return EINVAL;
@@ -693,57 +485,23 @@ int kdecl ksys_msg_readiov(thread_t *act, struct kcall_args_msg_readiov *kap)
         return ENOERROR;
     }
 
-    /* Make sure thread is replied blocked on a channel owned by this process.
+    /* Claim the client as ksys_msg_readv does, keeping the channel lock for the
+     * checks below. The claim comes first: a reply that holds it rewrites
+     * thp->flags and thp->args.ms.* outside the lock, so they are only read
+     * once the claim is ours. It then keeps a reply off thp while viov_to_piov
+     * walks them.
      */
-    if (thp->state != STATE_REPLY && thp->state != STATE_NET_REPLY) {
+    cop = reply_client_lock(cop, thp, &chp);
+    if (!cop)
         return ESRCH;
+    if (!reply_client_claim_locked(thp)) {
+        kspinlock_unlock(&chp->lock);
+        KCALL_RESTART(act); /* held for one kernel entry of its owner */
+        return ENOERROR;
     }
 
-    /* Verify that the message has been fully received, and that the receiving
-     * thread has completed any specialret() processing that needs to be done.
-     */
-    if (thp->internal_flags & RTMUX_ITF_SPECRET_PENDING) {
-        return ESRCH;
-    }
-
-    if (thp->blocked_on != cop) {
-        connect_t *cop1 = cop;
-        cop = thp->blocked_on;
-
-        /* NULL: client's blocked_on was cleared by a concurrent teardown
-         * (force_ready on a client whose process is exiting) -> ESRCH, matching
-         * the locked recheck and the guard in fastmsg.c. Without it the deref
-         * below load-faults near NULL.
-         */
-        if (!cop || (cop->flags & COF_VCONNECT) == 0 ||
-            cop->un.lcl.cop != cop1) {
-            return ESRCH;
-        }
-    }
-
-    /* State-recheck + MSG_DELIVERY claim under channel_slock. The claim keeps
-     * replyv off thp during the thp->args.ms.* walk via viov_to_piov.
-     */
-    kspinlock_lock(&cop->channel->lock);
-    if (thp->state != STATE_REPLY && thp->state != STATE_NET_REPLY) {
-        kspinlock_unlock(&cop->channel->lock);
-        return ESRCH;
-    }
-    if (thp->internal_flags & RTMUX_ITF_SPECRET_PENDING) {
-        kspinlock_unlock(&cop->channel->lock);
-        return ESRCH;
-    }
-    if (thp->internal_flags & RTMUX_ITF_MSG_DELIVERY) {
-        kspinlock_unlock(&cop->channel->lock);
-        return ESRCH;
-    }
-    if (thp->blocked_on != cop) {
-        kspinlock_unlock(&cop->channel->lock);
-        return ESRCH;
-    }
-
-    /* Snapshot the iov-source fields under the slock — once it is released
-     * MSG_DELIVERY alone keeps them stable, but the cached values suffice.
+    /* Snapshot the iov-source fields: the claim keeps them stable, and the
+     * cached values are all the walk needs.
      */
     if (kap->flags & RTMUX_READIOV_REPLY) {
         src_msg = thp->args.ms.rmsg;
@@ -754,7 +512,8 @@ int kdecl ksys_msg_readiov(thread_t *act, struct kcall_args_msg_readiov *kap)
          * client iov to describe.
          */
         if (thp->flags & RTMUX_FLG_THR_BUFF_MSG) {
-            kspinlock_unlock(&cop->channel->lock);
+            kspinlock_unlock(&chp->lock);
+            msg_claim_release(chp, thp);
             return EINVAL;
         }
         src_msg = thp->args.ms.smsg;
@@ -767,27 +526,17 @@ int kdecl ksys_msg_readiov(thread_t *act, struct kcall_args_msg_readiov *kap)
      * page table, so it works from any process.
      */
     if (src_parts > 0 && thp->process != act->process) {
-        kspinlock_unlock(&cop->channel->lock);
+        kspinlock_unlock(&chp->lock);
+        msg_claim_release(chp, thp);
         return ENOTSUP;
     }
-    ITF_SET(thp, RTMUX_ITF_MSG_DELIVERY);
-    kspinlock_unlock(&cop->channel->lock);
+    kspinlock_unlock(&chp->lock);
 
     n = viov_to_piov(act, thp->process, kap->iov, kap->parts, src_msg,
                      src_parts, kap->offset,
                      (kap->flags & RTMUX_READIOV_CURSOR) ? kap->cursor : NULL);
 
-    /* Claim release + MSG_FORCE_RDY drain under channel_slock. */
-    kspinlock_lock(&cop->channel->lock);
-    ITF_CLR(thp, RTMUX_ITF_MSG_DELIVERY);
-    if (thp->internal_flags & RTMUX_ITF_MSG_FORCE_RDY) {
-        ITF_CLR(thp, RTMUX_ITF_MSG_FORCE_RDY);
-        thp_status = (unsigned) KSTATUS(thp);
-        do_force_ready = 1;
-    }
-    kspinlock_unlock(&cop->channel->lock);
-    if (do_force_ready)
-        force_ready(thp, thp_status);
+    msg_claim_release(chp, thp);
 
     if (n < 0) {
         return -n;
@@ -812,15 +561,16 @@ int kdecl ksys_msg_info(thread_t *act, struct kcall_args_msg_info *kap)
 {
     thread_t *thp;
     connect_t *cop;
+    channel_t *chp;
     struct _msg_info info;
     struct user_slice info_slice;
 
     /* Pure reader. WR_VERIFY_PTR / WR_PROBE_INT happen before the
      * non-preemptible section so caller-page faulting can use the regular fault
-     * path. channel_slock then protects the get_rcvinfo snapshot against a
-     * concurrent ksys_msg_replyv / ksys_msg_error mutating thp's args/state
-     * mid-read. No MSG_DELIVERY claim is needed — this is not a long xfer that
-     * would block the writer; the slock window covers the entire snapshot.
+     * path. The channel lock then protects the get_rcvinfo snapshot against a
+     * ksys_msg_replyv / ksys_msg_error that starts meanwhile. The snapshot
+     * takes no MSG_DELIVERY claim of its own: it is not a long transfer, and
+     * the lock is held for all of it.
      */
     if (user_slice_init(act, kap->info, sizeof(*kap->info), sizeof(*kap->info),
                         USER_SLICE_WR, &info_slice))
@@ -830,49 +580,17 @@ int kdecl ksys_msg_info(thread_t *act, struct kcall_args_msg_info *kap)
         return ENOERROR;
     }
 
-    /* Make sure thread is replied blocked on a channel owned by this process.
+    /* The snapshot is taken under the channel lock, which holds a reply, an
+     * error and force_ready off thp for its length. One that has already
+     * claimed thp is changing those fields outside the lock: wait it out.
      */
-    if (thp->state != STATE_REPLY && thp->state != STATE_NET_REPLY) {
+    cop = reply_client_lock(cop, thp, &chp);
+    if (!cop)
         return ESRCH;
-    }
-
-    /* Verify that the message has been fully received, and that the receiving
-     * thread has completed any specialret() processing that needs to be done.
-     */
-    if (thp->internal_flags & RTMUX_ITF_SPECRET_PENDING) {
-        return ESRCH;
-    }
-
-    if (thp->blocked_on != cop) {
-        connect_t *cop1 = cop;
-        cop = thp->blocked_on;
-
-        /* NULL: client's blocked_on was cleared by a concurrent teardown
-         * (force_ready on a client whose process is exiting) -> ESRCH, matching
-         * the locked recheck and the guard in fastmsg.c. Without it the deref
-         * below load-faults near NULL.
-         */
-        if (!cop || (cop->flags & COF_VCONNECT) == 0 ||
-            cop->un.lcl.cop != cop1) {
-            return ESRCH;
-        }
-    }
-
-    /* channel_slock recheck + full get_rcvinfo snapshot under the lock.
-     * Releases on every error path.
-     */
-    kspinlock_lock(&cop->channel->lock);
-    if (thp->state != STATE_REPLY && thp->state != STATE_NET_REPLY) {
-        kspinlock_unlock(&cop->channel->lock);
-        return ESRCH;
-    }
-    if (thp->internal_flags & RTMUX_ITF_SPECRET_PENDING) {
-        kspinlock_unlock(&cop->channel->lock);
-        return ESRCH;
-    }
-    if (thp->blocked_on != cop) {
-        kspinlock_unlock(&cop->channel->lock);
-        return ESRCH;
+    if (thp->internal_flags & RTMUX_ITF_MSG_DELIVERY) {
+        kspinlock_unlock(&chp->lock);
+        KCALL_RESTART(act);
+        return ENOERROR;
     }
 
     /* Zeroed before the fill because the copy-out below moves the whole struct,
@@ -884,10 +602,10 @@ int kdecl ksys_msg_info(thread_t *act, struct kcall_args_msg_info *kap)
      */
     memset(&info, 0, sizeof info);
     get_rcvinfo(thp, -1, cop, &info);
-    kspinlock_unlock(&cop->channel->lock);
+    kspinlock_unlock(&chp->lock);
 
     /* Snapshot under the lock, copy out after it. get_rcvinfo used to write
-     * straight into the caller's buffer while cop->channel->lock was held: a
+     * straight into the caller's buffer while the channel lock was held: a
      * sibling thread unmapping the page in that window faulted S-mode with the
      * lock held and no handler armed, so the channel lock was never released
      * and every later MsgSend/Receive on it spun forever. The entry probe

@@ -19,6 +19,7 @@ int io_unblock(ioserv_context_t *ctp,
 int io_console_write(ioserv_context_t *ctp,
                      io_write_t *msg,
                      struct slog_ocb *ocb);
+void logger_stat(struct stat *st, const struct slogdev *dev, bool console);
 int io_msg(ioserv_context_t *ctp, io_msg_t *msg, struct slog_ocb *ocb);
 
 #endif

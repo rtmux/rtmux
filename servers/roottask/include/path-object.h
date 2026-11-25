@@ -19,6 +19,7 @@ enum {
     OBJECT_MEM_SHARED,
     OBJECT_MEM_FD,
     OBJECT_MEM_TYPED,
+    OBJECT_POISONED = 0xa5, /* CONFIG_DEBUG_INJECT: set on a freed object */
 };
 
 /* Max size of a path object is limited by the uint8_t we use to keep track of
@@ -45,6 +46,7 @@ struct server_object {
     int chid;
     unsigned handle;
     unsigned file_type;
+    dev_t devno;
 };
 
 struct symlink_object {
@@ -88,6 +90,21 @@ struct mm_object {
         struct pa_restrict *restriction;
         off64_t size;
         unsigned flags;
+
+        /* A growth whose existing mappings are not made yet (as/resize.c,
+         * MM_MEM_GROW_PENDING): the lowest size it grew from (under the object
+         * lock), the next object queued, and the queue entries not drained.
+         */
+        off64_t grow_from;
+        union path_object *grow_next;
+        unsigned grow_busy; /* queue entries not yet drained, grow_mutex */
+
+        /* Bumped by every vm_grow (every write calls it), every size change and
+         * every mapping a process other than roottask gets, under the object
+         * lock: a failed write undoes its growth only if nothing could have put
+         * bytes in the grown range since (vm_undo_grow).
+         */
+        uint64_t wgen; /* 64 bits: it does not wrap while a write is out */
     } mm;
 };
 

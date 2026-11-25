@@ -11,9 +11,11 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <sched.h>
+#include <semaphore.h>
 #include <signal.h>
 #include <spawn.h>
 #include <stdatomic.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,6 +26,7 @@
 #include <sys/resource.h>
 #include <sys/rtmux-core.h>
 #include <sys/siginfo.h>
+#include <sys/states.h>
 #include <sys/wait.h>
 
 #include "test.h"
@@ -209,6 +212,48 @@ static void test_posix_clock_edges(void)
     rc = clock_getres((clockid_t) -1, &ts);
     snprintf(detail, sizeof detail, "rc=%d errno=%d", rc, errno);
     check(rc == -1 && errno == EINVAL, "clock_getres(invalid clock)", detail);
+
+    /* CPU-time clocks have a resolution too: the two fixed IDs, the ID
+     * pthread_getcpuclockid makes, and not an ID naming a thread that does not
+     * exist. It is at most one tick, the resolution of CLOCK_MONOTONIC.
+     */
+    {
+        static const clockid_t fixed[] = {CLOCK_THREAD_CPUTIME_ID,
+                                          CLOCK_PROCESS_CPUTIME_ID};
+        struct timespec tick = {0, 0}, cpu = {-1, -1};
+        clockid_t self = 0;
+        int ok = clock_getres(CLOCK_MONOTONIC, &tick) == 0;
+
+        for (size_t i = 0; i < sizeof fixed / sizeof fixed[0]; i++) {
+            cpu = (struct timespec) {-1, -1};
+            errno = 0;
+            rc = clock_getres(fixed[i], &cpu);
+            ok = ok && rc == 0 && cpu.tv_sec == 0 && cpu.tv_nsec > 0 &&
+                 cpu.tv_nsec <= tick.tv_nsec &&
+                 clock_getres(fixed[i], NULL) == 0;
+        }
+        snprintf(detail, sizeof detail, "rc=%d errno=%d res=%lld.%09lld", rc,
+                 errno, (long long) cpu.tv_sec, (long long) cpu.tv_nsec);
+        check(ok, "clock_getres(CPU-time clocks)", detail);
+
+        cpu = (struct timespec) {-1, -1};
+        errno = 0;
+        rc = pthread_getcpuclockid(pthread_self(), &self);
+        if (rc == 0)
+            rc = clock_getres(self, &cpu);
+        snprintf(detail, sizeof detail, "rc=%d errno=%d res=%lld.%09lld", rc,
+                 errno, (long long) cpu.tv_sec, (long long) cpu.tv_nsec);
+        check(rc == 0 && cpu.tv_sec == 0 && cpu.tv_nsec > 0 &&
+                  cpu.tv_nsec <= tick.tv_nsec,
+              "clock_getres(pthread_getcpuclockid clock)", detail);
+
+        /* The same ID with a thread number no thread of this process has. */
+        errno = 0;
+        rc = clock_getres(self | 0xffffU, &cpu) == -1 ? errno : 0;
+        snprintf(detail, sizeof detail, "id=%llx rc=%d",
+                 (unsigned long long) (self | 0xffffU), rc);
+        check(rc == EINVAL, "clock_getres(CPU clock of no thread)", detail);
+    }
 
     ts.tv_sec = 0;
     ts.tv_nsec = 1000000000L;
@@ -413,6 +458,18 @@ static void test_timer_create_signal_event_rejected(void)
              strerror(errno));
     check(tid == -1 && errno == EINVAL,
           "__timer_create(SIGEV_SIGNAL_THREAD) -> EINVAL", detail);
+
+    /* SIGEV_INTR — not an event kind the kernel delivers */
+    memset(&ev, 0, sizeof ev);
+    ev.sigev_notify = SIGEV_INTR;
+    errno = 0;
+    tid = __timer_create(CLOCK_REALTIME, &ev);
+    snprintf(detail, sizeof detail, "tid=%d errno=%d (%s)", tid, errno,
+             strerror(errno));
+    check(tid == -1 && errno == EINVAL, "__timer_create(SIGEV_INTR) -> EINVAL",
+          detail);
+    if (tid != -1)
+        (void) destroy_timer(tid);
 }
 
 static void test_timer_create_notification_bad_coid(void)
@@ -643,6 +700,7 @@ static int64_t median_i64(int64_t *v, int n)
  * repeats a whole round if a stall hit enough pairs to move the median.
  */
 #define CPUTIME_MAX_PAIRS 50
+#define CPUTIME_SPIN_NS 10000 /* one short burst */
 
 struct cputime_round {
     int64_t med_err, med_dcpu, med_dbusy;
@@ -666,7 +724,8 @@ static void cputime_round_run(struct cputime_round *r, int pairs, int per_block)
     for (int i = 0; i < pairs; i++) {
         uint64_t cb = 0, sb = 0, cw = 0;
         uint64_t cc = cputime_block(per_block, 0, &cb, &cw);
-        uint64_t sc = cputime_block(per_block, 10000, &sb, &r->spin_wall);
+        uint64_t sc =
+            cputime_block(per_block, CPUTIME_SPIN_NS, &sb, &r->spin_wall);
         int64_t dcpu = (int64_t) sc - (int64_t) cc;
         int64_t dbusy = (int64_t) sb - (int64_t) cb;
 
@@ -688,6 +747,55 @@ static void cputime_round_run(struct cputime_round *r, int pairs, int per_block)
     r->med_dbusy = median_i64(dbusy_v, pairs);
 }
 
+/* Read the first line of a /sys entry into buf; false if it cannot be read. */
+static bool sys_file_line(const char *file, char *buf, size_t len)
+{
+    FILE *f = fopen(file, "r");
+    bool got;
+
+    if (!f)
+        return false;
+    got = fgets(buf, (int) len, f) != NULL;
+    fclose(f);
+    return got;
+}
+
+/* Whether the kernel command line carries rtmux.icount=<shift> as a token. */
+static bool cmdline_has_icount(void)
+{
+    static const char key[] = "rtmux.icount=";
+    const size_t klen = sizeof key - 1;
+    char buf[512];
+    const char *p = buf;
+
+    if (!sys_file_line("/sys/cmdline", buf, sizeof buf))
+        return false;
+    while ((p = strstr(p, key)) != NULL) {
+        if ((p == buf || p[-1] == ' ') && p[klen] >= '0' && p[klen] <= '9')
+            return true;
+        p += klen;
+    }
+    return false;
+}
+
+/* Whether this guest's clock can resolve a 10 us burst against a 1% bound.
+ * Hardware can, and so can QEMU on its instruction-count clock (EMU_ICOUNT,
+ * which puts rtmux.icount= on the command line). QEMU on the host's wall clock
+ * cannot: a CLOCK_MONOTONIC read there costs more than the burst, so a spin
+ * burst and a control burst both bracket one read and differ by ~0 ns, and host
+ * scheduling moves the unbracketed kernel time of a pair by milliseconds. A
+ * board that cannot be read or is unknown counts as QEMU's.
+ */
+static bool cputime_clock_resolves_bursts(void)
+{
+    char board[128];
+
+    if (cmdline_has_icount())
+        return true;
+    return sys_file_line("/sys/board", board, sizeof board) &&
+           strcmp(board, "unknown\n") != 0 && !strstr(board, "riscv-virtio");
+}
+
 static void test_cputime_short_bursts(void)
 {
     enum { PAIRS = 50, PER_BLOCK = 100, ROUNDS = 3 }; /* 10^4 spin bursts */
@@ -696,6 +804,7 @@ static void test_cputime_short_bursts(void)
     uint64_t res_ns = 0, tol = 0, c0, c1;
     int64_t noise = 0, limit = 0;
     int round, ok_pair = 0, ok_totals = 0, ok_dcpu = 0, ok_ctl = 0;
+    bool resolves = cputime_clock_resolves_bursts();
     char detail[400], hist[100] = "";
 
     if (clock_getres(CLOCK_MONOTONIC, &res) == 0)
@@ -771,7 +880,7 @@ static void test_cputime_short_bursts(void)
          * timer and wake work is charged) and never more than the wall time.
          */
         ok_ctl = r.ctl_cpu != 0 && r.ctl_cpu <= r.ctl_wall + 2 * res_ns;
-        if (ok_pair && ok_totals && ok_dcpu && ok_ctl)
+        if ((!resolves || (ok_pair && ok_dcpu)) && ok_totals && ok_ctl)
             break;
     }
     if (round > ROUNDS)
@@ -786,17 +895,34 @@ static void test_cputime_short_bursts(void)
              (unsigned long long) r.dbusy_total, (unsigned long long) res_ns,
              hist, (long long) r.err_min, (long long) r.err_q1,
              (long long) r.err_q3, (long long) r.err_max);
-    check(ok_pair, "cputime_short_bursts", detail);
+    if (resolves) {
+        check(ok_pair, "cputime_short_bursts", detail);
+    } else {
+        /* The per-pair checks need a clock that resolves the burst (see
+         * cputime_clock_resolves_bursts); the totals and the fixed cost below
+         * hold on any clock.
+         */
+        snprintf(
+            detail, sizeof detail,
+            "QEMU wall clock cannot resolve a 10 us burst (median per-pair "
+            "bracketed delta %lld ns for a nominal %d ns); run with "
+            "EMU_ICOUNT=1 or on hardware",
+            (long long) r.med_dbusy, PER_BLOCK * CPUTIME_SPIN_NS);
+        test_skip("cputime_short_bursts", detail);
+        test_skip("cputime_short_bursts dcpu_total sanity", detail);
+    }
     snprintf(detail, sizeof detail,
              "attempt %d: spin cpu=%llu busy=%llu wall=%llu", round,
              (unsigned long long) r.spin_cpu, (unsigned long long) r.spin_busy,
              (unsigned long long) r.spin_wall);
     check(ok_totals, "cputime_short_bursts totals bound busy <= cpu <= wall",
           detail);
-    snprintf(detail, sizeof detail,
-             "attempt %d: median dcpu=%lld dbusy=%lld", round,
-             (long long) r.med_dcpu, (long long) r.med_dbusy);
-    check(ok_dcpu, "cputime_short_bursts dcpu_total sanity", detail);
+    if (resolves) {
+        snprintf(detail, sizeof detail,
+                 "attempt %d: median dcpu=%lld dbusy=%lld", round,
+                 (long long) r.med_dcpu, (long long) r.med_dbusy);
+        check(ok_dcpu, "cputime_short_bursts dcpu_total sanity", detail);
+    }
     snprintf(detail, sizeof detail,
              "attempt %d: control cpu=%llu wall=%llu (fixed cost billed, "
              "sleeps not)", round, (unsigned long long) r.ctl_cpu,
@@ -862,6 +988,179 @@ static void test_cputime_two_threads(void)
           "cputime two threads: no more CPU than wall x harts", detail);
 }
 
+/* CLOCK_PROCESS_CPUTIME_ID never goes backwards: not for one thread reading it
+ * in a loop (the tick bills the reader between two reads), and not across
+ * threads (a read may not return less than a value another thread's read had
+ * already returned before this one began). Each reader takes the largest value
+ * published so far, reads the clock, and then publishes its own; a value below
+ * the one taken first is a step backwards.
+ */
+struct cpumono {
+    atomic_uint_fast64_t *seen;
+    atomic_int *stop;
+    uint64_t reads, back, worst;
+    clockid_t clk;
+};
+
+static void cpumono_step(struct cpumono *m)
+{
+    uint64_t floor = atomic_load(m->seen);
+    uint64_t v = clock_ns(m->clk);
+
+    if (v < floor) {
+        m->back++;
+        if (floor - v > m->worst)
+            m->worst = floor - v;
+    }
+    while (v > floor && !atomic_compare_exchange_weak(m->seen, &floor, v))
+        ;
+    m->reads++;
+}
+
+static void *cpumono_reader(void *arg)
+{
+    while (!atomic_load_explicit(((struct cpumono *) arg)->stop,
+                                 memory_order_relaxed))
+        cpumono_step(arg);
+    return NULL;
+}
+
+static void test_cputime_process_monotonic(void)
+{
+    atomic_uint_fast64_t seen;
+    atomic_int stop;
+    struct cpumono solo = {&seen, &stop, 0, 0, 0, CLOCK_PROCESS_CPUTIME_ID};
+    struct cpumono pair[2] = {
+        {&seen, &stop, 0, 0, 0, CLOCK_PROCESS_CPUTIME_ID},
+        {&seen, &stop, 0, 0, 0, CLOCK_PROCESS_CPUTIME_ID}};
+    pthread_t t[2];
+    uint64_t end, prev, back = 0, worst = 0, reads = 0;
+    int made = 0;
+    char detail[200];
+
+    /* One reader, 300 ms: every read at least the one before. */
+    prev = clock_ns(CLOCK_PROCESS_CPUTIME_ID);
+    end = clock_ns(CLOCK_MONOTONIC) + 300000000ULL;
+    do {
+        for (int i = 0; i < 64; i++) {
+            uint64_t v = clock_ns(CLOCK_PROCESS_CPUTIME_ID);
+
+            if (v < prev) {
+                back++;
+                if (prev - v > worst)
+                    worst = prev - v;
+            }
+            prev = v;
+            reads++;
+        }
+    } while (clock_ns(CLOCK_MONOTONIC) < end);
+    snprintf(detail, sizeof detail, "reads=%llu backwards=%llu worst=%llu ns",
+             (unsigned long long) reads, (unsigned long long) back,
+             (unsigned long long) worst);
+    check(prev != 0 && back == 0,
+          "cputime: process clock is monotonic for one reader", detail);
+
+    /* Three readers (two threads and this one), 300 ms. */
+    atomic_init(&seen, 0);
+    atomic_init(&stop, 0);
+    for (; made < 2; made++)
+        if (pthread_create(&t[made], NULL, cpumono_reader, &pair[made]) != 0)
+            break;
+    end = clock_ns(CLOCK_MONOTONIC) + 300000000ULL;
+    do {
+        for (int i = 0; i < 64; i++)
+            cpumono_step(&solo);
+    } while (clock_ns(CLOCK_MONOTONIC) < end);
+    atomic_store(&stop, 1);
+    for (int i = 0; i < made; i++)
+        (void) pthread_join(t[i], NULL);
+    back = solo.back + pair[0].back + pair[1].back;
+    reads = solo.reads + pair[0].reads + pair[1].reads;
+    worst = solo.worst;
+    for (int i = 0; i < 2; i++)
+        if (pair[i].worst > worst)
+            worst = pair[i].worst;
+    snprintf(detail, sizeof detail,
+             "threads=%d reads=%llu backwards=%llu worst=%llu ns", made,
+             (unsigned long long) reads, (unsigned long long) back,
+             (unsigned long long) worst);
+    check(made == 2 && pair[0].reads > 0 && pair[1].reads > 0 && back == 0,
+          "cputime: process clock is monotonic across threads", detail);
+}
+
+/* A thread's CPU clock read from other harts never goes backwards. The target
+ * and its siblings yield in a tight loop, so many reads land while the
+ * target's hart is switching away from it. The switch bills the target before
+ * the hart stops showing it as current, and a read in between used to add the
+ * next stretch to it as well, then lose it once the switch completed.
+ */
+enum { REMOTE_READERS = 2, REMOTE_MAX_YIELDERS = 8 };
+
+static void *cpuremote_yielder(void *arg)
+{
+    atomic_int *stop = arg;
+    const struct timespec nap = {.tv_sec = 0, .tv_nsec = 50000};
+
+    for (unsigned i = 0; !atomic_load_explicit(stop, memory_order_relaxed);
+         i++) {
+        if ((i & 255) == 255)
+            (void) nanosleep(&nap, NULL);
+        else
+            (void) sched_yield();
+    }
+    return NULL;
+}
+
+static void test_cputime_remote_monotonic(void)
+{
+    atomic_uint_fast64_t seen;
+    atomic_int stop, ystop; /* readers stop first: the target must outlive them */
+    pthread_t yt[REMOTE_MAX_YIELDERS], rt[REMOTE_READERS];
+    struct cpumono r[REMOTE_READERS];
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    int ny = 0, nr = 0, want;
+    uint64_t reads = 0, back = 0, worst = 0;
+    clockid_t cid;
+    char detail[200];
+
+    want = ncpu < 2 ? 2
+                    : (ncpu > REMOTE_MAX_YIELDERS ? REMOTE_MAX_YIELDERS
+                                                  : (int) ncpu);
+    atomic_init(&seen, 0);
+    atomic_init(&stop, 0);
+    atomic_init(&ystop, 0);
+    for (; ny < want; ny++)
+        if (pthread_create(&yt[ny], NULL, cpuremote_yielder, &ystop) != 0)
+            break;
+    if (ny > 0 && pthread_getcpuclockid(yt[0], &cid) == 0) {
+        for (; nr < REMOTE_READERS; nr++) {
+            r[nr] = (struct cpumono) {&seen, &stop, 0, 0, 0, cid};
+            if (pthread_create(&rt[nr], NULL, cpumono_reader, &r[nr]) != 0)
+                break;
+        }
+    }
+    sleep_ms(300);
+    atomic_store(&stop, 1);
+    for (int i = 0; i < nr; i++) {
+        (void) pthread_join(rt[i], NULL);
+        reads += r[i].reads;
+        back += r[i].back;
+        if (r[i].worst > worst)
+            worst = r[i].worst;
+    }
+    atomic_store(&ystop, 1);
+    for (int i = 0; i < ny; i++)
+        (void) pthread_join(yt[i], NULL);
+    snprintf(
+        detail, sizeof detail,
+        "yielders=%d/%d readers=%d reads=%llu backwards=%llu worst=%llu ns", ny,
+        want, nr, (unsigned long long) reads, (unsigned long long) back,
+        (unsigned long long) worst);
+    check(ny == want && nr == REMOTE_READERS && reads > 0 && back == 0,
+          "cputime: another thread's clock is monotonic across its switches",
+          detail);
+}
+
 /* Q63(c): yield/steal stress for the Q25 switch-time billing. N = 2 x harts
  * threads call sched_yield() in a tight loop (every 256th round they nap 50 us
  * instead, so a hart can go idle and steal another's just-yielded thread) for
@@ -872,13 +1171,23 @@ static void test_cputime_two_threads(void)
  * <= wall x harts (never over-billed) and, since busy harts bill nearly
  * everything, >= half of it (nothing lost); the process clock must equal the
  * sum of its threads' clocks. At CPUS=1 it is a plain yield-rotation check.
+ *
+ * Both exact checks compare clocks over the same interval. A worker's own
+ * check runs from its first clock read, not from its creation, so thread
+ * start-up the host stalled is not counted against its lifetime. The workers
+ * then park before they exit, and the sum takes each parked worker's clock
+ * from this thread once the worker has blocked: a worker's exit path used to
+ * be billed to the process
+ * after the worker's last read of its own clock, and a host stall in eight
+ * exit paths made the process clock tens of milliseconds larger than the sum.
  */
 enum { STRESS_MAX_THREADS = 16 };
 
 struct yield_stress {
     uint64_t end;
-    uint64_t cpu;
-    uint64_t life; /* wall time from the worker's first line to its last */
+    uint64_t cpu;  /* CPU time from the worker's first clock read to its last */
+    uint64_t life; /* wall time over at least that stretch */
+    sem_t *parked, *release;
 };
 
 static void *yield_stress_worker(void *arg)
@@ -886,6 +1195,7 @@ static void *yield_stress_worker(void *arg)
     struct yield_stress *ys = arg;
     const struct timespec nap = {.tv_sec = 0, .tv_nsec = 50000};
     uint64_t t0 = clock_ns(CLOCK_MONOTONIC);
+    uint64_t c0 = clock_ns(CLOCK_THREAD_CPUTIME_ID);
 
     for (unsigned i = 0; clock_ns(CLOCK_MONOTONIC) < ys->end; i++) {
         if ((i & 255) == 255)
@@ -893,48 +1203,100 @@ static void *yield_stress_worker(void *arg)
         else
             (void) sched_yield();
     }
-    ys->cpu = clock_ns(CLOCK_THREAD_CPUTIME_ID);
+    ys->cpu = clock_ns(CLOCK_THREAD_CPUTIME_ID) - c0;
     ys->life = clock_ns(CLOCK_MONOTONIC) - t0;
+    (void) sem_post(ys->parked);
+    (void) sem_wait(ys->release);
     return NULL;
+}
+
+/* Sum the CPU clocks of n parked workers once each is blocked on its
+ * semaphore, so none still accrues. Returns false when one does not block or
+ * its clock cannot be read.
+ */
+static bool yield_stress_parked_sum(const pthread_t *tid, int n, uint64_t *sum)
+{
+    uint64_t total = 0;
+
+    for (int i = 0; i < n; i++) {
+        clockid_t cid;
+        struct timespec ts;
+
+        if (!wait_thread_state(tid[i], STATE_SEM) ||
+            pthread_getcpuclockid(tid[i], &cid) != 0 ||
+            clock_gettime(cid, &ts) != 0)
+            return false;
+        total += ts_ns(&ts);
+    }
+    *sum = total;
+    return true;
 }
 
 static void test_cputime_yield_steal_stress(void)
 {
-    struct yield_stress ys[STRESS_MAX_THREADS] = {{0, 0, 0}};
+    struct yield_stress ys[STRESS_MAX_THREADS] = {{0}};
     pthread_t tid[STRESS_MAX_THREADS];
     long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
     int n, created = 0;
-    uint64_t p0, p1, m0, m1, w0, w1, sum = 0, pd, wall, tol;
+    sem_t parked, release;
+    int nparked = 0;
+    bool settled = false;
+    uint64_t p0, p1, m0, m1, w0, w1, sum = 0, run = 0, pd, wall, tol;
     uint64_t over = 0;
-    char detail[200];
+    char detail[240];
 
     if (ncpu < 1)
         ncpu = 1;
     n = ncpu * 2 > STRESS_MAX_THREADS ? STRESS_MAX_THREADS : (int) ncpu * 2;
     if (n < 2)
         n = 2;
+    if (sem_init(&parked, 0, 0) != 0 || sem_init(&release, 0, 0) != 0) {
+        test_fail("cputime yield stress: threads created", "sem_init failed");
+        return;
+    }
 
     p0 = clock_ns(CLOCK_PROCESS_CPUTIME_ID);
     m0 = clock_ns(CLOCK_THREAD_CPUTIME_ID);
     w0 = clock_ns(CLOCK_MONOTONIC);
     for (int i = 0; i < n; i++) {
         ys[i].end = w0 + 400000000ULL;
+        ys[i].parked = &parked;
+        ys[i].release = &release;
         if (pthread_create(&tid[i], NULL, yield_stress_worker, &ys[i]) != 0)
             break;
         created++;
     }
-    for (int i = 0; i < created; i++)
-        pthread_join(tid[i], NULL);
+    /* The workers run for 400 ms; give up well past that rather than hang. */
+    {
+        struct timespec dl;
+
+        clock_gettime(CLOCK_REALTIME, &dl);
+        dl.tv_sec += 30;
+        while (nparked < created) {
+            if (sem_timedwait(&parked, &dl) == 0)
+                nparked++;
+            else if (errno != EINTR)
+                break;
+        }
+    }
     w1 = clock_ns(CLOCK_MONOTONIC);
+    settled = nparked == created && yield_stress_parked_sum(tid, created, &sum);
     m1 = clock_ns(CLOCK_THREAD_CPUTIME_ID);
     p1 = clock_ns(CLOCK_PROCESS_CPUTIME_ID);
+    for (int i = 0; i < created; i++)
+        (void) sem_post(&release);
+    for (int i = 0; i < created; i++)
+        pthread_join(tid[i], NULL);
+    (void) sem_destroy(&parked);
+    (void) sem_destroy(&release);
 
     for (int i = 0; i < created; i++) {
-        sum += ys[i].cpu;
+        run += ys[i].cpu;
 
-        /* A thread runs on one hart at a time, so its clock cannot exceed its
-         * own lifetime; a stolen stretch billed from both harts would show here
-         * even when the all-thread sum stays under wall x harts.
+        /* A thread runs on one hart at a time, so its clock cannot advance
+         * faster than the wall clock; a stolen stretch billed from both harts
+         * would show here even when the all-thread sum stays under wall x
+         * harts.
          */
         if (ys[i].cpu > ys[i].life && ys[i].cpu - ys[i].life > over)
             over = ys[i].cpu - ys[i].life;
@@ -944,19 +1306,21 @@ static void test_cputime_yield_steal_stress(void)
     wall = w1 - w0;
     tol = wall / 100 > 2000000 ? wall / 100 : 2000000;
     snprintf(detail, sizeof detail,
-             "threads=%d/%d sum=%llu proc=%llu wall=%llu ncpu=%ld tol=%llu over=%llu",
-             created, n, (unsigned long long) sum, (unsigned long long) pd,
+             "threads=%d/%d settled=%d sum=%llu run=%llu proc=%llu wall=%llu "
+             "ncpu=%ld tol=%llu over=%llu",
+             created, n, settled, (unsigned long long) sum,
+             (unsigned long long) run, (unsigned long long) pd,
              (unsigned long long) wall, ncpu, (unsigned long long) tol,
              (unsigned long long) over);
     check(created == n, "cputime yield stress: threads created", detail);
     check(sum <= wall * (uint64_t) ncpu + tol,
           "cputime yield stress: per-thread sum <= wall x harts", detail);
-    check(over <= tol, "cputime yield stress: no thread clock exceeds its lifetime",
-          detail);
+    check(over <= tol,
+          "cputime yield stress: no thread clock exceeds its lifetime", detail);
     check(sum >= wall * (uint64_t) ncpu / 2,
           "cputime yield stress: busy harts bill at least half of wall x harts",
           detail);
-    check(pd + tol >= sum && pd <= sum + tol + 5000000,
+    check(settled && pd + tol >= sum && pd <= sum + tol + 5000000,
           "cputime yield stress: sum of thread clocks == process clock",
           detail);
 }
@@ -1443,10 +1807,22 @@ static void test_rlimit_data(void)
 /* Q34: 1 ns nanosleep storm on a tickless hart. The sleeper is pinned to hart 1
  * and a watchdog counter to hart 2; the sleeper checks the watchdog advances in
  * every 100 ms window, i.e. that a storm of sub-tick timer deadlines does not
- * wedge or starve another hart. Needs three online harts.
+ * wedge or starve another hart. With fewer than three online harts there is no
+ * hart for the watchdog: the sleeper runs alone on the last hart and only the
+ * completion, monotonic-time and interrupt checks apply.
+ *
+ * Each sleep is woken across harts (the boot hart owns the timer wheel), so a
+ * wakeup lost on the way to an idle sleeper hart costs an IDLE_MAX_SLEEP_NS
+ * backstop; a few thousand of those exhaust the deadline.
  */
 enum { STORM_CALLS = 100000, STORM_WINDOW_NS = 100000000 };
-#define STORM_DEADLINE_NS 100000000000ULL /* 100 s */
+/* A relative 1 ns sleep whose deadline has passed fires at the next timer
+ * expiry. With the boot hart busy that can be a whole 1 ms tick, so the worst
+ * case for STORM_CALLS is 100 s: a deadline of exactly that has no margin.
+ * Half as much again covers a loaded host; a run that needs more than one tick
+ * per call on average still fails.
+ */
+#define STORM_DEADLINE_NS 150000000000ULL /* 150 s */
 #define STORM_INTR_SLACK 64
 
 struct storm_ctx {
@@ -1456,6 +1832,7 @@ struct storm_ctx {
     int sleeper_cpu, watchdog_cpu;
     uint64_t elapsed_ns;
     long backward, failed_calls, stalled_windows, windows;
+    long done; /* calls completed before the loop ended */
     long intr_before, intr_after;
 };
 
@@ -1538,6 +1915,7 @@ static void *storm_sleeper(void *arg)
             req = rem;
         }
         now = clock_ns(CLOCK_MONOTONIC);
+        c->done = i + 1;
         if (now - t0 > STORM_DEADLINE_NS) {
             c->failed_calls++; /* bounded: a regression must fail, not hang */
             break;
@@ -1545,7 +1923,7 @@ static void *storm_sleeper(void *arg)
         if (now < last)
             c->backward++;
         last = now;
-        if (now - win_start >= STORM_WINDOW_NS) {
+        if (c->watchdog_cpu >= 0 && now - win_start >= STORM_WINDOW_NS) {
             uint64_t cnt = atomic_load(&c->counter);
 
             c->windows++;
@@ -1560,20 +1938,54 @@ static void *storm_sleeper(void *arg)
     return NULL;
 }
 
-static void test_nanosleep_1ns_storm(void)
+/* A thread that keeps hart 0, the boot hart, busy until told to stop. */
+static atomic_int storm_hog_stop;
+
+static void *storm_hog(void *arg)
+{
+    (void) arg;
+    if (storm_pin(0) != 0)
+        return NULL;
+    while (!atomic_load_explicit(&storm_hog_stop, memory_order_relaxed))
+        ;
+    return NULL;
+}
+
+/* --nanosleep-1ns-storm-hog: the storm with the boot hart busy, its worst case
+ * for the one-tick fallback.
+ */
+void test_nanosleep_1ns_storm_hog(void)
+{
+    pthread_t hog;
+
+    atomic_store(&storm_hog_stop, 0);
+    if (pthread_create(&hog, NULL, storm_hog, NULL) != 0) {
+        test_fail("nanosleep_1ns_storm with the boot hart busy", "pthread_create failed");
+        return;
+    }
+    test_nanosleep_1ns_storm();
+    atomic_store(&storm_hog_stop, 1);
+    (void) pthread_join(hog, NULL);
+}
+
+void test_nanosleep_1ns_storm(void)
 {
     static struct storm_ctx c;
     pthread_t wd, sl;
     char detail[200];
+    long harts = sysconf(_SC_NPROCESSORS_ONLN);
+    bool watchdog = harts >= 3;
 
-    if (sysconf(_SC_NPROCESSORS_ONLN) < 3) {
-        test_skip("nanosleep_1ns_storm", "needs 3 online harts");
+    if (harts < 1) {
+        test_fail("nanosleep_1ns_storm fixture", "no online harts");
         return;
     }
-    c.sleeper_cpu = 1;
-    c.watchdog_cpu = 2;
+    c.sleeper_cpu = watchdog ? 1 : (int) harts - 1;
+    c.watchdog_cpu = watchdog ? 2 : -1;
     c.intr_before = c.intr_after = -1;
-    if (pthread_create(&wd, NULL, storm_watchdog, &c) != 0) {
+    if (!watchdog) {
+        atomic_store(&c.pinned, 1);
+    } else if (pthread_create(&wd, NULL, storm_watchdog, &c) != 0) {
         test_fail("nanosleep_1ns_storm fixture", strerror(errno));
         return;
     }
@@ -1581,27 +1993,34 @@ static void test_nanosleep_1ns_storm(void)
         (void) sched_yield();
     if (pthread_create(&sl, NULL, storm_sleeper, &c) != 0) {
         atomic_store(&c.stop, 1);
-        (void) pthread_join(wd, NULL);
+        if (watchdog)
+            (void) pthread_join(wd, NULL);
         test_fail("nanosleep_1ns_storm fixture", strerror(errno));
         return;
     }
     (void) pthread_join(sl, NULL);
     atomic_store(&c.stop, 1);
-    (void) pthread_join(wd, NULL);
+    if (watchdog)
+        (void) pthread_join(wd, NULL);
 
     snprintf(detail, sizeof detail,
-             "calls=%d failed=%ld backward=%ld windows=%ld stalled=%ld "
+             "calls=%ld/%d failed=%ld backward=%ld windows=%ld stalled=%ld "
              "elapsed_ns=%llu intr_delta=%ld",
-             STORM_CALLS, c.failed_calls, c.backward, c.windows,
+             c.done, STORM_CALLS, c.failed_calls, c.backward, c.windows,
              c.stalled_windows, (unsigned long long) c.elapsed_ns,
              c.intr_before >= 0 && c.intr_after >= 0
                  ? c.intr_after - c.intr_before
                  : -1L);
     printf("  nanosleep_1ns_storm: %s\n", detail);
-    check(atomic_load(&c.pinned) == 1 && c.failed_calls == 0 && !c.backward &&
-              c.windows > 0 && !c.stalled_windows,
-          "nanosleep_1ns_storm completes, time monotonic, watchdog advances",
-          detail);
+    if (watchdog)
+        check(atomic_load(&c.pinned) == 1 && c.failed_calls == 0 &&
+                  !c.backward && c.windows > 0 && !c.stalled_windows,
+              "nanosleep_1ns_storm completes, time monotonic, watchdog advances",
+              detail);
+    else
+        check(c.failed_calls == 0 && !c.backward,
+              "nanosleep_1ns_storm completes, time monotonic (no watchdog hart)",
+              detail);
 
     /* Upper bound on the sleeper hart's STIMER interrupts. Each 1 ns sleep arms
      * one deadline, and one deadline costs at most one interrupt (a sleep that
@@ -1634,6 +2053,16 @@ static void test_nanosleep_1ns_storm(void)
                   (uint64_t) delta <= bound,
               "nanosleep_1ns_storm timer interrupt delta within bound", detail);
     }
+}
+
+/* CPU-time billing, also run alone by syscall_testing --cputime. */
+void test_cputime(void)
+{
+    test_cputime_short_bursts();
+    test_cputime_two_threads();
+    test_cputime_process_monotonic();
+    test_cputime_remote_monotonic();
+    test_cputime_yield_steal_stress();
 }
 
 /* Entry point */
@@ -1673,10 +2102,7 @@ void test_timers(void)
     test_timer_create_exhaust();
     test_timer_id_reuse();
 
-    /* CPU-time billing */
-    test_cputime_short_bursts();
-    test_cputime_two_threads();
-    test_cputime_yield_steal_stress();
+    test_cputime();
     test_rlimit_negative();
     test_rlimit_cpu_kill();
     test_rlimit_inherit();
@@ -1684,4 +2110,152 @@ void test_timers(void)
     test_rlimit_as_concurrent();
     test_rlimit_data();
     test_nanosleep_1ns_storm();
+}
+
+/* timer_fire_stale: the timer expiry records a due sleep's fire under the
+ * wheel lock and delivers it once the lock is released. A sleep that ends by
+ * another path in between leaves the recorded fire to reach whatever wait the
+ * thread is in by then, and its next sleep must still run its full length.
+ * The fixture holds the fire between the record and the delivery
+ * (stall-timer-fire), interrupts the first sleep meanwhile, and starts a
+ * second; the hold ends once the thread sleeps again. The expiry runs on the
+ * boot hart, which the hold keeps with interrupts off, so the test runs on the
+ * others and waits there by spinning on the clock and on semaphores, never by
+ * a timed sleep. Needs /bin/inject and three harts.
+ */
+#define FIRE_STALE_FIRST_MS 20
+#define FIRE_STALE_SECOND_MS 1000
+
+struct fire_stale {
+    sem_t go, again;
+    atomic_int woken; /* the first sleep has returned */
+    int first_rc, second_rc;
+    long long second_ms;
+};
+
+static long long fire_stale_now_ms(void)
+{
+    return (long long) (clock_ns(CLOCK_MONOTONIC) / 1000000);
+}
+
+static void *fire_stale_sleeper(void *arg)
+{
+    struct fire_stale *f = arg;
+    struct timespec first = {.tv_nsec = FIRE_STALE_FIRST_MS * 1000000L};
+    struct timespec second = {.tv_sec = FIRE_STALE_SECOND_MS / 1000};
+    long long t0;
+
+    (void) sem_wait(&f->go);
+    f->first_rc = clock_nanosleep(CLOCK_MONOTONIC, 0, &first, NULL);
+    atomic_store(&f->woken, 1);
+    (void) sem_wait(&f->again);
+    t0 = fire_stale_now_ms();
+    f->second_rc = clock_nanosleep(CLOCK_MONOTONIC, 0, &second, NULL);
+    f->second_ms = fire_stale_now_ms() - t0;
+    return NULL;
+}
+
+/* Arm the hold for thread tid of pid: /bin/inject's status. */
+static int fire_stale_arm(int pid, pthread_t tid, int ms)
+{
+    char p[16], t[16], m[16];
+    char *argv[] = {"inject", "stall-timer-fire", p, t, m, NULL};
+    pid_t child;
+    int st;
+
+    snprintf(p, sizeof p, "%d", pid);
+    snprintf(t, sizeof t, "%d", (int) tid);
+    snprintf(m, sizeof m, "%d", ms);
+    if (posix_spawn(&child, "/bin/inject", NULL, NULL, argv, NULL) != 0 ||
+        waitpid(child, &st, 0) != child || !WIFEXITED(st))
+        return -1;
+    return WEXITSTATUS(st);
+}
+
+/* One attempt: 1 when the fire was held past the first sleep's end, 0 when
+ * the window was missed, -1 when the fixture failed.
+ */
+static int fire_stale_try(void)
+{
+    struct fire_stale f = {.first_rc = -1, .second_rc = -1};
+    pthread_t sleeper;
+    long long t;
+    int held = -1;
+    char d[128];
+
+    if (sem_init(&f.go, 0, 0) || sem_init(&f.again, 0, 0)) {
+        test_fail("timer fire stale fixture", "sem_init");
+        return -1;
+    }
+    if (pthread_create(&sleeper, NULL, fire_stale_sleeper, &f)) {
+        test_fail("timer fire stale fixture", "pthread_create");
+        goto out;
+    }
+    if (!wait_thread_state(sleeper, STATE_SEM) ||
+        fire_stale_arm((int) getpid(), sleeper, 3000) != 0) {
+        test_fail("timer fire stale fixture", "cannot arm the hold");
+        (void) sem_post(&f.go);
+        (void) sem_post(&f.again);
+        (void) pthread_join(sleeper, NULL);
+        goto out;
+    }
+
+    /* Let the first sleep start, and give the boot hart time to fire it and
+     * take the hold; then end the sleep, unless it has ended already.
+     */
+    (void) sem_post(&f.go);
+    t = fire_stale_now_ms() + FIRE_STALE_FIRST_MS + 200;
+    while (fire_stale_now_ms() < t && !atomic_load(&f.woken))
+        ;
+    if (!atomic_load(&f.woken))
+        (void) thread_ctl(RTMUX_TCTL_INTERRUPT, (void *) (long) sleeper);
+    t = fire_stale_now_ms() + 3000;
+    while (fire_stale_now_ms() < t && !atomic_load(&f.woken))
+        ;
+    held = atomic_load(&f.woken) && f.first_rc == EINTR;
+    if (!held) {
+        /* The fire came first: move the hold to a pid that does not exist
+         * before the second sleep can meet it.
+         */
+        (void) fire_stale_arm(INT32_MAX, 0, 1);
+    }
+    (void) sem_post(&f.again);
+    (void) pthread_join(sleeper, NULL);
+
+    /* An interrupt that came before the boot hart fired the first sleep left
+     * the hold armed for the second sleep's own fire, which it then held for
+     * its full length: the window was missed.
+     */
+    if (held && f.second_ms >= 2500)
+        held = 0;
+    if (held) {
+        snprintf(d, sizeof d, "second sleep rc %d after %lld ms of %d",
+                 f.second_rc, f.second_ms, FIRE_STALE_SECOND_MS);
+        check(inject_run("site-wait", "timer-fire", NULL) == 0,
+              "the first sleep's fire was held", "the hold was not taken");
+        check(f.second_rc == 0 && f.second_ms >= FIRE_STALE_SECOND_MS,
+              "a stale timer fire leaves the next sleep to run its length", d);
+    }
+out:
+    (void) sem_destroy(&f.go);
+    (void) sem_destroy(&f.again);
+    return held;
+}
+
+int timer_fire_stale(void)
+{
+    int held = 0;
+
+    if (sysconf(_SC_NPROCESSORS_ONLN) < 3 ||
+        inject_run("alloc-status", NULL, NULL) != 0)
+        return TC_EXIT_SKIP;
+    (void) test_pin_mask(~1U);
+    for (int i = 0; i < 5 && held == 0; i++)
+        held = fire_stale_try();
+    (void) test_pin_mask(~0U);
+    if (held == 0)
+        test_fail("timer fire stale fixture",
+                  "no attempt held the first sleep's fire past its "
+                  "interrupt");
+    return 0;
 }

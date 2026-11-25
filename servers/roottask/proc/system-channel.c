@@ -28,7 +28,9 @@ struct kcall_args_proc_register_syschan {
  *
  * Registers the calling process's system channel with the kernel (via
  * __KSYS_PRIV_PROC_REGISTER_SYSCHAN) so the kernel can deliver termination and
- * shutdown notifications to it directly, then replies success.
+ * shutdown notifications to it directly, delivers the signals that were sent to
+ * the process before it had one (signal_flush_early_locked), then replies
+ * success.
  *
  * Parameters:
  *   ctp : I/O service context (ctp->info.pid = calling process)
@@ -38,11 +40,24 @@ struct kcall_args_proc_register_syschan {
 int proc_syschan(ioserv_context_t *ctp, proc_syschan_t *msg)
 {
     struct kcall_args_proc_register_syschan args;
-    int r;
+    process_t *prp;
+    int r, killed = 0;
 
     args.pid = ctp->info.pid;
     args.chid = msg->i.chid;
+
+    /* Register and deliver the signals sent before now under the process's
+     * lock, the one signal_one posts under: a signal either finds the channel
+     * or is kept and flushed here, never neither.
+     */
+    if (!(prp = root_proc_lock(ctp->info.pid)))
+        return ESRCH;
     r = (int) syscall_priv(__KSYS_PRIV_PROC_REGISTER_SYSCHAN, &args);
+    if (r == EOK)
+        killed = signal_flush_early_locked(ctp->info.pid);
+    root_proc_unlock(ctp->info.pid);
+    if (killed)
+        proc_exit_finish(ctp->info.pid);
     if (r != EOK) {
         root_log("proc_syschan: pid %d chid %d not found (r=%d)\n",
                  ctp->info.pid, msg->i.chid, r);

@@ -16,19 +16,15 @@ config TIMER_HZ
          100 = 10 ms tick (traditional Unix)
 
 config SMP_MSGOPT
-    bool "SMP lockless message transfer optimization"
-    default y
+    def_bool y
     depends on SMP
     help
-      Allow cross-CPU message transfers without holding the kernel lock.
-      Threads in mid-transfer are marked with RTMUX_ITF_MSG_DELIVERY so
-      other CPUs skip them.
-
-      Default flipped to y in P2.1e (May 2026) — the IPC calls are
-      transitioning off the BKL (the "inkernel lock relaxed" condition
-      the option was waiting for).  See arch/riscv/calls.c's
-      kcall_no_bkl[] table and kernel/ipc/fastmsg.c::kcall_msg_receivev
-      for the consumers.
+      Cross-CPU message transfers run without a kernel-wide lock: a thread
+      in mid-transfer is claimed with RTMUX_ITF_MSG_DELIVERY, and force_ready
+      defers to the claimer. An SMP kernel is not correct without it (a
+      timeout or teardown would unlink a thread another hart is copying to),
+      so it is not a choice; kernel/include/core/macros.h refuses the
+      combination at build time.
 
 config PRIO_REPLY_DEPTH
     int "Priority propagation depth through REPLY-blocked clients"
@@ -106,6 +102,25 @@ config DEBUG_INJECT
 
       Off in the default configuration: the call is unbound (ENOSYS) and no
       code is built. Never enable it on a deployed system.
+
+config DEBUG_DISPATCH_OWNER
+    bool "Crash when one thread becomes current on two harts"
+    default n
+    depends on SMP
+    help
+      Track, for every thread, the hart whose current thread it is, and
+      crash the moment a second hart makes it current, or a picker takes
+      a thread off a run queue that is not ready (it was queued twice).
+      Two harts running one thread share its saved registers and, from
+      its next trap on, one kernel stack; this names the bad dispatch
+      instead of the much later corruption. The report gives both harts,
+      the thread's state and its last dispatch and last wakeup with
+      their call sites. A thread queued by one hart while still current
+      on another is only reported, rate limited: the pickers hold it
+      back until that hart switches away.
+
+      Adds two atomic operations to every thread switch. Development
+      builds only.
 
 config LOCK_DEBUG
     bool "Kernel lock debug (lock-rank checker)"

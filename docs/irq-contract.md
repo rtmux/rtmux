@@ -197,8 +197,10 @@ where it is reachable in IST thread context:
 
 - the `RTMUX_FLG_THR_INTR_PENDING` fast path (IRQ already pending when
   `interrupt_wait()` is entered);
-- the race-close re-check that happens after the `STATE_INTR` commit but before
-  `block()`;
+- the pending-bit checks under the local dispatch lock: one before the next
+  thread is chosen and one after. Choosing can drop the lock, and with it the
+  interrupt mask, to look at other harts for a thread to steal; the second
+  check runs with the lock held through the switch away from the pinned IST;
 - the normal blocked return after an IRQ wakes a `STATE_INTR` thread and the IST
   resumes from `block()`.
 
@@ -206,3 +208,21 @@ The scheduler-side hook in `mark_running_default()` also observes `STATE_INTR`
 threads as they transition to running.  The syscall-side blocked return is the
 contract endpoint for host trace correlation, so no queue, worker thread, or
 resident trace buffer is added.
+
+## Interrupt thread priorities
+
+The shared header `internal/include/sys/priority-bands.h` assigns priority 21
+to device interrupt threads and 22 to the PCI interrupt demultiplexer. The
+serial IST also sends its receive notification at 21. On a terminal-generated
+interrupt, quit or suspend, roottask passes the dispatcher's effective priority
+to the foreground process's signal thread. The loan lasts until the next
+receive and is bounded by the device IST band and the configured unprivileged
+ceiling. Ordinary signals use the system thread's fixed priority. A spawned
+process starts with its requested scheduling attributes. Priorities above the
+unprivileged ceiling require scheduling authority in both the parent and the
+resolved executable's manifest grant.
+
+`make check-driver-priorities` checks service sources and numeric-priority
+fixtures. `make check-serial-priority` times Ctrl-C against a foreground FIFO
+priority-15 job on one hart and verifies its shell status and the priority of
+an ordinary signal handler.

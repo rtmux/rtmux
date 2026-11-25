@@ -393,8 +393,12 @@ int kdecl ksys_sched_yield(thread_t *act, struct kcall_args_null *kap)
     /* #90 __sched_yield. yield() is sched_slock-internal; preempt fence covers
      * the function body.
      */
-    (void) act;
     (void) kap;
+    SETKSTATUS(act, EOK);
     yield();
-    return EOK;
+
+    /* FIFO may already have switched. Other policies set TIMESLICE and
+     * kernel_exit handles that flag before returning to the caller.
+     */
+    return ENOERROR;
 }

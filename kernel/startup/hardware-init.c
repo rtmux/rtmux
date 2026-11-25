@@ -7,16 +7,16 @@
 
 #include <startup.h>
 #include <asm/boot-stack.h>
+#include <minmax.h>
 #include <startup-api.h>
 #include <rtmux-version.h>
 
 #define STARTUP_DEBUG_LEVEL 4
 
-/* Boot heap: pre-allocated physical memory for the kernel heap, used before
- * roottask's physical allocator (pa_init) takes over.
- */
+/* The kernel object heap and the VM physical allocator own separate RAM. */
+#define BOOT_HEAP_MIN MEG(8)
 paddr_t boot_heap_paddr;
-size_t boot_heap_size = MEG(8);
+size_t boot_heap_size;
 
 /* main() Startup program executing out of RAM
  *
@@ -113,11 +113,22 @@ int hardware_init(int argc, char **argv, char **envv)
     /* Pre-allocate a heap region for the kernel to use before as (pa_init)
      * takes over. calloc_ram removes this region from the ram_list, so it won't
      * appear in sysram asinfo entries — preventing pa_init from double-managing
-     * the same memory.
+     * the same memory. The original 8 MiB reserve covers the default 256 MiB
+     * machine. Larger systems also need kernel objects and page tables for
+     * their residents. Try the same fraction of available RAM there, retaining
+     * the original minimum on small or fragmented machines.
      */
-    boot_heap_paddr = calloc_ram(boot_heap_size, __PAGESIZE);
-    if (boot_heap_paddr == NULL_PADDR)
-        crash("failed to allocate boot heap\n");
+    boot_heap_size =
+        max_size(BOOT_HEAP_MIN, TRUNC(ram_bytes() / 32, __PAGESIZE));
+    for (;;) {
+        boot_heap_paddr = calloc_ram(boot_heap_size, __PAGESIZE);
+        if (boot_heap_paddr != NULL_PADDR)
+            break;
+        if (boot_heap_size == BOOT_HEAP_MIN)
+            crash("failed to allocate boot heap\n");
+        boot_heap_size =
+            max_size(BOOT_HEAP_MIN, TRUNC(boot_heap_size / 2, __PAGESIZE));
+    }
 
     /* Initialize CPU sections in the syspage. This must be done before
      * init_mmu().

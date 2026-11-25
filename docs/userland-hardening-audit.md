@@ -12,7 +12,7 @@ gate: POSIX.1, native realtime, or LKL-supporting behavior only.
 | Block-backed suite execution | Done | Commit `4bf380c3`: `scripts/qemu-regress.sh --mode syscall-testing-disk` boots `/sbin/init`, mounts `/usr` from the NVMe romfs image, and runs `/usr/bin/syscall_testing`. |
 | PCI/NVMe smoke | Done | Commit `b8951ea9`: `pci-nvme-smoke` asserts ECAM discovery, BAR0 mapping, VID:DID read, GPT parse, IRQ/MSI vector allocation, and `mainfs=` selecting `nvme0n1p8`. |
 | Sysinfo through pci-server | Deferred, YAGNI | No user utility maps PCI config space directly.  The pci-server protocol has no read-only inventory op; using attach for inspection would reinitialize live devices and fails on driver-owned NVMe.  Add a read-only query op only when a real PCI inventory consumer exists. |
-| Getty/login terminal edges | Done | Commit `bd1cb343`: `scripts/vi-test.py` drives wrong-password, unknown-user, retry-limit, prompt, CR/LF, and terminal-recovery paths. |
+| Getty/login terminal edges | Done | Commit `bd1cb343`: `scripts/vi-test.py` drives wrong-password, unknown-user, retry-limit, prompt, CR/LF, and terminal-recovery paths. It also checks that login resets PATH, retains TERM and discards inherited variables before starting the shell. |
 | Shell/editor TTY smoke | Done | Commit `c0aa647c`: `make tty-smoke` drives login, `sh`, and `vi` over serial, including editing, backspace/DEL, read-only save failure, and prompt recovery. |
 
 ## Review Notes

@@ -135,6 +135,7 @@ void kext_proc_query(void *data)
     out->num_total_threads = prp->threads.nentries - prp->threads.nfree;
     out->terming_priority = prp->terming_priority;
     out->process_priority = prp->process_priority;
+    out->may_set_priv_priority = (prp->priv_caps & RTMUX_PRIV_CAP_SCHED) != 0;
     out->base_addr = prp->base_addr;
     out->boundary_addr = prp->boundary_addr;
     out->max_cpu_time = prp->max_cpu_time;
@@ -500,6 +501,68 @@ void kext_proc_register_syschan(void *data)
     SETKSTATUS(act, EOK);
 }
 
+/* kext_proc_syschan_detach — take a process's system channel out of use and
+ * hand back the signals nobody received from it.
+ *
+ * For exec, which ends the old image's threads and then its channels: a signal
+ * that was queued for the old image's system thread and never received belongs
+ * to the new image. Clears prp->sys_chp, so that later deliveries find no
+ * channel (kext_signal_deliver answers ENXIO and roottask keeps the signal),
+ * and unlinks every queued signal notification, reporting them as a set. The
+ * channel itself is left for the caller to destroy. One instance per signal
+ * survives, and one sender, that of the last one in the queue, as in every
+ * other pending set here.
+ */
+struct kcall_args_proc_syschan_detach {
+    pid_t pid;
+    pid_t sender;  /* out: sender of the last queued signal, 0 if none */
+    uint64_t sigs; /* out: bit n is set when signal n was queued */
+};
+
+void kext_proc_syschan_detach(void *data)
+{
+    struct kcall_args_proc_syschan_detach *kap = data;
+    thread_t *act = get_active_thread(get_cpunum());
+    notification_t *pup, *next;
+    process_t *prp;
+    channel_t *chp;
+
+    kap->sender = 0;
+    kap->sigs = 0;
+    if (!(prp = lookup_pid_rcu(kap->pid))) {
+        rcu_read_unlock(&process_rcu);
+        kcall_err(act, ESRCH);
+        return;
+    }
+    rcu_read_lock(&connobj_rcu);
+    kspinlock_lock(&prp->vec_slock);
+    chp = prp->sys_chp;
+    prp->sys_chp = NULL;
+    kspinlock_unlock(&prp->vec_slock);
+    if (chp) {
+        kspinlock_lock(&chp->lock);
+        for (pup = pril_first(&chp->send_queue); pup; pup = next) {
+            uint32_t signo;
+
+            next = pril_next(pup);
+            if (TYPE_MASK(pup->type) != TYPE_NOTIFICATION ||
+                pup->code != _NOTIFICATION_CODE_SIGNAL)
+                continue;
+            signo = (uint32_t) pup->value;
+            if (signo >= 1 && signo < 64) {
+                kap->sigs |= 1ULL << signo;
+                kap->sender = (pid_t) ((uint64_t) pup->value >> 32);
+            }
+            pril_rem(&chp->send_queue, pup);
+            object_free(chp->process, &notification_souls, pup);
+        }
+        kspinlock_unlock(&chp->lock);
+    }
+    rcu_read_unlock(&connobj_rcu);
+    rcu_read_unlock(&process_rcu);
+    SETKSTATUS(act, EOK);
+}
+
 /* kext_proc_list_children — fill an array of pid_t with the children of
  * "parent_pid" (head-of-list at parent->child, walked via ->sibling). Used by
  * proc_wait to enumerate children without dereferencing the kernel-allocated
@@ -592,8 +655,8 @@ void kext_proc_wait_finalize(void *data)
                 prp->running_time + prp->kids_running_time;
             parent->kids_system_time +=
                 prp->system_time + prp->kids_system_time;
-            prp->flags &= ~RTMUX_FLG_PROC_WAITINFO;
-            prp->flags |= RTMUX_FLG_PROC_WAITDONE;
+            PROC_FLG_CLR(prp, RTMUX_FLG_PROC_WAITINFO);
+            PROC_FLG_SET(prp, RTMUX_FLG_PROC_WAITDONE);
         }
         if (prp->flags & RTMUX_FLG_PROC_ZOMBIE) {
             kap->send_term_notification = 1;
@@ -609,7 +672,7 @@ void kext_proc_wait_finalize(void *data)
          */
         break;
     case WCONTINUED:
-        prp->flags &= ~RTMUX_FLG_PROC_CONTINUED;
+        PROC_FLG_CLR(prp, RTMUX_FLG_PROC_CONTINUED);
         break;
     default:
         break;
@@ -658,8 +721,8 @@ void kext_proc_nozombie_mark(void *data)
     (void) kap->si_proc_pid;
     (void) kap->status;
     kspinlock_lock(&prp->vec_slock);
-    prp->flags |= RTMUX_FLG_PROC_WAITINFO;
-    prp->flags |= RTMUX_FLG_PROC_NOZOMBIE;
+    PROC_FLG_SET(prp, RTMUX_FLG_PROC_WAITINFO);
+    PROC_FLG_SET(prp, RTMUX_FLG_PROC_NOZOMBIE);
     kspinlock_unlock(&prp->vec_slock);
     rcu_read_unlock(&process_rcu);
     SETKSTATUS(act, EOK);
@@ -686,15 +749,14 @@ void kext_proc_exit_mark(void *data)
         return;
     }
     kspinlock_lock(&prp->vec_slock);
-    prp->flags |= RTMUX_FLG_PROC_TERMING;
-    prp->flags |= RTMUX_FLG_PROC_DESTROYALL;
+    PROC_FLG_SET(prp, RTMUX_FLG_PROC_TERMING | RTMUX_FLG_PROC_DESTROYALL);
     prp->boundary_addr = VM_KERN_SPACE_BOUNDARY;
 
     /* siginfo moved to root_process_t; caller stamps it via
      * root_proc(pid)->siginfo before invoking this kernel extension.
      */
     (void) kap->exit_status;
-    prp->flags |= RTMUX_FLG_PROC_WAITINFO;
+    PROC_FLG_SET(prp, RTMUX_FLG_PROC_WAITINFO);
     kspinlock_unlock(&prp->vec_slock);
     rcu_read_unlock(&process_rcu);
     SETKSTATUS(act, EOK);
@@ -808,7 +870,7 @@ void kext_proc_exit_finalize(void *data)
         return;
     }
     kspinlock_lock(&prp->vec_slock);
-    prp->flags &= ~RTMUX_FLG_PROC_TERMING;
+    PROC_FLG_CLR(prp, RTMUX_FLG_PROC_TERMING);
     prp->priv_caps = 0;
     kspinlock_unlock(&prp->vec_slock);
     rcu_read_unlock(&process_rcu);
@@ -839,9 +901,9 @@ void kext_proc_flags_op(void *data)
         return;
     }
     kspinlock_lock(&prp->vec_slock);
-    prp->flags &= ~kap->flags_clear;
-    prp->flags |= kap->flags_set;
-    kap->flags_after = prp->flags;
+    PROC_FLG_CLR(prp, kap->flags_clear);
+    PROC_FLG_SET(prp, kap->flags_set);
+    kap->flags_after = __atomic_load_n(&prp->flags, __ATOMIC_RELAXED);
     kspinlock_unlock(&prp->vec_slock);
     rcu_read_unlock(&process_rcu);
     SETKSTATUS(act, EOK);
@@ -927,8 +989,55 @@ extern struct pa_quantum *pa_alloc(paddr_t size,
                                    unsigned *status_p,
                                    struct pa_restrict *restriction,
                                    paddr_t resv_size);
+extern void pa_free(struct pa_quantum *paq, size_t num, paddr_t resv_size);
 extern paddr_t pa_quantum_to_paddr(struct pa_quantum *pq);
 extern struct pa_restrict *restrict_user;
+
+/* root_map_all — map [va_lo, va_hi] of adp to paddr.. with prot, all or
+ * nothing: a MAP that stops part of the way (a page table could not be had) has
+ * the pages it did unmapped again, so a failure leaves no PTE of the range
+ * behind. Called with as_slock held; the caller completes the TLB flush after
+ * dropping it when *flushp is set.
+ *
+ * Returns cpu_pte_manipulate's error. The UNMAP walks only tables the MAP just
+ * used, and allocates none.
+ */
+static int root_map_all(address_t *adp,
+                        uintptr_t va_lo,
+                        uintptr_t va_hi,
+                        paddr_t paddr,
+                        int prot,
+                        unsigned *flushp)
+{
+    struct mm_pte_manipulate manip;
+    int r;
+
+    manip.adp = adp;
+    manip.start = va_lo;
+    manip.end = va_hi + 1; /* cpu_pte_manipulate uses [start, end) */
+    manip.split_end = 0;
+    manip.first = 0;
+    manip.paddr = paddr;
+    manip.prot = (unsigned) prot;
+    manip.op = PTE_OP_MAP;
+    manip.special = 0;
+    manip.shmem_flags = 0;
+    manip.tlb_flush_pending = 0;
+    r = cpu_pte_manipulate(&manip);
+    if (r != EOK && manip.start > va_lo) {
+        struct mm_pte_manipulate undo = manip;
+
+        undo.end = undo.start;
+        undo.start = va_lo;
+        undo.op = PTE_OP_UNMAP;
+        undo.tlb_flush_pending = 0;
+        if (cpu_pte_manipulate(&undo) != EOK)
+            crash("cannot unmap a failed roottask map");
+        manip.tlb_flush_pending |= undo.tlb_flush_pending;
+    }
+    *flushp = manip.tlb_flush_pending;
+    return r;
+}
 
 /* kext_root_mmap_phys_user — install PTEs in roottask's pgdir mapping
  * "paddr..paddr+size-1" to "vaddr..vaddr+size-1" with the given prot. Bypasses
@@ -1002,22 +1111,10 @@ void kext_root_mmap_phys_user(void *data)
      * hop.
      */
     {
-        struct mm_pte_manipulate manip;
         unsigned flush_pending;
 
-        manip.adp = adp;
-        manip.start = va_lo;
-        manip.end = va_hi + 1; /* cpu_pte_manipulate uses [start, end) */
-        manip.split_end = 0;
-        manip.first = 0;
-        manip.paddr = kap->paddr;
-        manip.prot = (unsigned) kap->prot;
-        manip.op = PTE_OP_MAP;
-        manip.special = 0;
-        manip.shmem_flags = 0;
-        manip.tlb_flush_pending = 0;
-        r = cpu_pte_manipulate(&manip);
-        flush_pending = manip.tlb_flush_pending;
+        r = root_map_all(adp, va_lo, va_hi, kap->paddr, kap->prot,
+                         &flush_pending);
         if (r == EOK && kap->vaddr == 0)
             root_phys_map_va = va_hi + 1; /* bump for the next caller */
         kspinlock_unlock(&as_slock);
@@ -1062,7 +1159,7 @@ void kext_root_mmap_anon_user(void *data)
     paddr_t paddr;
     size_t size_aligned;
     uintptr_t va_lo, va_hi;
-    struct mm_pte_manipulate manip;
+    unsigned flush_pending;
     int r;
 
     if (!prp || !(adp = prp->memory)) {
@@ -1108,35 +1205,30 @@ void kext_root_mmap_anon_user(void *data)
     if (va_lo + size_aligned < va_lo ||
         va_lo + size_aligned > RTMUX_ROOTTASK_UADDR_END) {
         kspinlock_unlock(&as_slock);
-        /* Leak pq — bootstrap path, fatal anyway. */
+
+        /* Nothing is mapped yet. Roottask asks again for each spawn that needs
+         * a new loader context, so keeping pq would leak it each time.
+         */
+        pa_free(pq, LEN_TO_NQUANTUM(size_aligned), 0);
         kap->ret = EINVAL;
         SETKSTATUS(act, EINVAL);
         return;
     }
     va_hi = va_lo + size_aligned - 1;
 
-    manip.adp = adp;
-    manip.start = va_lo;
-    manip.end = va_hi + 1;
-    manip.split_end = 0;
-    manip.first = 0;
-    manip.paddr = paddr;
-    manip.prot = (unsigned) kap->prot;
-    manip.op = PTE_OP_MAP;
-    manip.special = 0;
-    manip.shmem_flags = 0;
-    manip.tlb_flush_pending = 0;
-    r = cpu_pte_manipulate(&manip);
-    {
-        unsigned flush_pending = manip.tlb_flush_pending;
-        if (r == EOK)
-            root_phys_map_va = va_hi + 1;
-        kspinlock_unlock(&as_slock);
-        if (flush_pending)
-            cpu_tlb_flush_complete();
-    }
+    /* All or nothing: roottask asks again for the next loader context it needs,
+     * at the same address, so a run kept after a partial MAP would leak each
+     * time.
+     */
+    r = root_map_all(adp, va_lo, va_hi, paddr, kap->prot, &flush_pending);
+    if (r == EOK)
+        root_phys_map_va = va_hi + 1;
+    kspinlock_unlock(&as_slock);
+    if (flush_pending)
+        cpu_tlb_flush_complete();
     if (r != EOK) {
-        /* Leak pq on failure — bootstrap path, fatal anyway. */
+        /* Nothing of the run is mapped any more, and no TLB holds it. */
+        pa_free(pq, LEN_TO_NQUANTUM(size_aligned), 0);
         kap->ret = r;
         SETKSTATUS(act, r);
         return;

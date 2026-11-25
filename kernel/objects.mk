@@ -4,7 +4,6 @@
 #
 
 KER_SRC = init/objects init/entry init/setup init/roottask \
-          init/shutdown \
           printk/kprintf \
           core/priv core/globals core/idle \
           core/sys \
@@ -36,6 +35,10 @@ endif
 
 ifdef CONFIG_DEBUG_INJECT
 KER_SRC += debug/inject
+endif
+
+ifdef CONFIG_DEBUG_DISPATCH_OWNER
+KER_SRC += debug/dispatch-owner
 endif
 
 # RCU lookup lifetime support lives in sync/rcu.

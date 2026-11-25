@@ -186,7 +186,9 @@ void init_objects()
      *   [guard 4KB] [usable stack KSYS_STACK_NBYTES]
      */
     ksys_stack_size = (KSYS_STACK_NBYTES + __PAGESIZE) * num_processors;
-    run_ker_stack_bot = (uintptr_t) _scalloc(ksys_stack_size);
+    run_ker_stack_bot = (uintptr_t) _scalloc_pgalign(ksys_stack_size);
+    if (!run_ker_stack_bot)
+        crash();
     run_ker_stack_top = run_ker_stack_bot + ksys_stack_size;
     ksys_sp = STACK_INIT(run_ker_stack_bot, ksys_stack_size);
 

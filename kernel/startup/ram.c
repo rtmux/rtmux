@@ -628,6 +628,15 @@ void reserve_ram(unsigned size, unsigned align, unsigned pagesize)
                       "ram");
 }
 
+/* Sum RAM extents so a hole between memory banks never sizes the heap. */
+paddr_t ram_bytes(void)
+{
+    paddr_t bytes = 0;
+    for (struct ram_entry *r = ram_list; r->size != 0; ++r)
+        bytes += r->size;
+    return bytes;
+}
+
 paddr_t ram_top(void)
 {
     paddr_t top = 0;

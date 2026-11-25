@@ -87,13 +87,19 @@ static int teardown_call(int op, void *arg, const char *what)
     return rc;
 }
 
-/* process_threads_destroy — destroy all threads of a process. Parameters:
- *   prp : opaque kernel-VA pointer to the target process
+/* process_threads_destroy — one pass at destroying every thread of a process.
+ * Parameters:
+ *   prp : opaque kernel-VA pointer to the target process, valid under
+ *         root_proc_lock
+ * Return value: EOK, or EAGAIN when a thread could not be destroyed yet (see
+ * teardown_call) and the pass must be made again later; proc_exit_finish makes
+ * it, without the process lock.
  */
-void process_threads_destroy(process_t *prp)
+int process_threads_destroy(process_t *prp)
 {
-    (void) teardown_call(__KSYS_PRIV_EXIT_DESTROY_THREADS, prp,
-                         "process_threads_destroy");
+    int rc = (int) syscall_priv(__KSYS_PRIV_EXIT_DESTROY_THREADS, prp);
+
+    return rc < 0 ? -rc : rc;
 }
 
 /* process_timer_destroy — destroy one timer of a process. Parameters:
@@ -123,6 +129,7 @@ int process_connect_detach(process_t *prp, int coid)
 struct kcall_args_process_create {
     pid_t parent_pid;
     void *lcp;
+    int exec;
 
     /* Mirrors kernel/ext/process.c::kcall_args_process_create. The kernel
      * writes adp_out and pid_out before SETKSTATUS so the roottask side never
@@ -144,11 +151,13 @@ struct kcall_args_process_create {
  * Parameters:
  *   parent_pid : pid of the creating process
  *   lcp        : loader context to associate with the new process
+ *   exec       : non-zero if the child only carries the new image of an exec
  *   out_pid    : if non-NULL, receives the new process's pid (0 on error)
  * Return value: kernel-VA process_t pointer, or (process_t *)-1 on failure.
  */
 static process_t *process_create_locked(pid_t parent_pid,
                                         void *lcp,
+                                        int exec,
                                         pid_t *out_pid)
 {
     struct kcall_args_process_create data;
@@ -157,14 +166,21 @@ static process_t *process_create_locked(pid_t parent_pid,
 
     data.parent_pid = parent_pid;
     data.lcp = lcp;
+    data.exec = exec;
     data.adp_out = NULL;
     data.pid_out = 0;
 
     prp = (process_t *) syscall_priv(__KSYS_PRIV_PROCESS_CREATE, &data);
-    if (prp == (void *) -1 || !prp) {
+
+    /* The raw kcall returns -errno on failure. A valid process pointer is also
+     * in the high half, so test the errno range before using pid_out. pid 0 in
+     * thread_create would start the loader inside roottask.
+     */
+    if (!prp || (uintptr_t) prp >= (uintptr_t) -256L) {
+        errno = prp ? (int) -(intptr_t) prp : ENOMEM;
         if (out_pid)
             *out_pid = 0;
-        return prp;
+        return (process_t *) -1;
     }
 
     /* Claim the roottask-side per-process slot before any code path that writes
@@ -212,7 +228,7 @@ static process_t *process_create_locked(pid_t parent_pid,
     return prp;
 }
 
-process_t *process_create(pid_t parent_pid, void *lcp, pid_t *out_pid)
+process_t *process_create(pid_t parent_pid, void *lcp, int exec, pid_t *out_pid)
 {
     process_t *prp;
     pid_t pid = 0;
@@ -224,7 +240,7 @@ process_t *process_create(pid_t parent_pid, void *lcp, pid_t *out_pid)
      * space down; the lock is not recursive, so callers must not hold it.
      */
     proc_wlock_adp(ROOTTASK_PID);
-    prp = process_create_locked(parent_pid, lcp, out_pid);
+    prp = process_create_locked(parent_pid, lcp, exec, out_pid);
     proc_unlock_adp(ROOTTASK_PID);
     if (prp == (void *) -1 || !prp)
         return prp;
@@ -324,29 +340,52 @@ void *process_startup(pid_t pid, int start, uint64_t priv_caps)
     return (void *) syscall_priv(__KSYS_PRIV_PROCESS_STARTUP, &data);
 }
 
+/* Mirrors kernel/ext/process.c::kcall_args_process_exec. */
 struct kcall_args_process_exec {
-    void *lcp;
-    int *prcvid;
-    int rcvid;
+    unsigned op;
     pid_t ppid;
+    int lrcvid;
+    int crcvid;
+    pid_t shell_pid;
+    uint64_t priv_caps;
 };
 
-/* process_exec — perform the exec() image-replacement step. Parameters:
- *   lcp    : loader context for the replacement image
- *   prcvid : in/out pointer to the rcvid stored in the loader context
- *   rcvid  : rcvid of the message driving the exec
- *   ppid   : parent pid
- * Return value: EOK on success, -1 on failure (errno set).
+/* process_exec — one step of the image swap of an exec (see
+ * kernel/ext/process.c). Parameters:
+ *   op        : EXEC_BEGIN, EXEC_QUIESCE or EXEC_COMMIT
+ *   ppid      : the process that called exec
+ *   lrcvid    : rcvid of the loader thread of the shell (BEGIN, COMMIT)
+ *   crcvid    : rcvid of the thread that called exec (BEGIN, COMMIT)
+ *   shell_pid : the shell, the child the new image was loaded into (BEGIN,
+ *               QUIESCE)
+ *   priv_caps : authority the new image starts with (COMMIT)
+ * Return value: EOK on success, -1 on failure (errno set; EAGAIN means a
+ *   thread has yet to leave, call again).
  */
-int process_exec(void *lcp, int *prcvid, int rcvid, int ppid)
+int process_exec(unsigned op,
+                 pid_t ppid,
+                 int lrcvid,
+                 int crcvid,
+                 pid_t shell_pid,
+                 uint64_t priv_caps)
 {
     struct kcall_args_process_exec data;
+    int r;
 
-    data.lcp = lcp;
-    data.prcvid = prcvid;
-    data.rcvid = rcvid;
+    data.op = op;
     data.ppid = ppid;
-    return (int) (syscall_priv(__KSYS_PRIV_PROCESS_EXEC, &data));
+    data.lrcvid = lrcvid;
+    data.crcvid = crcvid;
+    data.shell_pid = shell_pid;
+    data.priv_caps = priv_caps;
+    r = (int) syscall_priv(__KSYS_PRIV_PROCESS_EXEC, &data);
+
+    /* kcall_err() sets SETKSTATUS(thp, -err): -errno on failure. */
+    if (r < 0) {
+        errno = -r;
+        r = -1;
+    }
+    return r;
 }
 
 /* process_shutdown — release a process's address space.

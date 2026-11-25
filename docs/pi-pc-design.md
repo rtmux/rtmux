@@ -137,6 +137,39 @@ Every path below must deboost or transfer ownership correctly:
 | priority change | `sched_thread` (`__sched_set`), `sched_ss_update`/`sched_ss_adjust` | set the base only (`thread_set_base_prio`), then reapply `max(base, loans)`; see "Base and Effective Priority" |
 | condvar reacquire | `ksys_sync_condvar_wait` re-lock leg | move from CV wait to mutex turnstile without collision-mixing |
 
+Each owner keeps its turnstiles in a priority list keyed by their highest
+waiter. Recomputing the owner's inherited priority reads the first entry.
+Updating a loan skips equal-priority groups, so insertion visits at most
+`NUM_PRI` priority levels. Debug list validation can also walk the entries.
+The `--pi-owner-loans` guest test releases three contended mutexes out of
+priority order and checks the effective priority after each handoff.
+
+Worst case under `sync_pi_slock`, interrupts off: a loan update is one
+`pril_rem` and one `pril_add` on the owner's list. Each steps once per distinct
+priority level on that list, and turnstile loans carry no notification boost
+bit, so a list has at most `NUM_PRI` = 256 levels and an update takes at most
+512 list steps however many mutexes the owner holds. Reading the owner's
+inherited priority (`sync_pi_target_locked`) takes constant time.
+
+Thread exit keeps the rule that whichever of the dying owner and a contender
+comes second sees the other, but pays for it only when there is something to
+see. `thread_t.sync_owner_flags` has a TRACKED bit, set (with an atomic OR)
+whenever the kernel records the thread as an owner: a contender naming it in a
+lock word, a turnstile taking it as owner, a robust record filed on it, or the
+thread itself queueing on a mutex it may be handed. Exit sets CLOSED with the
+same atomic OR. One of the two ORs comes first: if TRACKED was already set,
+exit scans the 128 chains as before; if CLOSED came first, the registration
+sees it and treats the thread as a dead owner, and exit returns without
+taking a chain lock. The bit is sticky until the thread is recycled, so a
+thread that ever contended a kernel-visible mutex pays the scan at exit.
+
+`thread_t.blocked_on_turnstile` is written only under the chain lock of the
+key its thread queues under, and cleared under `sync_pi_slock` as well. A
+holder of that chain lock may therefore read it without the PI lock; a reader
+that holds only `sync_pi_slock` may read it and take a turnstile reference.
+Waiters bound to no turnstile (semaphores, condition variables, mutexes
+without `PRIO_INHERIT`) leave their chain without touching `sync_pi_slock`.
+
 When a non-winning waiter leaves the queue, recompute the owner's boost from
 remaining waiters.  Clearing the boost simply because one waiter left is wrong
 when another higher-than-base waiter remains.
@@ -147,13 +180,9 @@ timeout cleanup, recompute owner boosts from remaining turnstiles, and free
 idle turnstiles after the last contender/owner/reference leaves.  The table
 remains the audit map for future priority-ceiling work.
 
-Legacy fields in `kernel/include/objects.h` are not reused blindly.  The design
-replacement is:
-
-- `thread_t.blocked_on_turnstile`: explicit pointer for PI propagation;
-- `thread_t.owned_turnstiles`: owner-held list used for deboost and death;
-- `ksync_t.mutex_holdlist`: retired from new PI code unless a replacement proves
-  it has the exact lifetime and granularity above.
+A blocked PI waiter records its turnstile in `thread_t.blocked_on_turnstile`.
+Each owner links its turnstiles through `thread_t.owned_turnstiles` for
+priority recomputation and thread teardown.
 
 ## RCU And Pinning
 
@@ -231,7 +260,10 @@ comparison.
 A thread created by a server while it serves a request starts at the
 request's priority, so a process spawned through roottask inherits its
 spawner's priority as POSIX requires; otherwise a new thread starts at its
-creator's base (`thread_inherit_prio`). PI loans are never inherited.
+creator's base (`thread_inherit_prio`). PI loans are never inherited. A
+creator that blocks until the new thread first runs (`pthread_create`) lends it
+its own running priority, loans included, until then, so it never waits on a
+thread below itself; the new thread's base is still the inherited priority.
 
 ### When a message loan starts and ends
 
@@ -241,6 +273,7 @@ creator's base (`thread_inherit_prio`). PI loans are never inherited.
 | `MsgCurrent` naming a client (`msg_current_take`) | `msg_loan` = that client's effective priority, new generation, request flag; on a `RTMUX_FLG_CHF_FIXED_PRIORITY` channel it lends nothing, so `msg_loan` is 0 with no request flag and an empty loan is left as it was; `pend_loan` unchanged |
 | receive of a notification, or a remote (`COF_NETCON`) message | `msg_loan` = its priority, new generation, no request flag, until the next receive |
 | receive on a `RTMUX_FLG_CHF_FIXED_PRIORITY` channel | `msg_loan` = 0 |
+| `thread_create` whose creator blocks until the new thread runs, with the creator running above the priority the new thread inherits | the new thread's `msg_loan` = the creator's running priority, no request flag; `thread_specret` ends it once it has readied the creator and applied any explicit policy, or a `SchedSet` on the new thread ends it before that |
 | send or notification queued with no receiver | `pend_loan` raised to its priority on each thread whose `last_chid` is the channel, whatever that thread's current priority |
 | `MsgReply` / `MsgError` that leaves the thread with no client | the request loan ends; if the call completed an exchange on the channel the thread serves, `pend_loan` = the send-queue head read as the client was unlinked |
 | reply to an older client while serving a newer one | unchanged: the newer client's loan stays |
@@ -289,12 +322,16 @@ Bounds and policies:
   `prio.reply_depth_overflow` counts the stop. No error is returned: the thread
   whose change started the walk is not deadlocked. `prio-loan` case 5 builds a
   chain one longer than the bound and checks both.
-- Cycles: a mutex-only cycle returns `EDEADLK` as before. An IPC hop that comes
+- Cycles: an explicit mutex lock that encounters a mutex-only cycle returns `EDEADLK`. An IPC hop that comes
   back to the contending waiter (it holds the request its mutex's owner waits
   on) is also a cycle and returns `EDEADLK` to that waiter instead of blocking
   forever (`prio-loan` case 4). The failed lock then walks the owner's chain
   again unconditionally (`sync_pi_recompute_chain`), taking the contender's
-  floor back out of every thread it reached.
+  floor back out of every thread it reached. A condition waiter has already
+  released its mutex before its reacquire encounters the cycle. The walk stops
+  at the same bound, and the waiter stays queued for handoff. The
+  `--cond-pi-cycle` fixture times out another participant and verifies that
+  the condition waiter returns holding its mutex.
 - Re-sorting: every adjust re-sorts the thread in the queue it waits on: the
   dispatch queue, a channel send queue (`adjust_priority_default`), or its
   sync chain (`sync_chain_requeue_waiter_locked`, which first finds the thread

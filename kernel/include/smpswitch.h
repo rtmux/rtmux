@@ -19,15 +19,11 @@ extern unsigned num_processors;
 #define WANT_SMP_MACROS
 #endif
 
+#define SPINLOCK(spin) intrspin_acquire(spin)
+#define SPINUNLOCK(spin) intrspin_release(spin)
+
 #if defined(WANT_SMP_MACROS)
 
-#define SPINLOCK(spin)                              \
-    do {                                            \
-        while ((spin)->value) { /* nothing to do */ \
-        }                                           \
-    } while (_smp_xchg(&(spin)->value, 1) != 0)
-/* Publish critical-section writes before the next acquire exchange. */
-#define SPINUNLOCK(spin) __atomic_store_n(&(spin)->value, 0, __ATOMIC_RELEASE)
 #define SENDIPI(cpu, cmd) send_ipi(cpu, cmd)
 #define SMP_FLUSH_TLB()     \
     if (num_processors > 1) \
@@ -43,8 +39,6 @@ extern unsigned num_processors;
 #define MEM_BARRIER_RW() __cpu_membarrier()
 
 #else /* Single-CPU */
-#define SPINLOCK(spin)
-#define SPINUNLOCK(spin)
 #define SENDIPI(cpu, cmd)
 #define SMP_FLUSH_TLB()
 #define SMP_SPINVAR(class, var)

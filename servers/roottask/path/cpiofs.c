@@ -89,7 +89,17 @@ struct cpiofs_ocb {
 
 static unsigned ocb_live;
 static unsigned ocb_mappings; /* of ocb_live, the ones behind VM mappings */
+static unsigned ocb_made; /* of ocb_live, the ones allocated, not reserved */
+static unsigned ocb_peak; /* the most ocb_made has been since boot */
 static unsigned ocb_failures;
+
+/* OCB use for /sys/kstats; read without a lock, so a moment old. */
+void cpiofs_ocb_stats(unsigned *live, unsigned *mappings, unsigned *peak)
+{
+    *live = __atomic_load_n(&ocb_live, __ATOMIC_RELAXED);
+    *mappings = __atomic_load_n(&ocb_mappings, __ATOMIC_RELAXED);
+    *peak = __atomic_load_n(&ocb_peak, __ATOMIC_RELAXED);
+}
 
 static void ocb_fail_note(const char *what)
 {
@@ -116,8 +126,11 @@ static void ocb_fail_note(const char *what)
 static struct cpiofs_ocb *ocb_alloc(void)
 {
     struct cpiofs_ocb *ocb;
+    unsigned live = __atomic_add_fetch(&ocb_live, 1, __ATOMIC_RELAXED);
+    unsigned made;
+    unsigned peak;
 
-    if (__atomic_add_fetch(&ocb_live, 1, __ATOMIC_RELAXED) > CPIOFS_MAX_OCBS) {
+    if (live > CPIOFS_MAX_OCBS) {
         __atomic_sub_fetch(&ocb_live, 1, __ATOMIC_RELAXED);
         ocb_fail_note("OCB limit reached");
         return NULL;
@@ -126,7 +139,18 @@ static struct cpiofs_ocb *ocb_alloc(void)
     if (!ocb) {
         __atomic_sub_fetch(&ocb_live, 1, __ATOMIC_RELAXED);
         ocb_fail_note("roottask heap exhausted allocating an OCB");
+        return NULL;
     }
+
+    /* The peak counts OCBs that exist, not reservations a failed calloc would
+     * give back.
+     */
+    made = __atomic_add_fetch(&ocb_made, 1, __ATOMIC_RELAXED);
+    peak = __atomic_load_n(&ocb_peak, __ATOMIC_RELAXED);
+    while (made > peak &&
+           !__atomic_compare_exchange_n(&ocb_peak, &peak, made, true,
+                                        __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+        ;
     return ocb;
 }
 
@@ -136,6 +160,7 @@ static void ocb_free(struct cpiofs_ocb *ocb)
         __atomic_sub_fetch(&ocb_mappings, 1, __ATOMIC_RELAXED);
     free(ocb->prefix);
     free(ocb);
+    __atomic_sub_fetch(&ocb_made, 1, __ATOMIC_RELAXED);
     __atomic_sub_fetch(&ocb_live, 1, __ATOMIC_RELAXED);
 }
 
@@ -357,6 +382,14 @@ static int cpiofs_read(ioserv_context_t *ctp, io_read_t *msg, void *handle)
     return IOSERV_NPARTS(1);
 }
 
+/* The offset of the payload identifies its entry for the archive lifetime. Even
+ * an empty entry has its own header before the next payload.
+ */
+static ino_t cpiofs_inode(const uint8_t *data)
+{
+    return data ? (ino_t) (data - cpio_base) : 1;
+}
+
 static int cpiofs_stat(ioserv_context_t *ctp, io_stat_t *msg, void *handle)
 {
     struct cpiofs_ocb *ocb = handle;
@@ -371,7 +404,8 @@ static int cpiofs_stat(ioserv_context_t *ctp, io_stat_t *msg, void *handle)
     msg->o.st_mode = ocb->mode;
     msg->o.st_size = (off_t) ocb->size;
     msg->o.st_nlink = 1;
-    msg->o.st_dev = (ctp->info.srcnd << RTMUX_NODE_BITS) | path_devno;
+    msg->o.st_dev = (ctp->info.srcnd << RTMUX_NODE_BITS) | cpiofs_devno;
+    msg->o.st_ino = cpiofs_inode(ocb->data);
     msg->o.st_rdev = (ctp->info.srcnd << RTMUX_NODE_BITS) | cpiofs_devno;
 
     return IOSERV_PTR(ctp, &msg->o, sizeof(msg->o));
@@ -502,7 +536,7 @@ static void readdir_cb(const cpio_file_info_t *info, void *user_data)
         return;
 
     struct dirent *dp = (struct dirent *) ((char *) ctx->dp + ctx->used_bytes);
-    dp->d_ino = (ino_t) (ctx->entry_idx + 1);
+    dp->d_ino = cpiofs_inode(info->data);
     dp->d_reclen = (uint16_t) reclen;
     dp->d_namelen = (uint16_t) strlen(name);
     memcpy(dp->d_name, name, strlen(name) + 1);

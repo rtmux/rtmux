@@ -19,6 +19,7 @@ int pthread_cond_wait(pthread_cond_t *cond, pthread_mutex_t *mutex)
     if ((mutex->owner & ~RTMUX_SYNC_WAITING) != LIBC_TLS()->__owner) {
         return EPERM;
     }
+    pthread_testcancel();
     __libc_wait_enter(&w);
     ret = sync_condvar_wait_r((sync_t *) cond, (sync_t *) mutex);
     __libc_wait_exit(&w);

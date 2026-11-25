@@ -24,6 +24,39 @@
 #include <sys/rtmux-core.h>
 #include <unistd.h>
 #include "connect.h"
+#ifndef LDSO_MINIMAL_CONNECT
+#include "signal-state.h"
+#endif
+
+/* Send a connect message. For open() (FLAG_INTERRUPTIBLE, set where _vopen
+ * comes in) the send is a registered wait, like read()'s: POSIX lets open()
+ * fail with EINTR, and a service may hold an open for as long as it likes (a
+ * FIFO with no peer, a device that is not ready), so a signal whose handler was
+ * installed without SA_RESTART breaks it. The connects libc makes for other
+ * calls (stat, access, opendir, the pieces of a path walk) are not: their
+ * callers do not expect EINTR. After an EINTR nothing more is sent on that
+ * connection: the server may still hold the open.
+ */
+static int connect_send(const struct _connect_ctrl *ctrl,
+                        int fd,
+                        const iov_t *siov,
+                        int sparts,
+                        const iov_t *riov,
+                        int rparts)
+{
+#ifndef LDSO_MINIMAL_CONNECT
+    if (ctrl->flags & FLAG_INTERRUPTIBLE) {
+        libc_waiter_t w;
+        int ret;
+
+        __libc_wait_enter(&w);
+        ret = ctrl->send(fd, siov, sparts, riov, rparts);
+        __libc_wait_exit(&w);
+        return ret;
+    }
+#endif
+    return ctrl->send(fd, siov, sparts, riov, rparts);
+}
 
 #ifndef SYMLOOP_MAX
 #define SYMLOOP_MAX _POSIX_SYMLOOP_MAX
@@ -48,8 +81,48 @@ static const struct _io_connect_entry _connect_proc_entry = {
     PATH_HANDLE,
 };
 
+/* Send an open connect on *fdp. A server answers EADDRINUSE, before it runs the
+ * open, when it still holds a binding on this id: one from an open this process
+ * gave up on (a timeout or a signal) that the server is still running, so its
+ * failed reply has not closed it yet. Nothing was done, so send the connect
+ * once more on a new id, keeping the busy one attached until then so that it is
+ * not the id given; then *fdp is the new id and the busy one is detached.
+ * EADDRINUSE is the server's answer for that alone (an open does not fail with
+ * it), and is reported EBUSY if it cannot be got past.
+ */
+static int connect_send_open(const struct _connect_ctrl *ctrl,
+                             int *fdp,
+                             const struct _io_connect_entry *entry,
+                             const iov_t *siov,
+                             int sparts,
+                             const iov_t *riov)
+{
+    const struct _io_connect *msg = ctrl->msg;
+    int fd, ret, err;
+
+    ret = connect_send(ctrl, *fdp, siov, sparts, riov, 2);
+    if (ret != -1 || errno != EADDRINUSE)
+        return ret;
+    if (msg->subtype != _IO_CONNECT_OPEN &&
+        msg->subtype != _IO_CONNECT_COMBINE &&
+        msg->subtype != _IO_CONNECT_COMBINE_CLOSE)
+        return ret; /* the server checks only opens: its own answer */
+    fd = connect_attach(entry->nd, entry->pid, entry->chid,
+                        (unsigned) ctrl->base, RTMUX_FLG_COF_CLOEXEC);
+    if (fd == -1) {
+        errno = EBUSY;
+        return -1;
+    }
+    ret = connect_send(ctrl, fd, siov, sparts, riov, 2);
+    err = ret == -1 && errno == EADDRINUSE ? EBUSY : errno;
+    (void) connect_detach_r((uint64_t) *fdp);
+    *fdp = fd;
+    errno = err;
+    return ret;
+}
+
 static int _connect_io(struct _connect_ctrl const *ctrl,
-                       int fd,
+                       int *fdp,
                        const char *prefix,
                        unsigned prefix_len,
                        const char *path,
@@ -101,7 +174,7 @@ static int _connect_io(struct _connect_ctrl const *ctrl,
 
     if (ret && (!(ctrl->flags & FLAG_TEST_ND_ONLY) ||
                 RTMUX_NODE_CMP(ctrl->nd, entry->nd) == 0)) {
-        ret = ctrl->send(fd, siov, (int) sparts, riov, 2);
+        ret = connect_send_open(ctrl, fdp, entry, siov, (int) sparts, riov);
         if (ret != -1 || (ctrl->flags & FLAG_TEST_ENTRY))
             return ret;
     }
@@ -141,9 +214,14 @@ static int _connect_io(struct _connect_ctrl const *ctrl,
         msg->subtype = _IO_CONNECT_COMBINE_CLOSE;
 
         saved_errno = errno;
-        ret = ctrl->send(fd, siov, (int) sparts, riov, 2);
+        ret = connect_send_open(ctrl, fdp, entry, siov, (int) sparts, riov);
         if (ret == -1) {
-            errno = (ctrl->flags & FLAG_TEST_ENTRY) ? ENXIO : saved_errno;
+            /* A signal that broke this send ends the open: keep its EINTR,
+             * which the callers stop at, over the first send's error, which
+             * they would try the next server for.
+             */
+            if (errno != EINTR)
+                errno = (ctrl->flags & FLAG_TEST_ENTRY) ? ENXIO : saved_errno;
         } else if (((unsigned) ret &
                     (_IO_CONNECT_RET_FLAG | _IO_CONNECT_RET_TYPE_MASK)) !=
                    (_IO_CONNECT_RET_FLAG | _IO_CONNECT_RET_LINK)) {
@@ -188,7 +266,7 @@ static int _connect_request(struct _connect_ctrl *ctrl,
     msg->handle = entry->handle;
     msg->eflag = reply->eflag;
 
-    ctrl->status = _connect_io(ctrl, fd, prefix, prefix_len, path + path_skip,
+    ctrl->status = _connect_io(ctrl, &fd, prefix, prefix_len, path + path_skip,
                                buffer, entry);
     if (ctrl->status == -1) {
         connect_detach_r((uint64_t) fd);
@@ -416,7 +494,8 @@ static int _connect_request(struct _connect_ctrl *ctrl,
                     }
                     SETIOV(riov2 + 0, reply, sizeof *reply);
                     SETIOV(riov2 + 1, buffer, msg->reply_max - sizeof *reply);
-                    ctrl->status = ctrl->send(fd, siov2, sparts2, riov2, 2);
+                    ctrl->status =
+                        connect_send(ctrl, fd, siov2, sparts2, riov2, 2);
                     if (ctrl->status == -1 ||
                         msg->subtype == _IO_CONNECT_COMBINE_CLOSE) {
                         io_close_t msg2;
@@ -426,7 +505,14 @@ static int _connect_request(struct _connect_ctrl *ctrl,
                         msg2.i.combine_len = sizeof msg2.i;
                         SETIOV(siov2 + 0, &msg2.i, sizeof msg2.i);
                         save_errno = errno;
-                        (void) ctrl->send(fd, siov2, 1, 0, 0);
+
+                        /* Not after a signal broke the open: the close would
+                         * wait for the server that still holds it. Its reply to
+                         * the open is lost, and the detach below ends the
+                         * connection.
+                         */
+                        if (ctrl->status != -1 || save_errno != EINTR)
+                            (void) ctrl->send(fd, siov2, 1, 0, 0);
                         errno = save_errno;
                         if (ctrl->status == -1) {
                             connect_detach_r((uint64_t) fd);

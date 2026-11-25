@@ -56,7 +56,14 @@ paddr_t strtopaddr(const char *nptr, char **endptr, int base)
         digit = radix_value(*p);
         if (digit >= (unsigned) base)
             break;
-        value = value * (unsigned) base + digit;
+
+        /* Saturate rather than wrap, as libc's strtoul does: a number too large
+         * for the type must not come back as a small one.
+         */
+        if (value > ((paddr_t) -1 - digit) / (unsigned) base)
+            value = (paddr_t) -1;
+        else
+            value = value * (unsigned) base + digit;
         ++p;
     }
     if (p == startp)

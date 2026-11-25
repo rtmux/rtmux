@@ -11,5 +11,6 @@
 
 int pthread_join(pthread_t thread, void **value_ptr)
 {
+    pthread_testcancel();
     return __rtmux_pthread_ret(thread_join_r((int) thread, value_ptr));
 }

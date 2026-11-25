@@ -7,6 +7,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <devctl.h>
+#include <devctl/proc.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -23,6 +25,8 @@
 #include <sched.h>
 #include <stdalign.h>
 #include <unistd.h>
+#include <sys/procfs.h>
+#include <sys/procmsg.h>
 #include <sys/rtmux-core.h>
 
 #include "test.h"
@@ -266,6 +270,148 @@ int inject_run(const char *a1, const char *a2, const char *a3)
         waitpid(pid, &st, 0) != pid || !WIFEXITED(st))
         return -1;
     return WEXITSTATUS(st);
+}
+
+/* Wait, for three seconds at most, until thread tid of this process is blocked
+ * in state: the way to know which side of an exchange is already waiting.
+ */
+int test_thread_blocked(pthread_t tid, int state)
+{
+    char path[32];
+    int found = 0, fd;
+
+    snprintf(path, sizeof path, "/proc/%d", (int) getpid());
+    fd = open(path, O_RDONLY);
+    if (fd < 0)
+        return 0;
+    for (int i = 0; i < 300 && !found; i++) {
+        procfs_status st = {.tid = tid};
+
+        if (devctl(fd, DEVCTL_PROC_TIDSTATUS, &st, sizeof st, NULL) != EOK ||
+            st.tid != tid)
+            break;
+        found = st.state == state;
+        if (!found)
+            sleep_ms(10);
+    }
+    close(fd);
+    return found;
+}
+
+/* A channel of this process and a side-channel connection to it. Returns
+ * nonzero when both exist.
+ */
+int test_chan_open(unsigned flags, int *chid, int *coid)
+{
+    *coid = -1;
+    *chid = channel_create(flags);
+    if (*chid != -1)
+        *coid = connect_attach(0, getpid(), *chid, RTMUX_SIDE_CHANNEL, 0);
+    return *coid != -1;
+}
+
+/* Arm a roottask debug window; see test.h. */
+int test_window_arm(unsigned where, unsigned ms)
+{
+    struct _proc_jobctl msg;
+
+    memset(&msg, 0, sizeof msg);
+    msg.type = _PROC_JOBCTL;
+    msg.subtype = _PROC_JOBCTL_DEBUG;
+    msg.arg = (int32_t) where;
+    msg.arg2 = (int32_t) ms;
+    return msg_sendnc(ROOTTASK_COID, &msg, sizeof msg, 0, 0) == 0;
+}
+
+/* Wait, for ms milliseconds at most, until *flag is at least want. Returns
+ * nonzero when it is.
+ */
+int test_wait_flag(atomic_int *flag, int want, int ms)
+{
+    for (int i = 0; i < ms && atomic_load(flag) < want; i++)
+        sleep_ms(1);
+    return atomic_load(flag) >= want;
+}
+
+/* Arm a timeout for the calling thread's next receive. */
+void test_receive_within(uint64_t ns)
+{
+    (void) __timer_timeout(CLOCK_MONOTONIC, RTMUX_TIMEOUT_RECEIVE, NULL, &ns,
+                           NULL);
+}
+
+/* Keep the observer process alive through the injected window. Reaping an
+ * inject helper here can wait for an RCU grace period on the stalled hart. */
+
+
+int stall_watch_start(struct stall_watch *watch, const char *site)
+{
+    int events[2], commands[2];
+    if (pipe(events) < 0)
+        return -1;
+    if (pipe(commands) < 0) {
+        close(events[0]);
+        close(events[1]);
+        return -1;
+    }
+    /* A later monitor must not keep this one's release pipe open. */
+    if (fcntl(commands[1], F_SETFD, FD_CLOEXEC) == -1 ||
+        fcntl(events[0], F_SETFD, FD_CLOEXEC) == -1) {
+        close(events[0]);
+        close(events[1]);
+        close(commands[0]);
+        close(commands[1]);
+        return -1;
+    }
+    posix_spawn_file_actions_t actions;
+    int rc = posix_spawn_file_actions_init(&actions);
+    if (!rc) {
+        rc = posix_spawn_file_actions_adddup2(&actions, commands[0], 0);
+        if (!rc)
+            rc = posix_spawn_file_actions_adddup2(&actions, events[1], 1);
+        if (!rc)
+            rc = posix_spawn_file_actions_addclose(&actions, commands[1]);
+        if (!rc) {
+            char *argv[] = {"inject", "site-watch", (char *) site, NULL};
+            rc = posix_spawn(&watch->pid, "/bin/inject", &actions, NULL, argv,
+                             NULL);
+        }
+        posix_spawn_file_actions_destroy(&actions);
+    }
+    close(commands[0]);
+    close(events[1]);
+    if (rc) {
+        close(events[0]);
+        close(commands[1]);
+        return -1;
+    }
+    watch->events = events[0];
+    watch->release = commands[1];
+    char ready;
+    return read(watch->events, &ready, 1) == 1 && ready == 'R' ? 0 : -1;
+}
+
+void stall_watch_release(struct stall_watch *w)
+{
+    if (w->pid > 0 && w->release >= 0) {
+        close(w->release);
+        w->release = -1;
+    }
+}
+
+void stall_watch_finish(struct stall_watch *w)
+{
+    if (w->pid > 0) {
+        stall_watch_release(w);
+        close(w->events);
+        (void) waitpid(w->pid, NULL, 0);
+    }
+}
+
+int stall_watch_entered(struct stall_watch *w)
+{
+    char event;
+    return read(w->events, &event, 1) == 1 && event == 'Y';
 }
 
 /* Child: connect to the parent's channel DISC_CONNS times, then park. */

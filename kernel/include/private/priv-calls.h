@@ -137,7 +137,8 @@
     X(PROC_CAP_MINT, PROCESS, kext_proc_cap_mint)                 \
     X(SOUL_STATS, SYSTEM, kext_soul_stats)                        \
     X(DEBUG_INJECT, INJECT, RTMUX_PRIV_INJECT_HANDLER)            \
-    X(ICACHE_SYNC, PTE, kext_icache_sync_all)
+    X(ICACHE_SYNC, PTE, kext_icache_sync_all)                     \
+    X(PROC_SYSCHAN_DETACH, PROCESS, kext_proc_syschan_detach)
 
 enum {
 #define RTMUX_PRIV_ENUM(id, cap, handler) __KSYS_PRIV_##id,

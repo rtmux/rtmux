@@ -18,7 +18,7 @@
  */
 
 #include <core/globals.h>
-#include "as.h"          /* CPU_1TO1_VADDR_BIAS, PA_TO_VA */
+#include "as.h"
 #include <sv39-lookup.h> /* PTE_*, cpu_pte_lookup, sv39_leaf_paddr */
 #include <sys/mman.h>
 

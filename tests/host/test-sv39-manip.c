@@ -70,7 +70,7 @@ struct run {
 };
 
 static struct run manip(pagetable_t root,
-                        enum sv39_manip_op op,
+                        enum pte_op op,
                         uintptr_t start,
                         uintptr_t end,
                         uint64_t paddr,
@@ -108,7 +108,7 @@ static void check_map_ok(void)
     struct run r;
 
     alloc_budget = 8;
-    r = manip(root, SV39_MANIP_MAP, va, va + 3 * PGSIZE, 0x80000000UL,
+    r = manip(root, PTE_OP_MAP, va, va + 3 * PGSIZE, 0x80000000UL,
               USER_RW);
     CHECK(r.err == 0 && r.changed);
     CHECK(r.start == va + 3 * PGSIZE && r.paddr == 0x80003000UL);
@@ -131,14 +131,14 @@ static void check_map_over_superpage(void)
     /* The tables for the region below the leaf, then the leaf in the next L1
      * slot of the same L1 table.
      */
-    r = manip(root, SV39_MANIP_PREALLOC, leaf - MIB2, leaf - MIB2 + PGSIZE, 0,
+    r = manip(root, PTE_OP_PREALLOC, leaf - MIB2, leaf - MIB2 + PGSIZE, 0,
               0);
     CHECK(r.err == 0 && PX(2, leaf) == PX(2, leaf - MIB2));
     plant_megapage(root, leaf);
     CHECK(!sv39_walk_slot(root, leaf, NULL, &err) && err == EEXIST);
 
     before = allocs;
-    r = manip(root, SV39_MANIP_MAP, leaf - 2 * PGSIZE, leaf + 2 * PGSIZE,
+    r = manip(root, PTE_OP_MAP, leaf - 2 * PGSIZE, leaf + 2 * PGSIZE,
               0x80000000UL, USER_RW);
     CHECK(r.err == EEXIST);
     CHECK(r.start == leaf && r.paddr == 0x80002000UL && r.changed);
@@ -147,7 +147,7 @@ static void check_map_over_superpage(void)
     CHECK(allocs == before); /* the leaf was never read as a table */
 
     /* Starting on the leaf itself: nothing done, nothing changed. */
-    r = manip(root, SV39_MANIP_MAP, leaf, leaf + PGSIZE, 0x90000000UL,
+    r = manip(root, PTE_OP_MAP, leaf, leaf + PGSIZE, 0x90000000UL,
               USER_RW);
     CHECK(r.err == EEXIST && r.start == leaf && r.paddr == 0x90000000UL);
     CHECK(!r.changed);
@@ -161,7 +161,7 @@ static void check_map_over_gigapage(void)
 
     root[2] = PA2PTE(0x140000000UL) | LEAF_RW;
     alloc_budget = 8;
-    r = manip(root, SV39_MANIP_MAP, 0x80001000UL, 0x80003000UL, 0x1000UL,
+    r = manip(root, PTE_OP_MAP, 0x80001000UL, 0x80003000UL, 0x1000UL,
               USER_RW);
     CHECK(r.err == EEXIST && r.start == 0x80001000UL && !r.changed);
 }
@@ -176,7 +176,7 @@ static void check_map_enomem_midway(void)
     struct run r;
 
     alloc_budget = 2; /* L1 and the L0 below the edge, none for the next L0 */
-    r = manip(root, SV39_MANIP_MAP, edge - 2 * PGSIZE, edge + 2 * PGSIZE,
+    r = manip(root, PTE_OP_MAP, edge - 2 * PGSIZE, edge + 2 * PGSIZE,
               0x80000000UL, USER_RW);
     CHECK(r.err == ENOMEM);
     CHECK(r.start == edge && r.paddr == 0x80002000UL && r.changed);
@@ -185,7 +185,7 @@ static void check_map_enomem_midway(void)
 
     /* No table at all for the first page: ENOMEM with no progress. */
     alloc_budget = 0;
-    r = manip(root, SV39_MANIP_MAP, 0x50000000UL, 0x50001000UL, 0x1000UL,
+    r = manip(root, PTE_OP_MAP, 0x50000000UL, 0x50001000UL, 0x1000UL,
               USER_RW);
     CHECK(r.err == ENOMEM && r.start == 0x50000000UL && r.paddr == 0x1000UL);
     CHECK(!r.changed);
@@ -199,10 +199,10 @@ static void check_prealloc(void)
     struct run r;
 
     alloc_budget = 1; /* L1 only: the L0 for the first page fails */
-    r = manip(root, SV39_MANIP_PREALLOC, va, va + PGSIZE, 0, 0);
+    r = manip(root, PTE_OP_PREALLOC, va, va + PGSIZE, 0, 0);
     CHECK(r.err == ENOMEM && r.start == va && !r.changed);
     alloc_budget = 4;
-    r = manip(root, SV39_MANIP_PREALLOC, va, va + 2 * PGSIZE, 0, 0);
+    r = manip(root, PTE_OP_PREALLOC, va, va + 2 * PGSIZE, 0, 0);
     CHECK(r.err == 0 && r.start == va + 2 * PGSIZE && !r.changed);
     CHECK(slot(root, va) && !*slot(root, va));
 }
@@ -220,20 +220,20 @@ static void check_unmap_prot(void)
     int before;
 
     alloc_budget = 8;
-    (void) manip(root, SV39_MANIP_MAP, va, va + 2 * PGSIZE, 0x80000000UL,
+    (void) manip(root, PTE_OP_MAP, va, va + 2 * PGSIZE, 0x80000000UL,
                  USER_RW);
     before = allocs;
 
     /* Over a hole (no table): success, nothing changed, nothing allocated. */
-    r = manip(root, SV39_MANIP_UNMAP, 0x70000000UL, 0x70003000UL, 0, 0);
+    r = manip(root, PTE_OP_UNMAP, 0x70000000UL, 0x70003000UL, 0, 0);
     CHECK(r.err == 0 && r.start == 0x70003000UL && !r.changed);
-    r = manip(root, SV39_MANIP_PROT, 0x70000000UL, 0x70003000UL, 0, USER_RW);
+    r = manip(root, PTE_OP_PROT, 0x70000000UL, 0x70003000UL, 0, USER_RW);
     CHECK(r.err == 0 && !r.changed && allocs == before);
 
     /* PROT keeps the frame and the Svpbmt bits, swaps the flag bits. */
     p = slot(root, va);
     *p |= PBMT_NC;
-    r = manip(root, SV39_MANIP_PROT, va, va + PGSIZE, 0,
+    r = manip(root, PTE_OP_PROT, va, va + PGSIZE, 0,
               PTE_V | PTE_A | PTE_R | PTE_U);
     CHECK(r.err == 0 && r.changed);
     CHECK(*p == (PA2PTE(0x80000000UL) | PBMT_NC | PTE_V | PTE_A | PTE_R |
@@ -241,21 +241,147 @@ static void check_unmap_prot(void)
     CHECK(PTE2PA(*p) == 0x80000000UL);
 
     /* UNMAP clears both pages; the second pass finds them invalid. */
-    r = manip(root, SV39_MANIP_UNMAP, va, va + 2 * PGSIZE, 0, 0);
+    r = manip(root, PTE_OP_UNMAP, va, va + 2 * PGSIZE, 0, 0);
     CHECK(r.err == 0 && r.changed && !*slot(root, va) &&
           !*slot(root, va + PGSIZE));
-    r = manip(root, SV39_MANIP_UNMAP, va, va + 2 * PGSIZE, 0, 0);
+    r = manip(root, PTE_OP_UNMAP, va, va + 2 * PGSIZE, 0, 0);
     CHECK(r.err == 0 && !r.changed);
 
     /* Over a 2 MiB leaf: EEXIST at its first page, the page before it done. */
-    (void) manip(root, SV39_MANIP_MAP, leaf - PGSIZE, leaf, 0x80000000UL,
+    (void) manip(root, PTE_OP_MAP, leaf - PGSIZE, leaf, 0x80000000UL,
                  USER_RW);
     plant_megapage(root, leaf);
-    r = manip(root, SV39_MANIP_UNMAP, leaf - PGSIZE, leaf + PGSIZE, 0, 0);
+    r = manip(root, PTE_OP_UNMAP, leaf - PGSIZE, leaf + PGSIZE, 0, 0);
     CHECK(r.err == EEXIST && r.start == leaf && r.changed);
     CHECK(!*slot(root, leaf - PGSIZE));
-    r = manip(root, SV39_MANIP_PROT, leaf, leaf + PGSIZE, 0, USER_RW);
+    r = manip(root, PTE_OP_PROT, leaf, leaf + PGSIZE, 0, USER_RW);
     CHECK(r.err == EEXIST && r.start == leaf && !r.changed);
+}
+
+/* BAD marks pages past the end of their object: it writes the invalid
+ * PTE_SW_BUS mark over an empty slot or a valid leaf, creating tables like MAP.
+ * sv39_past_end sees only that mark; PROT leaves it as it is, UNMAP and a later
+ * MAP replace it.
+ */
+static void check_bad_mark(void)
+{
+    pagetable_t root = new_root();
+    uintptr_t va = 0x20000000UL;
+    struct run r;
+
+    alloc_budget = 8;
+    r = manip(root, PTE_OP_MAP, va, va + PGSIZE, 0x80000000UL, USER_RW);
+    CHECK(r.err == 0);
+    CHECK(!sv39_past_end(root, va) && !sv39_past_end(root, va + PGSIZE));
+
+    /* Over the mapped page and the empty one after it. */
+    r = manip(root, PTE_OP_BAD, va, va + 2 * PGSIZE, 0, 0);
+    CHECK(r.err == 0 && r.changed && r.start == va + 2 * PGSIZE);
+    CHECK(*slot(root, va) == PTE_SW_BUS && *slot(root, va + PGSIZE) == PTE_SW_BUS);
+    CHECK(sv39_past_end(root, va) && sv39_past_end(root, va + PGSIZE + 8));
+    CHECK(!sv39_lookup_leaf(root, va, NULL, NULL));
+    CHECK(!sv39_past_end(root, va + 2 * PGSIZE)); /* empty slot */
+    CHECK(!sv39_past_end(root, 0x60000000UL));    /* no table */
+
+    /* PROT does not make a marked page valid. */
+    r = manip(root, PTE_OP_PROT, va, va + 2 * PGSIZE, 0, USER_RW);
+    CHECK(r.err == 0 && !r.changed && *slot(root, va) == PTE_SW_BUS);
+
+    /* MAP over the mark: an ordinary page again. */
+    r = manip(root, PTE_OP_MAP, va + PGSIZE, va + 2 * PGSIZE, 0x90000000UL, USER_RW);
+    CHECK(r.err == 0 && *slot(root, va + PGSIZE) == (PA2PTE(0x90000000UL) | USER_RW));
+    CHECK(!sv39_past_end(root, va + PGSIZE));
+
+    /* UNMAP clears the mark: an unmapped page is SIGSEGV, not SIGBUS. */
+    r = manip(root, PTE_OP_UNMAP, va, va + 2 * PGSIZE, 0, 0);
+    CHECK(r.err == 0 && r.changed && !*slot(root, va) && !*slot(root, va + PGSIZE));
+    CHECK(!sv39_past_end(root, va));
+
+    /* Marking or clearing an invalid slot changes no translation: no flush. */
+    r = manip(root, PTE_OP_BAD, va, va + PGSIZE, 0, 0);
+    CHECK(r.err == 0 && !r.changed && sv39_past_end(root, va));
+    r = manip(root, PTE_OP_UNMAP, va, va + PGSIZE, 0, 0);
+    CHECK(r.err == 0 && !r.changed && !*slot(root, va));
+
+    /* With no table, BAD has to make one, and reports ENOMEM if it cannot. */
+    alloc_budget = 0;
+    r = manip(root, PTE_OP_BAD, 0x50000000UL, 0x50001000UL, 0, 0);
+    CHECK(r.err == ENOMEM && !r.changed);
+}
+
+/* BAD over whole 2 MiB regions marks their level-one slots and makes no
+ * level-zero table: at most one table per 2 MiB. Every other operation keeps
+ * the mark on the pages it does not touch.
+ */
+static void check_bad_mark_coarse(void)
+{
+    pagetable_t root = new_root();
+    uintptr_t gib = 0x80000000UL; /* L2 slot 2 */
+    uintptr_t va = 0x40000000UL;  /* L2 slot 1 */
+    pagetable_t l1;
+    struct run r;
+    int before;
+
+    /* A whole gigabyte: one level-one table, no level-zero table. */
+    alloc_budget = 8;
+    before = allocs;
+    r = manip(root, PTE_OP_BAD, gib, gib + sv39_leaf_size(2), 0, 0);
+    CHECK(r.err == 0 && !r.changed && allocs == before + 1);
+    CHECK(sv39_past_end(root, gib) && sv39_past_end(root, gib + sv39_leaf_size(2) - 1));
+    CHECK(!sv39_lookup_leaf(root, gib + 12345, NULL, NULL));
+
+    /* 2 MiB and two pages: the level-one table, and one level-zero table for
+     * the two pages past the whole region.
+     */
+    before = allocs;
+    r = manip(root, PTE_OP_BAD, va, va + MIB2 + 2 * PGSIZE, 0, 0);
+    CHECK(r.err == 0 && r.start == va + MIB2 + 2 * PGSIZE && allocs == before + 2);
+    l1 = PA_TO_VA(PTE2PA(root[PX(2, va)]));
+    CHECK(l1[PX(1, va)] == PTE_SW_BUS);
+    CHECK(sv39_past_end(root, va) && sv39_past_end(root, va + MIB2 - 1) &&
+          sv39_past_end(root, va + MIB2 + PGSIZE) && !sv39_past_end(root, va + MIB2 + 2 * PGSIZE));
+
+    /* BAD over part of a marked region changes nothing and makes no table. */
+    before = allocs;
+    r = manip(root, PTE_OP_BAD, va + 3 * PGSIZE, va + 9 * PGSIZE, 0, 0);
+    CHECK(r.err == 0 && !r.changed && allocs == before && l1[PX(1, va)] == PTE_SW_BUS);
+
+    /* PROT does nothing to a mark. */
+    r = manip(root, PTE_OP_PROT, va, va + MIB2, 0, USER_RW);
+    CHECK(r.err == 0 && !r.changed && l1[PX(1, va)] == PTE_SW_BUS);
+
+    /* MAP one page inside the marked region: the mark is split into a table
+     * of marks, and only that page changes.
+     */
+    before = allocs;
+    r = manip(root, PTE_OP_MAP, va + 5 * PGSIZE, va + 6 * PGSIZE, 0x90000000UL, USER_RW);
+    CHECK(r.err == 0 && allocs == before + 1 && (l1[PX(1, va)] & PTE_V));
+    CHECK(*slot(root, va + 5 * PGSIZE) == (PA2PTE(0x90000000UL) | USER_RW));
+    CHECK(sv39_past_end(root, va + 4 * PGSIZE) && sv39_past_end(root, va + 6 * PGSIZE) &&
+          sv39_past_end(root, va + MIB2 - PGSIZE));
+
+    /* UNMAP of a whole marked region clears its level-one mark. */
+    r = manip(root, PTE_OP_UNMAP, gib, gib + MIB2, 0, 0);
+    l1 = PA_TO_VA(PTE2PA(root[PX(2, gib)]));
+    CHECK(r.err == 0 && !l1[PX(1, gib)] && !sv39_past_end(root, gib) &&
+          sv39_past_end(root, gib + MIB2));
+
+    /* UNMAP of part of one splits it: the page goes, its neighbours keep the
+     * mark.
+     */
+    before = allocs;
+    r = manip(root, PTE_OP_UNMAP, gib + MIB2 + PGSIZE, gib + MIB2 + 2 * PGSIZE, 0, 0);
+    CHECK(r.err == 0 && allocs == before + 1);
+    CHECK(!sv39_past_end(root, gib + MIB2 + PGSIZE) && !*slot(root, gib + MIB2 + PGSIZE));
+    CHECK(sv39_past_end(root, gib + MIB2) && sv39_past_end(root, gib + MIB2 + 2 * PGSIZE));
+
+    /* With no table for the split, the whole mark goes rather than the unmap
+     * failing: the region then faults SIGSEGV.
+     */
+    alloc_budget = 0;
+    r = manip(root, PTE_OP_UNMAP, gib + 2 * MIB2 + PGSIZE, gib + 2 * MIB2 + 2 * PGSIZE, 0, 0);
+    CHECK(r.err == 0 && !l1[PX(1, gib + 2 * MIB2)] && !sv39_past_end(root, gib + 2 * MIB2));
+    CHECK(sv39_past_end(root, gib + 3 * MIB2));
 }
 
 int main(void)
@@ -266,6 +392,8 @@ int main(void)
     check_map_enomem_midway();
     check_prealloc();
     check_unmap_prot();
+    check_bad_mark();
+    check_bad_mark_coarse();
     puts("sv39-manip: PASS");
     return 0;
 }

@@ -55,11 +55,53 @@ void intrevent_preemption(unsigned prio)
 }
 
 
+/* End thp's wait for a SIGEV_UNBLOCK event: a sleep ends with no error, any
+ * other wait with ETIMEDOUT. With wait_seq, only the wait of that wake_seq
+ * (thread_wake_seq) ends, and a thread woken since is left alone: a timeout
+ * timer's fire is delivered after its wheel lock is dropped, and the wait it
+ * was armed for may have ended and the thread entered a later one meanwhile.
+ * Without, whatever wait thp is in now ends.
+ *
+ * Returns false when the event found its wait over and woke nothing: a sleep
+ * claimed by another waker, or a bound wait thp has left. A bound wait that
+ * another hart ends under its own lock after this entry check still counts as
+ * woken.
+ */
+static bool sigevent_unblock(const struct sigevent *evp,
+                             thread_t *thp,
+                             const uint32_t *wait_seq)
+{
+    uint32_t seq = wait_seq ? *wait_seq : thread_wake_seq(thp);
+
+    /* A fire for a wait that is over leaves the thread's later wait alone. */
+    if (wait_seq && thread_wake_seq(thp) != seq)
+        return false;
+
+    /* a critical unblock event seems unlikely, but wth. */
+    if (evp->sigev_notify & SIGEV_FLAG_CRITICAL)
+        CRITICAL_MARK_THREAD(thp);
+
+    if (thp->state == STATE_NANOSLEEP) {
+        /* force_ready may end the same sleep on another hart. A claim lost to
+         * an older sequence means the sleep this timer was for has ended
+         * already.
+         */
+        if (!thread_wake_claim(thp, seq))
+            return false;
+        ready(thp);
+    } else if (wait_seq) {
+        (void) force_ready_wait(thp, ETIMEDOUT, seq);
+    } else {
+        force_ready(thp, ETIMEDOUT);
+    }
+    return true;
+}
+
 /* sigevent_deliver_inline — helper for the direct-from-trap notification
  * delivery model. Called from:
  *   - arch/riscv/trap-handler.c PLIC branch (per attached
- *     interrupt_t, for INTR_KIND_THREAD via a synthetic SIGEV_INTR
- *     and for INTR_KIND_EVENT via the registered itp->event).
+ *     interrupt_t of INTR_KIND_EVENT, via the registered itp->event;
+ *     an INTR_KIND_THREAD wake is inlined there).
  *   - arch/riscv/trap-handler.c STIMER branch (via
  *     timer-core.c::timer_fire).
  *   - kernel/time/timer-core.c::timer_activate (kernel extension context —
@@ -67,7 +109,6 @@ void intrevent_preemption(unsigned prio)
  *
  * Calls sigevent_exe(evp, target, 1) directly — sigevent_exe handles every
  * sigev_notify kind correctly:
- *   - SIGEV_INTR  → ready() or atomic_or INTR_PENDING.
  *   - SIGEV_UNBLOCK → ready() or force_ready(ETIMEDOUT).
  *   - SIGEV_NOTIFICATION → notification_deliver() (channel_slock).
  *   - SIGEV_NONE  → no-op (or timer_pending() for the idle thread).
@@ -93,9 +134,28 @@ void sigevent_deliver_inline(const struct sigevent *evp,
                              thread_t *target,
                              int reserved)
 {
+    sigevent_deliver_wait(evp, target, reserved, NULL);
+}
+
+/* sigevent_deliver_wait — sigevent_deliver_inline for an event bound to one
+ * wait of target: with wait_seq, a SIGEV_UNBLOCK ends only the wait of that
+ * wake_seq (sigevent_unblock). The timer expiry delivers a thread timeout's
+ * fire through it. A bound fire whose wait is over wakes nothing and leaves the
+ * preempt-sentinel alone.
+ */
+void sigevent_deliver_wait(const struct sigevent *evp,
+                           thread_t *target,
+                           int reserved,
+                           const uint32_t *wait_seq)
+{
     if (!evp || !target)
         return;
-    (void) sigevent_exe(evp, target, 1, reserved);
+    if (wait_seq && SIGEV_GET_TYPE(evp) == SIGEV_UNBLOCK) {
+        if (!sigevent_unblock(evp, target, wait_seq))
+            return;
+    } else {
+        (void) sigevent_exe(evp, target, 1, reserved);
+    }
 
     /* Preempt-sentinel: bump this CPU's pending_preempt_prio if the wake just
      * made a higher-priority thread runnable. Long-running kernel extension
@@ -168,9 +228,11 @@ void intrevent_flush(void)
 /* sigevent_exe — execute a sigevent against a target thread.
  *
  * Dispatches on sigev_notify kind (SIGEV_NONE / SIGEV_THREAD /
- * SIGEV_NOTIFICATION / SIGEV_UNBLOCK / SIGEV_INTR; signal kinds are rejected),
- * either delivering the event or just validating it. May be called directly
- * from an interrupt handler. Parameters:
+ * SIGEV_NOTIFICATION / SIGEV_UNBLOCK; signal kinds and SIGEV_INTR are rejected:
+ * an interrupt thread is woken by interrupt_attach_thread's inline wake in the
+ * trap handler, and nothing sends it SIGEV_INTR as an event), either delivering
+ * the event or just validating it. May be called directly from an interrupt
+ * handler. Parameters:
  *   evp      : the sigevent to execute
  *   thp      : target thread
  *   deliver  : non-zero to actually deliver, zero to validate only
@@ -297,37 +359,8 @@ int rdecl sigevent_exe(const struct sigevent *evp,
     }
 
     case SIGEV_UNBLOCK:
-        if (deliver) {
-            /* a critical unblock event seems unlikely, but wth. */
-            if (evp->sigev_notify & SIGEV_FLAG_CRITICAL)
-                CRITICAL_MARK_THREAD(thp);
-
-            if (thp->state == STATE_NANOSLEEP) {
-                ready(thp);
-            } else {
-                force_ready(thp, ETIMEDOUT);
-            }
-        }
-        break;
-
-    case SIGEV_INTR:
-        if (deliver) {
-            if (thp->state == STATE_INTR) {
-                if (evp->sigev_notify & SIGEV_FLAG_CRITICAL)
-                    CRITICAL_MARK_THREAD(thp);
-                ready(thp);
-            } else {
-                /* Atomic OR — paired with atomic_clr in ksys_interrupt_wait
-                 * (kernel/irq/interrupt.c). The atomic + atomic pairing lets
-                 * ksys_interrupt_wait run BKL-less without losing cross-CPU
-                 * INTR_PENDING set/clear ordering against other paths that
-                 * read-modify-write thp->flags (force_ready KILLSELF set, exec
-                 * KCALL_ERR_SET set, etc.).
-                 */
-                atomic_or((volatile unsigned *) &thp->flags,
-                          RTMUX_FLG_THR_INTR_PENDING);
-            }
-        }
+        if (deliver)
+            (void) sigevent_unblock(evp, thp, NULL);
         break;
 
     default:

@@ -139,7 +139,7 @@ struct startup_trailer {
 
 unsigned arch_max_paddr_bits(void);
 
-#define COMMON_OPTIONS_STRING CPU_COMMON_OPTIONS_STRING "D:f:K:N:P:R:Tv"
+#define COMMON_OPTIONS_STRING CPU_COMMON_OPTIONS_STRING "D:F:f:K:N:P:R:Tv"
 
 struct local_syspage {
     SYSPAGE_SECTION(syspage);

@@ -38,11 +38,20 @@ static bool word_is(const struct group *g, const char *kw)
     return g->plain && g->wlen == strlen(kw) && !memcmp(g->word, kw, g->wlen);
 }
 
-/* The word that just ended is complete. */
-static void group_word(struct group *g)
+/* Reserved words after which the grammar expects another command. */
+bool sh_command_prefix(const char *word, size_t len)
 {
     static const char *const lead[] = {"then",  "do",    "else", "elif", "if",
-                                       "while", "until", "!",    "{",    "}"};
+                                       "while", "until", "!",    "{"};
+
+    for (size_t i = 0; i < sizeof lead / sizeof *lead; i++)
+        if (len == strlen(lead[i]) && !memcmp(word, lead[i], len))
+            return true;
+    return false;
+}
+
+static void group_word(struct group *g)
+{
     bool at_cmd = g->cmd;
 
     if (g->wlen == 0)
@@ -64,9 +73,7 @@ static void group_word(struct group *g)
     } else if (at_cmd && word_is(g, "case")) {
         g->subject = 1;
     } else if (at_cmd) {
-        for (size_t i = 0; i < sizeof lead / sizeof *lead; i++)
-            if (word_is(g, lead[i]))
-                g->cmd = true;
+        g->cmd = g->plain && sh_command_prefix(g->word, g->wlen);
     }
     g->wlen = 0;
     g->plain = true;
@@ -308,4 +315,78 @@ const char *sh_scan_case_end(const char *p)
         if (g.done)
             return at;
     }
+}
+
+char *sh_heredoc_find(char *line)
+{
+    struct sh_scan sc = {line, 0};
+    struct sh_unit u;
+
+    for (;;) {
+        char *p = (char *) sc.p;
+
+        sh_unit_next(&sc, &u);
+        if (u.kind == SH_U_END)
+            return NULL;
+        if (u.kind != SH_U_LIT || sc.quote != 0)
+            continue;
+        if (*p == '#' && (p == line || strchr(" \t;&|<>()", p[-1])))
+            return NULL; /* a comment */
+        if (*p == '<' && p[1] == '<') {
+            if (p[2] != '<')
+                return p;
+            sc.p = p + 3; /* a here-string */
+        }
+    }
+}
+
+/* Parse a here-document delimiter starting at `hh` (the `<<`). Copies the word
+ * into `delim`, sets *strip for `<<-`, sets *quoted if any of it was quoted (so
+ * the body is not expanded), and returns the command-line remainder after the
+ * word. The word ends at whitespace or a redirection/list metacharacter, so
+ * `<<EOF >out` keeps `>out` in the remainder.
+ */
+char *sh_heredoc_delim(char *hh,
+                       char *delim,
+                       size_t dsize,
+                       bool *strip,
+                       bool *quoted)
+{
+    size_t dn = 0;
+    char *q = hh + 2;
+
+    *strip = false;
+    *quoted = false;
+    if (*q == '-') {
+        *strip = true;
+        q++;
+    }
+    while (*q == ' ' || *q == '\t')
+        q++;
+    while (*q && *q != ' ' && *q != '\t' && !strchr("<>|&;()", *q)) {
+        if (*q == '\'' || *q == '"') {
+            char qc = *q++;
+
+            *quoted = true;
+            while (*q && *q != qc) {
+                if (dn + 1 < dsize)
+                    delim[dn++] = *q;
+                q++;
+            }
+            if (*q)
+                q++;
+        } else if (*q == '\\' && q[1]) {
+            *quoted = true;
+            q++;
+            if (dn + 1 < dsize)
+                delim[dn++] = *q;
+            q++;
+        } else {
+            if (dn + 1 < dsize)
+                delim[dn++] = *q;
+            q++;
+        }
+    }
+    delim[dn] = '\0';
+    return q;
 }

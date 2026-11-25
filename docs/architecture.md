@@ -42,6 +42,13 @@ system logger, and the pipe service are separate processes. Opening a file or
 reading a block is an IPC round trip to the relevant service
 ([service-frontend-abi.md](service-frontend-abi.md), [vfs-contract.md](vfs-contract.md)).
 
+The roottask console and serial drivers share the input discipline in
+`lib/libc/ioserv/tty-ldisc.c`. In canonical mode it queues complete lines,
+supports erase and kill, and delivers an empty EOF as a zero-byte read.
+In noncanonical mode reads use the terminal's VMIN and VTIME settings.
+The serial server arms a timer for a pending read. The polled console
+checks the same monotonic deadline when it samples input.
+
 **LKL domains.** Optional `lkl-fsd` and `lkl-netd` servers run the Linux Kernel
 Library in user mode to reuse Linux ext4 and TCP/IP. Clients never call LKL
 directly; the kernel stays outside the Linux domain

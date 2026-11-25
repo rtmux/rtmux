@@ -78,16 +78,18 @@ void endpoint_cap_revoke_if_present(connect_t *cop)
 }
 
 /* Release the notification soul reserved for cop's disconnect notice, if it
- * still holds one. Safe to repeat: nresv is cleared with the release, and every
- * caller owns cop exclusively (a fresh attach, the last-link detach, or the
- * final free), so the clear needs no lock.
+ * still holds one. Safe to repeat, and safe to race: the client's detach
+ * releases it once the notice is delivered, and the server may receive that
+ * notice, detach and reach the final free on another hart before the client's
+ * release. Only the caller that clears nresv releases the soul. Once the notice
+ * is delivered the reservation is no longer needed (it was popped, or the
+ * notice merged with a queued one or went straight to a receiver), so either
+ * caller may be the one.
  */
 void connect_unreserve(connect_t *cop)
 {
-    if (cop && cop->nresv) {
-        cop->nresv = 0;
+    if (cop && __atomic_exchange_n(&cop->nresv, 0, __ATOMIC_ACQ_REL))
         object_unreserve(&notification_souls);
-    }
 }
 
 /* Recycle a connection soul that has been unpublished from every vector it was
@@ -109,8 +111,11 @@ void connect_unreserve(connect_t *cop)
  */
 void connect_soul_free(process_t *prp, connect_t *cop)
 {
-    connect_unreserve(cop);
+    /* After the drain: a client detach still inside its read section may be
+     * about to deliver with the reservation.
+     */
     rcu_sched_synchronize();
+    connect_unreserve(cop);
     endpoint_cap_revoke_if_present(cop);
     object_free(prp, &connect_souls, cop);
 }
@@ -193,26 +198,11 @@ static inline void vec_slocks_unlock(process_t *a, process_t *b)
     }
 }
 
-/* Decrement a process's open-connection count under its vec_slock.
- *
- * nfds is bumped under the owning process's vec_slock at attach
- * (connect_attach), so it must be decremented under the same lock. A plain
- * non-atomic -- races a concurrent attach's ++ on another hart and loses an
- * update, leaving nfds off by one at teardown (the intermittent process.c:465
- * nfds != 0 crash, seen as either a leak or a wrap-to-65535 underflow depending
- * on which update is lost). Callers must not already hold prp->vec_slock.
- */
-static inline void process_nfds_dec(process_t *prp)
+/* Charged client slots and their count change together under vec_slock. */
+static void process_nfds_dec_locked(process_t *prp)
 {
-    kspinlock_lock(&prp->vec_slock);
-
-    /* nfds is uint16_t; a mis-categorized detach would wrap it to 65535 and
-     * resurface as the same process.c teardown crash this accounting fixes.
-     * Fail at the source instead of far downstream.
-     */
     CRASHCHECK(prp->nfds == 0);
     prp->nfds--;
-    kspinlock_unlock(&prp->vec_slock);
 }
 
 /* Attach a connection to a channel (connect_attach kcall).
@@ -627,6 +617,8 @@ int _connect_detach(process_t *prp, int coid_arg)
                   cop->channel->process == prp && coid == cop->scoid;
 
     vector_rem(vec, coid);
+    if (!server_side)
+        process_nfds_dec_locked(prp);
     kspinlock_unlock(&prp->vec_slock);
     if (cop->links == 0) {
         connect_soul_free(prp, cop);
@@ -646,8 +638,6 @@ int _connect_detach(process_t *prp, int coid_arg)
             }
         }
     }
-    if (!server_side)
-        process_nfds_dec(prp);
 
     return EOK;
 }
@@ -696,7 +686,12 @@ int kdecl ksys_connect_detach(thread_t *act,
         rcu_read_unlock(&connobj_rcu);
         return EINVAL;
     }
+    bool server_side = vec == &prp->chancons && chp && chp->process == prp &&
+                       !(cop->flags & RTMUX_FLG_COF_GLOBAL) &&
+                       coid == cop->scoid;
     vector_rem(vec, (unsigned) coid);
+    if (!server_side)
+        process_nfds_dec_locked(prp);
     kspinlock_unlock(&prp->vec_slock);
     if (cap_pinned)
         (void) rtmux_cap_unpin(&prp->endpoint_caps, (rtmux_cap_t) handle);
@@ -846,11 +841,6 @@ int kdecl ksys_connect_detach(thread_t *act,
                 connect_soul_free(cop->process, cop);
             }
         }
-
-        /* vec_slock was released earlier in this call (before the force_ready
-         * sweep), so process_nfds_dec here is a fresh, non-nested acquire.
-         */
-        process_nfds_dec(act->process);
     }
 
     SETKSTATUS(act, 0);

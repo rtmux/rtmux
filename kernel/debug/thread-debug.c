@@ -82,6 +82,23 @@ int rdecl debug_process(process_t *prp, debug_process_t *dpp)
 
 
 
+/* The IPC caller holds the connection and channel through publication. */
+void debug_set_blocked_connect(thread_t *thp, connect_t *cop, channel_t *chp)
+{
+    if (cop->flags & COF_NETCON) {
+        thp->debug_connect.coid = (int32_t) cop->un.remote.coid;
+        thp->debug_connect.nd = RTMUX_LOCAL_NODE;
+        thp->debug_connect.pid = chp && chp->process ? chp->process->pid : -1;
+        thp->debug_connect.chid = chp ? chp->chid : -1;
+    } else {
+        thp->debug_connect.coid = (int32_t) thp->args.ms.coid;
+        thp->debug_connect.nd = cop->un.lcl.nd;
+        thp->debug_connect.pid = cop->un.lcl.pid;
+        thp->debug_connect.chid = (int32_t) cop->un.lcl.chid;
+    }
+    thp->debug_connect.scoid = cop->scoid | RTMUX_SIDE_CHANNEL;
+}
+
 /* Fill a debug_thread_t snapshot for a thread.
  *
  * Populates the debugger / procfs view of a thread: stop/fault state, register
@@ -157,52 +174,25 @@ int rdecl debug_thread(process_t *prp, thread_t *thp, debug_thread_t *dtp)
     dtp->real_priority = thp->real_priority;
     dtp->policy = thp->policy;
     dtp->syscall = (int16_t) _TRACE_GETSYSCALL(thp->syscall);
+    memset(&dtp->blocked, 0, sizeof dtp->blocked);
     switch (dtp->state = thp->state) {
     case STATE_SEND:
-    case STATE_REPLY: {
-        connect_t *cop = (connect_t *) thp->blocked_on;
-
-        if (cop->flags & COF_NETCON) {
-            channel_t *chp;
-
-            dtp->blocked.connect.coid = (int32_t) cop->un.remote.coid;
-            dtp->blocked.connect.nd = RTMUX_LOCAL_NODE;
-            if ((chp = cop->channel)) {
-                dtp->blocked.connect.pid = chp->process->pid;
-                dtp->blocked.connect.chid = chp->chid;
-            } else {
-                dtp->blocked.connect.pid = -1;
-                dtp->blocked.connect.chid = -1;
-            }
-        } else {
-            dtp->blocked.connect.coid = (int32_t) thp->args.ms.coid;
-            dtp->blocked.connect.nd = cop->un.lcl.nd;
-            dtp->blocked.connect.pid = cop->un.lcl.pid;
-            dtp->blocked.connect.chid = (int32_t) cop->un.lcl.chid;
-        }
-        dtp->blocked.connect.scoid = cop->scoid | RTMUX_SIDE_CHANNEL;
+    case STATE_REPLY:
+        dtp->blocked.connect = thp->debug_connect;
         break;
-    }
     case STATE_WAITTHREAD:
     case STATE_JOIN:
-        dtp->blocked.join.tid = (int) (((thread_t *) thp->blocked_on)->tid + 1);
-        break;
-    case STATE_SEM:
-        dtp->blocked.sync.sync = 0;
-        dtp->blocked.sync.id =
-            thp->blocked_on ? (int32_t) ((ksync_t *) thp->blocked_on)->addr : 0;
+        dtp->blocked.join.tid = thp->debug_join_tid;
         break;
     case STATE_RECEIVE:
-        dtp->blocked.channel.chid = ((channel_t *) thp->blocked_on)->chid;
+        dtp->blocked.channel.chid = thp->last_chid;
         break;
     case STATE_WAITPAGE:
         waitpage_status_get(thp, dtp);
         break;
     case STATE_MUTEX:
     case STATE_CONDVAR:
-        dtp->blocked.sync.sync = (uintptr_t) thp->args.mu.mutex;
-        dtp->blocked.sync.id =
-            thp->blocked_on ? (int32_t) ((ksync_t *) thp->blocked_on)->addr : 0;
+        dtp->blocked.sync.sync = thp->debug_sync_mutex;
         break;
     case STATE_STACK:
         dtp->blocked.stack.size =
@@ -235,9 +225,18 @@ uint64_t get_nsec_since_block(thread_t *thp)
     if (thp->state == STATE_READY || thp->state == STATE_RUNNING)
         return 0ULL;
 
-    uint64_t snapshot;
+    /* A thread still current on its hart has published its wait but not
+     * switched away, and the switch stamps timestamp_last_block
+     * (sched_account_switch): it has not been blocked for any time yet.
+     */
+    unsigned cpu = __atomic_load_n(&thp->runcpu, __ATOMIC_RELAXED);
+    if (cpu < CONFIG_PROCESSORS_MAX &&
+        __atomic_load_n(&pcpu_array[cpu].pc_curthread, __ATOMIC_ACQUIRE) == thp)
+        return 0ULL;
+
+    uint64_t snapshot, ts = thp->timestamp_last_block;
     snap_time(&snapshot, 0);
-    return snapshot - thp->timestamp_last_block;
+    return snapshot > ts ? snapshot - ts : 0ULL;
 }
 
 
@@ -283,7 +282,7 @@ int rdecl debug_stop(process_t *prp)
         return EINVAL;
     }
     if (!(prp->flags & RTMUX_FLG_PROC_DEBUG_STOPPED)) {
-        prp->flags |= RTMUX_FLG_PROC_DEBUG_STOPPED;
+        PROC_FLG_SET(prp, RTMUX_FLG_PROC_DEBUG_STOPPED);
         stop_threads(prp, 0, 0);
         dep->flags |= _DEBUG_FLAG_ISTOP;
         dep->why = _DEBUG_WHY_REQUESTED;
@@ -382,7 +381,7 @@ int rdecl debug_run(process_t *prp, debug_run_t *drp)
             if ((d->brk.type & _DEBUG_BREAK_EXEC) && KIP(thp) == d->brk.addr) {
                 dep->skip_brk = d;
                 if (!(drp_flags & _DEBUG_RUN_STEP)) {
-                    prp->flags &= ~RTMUX_FLG_PROC_DEBUG_STOPPED;
+                    PROC_FLG_CLR(prp, RTMUX_FLG_PROC_DEBUG_STOPPED);
                 }
                 drp_flags = (drp_flags & ~(unsigned) _DEBUG_RUN_STEP_ALL) |
                             _DEBUG_RUN_STEP;
@@ -415,7 +414,7 @@ int rdecl debug_run(process_t *prp, debug_run_t *drp)
             }
         }
     } else {
-        prp->flags &= ~RTMUX_FLG_PROC_DEBUG_STOPPED;
+        PROC_FLG_CLR(prp, RTMUX_FLG_PROC_DEBUG_STOPPED);
         cont_threads(prp, 0);
     }
     return EOK;
@@ -596,7 +595,7 @@ static int rdecl thread_fault(thread_t *thp, siginfo_t *info)
 
     _TRACE_SYS_EMIT_ADDRESS(thp, KIP(thp));
 
-    prp->flags |= RTMUX_FLG_PROC_DEBUG_STOPPED;
+    PROC_FLG_SET(prp, RTMUX_FLG_PROC_DEBUG_STOPPED);
     stop_threads(prp, 0, 0);
 
     /* Save away fault state */

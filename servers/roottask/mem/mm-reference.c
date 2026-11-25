@@ -74,7 +74,7 @@ static int pq_init_run(void *dst, size_t len, void *d)
              * preemption disabled for milliseconds, blowing the RT budget. 64
              * KiB chunks bound each non-preemptible burst.
              */
-            paddr_t p = (paddr_t) ((uintptr_t) dst - CPU_1TO1_VADDR_BIAS);
+            paddr_t p = (paddr_t) VA_TO_PA(dst);
             size_t left = len;
 
             while (left) {
@@ -85,13 +85,24 @@ static int pq_init_run(void *dst, size_t len, void *d)
             }
         } else {
             void *endp;
+            void *run = NULL; /* the first page of a run still to zero */
+            int rc;
 
+            /* The run is physically contiguous, so consecutive pages that need
+             * zeroing go to the kernel as one range; it bounds each call.
+             */
             endp = (uint8_t *) dst + len;
             do {
-                if (!(pa_pq_flags(pq) & PAQ_FLAG_ZEROED)) {
-                    (void) kernel_page_zero(
-                        (paddr_t) ((uintptr_t) dst - CPU_1TO1_VADDR_BIAS),
-                        QUANTUM_SIZE);
+                if (pa_pq_flags(pq) & PAQ_FLAG_ZEROED) {
+                    if (run &&
+                        (rc = kernel_page_zero(
+                             (paddr_t) VA_TO_PA(run),
+                             (size_t) ((uint8_t *) dst - (uint8_t *) run))))
+                        return rc; /* the run is not zero: do not expose it */
+                    run = NULL;
+                } else {
+                    if (!run)
+                        run = dst;
 
                     /* RUSH3: If we set PAQ_FLAG_ZEROED here and maintained
                      * RUSH3: it properly (e.g. turned it off when setting
@@ -105,6 +116,10 @@ static int pq_init_run(void *dst, size_t len, void *d)
                 ++pq;
                 dst = (uint8_t *) dst + QUANTUM_SIZE;
             } while (dst < endp);
+            if (run && (rc = kernel_page_zero(
+                            (paddr_t) VA_TO_PA(run),
+                            (size_t) ((uint8_t *) endp - (uint8_t *) run))))
+                return rc;
         }
         break;
     case OBJECT_MEM_FD:
@@ -144,8 +159,7 @@ static int pq_init_run(void *dst, size_t len, void *d)
              * above; route through kernel_page_zero.
              */
             uintptr_t pad = (uintptr_t) dst + got;
-            (void) kernel_page_zero((paddr_t) (pad - CPU_1TO1_VADDR_BIAS),
-                                    len - got);
+            (void) kernel_page_zero((paddr_t) VA_TO_PA(pad), len - got);
         }
         data->icache_check = 1;
         break;
@@ -727,15 +741,26 @@ int memory_reference(struct mm_map **mmp,
     data.off_end = mm->offset + (off64_t) (end - mm->start);
     data.off_start = mm->offset + (off64_t) (start - mm->start);
     if (flags & MR_TRUNC) {
-        /* truncate reference to the limit of the object */
-        if (data.off_start >= obp->mem.mm.size) {
-            /* first reference is past end of object - user will fault if he
-             * ends up touching this location
-             */
-            return EOK;
-        }
+        /* Truncate the reference to the limit of the object. The pages past it
+         * are marked so that touching one is SIGBUS; vm_grow_drain maps them if
+         * the object grows to cover them.
+         */
         if (data.off_end >= obp->mem.mm.size) {
-            data.off_end = (obp->mem.mm.size - 1) | (off64_t) (__PAGESIZE - 1);
+            uintptr_t past = start;
+
+            if (data.off_start < obp->mem.mm.size) {
+                data.off_end =
+                    (obp->mem.mm.size - 1) | (off64_t) (__PAGESIZE - 1);
+                past += (uintptr_t) (data.off_end + 1 - data.off_start);
+            }
+            if (past <= end) {
+                r = pte_bad(or->adp, past, end);
+                if (r != EOK)
+                    return r;
+                obp->mem.mm.flags |= MM_MEM_HAS_BAD_PAGE;
+            }
+            if (past == start)
+                return EOK;
         }
     }
 
@@ -824,6 +849,13 @@ int memory_reference(struct mm_map **mmp,
                          data.off_end, pq_map, &data);
     if (r != EOK)
         goto fail1;
+
+    /* A process that can now reach these pages (and store into them, now or
+     * after an mprotect) voids a failed write's undo of a growth
+     * (vm_undo_grow); roottask's own copy mapping does not.
+     */
+    if (or->pid != ROOTTASK_PID)
+        obp->mem.mm.wgen++;
 
 fail1:
     if (data.unlock_obp)

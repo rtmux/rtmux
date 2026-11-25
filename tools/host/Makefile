@@ -35,13 +35,14 @@ PROGS = $(BUILD_BASE)/mkasmoff $(BUILD_BASE)/mkromfs $(BUILD_BASE)/treeromfs \
         $(BUILD_BASE)/bootstrap-manifest-test $(BUILD_BASE)/elf-range-test \
         $(BUILD_BASE)/ldso-hash-test $(BUILD_BASE)/ldso-page-test \
         $(BUILD_BASE)/ldso-parse-test $(BUILD_BASE)/ldso-path-test \
-        $(BUILD_BASE)/cpio-parser-test $(BUILD_BASE)/spawn-fd-policy-test \
-        $(BUILD_BASE)/serial-reply-test $(BUILD_BASE)/outcomes-test \
+        $(BUILD_BASE)/ticket-lock-test $(BUILD_BASE)/tty-ldisc-test $(BUILD_BASE)/spawn-search-test $(BUILD_BASE)/cpio-parser-test $(BUILD_BASE)/startup-strtoul-test $(BUILD_BASE)/spawn-fd-policy-test $(BUILD_BASE)/loader-end-test \
+        $(BUILD_BASE)/serial-reply-test $(BUILD_BASE)/open-bind-test $(BUILD_BASE)/outcomes-test \
         $(BUILD_BASE)/sv39-lookup-test $(BUILD_BASE)/sv39-manip-test \
         $(BUILD_BASE)/strftime-test $(BUILD_BASE)/sh-scan-test $(BUILD_BASE)/tz-test \
         $(BUILD_BASE)/malloc-stats-test $(BUILD_BASE)/pci-args-test \
-        $(BUILD_BASE)/libc-algorithms-test $(BUILD_BASE)/pgrp-table-test \
-        $(BUILD_BASE)/heap-arena-test
+        $(BUILD_BASE)/libc-algorithms-test $(BUILD_BASE)/pgrp-table-test $(BUILD_BASE)/process-slot-test \
+        $(BUILD_BASE)/sysfs-ocb-test \
+        $(BUILD_BASE)/heap-arena-test $(BUILD_BASE)/kernel-alloc-test $(BUILD_BASE)/iodir-test
 
 # Each tool compiles and links its sources in one command, so -MMD cannot give a
 # per-tool dependency file (with several sources it writes one named after each
@@ -59,12 +60,38 @@ HOST_HDRS = $(wildcard $(TOPDIR)/include/*.h $(TOPDIR)/include/*/*.h \
 
 all: $(PROGS)
 
+$(BUILD_BASE)/tty-ldisc-test: $(TEST_DIR)/test-tty-ldisc.c ../../lib/libc/ioserv/tty-ldisc.c \
+                              ../../internal/include/sys/ioserv-ldisc.h
+	@mkdir -p $(@D)
+	$(msg) HOSTCC $(notdir $@)
+	$(Q)$(HOST_CC) $(HOST_CFLAGS) -idirafter ../../internal/include -o $@ $(filter %.c,$^)
+
+$(BUILD_BASE)/spawn-search-test: $(TEST_DIR)/test-spawn-search.c ../../lib/libc/spawn/posix-spawnp.c \
+                                ../../internal/include/exec-path.h ../../lib/libc/internal/exec-path-default.h
+	@mkdir -p $(@D)
+	$(msg) HOSTCC $(notdir $@)
+	$(Q)$(HOST_CC) $(HOST_CFLAGS) -D__hidden= -I../../lib/libc/internal -idirafter ../../internal/include \
+	    -o $@ $(TEST_DIR)/test-spawn-search.c
+
+$(BUILD_BASE)/ticket-lock-test: ../../tests/userland/lock-rank-stress/tickets.c \
+                               ../../arch/riscv/include/ticket-lock.h ../../internal/include/sys/spinlock.h
+	@mkdir -p $(@D)
+	$(msg) HOSTCC $(notdir $@)
+	$(Q)$(HOST_CC) $(HOST_CFLAGS) -DTICKET_HOST_TEST -idirafter ../../internal/include \
+	    -I../../arch/riscv/include -pthread -o $@ $<
+
 $(BUILD_BASE)/spawn-fd-policy-test: $(TEST_DIR)/test-spawn-fd-policy.c \
                                     ../../servers/roottask/include/spawn-fd-policy.h
 	@mkdir -p $(@D)
 	$(msg) HOSTCC $(notdir $@)
 	$(Q)$(HOST_CC) $(HOST_CPPFLAGS) -I../../internal/include -I../../include $(HOST_CFLAGS) -o $@ \
 	    $(TEST_DIR)/test-spawn-fd-policy.c
+
+$(BUILD_BASE)/loader-end-test: $(TEST_DIR)/test-loader-end.c \
+                               ../../servers/roottask/include/loader-end.h
+	@mkdir -p $(@D)
+	$(msg) HOSTCC $(notdir $@)
+	$(Q)$(HOST_CC) -I../../servers/roottask/include $(HOST_CFLAGS) -o $@ $(TEST_DIR)/test-loader-end.c
 
 $(BUILD_BASE)/pgrp-table-test: $(TEST_DIR)/test-pgrp-table.c \
                                ../../servers/roottask/proc/pgrp-table.c \
@@ -73,6 +100,22 @@ $(BUILD_BASE)/pgrp-table-test: $(TEST_DIR)/test-pgrp-table.c \
 	$(msg) HOSTCC $(notdir $@)
 	$(Q)$(HOST_CC) $(HOST_CPPFLAGS) -I../../servers/roottask/include $(HOST_CFLAGS) -o $@ \
 	    $(TEST_DIR)/test-pgrp-table.c ../../servers/roottask/proc/pgrp-table.c
+
+$(BUILD_BASE)/process-slot-test: $(TEST_DIR)/test-process-slot.c ../../servers/roottask/sys/root-process.c
+	@mkdir -p $(@D)
+	$(msg) HOSTCC $(notdir $@)
+	$(Q)$(HOST_CC) -I../../servers/roottask/include $(HOST_CFLAGS) -pthread -o $@ $<
+
+# roottask's /sys OCB pool, from several threads at once.
+$(BUILD_BASE)/sysfs-ocb-test: $(TEST_DIR)/test-sysfs-ocb.c ../../servers/roottask/path/sysfs-ocb.c \
+                              ../../servers/roottask/include/root-mutex.h \
+                              ../../servers/roottask/path/sysfs-ocb.h
+	@mkdir -p $(@D)
+	$(msg) HOSTCC $(notdir $@)
+	$(Q)$(HOST_CC) -I../../servers/roottask/path -I../../servers/roottask/include \
+	    -idirafter ../../internal/include \
+	    -DCONFIG_SERVER_POOL_CANARY $(HOST_CFLAGS) -pthread -o $@ \
+	    $(TEST_DIR)/test-sysfs-ocb.c ../../servers/roottask/path/sysfs-ocb.c
 
 # Outcome accounting (pass/fail/gap/skip) shared with the guest suite.
 $(BUILD_BASE)/outcomes-test: $(TEST_DIR)/test-outcomes.c
@@ -116,7 +159,7 @@ $(BUILD_BASE)/pci-args-test: $(TEST_DIR)/test-pci-args.c ../../servers/pci/args.
 # The shared serial service is compiled against the tree's own headers with the
 # IPC calls stubbed (the host libc has no ssp/string.h, so fortify is off).
 SERIAL_DIR = ../../userland/dev-serial-common
-NOTIFY_LIST = ../../lib/libc/ioserv/notify-list.c
+NOTIFY_LIST = ../../lib/libc/ioserv/notify-list.c ../../lib/libc/ioserv/tty-ldisc.c
 $(BUILD_BASE)/serial-reply-test: $(TEST_DIR)/test-serial-reply.c $(SERIAL_DIR)/serial-service.h \
                                  $(NOTIFY_LIST)
 	@mkdir -p $(@D)
@@ -124,6 +167,14 @@ $(BUILD_BASE)/serial-reply-test: $(TEST_DIR)/test-serial-reply.c $(SERIAL_DIR)/s
 	$(Q)$(HOST_CC) -I$(SERIAL_DIR) -I../../include -I../../internal/include $(HOST_CFLAGS) \
 	    -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -o $@ $(TEST_DIR)/test-serial-reply.c \
 	    $(NOTIFY_LIST)
+
+IOSERV_DIR = ../../lib/libc/ioserv
+$(BUILD_BASE)/open-bind-test: $(TEST_DIR)/test-open-bind.c $(IOSERV_DIR)/open-bind.c \
+                             $(IOSERV_DIR)/api.h $(IOSERV_DIR)/internal.h
+	@mkdir -p $(@D)
+	$(msg) HOSTCC $(notdir $@)
+	$(Q)$(HOST_CC) -I$(IOSERV_DIR) -I../../lib/libc/internal -I../../include \
+	    -I../../internal/include $(HOST_CFLAGS) -Dcalloc=fail_binding_alloc -o $@ $(filter %.c,$^)
 
 # libc strftime against the host headers, renamed so the host copy is never
 # called. When the host compiler supports AddressSanitizer a second build runs
@@ -207,15 +258,37 @@ $(BUILD_BASE)/malloc-stats-test: $(MALLOC_DEPS)
 	$(Q)$(HOST_CC) $(MALLOC_FLAGS) $(HOST_CFLAGS) -o $@ \
 	    $(TEST_DIR)/test-malloc-stats.c ../../lib/libc/alloc/malloc-core.c
 
+# Build the allocator against the host mmap ABI and the directory client
+# against RTMux's on-wire ABI. Only the client's allocators are redirected.
+$(BUILD_BASE)/iodir-alloc.o: ../../lib/libc/alloc/malloc-core.c ../../lib/libc/alloc/malloc-core.h
+	@mkdir -p $(@D)
+	$(Q)$(HOST_CC) $(MALLOC_FLAGS) $(HOST_CFLAGS) -c $< -o $@
+
+IODIR_FLAGS = -I../../lib/libc/internal -I../../lib/libc/alloc -I../../include \
+              -I../../internal/include -I../../lib/common $(HOST_CFLAGS) -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0
+$(BUILD_BASE)/iodir-test: $(TEST_DIR)/test-iodir.c ../../lib/libc/posix/iodir.c \
+                          $(BUILD_BASE)/iodir-alloc.o ../../lib/libc/internal/connect.h
+	@mkdir -p $(@D)
+	$(msg) HOSTCC $(notdir $@)
+	$(Q)$(HOST_CC) $(IODIR_FLAGS) -include ../../lib/libc/rtmux-libc-local.h \
+	    -Dmalloc=__crt_malloc -Dcalloc=__crt_calloc -Dfree=__crt_free \
+	    -Dstrdup=dir_test_strdup -c ../../lib/libc/posix/iodir.c -o $@.o
+	$(Q)$(HOST_CC) $(IODIR_FLAGS) -o $@ $< $@.o $(BUILD_BASE)/iodir-alloc.o -pthread
+
 # Roottask's malloc arena (servers/roottask/sys/heap.c) under the real allocator.
 HEAP_DEPS = $(TEST_DIR)/test-heap-arena.c ../../lib/libc/alloc/malloc-core.c \
             ../../servers/roottask/sys/heap.c \
-            ../../servers/roottask/include/heap-stats.h
+            ../../servers/roottask/include/heap-stats.h ../../servers/roottask/include/root-mutex.h
+$(BUILD_BASE)/kernel-alloc-test: $(TEST_DIR)/test-kernel-alloc.c ../../kernel/object/alloc.c
+	@mkdir -p $(@D)
+	$(msg) HOSTCC $(notdir $@)
+	$(Q)$(HOST_CC) $(HOST_CFLAGS) -std=c11 -o $@ $<
+
 $(BUILD_BASE)/heap-arena-test: $(HEAP_DEPS)
 	@mkdir -p $(@D)
 	$(msg) HOSTCC $(notdir $@)
 	$(Q)$(HOST_CC) $(MALLOC_FLAGS) -I../../servers/roottask/include \
-	    -DCONFIG_ROOTTASK_HEAP_SIZE=4194304 $(HOST_CFLAGS) -o $@ \
+	    -DCONFIG_ROOTTASK_HEAP_SIZE=4194304 $(HOST_CFLAGS) -Wl,--wrap=pthread_mutex_lock -o $@ \
 	    $(TEST_DIR)/test-heap-arena.c ../../lib/libc/alloc/malloc-core.c \
 	    ../../servers/roottask/sys/heap.c
 
@@ -260,15 +333,15 @@ $(BUILD_BASE)/sh-scan-test: $(TEST_DIR)/test-sh-scan.c $(SH_DIR)/sh-scan.c $(SH_
 # it a signal at the one moment a read could lose it (tests/host/sh-host-shim.c).
 # Subshells run this same binary. The format-truncation warning is about the
 # line editor's path buffers, which the target compiler does not report.
-$(BUILD_BASE)/sh-host: $(TEST_DIR)/sh-host-shim.c $(SH_DIR)/sh.c $(SH_DIR)/sh-scan.c \
-                       $(SH_DIR)/sh-scan.h ../../userland/include/toolbox.h
+$(BUILD_BASE)/sh-host: $(TEST_DIR)/sh-host-shim.c $(SH_DIR)/sh.c $(SH_DIR)/sh-scan.c $(SH_DIR)/sh-parse.c \
+                       $(SH_DIR)/sh-scan.h $(SH_DIR)/sh-parse.h ../../userland/include/toolbox.h
 	@mkdir -p $(@D)
 	$(msg) HOSTCC $(notdir $@)
 	$(Q)$(HOST_CC) -std=gnu11 -D_GNU_SOURCE -DEOK=0 \
 	    -DSH_TEST_AWAIT_WINDOW=sh_test_await_window \
 	    '-DSH_SELF_PATH="$(abspath $@)"' -I../../userland/include -I$(SH_DIR) \
 	    $(HOST_CFLAGS) -Wno-format-truncation -o $@ \
-	    $(TEST_DIR)/sh-host-shim.c $(SH_DIR)/sh.c $(SH_DIR)/sh-scan.c
+	    $(TEST_DIR)/sh-host-shim.c $(SH_DIR)/sh.c $(SH_DIR)/sh-scan.c $(SH_DIR)/sh-parse.c
 
 cap-table-test: $(BUILD_BASE)/cap-table-test
 	$(Q)$<
@@ -320,20 +393,22 @@ $(BUILD_BASE)/elf-range-test: $(TEST_DIR)/test-elf-range.c ../../kernel/include/
 
 # Sv39 leaf walk and superpage address arithmetic, from the kernel's header.
 $(BUILD_BASE)/sv39-lookup-test: $(TEST_DIR)/test-sv39-lookup.c \
+                              ../../internal/include/pte-op.h \
                               ../../arch/riscv/include/sv39-lookup.h \
                               ../../arch/riscv/include/cpu-paging.h
 	@mkdir -p $(@D)
 	$(msg) HOSTCC $(notdir $@)
-	$(Q)$(HOST_CC) -I../../arch/riscv/include $(HOST_CFLAGS) -o $@ \
+	$(Q)$(HOST_CC) -I../../arch/riscv/include -iquote ../../internal/include $(HOST_CFLAGS) -o $@ \
 	    $(TEST_DIR)/test-sv39-lookup.c
 
 # The loop behind cpu_pte_manipulate: error mapping and the progress it leaves.
 $(BUILD_BASE)/sv39-manip-test: $(TEST_DIR)/test-sv39-manip.c \
+                              ../../internal/include/pte-op.h \
                               ../../arch/riscv/include/sv39-lookup.h \
                               ../../arch/riscv/include/cpu-paging.h
 	@mkdir -p $(@D)
 	$(msg) HOSTCC $(notdir $@)
-	$(Q)$(HOST_CC) -I../../arch/riscv/include $(HOST_CFLAGS) -o $@ \
+	$(Q)$(HOST_CC) -I../../arch/riscv/include -iquote ../../internal/include $(HOST_CFLAGS) -o $@ \
 	    $(TEST_DIR)/test-sv39-manip.c
 
 $(BUILD_BASE)/ldso-hash-test: $(TEST_DIR)/test-ldso-hash.c ../../lib/ldso/hash.c \
@@ -372,20 +447,28 @@ $(BUILD_BASE)/cpio-parser-test: $(TEST_DIR)/test-cpio-parser.c ../../kernel/star
 	    -idirafter ../../internal/include -o $@ \
 	    $(TEST_DIR)/test-cpio-parser.c ../../kernel/startup/lib/cpio.c
 
+$(BUILD_BASE)/startup-strtoul-test: $(TEST_DIR)/test-startup-strtoul.c \
+                                    ../../kernel/startup/lib/strtoul.c
+	@mkdir -p $(@D)
+	$(msg) HOSTCC $(notdir $@)
+	$(Q)$(HOST_CC) $(HOST_CFLAGS) -I../../kernel/include -o $@ \
+	    $(TEST_DIR)/test-startup-strtoul.c
+
 host-tests: $(BUILD_BASE)/path-normalize-test $(BUILD_BASE)/cap-table-test \
             $(BUILD_BASE)/bootstrap-manifest-test $(BUILD_BASE)/elf-range-test \
             $(BUILD_BASE)/ldso-hash-test $(BUILD_BASE)/ldso-page-test \
             $(BUILD_BASE)/ldso-parse-test $(BUILD_BASE)/ldso-path-test \
-            $(BUILD_BASE)/cpio-parser-test $(BUILD_BASE)/spawn-fd-policy-test \
-            $(BUILD_BASE)/serial-reply-test $(BUILD_BASE)/outcomes-test \
+            $(BUILD_BASE)/ticket-lock-test $(BUILD_BASE)/tty-ldisc-test $(BUILD_BASE)/spawn-search-test $(BUILD_BASE)/cpio-parser-test $(BUILD_BASE)/startup-strtoul-test $(BUILD_BASE)/spawn-fd-policy-test $(BUILD_BASE)/loader-end-test \
+            $(BUILD_BASE)/serial-reply-test $(BUILD_BASE)/open-bind-test $(BUILD_BASE)/outcomes-test \
             $(BUILD_BASE)/sv39-lookup-test $(BUILD_BASE)/sv39-manip-test \
             $(BUILD_BASE)/strftime-test $(BUILD_BASE)/strftime-asan-test \
             $(BUILD_BASE)/sh-scan-test $(BUILD_BASE)/libc-algorithms-test \
             $(BUILD_BASE)/tz-test $(BUILD_BASE)/tz-asan-test $(TZ_ZONES)/.stamp \
             $(BUILD_BASE)/malloc-stats-test $(BUILD_BASE)/pci-args-test \
-            $(BUILD_BASE)/pgrp-table-test $(BUILD_BASE)/heap-arena-test \
-            $(BUILD_BASE)/sh-host
+            $(BUILD_BASE)/pgrp-table-test $(BUILD_BASE)/process-slot-test $(BUILD_BASE)/heap-arena-test $(BUILD_BASE)/kernel-alloc-test \
+            $(BUILD_BASE)/sysfs-ocb-test $(BUILD_BASE)/sh-host $(BUILD_BASE)/iodir-test
 	$(Q)$<
+	$(Q)$(BUILD_BASE)/iodir-test
 	$(Q)$(BUILD_BASE)/cap-table-test
 	$(Q)$(BUILD_BASE)/bootstrap-manifest-test
 	$(Q)$(BUILD_BASE)/elf-range-test
@@ -394,9 +477,17 @@ host-tests: $(BUILD_BASE)/path-normalize-test $(BUILD_BASE)/cap-table-test \
 	$(Q)$(BUILD_BASE)/ldso-parse-test
 	$(Q)$(BUILD_BASE)/ldso-path-test
 	$(Q)$(BUILD_BASE)/cpio-parser-test
+	$(Q)$(BUILD_BASE)/startup-strtoul-test
+	$(Q)$(BUILD_BASE)/tty-ldisc-test
+	$(Q)$(BUILD_BASE)/spawn-search-test
+	$(Q)$(BUILD_BASE)/ticket-lock-test
 	$(Q)$(BUILD_BASE)/spawn-fd-policy-test
+	$(Q)$(BUILD_BASE)/loader-end-test
 	$(Q)$(BUILD_BASE)/pgrp-table-test
+	$(Q)$(BUILD_BASE)/process-slot-test
+	$(Q)$(BUILD_BASE)/sysfs-ocb-test
 	$(Q)$(BUILD_BASE)/serial-reply-test
+	$(Q)$(BUILD_BASE)/open-bind-test
 	$(Q)$(BUILD_BASE)/outcomes-test >/dev/null
 	$(Q)$(BUILD_BASE)/sv39-lookup-test
 	$(Q)$(BUILD_BASE)/sv39-manip-test
@@ -413,6 +504,7 @@ host-tests: $(BUILD_BASE)/path-normalize-test $(BUILD_BASE)/cap-table-test \
 	$(Q)RTMUX_TZDIR=$(abspath $(TZ_ZONES))/ $(BUILD_BASE)/tz-asan-test
 	$(Q)$(BUILD_BASE)/malloc-stats-test
 	$(Q)$(BUILD_BASE)/heap-arena-test
+	$(Q)$(BUILD_BASE)/kernel-alloc-test
 	$(Q)$(BUILD_BASE)/pci-args-test
 	$(Q)out=$$($(BUILD_BASE)/libc-algorithms-test) || { printf '%s\n' "$$out"; exit 1; }
 	$(Q)$(PYTHON) $(TEST_DIR)/test-capability-namespace-doc.py

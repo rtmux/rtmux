@@ -30,6 +30,26 @@
 
 .text
 
+.globl setjmp
+.type setjmp, @function
+setjmp:
+    li a1, 1
+    tail sigsetjmp
+.size setjmp, . - setjmp
+
+.globl sigsetjmp
+.type sigsetjmp, @function
+sigsetjmp:
+    addi sp, sp, -16
+    sd ra, 8(sp)
+    sd a0, 0(sp)
+    call __jmp_save_mask
+    ld a0, 0(sp)
+    ld ra, 8(sp)
+    addi sp, sp, 16
+    tail _setjmp
+.size sigsetjmp, . - sigsetjmp
+
 .globl _setjmp
 .type _setjmp, @function
 _setjmp:

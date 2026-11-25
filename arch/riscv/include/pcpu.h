@@ -138,15 +138,17 @@ struct pcpu {
     volatile uint32_t pc_inject_spin_ms; /* IPI_DEBUG_SPIN: ms, UINT32_MAX = hang */
     volatile uint32_t pc_inject_hold_console; /* IPI_DEBUG_SPIN: spin under the console lock */
 
-    /* CPU-time billing (sched_account_current in kernel/sched/dispatch.c).
-     * pc_account_stamp is the snap_time() ns at which the active thread's
-     * unbilled stretch began. Written only by the owner hart; pc_account_seq is
-     * the seqcount (odd = update in flight) that lets another hart's clock read
-     * add the live stretch to a running thread's banked running_time.
+    /* CPU-time billing (sched_account_switch in kernel/sched/dispatch.c).
+     * pc_account_stamp is the snap_time() ns at which the unbilled stretch of
+     * pc_account_thp began; pc_account_thp is NULL once that stretch is closed
+     * (billed for the last time before a switch) and no new one has begun.
+     * Both are written only by the owner hart; pc_account_seq is the seqcount
+     * (odd = update in flight) that lets another hart's clock read add the
+     * live stretch to a running thread's banked running_time.
      */
     uint64_t pc_account_stamp;
+    struct thread_entry *pc_account_thp;
     atomic_uint pc_account_seq;
-    uint8_t pc_account_billed; /* active thread already billed before enqueue */
 
     /* pc_timer_progress — supervisor timer interrupts this hart has taken.
      * Written only by the owner hart (relaxed fetch_add at timer-trap entry,
@@ -157,7 +159,30 @@ struct pcpu {
      */
     atomic_ulong pc_timer_progress;
     atomic_uint pc_ipi_refused; /* IPIs sent to this CPU after it was dropped */
-    uint8_t pc_pad[68];         /* keep sizeof(struct pcpu) power-of-two */
+
+    /* A thread this hart just blocked while a kill or a cancel was pending on
+     * it, pinned; kernel_exit delivers the request before it dispatches
+     * anything (thread_block_recheck). Owner hart only.
+     */
+    struct thread_entry *pc_block_recheck;
+
+    /* The identity (req_gen) of the request force_ready is making an unblock
+     * notification for, for the length of that notification_deliver call, or
+     * 0: a server that is waiting gets the notification at once, and is told
+     * which request it is about (msg_unblock_received). Checked under the
+     * channel lock with the request still blocked, not read at the delivery, by
+     * which time the client may be in its next request. Owner hart only.
+     */
+    uint64_t pc_unblock_gen;
+
+    /* Dispatch locks this hart holds (SCHED_LOCK nesting), and the CPUs whose
+     * reschedule IPIs it queued meanwhile: send_ipi posts the command bits at
+     * once but leaves the SBI call to the outermost SCHED_UNLOCK, so no SBI
+     * call is made with a dispatch lock held. Owner hart only.
+     */
+    uint64_t pc_ipi_defer;
+    uint8_t pc_sched_depth;
+    uint8_t pc_pad[31]; /* keep sizeof(struct pcpu) power-of-two */
 };
 
 #ifndef __cplusplus

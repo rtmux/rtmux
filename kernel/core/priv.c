@@ -113,6 +113,7 @@ extern void kext_root_mmap_phys_user(void *);
 extern void kext_root_mmap_anon_user(void *);
 extern void kext_proc_set_spawn(void *);
 extern void kext_proc_register_syschan(void *);
+extern void kext_proc_syschan_detach(void *);
 extern void kext_proc_list_children(void *);
 extern void kext_proc_wait_finalize(void *);
 extern void kext_proc_nozombie_mark(void *);

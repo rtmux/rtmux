@@ -114,8 +114,9 @@ ksys_interrupt_attach_thread(thread_t *act,
  * thread on each IRQ via interrupt_wait, the kernel delivers a COPY of "*event"
  * inline from trap context via sigevent_deliver_inline() — no intrevent_add /
  * drain round-trip. Suitable sigev_notify values: SIGEV_NOTIFICATION,
- * SIGEV_INTR, SIGEV_UNBLOCK, SIGEV_NONE. SIGEV_THREAD is rejected at
- * registration (thread_create is unsafe in trap context).
+ * SIGEV_UNBLOCK, SIGEV_NONE. SIGEV_THREAD is rejected at registration
+ * (thread_create is unsafe in trap context), and so is SIGEV_INTR: an IST
+ * attaches with interrupt_attach_thread.
  *
  * The calling thread's process is recorded as the owner so per-process cleanup
  * on exit works identically to interrupt_attach_thread.
@@ -241,8 +242,8 @@ int kdecl ksys_interrupt_unmask(thread_t *act,
 }
 
 
-/* #58 interrupt_wait — IST blocks here until SIGEV_INTR delivers an interrupt
- * event to act->flags |= RTMUX_FLG_THR_INTR_PENDING.
+/* #58 interrupt_wait — IST blocks here until the trap handler's inline wake
+ * delivers an interrupt (act->flags |= RTMUX_FLG_THR_INTR_PENDING).
  *
  * The PENDING-clear is atomic_clr; the wait path uses unready+block
  * (sched_slock-internal in dispatch.c). No additional locking needed in the
@@ -296,10 +297,10 @@ int kdecl ksys_interrupt_wait(thread_t *act,
     }
 
     if (act->flags & RTMUX_FLG_THR_INTR_PENDING) {
-        /* Atomic clear — paired with atomic_or in event.c SIGEV_INTR delivery.
-         * Preserves cross-CPU ordering against other paths that
-         * read-modify-write act->flags (force_ready KILLSELF set, exec
-         * KCALL_ERR_SET set, etc.).
+        /* Atomic clear — paired with the atomic_or of the trap handler's
+         * INTR_KIND_THREAD wake. Preserves cross-CPU ordering against other
+         * paths that read-modify-write act->flags (force_ready KILLSELF set,
+         * exec KCALL_ERR_SET set, etc.).
          */
         atomic_clr((volatile unsigned *) &act->flags,
                    RTMUX_FLG_THR_INTR_PENDING);
@@ -343,39 +344,19 @@ int kdecl ksys_interrupt_wait(thread_t *act,
     }
 
     SETKSTATUS(act, 0);
+    thread_wake_open(act); /* one waker may now end this wait */
     act->state = STATE_INTR;
     _TRACE_TH_EMIT_STATE(act, INTR);
 
-    /* Race-close re-check: an IRQ trap fired on THIS hart between the
-     * INTR_PENDING check (line ~243) and the STATE_INTR commit above would have
-     * observed "act" in STATE_RUNNING (== "here" on the trap-handler same-hart
-     * check) and taken the atomic_or PENDING path. Re-check after the state
-     * commit so we don't block() with PENDING already set.
-     *
-     * IRQ-pinning invariant: same-hart program order is sufficient here. The
-     * trap handler runs on the SAME hart as this IST (the source is SENABLE'd
-     * only on this hart via plic_owner_hart[] and this thread's runmask pins it
-     * here). No cross-hart memory fence is required — a compiler barrier keeps
-     * the C compiler from reordering the state write past the PENDING read;
-     * hardware program order does the rest.
+    /* The final pending-bit check and the switch away must exclude the
+     * same-hart PLIC handler throughout.
      */
-    __asm__ __volatile__("" ::: "memory");
-    if (act->flags & RTMUX_FLG_THR_INTR_PENDING) {
-        atomic_clr((volatile unsigned *) &act->flags,
-                   RTMUX_FLG_THR_INTR_PENDING);
-        act->state = STATE_RUNNING;
-        act->timeout_flags = 0;
-        CRITICAL_MARK_THREAD(act);
-        _TRACE_IST_DISPATCH(NULL, act);
-        return EOK;
-    }
-
-    /* block() is sched_slock-internal; preempt fence drops below the tail call
-     * by symmetry with the receive path (block doesn't return on the same kcall
-     * stack — the new active runs after trap exit). Equivalent to the BKL idiom
-     * of dropping the lock pre-block.
-     */
-    block();
+    block_interrupt_wait();
     _TRACE_IST_DISPATCH(NULL, act);
-    return EOK;
+
+    /* The status is already stored. Leave through kernel_exit also when the IST
+     * kept the hart: block_current may have put a thread back on the run list
+     * with a reschedule request, which only kernel_exit honours.
+     */
+    return ENOERROR;
 }

@@ -56,23 +56,23 @@
 
 /* FAIL_NEXT_TURNSTILE(pid): the next allocation of a PI turnstile on behalf of
  * that process fails once, whether it is a condvar wait's reservation or a
- * contended lock's own. ALLOC_STATUS reports whether it was consumed.
+ * contended lock's own. SITE_STATUS(TURNSTILE) reports whether it was consumed.
  */
 #define INJECT_OP_FAIL_NEXT_TURNSTILE 9
 
 /* STALL_MUTEX_LOCK(pid, ms): the next contended PI mutex lock by that process
  * stalls for ms milliseconds in the window where it has published its wait but
- * not yet queued, with the chain lock dropped. ALLOC_STATUS reports whether the
- * stall was taken. A race that needs another thread to act in that window is
- * otherwise a matter of luck.
+ * not yet queued, with the chain lock dropped. SITE_STATUS(STALL_LOCK) reports
+ * whether the stall was taken. A race that needs another thread to act in that
+ * window is otherwise a matter of luck.
  */
 #define INJECT_OP_STALL_MUTEX_LOCK 10
 
 /* STALL_FORCE_READY(pid, ms): the next force_ready of a thread of that process
- * that read it as a condvar, semaphore or mutex waiter stalls for ms
- * milliseconds before it takes the wait chain lock, the window in which the
- * waiter can be woken and block elsewhere. ALLOC_STATUS reports whether the
- * stall was taken.
+ * that read it as a condvar, semaphore or mutex waiter, or as a receiver,
+ * stalls for ms milliseconds before it takes the wait chain or channel lock,
+ * the window in which the waiter can be woken and block again.
+ * SITE_STATUS(STALL_FORCE_READY) reports whether the stall was taken.
  */
 #define INJECT_OP_STALL_FORCE_READY 11
 
@@ -124,10 +124,259 @@
 /* PRIO_SETTLE_STATS(what): what 0, ret is how many deferred priority settles
  * (K29) ran in thread context since the last reset; 1, how many priority
  * recomputations ran inside force_ready's client departure, which must be none:
- * force_ready runs in timer and event context under caller locks; 2 resets both
- * counts.
+ * force_ready runs in timer and event context under caller locks; 2 resets the
+ * counters and 3 reads the subset of deferred settles run on idle harts with
+ * interrupts off.
  */
 #define INJECT_OP_PRIO_SETTLE_STATS 19
+
+/* SITE_STATUS(site) returns one after that particular injection was taken.
+ * SITE_RELEASE(site) ends the current stall before its watchdog expires.
+ */
+#define INJECT_OP_SITE_STATUS 20
+#define INJECT_OP_SITE_RELEASE 21
+#define INJECT_OP_STALL_SYNC_WAKER 22
+#define INJECT_OP_SYNC_WAKE_CLAIMS 23
+#define INJECT_OP_INTR_BEFORE_SWITCH 24
+
+/* STALL_BLOCK(pid, tid << 32 | ms): thread tid (as pthread_t) of pid stalls the
+ * next time it is about to publish a blocked state: past every pending check of
+ * the kernel call, still running. A kill or a cancel posted during the stall
+ * finds a running thread and must still reach it once it blocks.
+ */
+#define INJECT_OP_STALL_BLOCK 25
+
+/* CRASH(how): the calling hart reports a fatal error and takes the kernel's
+ * crash path, as a kernel fault or a failed assertion does: the crash
+ * rendezvous, which prints every hart's report and halts (how 0). Or it reports
+ * and powers the machine off through the SBI, as a roottask crash does (how
+ * INJECT_CRASH_SHUTDOWN). For the harness's crash dump.
+ */
+#define INJECT_OP_CRASH 26
+#define INJECT_CRASH_SHUTDOWN 1
+
+/* STALL_REPLY_CLAIM(pid, ms): the next reply, error or follow-up copy by a
+ * thread of that process stalls after the rcvid lookup and before it reads the
+ * connection's channel, until a channel destroy on another hart has detached
+ * the connection or ms milliseconds pass. SITE_STATUS(STALL_REPLY_CLAIM)
+ * reports whether the stall was taken, and
+ * SITE_STATUS(INJECT_SITE_REPLY_DETACHED) whether a detach ended it.
+ */
+#define INJECT_OP_STALL_REPLY_CLAIM 27
+
+/* PREEMPT_REPLY_UNBLOCK(pid): the next reply by a thread of that process that
+ * removes a queued unblock notification restarts as if a preemption were
+ * pending (after a 1 ms stall). SITE_STATUS(STALL_REPLY_UNBLOCK) reports
+ * whether it was.
+ */
+#define INJECT_OP_PREEMPT_REPLY_UNBLOCK 28
+
+/* XFER_TRACE(pid): count, for the threads of that process, what its stepped
+ * message copies do from now on. XFER_STATS(what) reads a counter:
+ * INJECT_XFER_STARTS stepped copies begun from byte 0, INJECT_XFER_YIELDS steps
+ * that ended in a restart, INJECT_XFER_PEEKS transfers of a message's head to
+ * or from a kernel buffer (the header peek and its write-back), and
+ * INJECT_XFER_BUDGETS steps (of a copy or a vector scan) that ended because
+ * their time was up, not because a preemption was pending.
+ */
+#define INJECT_OP_XFER_TRACE 29
+#define INJECT_OP_XFER_STATS 30
+
+/* STALL_CLAIM_HELD(pid, ms): the next msg_readv by a thread of that process
+ * stalls with its claim on the client held, until SITE_RELEASE or ms.
+ * STALL_FORCE_CLAIMED(pid, ms): the next force_ready of a thread of that
+ * process that finds it claimed releases the STALL_CLAIM_HELD stall and then
+ * waits, before it hands its wake to the claimer, for the claim to go or ms to
+ * pass. Together they put a claimer's release inside a waker's decision.
+ */
+#define INJECT_OP_STALL_CLAIM_HELD 33
+#define INJECT_OP_STALL_FORCE_CLAIMED 34
+
+/* STALL_CAP_PEEK(pid, tid << 32 | ms): thread tid (as pthread_t) of pid stalls
+ * the next time it has copied a long message and is about to look at its head
+ * for a native capability header: the window in which a sibling of the sender
+ * can rewrite the header the receiver was already given.
+ */
+#define INJECT_OP_STALL_CAP_PEEK 35
+
+enum {
+    INJECT_XFER_STARTS,
+    INJECT_XFER_YIELDS,
+    INJECT_XFER_PEEKS,
+    INJECT_XFER_BUDGETS,
+    INJECT_XFER_COUNTERS
+};
+
+/* INTR_AFTER_SELECT(pid): like INTR_BEFORE_SWITCH, but the interrupt arrives
+ * after the blocking IST has chosen the next thread, the window in which the
+ * scheduler drops the dispatch lock to look for a thread to steal.
+ */
+#define INJECT_OP_INTR_AFTER_SELECT 31
+
+/* INTR_SELECT_SEEN: ret is what the last INTR_AFTER_SELECT injection found: 0
+ * not taken, 1 no thread had been chosen, or 2 plus the chosen thread's
+ * pthread_t shifted left by 8. Reading it resets it.
+ */
+#define INJECT_OP_INTR_SELECT_SEEN 32
+
+/* STALL_READY(pid, tid << 32 | ms): the next wakeup of thread tid (as
+ * pthread_t) of pid stalls for ms milliseconds at the start of ready(), when
+ * its waker has claimed the wait and the thread still reads as waiting. A
+ * second waker that claims the same wait meanwhile readies it twice.
+ */
+#define INJECT_OP_STALL_READY 36
+
+/* STALL_SWITCH(pid, tid << 32 | ms): thread tid of pid holds its hart for ms
+ * milliseconds the next time that hart is about to switch away from it: while
+ * block() looks at the other harts for a thread to steal, with the dispatch
+ * lock dropped, or after a reschedule has queued it READY. A wakeup or a steal
+ * in that window finds it still the hart's current thread.
+ */
+#define INJECT_OP_STALL_SWITCH 37
+
+/* STALL_SEND_PICK(pid, tid << 32 | ms): thread tid (as pthread_t) of pid stalls
+ * in its next msg_sendv right after it has looked for a waiting receiver and
+ * dropped the channel lock: the window in which the receiver it saw, if it did
+ * not claim it, is woken by somebody else.
+ */
+#define INJECT_OP_STALL_SEND_PICK 38
+
+/* GRANT_IPC_CAP(pid): give pid RTMUX_PRIV_CAP_IPC, which a started process
+ * never holds, so that a test can register as the remote IPC service and reach
+ * the kernel's remote IPC paths. EBUSY for a process still loading: its start
+ * sets its capabilities and would drop the grant.
+ */
+#define INJECT_OP_GRANT_IPC_CAP 39
+
+/* STALL_STEAL(pid, tid << 32 | ms): the next steal of thread tid of pid from
+ * another hart's run queue holds the stealing hart for ms milliseconds between
+ * the two dispatch locks, with the thread off every queue and not yet current:
+ * an unready() meanwhile finds it in transit.
+ */
+#define INJECT_OP_STALL_STEAL 40
+
+/* POKE(pid, tid << 8 | action): act on thread tid (as pthread_t) of pid as a
+ * stray waker or a teardown would: INJECT_POKE_READY calls ready() on it,
+ * INJECT_POKE_STOP unready()s it into STATE_STOPPED. For tests that hold a
+ * scheduler window open and need a second party in it. ret is EOK or ESRCH.
+ */
+#define INJECT_OP_POKE 41
+#define INJECT_POKE_READY 0
+#define INJECT_POKE_STOP 1
+
+/* SCHED_STATS(what): what 0, ret is how many remote dispatch locks a steal scan
+ * took on a queue it then found empty, since boot; what 1, how many times
+ * thread_set_as_prp took thread_as_slock (mod 2^31).
+ */
+#define INJECT_OP_SCHED_STATS 42
+
+/* STALL_CANCEL(pid, ms): the next cancel of a thread of pid by another thread
+ * stalls for ms milliseconds after it read the target's wait as cancelable and
+ * before it posts the cancel and ends that wait: the target can be woken
+ * meanwhile, disable cancellation and wait again.
+ */
+#define INJECT_OP_STALL_CANCEL 43
+
+/* STALL_REPRIO(pid, tid << 32 | ms): the next priority change of thread tid (as
+ * pthread_t) of pid while it is READY holds the changing hart for ms
+ * milliseconds once it has moved the thread to its new priority, before it
+ * returns: a stop meanwhile must still keep the thread from running.
+ */
+#define INJECT_OP_STALL_REPRIO 44
+
+/* HOLD_EXIT_DESTROY(pid, ms): for ms from now, roottask's pass at destroying
+ * the threads of that process (kext_exit_destroy_threads) asks to be made again
+ * (EAGAIN) after doing its work, as it does while a thread is held by a message
+ * transfer. One process at a time; the hold ends by itself.
+ */
+#define INJECT_OP_HOLD_EXIT_DESTROY 45
+
+/* STALL_UNBLOCK_RACE(pid, ms): hold open the window between a REPLY timeout's
+ * look for a claim on its client and its unblock notification, against a reply
+ * to that client. The next force_ready of a reply-blocked thread of pid on a
+ * channel that wants unblock notifications, before it tests the client's claim
+ * under the channel lock, waits for a claim on the client or ms milliseconds
+ * (STALL_UNBLOCK_FORCE). The next reply or error by a thread of pid, once it
+ * has looked for a queued unblock notification, waits for one to be marked
+ * queued or ms milliseconds (STALL_UNBLOCK_REPLY). SITE_STATUS reports each.
+ */
+#define INJECT_OP_STALL_UNBLOCK_RACE 46
+
+/* SLOW_KPAGE_ZERO(pid, us << 32 | count): the roottask thread that next zeroes
+ * a page while serving a request of process pid (kext_kpage_zero, the zeroing
+ * of a MAP) takes us microseconds longer for that page and each of the next
+ * count - 1 pages it zeroes, so a MAP of a few MiB lasts seconds and a kill
+ * lands in the middle of it. SITE_STATUS(STALL_KPAGE_ZERO) reports whether it
+ * began; SITE_RELEASE ends it.
+ */
+#define INJECT_OP_SLOW_KPAGE_ZERO 47
+
+/* STALL_THREAD_CREATE(pid, ms): the next thread_create in process pid, once it
+ * has published the new thread and counted it active and before the thread
+ * first runs, spins for ms milliseconds (STALL_THREAD_CREATE), so a kill of pid
+ * lands while the thread is half made. SITE_STATUS reports whether it was
+ * taken.
+ */
+#define INJECT_OP_STALL_THREAD_CREATE 48
+
+/* RCU_STALL_WAITS(hart, reset): ret is how many RCU-sched grace-period waits on
+ * hart had to wait for a hart held in an injected stall (inject_stall_until) to
+ * leave its kernel call; reset clears the count after it is read. The waiter
+ * spins its own hart all that time, so a stall of seconds holds that hart too,
+ * whatever thread a test expected to run there. A test that sees the count of
+ * its thread's hart rise during its window knows its setup was spoiled by that,
+ * not by the code under test.
+ */
+#define INJECT_OP_RCU_STALL_WAITS 49
+
+/* STALL_TIMER_FIRE(pid, tid << 32 | ms): the next timer of thread tid (as
+ * pthread_t) of pid that the timer expiry (timer_expiry) finds due holds the
+ * hart that fired it, with interrupts off, between recording the fire under the
+ * wheel lock and delivering it: the window in which the wait the timer was
+ * armed for can end by another path and the thread start the next one. A fire
+ * whose deadline had passed when the timer was armed is delivered by the kernel
+ * path that armed it (timer_activate_impl, or timeout_deferred_fire after the
+ * caller drops its lock), not by the expiry, and is not held: the arm stays for
+ * the next expired timer. The hold lasts until the thread has been woken and is
+ * in a nanosleep again, or ms milliseconds.
+ */
+#define INJECT_OP_STALL_TIMER_FIRE 50
+
+/* ABANDON_EXEC(pid): the next exec of a thread of pid is given up in its first
+ * kernel step, as when the loader shell goes away between two calls of that
+ * step: the first call does its work and asks to be made again (EAGAIN), and
+ * the next one fails with ESRCH, so roottask answers the caller with the error
+ * and the caller carries on.
+ */
+#define INJECT_OP_ABANDON_EXEC 51
+
+enum inject_site {
+    STALL_LOCK,
+    STALL_LOCK_EARLY,
+    STALL_LOCK_PROPAGATED,
+    STALL_FORCE_READY,
+    STALL_SYNC_WAKER,
+    STALL_BLOCK,
+    STALL_REPLY_CLAIM,
+    STALL_REPLY_UNBLOCK,
+    STALL_CLAIM_HELD,
+    STALL_FORCE_CLAIMED,
+    STALL_CAP_PEEK,
+    STALL_READY,
+    STALL_SWITCH,
+    STALL_SEND_PICK,
+    STALL_STEAL,
+    STALL_CANCEL,
+    STALL_REPRIO,
+    STALL_UNBLOCK_FORCE,
+    STALL_UNBLOCK_REPLY,
+    STALL_KPAGE_ZERO,
+    STALL_THREAD_CREATE,
+    STALL_TIMER_FIRE,
+    STALL_SITES,
+    INJECT_SITE_TURNSTILE = STALL_SITES,
+    INJECT_SITE_REPLY_DETACHED
+};
 
 #define INJECT_SPIN_MAX_MS 10000
 

@@ -299,6 +299,16 @@ departing client cannot replace the fence: a notification lend or a REPLY
 propagation bumps the generation too, so a loan install failing on it could not
 tell a departed client from a busy server.
 
+The debug-inject loan-context test times out clients on a two-server reply
+chain eight times. It counts settles on idle harts and checks that interrupts
+are disabled there. Both four-hart parallel TCG and instruction-clock TCG
+passed with lock debugging enabled. Across five alternating paired loops of
+one million iterations, the full RISC-V departure fence added 1.93 to
+2.07 ns per iteration in the instruction-clock model (shift 1). This measures
+the additional instruction in that model. Parallel TCG showed host scheduling
+noise, including a negative paired delta. Hardware latency requires a board
+measurement.
+
 The priority settle and the chain walk do not run here.  `force_ready` only
 queues the server on its hart's list (`thread_prio_defer_settle`, under the leaf
 lock `LOCK_CLASS_PRIO_DEFER`); `kernel_exit` settles that list before the hart
@@ -449,6 +459,7 @@ rationale lives at the cited source lines.
 | Receive blocks waiting for send | receiver `STATE_RECEIVE`, channel receive queue links, bridge bit | queue insert under channel lock plus `cpu_smp_mb()` before bridge clear | sender observes bridge clear before matching receiver | receiver thread remains pinned by queue membership until send/reply state transition. |
 | Reply wakes sender | reply data and sender state transition | data copy and state update before readying sender | sender returns through kernel exit after scheduler acquire | reply buffer lifetime is caller-owned; kernel only guarantees copied bytes and final status. |
 | Notification delivery | notification payload, target queue link or pending bit | queue/pending update before readying target | target observes under channel lock or scheduler acquire | notification object stays queued until receive consumes it. |
+| Kill or cancel of a blocking thread | requester: `RTMUX_FLG_THR_KILLSELF`, or `PTHREAD_CANCEL_PENDING` in the target's TLS plus `RTMUX_ITF_CANCEL_POSTED`; blocking hart: the wait state and `pc_curthread` | requester: `cpu_smp_mb()` after its stores, then it reads the target's state and active hart; blocking hart: `cpu_smp_mb()` in `block_recheck_arm()` after the displacement, then it reads the two flags | whichever side loads second sees the other's store: the requester calls `force_ready()` on a blocked target, or the blocking hart notes the thread in `pc_block_recheck` and `kernel_exit` delivers the request (`thread_block_recheck()`) before it dispatches anything | the noted thread is pinned (`tthread_pin`) from the note to the delivery; `force_ready()` claims the wait under the wait's own lock, so both sides acting is harmless. |
 
 RTMux notification = the single async-delivery primitive unifying what Linux
 splits across threaded-IRQ wakeups, eventfd, and completions. It is
@@ -467,8 +478,8 @@ IPI bits are defined in `kernel/include/smpswitch.h` and handled in
 | `IPI_TLB_FLUSH` | `sfence.vma`, then completion-counter release | Sender must publish page-table changes before the IPI and wait for the counter when freeing/reusing storage. |
 | `IPI_TLB_SAFE` | acknowledge safe TLB point | Used as a round trip; caller waits for bit clearance. |
 | `IPI_CLOCK_LOAD` | reload local timer | Timer state must be visible before send. |
-| `IPI_PARKIT` | park/quiesce receiver | Crash/shutdown-only paths. |
-| `IPI_CRASH` | enter crash rendezvous | No normal locks may be acquired. |
+| `IPI_PARKIT` | permanently park receiver | Clears the online and scheduling masks before parking. |
+| `IPI_CRASH` | enter crash rendezvous | The first crasher signals online CPUs and APs committed to join. The rendezvous includes CPUs already in crash handling and excludes parked CPUs. |
 | `IPI_CONTEXT_SAVE`, `IPI_CHECK_INTR`, `IPI_INTR_MASK`, `IPI_INTR_UNMASK` | reserved or not-yet-implemented | New users must document the receiver side first. |
 
 `send_ipi()` ORs the command into the target pending word and sends an SBI IPI.
@@ -562,6 +573,7 @@ more than one dispatch lock is needed.
 | `STATE_RECEIVE`, `STATE_REPLY`, `STATE_SEND`, `STATE_INTR` | blocking wait states | Exact wake source is RTMux IPC/interrupt state, not Linux wait queues. |
 | `STATE_NANOSLEEP` | timed interruptible sleep analogue | Timeout path must preserve bridge-bit and scheduler ordering. |
 | `SCHED_FIFO`, `SCHED_RR`, `SCHED_OTHER`, `SCHED_SPORADIC` | POSIX scheduler policies | Names are already POSIX; RTMux policy enums stay unchanged. |
+| `pc_curthread` (current thread) | `rq->curr`, `p->on_cpu` | A thread is current on at most one hart. Only the owning hart writes its slot, through `set_active_thread`. A thread becomes current from `STATE_READY` only by being unlinked from a dispatch queue under that queue's `LOCK_CLASS_SCHED` lock, or from a wait state when its waker hands it the waker's own hart (`block_and_ready`). A hart that queues its current thread READY (`resched`, `yield`, `adjust_priority`) switches away from it before it drops that lock. A wait has one waker: it claims the wait under the wait's own lock (a receiver: by unlinking it from the channel's receive queue under `chp->lock`; `force_ready` leaves an unlinked receiver to the claimer) and readies the thread once. `ready()` first waits until the thread's hart has switched away from it, and ignores a thread that is current and runnable; a past-deadline timeout armed by `block()` is delivered after the switch. `CONFIG_DEBUG_DISPATCH_OWNER` crashes on a second claim of a current thread or on queueing one. |
 
 ## Turnstile Prerequisite
 
@@ -626,7 +638,7 @@ Audited windows and their frozen branch classification:
 | --- | --- | --- | --- |
 | cap_lookup_pin_typed | 3 zero tests (table, slots, object non-NULL) | argument sanity | non-secret, no slot access reached yet |
 | cap_lookup_pin_typed | index == 0, index >= nslots (1 bgeu) | slot bounds | the one accepted V1 bounds compare per this window |
-| cap_lookup_pin_typed | 2 lock spin tests | cap_lock acquire | control flow, no authority datum |
+| cap_lookup_pin_typed | 1 lock spin test (ticket owner != ticket) | cap_lock acquire | control flow on the lock word, no authority datum |
 | cap_lookup_pin_typed | rights == 0 | reject empty-rights lookup | authority check, precedes use |
 | cap_lookup_pin_typed | state == LIVE, generation match, object type, rights subset | authority validation | must precede the slot->object load; no branch sits between the last of these and the load |
 | cap_lookup_pin_typed | pin_count == UINT32_MAX | refcount saturation | liveness, not authority; still precedes the object publication |
@@ -639,3 +651,13 @@ checks (state, generation, rights) remain the last data-dependent branches
 before the validated object is read.  A new or reordered branch in either window
 is a gate failure that a reviewer must justify here before regenerating the
 golden with the script's --emit mode.
+
+The six-hart early-crash regression requires four participants. CPUs 3 and 4
+crash after committing to join, CPU 2 parks, and CPU 5 never joins. Three
+successive boots reported the exact count. In three alternating four-hart
+rt-check pairs with single-threaded TCG and an instruction clock (shift 1),
+scheduler p99 was 41.6, 4654.2 and 19.0 microseconds on the baseline and
+19.0, 16.2 and 41.6 microseconds with the direct running-CPU lookup. All six
+checks passed. Parallel TCG on the loaded host showed millisecond-scale
+variation on both revisions. These measurements establish no hardware
+worst-case bound.

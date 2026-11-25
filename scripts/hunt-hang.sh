@@ -1,5 +1,5 @@
 #!/bin/sh
-# Boot a regress mode in a loop with the hang post-mortem enabled, and stop at
+# Boot a regress mode in a loop with the timeout and crash dumps enabled, and stop at
 # the first failure. Each failing loop leaves artifacts in its hunt directory
 # and an identity file naming the commit, dirty state, and kernel hash.
 #

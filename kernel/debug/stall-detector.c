@@ -234,6 +234,24 @@ static void stall_scan_roottask_waiters(void)
                 now - ts <= STALL_WAIT_TIMEOUT_NSEC ||
                 ts == thp->stall_reported_ts)
                 continue;
+
+            /* A thread that is still its hart's current thread has published
+             * its wait but not switched away yet. The switch stamps
+             * timestamp_last_block (sched_account_switch) before it moves the
+             * hart off the thread, so until then the stamp is the previous
+             * block's. Once the thread is off its hart, the re-read of the
+             * stamp below sees the new one and skips the thread. This hart
+             * counts too: the scan runs in its tick, which can interrupt that
+             * window here as well.
+             */
+            {
+                unsigned cpu = __atomic_load_n(&thp->runcpu, __ATOMIC_RELAXED);
+
+                if (cpu < CONFIG_PROCESSORS_MAX &&
+                    __atomic_load_n(&pcpu_array[cpu].pc_curthread,
+                                    __ATOMIC_ACQUIRE) == thp)
+                    continue;
+            }
             w->pid = prp->pid;
             w->tid = (int) thp->tid;
             w->state = state;
@@ -310,11 +328,12 @@ static void stall_dump(void)
             !!(ik & (INKERNEL_NOW >> 1)), /* INKERNEL_LOCK adjacent bit */
             (ik >> 24) & 0xff, ik & 0xff);
 
+    uint64_t online = cpu_online_snapshot();
     kprintf("-- Per-CPU active thread --\n");
     for (cpu = 0; cpu < num_processors; cpu++) {
         thread_t *thp;
 
-        if (!cpu_online(cpu))
+        if (!cpu_in_mask(online, cpu))
             continue;
         thp = get_active_thread(cpu);
         if (!thp) {

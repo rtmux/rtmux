@@ -37,6 +37,20 @@ construction, not by a priority comparison that could be tuned wrong: their
 already-allocated working set is never a reclaim target because nothing is ever
 reclaimed. The rule that protects them is structural.
 
+## Process creation and the kernel heap
+
+Startup reserves one thirty-second of available RAM for the kernel object heap,
+rounded down to a page, with an 8 MiB minimum. When a contiguous extent of the
+requested size is unavailable, startup halves the request down to that minimum.
+The physical allocator reports free memory separately. Process creation can
+therefore return ENOMEM while the physical allocator still has pages available.
+
+In a four-hart, 656 MiB guest, starting 200 idle instances of `cat` reduced
+physical free memory from 626524160 to 305049600 bytes, about 1.53 MiB per
+resident. The used part of roottask's fixed heap arena (`roottask.heap_used`
+in `/sys/kstats`) grew from 256 KiB to 512 KiB over the same interval.
+These are guest-wide deltas. They include the cost of eagerly backed mappings.
+
 ## What "protected by construction" requires of a realtime process
 
 Because memory is never reclaimed, a realtime process is safe if and only if it

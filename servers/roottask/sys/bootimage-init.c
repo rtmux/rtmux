@@ -15,6 +15,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <sys/priority-bands.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <spawn.h>
@@ -170,5 +171,5 @@ void bootimage_init(void)
     if (code == -1)
         crash();
 
-    msg_send_notification(ROOTTASK_COID, PROC_INIT_PRIORITY, code, 0);
+    msg_send_notification(ROOTTASK_COID, RTMUX_PRIO_SERVER, code, 0);
 }

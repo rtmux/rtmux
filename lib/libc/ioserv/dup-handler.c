@@ -49,6 +49,8 @@ int _ioserv_dup_handler(ioserv_context_t *ctp, ioserv_msg_t *msg)
 
     if (_ioserv_handle(&ctp->info, binding, _IOSERV_HANDLE_SET) !=
         (void *) -1) {
+        ctp->bound = binding;
+        ctp->bound_serial = binding->serial;
         return n;
     }
     n = errno;

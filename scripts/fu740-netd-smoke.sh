@@ -1,5 +1,6 @@
 #!/bin/sh
 set -eu
+. "$(dirname -- "$0")/crash-signatures.sh"
 
 log=build/fu740-logs/lkl-netd.log
 runner=${FU740_RUNNER:-}
@@ -37,7 +38,7 @@ require()
 
 reject_bad_log()
 {
-    bad_re='FAULT|FATAL|CRASH|Kernel panic|panic:|lkl-host: panic|FREED-ACTIVE|__kernel_restore bad ptr|/usr unavailable|Undefined symbol|No such file or directory|Bad file descriptor'
+    bad_re=$RTMUX_BAD_RE
 
     if grep -Eq 'RTMux lkl-netd-http: FAIL|RTMux lkl-netd-revoke: FAIL' "$log"; then
         echo "fu740-netd-smoke: board log contains lkl-netd FAIL marker" >&2

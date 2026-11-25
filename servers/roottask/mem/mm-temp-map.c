@@ -47,7 +47,7 @@ int pte_temp_map(address_t *adp,
     unsigned min_len;
 
     paddr = pa_quantum_to_paddr(pq);
-    vaddr = (uintptr_t) paddr + CPU_1TO1_VADDR_BIAS;
+    vaddr = (uintptr_t) PA_TO_VA(paddr);
 
     or = mm->obj_ref;
     obp = or->obp;

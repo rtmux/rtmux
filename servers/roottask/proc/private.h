@@ -24,14 +24,28 @@ extern soul_t wait_souls;
 
 #include <process.h>
 
+static inline int spawn_add_size(size_t *sum, size_t add)
+{
+    if (add > SIZE_MAX - *sum)
+        return E2BIG;
+    *sum += add;
+    return EOK;
+}
+
 /* A copy of one process's group and session state, taken under its slot lock
  * (proc_snapshot, jobctl.c): what setpgid and the job control checks both read.
- * The slot lock makes the process's own fields (ppid, pgrp, sid, flags, execed)
+ * The slot lock makes the process's own fields (ppid, pgrp, sid, flags)
  * consistent with each other. fg and fd belong to the session that every member
  * shares and are changed under pgrp_mutex and another member's slot lock, so
  * they are only a reading at one moment: a caller that needs them to hold
- * across a decision takes pgrp_mutex, as setpgid does.
+ * across a decision takes pgrp_mutex, as setpgid does. A process that is ending
+ * or has ended: it takes no signal and starts no second exit.
  */
+#define PROC_DEAD_FLAGS                                  \
+    (RTMUX_FLG_PROC_TERMING | RTMUX_FLG_PROC_ZOMBIE |    \
+     RTMUX_FLG_PROC_WAITINFO | RTMUX_FLG_PROC_WAITDONE | \
+     RTMUX_FLG_PROC_DESTROYALL)
+
 struct proc_snap {
     pid_t ppid;
     pid_t pgrp;
@@ -39,8 +53,6 @@ struct proc_snap {
     pid_t fg;  /* foreground group of the session's terminal */
     int fd;    /* roottask's descriptor to the terminal, or -1 */
     unsigned flags;
-    unsigned char execed; /* it has replaced its image */
-    channel_t *chp;       /* the process's system channel */
 };
 
 int proc_snapshot(pid_t pid, struct proc_snap *s);

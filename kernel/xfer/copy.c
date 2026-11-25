@@ -169,6 +169,9 @@ int xfer_atomic_or_user(volatile unsigned *uaddr, unsigned bits)
     return xfer_fetch_or_user(uaddr, bits, NULL);
 }
 
+/* A word as xfer_memcpy moves it: it may alias any object. */
+typedef uintptr_t __attribute__((__may_alias__)) xfer_word_t;
+
 /* This routine is used to do memcpy between a kernel buffer and a user buffer
  * during short msg transfer. It will guranteed to return an error msg when the
  * user buffer can not be accessed.
@@ -176,12 +179,11 @@ int xfer_atomic_or_user(volatile unsigned *uaddr, unsigned bits)
 int xfer_memcpy(void *dst, const void *src, size_t len)
 {
     void *old_handler;
+    jmp_buf env, *old_env = GET_XFER_ENV();
     register uint8_t *d;
     register const uint8_t *s;
 
     if (!(old_handler = (void *) GET_XFER_HANDLER())) {
-        jmp_buf env;
-        jmp_buf *old_env = GET_XFER_ENV();
         int status;
 
         /* Setup the jump buffer for all exiting of this function */
@@ -200,10 +202,37 @@ int xfer_memcpy(void *dst, const void *src, size_t len)
     }
     d = dst;
     s = src;
-    while (len--) {
-        *d++ = *s++;
+
+    /* Words where both ends share their alignment: an aligned word lies in one
+     * page, so a fault still stops the copy at a page boundary, with every byte
+     * before it moved. Bytes for the unaligned head, the tail, and a pair of
+     * buffers that cannot be aligned together. The accesses are volatile so
+     * that the loops stay loops: a call to memcpy here would be the byte loop
+     * again.
+     */
+    if ((((uintptr_t) d ^ (uintptr_t) s) & (sizeof(xfer_word_t) - 1)) == 0) {
+        while (len && ((uintptr_t) d & (sizeof(xfer_word_t) - 1))) {
+            *(volatile uint8_t *) d++ = *(const volatile uint8_t *) s++;
+            len--;
+        }
+        while (len >= sizeof(xfer_word_t)) {
+            *(volatile xfer_word_t *) (void *) d =
+                *(const volatile xfer_word_t *) (const void *) s;
+            d += sizeof(xfer_word_t);
+            s += sizeof(xfer_word_t);
+            len -= sizeof(xfer_word_t);
+        }
     }
+    while (len--) {
+        *(volatile uint8_t *) d++ = *(const volatile uint8_t *) s++;
+    }
+
+    /* A standalone copy armed its own env above: put the old one back with the
+     * handler, so that no later fault can longjmp into this dead frame.
+     */
     SET_XFER_HANDLER(old_handler);
+    if (!old_handler)
+        SET_XFER_ENV(old_env);
     return 0;
 }
 

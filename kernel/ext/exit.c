@@ -64,19 +64,55 @@ int exit_ready_stopped(thread_t *thp)
     return 0;
 }
 
-/* kext_exit_destroy_threads — tear down every thread in a dying process.
+/* exit_pass_thread — the thread in slot tid of prp that a destroy pass may act
+ * on, or NULL.
  *
- * Called from roottask's process_threads_destroy via syscall_priv. Parameters:
- *   arg : process_t * for the dying process
+ * The slot is read under vec_slock: a vector_add that grows the vector frees
+ * the old slot array under that lock. A thread that thread_create is still
+ * setting up (CREATING, see thread_destroy) is left to its creator and may not
+ * yet be counted active: *creating is set for it, so the pass asks to be made
+ * again rather than report the threads gone. The creator holds nothing a pass
+ * waits for and readies the thread within its call. The thread returned stays
+ * valid for the rest of the pass even if it is reaped meanwhile: a reap waits
+ * for an RCU-sched grace period, and this kernel call is no quiescent state.
  */
-void kext_exit_destroy_threads(void *arg)
+static thread_t *exit_pass_thread(process_t *prp,
+                                  int tid,
+                                  const thread_t *keep,
+                                  bool *creating)
 {
-    process_t *prp = arg;
+    thread_t *thp;
+
+    kspinlock_lock(&prp->vec_slock);
+    thp = vector_lookup2(&prp->threads, (unsigned) tid);
+    if (thp && (thp->internal_flags & RTMUX_ITF_CREATING)) {
+        *creating = true;
+        thp = NULL;
+    }
+    kspinlock_unlock(&prp->vec_slock);
+    return thp == keep ? NULL : thp;
+}
+
+/* exit_destroy_threads — tear down the threads of a process, all but one.
+ *
+ * keep is NULL for a dying process, where every thread goes. An exec keeps the
+ * thread that called it: that one is reply-blocked in roottask for the whole
+ * swap and becomes the new image's first thread, so no pass here may touch it.
+ * A request to try again (EAGAIN) is left in the caller's kcall status, as for
+ * any teardown call; it is made while a thread is still being created. The
+ * passes run without vec_slock (thread_destroy takes it), so they read each
+ * slot through exit_pass_thread. Parameters:
+ *   prp  : process whose threads to destroy
+ *   keep : thread to leave alone, or NULL
+ */
+void exit_destroy_threads(process_t *prp, thread_t *keep)
+{
     thread_t *act = get_active_thread(get_cpunum());
     int tid;
     thread_t *thp;
     int destroyed = 0;
     int unparked = 0;
+    bool creating = false;
 
     /* Defensive guard: refuse to destroy the ROOTTASK_PID (roottask) process.
      * In the U-mode pool model the loader thread (a roottask pool thread) calls
@@ -90,7 +126,7 @@ void kext_exit_destroy_threads(void *arg)
     }
     /* First pass: destroy what we can */
     for (tid = 0; tid < prp->threads.nentries; ++tid) {
-        if ((thp = vector_lookup2(&prp->threads, (unsigned) tid))) {
+        if ((thp = exit_pass_thread(prp, tid, keep, &creating))) {
             atomic_or(&thp->flags, RTMUX_FLG_THR_DETACHED);
             thread_destroy(thp);
             destroyed++;
@@ -106,7 +142,7 @@ void kext_exit_destroy_threads(void *arg)
      * alive.
      */
     for (tid = 0; tid < prp->threads.nentries; ++tid) {
-        if ((thp = vector_lookup2(&prp->threads, (unsigned) tid)) &&
+        if ((thp = exit_pass_thread(prp, tid, keep, &creating)) &&
             thp->state == STATE_STOPPED && tthread_pin(thp) == EOK) {
             unparked |= exit_ready_stopped(thp);
             tthread_unpin(thp);
@@ -138,7 +174,7 @@ void kext_exit_destroy_threads(void *arg)
      * chp->reply_queue; the LINK2_REM below handles a missing next pointer.
      */
     for (tid = 0; tid < prp->threads.nentries; ++tid) {
-        if ((thp = vector_lookup2(&prp->threads, (unsigned) tid))) {
+        if ((thp = exit_pass_thread(prp, tid, keep, &creating))) {
             int reply_send;
             int stamped_dead = 0;
 
@@ -299,14 +335,40 @@ void kext_exit_destroy_threads(void *arg)
                  * (including its sync cleanup), yet may hold a mutex: hand
                  * those on now.
                  */
-                thread_sync_teardown(thp);
+                sync_thread_cleanup(thp);
             }
             thread_destroy(thp);
         }
     }
 
     LOGF_T("proc_exit: pid=%d destroyed %d threads\n", prp->pid, destroyed);
+    if (creating) {
+        kcall_err(act, EAGAIN);
+        return;
+    }
     SETKSTATUS(act, EOK);
+}
+
+/* kext_exit_destroy_threads — tear down every thread in a dying process.
+ *
+ * Called from roottask's process_threads_destroy via syscall_priv. Parameters:
+ *   arg : process_t * for the dying process
+ */
+void kext_exit_destroy_threads(void *arg)
+{
+    process_t *prp = arg;
+    thread_t *act = get_active_thread(get_cpunum());
+    exit_destroy_threads(prp, NULL);
+
+    /* A running sibling can pass its return-to-user KILLSELF check and enter a
+     * blocking call as another hart asks it to die. The reschedule IPI then
+     * sees a blocked thread. Retry from roottask until every sibling has
+     * self-reaped, including one that just joined a receive or sync queue.
+     */
+    if (prp->pid != ROOTTASK_PID && (int) KSTATUS(act) == EOK &&
+        (__atomic_load_n(&prp->num_active_threads, __ATOMIC_ACQUIRE) != 0 ||
+         inject_exit_destroy_held(prp)))
+        kcall_err(act, EAGAIN);
 }
 
 /* Per-process resource teardown bodies.
@@ -489,6 +551,6 @@ void process_destroy(process_t *prp, pid_t killer_pid)
     if (!thp)
         return;
 
-    prp->flags |= RTMUX_FLG_PROC_DESTROYALL;
+    PROC_FLG_SET(prp, RTMUX_FLG_PROC_DESTROYALL);
     atomic_or(&thp->flags, RTMUX_FLG_THR_DETACHED | RTMUX_FLG_THR_KILLSELF);
 }

@@ -36,7 +36,7 @@ int pte_temp_map(address_t *adp,
     (void) user_va;
 
     paddr = pa_quantum_to_paddr(pq);
-    vaddr = (uintptr_t) paddr + CPU_1TO1_VADDR_BIAS;
+    vaddr = (uintptr_t) PA_TO_VA(paddr);
 
     return func((void *) vaddr, len, d);
 }

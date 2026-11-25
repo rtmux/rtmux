@@ -25,14 +25,28 @@ int debug_process_call(enum rtmux_debug_request request,
                        pid_t pid,
                        int tid,
                        union rtmux_debug_data *data);
-process_t *process_create(pid_t parent_pid, void *lcp, pid_t *out_pid);
+process_t *process_create(pid_t parent_pid,
+                          void *lcp,
+                          int exec,
+                          pid_t *out_pid);
 int process_destroy_call(pid_t pid);
 int process_destroy_all(pid_t pid);
-int process_exec(void *lcp, int *prcvid, int rcvid, int ppid);
+/* The steps of an exec; see kernel/ext/process.c. */
+enum {
+    EXEC_BEGIN = 1,
+    EXEC_QUIESCE = 2,
+    EXEC_COMMIT = 3,
+};
+int process_exec(unsigned op,
+                 pid_t ppid,
+                 int lrcvid,
+                 int crcvid,
+                 pid_t shell_pid,
+                 uint64_t priv_caps);
 int process_shutdown(process_t *prp, int exec);
 int process_reparent(pid_t pid);
-void signal_kill(channel_t *chp, int signo, pid_t sender_pid);
-void process_threads_destroy(process_t *prp);
+int signal_kill(pid_t pid, int signo, pid_t sender_pid);
+int process_threads_destroy(process_t *prp);
 int process_timer_destroy(process_t *prp, int id);
 int process_connect_detach(process_t *prp, int coid);
 int process_bind(pid_t pid);

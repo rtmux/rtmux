@@ -33,11 +33,9 @@
 #include <sys/procmsg.h>
 #include <signal.h>
 #include <termios.h>
+#include <sys/ioserv-ldisc.h>
 #include <devctl/common.h>
 #include <devctl/tty.h>
-
-#define RTMUX_SERIAL_LINEBUF_SIZE 256
-#define RTMUX_SERIAL_COOKED_BUF_SIZE 512
 
 static struct termios ser_termios;
 static pid_t ser_pgrp;
@@ -52,12 +50,11 @@ static int pending_rcvid = -1;
 static int pending_scoid = -1;
 static int pending_coid = -1;
 
-static uint8_t linebuf[RTMUX_SERIAL_LINEBUF_SIZE];
-static unsigned linebuf_len;
-
-static uint8_t cooked_rxbuf[RTMUX_SERIAL_COOKED_BUF_SIZE];
-static volatile unsigned cooked_head;
-static volatile unsigned cooked_tail;
+static struct ioserv_ldisc ser_input;
+static struct tty_read_clock pending_clock;
+static unsigned pending_size;
+static timer_t read_timer;
+static int read_timer_created;
 
 /* Armed readiness notifications (_IO_NOTIFY), one list per condition. Like the
  * rings, the lists are only touched by the dispatch thread, which also runs
@@ -121,6 +118,7 @@ static int ser_jobctl_gate(pid_t pid, int is_write)
 }
 
 static void serial_flush_input(void);
+static void ser_finish_read(void);
 
 /* A termios signal character typed on a terminal that has a session: echo it,
  * drop what was typed ahead (unless NOFLSH), and signal the session's
@@ -164,6 +162,7 @@ static void serial_termios_init(void)
     ser_termios.c_cflag = CS8 | CREAD | HUPCL;
     ser_termios.c_ispeed = ser_termios.c_ospeed = B38400;
     ser_termios.c_lflag = ECHO | ECHOE | ECHOK | ICANON | ISIG;
+    ser_termios.c_cc[VMIN] = 1;
     ser_termios.c_cc[VEOF] = 0x04;
     ser_termios.c_cc[VEOL] = 0;
     ser_termios.c_cc[VERASE] = 0x08;
@@ -188,133 +187,37 @@ static int ser_open(ioserv_context_t *ctp,
     return EOK;
 }
 
-static void tx_str(const char *s)
-{
-    for (; *s; s++)
-        tx_byte((uint8_t) *s);
-}
-
-static inline int cooked_empty(void)
-{
-    return cooked_head == cooked_tail;
-}
-
-static void cooked_put(uint8_t c)
-{
-    if ((cooked_head - cooked_tail) < RTMUX_SERIAL_COOKED_BUF_SIZE) {
-        cooked_rxbuf[cooked_head % RTMUX_SERIAL_COOKED_BUF_SIZE] = c;
-        cooked_head++;
-    }
-}
-
-static int cooked_get(void)
-{
-    uint8_t c;
-
-    if (cooked_empty())
-        return -1;
-
-    c = cooked_rxbuf[cooked_tail % RTMUX_SERIAL_COOKED_BUF_SIZE];
-    cooked_tail++;
-    return c;
-}
-
-/* Next cooked byte without consuming it, or -1 when none. */
-static int cooked_peek(void)
-{
-    if (cooked_empty())
-        return -1;
-    return cooked_rxbuf[cooked_tail % RTMUX_SERIAL_COOKED_BUF_SIZE];
-}
-
-static void echo_char(int c)
-{
-    if (c == '\n') {
-        tx_byte('\r');
-        tx_byte('\n');
-    } else if (c >= ' ' && c < 0x7F) {
-        tx_byte((uint8_t) c);
-    }
-}
-
-/* Applies a small canonical line discipline. Raw mode delivers bytes
- * immediately; canonical mode buffers until newline and handles erase/kill.
- */
-static void process_input_byte(int c)
-{
-    uint8_t verase;
-    uint8_t vkill;
-
-    if (ser_signal_char(c))
-        return;
-
-    if ((ser_termios.c_iflag & ICRNL) && c == '\r')
-        c = '\n';
-
-    if (!(ser_termios.c_lflag & ICANON)) {
-        if (ser_termios.c_lflag & ECHO)
-            echo_char(c);
-        cooked_put((uint8_t) c);
-        return;
-    }
-
-    verase = ser_termios.c_cc[VERASE];
-    vkill = ser_termios.c_cc[VKILL];
-
-    if (c == verase || c == 0x08 || c == 0x7F) {
-        if (linebuf_len > 0) {
-            linebuf_len--;
-            if (ser_termios.c_lflag & ECHOE)
-                tx_str("\b \b");
-            else if (ser_termios.c_lflag & ECHO)
-                tx_byte('\b');
-        }
-        return;
-    }
-
-    if (c == vkill) {
-        while (linebuf_len > 0) {
-            if (ser_termios.c_lflag & (ECHOE | ECHOK))
-                tx_str("\b \b");
-            linebuf_len--;
-        }
-        return;
-    }
-
-    if (c == '\n') {
-        if (linebuf_len < RTMUX_SERIAL_LINEBUF_SIZE)
-            linebuf[linebuf_len++] = '\n';
-        if (ser_termios.c_lflag & ECHO)
-            echo_char('\n');
-        for (unsigned i = 0; i < linebuf_len; i++)
-            cooked_put(linebuf[i]);
-        linebuf_len = 0;
-        return;
-    }
-
-    if (linebuf_len < RTMUX_SERIAL_LINEBUF_SIZE - 1) {
-        linebuf[linebuf_len++] = (uint8_t) c;
-        if (ser_termios.c_lflag & ECHO)
-            echo_char(c);
-    }
-}
-
-static int cooked_rxbuf_get(void)
+static void ser_pump(void)
 {
     int c;
-
-    while ((c = rxbuf_get()) >= 0)
-        process_input_byte(c);
-    return cooked_get();
+    while (ser_input.head - ser_input.tail <= TTY_QUEUE - TTY_LINE &&
+           (c = rxbuf_get()) >= 0) {
+        struct tty_echo echo;
+        if (ser_signal_char(c))
+            continue;
+        ioserv_ldisc_feed(&ser_input, &ser_termios, (unsigned char) c, &echo);
+        for (unsigned i = 0; i < echo.repeat; i++)
+            for (unsigned j = 0; j < echo.len; j++)
+                tx_byte((uint8_t) echo.bytes[j]);
+    }
 }
 
-static int cooked_rxbuf_peek(void)
+static int ser_arm_read(uint64_t deadline)
 {
-    int c;
-
-    while ((c = rxbuf_get()) >= 0)
-        process_input_byte(c);
-    return cooked_peek();
+    if (!deadline)
+        return 0;
+    if (!read_timer_created) {
+        struct sigevent ev;
+        SIGEV_NOTIFICATION_INIT(&ev, notification_coid, RTMUX_PRIO_DEVICE_IST,
+                                NOTIFICATION_CODE_RX, 0);
+        if (timer_create(CLOCK_MONOTONIC, &ev, &read_timer) == -1)
+            return errno;
+        read_timer_created = 1;
+    }
+    struct itimerspec spec = {0};
+    spec.it_value.tv_sec = (time_t) (deadline / 1000000000);
+    spec.it_value.tv_nsec = (long) (deadline % 1000000000);
+    return timer_settime(read_timer, TIMER_ABSTIME, &spec, NULL) ? errno : 0;
 }
 
 /* Forget the parked reader. A nonzero err is replied to it; zero means the
@@ -385,30 +288,32 @@ static int ser_read(ioserv_context_t *ctp, io_read_t *msg, void *ocb)
     if ((c = ser_jobctl_gate(ctp->info.pid, 0)) != 0)
         return c;
 
-    c = cooked_rxbuf_get();
+    /* At most TTY_QUEUE bytes, so it fits an unsigned. */
+    unsigned size =
+        (unsigned) (msg->i.nbytes < TTY_QUEUE ? msg->i.nbytes : TTY_QUEUE);
+    if (size > ctp->msg_max_size)
+        size = (unsigned) ctp->msg_max_size;
+    struct tty_read_clock clock = {0};
+    unsigned consume;
+    ser_pump();
+    c = ioserv_ldisc_read(&ser_input, &ser_termios, &clock, ioserv_tty_now(),
+                          ioflag & O_NONBLOCK, (char *) msg, size, &consume);
     if (c >= 0) {
-        *(char *) msg = (char) c;
-        _IO_SET_READ_NBYTES(ctp, 1);
-        return IOSERV_PTR(ctp, msg, 1);
+        ser_input.tail += consume;
+        _IO_SET_READ_NBYTES(ctp, c);
+        return c ? IOSERV_PTR(ctp, msg, c) : EOK;
     }
-
     if (ioflag & O_NONBLOCK)
         return EAGAIN;
     if (ser_pending_live())
         return EBUSY;
-
+    if ((c = ser_arm_read(clock.deadline)) != 0)
+        return c;
+    pending_size = size;
+    pending_clock = clock;
     pending_rcvid = ctp->rcvid;
     pending_scoid = ctp->info.scoid;
     pending_coid = ctp->info.coid;
-    c = cooked_rxbuf_get();
-    if (c >= 0) {
-        pending_rcvid = -1;
-        pending_scoid = -1;
-        pending_coid = -1;
-        *(char *) msg = (char) c;
-        _IO_SET_READ_NBYTES(ctp, 1);
-        return IOSERV_PTR(ctp, msg, 1);
-    }
     return IOSERV_NOREPLY;
 }
 
@@ -460,11 +365,15 @@ static int ser_write(ioserv_context_t *ctp, io_write_t *msg, void *ocb)
     return EOK;
 }
 
+static dev_t ser_devno;
+static ino_t ser_inode;
+
 static int ser_stat(ioserv_context_t *ctp, io_stat_t *msg, void *ocb)
 {
     (void) ocb;
     memset(&msg->o, 0, sizeof msg->o);
-    msg->o.st_ino = 100;
+    msg->o.st_dev = msg->o.st_rdev = ser_devno;
+    msg->o.st_ino = ser_inode;
     msg->o.st_size = 1;
     msg->o.st_ctime = msg->o.st_mtime = msg->o.st_atime = time(0);
     msg->o.st_mode = 0666 | S_IFCHR;
@@ -480,8 +389,8 @@ static void serial_flush_input(void)
 {
     while (rxbuf_get() >= 0)
         ;
-    linebuf_len = 0;
-    cooked_tail = cooked_head;
+    ser_input.editing = 0;
+    ser_input.tail = ser_input.head;
 }
 
 static int ser_devctl(ioserv_context_t *ctp, io_devctl_t *msg, void *ocb)
@@ -528,7 +437,13 @@ static int ser_devctl(ioserv_context_t *ctp, io_devctl_t *msg, void *ocb)
         if (msg->i.nbytes < (int32_t) sizeof(struct termios) ||
             (size_t) ctp->size < sizeof(*msg) + sizeof(struct termios))
             return EINVAL;
+        int flush = msg->i.devctl_cmd == DEVCTL_TTY_SET_ATTR_FLUSH;
+        if (flush)
+            serial_flush_input();
+        ioserv_ldisc_set(&ser_input, &ser_termios,
+                         (const struct termios *) data, flush);
         memcpy(&ser_termios, data, sizeof(struct termios));
+        pending_clock = (struct tty_read_clock) {0};
         ioserv_tty_hangup_wake(ser_notify_lists, &ser_termios);
 
         /* A reader parked on a line that is now hung up gets end of file. */
@@ -537,6 +452,8 @@ static int ser_devctl(ioserv_context_t *ctp, io_devctl_t *msg, void *ocb)
 
             ser_cancel_pending(0);
             (void) msg_reply(rcvid, 0, NULL, 0);
+        } else {
+            ser_finish_read();
         }
         break;
     case DEVCTL_TTY_GET_PGRP:
@@ -641,8 +558,11 @@ static unsigned ser_ready(unsigned want)
 
     if (ioserv_tty_hung_up(&ser_termios))
         return 0; /* POLLHUP, never writable (POSIX 2.10.6) */
-    if ((want & _NOTIFY_COND_INPUT) && cooked_rxbuf_peek() >= 0)
-        sat |= _NOTIFY_COND_INPUT;
+    if (want & _NOTIFY_COND_INPUT) {
+        ser_pump();
+        if (ser_input.head != ser_input.tail)
+            sat |= _NOTIFY_COND_INPUT;
+    }
     return sat & want;
 }
 
@@ -651,7 +571,7 @@ static unsigned ser_ready(unsigned want)
  */
 static void ser_notify_input(void)
 {
-    if (!cooked_empty())
+    if (ser_input.head != ser_input.tail)
         ioserv_notify_trigger(ser_notify_lists, 1, IOSERV_NOTIFY_INPUT);
 }
 
@@ -673,52 +593,40 @@ static int ser_notify(ioserv_context_t *ctp, io_notify_t *msg, void *ocb)
         ioserv_tty_hup(&ser_termios), NULL);
 }
 
+static void ser_finish_read(void)
+{
+    ser_pump();
+    if (ser_pending_live()) {
+        char reply[TTY_QUEUE];
+        unsigned consume;
+        int n = ioserv_ldisc_read(&ser_input, &ser_termios, &pending_clock,
+                                  ioserv_tty_now(), 0, reply, pending_size,
+                                  &consume);
+        if (n >= 0) {
+            int rcvid = pending_rcvid;
+            ser_cancel_pending(0);
+            if (msg_reply(rcvid, n, reply, n) != -1)
+                ser_input.tail += consume;
+        } else {
+            int err = ser_arm_read(pending_clock.deadline);
+            if (err)
+                ser_cancel_pending(err);
+        }
+    }
+    /* Whatever the reader left is readable by the pollers. */
+    ser_notify_input();
+}
+
 static int rx_notification_handler(message_context_t *ctp,
                                    int code,
                                    unsigned flags,
                                    void *handle)
 {
-    char reply;
-    int rcvid;
-    int c;
-
     (void) ctp;
     (void) code;
     (void) flags;
     (void) handle;
-
-    if (!ser_pending_live()) {
-        /* Nobody is reading, but a job may be running that ^C must reach, or a
-         * poller may be waiting: run what arrived through the line discipline
-         * now, so a signal character is seen when typed and a completed line
-         * wakes the poller. The bytes stay queued for the next reader.
-         */
-        if (ser_sid ||
-            ioserv_notify_armed(ser_notify_lists, IOSERV_NOTIFY_INPUT, 1))
-            (void) cooked_rxbuf_peek();
-        ser_notify_input();
-        return 0;
-    }
-
-    c = cooked_rxbuf_peek();
-    if (c < 0)
-        return 0;
-
-    reply = (char) c;
-    rcvid = pending_rcvid;
-    pending_rcvid = -1;
-    pending_scoid = -1;
-    pending_coid = -1;
-
-    /* The reader can still die between the liveness check and the reply: only
-     * consume the byte once the reply succeeded, so a failed reply leaves it
-     * for the next reader.
-     */
-    if (msg_reply(rcvid, 1, &reply, 1) != -1)
-        cooked_tail++;
-
-    /* Whatever the reader left is readable by the pollers. */
-    ser_notify_input();
+    ser_finish_read();
     return 0;
 }
 

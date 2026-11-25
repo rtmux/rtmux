@@ -96,8 +96,9 @@ static const ioserv_ops_t proc_wait_funcs = {
  * Takes pid_t (not process_t*) so the caller never dereferences the
  * kernel-allocated process_t (heap PTE_U=0). All reads come from the
  * process_query_info snapshot; the terminal writes (clear WAITINFO, set
- * WAITDONE, fold cpu times, clear si_signo) happen kernel-side via
- * ProcessWaitFinalize.
+ * WAITDONE, fold cpu times, clear CONTINUED) happen kernel-side via
+ * ProcessWaitFinalize, and a reported stop or continue clears its si_signo
+ * here, in root_proc.
  *
  * See the return-value legend in the comment block above.
  */
@@ -110,6 +111,7 @@ int proc_wait_check(pid_t prp_pid,
     root_proc_info_t qinfo;
     int send_term_notification = 0;
     unsigned terming_priority = 0;
+    int finalized = EOK;
     int ret_match;
 
     if (process_query_info(prp_pid, &qinfo) != EOK) {
@@ -194,12 +196,26 @@ int proc_wait_check(pid_t prp_pid,
         return 0;
     }
 
-    /* A child collected here is gone from its group before its waiter is told,
-     * so that what the waiter does next (join that group, ask for it) sees it
-     * as ended. One that is only looked at (WNOWAIT) stays a member, a zombie.
+    /* A child collected here is gone from its group, and reads as reaped
+     * (WAITDONE, so its /proc/<pid>/wait handles read stale), before its waiter
+     * is told, so that what the waiter does next (join that group, ask for it,
+     * read a handle) sees it as ended. One that is only looked at (WNOWAIT)
+     * stays a member, a zombie. The reply sends the qinfo snapshot.
      */
-    if (match == WEXITED && !(wap->options & WNOWAIT))
-        proc_pgrp_reap(prp_pid);
+    if (!(wap->options & WNOWAIT)) {
+        if (match == WEXITED)
+            proc_pgrp_reap(prp_pid);
+
+        /* A stop or continue is reported once. Its siginfo must not outlive the
+         * report, or the next waiter would see the same event and a later fault
+         * would be masked by it.
+         */
+        if (match == WUNTRACED || match == WCONTINUED)
+            root_proc(prp_pid)->siginfo.si_signo = 0;
+        finalized =
+            ProcessWaitFinalize(prp_pid, parent_pid, match, &ret_match,
+                                &send_term_notification, &terming_priority);
+    }
 
     /* Unblock the waiting thread... */
 
@@ -237,25 +253,13 @@ int proc_wait_check(pid_t prp_pid,
         root_warn("proc_wait_check: msg_info() failed, errno=%d\n", errno);
     }
 
-    /* Clean up prp status if requested so it is not reported again */
+    /* A WNOWAIT report leaves the status in place to be reported again. */
     if (wap->options & WNOWAIT) {
         return WNOWAIT;
     }
-
-    /* A stop or continue is reported once. Its siginfo must not outlive the
-     * report, or the next waiter would see the same event and a later fault
-     * would be masked by it.
-     */
-    if (match == WUNTRACED || match == WCONTINUED) {
-        root_proc(prp_pid)->siginfo.si_signo = 0;
-    }
-    if (ProcessWaitFinalize(prp_pid, parent_pid, match, &ret_match,
-                            &send_term_notification,
-                            &terming_priority) != EOK) {
+    if (finalized != EOK) {
         return match; /* prp gone — caller still treats as matched */
     }
-    if (match == WEXITED)
-        procfs_wait_stale(prp_pid);
     if (send_term_notification) {
         msg_send_notification(ROOTTASK_COID, (int) terming_priority,
                               PROC_CODE_TERM, prp_pid);

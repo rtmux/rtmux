@@ -99,7 +99,8 @@ int kdecl ksys_timer_create(thread_t *act, struct kcall_args_timer_create *kap)
         return EINVAL;
     }
 
-    /* Reject signal-based timer events — use SIGEV_NOTIFICATION.
+    /* Reject signal-based timer events — use SIGEV_NOTIFICATION. SIGEV_INTR is
+     * not an event kind sigevent_exe delivers.
      *
      * SIGEV_THREAD is also rejected: the fire path runs from trap context
      * (STIMER) via sigevent_deliver_inline, which cannot safely call
@@ -111,6 +112,7 @@ int kdecl ksys_timer_create(thread_t *act, struct kcall_args_timer_create *kap)
     case SIGEV_SIGNAL:
     case SIGEV_SIGNAL_THREAD:
     case SIGEV_THREAD:
+    case SIGEV_INTR:
         timer_free(prp, tip);
         return EINVAL;
     default:
@@ -462,6 +464,8 @@ int kdecl ksys_timer_timeout(thread_t *act,
 
         act->args.to.timeptr = kap->otime; /* Save return time ptr. */
         SETKSTATUS(act, 0);
+        inject_block_stall(act);
+        thread_wake_open(act); /* one waker may now end this sleep */
         act->state = STATE_NANOSLEEP;
         _TRACE_TH_EMIT_STATE(act, NANOSLEEP);
         /* block() is sched_slock-internal; drop preempt fence first. */

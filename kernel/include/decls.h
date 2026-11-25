@@ -36,6 +36,7 @@
 
 /* Core scheduler/thread calls */
 void rdecl block(void);
+void block_interrupt_wait(void);
 void rdecl unready(thread_t *thp, int newstate);
 void __attribute__((noreturn)) rdecl
 unready_release_and_exit(thread_t *thp, int newstate, kspinlock_t *to_release);
@@ -81,6 +82,7 @@ void *nano_query(unsigned type,
                  void *objbuf,
                  size_t objsize);
 int rdecl force_ready(thread_t *thp, unsigned err);
+int rdecl force_ready_wait(thread_t *thp, unsigned err, uint32_t wake_seq);
 void prio_defer_init(void);
 void specialret_attr specialret(thread_t *thp);
 void rdecl deliver_fault(thread_t *thp, siginfo_t *info);
@@ -155,17 +157,20 @@ int rdecl kernel_thread_checkpoint(CPU_REGISTERS *regs);
 void rdecl thread_destroy(thread_t *thp);
 void rdecl thread_destroyall(thread_t *thp);
 void rdecl thread_cancel(thread_t *thp);
+void rdecl thread_block_recheck(thread_t *thp);
+void rdecl thread_cancel_posted_refresh(thread_t *act);
 int rdecl process_pin(process_t *prp);
 void rdecl process_unpin(process_t *prp);
 int rdecl tthread_pin(thread_t *thp);
 int thread_active_hart(thread_t *thp);
 int exit_ready_stopped(thread_t *thp);
+void exit_destroy_threads(process_t *prp, thread_t *keep);
 void rdecl tthread_unpin(thread_t *thp);
 int rdecl thread_set_as_prp(thread_t *thp, process_t *prp);
 void rdecl thread_clear_as_prp_if(thread_t *thp, process_t *prp);
 unsigned rdecl thread_as_release_borrowers(process_t *prp);
+void rdecl thread_as_reopen_borrowers(process_t *prp);
 void rdecl sync_thread_cleanup(thread_t *thp);
-void rdecl thread_sync_teardown(thread_t *thp);
 uint32_t rdecl keygen(const unsigned char *buf, size_t n, uint64_t secret);
 uint64_t keydata_draw(uintptr_t salt);
 void keydata_stir(void);
@@ -224,8 +229,6 @@ void _sfree(void *data, size_t size);
 int purger_register(int (*purge)(size_t), unsigned prio);
 int purger_invoke(size_t amount);
 
-void shutdown(unsigned sigcode, const CPU_REGISTERS *reg);
-
 process_t *rdecl lookup_pid(pid_t pid);
 process_t *rdecl
 lookup_pid_rcu(pid_t pid); /* opens RCU-sched section; caller unlocks */
@@ -239,13 +242,12 @@ connect_t *rdecl lookup_rcvid(kcall_args_t *kap, int rcvid, thread_t **thpp);
  * unconditionally). Call after the last dereference of cop / thp.
  */
 void rdecl lookup_rcvid_release(void);
-void rdecl lookup_rcvid_release_all(void);
 limits_t *rdecl lookup_limits(uid_t uid);
 ksync_t *rdecl sync_create(process_t *bill_prp, sync_t *sync, unsigned flags);
 int rdecl sync_destroy(process_t *prp, sync_t *sync);
 ksync_t *rdecl sync_lookup(sync_t *sync, unsigned create);
 void rdecl sync_wakeup(ksync_t *syp, int all);
-bool rdecl sync_chain_force_ready(thread_t *thp);
+bool rdecl sync_chain_force_ready(thread_t *thp, const uint32_t *wake_seq);
 
 notification_t *rdecl notification_add(process_t *prp,
                                        pril_head_t *queue,
@@ -279,8 +281,9 @@ void rdecl remove_unblock(thread_t *thp, connect_t *cop, int rcvid);
 
 /* Add support for sporatic cleanup */
 void rdecl sched_ss_cleanup(thread_t *thp);
-void rdecl sched_account_current(uint64_t now);
-void rdecl sched_account_restart(void);
+void rdecl sched_account_current(void);
+void rdecl sched_account_switch(thread_t *next);
+void rdecl sched_account_restart(thread_t *next);
 uint64_t rdecl sched_account_read(thread_t *thp, uint64_t now);
 int rdecl sched_ss_adjust(void);
 void rdecl sched_ss_update(thread_t *thp,
@@ -295,6 +298,15 @@ int rdecl sched_thread(thread_t *thp, int policy, struct sched_param *param);
 void rdecl timeout_start(thread_t *thp);
 void rdecl timeout_start_deferred(thread_t *thp);
 void rdecl timeout_deferred_fire(void);
+extern atomic_int clock_boot_missed; /* time/clock-core.c */
+void rdecl clock_catch_up(void);
+
+/* Whether a timer that fell due in a boot-hart kernel call waits for
+ * clock_catch_up on cpu (only the boot hart sets the flag).
+ */
+#define clock_catch_up_due(cpu) \
+    ((cpu) == boot_cpunum &&    \
+     __atomic_load_n(&clock_boot_missed, __ATOMIC_RELAXED))
 void rdecl timeout_stop(thread_t *thp);
 
 /* reserved != 0 routes a SIGEV_NOTIFICATION through the allocation-free reserve
@@ -314,6 +326,10 @@ int rdecl sigevent_exe(const struct sigevent *evp,
 void sigevent_deliver_inline(const struct sigevent *evp,
                              thread_t *target,
                              int reserved);
+void sigevent_deliver_wait(const struct sigevent *evp,
+                           thread_t *target,
+                           int reserved,
+                           const uint32_t *wait_seq);
 int rdecl sigevent_proc(const struct sigevent *evp);
 int rdecl sigevent_notification_roottask(int code,
                                          unsigned priority,
@@ -336,13 +352,12 @@ int viov_to_piov(thread_t *act,
                  struct _iov_cursor *curp);
 
 int rdecl debug_process(process_t *prp, debug_process_t *dpp);
+void debug_set_blocked_connect(thread_t *thp, connect_t *cop, channel_t *chp);
 int rdecl debug_thread(process_t *prp, thread_t *thp, debug_thread_t *dtp);
 int rdecl debug_stop(process_t *prp);
 int rdecl debug_run(process_t *prp, debug_run_t *drp);
 int rdecl debug_break(process_t *pid, debug_break_t *dbp);
 int rdecl debug_break_list(process_t *pid, debug_breaklist_t *dbp);
-
-unsigned kdebug_enter(process_t *prp, unsigned sigcode, CPU_REGISTERS *reg);
 
 void rdecl send_ipi(unsigned cpu, int cmd);
 void rdecl smp_flush_tlb(void);

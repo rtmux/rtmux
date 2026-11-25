@@ -6,6 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TOP_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$TOP_DIR" || exit 1
 . "$SCRIPT_DIR/qemu-headless.sh"
+. "$SCRIPT_DIR/crash-signatures.sh"
 AUTOCONF_H=internal/include/generated/autoconf.h
 
 MODE=syscall-testing
@@ -17,6 +18,11 @@ PROCS=
 # QEMU_REGRESS_GDB_ON_TIMEOUT=1 is --gdb-on-timeout for a caller (CI) that
 # cannot pass the flag through its make targets.
 GDB_ON_TIMEOUT=${QEMU_REGRESS_GDB_ON_TIMEOUT:-0}
+# QEMU_REGRESS_DUMP_EVERY=N (with --gdb-on-timeout): also dump the running guest
+# every N seconds into MODE-idx.live-K.dump, detach and let it run on. The run
+# must still pass, so this checks that a dump leaves a guest it caught merely
+# slow as it was.
+DUMP_EVERY=${QEMU_REGRESS_DUMP_EVERY:-0}
 KEEP_LOGS=$GDB_ON_TIMEOUT
 REQUIRE_SUPPORTED=0
 DISK_SUITE=0
@@ -354,10 +360,10 @@ require_log_patterns_in_order()
     if ! awk -v mode="$MODE" -v label="$label" '
         BEGIN {
             next_pat = 1
-            pat_count = ARGC - 2
-            for (i = 2; i < ARGC; i++)
-                pat[i - 1] = ARGV[i]
-            ARGC = 2
+            pat_count = ARGC - 1
+            for (i = 1; i < ARGC; i++)
+                pat[i] = ARGV[i]
+            ARGC = 1
         }
         {
             if (next_pat <= pat_count && $0 ~ pat[next_pat])
@@ -370,11 +376,85 @@ require_log_patterns_in_order()
                 exit 1
             }
         }
-    ' "$log" "$@"; then
+    ' "$@" < "$log"; then
         tail -n 160 "$log"
         return 1
     fi
     return 0
+}
+
+# What run_one returns, and vcpu-steal.py exits with, for a run that is neither
+# a pass nor a failure; the repeat loop runs it again.
+RC_INVALID_RUN=3
+
+# Whether this mode runs the wake-latency probe.
+mode_runs_wake_probe()
+{
+    [ "$MODE" = "smp-invariants" ] || [ "$MODE" = "preempt-latency" ]
+}
+
+# Whether this run can have its late wakes audited against host scheduling
+# (scripts/vcpu-steal.py): the modes that run the wake-latency probe, on a host
+# that accounts run-queue wait per thread, with a QEMU that can timestamp the
+# probe's beacons. QEMU_REGRESS_STEAL_AUDIT=0 turns it off, and an icount run
+# needs none: its clock does not see the host.
+steal_audit_available()
+{
+    mode_runs_wake_probe || return 1
+    [ "${QEMU_REGRESS_STEAL_AUDIT:-1}" != 0 ] || return 1
+    [ -z "${EMU_ICOUNT:-}" ] || return 1
+    [ -r /proc/self/schedstat ] || return 1
+    # emu.sh splits EMU_QEMU_OPTS on white space, and the trace file's name
+    # goes through it.
+    case "$1" in *[[:space:]]*) return 1 ;; esac
+    command -v python3 >/dev/null 2>&1 || return 1
+    # The same answer for every run: ask QEMU once.
+    if [ -z "$STEAL_TRACE_EVENT" ]; then
+        STEAL_TRACE_EVENT=no
+        if "${QEMU:-qemu-system-riscv64}" -trace help 2>/dev/null |
+           grep -qx goldfish_rtc_write; then
+            STEAL_TRACE_EVENT=yes
+        fi
+    fi
+    [ "$STEAL_TRACE_EVENT" = yes ]
+}
+STEAL_TRACE_EVENT=
+
+# The wake-latency probe must have measured every source: a pass that skipped
+# one, or that the guest could not judge, is not a pass. A phase the probe left
+# to the host audit is settled here.
+#
+# Returns 0 for a pass, 1 for a failure, and RC_INVALID_RUN for a run the host
+# was too loaded to judge (see scripts/vcpu-steal.py), which is neither.
+check_preempt_latency()
+{
+    local log="$1" audit="$2"
+    local phase pats=()
+
+    # The cross-hart pass needs a fourth hart.
+    for phase in ipc timer timer-crosshart irq; do
+        if [ "$phase" != timer-crosshart ] || [ "${CPUS:-1}" -ge 4 ]; then
+            pats+=("^preempt-latency: ${phase} (PASS|UNAUDITED) ")
+        fi
+    done
+    require_log_patterns "$log" "wake-latency measurement" "${pats[@]}" ||
+        return 1
+    if ! grep -Eq '^preempt-latency: (AUDIT-REQUIRED|[a-z-]+ UNAUDITED) ' "$log"; then
+        return 0
+    fi
+    if [ "$audit" -ne 1 ]; then
+        echo "  FAIL     ${MODE} has wakes over the bound and no host audit"
+        return 1
+    fi
+    python3 "$TOP_DIR/scripts/vcpu-steal.py" audit --expect-samples \
+            --trace "${log}.steal-trace" --sched "${log}.steal-sched" \
+            < "$log" | sed 's/^/  STEAL    /'
+    case "${PIPESTATUS[0]}" in
+        0) return 0 ;;
+        "$RC_INVALID_RUN") return "$RC_INVALID_RUN" ;;
+    esac
+    echo "  FAIL     ${MODE} has wakes over the bound that host scheduling does not explain"
+    return 1
 }
 
 require_lkl_net_oracle()
@@ -519,11 +599,23 @@ Options:
                     "liveness:" lines naming the reply-blocked roottask thread),
                     hang-inject (hang all but one hart; needs --gdb-on-timeout,
                     passes on a complete per-hart dump),
+                    crash-inject (crash the kernel; needs --gdb-on-timeout,
+                    passes on a complete per-hart dump taken after the crash),
+                    crash-inject-shutdown (a crash report, then the SBI
+                    power-off a roottask crash ends in; needs
+                    --gdb-on-timeout, passes on a complete dump of the
+                    stopped guest),
                     tickless-idle (quiet-hart tick drop + one-shot deadline),
                     fault-recovery (fault taxonomy smoke),
                     monotonic-time (continuous clock across a skipped-tick gap),
                     pi-inversion-xfail, rcu-lookup-measure, revoke-stress,
-                    smp-invariants (CPUS=8 bounded SMP invariant smoke),
+                    lock-debug (8-hart FIFO ticket and lock rank checks),
+                    smp-invariants (CPUS=8 bounded SMP invariant smoke; it
+                    and preempt-latency audit every wake over the latency
+                    bound against host scheduling with scripts/vcpu-steal.py,
+                    QEMU_REGRESS_STEAL_AUDIT=0 turns that off; EMU_ICOUNT=1
+                    runs either on QEMU's instruction-count clock, where the
+                    bound is checked without the host),
                     syslog-wrap (CONFIG_ROOTTASK_SYSLOG_SIZE=4096; /sys/log
                     wrap and EOVERFLOW),
                     serial-unblock (dev-serial-8250 drops a SIGKILLed parked
@@ -597,9 +689,11 @@ Options:
                     storm's 800 exits are all but one of the pshut samples);
                     forces CONFIG_INSTRUMENTATION=y; at most 256 residents;
                     above 100 the guest gets 2 MiB more RAM per resident
-  --gdb-on-timeout  On a timeout, dump every hart through a live gdb stub
+  --gdb-on-timeout  On a timeout or unexpected crash, dump every hart through a live gdb stub
                     (scripts/gdb/dump-state.gdb) into build/lkl-logs/MODE-N.dump
-                    before killing QEMU; implies --keep-logs
+                    before killing QEMU; implies --keep-logs.
+                    QEMU_REGRESS_DUMP_EVERY=N also dumps the running guest
+                    every N seconds and lets it run on
   --keep-logs       Keep passing logs (at build/lkl-logs/MODE-idx.log) instead
                     of deleting them; IOMMU DTB preflights also keep
                     build/lkl-logs/MODE-iommu.{dtb,dts}
@@ -1062,10 +1156,11 @@ check_smp_bringup()
             'smp: 3 harts online[[:space:]]*$' || return 1
         ;;
     smp-ap-crash-early)
-        require_log_patterns "$log" "crash before join" \
-            'cpu_start_others: hart [0-9]+ \(cpu 3\) failed' \
-            'injected crash on cpu 2 before it joined' \
-            'crash rendezvous: 3 arrived, 3 expected' || return 1
+        require_log_patterns "$log" "crash before online" \
+            'cpu_start_others: hart [0-9]+ \(cpu 5\) failed' \
+            'injected crash on cpu 3 before online' \
+            'injected crash on cpu 4 before online' \
+            'crash rendezvous: 4 arrived, 4 expected' || return 1
         ;;
     smp-hart-start-late)
         require_log_patterns "$log" "late hart" \
@@ -1379,7 +1474,7 @@ validate_lkl_personality_archive()
         return 1
     fi
     ar_tool="$(resolve_tool "${LKL_AR:-}" riscv64-unknown-linux-gnu-ar \
-        riscv64-linux-gnu-ar riscv-none-elf-ar llvm-ar ar)" || {
+        riscv64-linux-gnu-ar "${CROSS_COMPILE:-riscv-none-elf-}ar" llvm-ar ar)" || {
         echo "qemu-regress: need ar to verify $lib" >&2
         return 1
     }
@@ -1518,6 +1613,15 @@ case "$MODE" in
         FAIL_MARKER="RTMux ${MODE}: FAIL"
         MODE_ARG="rtmux.run=${MODE}"
         ;;
+    lock-debug)
+        BEGIN_MARKER="RTMux lock-debug: BEGIN"
+        PASS_MARKER="RTMux lock-debug: PASS"
+        FAIL_MARKER="RTMux lock-debug: FAIL"
+        MODE_ARG="rtmux.run=lock-debug"
+        NEEDS_DEBUG_INJECT=1
+        CPUS=8
+        export CPUS
+        ;;
     debug-inject)
 
         # Forces CONFIG_DEBUG_INJECT=y, boots four harts, stalls hart 1 for
@@ -1578,6 +1682,33 @@ case "$MODE" in
         NEEDS_DEBUG_INJECT=1
         if [ "$GDB_ON_TIMEOUT" -ne 1 ]; then
             echo "qemu-regress: --mode hang-inject needs --gdb-on-timeout" >&2
+            exit 2
+        fi
+        ;;
+    crash-inject|crash-inject-shutdown)
+
+        # Crashes the kernel: crash-inject through the crash path a kernel fault
+        # takes, which reports and parks every hart; crash-inject-shutdown
+        # reports and powers off through the SBI, as a roottask crash does. Only
+        # meaningful with --gdb-on-timeout: the pass condition is a complete
+        # dump, taken after the crash (of the guest -no-shutdown kept stopped,
+        # for the second), with a block for every hart.
+        BEGIN_MARKER="RTMux ${MODE}: BEGIN"
+        PASS_MARKER="RTMux ${MODE}: PASS"
+        FAIL_MARKER="RTMux ${MODE}: FAIL"
+        MODE_ARG="rtmux.run=${MODE}"
+        NEEDS_DEBUG_INJECT=1
+        if [ "$GDB_ON_TIMEOUT" -ne 1 ]; then
+            echo "qemu-regress: --mode ${MODE} needs --gdb-on-timeout" >&2
+            exit 2
+        fi
+
+        # The stopped guest is kept and found through QMP, which run_one
+        # drives with python3; without it QEMU exits on the power-off and
+        # takes the state to dump with it.
+        if [ "$MODE" = "crash-inject-shutdown" ] &&
+           ! command -v python3 >/dev/null 2>&1; then
+            echo "qemu-regress: --mode ${MODE} needs python3" >&2
             exit 2
         fi
         ;;
@@ -1686,16 +1817,14 @@ case "$MODE" in
         ;;
     smp-ap-crash-early)
 
-        # K32: the last of 4 harts fails to start and cpu 2 crashes after it
-        # committed to joining but before it is online, with cpu 1 online. The
-        # crash dump must complete, and its rendezvous must have waited for
-        # the exact set: cpu 0, cpu 1 and the crashing cpu 2.
+        # CPU 5 fails to start, CPU 2 parks, and CPUs 3 and 4 crash before
+        # going online. The two crashers and online CPUs 0 and 1 must arrive.
         BEGIN_MARKER='Boot command line:'
         PASS_MARKER='=== END CRASH DUMP ==='
         FAIL_MARKER='*** /usr unavailable'
         MODE_ARG="rtmux.inject=hart-start-fail rtmux.inject=ap-crash-early"
         NEEDS_DEBUG_INJECT=1
-        CPUS=4
+        CPUS=6
         export CPUS
         ;;
     smp-sparse-harts|smp-too-many-harts)
@@ -1864,6 +1993,7 @@ esac
 # default run is one vCPU, which has no CPU1 and would false-fail; bump the
 # default when the caller did not set CPUS explicitly.
 if { [ "$MODE" = "debug-inject" ] || [ "$MODE" = "hang-inject" ] ||
+     [ "$MODE" = "crash-inject" ] || [ "$MODE" = "crash-inject-shutdown" ] ||
      [ "$MODE" = "hart-watchdog" ] || [ "$MODE" = "hart-watchdog-console" ] ||
      [ "$MODE" = "hart-watchdog-idle" ]; } && [ -z "${CPUS:-}" ]; then
     CPUS=4
@@ -1920,18 +2050,11 @@ if [ "$MODE" = "smp-invariants" ] && [ -z "${CPUS:-}" ]; then
     export CPUS
 fi
 
-BAD_RE='FAULT|FATAL|CRASH|Kernel panic|panic:|lkl-host: panic|FREED-ACTIVE|__kernel_restore bad ptr|/usr unavailable|Undefined symbol|No such file or directory|Bad file descriptor'
-if [ "$MODE" = "lkl-fsd-crash" ] || [ "$MODE" = "lkl-netd-crash" ] ||
-   [ "$MODE" = "lkl-netd-direct-denied" ] ||
-   [ "$MODE" = "lkl-netd-revoke" ] || [ "$MODE" = "lkl-multi-crash" ] ||
-   [ "$MODE" = "lkl-netd-restart" ] || [ "$MODE" = "lkl-netd-stale" ] ||
-   [ "$MODE" = "lkl-fsd-restart" ]; then
-    BAD_RE='FATAL|CRASH|Kernel panic|panic:|lkl-host: panic|FREED-ACTIVE|__kernel_restore bad ptr|/usr unavailable|Undefined symbol|No such file or directory|Bad file descriptor'
-fi
+BAD_RE="$RTMUX_BAD_RE"
 
 # smp-ap-crash-early crashes on purpose and checks the dump itself.
 if [ "$MODE" = "smp-ap-crash-early" ]; then
-    BAD_RE='FATAL|Kernel panic|panic:|FREED-ACTIVE|__kernel_restore bad ptr|/usr unavailable|Undefined symbol'
+    BAD_RE="$RTMUX_FATAL_RE|$RTMUX_SETUP_RE"
 fi
 
 # spawn-storm --procs measures teardown cost, which only an instrumented kernel
@@ -2004,8 +2127,10 @@ if [ "$NEEDS_LKL_SERVERS" -eq 1 ] || [ "$NEEDS_INSTRUMENTATION" -eq 1 ] ||
         fi
         rm -f .config.bak
     fi
-    if [ "$NEEDS_DEBUG_INJECT" -eq 1 ] &&
-       ! grep -q '^CONFIG_DEBUG_INJECT=y$' .config; then
+    for feature in DEBUG_INJECT LOCK_DEBUG; do
+        [ "$NEEDS_DEBUG_INJECT" -eq 1 ] || continue
+        [ "$feature" != LOCK_DEBUG ] || [ "$MODE" = lock-debug ] || continue
+        grep -q "^CONFIG_${feature}=y$" .config && continue
         if [ "$RESTORE_CONFIG" -eq 0 ]; then
             CONFIG_SAVE="$(mktemp /tmp/rtmux-config.XXXXXX)"
             AUTOCONF_SAVE="$(mktemp /tmp/rtmux-autoconf.XXXXXX)"
@@ -2017,15 +2142,9 @@ if [ "$NEEDS_LKL_SERVERS" -eq 1 ] || [ "$NEEDS_INSTRUMENTATION" -eq 1 ] ||
             RESTORE_CONFIG=1
         fi
 
-        if grep -q '^CONFIG_DEBUG_INJECT=' .config; then
-            sed -i.bak 's/^CONFIG_DEBUG_INJECT=.*/CONFIG_DEBUG_INJECT=y/' .config
-        elif grep -q '^# CONFIG_DEBUG_INJECT is not set' .config; then
-            sed -i.bak 's/^# CONFIG_DEBUG_INJECT is not set/CONFIG_DEBUG_INJECT=y/' .config
-        else
-            printf '\nCONFIG_DEBUG_INJECT=y\n' >>.config
-        fi
-        rm -f .config.bak
-    fi
+        sed -i -e "/^CONFIG_${feature}=/d" -e "/^# CONFIG_${feature} is not set$/d" .config
+        printf 'CONFIG_%s=y\n' "$feature" >>.config
+    done
     if [ "$NEEDS_STALL_DETECTOR" -eq 1 ] &&
        ! grep -q '^CONFIG_STALL_DETECTOR=y$' .config; then
         if [ "$RESTORE_CONFIG" -eq 0 ]; then
@@ -2281,25 +2400,28 @@ run_identity()
     echo "${prefix}cpus: ${CPUS:-default}"
 }
 
-# dump_hang_state LOG PORT: attach to the live gdb stub and write every hart's
-# state to LOG's .dump sibling, headed by the build identity. A gdb failure is
-# written into the dump as such: an incomplete dump is never passed off as a
-# complete one.
-dump_hang_state()
+# dump_guest_state LOG PORT REASON [DUMP detach]: attach to the live gdb stub and
+# write every hart's state to DUMP (LOG's .dump sibling by default), headed by
+# the build identity. With "detach" gdb lets the guest run on afterwards. A gdb
+# failure is written into the dump as such: an incomplete dump is never passed
+# off as a complete one.
+dump_guest_state()
 {
-    local log="$1" port="$2"
-    local dump="${log%.log}.dump"
+    local log="$1" port="$2" reason="$3"
+    local dump="${4:-${log%.log}.dump}"
+    local after=()
+    [ "${5:-}" = detach ] && after=(-ex detach)
     local kernel
     kernel=$(run_kernel)
     local gdb="${GDB:-gdb-multiarch}"
 
     {
-        echo "# hang dump for ${MODE} after ${TIMEOUT}s"
+        echo "# ${reason} dump for ${MODE}"
         run_identity '# '
     } >"$dump"
-    echo "  HANG     ${MODE}: no pass marker after ${TIMEOUT}s; dumping harts to ${dump}"
+    echo "  DUMP     ${MODE}: ${reason}, dumping harts to ${dump}"
     if "$TIMEOUT_CMD" "${HANG_DUMP_TIMEOUT:-120}" "$gdb" -batch -ex "target remote :${port}" \
-        -x "$TOP_DIR/scripts/gdb/dump-state.gdb" "$kernel" >>"$dump" 2>&1 &&
+        -x "$TOP_DIR/scripts/gdb/dump-state.gdb" "${after[@]}" "$kernel" >>"$dump" 2>&1 &&
        grep -q "DUMP COMPLETE" "$dump"; then
         echo "# result: complete" >>"$dump"
 
@@ -2496,6 +2618,59 @@ check_roottask_wait_reports()
     return "$bad"
 }
 
+# log_has_crash LOG: whether LOG holds one of this mode's fatal markers that
+# names a crash (not, say, a missing /usr).
+log_has_crash()
+{
+    awk -v bad="$BAD_RE" -v crash="$RTMUX_CRASH_RE" '$0 ~ bad && $0 ~ crash { found=1; exit } END { exit !found }' "$1"
+}
+
+# injected_crash_seen LOG KIND: whether the crash in LOG is the one the
+# crash-inject modes asked for: the kernel's "FATAL: KIND requested by
+# debug-inject" line,
+# after the mode's begin marker, with no other signature of BAD_RE before it.
+# Any other crash or setup failure, during boot say, fails them.
+injected_crash_seen()
+{
+    awk -v begin="$BEGIN_MARKER" -v report="FATAL: $2 requested by debug-inject" -v bad="$BAD_RE" '
+        started && index($0, report) { found = 1; exit }
+        $0 ~ bad { exit }
+        index($0, begin) { started = 1 }
+        END { exit !found }' "$1"
+}
+
+# guest_shut_down SOCK: whether the QEMU listening for QMP on SOCK holds a guest
+# that has shut down. Under --gdb-on-timeout QEMU runs with -no-shutdown, so a
+# guest that powers off (a roottask crash, crash-inject-shutdown, or the end of
+# a run) leaves QEMU stopped rather than gone, and the gdb stub still answers.
+guest_shut_down()
+{
+    [ -S "$1" ] || return 1
+    "$TIMEOUT_CMD" 5 python3 -I - "$1" 2>/dev/null <<'PY'
+import json, socket, sys
+
+s = socket.socket(socket.AF_UNIX)
+s.settimeout(2)
+s.connect(sys.argv[1])
+f = s.makefile("rw")
+
+
+def call(name):
+    f.write(json.dumps({"execute": name}) + "\n")
+    f.flush()
+    while True:
+        r = json.loads(f.readline())
+        if "return" in r or "error" in r:
+            return r
+
+
+f.readline()  # greeting
+call("qmp_capabilities")
+status = call("query-status").get("return", {}).get("status")
+sys.exit(0 if status == "shutdown" else 1)
+PY
+}
+
 # check_hang_inject_dump DUMP: the injected hang must have left a complete dump
 # with a register block and a backtrace for every hart the guest has.
 check_hang_inject_dump()
@@ -2507,7 +2682,7 @@ check_hang_inject_dump()
        [ "$bt" -ge "$want" ] && grep -q "^DUMP COMPLETE: ${want} harts" "$dump"; then
         return 0
     fi
-    echo "  FAIL     hang-inject: dump has $got hart blocks and $bt backtraces, want $want of each"
+    echo "  FAIL     ${MODE}: dump has $got hart blocks and $bt backtraces, want $want of each"
     return 1
 }
 
@@ -2568,15 +2743,30 @@ run_one()
         cmd+=("${EXTRA_ARGS[@]}")
     fi
     local wrap_timeout="$TIMEOUT"
-    local gdb_port=
-    local ticks=0 hung=0 hang_ok=0
+    local gdb_port='' qmp_sock='' qmp_opts='' log_size='' last_size=-1
+    local start_s="$SECONDS" hung=0 hang_ok=0 crash_ok=0 signature=
+    local live_dumps=0 live_bad=0
     if [ "$GDB_ON_TIMEOUT" -eq 1 ]; then
 
-        # Unique per process and run, so concurrent harness loops do not
-        # collide.
-        gdb_port=$((20000 + ($$ % 20000) + idx))
+        # A port the OS reports free, so concurrent harness loops do not
+        # collide: two pids can map to the same 20000 + pid % 20000. The
+        # pid-based port stays as the fallback without python3.
+        gdb_port=$(python3 -c 'import socket
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])' 2>/dev/null) ||
+            gdb_port=
+        [ -n "$gdb_port" ] || gdb_port=$((20000 + ($$ % 20000) + idx))
         cmd+=("-gdb-live=${gdb_port}")
         wrap_timeout=$((TIMEOUT + ${HANG_DUMP_TIMEOUT:-120} + 20)) # headroom for the dump
+
+        # A guest that powers off would take QEMU, and the state to dump, with
+        # it: keep the stopped guest, and ask QMP whether it has shut down.
+        # The socket goes in /tmp, whose short path fits a socket name.
+        if command -v python3 >/dev/null 2>&1; then
+            qmp_sock="$(mktemp -u /tmp/rtmux-qmp.XXXXXX)"
+            qmp_opts="-no-shutdown -qmp unix:${qmp_sock},server=on,wait=off"
+        fi
     fi
 
     # serial-unblock feeds the guest UART (QEMU's stdio) the bytes the guest
@@ -2591,12 +2781,42 @@ run_one()
         exec {serial_fd}<>"$serial_fifo"
         stdin_src="$serial_fifo"
     fi
-    "$TIMEOUT_CMD" "$wrap_timeout" "${cmd[@]}" <"$stdin_src" >"$log" 2>&1 &
+    local steal_audit=0 steal_pid= steal_opts="${EMU_QEMU_OPTS:-}"
+    if steal_audit_available "$log"; then
+        steal_audit=1
+        cmd+=("rtmux.host_audit=1")
+        : >"${log}.steal-trace"
+        steal_opts="${steal_opts:+$steal_opts }-trace goldfish_rtc_write -msg timestamp=on -D ${log}.steal-trace"
+        python3 "$TOP_DIR/scripts/vcpu-steal.py" sample \
+            --trace "${log}.steal-trace" --out "${log}.steal-sched" &
+        steal_pid=$!
+    fi
+    if [ -n "$qmp_opts" ]; then
+        steal_opts="${steal_opts:+$steal_opts }${qmp_opts}"
+    fi
+    EMU_QEMU_OPTS="$steal_opts" \
+        "$TIMEOUT_CMD" "$wrap_timeout" "${cmd[@]}" <"$stdin_src" >"$log" 2>&1 &
     local runner=$!
     local terminal=0
     while kill -0 "$runner" 2>/dev/null; do
+        # crash-inject-shutdown's crash report comes before its power-off:
+        # once it is in the log, leave it to the shutdown check below, which
+        # dumps the stopped guest. Any signature before it ends the run here.
         if grep -Fq -e "$FAIL_MARKER" -e "RTMux ${MODE}: SKIP" "$log" ||
-           grep -Eq "$BAD_RE" "$log"; then
+           { { [ "$MODE" != "crash-inject-shutdown" ] ||
+               ! grep -aFq "FATAL: power-off crash requested by debug-inject" "$log"; } &&
+             grep -Eq "$BAD_RE" "$log"; }; then
+            # Only markers already fatal to this mode count. Some fixtures
+            # deliberately fault or crash and check the guest's own report.
+            if [ "$GDB_ON_TIMEOUT" -eq 1 ] &&
+               log_has_crash "$log"; then
+                dump_guest_state "$log" "$gdb_port" "unexpected crash"
+                if [ "$MODE" = "crash-inject" ] &&
+                   injected_crash_seen "$log" "crash" &&
+                   check_hang_inject_dump "${log%.log}.dump"; then
+                    crash_ok=1
+                fi
+            fi
             terminal=1
             kill "$runner" 2>/dev/null || true
             break
@@ -2613,6 +2833,27 @@ run_one()
             printf "\\x${serial_hex##* }" >&"$serial_fd"
             serial_sent=$((serial_sent + 1))
         done
+        # A guest that shut down under -no-shutdown leaves QEMU stopped. Ask
+        # only once the log has stopped growing: a running guest prints. A
+        # crash that ended in the shutdown is dumped first; any other shutdown
+        # ends the run as QEMU exiting would have.
+        if [ -n "$qmp_sock" ]; then
+            log_size="$(wc -c <"$log")"
+            if [ "$log_size" = "$last_size" ] && guest_shut_down "$qmp_sock"; then
+                if log_has_crash "$log"; then
+                    dump_guest_state "$log" "$gdb_port" "guest shutdown after a crash"
+                    if [ "$MODE" = "crash-inject-shutdown" ] &&
+                       injected_crash_seen "$log" "power-off crash" &&
+                       check_hang_inject_dump "${log%.log}.dump"; then
+                        crash_ok=1
+                    fi
+                fi
+                terminal=1
+                kill "$runner" 2>/dev/null || true
+                break
+            fi
+            last_size="$log_size"
+        fi
         if [ "$pass_seen" -eq 0 ] &&
            grep -q "$PASS_GREP" "$PASS_MARKER" "$log"; then
             pass_seen=1
@@ -2632,21 +2873,57 @@ run_one()
             break
         fi
         sleep 1
-        ticks=$((ticks + 1))
-        if [ "$GDB_ON_TIMEOUT" -eq 1 ] && [ "$ticks" -ge "$TIMEOUT" ]; then
-            dump_hang_state "$log" "$gdb_port"
+
+        # A live dump stops the guest, so its time is not the guest's: move
+        # the timeout's start by it, and look at the log again before
+        # judging the run.
+        if [ "$GDB_ON_TIMEOUT" -eq 1 ] && [ "$DUMP_EVERY" -gt 0 ] &&
+           kill -0 "$runner" 2>/dev/null &&
+           [ $((SECONDS - start_s)) -ge $(((live_dumps + 1) * DUMP_EVERY)) ]; then
+            local dump_s="$SECONDS"
+            live_dumps=$((live_dumps + 1))
+            dump_guest_state "$log" "$gdb_port" "live dump ${live_dumps}" \
+                "${log%.log}.live-${live_dumps}.dump" detach
+            grep -q '^# result: complete' "${log%.log}.live-${live_dumps}.dump" ||
+                live_bad=$((live_bad + 1))
+            start_s=$((start_s + SECONDS - dump_s))
+            continue
+        fi
+
+        # Wall-clock time, not loop passes: each pass also greps a growing
+        # log, so on a loaded host a pass count falls behind the clock, and the
+        # outer timeout (TIMEOUT plus the dump's headroom) killed QEMU before
+        # the count reached TIMEOUT and the dump was taken.
+        if [ "$GDB_ON_TIMEOUT" -eq 1 ] &&
+           [ $((SECONDS - start_s)) -ge "$TIMEOUT" ]; then
+            dump_guest_state "$log" "$gdb_port" "timeout after ${TIMEOUT}s"
             kill "$runner" 2>/dev/null || true
             hung=1
             if [ "$MODE" = "hang-inject" ]; then
                 if check_hang_inject_dump "${log%.log}.dump"; then
                     hang_ok=1
-                    echo "RTMux hang-inject: PASS" >>"$log"
                 fi
             fi
             break
         fi
     done
     wait "$runner" 2>/dev/null || rc=$?
+    if [ -n "$qmp_sock" ]; then
+        rm -f "$qmp_sock"
+    fi
+    if [ -n "$steal_pid" ]; then
+        # The sampler stops by itself when QEMU is gone; the signal is for a
+        # QEMU that never started.
+        kill "$steal_pid" 2>/dev/null || true
+        wait "$steal_pid" 2>/dev/null || true
+    fi
+
+    # The injected hang or crash was the test, and its dump is complete. QEMU
+    # writes the log at its own offset, so add the verdict only once it is gone
+    # and cannot write over the line.
+    if [ "$hang_ok" -eq 1 ] || [ "$crash_ok" -eq 1 ]; then
+        echo "RTMux ${MODE}: PASS" >>"$log"
+    fi
     if [ -n "$serial_fd" ]; then
         exec {serial_fd}>&-
         rm -f "$serial_fifo"
@@ -2675,16 +2952,27 @@ run_one()
         return 1
     fi
 
-    if ! grep -Fq "$BEGIN_MARKER" "$log"; then
-        echo "  FAIL     ${MODE} missing begin marker: ${BEGIN_MARKER}"
-        tail -n 120 "$log"
+    if [ "$live_bad" -gt 0 ]; then
+        echo "  FAIL     ${MODE}: ${live_bad} of ${live_dumps} live dumps incomplete"
+        return 1
+    fi
+    if [ "$live_dumps" -gt 0 ]; then
+        echo "  DUMP     ${MODE}: ${live_dumps} live dumps, guest ran on" \
+             "($(cat "${log%.log}".live-*.dump | grep -c 'hart in firmware') harts caught in firmware)"
+    fi
+
+    # Before the begin marker: a crash during boot names its line too.
+    if [ "$crash_ok" -ne 1 ] &&
+       signature="$(crash_signature_report "$log" "$BAD_RE")"; then
+        echo "  FAIL     ${MODE} boot log contains crash/fault signature"
+        tail -n 160 "$log"
+        echo "$signature"
         return 1
     fi
 
-    if grep -Eq "$BAD_RE" "$log"; then
-        echo "  FAIL     ${MODE} boot log contains crash/fault signature"
-        grep -En "$BAD_RE" "$log" | tail -n 20
-        tail -n 160 "$log"
+    if ! grep -Fq "$BEGIN_MARKER" "$log"; then
+        echo "  FAIL     ${MODE} missing begin marker: ${BEGIN_MARKER}"
+        tail -n 120 "$log"
         return 1
     fi
 
@@ -2721,6 +3009,18 @@ run_one()
     if ! grep -q "$PASS_GREP" "$PASS_MARKER" "$log"; then
         echo "  FAIL     ${MODE} missing pass marker: ${PASS_MARKER}"
         tail -n 160 "$log"
+        return 1
+    fi
+
+    if [ "$MODE" = "serial-unblock" ] && ! awk '
+        /getty B0 begin/ { active = 1 }
+        /getty B0 end/ { active = 0 }
+        active && /^RTMux\r?$/ { banners++ }
+        active && /getty: end of file/ { hangups++ }
+        /getty: Device or resource busy/ { busy++ }
+        END { exit !(banners == 1 && hangups == 1 && busy == 1) }
+    ' "$log"; then
+        echo "  FAIL     unexpected getty banner or diagnostic count"
         return 1
     fi
 
@@ -2873,13 +3173,22 @@ run_one()
             '^  PASS  fault-recovery readonly_write_fault[[:space:]]*$' || return 1
         require_log_patterns "$log" "fault recovery readonly event" \
             '^fault-event event_id=user-page-fault severity=thread-fatal subject=self cause=--fault-mprotect-ro action=reported-signal authority_delta=none[[:space:]]*$' || return 1
+        # --fault-sigsegv stores to address 1: the report names that address,
+        # not the signal number.
+        require_log_patterns "$log" "fault address" \
+            'user fault: pid=[0-9]+ tid=0 signo=11 code=1 fltno=11 addr=0000000000000001 ' || return 1
+        # A CPU-limit kill (SIGXCPU, 30) is no memory fault: its report names no
+        # address.
+        require_log_patterns "$log" "cpu limit" \
+            '^  PASS  fault-recovery cpu_limit[[:space:]]*$' \
+            'user fault: pid=[0-9]+ tid=[0-9]+ signo=30 code=[0-9]+ fltno=0 addr=0000000000000000 ' || return 1
         require_log_patterns_in_order "$log" "fault recovery report floods" \
             '^  PASS  fault-recovery bad_syscall_enosys[[:space:]]*$' \
             '^fault-event event_id=illegal-syscall severity=deny subject=self cause=out-of-range-call action=return-ENOSYS authority_delta=none[[:space:]]*$' \
             '^  PASS  fault-recovery crash_loop[[:space:]]*$' || return 1
         check_fault_report_bound "$log" 'ecall: invalid syscall' 100000 || return 1
-        # Two single faults above, then the crash loop's forty children.
-        check_fault_report_bound "$log" 'user fault: ' 42 || return 1
+        # Three single faults above, then the crash loop's forty children.
+        check_fault_report_bound "$log" 'user fault: ' 43 || return 1
     fi
 
     if [ "$MODE" = "rcu-lookup-measure" ]; then
@@ -2954,8 +3263,14 @@ run_one()
             '^lock-rank-stress: AB_workers=' \
             '^rcu-lookup-measure: measure-overhead samples=100 ' \
             '^revoke-stress: PASS[[:space:]]*$' \
-            '^preempt-latency: PASS ' \
+            '^preempt-latency: (PASS|AUDIT-REQUIRED) ' \
             '^ipc-contention: PASS ' || return 1
+    fi
+
+    local steal_rc=0
+    if mode_runs_wake_probe; then
+        check_preempt_latency "$log" "$steal_audit" || steal_rc=$?
+        [ "$steal_rc" -ne 1 ] || return 1
     fi
 
     if [ "$MODE" = "lkl-netd-iommu-fail-closed" ]; then
@@ -3035,13 +3350,17 @@ run_one()
     require_sync_log_oracle "$log" || return 1
     require_lkl_mode_oracle "$log" || return 1
 
+    if [ "$steal_rc" -eq "$RC_INVALID_RUN" ]; then
+        echo "  INVALID  ${MODE} run ${idx}: the host descheduled QEMU threads during wakes over the bound; not counted"
+        return "$RC_INVALID_RUN"
+    fi
     result="$(grep -E '=== Results:|RTMux .*: PASS|login:' "$log" | tail -n 1)"
     echo "  PASS     ${result:-$PASS_MARKER}"
     postprocess_trace_log "$log" || return 1
     # fdt-cpu-status inspects the log in the main loop, which removes it.
     if [ "$KEEP_LOGS" -eq 0 ] && [ "$MODE" != "fdt-cpu-status" ] &&
        { [ "$DIFFERENTIAL" -eq 0 ] || [ "$NET_LOG_DIFF" -eq 0 ]; }; then
-        rm -f "$log"
+        rm -f "$log" "${log}.steal-trace" "${log}.steal-sched"
     fi
 }
 
@@ -3207,6 +3526,7 @@ if [ "$DIFFERENTIAL" -eq 1 ]; then
 fi
 
 i=1
+INVALID_RUNS=0
 FDT_CPU_BASE_OPTS="${EMU_QEMU_OPTS:-}"
 while [ "$i" -le "$REPEAT" ]; do
     if [ "$MODE" = "fdt-cpu-status" ]; then
@@ -3220,7 +3540,29 @@ while [ "$i" -le "$REPEAT" ]; do
         i=$((i + 1))
         continue
     fi
-    run_one "$i" || exit 1
+    run_rc=0
+    run_one "$i" || run_rc=$?
+    if [ "$run_rc" -eq "$RC_INVALID_RUN" ]; then
+        # A run the host was too loaded to judge is repeated, and its log kept
+        # beside the others. More invalid runs than requested ones means this
+        # host cannot measure wake latency at all.
+        INVALID_RUNS=$((INVALID_RUNS + 1))
+        if [ "$KEEP_LOGS" -eq 1 ]; then
+            invalid_log="${LAST_LOG%.log}-invalid${INVALID_RUNS}.log"
+            for suffix in "" .steal-trace .steal-sched; do
+                [ ! -e "${LAST_LOG}${suffix}" ] ||
+                    mv "${LAST_LOG}${suffix}" "${invalid_log}${suffix}"
+            done
+        else
+            rm -f "$LAST_LOG" "${LAST_LOG}.steal-trace" "${LAST_LOG}.steal-sched"
+        fi
+        if [ "$INVALID_RUNS" -gt "$REPEAT" ]; then
+            echo "  FAIL     ${MODE}: ${INVALID_RUNS} invalid runs for $((i - 1)) valid ones; the host is too loaded to measure wake latency"
+            exit 1
+        fi
+        continue
+    fi
+    [ "$run_rc" -eq 0 ] || exit 1
     if [ "$DIFFERENTIAL" -eq 1 ]; then
         if [ "$NET_LOG_DIFF" -eq 1 ]; then
             differential_net_check || exit 1
@@ -3235,3 +3577,6 @@ while [ "$i" -le "$REPEAT" ]; do
     fi
     i=$((i + 1))
 done
+if [ "$INVALID_RUNS" -gt 0 ]; then
+    echo "  NOTE     ${MODE}: ${REPEAT} valid runs passed, ${INVALID_RUNS} invalid runs were repeated"
+fi

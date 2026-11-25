@@ -13,6 +13,21 @@
 #include <sys/path-registry.h>
 #include <sys/trace.h>
 
+/* root_proc_lock for a request that works in the sender's namespace: NULL, and
+ * nothing held, when the sender is gone or ended after sending and its root and
+ * cwd are detached (proc_terminate clears both under the lock).
+ */
+static process_t *root_proc_lock_ns(pid_t pid)
+{
+    process_t *prp = root_proc_lock(pid);
+
+    if (prp && !root_proc(pid)->root) {
+        root_proc_unlock(pid);
+        prp = NULL;
+    }
+    return prp;
+}
+
 int namesrv_resolve_io(ioserv_context_t *ctp, struct _io_connect *connect)
 {
     struct node_entry *node;
@@ -49,7 +64,7 @@ int namesrv_resolve_io(ioserv_context_t *ctp, struct _io_connect *connect)
     switch (connect->handle) {
     case PATH_HANDLE:
         namespace_stats_roundtrip(NAMESPACE_RT_RESOLVE);
-        if (!(prp = root_proc_lock(ctp->info.pid))) {
+        if (!(prp = root_proc_lock_ns(ctp->info.pid))) {
             ret = EL2HLT;
             break;
         }
@@ -116,7 +131,7 @@ int namesrv_change_root_cwd(message_context_t *ctp, struct _io_connect *connect)
         namespace_stats_roundtrip(connect->type == _PATH_CHROOT
                                       ? NAMESPACE_RT_CHROOT
                                       : NAMESPACE_RT_CHDIR);
-        if (!(prp = root_proc_lock(ctp->info.pid))) {
+        if (!(prp = root_proc_lock_ns(ctp->info.pid))) {
             ret = EL2HLT;
             break;
         }
@@ -150,7 +165,7 @@ int namesrv_change_root_cwd(message_context_t *ctp, struct _io_connect *connect)
                 break;
             }
 
-            if (!(prp = root_proc_lock(ctp->info.pid))) {
+            if (!(prp = root_proc_lock_ns(ctp->info.pid))) {
                 path_node_detach(node);
                 path_node_detach(start);
                 if (root != start)

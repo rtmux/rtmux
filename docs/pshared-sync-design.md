@@ -124,7 +124,7 @@ Private syncs keep VA keying unchanged (no resolution cost, no behavior change).
 
 `sync_chain_idx` and the waiter identity currently use the `sync_t *` VA.  Note
 (review finding, Codex): a non-PI contended mutex allocates **no** turnstile —
-waiters live on the chain list keyed by `thread_t.args.mu.wait_key`.  So the key
+waiters live on the chain list keyed by `thread_t.sync_wait_key`.  So the key
 abstraction must generalize the *waiter queue key*, not merely `turnstile_entry`.
 The key:
 
@@ -145,7 +145,7 @@ the identity-biased address space, even if the integers coincide.
 BIGGEST RISK (review finding, Codex): a blocked thread outlives the syscall
 stack — timeout, `force_ready`, and requeue all re-derive its key after the
 stack is gone.  So the key must be stored **durably in the thread**
-(`thread_t.args.mu.wait_key` widened from a VA to a `sync_key`), never as a stack
+(`thread_t.sync_wait_key` widened from a VA to a `sync_key`), never as a stack
 `sync_key *`.  Slice 1's whole job is this: decide the durable storage and route
 every chain/turnstile/waiter lookup through it, with `obj == NULL` so behavior is
 unchanged.
@@ -264,7 +264,7 @@ is a documented follow-up.  This keeps v1 off the most delicate turnstile code
    roottask/memobj involvement.  Testable on its own (resolve a known mapping and
    confirm two mappings of one shm page yield the same paddr).
 1. Kernel key abstraction, private-only: widen the durable waiter key
-   (`thread_t.args.mu.wait_key`) and `sync_chain_idx`/turnstile lookups to a
+   (`thread_t.sync_wait_key`) and `sync_chain_idx`/turnstile lookups to a
    `sync_key`, routing the existing VA path through it with `obj == NULL`.  Pure
    refactor, zero behavior change; the whole existing suite is the oracle.  This
    generalizes the *waiter-queue* key (non-PI mutexes have no turnstile), not just

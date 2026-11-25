@@ -164,7 +164,11 @@
  * to determine their values.
  */
 
-#define ARG_MAX 61440
+/* The argument and environment strings of exec and spawn with their NULs, one
+ * pointer per string and the two terminating null pointers. Enforced by libc
+ * and by roottask (spawn_args_fit in internal/include/sys/spawn-limits.h).
+ */
+#define ARG_MAX 98304
 #undef CHILD_MAX      /* no child max             */
 #undef OPEN_MAX       /* no open max              */
 #undef STREAM_MAX     /* no stream max            */

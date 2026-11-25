@@ -13,9 +13,10 @@
  *
  * Output goes to a dedicated PCI 16550 UART (QEMU's pci-serial device, vendor
  * 0x1b36 device 0x0002) at a self-assigned BAR. This bypasses BOTH the kernel's
- * kprintf_slock AND the SBI console path — the only shared state with the rest
- * of the kernel is the kspinlock value fields the monitor reads (no locks, no
- * atomics, just plain loads).
+ * kprintf_slock AND the SBI console path. The monitor only reads kernel state
+ * and takes no lock: lock words, the online mask and the IPI commands through
+ * atomic loads (intrspin_is_locked, cpu_online_snapshot), the other per-hart
+ * and thread fields it reports through plain loads.
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -770,20 +771,21 @@ void __attribute__((noreturn)) monitor_loop(void)
         mon_put_dec((unsigned) tick);
         mon_puts("] ");
         for (unsigned i = 0; i < N_SLOCKS; i++) {
-            unsigned v = monitor_slocks[i].slock->spin.value;
+            int locked = intrspin_is_locked(&monitor_slocks[i].slock->spin);
             mon_puts(monitor_slocks[i].name);
             mon_putc('=');
-            mon_putc(v ? 'L' : 'u');
+            mon_putc(locked ? 'L' : 'u');
             mon_putc(' ');
         }
 
         /* Per-CPU sched locks: one char per logical CPU in index order (L =
          * held, u = unlocked, - = offline).
          */
+        uint64_t online = cpu_online_snapshot();
         mon_puts("sched=");
         for (unsigned cpu = 0; cpu < num_processors; cpu++) {
             struct dispatch_entry *dpp = pcpu_array[cpu].pc_dispatch;
-            if (!cpu_online(cpu)) {
+            if (!cpu_in_mask(online, cpu)) {
                 mon_putc('-');
                 continue;
             }
@@ -791,8 +793,8 @@ void __attribute__((noreturn)) monitor_loop(void)
                 mon_putc('?');
                 continue;
             }
-            unsigned v = ((kspinlock_t *) &dpp->lock)->spin.value;
-            mon_putc(v ? 'L' : 'u');
+            int locked = intrspin_is_locked(&dpp->lock.spin);
+            mon_putc(locked ? 'L' : 'u');
         }
         mon_dump_thread_states();
 
@@ -806,7 +808,7 @@ void __attribute__((noreturn)) monitor_loop(void)
             unsigned hart = i;
             thread_t *thp;
 
-            if (!cpu_online(hart))
+            if (!cpu_in_mask(online, hart))
                 continue;
             thp = get_active_thread(hart);
 

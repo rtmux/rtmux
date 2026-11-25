@@ -5,71 +5,65 @@
  * The Regents of the University of California. All rights reserved.
  */
 
+#include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include "local.h"
 
 int setvbuf(FILE *__restrict fp, char *__restrict buf, int mode, size_t size)
 {
-    int ret;
+    int ret = 0;
     unsigned flags;
 
-    ret = 0;
+    if ((mode != _IONBF && mode != _IOLBF && mode != _IOFBF) ||
+        (mode != _IONBF && (size > INT_MAX || (buf && !size)))) {
+        errno = EINVAL;
+        return EOF;
+    }
 
-    (void) __sflush(fp);
-    if (fp->_flags & __SMBF)
-        free((void *) fp->_bf._base);
-    fp->_w = 0;
-    fp->_lbfsize = 0;
-
+    FLOCKFILE(fp);
+    if (__sflush(fp) != 0) {
+        FUNLOCKFILE(fp);
+        return EOF;
+    }
     flags =
         fp->_flags & ~(unsigned) (__SLBF | __SNBF | __SMBF | __SOPT | __SNPT);
-
-    switch (mode) {
-    case _IONBF:
-        flags |= __SNBF;
-        fp->_bf._base = fp->_p = fp->_nbuf;
-        fp->_bf._size = 1;
-        break;
-    case _IOLBF:
-        flags |= __SLBF;
-        /* FALLTHROUGH */
-    case _IOFBF:
-        /* allocate buffer if needed */
-        if (!buf) {
-            if (size == 0) {
-                if (fp->_blksize > 0)
-                    size = (size_t) fp->_blksize;
-                else
-                    size = BUFSIZ;
-            }
-            if (!(buf = malloc(size))) {
-                ret = EOF;
-                break;
-            }
+    if (mode != _IONBF && !buf) {
+        if (!size)
+            size = fp->_blksize > 0 ? (size_t) fp->_blksize : BUFSIZ;
+        buf = malloc(size);
+        if (buf)
             flags |= __SMBF;
+        else {
+            mode = _IONBF;
+            ret = EOF;
         }
-        fp->_bf._base = fp->_p = (unsigned char *) buf;
-        fp->_bf._size = (int) size;
-        break;
-    default:
-        ret = EOF;
-        break;
     }
 
-    if (ret == 0) {
-        fp->_flags = (unsigned short) flags;
-        if (flags & __SLBF)
-            fp->_lbfsize = -fp->_bf._size;
-        fp->_r = 0;
-
-        /* A stream already set up for writing skips __swsetup, so give it the
-         * new buffer's write room here; left at 0, __sfvwrite would drive _w
-         * negative and copy past the end of the buffer.
-         */
-        if (flags & __SWR)
-            fp->_w = flags & (__SLBF | __SNBF) ? 0 : fp->_bf._size;
+    if (fp->_flags & __SMBF)
+        free(fp->_bf._base);
+    if (HASUB(fp))
+        FREEUB(fp);
+    if (mode == _IONBF) {
+        flags |= __SNBF;
+        buf = (char *) fp->_nbuf;
+        size = 1;
+    } else if (mode == _IOLBF) {
+        flags |= __SLBF;
     }
+    fp->_flags = (unsigned short) flags;
+    fp->_bf._base = fp->_p = (unsigned char *) buf;
+    fp->_bf._size = (int) size;
+    fp->_r = 0;
+    fp->_lbfsize = (flags & __SLBF) ? -(int) size : 0;
+    fp->_w = (flags & __SWR) && mode == _IOFBF ? (int) size : 0;
+
+    /* A buffer set here means a write never reaches __smakebuf, which is what
+     * tells exit() there may be output to flush (__sdidinit).
+     */
+    __sdidinit = 1;
+    FUNLOCKFILE(fp);
     return ret;
 }
 

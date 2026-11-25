@@ -17,7 +17,6 @@ struct roottask_heap_stats {
     size_t used;         /* bytes below the bump pointer */
     size_t extent_bytes; /* bytes in free extents below it */
     size_t largest;      /* largest block a request could still get */
-    size_t dropped;      /* bytes lost when the extent table was full */
     unsigned extents;    /* free extents */
 };
 

@@ -84,6 +84,7 @@ paddr_t alloc_ram(paddr_t addr, paddr_t size, unsigned align);
 paddr_t calloc_ram(size_t size, unsigned align);
 void reserve_ram(unsigned size, unsigned align, unsigned pagesize);
 paddr_t ram_top(void);
+paddr_t ram_bytes(void);
 
 /* Command-line option handling */
 int getopt(int argc, char *const argv[], const char *opts);

@@ -29,27 +29,18 @@ typedef struct _jmp_buf {
     long __msk[2];
 } jmp_buf[1];
 
-extern int _setjmp(jmp_buf __env);
+extern int _setjmp(jmp_buf __env) __attribute__((__returns_twice__));
 extern void _longjmp(jmp_buf __env, int __val) __attribute__((__noreturn__));
 
 extern void longjmp(jmp_buf __env, int __val) __attribute__((__noreturn__));
 
-/* POSIX requires a setjmp() function prototype but suppressing the macro
- * definition or defining an external identifier with the name setjmp will cause
- * undefined behavior
- */
-extern int setjmp(jmp_buf);
-extern int sigsetjmp(jmp_buf __env, int __msk);
+extern int setjmp(jmp_buf) __attribute__((__returns_twice__));
+extern int sigsetjmp(jmp_buf __env, int __msk)
+    __attribute__((__returns_twice__));
 
 typedef jmp_buf sigjmp_buf;
 extern void siglongjmp(sigjmp_buf __env, int __val)
     __attribute__((__noreturn__));
-
-#define sigsetjmp(__env, __savemask)                                   \
-    ((__env)[0].__flg = (__savemask) ? 1 : 0, (__env)[0].__msk[0] = 0, \
-     (__env)[0].__msk[1] = 0, _setjmp(__env))
-#define setjmp(__env) sigsetjmp(__env, 1)
-#define longjmp(__env, __val) siglongjmp((__env), (__val))
 
 __END_DECLS
 #endif

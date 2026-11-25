@@ -289,7 +289,7 @@ static void ksys_start_roottask_umode(void)
      * on the first thread of a normal user process; the equivalent is done
      * here.
      */
-    prp->flags &= ~RTMUX_FLG_PROC_LOADING;
+    PROC_FLG_CLR(prp, RTMUX_FLG_PROC_LOADING);
 
     /* Pass user_sp in a0 so roottask's crt0 can build argc/argv from it.
      * cpu_thread_enter_umode zeros every GPR except PC/SP/TP, but the RTMux

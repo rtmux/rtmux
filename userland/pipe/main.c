@@ -1123,17 +1123,15 @@ static int pipe_service_closeocb(ioserv_context_t *ctp,
     flags = (unsigned) pipe_ocb_detach(ocb);
     free(ocb);
     if (S_ISFIFO(pipe->attr.mode) && flags != 0) {
-        if (flags & PIPE_OCB_LAST_READER) {
+        if (flags & PIPE_OCB_LAST_READER)
             unblock_clients(&pipe->waiting[IOSERV_NOTIFY_OUTPUT], NULL, -1,
                             EPIPE);
-            ioserv_notify_trigger(pipe->notify, INT_MAX, IOSERV_NOTIFY_OUTPUT);
-            ioserv_notify_trigger(pipe->notify, INT_MAX, IOSERV_NOTIFY_OBAND);
-        }
-        if (flags & PIPE_OCB_LAST_WRITER) {
+        if (flags & PIPE_OCB_LAST_WRITER)
             unblock_clients(&pipe->waiting[IOSERV_NOTIFY_INPUT], NULL, -1, EOK);
-            ioserv_notify_trigger(pipe->notify, INT_MAX, IOSERV_NOTIFY_INPUT);
-            ioserv_notify_trigger(pipe->notify, INT_MAX, IOSERV_NOTIFY_OBAND);
-        }
+        /* Poll reports a lost peer regardless of the requested events. */
+        if (flags & (PIPE_OCB_LAST_READER | PIPE_OCB_LAST_WRITER))
+            for (int i = 0; i < IOSERV_NOTIFY_COUNT; i++)
+                ioserv_notify_trigger(pipe->notify, INT_MAX, i);
         if (flags & PIPE_OCB_LAST_INUSE) {
             pipe->attr.nbytes = 0;
             pipe->rd = pipe->wr = 0;
@@ -1187,12 +1185,14 @@ static int pipe_service_notify(ioserv_context_t *ctp,
         int hup = 0;
 
         trigger = 0;
-        if ((int) pipe->attr.nbytes >= NotifyCounts[IOSERV_NOTIFY_INPUT] ||
-            !pipe->attr.wcount)
+        if ((ocb->ioflag & _IO_FLAG_RD) &&
+            ((int) pipe->attr.nbytes >= NotifyCounts[IOSERV_NOTIFY_INPUT] ||
+             !pipe->attr.wcount))
             trigger |= _NOTIFY_COND_INPUT;
-        if ((int) (BufferSize - (size_t) pipe->attr.nbytes) >=
-                NotifyCounts[IOSERV_NOTIFY_OUTPUT] ||
-            !pipe->attr.rcount)
+        if ((ocb->ioflag & _IO_FLAG_WR) &&
+            ((int) (BufferSize - (size_t) pipe->attr.nbytes) >=
+                 NotifyCounts[IOSERV_NOTIFY_OUTPUT] ||
+             !pipe->attr.rcount))
             trigger |= _NOTIFY_COND_OUTPUT;
 
         /* Hangup: the read end whose last writer has gone reports POLLHUP; the

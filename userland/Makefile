@@ -27,6 +27,7 @@ TOOLBOX_SRCS = \
     utils/toolbox.c \
     utils/vi.c \
     utils/sh.c \
+    utils/sh-parse.c \
     utils/sh-scan.c \
     utils/getty.c \
     utils/mount.c \

@@ -12,25 +12,34 @@
 #include <sys/stat.h>
 
 #include <posix.h>
+#include <sys/loader-fd.h>
+
+static int open_path(const char *path, int oflag, va_list ap, int track)
+{
+    int matched = 0;
+    int fd = __rtmux_procfd_open(path, oflag, 0, &matched);
+    if (!matched)
+        fd = _vopen(path, oflag, 0, ap);
+    if (track && fd != -1 && !matched)
+        __atfd_track_open(fd, path);
+    return fd;
+}
 
 int open(const char *path, int oflag, ...)
 {
     va_list ap;
-    int fd;
-    int matched = 0;
-
     va_start(ap, oflag);
-    fd = __rtmux_procfd_open(path, oflag, 0, &matched);
-    if (!matched)
-        fd = _vopen(path, oflag, 0, ap);
+    int fd = open_path(path, oflag, ap, 1);
     va_end(ap);
+    return fd;
+}
 
-    /* Remember the descriptor's path (absolute, or relative resolved against
-     * the cwd) so it can back fd-relative openat()/fstatat()/... later. Skip a
-     * /proc/<pid>/fd/N reopen (matched): its literal path is not a directory.
-     */
-    if (fd != -1 && !matched)
-        __atfd_track_open(fd, path);
+int __loader_open(const char *path, int flags, ...)
+{
+    va_list ap;
+    va_start(ap, flags);
+    int fd = open_path(path, flags, ap, 0);
+    va_end(ap);
     return fd;
 }
 

@@ -7,9 +7,7 @@
 # "  ok NAME" or "  FAIL NAME: ..." per case, then "gaps: PASS" or "gaps: FAIL".
 #
 # $SH is the shell the cases run as `sh -c`, and the one a case runs as a child;
-# it defaults to sh. $GAPS_DIR is the directory for scratch files. A non-empty
-# $GAPS_NO_EXEC skips the cases that need a successful exec to start the new
-# image.
+# it defaults to sh. $GAPS_DIR is the directory for scratch files.
 #
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -37,6 +35,19 @@ ck() {
         bad="$bad$1 "
     fi
 }
+
+out=$($SH -c 'echo before; echo "$((1 / 0))"; echo after' 2>/dev/null)
+rc=$?
+ck arithmetic-error-command "before" "$out"
+if test "$rc" -gt 0; then ck arithmetic-error-exits yes yes; else ck arithmetic-error-exits yes no; fi
+out=$($SH -c 'unset GLOCAL; GLOCAL=private; printenv GLOCAL || echo unset; export GLOCAL; printenv GLOCAL')
+ck shell-local-export "$(printf 'unset\nprivate')" "$out"
+out=$($SH -c 'unset GLOCAL; GLOCAL=private; echo "$(echo "$GLOCAL")"; GLOCAL=scoped printenv GLOCAL; printenv GLOCAL || echo hidden')
+ck shell-local-scope "$(printf 'private\nscoped\nhidden')" "$out"
+out=$($SH -c 'unset GLOCAL; GLOCAL=direct exec printenv GLOCAL')
+ck exec-prefix direct "$out"
+out=$($SH -c 'true &' 2>&1)
+ck quiet-background "" "$out"
 
 # --- a quote or a substitution that never ends is a syntax error, and nothing
 # of the line runs -----------------------------------------------------------
@@ -133,6 +144,18 @@ out=$($SH -c 'set -- "$1-g*"nomatch*; echo "$#:$1"' sh "$P")
 ck glob-quoted-nomatch "1:$P-g*nomatch*" "$out"
 out=$($SH -c 'set -- ${nov:-"$1-g*"}x*; echo "$#:$1"' sh "$P")
 ck glob-quoted-in-default "1:$P-g*x" "$out"
+control=$(printf '\003')
+: > "$P-g${control}a"
+out=$($SH -c 'set -- "$1-g$2"*; echo "$#:$1"' sh "$P" "$control")
+ck glob-control-byte "1:$P-g${control}a" "$out"
+: > "$P-bracket-"
+: > "$P-bracket]"
+: > "$P-bracketb"
+out=$($SH -c 'set -- "$1-bracket"[a"-"c]; echo "$#:$1"' sh "$P")
+ck glob-bracket-quoted-hyphen "1:$P-bracket-" "$out"
+out=$($SH -c 'set -- "$1-bracket"[a"]"c]; echo "$#:$1"' sh "$P")
+ck glob-bracket-quoted-close "1:$P-bracket]" "$out"
+rmf "$P-g${control}a" "$P-bracket-" "$P-bracket]" "$P-bracketb"
 rmf "$P-g*x" "$P-gax"
 
 # --- a ) in a comment or a case pattern does not end a $( ... ) -------------------
@@ -200,6 +223,11 @@ out=$($SH -c 'for i in 1 2; do echo $i; done >&-; echo "rc=$?"; echo after' 2>/d
 ck close-compound-for "$(printf 'rc=1\nafter')" "$out"
 out=$($SH -c '{ echo a; } >&-; echo "rc=$?"; echo after' 2>/dev/null)
 ck close-compound-brace "$(printf 'rc=1\nafter')" "$out"
+out=$($SH -c '{ $SH -c "echo first"; a=$?; $SH -c "echo second"; b=$?; } >&-; echo "$a $b"' 2>/dev/null)
+ck close-compound-external "1 1" "$out"
+out=$($SH -c '{ { echo recovered; } >"$1"; $SH -c "echo hidden"; rc=$?; } >&-; cat "$1"; echo "$rc"' _ "$P-cl" 2>/dev/null)
+ck close-compound-inner-open "$(printf 'recovered\n1')" "$out"
+
 rmf "$P-cl"
 
 # --- a background compound command, with a command after it -------------------------
@@ -313,10 +341,8 @@ out=$(echo "$raw" | tr -d '$>#')
 ck multiline-prompt "a b done" "$(echo $out)"
 
 # --- exec with a command applies its redirections to that command -------------
-if test -z "$GAPS_NO_EXEC"; then
-    out=$($SH -c 'exec echo hi 1>&2' 2>&1 >/dev/null)
-    ck exec-cmd-redirect hi "$out"
-fi
+out=$($SH -c 'exec echo hi 1>&2' 2>&1 >/dev/null)
+ck exec-cmd-redirect hi "$out"
 
 # --- elif ---------------------------------------------------------------------------------
 out=$($SH -c 'if false; then echo a; elif true; then echo b; else echo c; fi')
@@ -361,6 +387,12 @@ out=$($SH -c "case abc in 'a*') echo bad;; *) echo glob;; esac")
 ck case-squote-pattern-no-glob glob "$out"
 out=$($SH -c 'case a in a) echo A;; esac; case b in b) echo B;; esac')
 ck case-twice-one-line "A B" "$(echo $out)"
+out=$($SH -c 'if case x in x) true;; esac; then echo matched; fi')
+ck case-if-condition matched "$out"
+out=$($SH -c 'x=go; while case "$x" in go) true;; *) false;; esac; do echo once; x=stop; done')
+ck case-while-condition once "$out"
+out=$($SH -c '{ case a in a) case b in b) echo nested;; esac;; esac; }')
+ck case-nested-brace nested "$out"
 out=$($SH -c 'y="a b"; case "a b" in "$y") echo var;; esac')
 ck case-quoted-var-pattern var "$out"
 out=$($SH -c 'case ")" in ")") echo paren;; esac')
@@ -378,6 +410,21 @@ printf '%s\n' 'f() {' '  case $1 in' '    a)' '      if [ "$2" = y ]; then' '   
 out=$($SH "$P-ca.sh")
 ck case-multiline-in-function "AY other" "$(echo $out)"
 rmf "$P-ca.sh"
+
+out=$($SH -c 'cat <<"END" | cat
+;; esac ${literal}
+END
+echo done')
+ck pipe-quoted-heredoc "$(printf ';; esac ${literal}\ndone')" "$out"
+out=$($SH -c 'f() { f() { echo second; }; echo first; }; f; f')
+ck redefine-running-function "$(printf 'first\nsecond')" "$out"
+out=$($SH -c 'for i in first do last; do echo "$i"; done')
+ck for-do-word "$(printf 'first\ndo\nlast')" "$out"
+
+for invalid in 'echo before; fi' 'echo before; ; true' 'if true; then fi'; do
+    out=$($SH -c "$invalid" 2>/dev/null; echo "rc=$?")
+    ck malformed-compound "rc=2" "$out"
+done
 
 echo "  $n gap cases"
 if test -z "$bad"; then

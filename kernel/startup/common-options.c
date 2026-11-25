@@ -62,6 +62,12 @@ void handle_common_option(int opt)
             /* kprintf output channel */
             debug_opt[0] = optarg;
             break;
+        case 'F':
+            num = strtoul(optarg, &cp, 10);
+            /* The descriptor vector uses a 16-bit count and reserves 0xffff. */
+            if (*optarg && !*cp && num >= 3 && num < 0xffff)
+                kopt.max_fds = (unsigned) num;
+            break;
         case 'f':
             /* CPU and timer frequency */
             get_freq(&kopt.timebase_freq);

@@ -79,15 +79,22 @@ struct kcall_args_debug_process {
 };
 
 /* kext_thread_ctl_call packs (prp, tid, cmd, data) — layout MUST match the
- * kernel-side definition (kernel/core/args.h's kcall_args_thread_ctl is
- * private; we mirror its (cmd, data) tail here).
+ * kernel-side definition (kernel/ext/debug.c's kcall_args_tctl_args): the (cmd,
+ * data) pair is the nested kcall_args_thread_ctl of kernel/core/args.h, which
+ * is 8-byte aligned, so it starts after the padding that follows tid. Flattened
+ * here, cmd landed in that padding, and the kernel read tid as the command.
  */
 struct kcall_args_tctl_args {
     process_t *prp;
     int tid;
-    int32_t cmd;
-    void *data;
+    struct {
+        int32_t cmd;
+        void *data;
+    } tctl;
 };
+_Static_assert(offsetof(struct kcall_args_tctl_args, tctl) == 16 &&
+                   offsetof(struct kcall_args_tctl_args, tctl.data) == 24,
+               "kcall_args_tctl_args must match the kernel's layout");
 
 /* debug_attach — attach a debugger to a process. Parameters:
  *   pid   : target process pid
@@ -161,11 +168,11 @@ int kext_thread_ctl_call(process_t *prp, int tid, int32_t cmd, void *data)
     struct kcall_args_tctl_args args;
     args.prp = prp;
     args.tid = tid;
-    args.cmd = cmd;
-    args.data = data;
+    args.tctl.cmd = cmd;
+    args.tctl.data = data;
     /* Sigh - adjust for RUNMASK */
     if (cmd == RTMUX_TCTL_RUNMASK)
-        memcpy(&args.data, data, sizeof(args.data));
+        memcpy(&args.tctl.data, data, sizeof(args.tctl.data));
     return (int) syscall_priv(__KSYS_PRIV_THREAD_CTL, &args);
 }
 
@@ -452,7 +459,9 @@ struct kcall_args_kpage_zero {
 };
 
 /* kernel_page_zero — zero kernel-direct-map memory backing a physical range.
- * Wraps __KSYS_PRIV_KPAGE_ZERO; see the struct comment above. Parameters:
+ * Wraps __KSYS_PRIV_KPAGE_ZERO, calling it until the whole range is zeroed:
+ * each call stops at its time budget and leaves paddr and len at the rest.
+ * Parameters:
  *   paddr : physical base of the region to zero
  *   len   : number of bytes to zero
  * Return value: EOK on success, errno on failure.
@@ -461,9 +470,21 @@ int kernel_page_zero(paddr_t paddr, size_t len)
 {
     struct kcall_args_kpage_zero data;
 
+    /* The kernel takes at most 16 MiB a call and refuses more. */
+    const size_t max = (size_t) 16 << 20;
+
     data.paddr = paddr;
-    data.len = len;
-    return (int) syscall_priv(__KSYS_PRIV_KPAGE_ZERO, &data);
+    while (len) {
+        data.len = len < max ? len : max;
+        len -= data.len;
+        do { /* each call leaves paddr and len at what it did not reach */
+            int rc = (int) syscall_priv(__KSYS_PRIV_KPAGE_ZERO, &data);
+
+            if (rc != EOK)
+                return rc;
+        } while (data.len);
+    }
+    return EOK;
 }
 
 /* kernel_icache_sync_all — broadcast fence.i to every hart (slot
@@ -483,8 +504,8 @@ int kernel_icache_sync_all(void)
  * inheritance, kernel-side.
  *
  * Pre-publishes initial_ip / initial_sp on a child's prp before the loader
- * sends SPAWN_DONE, and applies the SPAWN_EXEC / SPAWN_NOZOMBIE inheritance
- * rules.
+ * sends SPAWN_DONE, and applies the SPAWN_NOZOMBIE rule (the child of an exec
+ * keeps NOZOMBIE).
  *
  * Returns the (possibly-augmented) caller-side spawn flags via
  * *spawn_flags_inout so the loader can keep its lcp->ctx.flags in sync with the
@@ -967,25 +988,54 @@ void system_shutdown(void)
 
 /* signal_kill (signal.c) */
 struct kext_signal_args {
-    channel_t *chp;
+    pid_t pid;
     int signo;
     pid_t sender_pid;
 };
 
 /* signal_kill — deliver a signal to a process by posting a notification to its
- * system channel. Parameters:
- *   chp        : opaque kernel-VA pointer to the target's system channel
+ * system channel. The kernel finds the channel from the pid; roottask never
+ * holds a pointer to it. Parameters:
+ *   pid        : the target process
  *   signo      : signal number to deliver
  *   sender_pid : pid of the sending process
+ * Return value: EOK when the notification was queued, ENXIO when the process
+ * has no system channel, ESRCH when there is no such process.
  */
-void signal_kill(channel_t *chp, int signo, pid_t sender_pid)
+int signal_kill(pid_t pid, int signo, pid_t sender_pid)
 {
     struct kext_signal_args args = {
-        .chp = chp,
+        .pid = pid,
         .signo = signo,
         .sender_pid = sender_pid,
     };
-    syscall_priv(__KSYS_PRIV_SIGNAL_DELIVER, &args);
+    int rc = (int) syscall_priv(__KSYS_PRIV_SIGNAL_DELIVER, &args);
+
+    return rc < 0 ? -rc : rc;
+}
+
+/* Mirrors kernel/ext/query.c::kcall_args_proc_syschan_detach. */
+struct kcall_args_proc_syschan_detach {
+    pid_t pid;
+    pid_t sender;
+    uint64_t sigs;
+};
+
+/* process_syschan_detach — take a process's system channel out of use and
+ * collect the signals queued on it that nobody received. Parameters:
+ *   pid    : the process
+ *   sender : out — the sender of the last queued signal, 0 if none
+ * Return value: the queued signals, bit n for signal n; 0 if there were none or
+ * the process is gone.
+ */
+uint64_t process_syschan_detach(pid_t pid, pid_t *sender)
+{
+    struct kcall_args_proc_syschan_detach args = {.pid = pid};
+
+    if (syscall_priv(__KSYS_PRIV_PROC_SYSCHAN_DETACH, &args) != EOK)
+        return 0;
+    *sender = args.sender;
+    return args.sigs;
 }
 
 /* Stack (stack.c) */
@@ -1084,7 +1134,7 @@ struct _thread_local_storage *thread_tls(struct _thread_local_storage *tls,
  *
  * "roottask_buf" MUST be a kernel-direct-map VA (>= KERNEL_VIRT_BASE); a U-mode
  * roottask buffer would not survive the satp swap. Most callers obtain such a
- * VA via pte_temp_map() which returns paddr + CPU_1TO1_VADDR_BIAS.
+ * VA via pte_temp_map() which returns PA_TO_VA(paddr).
  *
  * Returns EOK / EFAULT / ESRCH / EINVAL.
  */

@@ -17,6 +17,28 @@ validates the list afterwards, so a thread in another part of the program that
 closes one of them during the call can make the spawn fail with `EBADF`. Create
 pipes shared with children close-on-exec and keep them open across the spawn.
 
+`ARG_MAX` is 98,304 bytes (96 KiB) and is what `sysconf(_SC_ARG_MAX)` returns.
+It counts every argument and environment string with its terminating NUL, plus
+one pointer for each string and for the null pointer that ends each of the two
+vectors. `posix_spawn`, `posix_spawnp` and the `exec*` functions fail with
+`E2BIG` when the list is larger, before anything is sent, and roottask refuses
+an oversized request from a client that skips the check. The arguments are
+placed on the new program's stack, which is enlarged by their size, so they do
+not reduce the stack the program asked for. A spawn within the limit can still
+fail with `ENOMEM`: roottask copies a `posix_spawn` request into its fixed heap
+while it starts the child. Large requests are admitted in turn against half of
+that heap, and may wait there or fail with `EAGAIN` when too many queue, but
+the heap is shared with everything else roottask allocates, so a request can
+still meet a heap the rest of roottask has filled.
+
+## Shell command lists
+
+The toolbox shell parses command lists before expanding or executing them.
+Nested conditions, case arms, function bodies and trailing redirections share
+the grammar in `userland/utils/sh-parse.c`. Patterns carry a separate quote
+mask so every non-NUL byte remains available as data. The guest `sh-posix` suite exercises
+compound redirections and nested grammar. Its `gaps.sh` cases also run under dash.
+
 ## Profiles and what is claimed
 
 The matrix in `docs/posix-compliance.md` is the source of truth. An interface
@@ -48,8 +70,16 @@ Handlers do not interrupt the target thread. libc runs them on a per-process
 system thread, so a handler runs concurrently with the main thread, at the
 process's starting scheduling priority. `SA_SIGINFO` handlers receive
 `si_signo`, `si_code`, and `si_pid`, with no interrupted-context argument. A
-caught signal does not yet interrupt a blocked call with `EINTR`; code that
-relies on that needs a different wakeup (a timeout or a notification).
+caught signal whose handler was installed without `SA_RESTART` ends an
+`open()` or a `read()` that a service is holding with `EINTR`. An `open()`
+with `O_CREAT` or `O_TRUNC` is the exception: once sent it is not
+interrupted, because the server may already have created or truncated the
+file, and `EINTR` would say that nothing happened. A service that holds such an
+open for good (a FIFO opened with `O_CREAT` while no reader comes) therefore
+keeps the caller until it answers: open an existing FIFO without `O_CREAT`, or
+end the wait with `pthread_cancel`, which still applies. Other blocked calls are not
+yet interrupted; code that relies on that needs a different wakeup (a timeout
+or a notification).
 Stop and continue signals are treated as ignored: there is no job control.
 
 ## Memory
@@ -57,7 +87,8 @@ Stop and continue signals are treated as ignored: there is no job control.
 Mappings are populated eagerly: `mmap` allocates and maps every page up front
 and there is no demand paging, so a large mapping costs its full size at call
 time and fails with `ENOMEM` if physical memory is short. malloc grows its heap
-by mapping 256 KiB chunks and maps requests of 128 KiB or more directly.
+by mapping 256 KiB chunks and maps directly any request that, with its 8-byte
+header, does not fit a 128 KiB block (131,065 bytes or more).
 malloc is not async-signal-safe.
 
 ## Omitted interfaces

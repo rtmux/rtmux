@@ -32,6 +32,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/rtmux-core.h>
+#include <sys/states.h>
 
 #include "test.h"
 
@@ -183,6 +184,7 @@ struct client {
     int prio;
     pthread_mutex_t *hold; /* NULL: hold nothing */
     long reply_timeout_ms; /* 0: none */
+    long send_timeout_ms;  /* 0: none; leaves the send queue when it expires */
     atomic_int done;
     int rc, err;
 };
@@ -199,6 +201,11 @@ static void *client_main(void *raw)
         uint64_t ns = (uint64_t) c->reply_timeout_ms * 1000000ULL;
 
         (void) __timer_timeout(CLOCK_MONOTONIC, RTMUX_TIMEOUT_REPLY, NULL, &ns,
+                               NULL);
+    } else if (c->send_timeout_ms) {
+        uint64_t ns = (uint64_t) c->send_timeout_ms * 1000000ULL;
+
+        (void) __timer_timeout(CLOCK_MONOTONIC, RTMUX_TIMEOUT_SEND, NULL, &ns,
                                NULL);
     }
     c->rc = msg_send(c->coid, &req, 1, &rep, 1);
@@ -217,7 +224,7 @@ struct server {
     int base;
     pthread_mutex_t *hold; /* held from before the receive until `go` */
     atomic_int ready, received, go;
-    int rcvid;
+    int rcvid, current_rc;
     int prio_recv, prio_unlocked, prio_after, base_after, reply_rc;
 };
 
@@ -477,7 +484,7 @@ static void test_reply_cycle_deadlock(void)
 }
 
 /* A /sys/kstats value, or -1. */
-static long kstats_value(const char *key)
+long kstats_value(const char *key)
 {
     static char buf[8192];
     char want[64];
@@ -670,7 +677,7 @@ static void *case7_server(void *raw)
     k->rcvid = msg_receive(k->chid, buf, sizeof buf, NULL);
     k->prio_recv = self_prio(NULL);
     set_flag(&k->received);
-    (void) msg_current(0);
+    k->current_rc = msg_current(0);
     k->prio_unlocked = self_prio(NULL);
     set_flag(&k->go);
     k->reply_rc = k->rcvid == -1 ? -1 : msg_reply(k->rcvid, 0, &z, 1);
@@ -707,7 +714,7 @@ static void test_loan_ends_at_msg_current_zero(void)
              "received at %d (want 40), %d after msg_current(0) (want %d), "
              "reply rc %d",
              k.prio_recv, k.prio_unlocked, C7_BASE, k.reply_rc);
-    check(k.prio_recv == 40 && k.prio_unlocked == C7_BASE,
+    check(k.current_rc == 0 && k.prio_recv == 40 && k.prio_unlocked == C7_BASE,
           "prio loan: msg_current(0) ends the client's loan", detail);
     chan_close(k.chid, coid);
 }
@@ -878,9 +885,114 @@ static void test_loan_ends_for_blocked_server(void)
     run_loan_ends_for_blocked_server(false);
 }
 
+/* Case 10: a send queued behind the request a server is serving lends its
+ * priority to that server (the pending-send loan). The loan is dropped lazily:
+ * a sender that leaves the queue by timeout does not take it back at once, and
+ * the server keeps it until its next reply or receive reads the queue head
+ * again (docs/pi-pc-design.md "Not followed"). This pins that bound: the loan
+ * is there while the send is queued, and it is gone once the server has
+ * replied to the request it held. The priority seen between the timeout and
+ * the reply is reported, not checked.
+ */
+#define C10_BASE 5
+#define C10_QUEUED_MS 1000 /* long enough to see the loan on a loaded host */
+
+static void test_pending_loan_after_sender_timeout(void)
+{
+    static struct server k;
+    struct client held = {.prio = 10};
+    struct client queued = {.prio = 40, .send_timeout_ms = C10_QUEUED_MS};
+    pthread_t ts, th, tq;
+    int coid = -1, lent = -1, stale = -1;
+    char detail[224];
+
+    memset(&k, 0, sizeof k);
+    if (chan_open(&k.chid, &coid) != 0) {
+        test_fail("prio loan: queued sender timeout setup", strerror(errno));
+        return;
+    }
+    k.base = C10_BASE;
+    held.coid = coid;
+    queued.coid = coid;
+    if (!spawn(&ts, server_main, &k, "prio loan: queued sender server"))
+        return;
+    (void) wait_flag(&k.ready);
+    if (!spawn(&th, client_main, &held, "prio loan: queued sender held client")) {
+        set_flag(&k.go);
+        return;
+    }
+    if (!wait_flag(&k.received)) {
+        test_fail("prio loan: queued sender setup",
+                  "the server did not receive the held request");
+    } else if (spawn(&tq, client_main, &queued,
+                     "prio loan: queued sender client")) {
+        lent = wait_prio_n(ts, 40, C10_QUEUED_MS - 100);
+        (void) wait_flag(&queued.done);
+        stale = wait_prio_n(ts, 10, 5);
+        (void) pthread_join(tq, NULL);
+    }
+    set_flag(&k.go);
+    (void) pthread_join(ts, NULL);
+    (void) pthread_join(th, NULL);
+    snprintf(detail, sizeof detail,
+             "received at %d (want 10); with the send queued %d (want 40); "
+             "sender rc %d errno %d (want ETIMEDOUT); %d within 5 ms of the "
+             "timeout (10 if dropped at once); after the reply %d base %d "
+             "(want %d)",
+             k.prio_recv, lent, queued.rc, queued.err, stale, k.prio_after,
+             k.base_after, C10_BASE);
+    printf("prio loan: pending-send loan %d ms after its sender timed out: %d\n",
+           5, stale);
+    check(k.prio_recv == 10 && lent == 40 && queued.rc == -1 &&
+              queued.err == ETIMEDOUT && k.reply_rc == 0 &&
+              k.prio_after == C10_BASE &&
+              k.base_after == C10_BASE,
+          "prio loan: a timed-out queued send lends no later than the reply",
+          detail);
+    chan_close(k.chid, coid);
+}
+
+/* Measure the fence used by thread_end_orphan_loan against the same loop
+ * with only a compiler barrier. Batching amortizes both timer reads. */
+static uint64_t loan_fence_batch(bool fence)
+{
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    if (fence) {
+        for (unsigned i = 0; i < 1000000; ++i)
+            __asm__ volatile("fence rw, rw" ::: "memory");
+    } else {
+        for (unsigned i = 0; i < 1000000; ++i)
+            __asm__ volatile("" ::: "memory");
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    /* A monotonic interval: never negative. */
+    return (uint64_t) ((end.tv_sec - start.tv_sec) * 1000000000LL +
+                       end.tv_nsec - start.tv_nsec);
+}
+
 int loan_settle_context(void)
 {
-    run_loan_ends_for_blocked_server(true);
+    unsigned idle_rounds = 0;
+    if (inject_run("prio-settle-reset", NULL, NULL) != 0) {
+        test_skip("prio loan: settle context", "fault injection unavailable");
+        return 0;
+    }
+    for (int i = 0; i < 8; i++) {
+        run_loan_ends_for_blocked_server(true);
+        idle_rounds += inject_run("prio-settle-idle", "1", NULL) == 0;
+    }
+    check(idle_rounds != 0,
+          "prio loan: idle hart drained a deferred settle with interrupts off",
+          "no timeout exercised the idle-hart drain");
+    for (int i = 0; i < 5; i++) {
+        uint64_t first = loan_fence_batch(i & 1);
+        uint64_t second = loan_fence_batch(!(i & 1));
+        printf("loan departure fence: 1000000 iterations, control %llu ns, fenced %llu ns\n",
+               (unsigned long long) ((i & 1) ? second : first),
+               (unsigned long long) ((i & 1) ? first : second));
+    }
+    test_loan_ends_at_msg_current_zero();
     test_loan_ends_at_failed_msg_current();
     return 0;
 }
@@ -997,7 +1109,8 @@ out:
  * run at B's priority: the loan went to H, which no longer owns the mutex.
  * Needs /bin/inject and four harts; otherwise the case is skipped.
  */
-#define MHL_STALL_MS 4000L
+#define MHL_STALL_MS 10000L /* watchdog if the observer exits before release \
+                             */
 #define MHL_PRIO_H 20
 #define MHL_PRIO_W 30
 #define MHL_PRIO_B 50
@@ -1035,8 +1148,276 @@ static void *mhl_late(void *raw)
     return NULL;
 }
 
+struct bound_worker {
+    atomic_int go, acquired, done;
+    unsigned mask;
+    int priority;
+};
+
+static void *bound_locker(void *arg)
+{
+    struct bound_worker *w = arg;
+    (void) test_pin_mask(w->mask);
+    (void) set_fifo(w->priority);
+    while (!atomic_load(&w->go))
+        sleep_ms(1);
+    pthread_mutex_lock(&mhl_mutex);
+    set_flag(&w->acquired);
+    while (!atomic_load(&w->done))
+        sleep_ms(1);
+    pthread_mutex_unlock(&mhl_mutex);
+    return NULL;
+}
+
+/* How many RCU-sched waits on hart 1, where the threads these cases need to run
+ * are pinned, have waited for a hart held in an injected stall (see
+ * INJECT_OP_RCU_STALL_WAITS), or -1; reset clears the count after reading. */
+static int rcu_stall_waits(bool reset)
+{
+    int n = inject_run("rcu-stall-waits", "1", reset ? "reset" : NULL);
+
+    return n == 255 ? -1 : n;
+}
+
+/* Release the mutex with both waiters bound but neither on the wait queue.
+ * The lower-priority waiter takes the free word first and must inherit the
+ * other waiter's loan before that waiter resumes its walk. */
+static bool mutex_bound_acquire(bool last)
+{
+    bool spoiled = false;
+    struct bound_worker first = {.mask = 2, .priority = MHL_PRIO_W};
+    struct bound_worker late = {.mask = 4, .priority = MHL_PRIO_B};
+    struct stall_watch a = {.pid = -1}, b = {.pid = -1};
+    pthread_t wa, wb;
+    bool ha, hb, held = true;
+    char pid[16];
+    snprintf(pid, sizeof pid, "%d", (int) getpid());
+    (void) rcu_stall_waits(true);
+    pthread_mutex_lock(&mhl_mutex);
+    ha = spawn(&wa, bound_locker, &first, "bound acquire first worker");
+    hb = spawn(&wb, bound_locker, &late, "bound acquire late worker");
+    if (!ha || !hb || inject_run("stall-lock", pid, "10000") != 0 ||
+        inject_run("stall-lock-propagated", pid, "10000") != 0 ||
+        stall_watch_start(&a, "lock") != 0 ||
+        stall_watch_start(&b, "propagated") != 0)
+        goto failed;
+    set_flag(&first.go);
+    if (!stall_watch_entered(&a)) {
+        test_fail("first waiter bound", "lock stall timed out");
+        goto out;
+    }
+    set_flag(&late.go);
+    if (!stall_watch_entered(&b)) {
+        test_fail("late waiter bound", "propagated stall timed out");
+        goto out;
+    }
+    pthread_mutex_unlock(&mhl_mutex);
+    held = false;
+    stall_watch_release(&a);
+    if (!wait_flag(&first.acquired)) {
+        /* Its hart held by a grace-period wait on the stalled one. */
+        spoiled = rcu_stall_waits(false) > 0;
+        if (!spoiled || last)
+            test_fail("first bound waiter acquired",
+                      spoiled ? "did not return from mutex lock (a grace-period "
+                                "wait held its hart, every try)"
+                              : "did not return from mutex lock");
+        goto out;
+    }
+    check(
+        wait_prio(wa, MHL_PRIO_B) == MHL_PRIO_B && !atomic_load(&late.acquired),
+        "bound acquirer inherits from the remaining bound waiter",
+        "new owner did not inherit before the waiter queued");
+    goto out;
+failed:
+    test_fail("bound acquire setup", "did not reach both injection windows");
+out:
+    set_flag(&first.go);
+    set_flag(&late.go);
+    set_flag(&first.done);
+    set_flag(&late.done);
+    stall_watch_release(&a);
+    stall_watch_release(&b);
+    if (held)
+        pthread_mutex_unlock(&mhl_mutex);
+    if (ha)
+        (void) pthread_join(wa, NULL);
+    if (hb)
+        (void) pthread_join(wb, NULL);
+    stall_watch_finish(&a);
+    stall_watch_finish(&b);
+    return spoiled && !last; /* try again */
+}
+
+/* A grace-period wait spins its hart until every other hart is out of its
+ * kernel call, so a hart held seconds in an injected stall holds every hart
+ * that waits for a grace period meanwhile: thread teardown, a connection or
+ * channel freed anywhere in a busy system. A test thread pinned to such a hart
+ * cannot run, and the setups below, which need one running during a stall,
+ * failed at random that way. They are retried when the count of those waits
+ * rose; check here that it does. */
+struct rcu_probe {
+    atomic_int done;
+    long long ns; /* how long its create and join took, once done */
+};
+
+static void *rcu_probe_child(void *arg)
+{
+    (void) arg;
+    return NULL;
+}
+
+/* On hart 1, create a thread and join it: its teardown waits for a grace
+ * period. */
+static void *rcu_probe_run(void *arg)
+{
+    struct rcu_probe *s = arg;
+    struct timespec a, b;
+    pthread_t c;
+
+    (void) test_pin_mask(2);
+    clock_gettime(CLOCK_MONOTONIC, &a);
+    if (pthread_create(&c, NULL, rcu_probe_child, NULL) == 0)
+        (void) pthread_join(c, NULL);
+    clock_gettime(CLOCK_MONOTONIC, &b);
+    s->ns = (long long) (b.tv_sec - a.tv_sec) * 1000000000LL +
+            (b.tv_nsec - a.tv_nsec);
+    set_flag(&s->done);
+    return NULL;
+}
+
+static void mutex_stall_rcu_waits(void)
+{
+    struct bound_worker waiter = {.mask = 4, .priority = MHL_PRIO_B};
+    struct rcu_probe s = {0};
+    struct stall_watch watch = {.pid = -1};
+    pthread_t tw, ts;
+    bool hw, hs = false;
+    int n0, n1 = -1;
+    char pid[16], why[128];
+
+    snprintf(pid, sizeof pid, "%d", (int) getpid());
+    n0 = rcu_stall_waits(true); /* hart 1 counts from 0, before the stall */
+    pthread_mutex_lock(&mhl_mutex);
+    hw = spawn(&tw, bound_locker, &waiter, "rcu wait waiter");
+    if (!hw || inject_run("stall-lock-propagated", pid, "10000") ||
+        stall_watch_start(&watch, "propagated")) {
+        test_fail("rcu wait setup", "the propagated stall did not arm");
+        goto out;
+    }
+    set_flag(&waiter.go);
+    if (!stall_watch_entered(&watch)) {
+        test_fail("rcu wait setup", "the waiter did not reach the stall");
+        goto out;
+    }
+    hs = spawn(&ts, rcu_probe_run, &s, "rcu wait probe");
+    /* The probe's teardown on hart 1 waits for the stalled hart. */
+    for (int i = 0; i < 300 && (n1 = rcu_stall_waits(false)) <= 0; i++)
+        sleep_ms(10);
+    /* The probe was held: still, or for longer than a create and join take.
+     * Each read of the count is a spawn, slow while the stall lasts, so the
+     * stall may have ended, and the probe with it, before one returns. */
+    bool held = hs && (!atomic_load(&s.done) || s.ns > 1000000000LL);
+
+    snprintf(why, sizeof why,
+             "hart 1 count %d (was %d before the reset), probe %s %lld ns", n1,
+             n0, atomic_load(&s.done) ? "took" : "still held after",
+             atomic_load(&s.done) ? s.ns : -1LL);
+    check(n0 >= 0 && n1 > 0 && held,
+          "a grace-period wait on a hart held in a stall is counted", why);
+out:
+    stall_watch_release(&watch);
+    set_flag(&waiter.go);
+    set_flag(&waiter.done);
+    pthread_mutex_unlock(&mhl_mutex);
+    if (hw)
+        (void) pthread_join(tw, NULL);
+    if (hs)
+        (void) pthread_join(ts, NULL);
+    stall_watch_finish(&watch);
+}
+
+/* The new owner takes a free word in user space while the only waiter
+ * is paused after lending to the original owner. No handoff can supply
+ * the loan: the waiter must reread the word when its walk resumes. */
+static bool mutex_changed_owner(bool last)
+{
+    bool spoiled = false;
+    struct bound_worker waiter = {.mask = 4, .priority = MHL_PRIO_B};
+    struct bound_worker owner = {.mask = 2, .priority = MHL_PRIO_W};
+    struct stall_watch watch = {.pid = -1};
+    pthread_t tw, to;
+    bool hw, ho, held = true;
+    char pid[16];
+    snprintf(pid, sizeof pid, "%d", (int) getpid());
+    const char *why = NULL;
+    char detail[96];
+    int got;
+
+    (void) rcu_stall_waits(true);
+    pthread_mutex_lock(&mhl_mutex);
+    hw = spawn(&tw, bound_locker, &waiter, "owner-change waiter");
+    ho = spawn(&to, bound_locker, &owner, "owner-change replacement");
+    /* Each step names itself on failure: the case is rare to fail, and the
+     * one message it had covered every step. */
+    if (!hw || !ho)
+        why = "a worker did not start";
+    else if (inject_run("stall-lock-propagated", pid, "10000") ||
+             stall_watch_start(&watch, "propagated"))
+        why = "the propagated stall did not arm";
+    if (why)
+        goto failed;
+    set_flag(&waiter.go);
+    if (!stall_watch_entered(&watch)) {
+        why = "the waiter did not reach the propagated stall";
+        goto failed;
+    }
+    pthread_mutex_unlock(&mhl_mutex);
+    held = false;
+    set_flag(&owner.go);
+    if (!wait_flag(&owner.acquired)) {
+        /* Its hart held by a grace-period wait on the stalled one. */
+        spoiled = rcu_stall_waits(false) > 0;
+        if (spoiled && !last)
+            goto out;
+        why = spoiled ? "replacement did not acquire during the stall (a "
+                        "grace-period wait held its hart, every try)"
+                      : "replacement did not acquire during the stall";
+        goto failed;
+    }
+    if ((got = prio_of(to, NULL)) != MHL_PRIO_W) {
+        snprintf(detail, sizeof detail,
+                 "replacement ran at %d before the waiter resumed, not %d", got,
+                 MHL_PRIO_W);
+        why = detail;
+        goto failed;
+    }
+    stall_watch_release(&watch);
+    check(wait_prio(to, MHL_PRIO_B) == MHL_PRIO_B,
+          "waiter lends to the owner that replaced its original owner",
+          "new owner did not inherit when the waiter resumed");
+    goto out;
+failed:
+    test_fail("changed owner setup", why);
+out:
+    stall_watch_release(&watch);
+    set_flag(&waiter.go);
+    set_flag(&owner.go);
+    set_flag(&waiter.done);
+    set_flag(&owner.done);
+    if (held)
+        pthread_mutex_unlock(&mhl_mutex);
+    if (hw)
+        (void) pthread_join(tw, NULL);
+    if (ho)
+        (void) pthread_join(to, NULL);
+    stall_watch_finish(&watch);
+    return spoiled && !last; /* try again */
+}
+
 int mutex_handoff_loan(void)
 {
+    struct stall_watch watch = {.pid = -1};
     struct sched_param saved;
     pthread_t h, w, b;
     char pid[16], ms[16], detail[96];
@@ -1070,14 +1451,16 @@ int mutex_handoff_loan(void)
         goto out;
     }
     sleep_ms(200); /* W has left its own walk and queued: it must not eat the stall */
-    if (inject_run("stall-lock-propagated", pid, ms) != 0) {
+    if (inject_run("stall-lock-propagated", pid, ms) != 0 ||
+        stall_watch_start(&watch, "propagated") != 0) {
         test_fail("mutex_handoff_loan fixture", "inject refused");
         goto out;
     }
     have_b = spawn(&b, mhl_late, NULL, "mutex_handoff_loan late waiter");
 
     /* B's walk has reached H: it is in, or just about to enter, its stall. */
-    if (!have_b || wait_prio(h, MHL_PRIO_B) != MHL_PRIO_B) {
+    if (!have_b || !stall_watch_entered(&watch) ||
+        wait_prio(h, MHL_PRIO_B) != MHL_PRIO_B) {
         test_fail("mutex_handoff_loan fixture", "late waiter did not lend");
         goto out;
     }
@@ -1096,9 +1479,16 @@ int mutex_handoff_loan(void)
                   "the stall ran out before the handoff");
         goto out;
     }
-    check(inject_run("alloc-status", "consumed", NULL) == 0,
-          "the injected stall held the late waiter in its window",
-          "the stall was not taken");
+    struct sched_param raised = {.sched_priority = MHL_PRIO_B + 1};
+    check(__sched_set(0, b, SCHED_FIFO, &raised) == 0 &&
+              wait_prio(w, MHL_PRIO_B + 1) == MHL_PRIO_B + 1,
+          "bound waiter's changed priority reaches the new mutex owner",
+          "owner retained the previous turnstile maximum");
+    raised.sched_priority = MHL_PRIO_B;
+    check(__sched_set(0, b, SCHED_FIFO, &raised) == 0 &&
+              wait_prio(w, MHL_PRIO_B) == MHL_PRIO_B,
+          "bound waiter withdrawing a priority level updates its owner",
+          "owner retained the higher turnstile maximum");
     cur = wait_prio_n(w, MHL_PRIO_B, (int) MHL_STALL_MS + POLL_MS);
     snprintf(detail, sizeof detail, "owner runs at %d, want %d", cur,
              MHL_PRIO_B);
@@ -1106,6 +1496,7 @@ int mutex_handoff_loan(void)
           "PI waiter not yet queued still lends to the next owner", detail);
 
 out:
+    stall_watch_finish(&watch);
     set_flag(&mhl_h_release);
     set_flag(&mhl_w_release);
     if (have_h)
@@ -1114,6 +1505,13 @@ out:
         (void) pthread_join(w, NULL);
     if (have_b)
         (void) pthread_join(b, NULL);
+    mutex_stall_rcu_waits();
+    /* Each tried up to three times when a grace-period wait spoiled it. */
+    for (int i = 0; i < 3 && mutex_bound_acquire(i == 2); i++)
+        ;
+    for (int i = 0; i < 3 && mutex_changed_owner(i == 2); i++)
+        ;
+    pthread_mutex_destroy(&mhl_mutex);
     (void) test_pin_mask(~0U);
     (void) __sched_set(0, 0, policy, &saved);
     return 0;
@@ -1127,6 +1525,141 @@ int sched_set_error_after_lowering(void)
 int sched_set_error_while_migrating(void)
 {
     return sched_set_error_run(true);
+}
+
+/* pthread_create blocks its caller until the new thread first runs, so the new
+ * thread runs at the caller's priority until then, not at the priority it
+ * inherits. A thread of base 1 running at CS_LOAN on a notification creates a
+ * thread while a CS_SPIN spinner shares its one hart: started at the inherited
+ * 1, the new thread waited out the spinner, and so did pthread_create, as
+ * roottask's mapped-file cleaner once waited out a spawn storm for its spare
+ * worker.
+ */
+#define CS_BASE 1
+#define CS_SPIN 20
+#define CS_LOAN 30
+#define CS_SPIN_MS 1500 /* how long the spinner holds the hart at most */
+
+struct create_start {
+    int chid;
+    int rc;
+    long create_ms;
+    int child_prio, child_base; /* what the new thread runs at once started */
+    atomic_int stop;
+};
+
+static long ms_between(const struct timespec *a, const struct timespec *b)
+{
+    return (b->tv_sec - a->tv_sec) * 1000L +
+           (b->tv_nsec - a->tv_nsec) / 1000000L;
+}
+
+static void *cs_spinner(void *raw)
+{
+    struct create_start *k = raw;
+    struct timespec a, b;
+
+    clock_gettime(CLOCK_MONOTONIC, &a);
+    do
+        clock_gettime(CLOCK_MONOTONIC, &b);
+    while (!atomic_load_explicit(&k->stop, memory_order_acquire) &&
+           ms_between(&a, &b) < CS_SPIN_MS);
+    return NULL;
+}
+
+/* The loan ends once the creator is running again, so the new thread is back
+ * at the base it inherits.
+ */
+static void *cs_child(void *raw)
+{
+    struct create_start *k = raw;
+
+    k->child_prio = self_prio(&k->child_base);
+    return NULL;
+}
+
+static void *cs_creator(void *raw)
+{
+    struct create_start *k = raw;
+    struct timespec a, b;
+    char buf[64];
+    pthread_t c;
+
+    k->rc = -1;
+    if (msg_receive(k->chid, buf, sizeof buf, NULL) != 0)
+        return NULL; /* not the notification */
+    clock_gettime(CLOCK_MONOTONIC, &a);
+    k->rc = pthread_create(&c, NULL, cs_child, k);
+    clock_gettime(CLOCK_MONOTONIC, &b);
+    k->create_ms = ms_between(&a, &b);
+    set_flag(&k->stop);
+    if (k->rc == EOK)
+        (void) pthread_join(c, NULL);
+    return NULL;
+}
+
+static void test_create_starts_at_creator_prio(void)
+{
+    struct create_start k = {
+        .chid = -1, .rc = -1, .create_ms = -1, .child_prio = -1};
+    pthread_t creator, spinner;
+    int coid = -1, created = 0, sent = -1;
+    char detail[96];
+
+    if (test_pin_mask(1U) == -1 || chan_open(&k.chid, &coid) == -1) {
+        test_fail("create_start fixture", strerror(errno));
+        goto out;
+    }
+    /* The observer runs above all three on the one hart: the creator reaches
+     * its receive while the observer naps, and the spinner starts only once
+     * the observer waits, after the notification has made the creator the
+     * higher of the two.
+     */
+    if (!condloan_create(&creator, CS_BASE, cs_creator, &k)) {
+        test_fail("create_start fixture", "creator");
+        goto out;
+    }
+    created = 1;
+    if (!wait_thread_state(creator, STATE_RECEIVE)) {
+        test_fail("create_start fixture", "creator did not reach its receive");
+        goto out;
+    }
+    if (!condloan_create(&spinner, CS_SPIN, cs_spinner, &k)) {
+        test_fail("create_start fixture", "spinner");
+        goto out;
+    }
+    created = 2;
+    sent = msg_send_notification(coid, CS_LOAN, 1, 0);
+out:
+    if (created && sent != 0) {
+        /* No notification: unblock the creator's receive and the spinner. */
+        set_flag(&k.stop);
+        chan_close(k.chid, coid);
+        k.chid = coid = -1;
+    }
+    if (created)
+        (void) pthread_join(creator, NULL);
+    if (created == 2)
+        (void) pthread_join(spinner, NULL);
+    if (created == 2) {
+        snprintf(detail, sizeof detail,
+                 "pthread_create took %ld ms beside a %d ms spinner (rc %d, "
+                 "sent %d)",
+                 k.create_ms, CS_SPIN_MS, k.rc, sent);
+        check(sent == 0 && k.rc == EOK && k.create_ms >= 0 &&
+                  k.create_ms < CS_SPIN_MS / 2,
+              "create_start: a new thread runs at its blocked creator's "
+              "priority until it starts",
+              detail);
+        snprintf(detail, sizeof detail, "new thread at %d, base %d, want %d",
+                 k.child_prio, k.child_base, CS_BASE);
+        check(k.rc == EOK && k.child_prio == CS_BASE &&
+                  k.child_base == CS_BASE,
+              "create_start: the new thread then runs at the base it inherits",
+              detail);
+    }
+    chan_close(k.chid, coid);
+    (void) test_pin_mask(~0U);
 }
 
 void test_prio_loan(void)
@@ -1147,5 +1680,7 @@ void test_prio_loan(void)
     test_loan_ends_at_msg_current_zero();
     test_loan_ends_for_blocked_server();
     test_loan_ends_at_failed_msg_current();
+    test_pending_loan_after_sender_timeout();
+    test_create_starts_at_creator_prio();
     (void) __sched_set(0, 0, policy, &saved);
 }

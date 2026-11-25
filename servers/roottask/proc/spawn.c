@@ -11,16 +11,10 @@
 #include <limits.h>
 #include <sys/rtmux-core.h>
 #include "spawn-fd-policy.h"
+#include <sys/spawn-action-wire.h>
+#include <sys/spawn-limits.h>
 
 extern int ProcessCapMint(pid_t pid, uint32_t rights, rtmux_cap_t *cap);
-
-static int spawn_add_size(size_t *sum, size_t add)
-{
-    if (add > SIZE_MAX - *sum)
-        return E2BIG;
-    *sum += add;
-    return EOK;
-}
 
 
 /* Mint the key that lets the loader's _IO_DUP for one parent fd pass
@@ -73,7 +67,9 @@ static int spawn_fd_permitted(struct loader_context *lcp,
     case SPAWN_OFFER_SCAN:
         return connect_server_info(lcp->ctx.ppid, (uint64_t) parent_fd, &si) ==
                    parent_fd &&
-               spawn_fd_scan_ok(si.flags);
+               (spawn_fd_scan_ok(si.flags) ||
+                (!(si.flags & RTMUX_FLG_COF_DEAD) &&
+                 loader_action_source(lcp, parent_fd)));
     default:
         return 0;
     }
@@ -191,6 +187,70 @@ static int get_fdinfo(int rcvid,
  */
 int proc_spawn(ioserv_context_t *ctp, void *vmsg)
 {
+    return proc_spawn_with_actions(ctp, vmsg, NULL, 0, NULL);
+}
+
+/* libc recognizes /proc/self/fd/N as an open through an existing fd. Such a
+ * pathname names an input just as explicitly as a dup action.
+ */
+static int action_source_fd(const struct spawn_action_record *r,
+                            const char *path)
+{
+    static const char prefix[] = "/proc/self/fd/";
+    if (r->type == posix_file_action_type_DUP ||
+        r->type == posix_file_action_type_FCHDIR)
+        return r->fd;
+    if (r->type != posix_file_action_type_OPEN ||
+        strncmp(path, prefix, sizeof prefix - 1))
+        return -1;
+    path += sizeof prefix - 1;
+    if (*path < '0' || *path > '9')
+        return -1;
+    unsigned fd = 0;
+    do {
+        fd = fd * 10 + (unsigned) (*path++ - '0');
+        if (fd >= UINT16_MAX)
+            return -1;
+    } while (*path >= '0' && *path <= '9');
+    return *path ? -1 : (int) fd;
+}
+
+/* Validate the entire byte stream before creating a child. The second pass
+ * fills the descriptor bitmap next to the immutable action records.
+ */
+static int action_sources(const unsigned char *actions,
+                          unsigned bytes,
+                          unsigned char *bits,
+                          unsigned *size)
+{
+    size_t left = bytes;
+    while (left) {
+        struct spawn_action_record r;
+        const char *path;
+        int err = spawn_action_next(&actions, &left, &r, &path);
+        if (err)
+            return err;
+        int fd = action_source_fd(&r, path);
+        if (fd >= 0) {
+            unsigned i = (unsigned) fd / 8;
+            if (*size <= i)
+                *size = i + 1;
+            if (bits)
+                bits[i] |= (unsigned char) (1U << ((unsigned) fd % 8));
+        }
+    }
+    return EOK;
+}
+
+/* share_class: NULL, or where loader_context_alloc says which class the spawner
+ * is over its share of, instead of waiting (see proc_pspawn).
+ */
+int proc_spawn_with_actions(ioserv_context_t *ctp,
+                            void *vmsg,
+                            const unsigned char *actions,
+                            unsigned bytes,
+                            int *share_class)
+{
     struct loader_context *lcp;
     struct _thread_attr attr;
     int status;
@@ -220,6 +280,8 @@ int proc_spawn(ioserv_context_t *ctp, void *vmsg)
             ENDIAN_SWAP32(&msg->spawn.i.parms.sigdefault.bits[1]);
             ENDIAN_SWAP32(&msg->spawn.i.parms.sigignore.bits[0]);
             ENDIAN_SWAP32(&msg->spawn.i.parms.sigignore.bits[1]);
+            ENDIAN_SWAP32(&msg->spawn.i.parms.sigpending.bits[0]);
+            ENDIAN_SWAP32(&msg->spawn.i.parms.sigpending.bits[1]);
             ENDIAN_SWAP32(&msg->spawn.i.parms.stack_max);
             ENDIAN_SWAP32(&msg->spawn.i.parms.policy);
             ENDIAN_SWAP32(&msg->spawn.i.parms.runmask);
@@ -249,6 +311,13 @@ int proc_spawn(ioserv_context_t *ctp, void *vmsg)
         if (ctp->info.msglen < sizeof(struct _proc_spawn))
             return EMSGSIZE;
 
+        /* ARG_MAX, before anything is sized from the request: this is the only
+         * bound on a native request's arguments, which the loader copies to the
+         * child's stack.
+         */
+        if (!spawn_args_fit(msg->spawn.i.nbytes, msg->spawn.i.nargv,
+                            msg->spawn.i.narge))
+            return E2BIG;
         off = sizeof(struct _proc_spawn);
         if (spawn_add_size(&off, msg->spawn.i.searchlen) != EOK ||
             spawn_add_size(&off, msg->spawn.i.cwdlen) != EOK ||
@@ -259,7 +328,7 @@ int proc_spawn(ioserv_context_t *ctp, void *vmsg)
             return E2BIG;
         if (off > ctp->info.srcmsglen)
             return EMSGSIZE;
-        if (off > (size_t) INT_MAX)
+        if (off > SPAWN_MSG_MAX)
             return E2BIG;
         msgsize = (unsigned) off;
 
@@ -274,15 +343,31 @@ int proc_spawn(ioserv_context_t *ctp, void *vmsg)
             }
         }
 
-        if (!(lcp = loader_context_alloc(
-                  msgsize,
-                  LC_SPAWN | (((ctp->info.flags & RTMUX_MI_ENDIAN_DIFF))
-                                  ? LC_CROSS_ENDIAN
-                                  : 0)))) {
-            roottask_heap_note_nomem("loader context", msgsize);
-            return ENOMEM;
-        }
+        unsigned bitmap = 0;
+        status = action_sources(actions, bytes, NULL, &bitmap);
+        if (status)
+            return status;
+        if (bytes > UINT_MAX - msgsize || bitmap > UINT_MAX - msgsize - bytes)
+            return E2BIG;
+        /* EAGAIN when no context can be had; the cause is logged there. */
+        status = loader_context_alloc(
+            ctp->info.pid, msgsize + bytes + bitmap,
+            LC_SPAWN |
+                ((ctp->info.flags & RTMUX_MI_ENDIAN_DIFF) ? LC_CROSS_ENDIAN
+                                                          : 0),
+            &lcp, share_class);
+        if (status != EOK)
+            return status;
 
+        if (bytes) {
+            unsigned char *copy = (unsigned char *) &lcp->msg + msgsize;
+            memcpy(copy, actions, bytes);
+            memset(copy + bytes, 0, bitmap);
+            (void) action_sources(copy, bytes, copy + bytes, &bitmap);
+            lcp->ctx.msgsize = msgsize;
+            lcp->ctx.action_bytes = bytes;
+            lcp->ctx.action_source_bytes = bitmap;
+        }
         lcp->ctx.flags = msg->spawn.i.parms.flags;
         ppid = lcp->ctx.ppid = ctp->info.pid;
         if (msgsize <= (unsigned) ctp->info.msglen) {
@@ -304,7 +389,8 @@ int proc_spawn(ioserv_context_t *ctp, void *vmsg)
 
         {
             pid_t new_pid = 0;
-            prp = lcp->ctx.process = process_create(ppid, lcp, &new_pid);
+            prp = lcp->ctx.process = process_create(
+                ppid, lcp, (lcp->ctx.flags & SPAWN_EXEC) != 0, &new_pid);
             if (prp == (void *) -1) {
                 int err = errno ? errno : EAGAIN;
 
@@ -318,25 +404,22 @@ int proc_spawn(ioserv_context_t *ctp, void *vmsg)
 
             /* Signal default/ignore inheritance removed — signals eliminated */
 
+            /* A parent that ended meanwhile has no namespace to inherit; the
+             * child's loader then finds none and fails.
+             */
             if ((prp = root_proc_lock(ppid))) {
                 root_process_t *parent_tmp = root_proc(ppid);
                 root_process_t *child_tmp = root_proc(new_pid);
-                child_tmp->root = path_node_clone(parent_tmp->root);
-                child_tmp->cwd = path_node_clone(parent_tmp->cwd);
+                if (parent_tmp->root) {
+                    child_tmp->root = path_node_clone(parent_tmp->root);
+                    child_tmp->cwd = path_node_clone(parent_tmp->cwd);
+                }
 
                 root_proc_unlock(ppid);
             }
         }
 
         loader_thread_attr(&attr, lcp, ctp);
-        if (msg->spawn.i.parms.flags & SPAWN_EXPLICIT_SCHED) {
-            memcpy(&attr.sched_param, &msg->spawn.i.parms.param,
-                   sizeof attr.sched_param);
-            if (msg->spawn.i.parms.policy != RTMUX_SCHED_NOCHANGE) {
-                attr.policy = msg->spawn.i.parms.policy;
-            }
-        }
-
         prp = lcp->ctx.process;
         root_trace("proc_spawn: SPAWN_START pid=%d loader=%p lcp=%p\n",
                    lcp->ctx.pid, loader_load, lcp);
@@ -347,6 +430,14 @@ int proc_spawn(ioserv_context_t *ctp, void *vmsg)
              * which faults from U-mode roottask. TODO: kext to set flag by pid;
              * for now rely on the destroy path.
              */
+            static atomic_uint nfail;
+            unsigned n = root_warn_due(&nfail);
+
+            if (n)
+                root_warn(
+                    "spawn: no loader thread for pid %d (failure %u): "
+                    "%s\n",
+                    (int) lcp->ctx.pid, n, strerror(-status));
             (void) msg_send_notification_r(ROOTTASK_COID,
                                            attr.sched_param.sched_priority,
                                            PROC_CODE_TERM, lcp->ctx.pid);
@@ -500,59 +591,23 @@ int proc_spawn(ioserv_context_t *ctp, void *vmsg)
 
     case _PROC_SPAWN_EXEC:
         root_trace("SPAWN_EXEC: pid=%d nd=%d\n", ctp->info.pid, ctp->info.nd);
-        if (ctp->info.nd != RTMUX_LOCAL_NODE) {
-            root_trace("SPAWN_EXEC: non-local nd=%d, breaking\n", ctp->info.nd);
+        if (ctp->info.nd != RTMUX_LOCAL_NODE)
             break;
-        }
         spawn_key_revoke(ctp->rcvid);
+
+        /* The loader context names the process that called exec; it exists only
+         * while this process is still loading.
+         */
         lcp = process_startup(ctp->info.pid, 0, 0);
-        root_trace("SPAWN_EXEC: process_startup(%d) returned %p\n",
-                   ctp->info.pid, lcp);
-        if (!lcp || (uintptr_t) lcp >= (uintptr_t) -256L) {
-            root_trace("SPAWN_EXEC: process_startup FAILED\n");
+        if (!lcp || (uintptr_t) lcp >= (uintptr_t) -256L ||
+            !(lcp->ctx.flags & SPAWN_EXEC)) {
+            root_trace("SPAWN_EXEC: not the loader of an exec\n");
             break;
         }
         lcp->ctx.fds_done = 1;
-        root_trace(
-            "SPAWN_EXEC: lcp=%p state=0x%x flags=0x%lx ppid=%d rcvid=%d\n", lcp,
-            lcp->ctx.state, lcp->ctx.flags, lcp->ctx.ppid, lcp->ctx.rcvid);
         lcp->ctx.state = LC_EXEC_SWAP;
-        if (lcp->ctx.flags & SPAWN_NOZOMBIE) {
-            root_trace("SPAWN_EXEC: NOZOMBIE path, ppid=%d\n", lcp->ctx.ppid);
-            proc_nozombie(lcp->ctx.ppid, EOK);
-        }
-        {
-            int rcvid = lcp->ctx.rcvid;
-            pid_t exec_pid = lcp->ctx.ppid;
+        return proc_exec_swap(ctp, lcp);
 
-            root_trace(
-                "SPAWN_EXEC: calling process_exec lcp=%p rcvid=%d "
-                "ctp->rcvid=%d "
-                "ppid=%d\n",
-                lcp, rcvid, ctp->rcvid, lcp->ctx.ppid);
-
-            /* Once the image is replaced the parent can no longer setpgid the
-             * process. Marked before the swap, so that no setpgid sees the new
-             * image unmarked, and undone if the swap fails. The slot outlives
-             * the swap, so the mark does too. The exec'ing process is the
-             * loader's parent (kext_process_exec swaps the image into
-             * child->parent), hence ppid. The mark is set under the group lock
-             * so that a setpgid already past its execed check finishes its move
-             * before the swap rather than after it.
-             */
-            proc_pgrp_lock();
-            root_proc(exec_pid)->execed = 1;
-            proc_pgrp_unlock();
-            if (process_exec(lcp, &lcp->ctx.rcvid, ctp->rcvid, lcp->ctx.ppid) ==
-                -1) {
-                root_proc(exec_pid)->execed = 0;
-                msg_error(ctp->rcvid, errno);
-                return IOSERV_NOREPLY;
-            }
-
-            msg_error(rcvid, EOK);
-        }
-        return IOSERV_NOREPLY;
 
     case _PROC_SPAWN_DONE: {
         uint64_t caps = 0;
@@ -583,6 +638,12 @@ int proc_spawn(ioserv_context_t *ctp, void *vmsg)
         if (!lcp || (uintptr_t) lcp >= (uintptr_t) -256L) {
             break;
         }
+
+        /* The start is committed and the loader has handed over: a SIGKILL kept
+         * meanwhile acts now. Not after a failed commit, when the thread is
+         * still the loader.
+         */
+        signal_loaded(ctp->info.pid);
         /* SignalProcmask removed - signals eliminated */
         if (lcp->ctx.flags & SPAWN_PROC_CAP) {
             rtmux_cap_t pcap = 0;

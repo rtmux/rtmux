@@ -147,14 +147,31 @@ static const struct toolbox_applet applets[] = {
     {"id", applet_id, "id [USER]"},
     {"inject", applet_inject,
      "inject spin-irqoff HART MS | spin-console HART MS | hang-hart HART | "
-     "fail-alloc POOL PID | fail-turnstile PID | alloc-status | "
+     "fail-alloc POOL PID | fail-turnstile PID | site-wait SITE | site-release "
+     "SITE | alloc-status | "
      "fail-sched-set PID COUNT | sched-set-status | "
      "sched-set-displaced MIN | stall-lock PID MS | "
      "stall-lock-early PID MS | stall-lock-propagated PID MS | "
-     "stall-force-ready PID MS | pte-superpage PID VA | "
+     "stall-force-ready PID MS | stall-cancel PID MS | "
+     "stall-sync-waker PID MS | sync-wake-claims | "
+     "intr-before-switch PID | intr-after-select PID | intr-select-seen [TID] "
+     "| "
+     "stall-block PID TID [MS] | stall-ready PID TID MS | stall-steal PID TID "
+     "MS | "
+     "stall-reprio PID TID MS | stall-timer-fire PID TID MS | "
+     "poke PID TID ready|stop | sched-stats | as-lock-stats | serve | "
+     "hold-exit-destroy PID MS | abandon-exec PID | "
+     "stall-switch PID TID MS | crash [shutdown] | stall-reply-claim PID MS | "
+     "preempt-reply-unblock PID | stall-unblock-race PID MS | "
+     "slow-kpage-zero PID US/COUNT | stall-thread-create PID MS | "
+     "xfer-trace PID | xfer-stats N | "
+     "stall-claim-held PID MS | stall-force-claimed PID MS | "
+     "stall-cap-peek PID TID | stall-send-pick PID TID | grant-ipc-cap PID | "
+     "pte-superpage PID VA | "
      "pte-clear-superpage PID VA | pte-probe PID VA | "
      "fail-pte-map PID PAGES | manip-partial MIN | "
-     "prio-settle-thread MIN | prio-settle-departure MAX | "
+     "prio-settle-thread MIN | prio-settle-idle MIN | prio-settle-departure "
+     "MAX | "
      "prio-settle-reset"},
     {"kill", applet_kill, "kill [-SIG] PID ..."},
     {"login", applet_login, "login [USER]"},
@@ -962,7 +979,6 @@ static int applet_login(int argc, char **argv)
     const char *hash = NULL;
     char *guess;
     int tries = 0;
-    int home_ok;
     const char *shell;
     char *shell_argv0;
     pid_t pid;
@@ -1010,8 +1026,7 @@ static int applet_login(int argc, char **argv)
         name[0] = '\0';
     }
 
-    home_ok = chdir(pw->pw_dir) == 0;
-    if (!home_ok)
+    if (chdir(pw->pw_dir) != 0)
         chdir("/");
 
     if (setgid(pw->pw_gid) < 0) {
@@ -1024,13 +1039,6 @@ static int applet_login(int argc, char **argv)
     }
 
     shell = pw->pw_shell[0] != '\0' ? pw->pw_shell : LOGIN_DEFAULT_SHELL;
-    setenv("HOME", pw->pw_dir, 1);
-    setenv("PWD", home_ok ? pw->pw_dir : "/", 1);
-    setenv("USER", pw->pw_name, 1);
-    setenv("LOGNAME", pw->pw_name, 1);
-    setenv("SHELL", shell, 1);
-    setenv("PATH", LOGIN_DEFAULT_PATH, 0);
-
     shell_argv0 = login_argv0(shell);
     if (!shell_argv0)
         return 1;
@@ -1041,7 +1049,29 @@ static int applet_login(int argc, char **argv)
         };
         int err;
 
-        err = posix_spawn(&pid, shell, NULL, NULL, spawn_argv, NULL);
+        const char *term = getenv("TERM");
+        const struct {
+            const char *name;
+            const char *value;
+        } vars[] = {{"HOME", pw->pw_dir},
+                    {"USER", pw->pw_name},
+                    {"LOGNAME", pw->pw_name},
+                    {"SHELL", shell},
+                    {"PATH", LOGIN_DEFAULT_PATH},
+                    {"TERM", term && *term ? term : "vt100"}};
+        char *envp[sizeof(vars) / sizeof(vars[0]) + 1] = {0};
+        size_t i;
+        for (i = 0; i < sizeof(vars) / sizeof(vars[0]); i++) {
+            size_t n = strlen(vars[i].name) + strlen(vars[i].value) + 2;
+            if (!(envp[i] = malloc(n)))
+                break;
+            snprintf(envp[i], n, "%s=%s", vars[i].name, vars[i].value);
+        }
+        err = i == sizeof(vars) / sizeof(vars[0])
+                  ? posix_spawn(&pid, shell, NULL, NULL, spawn_argv, envp)
+                  : ENOMEM;
+        while (i)
+            free(envp[--i]);
         if (err != EOK) {
             fprintf(stderr, "%s: %s\n", shell, strerror(err));
             free(shell_argv0);
@@ -3105,6 +3135,19 @@ static int inject_call(unsigned op, unsigned long a0, unsigned long a1)
     return args.ret;
 }
 
+/* The kernel refuses to stall the hart its caller runs on, and a spawned
+ * process may start on any hart: move off the target before asking.
+ */
+static unsigned long inject_off_hart(const char *arg)
+{
+    unsigned long hart = strtoul(arg, NULL, 0);
+
+    if (hart < 32)
+        (void) thread_ctl(RTMUX_TCTL_RUNMASK,
+                          (void *) (uintptr_t) ~(1u << (unsigned) hart));
+    return hart;
+}
+
 static int applet_inject(int argc, char **argv)
 {
     static const char *const pools[] = {
@@ -3115,13 +3158,13 @@ static int applet_inject(int argc, char **argv)
     int rc;
 
     if (argc == 4 && !strcmp(argv[1], "spin-irqoff")) {
-        rc = inject_call(INJECT_OP_SPIN_IRQOFF, strtoul(argv[2], NULL, 0),
+        rc = inject_call(INJECT_OP_SPIN_IRQOFF, inject_off_hart(argv[2]),
                          strtoul(argv[3], NULL, 0));
     } else if (argc == 4 && !strcmp(argv[1], "spin-console")) {
-        rc = inject_call(INJECT_OP_SPIN_CONSOLE, strtoul(argv[2], NULL, 0),
+        rc = inject_call(INJECT_OP_SPIN_CONSOLE, inject_off_hart(argv[2]),
                          strtoul(argv[3], NULL, 0));
     } else if (argc == 3 && !strcmp(argv[1], "hang-hart")) {
-        rc = inject_call(INJECT_OP_HANG_HART, strtoul(argv[2], NULL, 0), 0);
+        rc = inject_call(INJECT_OP_HANG_HART, inject_off_hart(argv[2]), 0);
     } else if (argc == 4 && !strcmp(argv[1], "fail-alloc")) {
         unsigned id;
 
@@ -3137,6 +3180,16 @@ static int applet_inject(int argc, char **argv)
     } else if (argc == 4 && !strcmp(argv[1], "fail-sched-set")) {
         rc = inject_call(INJECT_OP_FAIL_NEXT_SCHED_SET,
                          strtoul(argv[2], NULL, 0), strtoul(argv[3], NULL, 0));
+    } else if ((argc == 3 || argc == 4) &&
+               !strcmp(argv[1], "rcu-stall-waits")) {
+        /* inject rcu-stall-waits HART [reset]: exit with that hart's count (at
+         * most 254; 255 for an error), cleared after it with reset.
+         */
+        rc = inject_call(INJECT_OP_RCU_STALL_WAITS, strtoul(argv[2], NULL, 0),
+                         argc == 4 && !strcmp(argv[3], "reset"));
+        if (rc >= 0)
+            printf("rcu-stall-waits=%d\n", rc);
+        return rc < 0 ? 255 : (rc > 254 ? 254 : rc);
     } else if (argc == 2 && !strcmp(argv[1], "sched-set-status")) {
         rc = inject_call(INJECT_OP_SCHED_SET_STATUS, 0, 0);
         if (rc >= 0)
@@ -3149,6 +3202,59 @@ static int applet_inject(int argc, char **argv)
             printf("sched-set-displaced=%d\n", rc);
         return rc >= 0 && (unsigned long) rc >= strtoul(argv[2], NULL, 0) ? 0
                                                                           : 3;
+    } else if (argc == 3 && (!strcmp(argv[1], "site-wait") ||
+                             !strcmp(argv[1], "site-watch") ||
+                             !strcmp(argv[1], "site-release"))) {
+        static const char *const names[] = {
+            [STALL_LOCK] = "lock",
+            [STALL_LOCK_EARLY] = "early",
+            [STALL_LOCK_PROPAGATED] = "propagated",
+            [STALL_FORCE_READY] = "force-ready",
+            [STALL_SYNC_WAKER] = "sync-waker",
+            [STALL_BLOCK] = "block",
+            [STALL_READY] = "ready",
+            [STALL_SWITCH] = "switch",
+            [STALL_REPLY_CLAIM] = "reply-claim",
+            [STALL_REPLY_UNBLOCK] = "reply-unblock",
+            [STALL_CLAIM_HELD] = "claim-held",
+            [STALL_FORCE_CLAIMED] = "force-claimed",
+            [STALL_CAP_PEEK] = "cap-peek",
+            [STALL_SEND_PICK] = "send-pick",
+            [STALL_STEAL] = "steal",
+            [STALL_CANCEL] = "cancel",
+            [STALL_REPRIO] = "reprio",
+            [STALL_UNBLOCK_FORCE] = "unblock-force",
+            [STALL_UNBLOCK_REPLY] = "unblock-reply",
+            [STALL_KPAGE_ZERO] = "kpage-zero",
+            [STALL_THREAD_CREATE] = "thread-create",
+            [STALL_TIMER_FIRE] = "timer-fire",
+            [INJECT_SITE_TURNSTILE] = "turnstile",
+            [INJECT_SITE_REPLY_DETACHED] = "reply-detached",
+        };
+        unsigned site = 0;
+        while (site < sizeof(names) / sizeof(names[0]) &&
+               strcmp(argv[2], names[site]))
+            site++;
+        if (site == sizeof(names) / sizeof(names[0]))
+            return 2;
+        if (!strcmp(argv[1], "site-release"))
+            return inject_call(INJECT_OP_SITE_RELEASE, site, 0) != 0;
+        bool watch = !strcmp(argv[1], "site-watch");
+        if (watch && write(STDOUT_FILENO, "R", 1) != 1)
+            return 1;
+        for (unsigned i = 0; i < INJECT_SPIN_MAX_MS; i++) {
+            rc = inject_call(INJECT_OP_SITE_STATUS, site, 0);
+            if (rc)
+                break;
+            (void) nanosleep(&(struct timespec) {.tv_nsec = 1000000}, NULL);
+        }
+        if (watch) {
+            char done;
+            if (write(STDOUT_FILENO, rc == 1 ? "Y" : "N", 1) == 1)
+                (void) read(STDIN_FILENO, &done, 1);
+            (void) inject_call(INJECT_OP_SITE_RELEASE, site, 0);
+        }
+        return rc == 1 ? 0 : 3;
     } else if (argc == 3 && !strcmp(argv[1], "fail-turnstile")) {
         rc = inject_call(INJECT_OP_FAIL_NEXT_TURNSTILE,
                          strtoul(argv[2], NULL, 0), 0);
@@ -3161,16 +3267,149 @@ static int applet_inject(int argc, char **argv)
     } else if (argc == 4 && !strcmp(argv[1], "stall-lock-propagated")) {
         rc = inject_call(INJECT_OP_STALL_MUTEX_PROPAGATED,
                          strtoul(argv[2], NULL, 0), strtoul(argv[3], NULL, 0));
-    } else if (argc == 4 && !strcmp(argv[1], "stall-force-ready")) {
-        rc = inject_call(INJECT_OP_STALL_FORCE_READY, strtoul(argv[2], NULL, 0),
+    } else if (argc == 3 && !strcmp(argv[1], "intr-before-switch")) {
+        rc = inject_call(INJECT_OP_INTR_BEFORE_SWITCH,
+                         strtoul(argv[2], NULL, 0), 0);
+    } else if ((argc == 2 || argc == 3) &&
+               !strcmp(argv[1], "intr-select-seen")) {
+        rc = inject_call(INJECT_OP_INTR_SELECT_SEEN, 0, 0);
+        printf("intr-select-seen=%d tid=%d\n", rc & 0xff, rc >> 8);
+        if (rc < 0)
+            return 3;
+
+        /* 10 not taken, 11 no thread, 12 a thread, 13 the thread named. */
+        if (argc == 3 && (rc & 0xff) == 2 && rc >> 8 == atoi(argv[2]))
+            return 13;
+        return (rc & 0xff) + 10;
+    } else if (argc == 3 && !strcmp(argv[1], "intr-after-select")) {
+        rc = inject_call(INJECT_OP_INTR_AFTER_SELECT, strtoul(argv[2], NULL, 0),
+                         0);
+    } else if (argc == 2 && !strcmp(argv[1], "sync-wake-claims")) {
+        rc = inject_call(INJECT_OP_SYNC_WAKE_CLAIMS, 0, 0);
+        printf("sync-wake-claims=%d\n", rc);
+        return rc == 1 ? 0 : 3;
+    } else if (argc == 4 && !strcmp(argv[1], "stall-sync-waker")) {
+        rc = inject_call(INJECT_OP_STALL_SYNC_WAKER, strtoul(argv[2], NULL, 0),
                          strtoul(argv[3], NULL, 0));
-    } else if (argc == 3 && !strcmp(argv[1], "prio-settle-thread")) {
+    } else if (argc == 2 && !strcmp(argv[1], "crash")) {
+        rc = inject_call(INJECT_OP_CRASH, 0, 0);
+    } else if (argc == 4 && !strcmp(argv[1], "stall-cap-peek")) {
+        rc = inject_call(INJECT_OP_STALL_CAP_PEEK, strtoul(argv[2], NULL, 0),
+                         strtoul(argv[3], NULL, 0) << 32 | INJECT_SPIN_MAX_MS);
+    } else if (argc == 4 && !strcmp(argv[1], "stall-send-pick")) {
+        rc = inject_call(INJECT_OP_STALL_SEND_PICK, strtoul(argv[2], NULL, 0),
+                         strtoul(argv[3], NULL, 0) << 32 | INJECT_SPIN_MAX_MS);
+    } else if (argc == 3 && !strcmp(argv[1], "crash") &&
+               !strcmp(argv[2], "shutdown")) {
+        rc = inject_call(INJECT_OP_CRASH, INJECT_CRASH_SHUTDOWN, 0);
+    } else if (argc == 5 && (!strcmp(argv[1], "stall-steal") ||
+                             !strcmp(argv[1], "stall-reprio"))) {
+        rc = inject_call(
+            !strcmp(argv[1], "stall-steal") ? INJECT_OP_STALL_STEAL
+                                            : INJECT_OP_STALL_REPRIO,
+            strtoul(argv[2], NULL, 0),
+            strtoul(argv[3], NULL, 0) << 32 | strtoul(argv[4], NULL, 0));
+    } else if ((argc == 4 || argc == 5) && !strcmp(argv[1], "stall-block")) {
+        rc = inject_call(
+            INJECT_OP_STALL_BLOCK, strtoul(argv[2], NULL, 0),
+            strtoul(argv[3], NULL, 0) << 32 |
+                (argc == 5 ? strtoul(argv[4], NULL, 0) : INJECT_SPIN_MAX_MS));
+    } else if (argc == 5 && (!strcmp(argv[1], "stall-ready") ||
+                             !strcmp(argv[1], "stall-switch") ||
+                             !strcmp(argv[1], "stall-timer-fire"))) {
+        rc = inject_call(
+            !strcmp(argv[1], "stall-ready")    ? INJECT_OP_STALL_READY
+            : !strcmp(argv[1], "stall-switch") ? INJECT_OP_STALL_SWITCH
+                                               : INJECT_OP_STALL_TIMER_FIRE,
+            strtoul(argv[2], NULL, 0),
+            strtoul(argv[3], NULL, 0) << 32 | strtoul(argv[4], NULL, 0));
+    } else if (argc == 4 && (!strcmp(argv[1], "stall-claim-held") ||
+                             !strcmp(argv[1], "stall-force-claimed"))) {
+        rc = inject_call(argv[1][6] == 'c' ? INJECT_OP_STALL_CLAIM_HELD
+                                           : INJECT_OP_STALL_FORCE_CLAIMED,
+                         strtoul(argv[2], NULL, 0), strtoul(argv[3], NULL, 0));
+    } else if (argc == 3 && !strcmp(argv[1], "abandon-exec")) {
+        rc = inject_call(INJECT_OP_ABANDON_EXEC, strtoul(argv[2], NULL, 0), 0);
+    } else if (argc == 4 && !strcmp(argv[1], "hold-exit-destroy")) {
+        rc = inject_call(INJECT_OP_HOLD_EXIT_DESTROY, strtoul(argv[2], NULL, 0),
+                         strtoul(argv[3], NULL, 0));
+    } else if (argc == 5 && !strcmp(argv[1], "poke")) {
+        rc = inject_call(INJECT_OP_POKE, strtoul(argv[2], NULL, 0),
+                         strtoul(argv[3], NULL, 0) << 8 |
+                             (strcmp(argv[4], "stop") ? INJECT_POKE_READY
+                                                      : INJECT_POKE_STOP));
+    } else if (argc == 2 && !strcmp(argv[1], "sched-stats")) {
+        rc = inject_call(INJECT_OP_SCHED_STATS, 0, 0);
+        if (rc >= 0)
+            printf("empty-steal-locks=%d\n", rc);
+        return rc >= 0 ? 0 : 1;
+    } else if (argc == 2 && !strcmp(argv[1], "as-lock-stats")) {
+        rc = inject_call(INJECT_OP_SCHED_STATS, 1, 0);
+        if (rc >= 0)
+            printf("as-slock-takes=%d\n", rc);
+        return rc >= 0 ? 0 : 1;
+    } else if (argc == 2 && !strcmp(argv[1], "serve")) {
+        /* One inject command per stdin line, answered with "0" or the exit
+         * status, for tests that need injection while a hart is held and no new
+         * process can be spawned.
+         */
+        char line[256];
+
+        while (fgets(line, sizeof line, stdin)) {
+            char *av[8] = {"inject"};
+            int ac = 1;
+
+            for (char *t = strtok(line, " \n"); t && ac < 7;
+                 t = strtok(NULL, " \n"))
+                av[ac++] = t;
+            av[ac] = NULL;
+            printf("%d\n", ac > 1 ? applet_inject(ac, av) : 2);
+            fflush(stdout);
+        }
+        return 0;
+    } else if (argc == 3 && !strcmp(argv[1], "xfer-trace")) {
+        rc = inject_call(INJECT_OP_XFER_TRACE, strtoul(argv[2], NULL, 0), 0);
+    } else if (argc == 3 && !strcmp(argv[1], "xfer-stats")) {
+        /* Exit status: the counter, capped at 200 (it is a small number). */
+        rc = inject_call(INJECT_OP_XFER_STATS, strtoul(argv[2], NULL, 0), 0);
+        if (rc >= 0)
+            printf("xfer-stats[%s]=%d\n", argv[2], rc);
+        return rc < 0 ? 255 : (rc > 200 ? 200 : rc);
+    } else if (argc == 4 && !strcmp(argv[1], "stall-reply-claim")) {
+        rc = inject_call(INJECT_OP_STALL_REPLY_CLAIM, strtoul(argv[2], NULL, 0),
+                         strtoul(argv[3], NULL, 0));
+    } else if (argc == 4 && !strcmp(argv[1], "slow-kpage-zero")) {
+        /* US/COUNT: the delay per page and how many pages it applies to. */
+        char *end;
+        unsigned long us = strtoul(argv[3], &end, 0);
+        unsigned long count = *end == '/' ? strtoul(end + 1, NULL, 0) : 0;
+
+        rc = inject_call(INJECT_OP_SLOW_KPAGE_ZERO, strtoul(argv[2], NULL, 0),
+                         us << 32 | count);
+    } else if (argc == 4 && !strcmp(argv[1], "stall-thread-create")) {
+        rc = inject_call(INJECT_OP_STALL_THREAD_CREATE,
+                         strtoul(argv[2], NULL, 0), strtoul(argv[3], NULL, 0));
+    } else if (argc == 4 && !strcmp(argv[1], "stall-unblock-race")) {
+        rc = inject_call(INJECT_OP_STALL_UNBLOCK_RACE,
+                         strtoul(argv[2], NULL, 0), strtoul(argv[3], NULL, 0));
+    } else if (argc == 3 && !strcmp(argv[1], "preempt-reply-unblock")) {
+        rc = inject_call(INJECT_OP_PREEMPT_REPLY_UNBLOCK,
+                         strtoul(argv[2], NULL, 0), 0);
+    } else if (argc == 4 && (!strcmp(argv[1], "stall-force-ready") ||
+                             !strcmp(argv[1], "stall-cancel"))) {
+        rc = inject_call(!strcmp(argv[1], "stall-cancel")
+                             ? INJECT_OP_STALL_CANCEL
+                             : INJECT_OP_STALL_FORCE_READY,
+                         strtoul(argv[2], NULL, 0), strtoul(argv[3], NULL, 0));
+    } else if (argc == 3 && (!strcmp(argv[1], "prio-settle-thread") ||
+                             !strcmp(argv[1], "prio-settle-idle"))) {
         /* Exit 0 when at least MIN deferred priority settles ran in thread
          * context since the last reset.
          */
-        rc = inject_call(INJECT_OP_PRIO_SETTLE_STATS, 0, 0);
+        rc = inject_call(INJECT_OP_PRIO_SETTLE_STATS,
+                         !strcmp(argv[1], "prio-settle-idle") ? 3 : 0, 0);
         if (rc >= 0)
-            printf("prio-settle-thread=%d\n", rc);
+            printf("%s=%d\n", argv[1], rc);
         return rc >= 0 && (unsigned long) rc >= strtoul(argv[2], NULL, 0) ? 0
                                                                           : 3;
     } else if (argc == 3 && !strcmp(argv[1], "prio-settle-departure")) {
@@ -3190,6 +3429,8 @@ static int applet_inject(int argc, char **argv)
     } else if (argc == 4 && !strcmp(argv[1], "pte-clear-superpage")) {
         rc = inject_call(INJECT_OP_PTE_CLEAR_SUPERPAGE,
                          strtoul(argv[2], NULL, 0), strtoul(argv[3], NULL, 0));
+    } else if (argc == 3 && !strcmp(argv[1], "grant-ipc-cap")) {
+        rc = inject_call(INJECT_OP_GRANT_IPC_CAP, strtoul(argv[2], NULL, 0), 0);
     } else if (argc == 4 && !strcmp(argv[1], "pte-probe")) {
         /* Exit 0 when PID's page table has no leaf at VA, 3 when it has one. */
         rc = inject_call(INJECT_OP_PTE_PROBE, strtoul(argv[2], NULL, 0),
@@ -3216,18 +3457,30 @@ static int applet_inject(int argc, char **argv)
             return rc == 1 && !strcmp(argv[2], "consumed") ? 0 : 3;
         return rc < 0 ? 1 : 0;
     } else {
-        fprintf(stderr,
-                "usage: inject spin-irqoff HART MS | spin-console HART MS | "
-                "hang-hart HART | fail-alloc POOL PID | fail-turnstile PID | "
-                "alloc-status [consumed] | fail-sched-set PID COUNT | "
-                "sched-set-status | "
-                "sched-set-displaced MIN | stall-lock PID MS | "
-                "stall-force-ready PID MS | pte-superpage PID VA | "
-                "pte-clear-superpage PID VA | pte-probe PID VA | "
-                "fail-pte-map PID PAGES | manip-partial MIN | "
-                "stall-lock-early PID MS | stall-lock-propagated PID MS | "
-                "prio-settle-thread MIN | prio-settle-departure MAX | "
-                "prio-settle-reset\n");
+        fprintf(
+            stderr,
+            "usage: inject spin-irqoff HART MS | spin-console HART MS | "
+            "hang-hart HART | fail-alloc POOL PID | fail-turnstile PID | "
+            "alloc-status [consumed] | fail-sched-set PID COUNT | "
+            "sched-set-status | "
+            "sched-set-displaced MIN | stall-lock PID MS | "
+            "stall-force-ready PID MS | stall-cancel PID MS | stall-sync-waker "
+            "PID MS | sync-wake-claims | intr-before-switch PID | "
+            "intr-after-select PID | intr-select-seen [TID] | "
+            "stall-block PID TID [MS] | stall-ready PID TID MS | "
+            "stall-steal PID TID MS | stall-reprio PID TID MS | "
+            "stall-timer-fire PID TID MS | "
+            "poke PID TID ready|stop | "
+            "hold-exit-destroy PID MS | abandon-exec PID | "
+            "sched-stats | serve | "
+            "stall-switch PID TID MS | crash [shutdown] | pte-superpage PID VA "
+            "| "
+            "pte-clear-superpage PID VA | pte-probe PID VA | "
+            "fail-pte-map PID PAGES | manip-partial MIN | "
+            "stall-lock-early PID MS | stall-lock-propagated PID MS | "
+            "prio-settle-thread MIN | prio-settle-idle MIN | "
+            "prio-settle-departure MAX | "
+            "prio-settle-reset | grant-ipc-cap PID\n");
         return 2;
     }
     return rc == 0 ? 0 : 1;

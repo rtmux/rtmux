@@ -32,7 +32,13 @@ int proc_getsetid(ioserv_context_t *ctp, proc_getsetid_t *msg);
 void proc_dispatch_init(void);
 
 /* loader-context.c */
-struct loader_context *loader_context_alloc(unsigned msgsize, int state);
+int loader_context_alloc(pid_t owner,
+                         unsigned msgsize,
+                         int state,
+                         struct loader_context **lcpp,
+                         int *share_class);
+int loader_share_await(pid_t owner, int k, uint64_t *until);
+size_t loader_context_bytes(void);
 void loader_context_free(struct loader_context *lcp);
 void loader_thread_attr(struct _thread_attr *attr,
                         struct loader_context *lcp,
@@ -42,7 +48,15 @@ void loader_thread_attr(struct _thread_attr *attr,
 int proc_setpgid(ioserv_context_t *ctp, proc_setpgid_t *msg);
 
 /* spawn.c */
+int proc_spawn_with_actions(ioserv_context_t *ctp,
+                            void *msg,
+                            const unsigned char *actions,
+                            unsigned bytes,
+                            int *share_class);
 int proc_spawn(ioserv_context_t *ctp, void *vmsg);
+
+/* exec.c */
+int proc_exec_swap(ioserv_context_t *ctp, struct loader_context *lcp);
 
 /* posix-spawn.c */
 int proc_pspawn(ioserv_context_t *ctp, void *vmsg);
@@ -106,7 +120,6 @@ int proc_jobctl_query(pid_t server, pid_t pid, struct _proc_jobctl_reply *out);
 int proc_jobctl_signal_fg(pid_t server, pid_t sid, int signo);
 int proc_jobctl_signal_bg(pid_t server, pid_t pid, int signo);
 int proc_jobctl_setpgrp(pid_t server, pid_t pid, pid_t pgrp);
-int proc_jobctl_tty_busy(pid_t server, pid_t sid);
 
 /* Process groups are tracked by their members (group.c). proc_pgrp_session
  * finds a group's session while it has a member, a zombie included.

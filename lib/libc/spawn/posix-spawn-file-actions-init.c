@@ -158,6 +158,8 @@ int posix_spawn_file_actions_addopen(
         return EINVAL;
     path_len = strlen(path) + 1;
     size = offsetof(_posix_spawn_file_actions_open_t, path) + path_len;
+    if (size < sizeof *open_action)
+        size = sizeof *open_action;
     if (size > UINT32_MAX)
         return ENOMEM;
     open_action = malloc(size);

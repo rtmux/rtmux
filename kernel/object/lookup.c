@@ -169,12 +169,17 @@ connect_t *rdecl lookup_rcvid(kcall_args_t *kap, int rcvid, thread_t **thpp)
             kcall_err(act, EBADF);
             return NULL;
         }
+
+        /* A channel destroy clears cop->channel at any moment: read it once. A
+         * detached connection has no server process to look the thread up in,
+         * and is not the remote IPC service's own.
+         */
+        channel_t *chp = __atomic_load_n(&cop->channel, __ATOMIC_ACQUIRE);
+
         if (act->process == remote_ipc.prp &&
-            (cop->scoid != MCINDEX(rcvid) ||
-             cop->channel->process != remote_ipc.prp)) {
-            thp = cop->channel
-                      ? vector_lookup(&cop->channel->process->threads, tid)
-                      : NULL;
+            (cop->scoid != MCINDEX(rcvid) || !chp ||
+             chp->process != remote_ipc.prp)) {
+            thp = chp ? vector_lookup(&chp->process->threads, tid) : NULL;
         } else {
             thp = vector_lookup(&vthread_vector, tid);
             if (kap) {
@@ -195,7 +200,6 @@ connect_t *rdecl lookup_rcvid(kcall_args_t *kap, int rcvid, thread_t **thpp)
             switch (SIGEV_GET_TYPE(kap->msg_deliver_event.event)) {
             case SIGEV_SIGNAL_THREAD:
             case SIGEV_UNBLOCK:
-            case SIGEV_INTR:
                 break;
 
             default:
@@ -237,25 +241,6 @@ void rdecl lookup_rcvid_release(void)
             break;
     }
     if (old == 1) {
-        rcu_sched_read_unlock();
-        rcu_sched_read_unlock();
-    }
-}
-
-
-/* lookup_rcvid_release_all — close every rcvid lookup window this CPU has open,
- * for a call that leaves the kernel without returning through the trap handler
- * (xfer_preempt), whatever number of lookups it made: one release only closes
- * one level, and the sections stay open, holding off grace periods, until some
- * later call's release finds the count at zero.
- */
-void rdecl lookup_rcvid_release_all(void)
-{
-    /* The nesting count is the state: the outermost release is the one that
-     * closes the sections, and zeroing the count makes this that release.
-     */
-    if (__atomic_exchange_n(&rcvid_rcu_nesting[get_cpunum()], 0,
-                            __ATOMIC_RELEASE)) {
         rcu_sched_read_unlock();
         rcu_sched_read_unlock();
     }

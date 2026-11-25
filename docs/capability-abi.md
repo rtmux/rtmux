@@ -207,7 +207,7 @@ Equal uids, a root sender, or a guessed scoid grant nothing.
   service serves only a child's own loader about its parent, only while fd
   inheritance is open, one fd per call, and only an fd the parent's spawn
   request offered (an explicit list entry other than `SPAWN_FDCLOSED`, or in scan
-  mode a live non-close-on-exec fd at its own number). The thread key is
+  mode a live non-close-on-exec fd at its own number). An ordered child file action may also name a close-on-exec source for dup or fchdir. The loader keeps its original flag until the actions finish and closes remaining close-on-exec descriptors before starting the image. The thread key is
   scrambled at `_PROC_SPAWN_DONE`, `_PROC_SPAWN_EXEC`, and when the loader
   abandons loading. Untrusted code first runs after `process_startup(start)` in
   `_PROC_SPAWN_DONE` (spawn) or after the `process_exec` swap in

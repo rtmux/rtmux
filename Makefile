@@ -43,8 +43,8 @@ LKL_EXT4_IMG = $(IMAGE_DIR)/lkl-ext4.img
 .PHONY: check-memory-safety-inventory check-assumptions
 .PHONY: check-boot-manifest check-loader-negative verify
 .PHONY: check-evidence-claims check-fault-recovery check-platform-boundary-contracts
-.PHONY: check-fu740-smoke-scripts check-make-target-names check-ci-coverage check-lkl-scripts
-.PHONY: check-header-deps check-gap-anchors check-rt-extra check-irq-modes check-hart-watchdog check-smp-bringup
+.PHONY: check-fu740-smoke-scripts check-crash-signatures check-make-target-names check-ci-coverage check-lkl-scripts
+.PHONY: check-header-deps check-config-rebuild check-kcall-layouts check-gap-anchors check-rt-extra check-irq-modes check-hart-watchdog check-smp-bringup
 .PHONY: check-guest-misc check-trace-modes check-leak-gate check-version-skew check-spawn-storm
 .PHONY: footprint-report check-lkl check-lkl-containment check-lkl-iommu-preflight check-lkl-iommu-live check-lkl-qemu check-lkl-differential check-lkl-trace check-trace-export check-trace-overhead
 .PHONY: check-qemu-deps check-lkl-differential-deps check-map-phys-inventory check-rcu-sched driver-gate indent check-indent check-style-deps
@@ -309,9 +309,9 @@ check: check-posix-matrix check-posix-matrix-strict-ignore check-porting-contrac
 check: check-kernel-nofp check-formal-claims check-gate-cert
 check: check-posix-matrix-options check-pse51 check-posix-profile-header
 check: check-posix-profile-config check-posix-profile-surface check-lkl-profile
-check: check-syscall-abi check-libc-abi check-make-target-names check-trace-export check-rt-budgets check-irq-contract
+check: check-syscall-abi check-libc-abi check-config-rebuild check-kcall-layouts check-make-target-names check-trace-export check-rt-budgets check-irq-contract
 check: check-platform-boundary-contracts
-check: check-lock-rank check-prio-writes check-preempt-inventory check-loader-negative check-fu740-smoke-scripts
+check: check-serial-priority check-lock-rank check-driver-priorities check-prio-writes check-proc-flags check-preempt-inventory check-loader-negative check-fu740-smoke-scripts check-crash-signatures
 check: driver-gate $(LKL_CHECK_DEP) check-emu-headless check-rt check-qemu-deps
 check: $(AUTOCONF_H) $(VER_FILE) startup initramfs
 ifeq ($(CONFIG_LKL_SERVERS),y)
@@ -326,6 +326,7 @@ endif
 	$(Q)./scripts/qemu-regress.sh --mode pci-nvme-smoke --timeout $(QEMU_BOOT_TIMEOUT)
 	@echo "  CHECK    boot RTMux + toolbox applet suite"
 	$(Q)./scripts/qemu-regress.sh --mode toolbox --timeout $(QEMU_BOOT_TIMEOUT)
+	$(Q)$(MAKE) check-lock-debug
 .PHONY: check
 
 # Boot RTMux and run the /bin toolbox applet functional suite in isolation.
@@ -357,6 +358,10 @@ tty-smoke: check-qemu-deps $(AUTOCONF_H) $(VER_FILE) startup initramfs
 	$(Q)python3 scripts/vi-test.py
 	@echo "  CHECK    job control over serial (^C, ^Z, fg, TOSTOP)"
 	$(Q)python3 scripts/tty-jobctl-test.py
+.PHONY: check-serial-priority
+check-serial-priority: check-qemu-deps $(AUTOCONF_H) $(VER_FILE) startup initramfs
+	$(Q)$(PYTHON) scripts/vi-test.py --serial-priority
+
 .PHONY: tty-smoke
 
 check-cap-namespace: host-tests check-posix-matrix check-qemu-deps $(AUTOCONF_H) $(VER_FILE) startup initramfs
@@ -396,6 +401,10 @@ check-loader-negative: check-qemu-deps $(AUTOCONF_H) $(VER_FILE) startup initram
 	$(msg) CHECK "loader image policy negatives"
 	$(Q)scripts/qemu-regress.sh --mode loader-negative --timeout $(QEMU_BOOT_TIMEOUT)
 
+check-lock-debug: check-qemu-deps
+	$(Q)scripts/qemu-regress.sh --mode lock-debug --timeout $(QEMU_SMP_TIMEOUT)
+.PHONY: check-lock-debug
+
 check-smp-invariants: check-qemu-deps $(AUTOCONF_H) $(VER_FILE) startup initramfs
 	$(msg) CHECK "SMP invariant ledger"
 	$(Q)$(PYTHON) scripts/check-smp-invariants.py
@@ -432,6 +441,10 @@ check-fault-recovery: check-qemu-deps $(AUTOCONF_H) $(VER_FILE) startup initramf
 check-fu740-smoke-scripts:
 	$(msg) CHECK "FU740 smoke script parsers"
 	$(Q)scripts/fu740-smoke-test.sh
+
+check-crash-signatures:
+	$(msg) CHECK "run-ending log signatures"
+	$(Q)scripts/check-crash-signatures.sh
 
 check-formal-claims:
 	$(msg) CHECK "formal claim schema"
@@ -506,6 +519,17 @@ check-gap-anchors:
 check-header-deps: all
 	$(msg) CHECK "header changes rebuild dependents"
 	$(Q)OUT="$(OUT)" scripts/check-header-deps.sh
+
+check-config-rebuild: $(AUTOCONF_H) $(VER_FILE)
+	$(msg) CHECK "config changes rebuild dependents"
+	$(Q)scripts/check-config-rebuild.sh
+
+# The private kernel-call argument structs roottask and the kernel both define
+# must agree; compared in the debug info, so it needs a gdb with Python.
+check-kcall-layouts: all
+	$(msg) CHECK "kernel-call argument layouts"
+	$(Q)$(PYTHON) scripts/check-kcall-layouts.py --self-test
+	$(Q)$(PYTHON) scripts/check-kcall-layouts.py --kernel "$(KERNEL_BIN)" --roottask "$(OUT)/servers/roottask/roottask"
 
 check-make-target-names:
 	$(msg) CHECK "make target naming"
@@ -903,10 +927,11 @@ check-syscall-abi:
 	$(msg) CHECK syscall ABI shape
 	$(Q)$(PYTHON) scripts/check-syscall-abi.py
 
-check-libc-abi: libc
+check-libc-abi: libc ldso
 	$(msg) CHECK "libc.so export surface"
 	$(Q)$(PYTHON) scripts/check-libc-abi.py --self-test
 	$(Q)$(PYTHON) scripts/check-libc-abi.py --readelf "$(READELF)" --so "$(LIBC_SO)"
+	$(Q)$(PYTHON) scripts/check-public-prototypes.py --cc "$(CC)" --libc "$(LIBC_SO)" --ldso "$(LDSO_SO)"
 	$(Q)$(PYTHON) scripts/check-sysconf-names.py
 
 check-rt-budgets:
@@ -939,12 +964,21 @@ check-lock-rank:
 	$(Q)$(PYTHON) scripts/check-lock-rank.py
 .PHONY: check-lock-rank
 
+.PHONY: check-driver-priorities
+check-driver-priorities:
+	$(Q)$(PYTHON) scripts/check-driver-priorities.py
+
 # Base vs lent priority: only kernel/include/thread-prio.h writes a thread's
 # base (real_priority) or its loans. Static text check, no build needed.
 check-prio-writes:
 	$(msg) CHECK base and loan priority writes go through the accessors
 	$(Q)scripts/check-prio-writes.sh
 .PHONY: check-prio-writes
+
+check-proc-flags:
+	$(msg) CHECK process flag writes go through the atomic helpers
+	$(Q)scripts/check-proc-flags.sh
+.PHONY: check-proc-flags
 
 # Preemption-checkpoint inventory: every long or unbounded loop in the
 # scheduling-critical kernel subsystems must be classified in

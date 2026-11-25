@@ -11,6 +11,12 @@ bytes over an existing connection and must not redo path lookup.  Transport
 paths may block on the target I/O service, but they must not mutate mount
 tables or permissions policy.
 
+Directory reads return whole records. Each `d_reclen` covers the header,
+the NUL-terminated name and any padding or extras. Successive headers must
+be aligned for `struct dirent`. The name length excludes the terminator.
+Libc also accepts older procfs records that counted it. A malformed reply
+fails the read with EIO, and an oversized reply fails with EOVERFLOW.
+
 ## Namespace Policy
 
 Path lookup, mount, permissions, procfs control files, and process-handle files
@@ -132,3 +138,26 @@ or namespace patches.  The gate runs host capability tests, userland test
 builds, POSIX matrix drift checks, an interactive QEMU smoke boot, and the
 guest syscall suite.  Realtime probes remain under `make check-rt` until §7.6
 adds capability-specific latency budgets.
+
+
+### Device identity
+
+Roottask allocates a device number for each external I/O service registration
+and releases it with the namespace object. Drivers get the number and inode
+from `ioserv_devino` before dispatch starts. Serial and NVMe device nodes
+report that number in `st_rdev`. A romfs instance uses it for `st_dev` and
+keeps the inode number stored on disk. The boot archive, sysfs, capfs and the
+memory namespaces also have distinct device numbers. A pathname alias resolves
+to the same device and inode as its target. `ttyname_r` searches the character
+device nodes in `/dev` for the open terminal's device number.
+
+### Controlling terminal ownership
+
+Roottask reserves a terminal by server PID before duplicating its descriptor.
+The reservation outlives the last process slot until the terminal has processed
+the unbind. Binding traffic holds a short registry lock only while changing
+the reservation. A delayed terminal therefore occupies its own worker while
+other servers continue binding and releasing sessions. One concurrent caller
+in the same session may wait up to one second for a detach or rebind. Further
+callers receive `EBUSY`. Reusing a process slot transfers its previous session
+reference to the cleanup path, which drops it after unlocking the slot.

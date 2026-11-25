@@ -31,7 +31,8 @@ import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-NM = os.environ.get("NM", "riscv-none-elf-nm")
+NM = os.environ.get("NM",
+                    (os.environ.get("CROSS_COMPILE") or "riscv-none-elf-") + "nm")
 LIBC_OBJ_GLOB = "build/lib/libc/**/*.o"
 
 # The exact objects and archive each server link rule pulls in -- mirror the

@@ -13,6 +13,23 @@
 #include <sys/ioserv-private.h>
 #include "internal.h"
 
+/* Close binding as a close message from its client would, with no reply: msg
+ * (the request just handled) is rewritten into that close.
+ */
+void _ioserv_close_binding(ioserv_context_t *ctp,
+                           ioserv_msg_t *msg,
+                           struct binding *binding)
+{
+    int rcvid = ctp->rcvid;
+
+    ctp->rcvid = 0;
+    ctp->info.msglen = sizeof msg->close;
+    msg->close.i.type = _IO_CLOSE;
+    msg->close.i.combine_len = sizeof msg->close.i;
+    (void) _ioserv_io_handler(ctp, msg, binding);
+    ctp->rcvid = rcvid;
+}
+
 void _ioserv_close_handler(ioserv_context_t *ctp, struct binding *binding)
 {
     if (atomic_sub_value(&binding->count, 1) == 1) {

@@ -31,6 +31,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <sched.h>
+#include <sys/priority-bands.h>
 #include <termios.h>
 #include <sys/mman.h>
 #include <sys/rtmux-core.h>
@@ -161,6 +163,12 @@ static void *ist_thread(void *arg)
 {
     int iid;
     (void) arg;
+    struct sched_param sp = {.sched_priority = RTMUX_PRIO_DEVICE_IST};
+    if (__sched_set(0, 0, SCHED_RR, &sp) == -1) {
+        DBGPRINT_LITERAL("serial: cannot set interrupt thread priority\n");
+        return NULL;
+    }
+
 
     if (thread_ctl(RTMUX_TCTL_IO, 0) == -1) {
         DBGPRINT_LITERAL("dev-serial-sifive: thread_ctl IO failed\n");
@@ -177,7 +185,8 @@ static void *ist_thread(void *arg)
      * initialized before the interrupt source can fire.
      */
     if (uart_drain_rx())
-        msg_send_notification(notification_coid, 10, NOTIFICATION_CODE_RX, 0);
+        msg_send_notification(notification_coid, RTMUX_PRIO_DEVICE_IST,
+                              NOTIFICATION_CODE_RX, 0);
     __interrupt_unmask(uart_vector, iid);
 
     for (;;) {
@@ -186,7 +195,8 @@ static void *ist_thread(void *arg)
         /* Drain the RX FIFO */
         (void) uart_drain_rx();
 
-        msg_send_notification(notification_coid, 10, NOTIFICATION_CODE_RX, 0);
+        msg_send_notification(notification_coid, RTMUX_PRIO_DEVICE_IST,
+                              NOTIFICATION_CODE_RX, 0);
 
         __interrupt_unmask(uart_vector, iid);
     }
@@ -306,8 +316,9 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    if (ioserv_attach(dpp, NULL, "/dev/ser1", _FTYPE_ANY, 0, &ser_connect_funcs,
-                      &ser_io_funcs, NULL) == -1) {
+    int ser_id = ioserv_attach(dpp, NULL, "/dev/ser1", _FTYPE_ANY, 0,
+                               &ser_connect_funcs, &ser_io_funcs, NULL);
+    if (ser_id == -1 || ioserv_devino(ser_id, &ser_devno, &ser_inode) == -1) {
         DBGPRINT_LITERAL("dev-serial-sifive: ioserv_attach failed\n");
         return 1;
     }

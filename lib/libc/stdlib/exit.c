@@ -9,12 +9,11 @@
 #include <stdio.h>
 #include <sys/cdefs.h>
 
-extern void (*__cleanup)(void) __hidden;
+extern void _cleanup(void) __hidden;
 
 void exit(int status)
 {
-    if (__cleanup)
-        __cleanup();
+    _cleanup();
     _exit(status);
     __builtin_unreachable();
 }

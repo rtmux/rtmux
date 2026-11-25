@@ -108,11 +108,18 @@ struct idle_stack {
  * the priority bit when the level empties. Caller holds the dpp lock.
  *
  * Returns 1 if the thread was unlinked, 0 if it was no longer at the expected
- * queue position (lost a race).
+ * queue position (lost a race) or is still current on another hart.
  */
-static int idle_unlink_ready(kdispatch_t *dpp, thread_t *thp)
+static int idle_unlink_ready(kdispatch_t *dpp, thread_t *thp, unsigned cpu)
 {
-    LINK3_HDR *queue = &DISPATCH_LST(dpp, thp->priority);
+    LINK3_HDR *queue = &DISPATCH_LST(dpp, thp->qprio);
+
+    /* Leave a thread another hart still has current (thread_current_elsewhere):
+     * that hart has not switched away from it yet.
+     */
+    if (thread_current_elsewhere(thp, cpu))
+        return 0;
+    dispatch_owner_pick(thp, __builtin_return_address(0));
 
     if (!thp->link3_link.prev) {
         if (queue->head != &thp->link3_link)
@@ -120,9 +127,7 @@ static int idle_unlink_ready(kdispatch_t *dpp, thread_t *thp)
         thp->link3_link.prev = &queue->head;
     }
 
-    LINK3_REM(*queue, &thp->link3_link, thread_t);
-    if (!DISPATCH_THP(dpp, thp->priority))
-        DISPATCH_CLR(dpp, thp);
+    DISPATCH_UNLINK(dpp, thp);
     return 1;
 }
 
@@ -137,6 +142,14 @@ static int idle_unlink_ready(kdispatch_t *dpp, thread_t *thp)
  * concurrent ready_default/resched_default on other CPUs cannot re-enqueue or
  * migrate it after we've pulled it from the queue.
  *
+ * cpu_idle keeps SIE off outside its wfi window, so the locks are taken with
+ * the irqsave pair. A plain outermost unlock would turn SIE back on: an
+ * IPI_RESCHED for a thread readied onto this hart after the local scan was then
+ * taken and cleared here, the remote scans found nothing, and cpu_idle slept in
+ * wfi on the queued thread until the IDLE_MAX_SLEEP_NS backstop
+ * (nanosleep_1ns_storm lost about one wakeup in 30 that way). With SIE left off
+ * the IPI stays pending and wakes the wfi.
+ *
  * The lock window ends inside this function — the dispatch lock is a leaf
  * spinlock and cannot straddle a context switch. The per-CPU bookkeeping
  * (set_active_thread, actives_prp) stays in cpu_idle() after this returns;
@@ -146,6 +159,7 @@ thread_t *idle_pick_thread(unsigned cpu)
 {
     kdispatch_t *dpp;
     thread_t *thp;
+    unsigned long sie;
 
     /* Boot-once gates — set before APs come up, never cleared. */
     if (!smp_dispatch_enabled || !kernel_threads_prp)
@@ -160,7 +174,7 @@ thread_t *idle_pick_thread(unsigned cpu)
      *          order — so we don't risk overlap by construction).
      * Phase 3: orphan-scan fallback under LOCAL_DPP.
      */
-    SCHED_LOCK_LOCAL();
+    sie = kspinlock_lock_irqsave(&LOCAL_DPP->lock);
     dpp = pcpu_array[cpu].pc_dispatch;
     for (int pri = NUM_PRI - 1; pri >= 0; pri--) {
         if (!DISPATCH_ISSET(dpp, pri))
@@ -169,16 +183,16 @@ thread_t *idle_pick_thread(unsigned cpu)
              thp = link3_to_thread(thp->link3_link.next)) {
             if (thp->state == STATE_READY &&
                 (thp->runmask & (1u << cpu)) == 0) {
-                if (!idle_unlink_ready(dpp, thp))
+                if (!idle_unlink_ready(dpp, thp, cpu))
                     continue;
                 thp->state = STATE_RUNNING;
                 thp->runcpu = cpu;
-                SCHED_UNLOCK_LOCAL();
+                kspinlock_unlock_irqrestore(&LOCAL_DPP->lock, sie);
                 return thp;
             }
         }
     }
-    SCHED_UNLOCK_LOCAL();
+    kspinlock_unlock_irqrestore(&LOCAL_DPP->lock, sie);
 
     /* Phase 2: try to steal from remote harts (each lock taken independently,
      * no nested holds).
@@ -192,9 +206,10 @@ thread_t *idle_pick_thread(unsigned cpu)
         if (src_cpu == cpu)
             continue;
         dpp = pcpu_array[src_cpu].pc_dispatch;
-        if (!dpp)
-            continue;
-        SCHED_LOCK(dpp);
+        if (!dpp || !DISPATCH_ANY(dpp))
+            continue; /* empty: not worth its lock (DISPATCH_ANY) */
+        sie = kspinlock_lock_irqsave(&dpp->lock);
+        inject_note_empty_steal_lock(dpp);
         for (int pri = NUM_PRI - 1; pri >= 0; pri--) {
             if (!DISPATCH_ISSET(dpp, pri))
                 continue;
@@ -202,34 +217,35 @@ thread_t *idle_pick_thread(unsigned cpu)
                  thp = link3_to_thread(thp->link3_link.next)) {
                 if (thp->state == STATE_READY &&
                     (thp->runmask & (1u << cpu)) == 0) {
-                    if (!idle_unlink_ready(dpp, thp))
+                    if (!idle_unlink_ready(dpp, thp, cpu))
                         continue;
                     /* Migrate ownership to this CPU's instance. */
                     thp->dpp = pcpu_array[cpu].pc_dispatch;
                     thp->state = STATE_RUNNING;
                     thp->runcpu = cpu;
-                    SCHED_UNLOCK(dpp);
+                    kspinlock_unlock_irqrestore(&dpp->lock, sie);
                     return thp;
                 }
             }
         }
-        SCHED_UNLOCK(dpp);
+        kspinlock_unlock_irqrestore(&dpp->lock, sie);
     }
 
     /* Phase 3: orphan-scan fallback. */
-    SCHED_LOCK_LOCAL();
+    sie = kspinlock_lock_irqsave(&LOCAL_DPP->lock);
     for (int t = 0; t < kernel_threads_prp->threads.nentries; t++) {
         thp = vector_lookup(&kernel_threads_prp->threads, (unsigned) t);
         if (thp && thp->state == STATE_READY &&
-            (thp->runmask & (1u << cpu)) == 0) {
+            (thp->runmask & (1u << cpu)) == 0 &&
+            !thread_current_elsewhere(thp, cpu)) {
             thp->dpp = pcpu_array[cpu].pc_dispatch;
             thp->state = STATE_RUNNING;
             thp->runcpu = cpu;
-            SCHED_UNLOCK_LOCAL();
+            kspinlock_unlock_irqrestore(&LOCAL_DPP->lock, sie);
             return thp;
         }
     }
-    SCHED_UNLOCK_LOCAL();
+    kspinlock_unlock_irqrestore(&LOCAL_DPP->lock, sie);
     return NULL;
 }
 

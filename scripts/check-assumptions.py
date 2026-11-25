@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Check that fixed bounds are documented in docs/assumptions.md."""
+from __future__ import annotations
 
 import argparse
 import re
@@ -20,6 +21,7 @@ SCAN_PATHS = (
     "internal/include/sys/iomsg.h",
     "internal/include/sys/virtio-mmio-msg.h",
     "internal/include/sys/rtmux-core.h",
+    "internal/include/sys/spawn-limits.h",
 )
 
 NAME_RE = re.compile(

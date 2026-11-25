@@ -9,25 +9,12 @@
 #include <stdio.h>
 #include "local.h"
 
-/* Locking flush for the fflush(NULL) walk: each stream is flushed under its own
- * lock so the all-streams flush is thread-safe per stream.
- */
-static int lflush(FILE *fp)
-{
-    int r;
-
-    FLOCKFILE(fp);
-    r = __sflush(fp);
-    FUNLOCKFILE(fp);
-    return r;
-}
-
 int fflush(FILE *fp)
 {
     int retval;
 
     if (!fp)
-        return _fwalk(lflush);
+        return _fwalk(__sflush, FWALK_WAIT);
 
     FLOCKFILE(fp);
     if ((fp->_flags & (__SWR | __SRW)) == 0) {

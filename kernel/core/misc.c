@@ -91,27 +91,6 @@ int kcall_attach(unsigned callnum, ksys_call_t *func)
     return 0;
 }
 
-/* Can be set to one by the kernel debugger so we can continue on from a crash()
- * message
- */
-int kdebug_walkout;
-
-void rdecl(crash)(const char *file, int line)
-{
-    interrupt_disable();
-    kprintf("Crash[%d] at %s line %d.\n", get_cpunum(), file, line);
-    for (;;) {
-        interrupt_disable();
-        debug_kdbreak();
-        if (!privateptr->debug_call) {
-            system_reboot(1);
-        }
-        if (kdebug_walkout)
-            break;
-    }
-}
-
-
 /* Routines to free any unrequired memory when the physical allocator can't
  * satisfy an allocation
  */

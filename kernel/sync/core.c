@@ -532,26 +532,6 @@ void rdecl synchash_rem(paddr_t addr,
                         SYNC_PINDEX(SYNC_OWNER_BITS(prp->pid, 0))) {
                         event_state = EVENT_DELIVER;
 
-                        thp = pril_first(&syp->waiting);
-                        if (thp) {
-                            unsigned type = TYPE_MASK(thp->type);
-
-                            if ((type == TYPE_THREAD &&
-                                 thp->state == STATE_MUTEX) ||
-                                (type == TYPE_SYNCEVENT &&
-                                 ((struct syncevent_entry *) thp)->subtype ==
-                                     SYNCEVENT_SUBTYPE_PRIORITYCEILING)) {
-                                if (thp->args.mu.owner) {
-                                    /* mutex_holdlist_rem now takes sync_slock
-                                     * internally — drop our hold around it.
-                                     */
-                                    kspinlock_unlock(&sync_slock);
-                                    mutex_holdlist_rem(syp);
-                                    kspinlock_lock(&sync_slock);
-                                    thp->args.mu.owner = 0;
-                                }
-                            }
-                        }
                         sync->owner = RTMUX_SYNC_DEAD;
                     }
                     /* looking for any event attached to the mutex */
@@ -620,25 +600,8 @@ void rdecl synchash_rem(paddr_t addr,
                         }
                     }
                 } else {
-                    /* remove the sync from its holding list */
                     thp = pril_first(&syp->waiting);
                     if (thp) {
-                        unsigned type = TYPE_MASK(thp->type);
-
-                        if (((type == TYPE_THREAD &&
-                              thp->state == STATE_MUTEX) ||
-                             (type == TYPE_SYNCEVENT &&
-                              ((struct syncevent_entry *) thp)->subtype ==
-                                  SYNCEVENT_SUBTYPE_PRIORITYCEILING)) &&
-                            thp->args.mu.owner) {
-                            /* mutex_holdlist_rem now takes sync_slock
-                             * internally — drop our hold around it.
-                             */
-                            kspinlock_unlock(&sync_slock);
-                            mutex_holdlist_rem(syp);
-                            kspinlock_lock(&sync_slock);
-                            thp->args.mu.owner = 0;
-                        }
                         /* Force ready any threads blocked on the sync */
                         do {
                             if (TYPE_MASK(thp->type) == TYPE_THREAD) {
@@ -748,75 +711,4 @@ void memobj_destroyed(path_object_t *obp,
             break;
         data.addr += HASH_PAGESIZE;
     }
-}
-
-
-/* mutex_holdlist_add / mutex_holdlist_rem walk the ksync_t wait-list
- * (pril_first) and mutate the per-thread mutex_holdlist links. Two flavours:
- *
- *   *_locked  — caller already holds sync_slock; primitive does not take
- *               it.  Used by paths needing a larger sync_slock-protected
- *               critical section that also covers surrounding
- *               pril_first / pril_rem on syp->waiting (force_ready
- *               STATE_MUTEX, adjust_priority_default STATE_MUTEX).
- *
- *   public form — takes sync_slock internally, calls the locked form,
- *                 releases.  Used by every other caller.
- *
- * Public callers MUST NOT hold sync_slock on entry — notably, synchash_rem
- * drops it around these calls.
- */
-void mutex_holdlist_add_locked(thread_t *thp, ksync_t *syp)
-{
-    ksync_t **owner;
-    ksync_t *curr;
-    thread_t *new;
-
-    new = pril_first(&syp->waiting);
-    owner = &thp->mutex_holdlist;
-    for (;;) {
-        curr = *owner;
-        if (!curr)
-            break;
-        thp = pril_first(&curr->waiting);
-        if (thp->priority < new->priority)
-            break;
-        owner = &thp->args.mu.next;
-    }
-    new->args.mu.next = curr;
-    new->args.mu.prev = owner;
-    if (curr) {
-        thp->args.mu.prev = &new->args.mu.next;
-    }
-    *owner = syp;
-}
-
-void mutex_holdlist_add(thread_t *thp, ksync_t *syp)
-{
-    kspinlock_lock(&sync_slock);
-    mutex_holdlist_add_locked(thp, syp);
-    kspinlock_unlock(&sync_slock);
-}
-
-
-void mutex_holdlist_rem_locked(ksync_t *syp)
-{
-    thread_t *thp;
-    thread_t *next_thp;
-    ksync_t *next_syp;
-
-    thp = pril_first(&syp->waiting);
-    next_syp = thp->args.mu.next;
-    *thp->args.mu.prev = next_syp;
-    if (next_syp) {
-        next_thp = pril_first(&next_syp->waiting);
-        next_thp->args.mu.prev = thp->args.mu.prev;
-    }
-}
-
-void mutex_holdlist_rem(ksync_t *syp)
-{
-    kspinlock_lock(&sync_slock);
-    mutex_holdlist_rem_locked(syp);
-    kspinlock_unlock(&sync_slock);
 }

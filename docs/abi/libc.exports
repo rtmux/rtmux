@@ -115,6 +115,7 @@ connect_flags	FUNC	WEAK	DEFAULT	-
 connect_flags_r	FUNC	WEAK	DEFAULT	-
 connect_server_info	FUNC	WEAK	DEFAULT	-
 connect_server_info_r	FUNC	WEAK	DEFAULT	-
+cpuid	FUNC	GLOBAL	DEFAULT	-
 creat	FUNC	GLOBAL	DEFAULT	-
 crypt	FUNC	GLOBAL	DEFAULT	-
 ctime	FUNC	GLOBAL	DEFAULT	-
@@ -231,6 +232,9 @@ ioserv_context_free	FUNC	GLOBAL	DEFAULT	-
 ioserv_detach	FUNC	GLOBAL	DEFAULT	-
 ioserv_devino	FUNC	GLOBAL	DEFAULT	-
 ioserv_handler	FUNC	GLOBAL	DEFAULT	-
+ioserv_ldisc_feed	FUNC	GLOBAL	DEFAULT	-
+ioserv_ldisc_read	FUNC	GLOBAL	DEFAULT	-
+ioserv_ldisc_set	FUNC	GLOBAL	DEFAULT	-
 ioserv_msg_again	FUNC	GLOBAL	DEFAULT	-
 ioserv_msgread	FUNC	GLOBAL	DEFAULT	-
 ioserv_msgreadv	FUNC	GLOBAL	DEFAULT	-
@@ -514,6 +518,7 @@ readdir_r	FUNC	GLOBAL	DEFAULT	-
 readlink	FUNC	GLOBAL	DEFAULT	-
 readlinkat	FUNC	GLOBAL	DEFAULT	-
 realloc	FUNC	GLOBAL	DEFAULT	-
+rewind	FUNC	GLOBAL	DEFAULT	-
 rewinddir	FUNC	GLOBAL	DEFAULT	-
 roottask_console_set	FUNC	GLOBAL	DEFAULT	-
 rtmux_delegate_device	FUNC	GLOBAL	DEFAULT	-
@@ -552,6 +557,7 @@ setenv	FUNC	GLOBAL	DEFAULT	-
 seteuid	FUNC	GLOBAL	DEFAULT	-
 setgid	FUNC	GLOBAL	DEFAULT	-
 setgrent	FUNC	GLOBAL	DEFAULT	-
+setjmp	FUNC	GLOBAL	DEFAULT	-
 setpgid	FUNC	GLOBAL	DEFAULT	-
 setpwent	FUNC	GLOBAL	DEFAULT	-
 setregid	FUNC	GLOBAL	DEFAULT	-
@@ -571,6 +577,7 @@ sigismember	FUNC	GLOBAL	DEFAULT	-
 siglongjmp	FUNC	GLOBAL	DEFAULT	-
 signal	FUNC	GLOBAL	DEFAULT	-
 sigprocmask	FUNC	GLOBAL	DEFAULT	-
+sigsetjmp	FUNC	GLOBAL	DEFAULT	-
 sleep	FUNC	GLOBAL	DEFAULT	-
 snprintf	FUNC	GLOBAL	DEFAULT	-
 sprintf	FUNC	GLOBAL	DEFAULT	-
@@ -668,6 +675,7 @@ unsetenv	FUNC	GLOBAL	DEFAULT	-
 vfprintf	FUNC	GLOBAL	DEFAULT	-
 vprintf	FUNC	GLOBAL	DEFAULT	-
 vsnprintf	FUNC	GLOBAL	DEFAULT	-
+vsprintf	FUNC	GLOBAL	DEFAULT	-
 wait	FUNC	GLOBAL	DEFAULT	-
 waitid	FUNC	GLOBAL	DEFAULT	-
 waitpid	FUNC	GLOBAL	DEFAULT	-

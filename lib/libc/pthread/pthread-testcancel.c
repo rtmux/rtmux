@@ -11,7 +11,7 @@
 #undef pthread_testcancel
 void pthread_testcancel(void)
 {
-    unsigned flags = LIBC_TLS()->__flags;
+    unsigned flags = __atomic_load_n(&LIBC_TLS()->__flags, __ATOMIC_ACQUIRE);
 
     if ((flags & (PTHREAD_CSTATE_MASK | PTHREAD_CANCEL_PENDING)) ==
         (PTHREAD_CANCEL_ENABLE | PTHREAD_CANCEL_PENDING))

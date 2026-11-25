@@ -108,14 +108,7 @@ struct mm_as {
 extern unsigned cpu_as_vaddrinfo(process_t *, uintptr_t, paddr_t *, size_t *);
 
 
-#define PTE_OP_MAP 0x0001
-#define PTE_OP_PROT 0x0002
-#define PTE_OP_UNMAP 0x0004
-#define PTE_OP_PREALLOC 0x0008
-#define PTE_OP_BAD 0x0010
-#define PTE_OP_PREEMPT 0x0080
-#define PTE_OP_TEMP 0x0200
-#define PTE_OP_FORCEMERGE 0x0400
+#include "pte-op.h"
 
 struct mm_pte_manipulate {
     paddr_t paddr;
@@ -210,7 +203,7 @@ extern int pte_prot(address_t *,
                     unsigned,
                     path_object_t *);
 extern int pte_unmap(address_t *, uintptr_t, uintptr_t, path_object_t *);
-extern int pte_bad(address_t *, uintptr_t);
+extern int pte_bad(address_t *, uintptr_t, uintptr_t);
 extern int pte_prealloc(address_t *, uintptr_t, uintptr_t);
 extern int pte_temp_map(address_t *,
                         uintptr_t,

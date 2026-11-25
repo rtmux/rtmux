@@ -32,7 +32,6 @@
 #include <sys/stat.h>
 #include <sys/iomsg.h>
 #include <sys/mount.h>
-#include <sys/pool-canary.h>
 #include <sys/syspage.h>
 #include <devctl/common.h>
 #include "externs.h"
@@ -43,6 +42,7 @@
 #include "root-process.h"
 #include "pinode.h"
 #include "root-log.h"
+#include "sysfs-ocb.h"
 
 /* Buffer sizes derived from the actual constraints they bound. A hardcoded
  * literal here would silently truncate /sys/cmdline if a future Kconfig change
@@ -144,13 +144,17 @@ static size_t synth_kstats(char *buf, size_t cap)
     }
     if (len < cap) {
         struct roottask_heap_stats hs;
+        memsize_t largest_run, free_bytes = pa_free_sizes(&largest_run);
 
         roottask_heap_stats(&hs);
         n = snprintf(buf + len, cap - len,
-                     "pa.free_bytes=%llu\nroottask.heap_used=%zu\n"
-                     "roottask.heap_size=%zu\nroottask.heap_largest=%zu\n",
-                     (unsigned long long) pa_free_size(), hs.used, hs.arena,
-                     hs.largest);
+                     "vm.rollback_pages=%lu\npa.free_bytes=%llu\n"
+                     "pa.largest_free_run=%llu\nroottask.heap_used=%zu\n"
+                     "roottask.heap_size=%zu\nroottask.heap_largest=%zu\n"
+                     "roottask.loader_context_bytes=%zu\n",
+                     pte_rollback_pages(), (unsigned long long) free_bytes,
+                     (unsigned long long) largest_run, hs.used, hs.arena,
+                     hs.largest, loader_context_bytes());
         if (n > 0 && (size_t) n < cap - len)
             len += (size_t) n;
     }
@@ -161,6 +165,17 @@ static size_t synth_kstats(char *buf, size_t cap)
         ioserv_reply_counters_snapshot(&rc);
         n = snprintf(buf + len, cap - len, "ioserv.disconnects=%llu\n",
                      (unsigned long long) rc.disconnects);
+        if (n > 0 && (size_t) n < cap - len)
+            len += (size_t) n;
+    }
+    if (len < cap) {
+        unsigned live, mappings, peak;
+
+        cpiofs_ocb_stats(&live, &mappings, &peak);
+        n = snprintf(buf + len, cap - len,
+                     "cpiofs.ocbs=%u\ncpiofs.ocb_mappings=%u\n"
+                     "cpiofs.ocb_peak=%u\nmmapfd.zombies=%u\n",
+                     live, mappings, peak, vm_fd_zombie_count());
         if (n > 0 && (size_t) n < cap - len)
             len += (size_t) n;
     }
@@ -181,27 +196,6 @@ static size_t synth_ioserv_accounting(char *buf, size_t cap)
 {
     return namespace_accounting_snapshot(buf, cap);
 }
-
-/* Per-open state. mode + (data, size) is enough — readdir uses pos. Dynamic
- * entries (synthesized on each open) own a malloc'd buffer in dyn_buf which
- * sysfs_close_ocb frees; static entries leave it NULL.
- */
-struct sysfs_ocb {
-    POOL_CANARY_HEAD
-    uint32_t mode;
-    uint64_t start_seq; /* stream entries: ring window [start_seq, end_seq) */
-    uint64_t end_seq;
-    const char *data;
-    size_t size;
-    off_t pos;
-    int idx;
-    char *dyn_buf;
-    POOL_CANARY_TAIL
-};
-
-#define SYSFS_MAX_OCBS 16
-static struct sysfs_ocb ocb_pool[SYSFS_MAX_OCBS];
-static int ocb_inuse[SYSFS_MAX_OCBS];
 
 /* Static directory listing. Order matters — readdir walks it.
  *
@@ -243,31 +237,6 @@ static const struct sysfs_entry sysfs_entries[] = {
 };
 #define SYSFS_NENTRIES \
     ((int) (sizeof(sysfs_entries) / sizeof(sysfs_entries[0])))
-
-static struct sysfs_ocb *ocb_alloc(void)
-{
-    for (int i = 0; i < SYSFS_MAX_OCBS; i++) {
-        if (!ocb_inuse[i]) {
-            pool_canary_check(&ocb_pool[i], "sysfs_ocb", i);
-            ocb_inuse[i] = 1;
-            memset(&ocb_pool[i], 0, sizeof(ocb_pool[i]));
-            pool_canary_arm(&ocb_pool[i]);
-            return &ocb_pool[i];
-        }
-    }
-    return NULL;
-}
-
-static void ocb_free(struct sysfs_ocb *ocb)
-{
-    for (int i = 0; i < SYSFS_MAX_OCBS; i++) {
-        if (&ocb_pool[i] == ocb) {
-            pool_canary_check(ocb, "sysfs_ocb", i);
-            ocb_inuse[i] = 0;
-            return;
-        }
-    }
-}
 
 /* Resolve a path relative to /sys. On success returns the kind:
  *   0 — not found
@@ -318,7 +287,7 @@ static int sysfs_open(ioserv_context_t *ctp,
     if (kind == 0)
         return ENOENT;
 
-    if (!(ocb = ocb_alloc()))
+    if (!(ocb = sysfs_ocb_alloc()))
         return ENOMEM;
 
     if (kind == 1) {
@@ -328,7 +297,7 @@ static int sysfs_open(ioserv_context_t *ctp,
         const struct sysfs_entry *e = &sysfs_entries[idx];
 
         if (!(e->mode & 0004) && !proc_isaccess(0, &ctp->info)) {
-            ocb_free(ocb);
+            sysfs_ocb_free(ocb);
             return EACCES;
         }
         ocb->mode = S_IFREG | e->mode;
@@ -336,7 +305,7 @@ static int sysfs_open(ioserv_context_t *ctp,
         if (e->stream_read) {
             ocb->dyn_buf = malloc(e->dyn_bufsz);
             if (!ocb->dyn_buf) {
-                ocb_free(ocb);
+                sysfs_ocb_free(ocb);
                 return ENOMEM;
             }
             stream_resample(ocb);
@@ -344,7 +313,7 @@ static int sysfs_open(ioserv_context_t *ctp,
             /* Dynamic — snapshot into a per-open buffer. */
             ocb->dyn_buf = malloc(e->dyn_bufsz);
             if (!ocb->dyn_buf) {
-                ocb_free(ocb);
+                sysfs_ocb_free(ocb);
                 return ENOMEM;
             }
             ocb->size = e->synth(ocb->dyn_buf, e->dyn_bufsz);
@@ -359,7 +328,7 @@ static int sysfs_open(ioserv_context_t *ctp,
     if (ioserv_open_bind(ctp, ocb, 0) == -1) {
         if (ocb->dyn_buf)
             free(ocb->dyn_buf);
-        ocb_free(ocb);
+        sysfs_ocb_free(ocb);
         return errno;
     }
     return EOK;
@@ -409,7 +378,7 @@ static int sysfs_readdir(ioserv_context_t *ctp, io_read_t *msg, void *handle)
             break;
 
         struct dirent *de = (struct dirent *) ((char *) dp + used);
-        de->d_ino = (ino_t) (ocb->pos + 1);
+        de->d_ino = (ino_t) (ocb->pos + 2);
         de->d_reclen = (uint16_t) reclen;
         de->d_namelen = (uint16_t) nlen;
         memcpy(de->d_name, name, nlen + 1);
@@ -494,8 +463,8 @@ static int sysfs_stat(ioserv_context_t *ctp, io_stat_t *msg, void *handle)
     msg->o.st_mode = ocb->mode;
     msg->o.st_size = (off_t) ocb->size;
     msg->o.st_nlink = 1;
-    msg->o.st_dev = (ctp->info.srcnd << RTMUX_NODE_BITS) | path_devno;
-    msg->o.st_rdev = (ctp->info.srcnd << RTMUX_NODE_BITS) | sysfs_devno;
+    msg->o.st_dev = (ctp->info.srcnd << RTMUX_NODE_BITS) | sysfs_devno;
+    msg->o.st_ino = (ino_t) (ocb->idx + 2);
     return IOSERV_PTR(ctp, &msg->o, sizeof(msg->o));
 }
 
@@ -553,7 +522,7 @@ static int sysfs_close_ocb(ioserv_context_t *ctp, void *reserved, void *handle)
             free(ocb->dyn_buf);
             ocb->dyn_buf = NULL;
         }
-        ocb_free(ocb);
+        sysfs_ocb_free(ocb);
     }
     return EOK;
 }
@@ -597,7 +566,7 @@ int sysfs_init(void)
     const char *cmd;
     int n;
 
-    pool_canary_init(ocb_pool, SYSFS_MAX_OCBS);
+    sysfs_ocb_init();
 
     /* Pull cmdline out of syspage and tack on a trailing newline so "cat
      * /sys/cmdline" looks right at the shell. The kernel populates it in

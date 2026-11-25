@@ -7,13 +7,6 @@
 
 #include <core/globals.h>
 
-/* A killing force_ready rereads a sync waiter's state at most this many times
- * while the waker that unlinked it readies it (usually a window of a few
- * instructions, longer for a broadcast); past it force_ready returns 0 and
- * leaves the wakeup to the waker.
- */
-#define FORCE_READY_WAKER_SPINS 100000u
-
 /* Scheduler Rosetta Stone (comments/prose only; no symbol renames):
  *
  *   kdispatch_t              = per-CPU runqueue state
@@ -59,15 +52,15 @@ static void chk_dispatch(int chkstate)
 
     /* chk_dispatch is retired as a runtime check under per-CPU sched locks.
      * Most callers invoke it BEFORE taking the local lock, and even when our
-     * lock IS held, dpp->lock.spin.value == 1 may instead mean "held by ANOTHER
-     * CPU doing a cross-CPU enqueue/steal on our queue" — legitimate under
-     * per-CPU locks. Distinguishing "I hold it" from "someone else holds it"
-     * would need a per-CPU sched_held_by_me[] flag, which is not maintained.
-     * Since the check is debug-only (gated on kopt.loglevel >= 3 above), the
-     * lost validation is acceptable; re-enable via a held-by-me flag if a
-     * future bug needs it. Walking other harts' queues here would also observe
-     * the transient (bit-set, head-NULL) window between LINK3_REM and
-     * DISPATCH_CLR and fire the invariant incorrectly.
+     * lock IS held, the lock bit test may instead mean "held by ANOTHER CPU
+     * doing a cross-CPU enqueue/steal on our queue" — legitimate under per-CPU
+     * locks. Distinguishing "I hold it" from "someone else holds it" would need
+     * a per-CPU sched_held_by_me[] flag, which is not maintained. Since the
+     * check is debug-only (gated on kopt.loglevel >= 3 above), the lost
+     * validation is acceptable; re-enable via a held-by-me flag if a future bug
+     * needs it. Walking other harts' queues here would also observe the
+     * transient (bit-set, head-NULL) window between LINK3_REM and DISPATCH_CLR
+     * and fire the invariant incorrectly.
      */
     return;
     (void) dpp;
@@ -132,30 +125,15 @@ static void chk_dispatch(int chkstate)
 
 static void rdecl mark_running_default(thread_t *new);
 
-/* Bill this hart's active thread up to now (see sched_account_current).
- *
- * snap_time() is arch_timer_now_ns(), free-running at ns resolution, because
- * RISC-V arch-init always sets qtp->timer_scale = -9. A port with another
- * timer_scale would get tick-granular qtp->nsec here and billing would degrade
- * to tick resolution (still correct in total, never double counted).
- */
-static inline void sched_account_now(void)
-{
-    uint64_t now;
-
-    snap_time(&now, 0);
-    sched_account_current(now);
-}
-
 /* Bill the active thread before it is enqueued STATE_READY and the dispatch
  * lock dropped: once act is on a ready queue another (idle) hart may steal and
- * run it, after which this hart must not write its running_time. The following
- * mark_running() sees pc_account_billed and only restarts the stamp.
+ * run it, after which this hart must not write its running_time. The stretch is
+ * closed here, so the following mark_running() bills nobody and only starts the
+ * next thread's stretch.
  */
 static inline void sched_account_expose(void)
 {
-    sched_account_now();
-    get_pcpu()->pc_account_billed = 1;
+    sched_account_switch(NULL);
 }
 
 #if CONFIG_PROCESSORS_MAX > 1 /* PDB condition is true */
@@ -168,7 +146,14 @@ static inline void sched_account_expose(void)
 
 static int dispatch_unlink_ready(kdispatch_t *dpp, thread_t *thp)
 {
-    LINK3_HDR *queue = &DISPATCH_LST(dpp, thp->priority);
+    LINK3_HDR *queue = &DISPATCH_LST(dpp, thp->qprio);
+
+    /* Every picker takes a thread off its queue here, so this is where a thread
+     * another hart still has current is left alone.
+     */
+    if (thread_current_elsewhere(thp, get_cpunum()))
+        return 0;
+    dispatch_owner_pick(thp, __builtin_return_address(0));
 
     if (!thp->link3_link.prev) {
         if (queue->head != &thp->link3_link)
@@ -176,10 +161,8 @@ static int dispatch_unlink_ready(kdispatch_t *dpp, thread_t *thp)
         thp->link3_link.prev = &queue->head;
     }
 
-    LINK3_REM(*queue, &thp->link3_link, thread_t);
+    DISPATCH_UNLINK(dpp, thp);
     THR_EV(thp);
-    if (!DISPATCH_THP(dpp, thp->priority))
-        DISPATCH_CLR(dpp, thp);
     return 1;
 }
 
@@ -214,6 +197,33 @@ static void kick_idle_hart(thread_t *thp)
             return;
         }
     }
+}
+
+/* The hart whose run queue dpp is, or -1. */
+static int dpp_owner_cpu(const kdispatch_t *dpp)
+{
+    for (unsigned h = 0; h < num_processors; h++)
+        if (pcpu_array[h].pc_dispatch == dpp)
+            return (int) h;
+    return -1;
+}
+
+/* This hart has just switched away from old. A waker that could not wait for
+ * that switch (ready_wait_switch_out) may have queued old elsewhere already,
+ * and the pickers passed it over while it was current here: kick a hart that
+ * can take it now. The hart it was queued on took its IPI while old was still
+ * current here and passed it over, so it is told again; an idle hart may also
+ * steal it.
+ */
+static inline void switched_away(thread_t *old)
+{
+    if (!old || old->state != STATE_READY || old->dpp == LOCAL_DPP)
+        return;
+    int owner = dpp_owner_cpu(old->dpp);
+
+    if (owner >= 0 && (unsigned) owner != get_cpunum())
+        SENDIPI((unsigned) owner, IPI_RESCHED);
+    kick_idle_hart(old);
 }
 
 static int rdecl select_cpu(thread_t *thp)
@@ -294,10 +304,11 @@ static thread_t *rdecl select_thread_default(int cpu, int prio)
         for (thp = DISPATCH_THP(dpp, hipri); thp;
              thp = link3_to_thread(thp->link3_link.next)) {
             if ((thp->runmask & runmask) == 0) {
-                if ((int) (unsigned) thp->priority >= prio) {
-                    if (!dispatch_unlink_ready(dpp, thp))
-                        continue;
-                }
+                /* By the list it is on (qprio), at or above prio: its priority
+                 * may differ, and a thread returned must be off it.
+                 */
+                if (!dispatch_unlink_ready(dpp, thp))
+                    continue;
                 return thp;
             }
         }
@@ -317,6 +328,11 @@ static thread_t *rdecl select_thread_default(int cpu, int prio)
     {
         SCHED_UNLOCK(pcpu_array[cpu].pc_dispatch);
 
+        /* The window where a thread blocking here is still this hart's current
+         * thread with the dispatch lock (and the interrupt mask) let go.
+         */
+        inject_switch_stall(get_active_thread((unsigned) cpu));
+
         for (int idx = 0; idx < (int) num_processors; idx++) {
             unsigned other = (unsigned) idx;
 
@@ -326,9 +342,10 @@ static thread_t *rdecl select_thread_default(int cpu, int prio)
             if (other == (unsigned) cpu)
                 continue;
             kdispatch_t *odpp = pcpu_array[other].pc_dispatch;
-            if (!odpp)
-                continue;
+            if (!odpp || !DISPATCH_ANY(odpp))
+                continue; /* empty: not worth its lock (DISPATCH_ANY) */
             SCHED_LOCK(odpp);
+            inject_note_empty_steal_lock(odpp);
             int ohi = DISPATCH_HIGHEST_PRI(odpp);
             if (ohi < prio || ohi < 0) {
                 SCHED_UNLOCK(odpp);
@@ -341,12 +358,31 @@ static thread_t *rdecl select_thread_default(int cpu, int prio)
                     if (!dispatch_unlink_ready(odpp, thp))
                         continue;
                     thp->dpp = pcpu_array[cpu].pc_dispatch;
+
+                    /* Off the queue, so no longer READY, before the lock drops:
+                     * the local lock is taken only after it, and an unready()
+                     * in between would unlink thp a second time. The caller
+                     * makes it current (idle_pick_thread does the same).
+                     */
+                    thp->state = STATE_RUNNING;
+                    thp->runcpu = (unsigned) cpu;
                     SCHED_UNLOCK(odpp);
+                    inject_steal_stall(thp);
                     SCHED_LOCK(pcpu_array[cpu].pc_dispatch);
-                    return thp;
+
+                    /* An unready() between the two locks (it locks thp->dpp,
+                     * already this hart's) found thp RUNNING and gave it its
+                     * new state, a stop or a teardown: it is no longer ours to
+                     * run. Look on; its next wakeup queues it again.
+                     */
+                    if (thp->state == STATE_RUNNING)
+                        return thp;
+                    SCHED_UNLOCK(pcpu_array[cpu].pc_dispatch);
+                    goto next_hart;
                 }
             }
             SCHED_UNLOCK(odpp);
+        next_hart:;
         }
 
         SCHED_LOCK(pcpu_array[cpu].pc_dispatch);
@@ -415,13 +451,8 @@ static thread_t *rdecl select_thread_default(int cpu, int prio)
         return NULL;
     }
 
-    LINK3_REM(DISPATCH_LST(dpp, (thp)->priority), &(thp)->link3_link, thread_t);
+    DISPATCH_UNLINK(dpp, thp);
     THR_EV(thp);
-
-    /* If that list is now empty, clear the readybit.   */
-    if (!DISPATCH_THP(dpp, (thp)->priority)) {
-        DISPATCH_CLR(dpp, (thp));
-    }
 
     return thp;
 }
@@ -453,19 +484,28 @@ static void rdecl mark_running_default(thread_t *new)
 
     /* Switch-time billing: charge old for its stretch and start new's. Must
      * precede rcu_sched_quiescent() (the sporadic ss_info deref in
-     * sched_account_current is only protected until this hart reports a
+     * sched_account_switch is only protected until this hart reports a
      * quiescent state) and set_active_thread() (so the stamp already belongs to
      * new when a remote seqcount reader first sees new as this hart's active
-     * thread). If old was billed earlier, before being enqueued READY, the flag
-     * makes this call only restart the stamp.
+     * thread). If old was billed earlier, before being enqueued READY, its
+     * stretch is already closed and this call only starts new's.
      */
-    sched_account_now();
+    sched_account_switch(new);
     if (old != new)
         rcu_sched_quiescent();
+
+    /* runcpu before the store: thread_current_elsewhere reads it to find the
+     * one hart new can be current on.
+     */
+    new->runcpu = get_cpunum();
+    dispatch_owner_run_site(__builtin_return_address(0));
     set_active_thread(get_cpunum(), new);
+#if CONFIG_PROCESSORS_MAX > 1
+    if (old != new)
+        switched_away(old);
+#endif
 
     new->state = STATE_RUNNING;
-    new->runcpu = get_cpunum();
 
     /* While RUNNING, thp->dpp must point at this CPU's per-CPU dispatch
      * instance. Defensive snap for the rare path where a thread reached RUNNING
@@ -499,46 +539,78 @@ static void rdecl mark_running_default(thread_t *new)
  * SMP invariant (Standing Gate): the active thread's running_time (and the
  * sporadic ss_info consumed/curr_budget it drives) is written ONLY by the hart
  * that owns it, i.e. the hart whose pc_curthread it is, and only from
- * sched_account_current() on that hart; no cross-hart writer exists. The owning
+ * sched_account_switch() on that hart; no cross-hart writer exists. The owning
  * process's running_time is shared by that process's threads on every hart, so
- * it is updated with atomic_fetch_add. pc_account_stamp is likewise owner-hart
- * written; pc_account_seq is its seqcount (odd while an update is in flight) so
- * a remote clock read can add the live, not-yet-billed stretch to a running
- * thread without taking a lock (sched_account_live). Idle time and time spent
- * on a hart with no active thread are billed to nobody.
+ * it is updated with atomic_fetch_add. pc_account_stamp and pc_account_thp are
+ * likewise owner-hart written; pc_account_seq is their seqcount (odd while an
+ * update is in flight) so a remote clock read can add the live, not-yet-billed
+ * stretch to a running thread without taking a lock (sched_account_read). Idle
+ * time and time spent on a hart with no active thread are billed to nobody.
+ *
+ * pc_account_thp names the thread whose stretch began at pc_account_stamp. A
+ * switch bills the outgoing thread and names the incoming one in the same
+ * seqcount update, before set_active_thread(): a reader that still sees the
+ * outgoing thread as current then finds its stretch closed and returns the
+ * banked value, which already holds the whole stretch. Matching pc_curthread
+ * alone let such a reader add the next thread's stretch to it, and its clock
+ * stepped back once the switch completed.
  *
  * Every path that changes this hart's active thread calls
- * sched_account_current() (thread->thread via mark_running_default, thread->
- * idle via block/block_release/yield-to-none) or sched_account_restart()
+ * sched_account_switch() (thread->thread via mark_running_default and the
+ * inline IPC handoff, thread->idle via block/block_release/yield-to-none,
+ * thread->queue via sched_account_expose) or sched_account_restart()
  * (idle->thread via cpu_idle) BEFORE set_active_thread(), so the outgoing
- * thread is charged exactly its own stretch. The tick also bills, so RLIMIT_CPU
- * and sporadic budgets are enforced against live consumption. A thread being
- * destroyed on its own hart is billed on its way off the CPU (unready ->
- * block); a dead or reaped pc_curthread that is abandoned in kernel_exit is not
- * billed, since its process may already be gone.
+ * thread is charged exactly its own stretch. The tick also bills
+ * (sched_account_current), so RLIMIT_CPU and sporadic budgets are enforced
+ * against live consumption. A thread being destroyed on its own hart is billed
+ * on its way off the CPU (unready -> block); a dead or reaped pc_curthread that
+ * is abandoned in kernel_exit is not billed, since its process may already be
+ * gone: pc_account_thp then no longer matches pc_curthread, and nothing bills
+ * or reads through it until the next thread's stretch begins.
+ *
+ * Callers have interrupts off (a dispatch lock, the tick, interrupt_save), so
+ * the tick never nests in a bill. The clock is read inside the seqcount update.
+ * A reader takes its own time first and then finds the stretch open, so the
+ * bill that closes it must end no earlier: a time taken before the update could
+ * precede the reader's, and the bill then banked less than the reader had
+ * already returned. A switch away from a thread that is leaving in a wait state
+ * also stamps its timestamp_last_block with the same read, so blocking reads
+ * the clock once; that thread is still this hart's current thread here. A
+ * thread that leaves READY or RUNNING (a yield, a preemption) keeps its last
+ * block time.
+ *
+ * snap_time() is arch_timer_now_ns(), free-running at ns resolution, because
+ * RISC-V arch-init always sets qtp->timer_scale = -9. A port with another
+ * timer_scale would get tick-granular qtp->nsec here and billing would degrade
+ * to tick resolution (still correct in total, never double counted).
  */
-void rdecl sched_account_current(uint64_t now)
+void rdecl sched_account_switch(thread_t *next)
 {
     struct pcpu *pc = get_pcpu();
-    thread_t *act = pc->pc_curthread;
-    uint64_t stamp = pc->pc_account_stamp;
-    uint64_t delta = now > stamp ? now - stamp : 0;
+    thread_t *act = pc->pc_account_thp;
+    uint64_t stamp = __atomic_load_n(&pc->pc_account_stamp, __ATOMIC_RELAXED);
+    uint64_t now, end, delta;
     unsigned seq =
         atomic_load_explicit(&pc->pc_account_seq, memory_order_relaxed);
 
     atomic_store_explicit(&pc->pc_account_seq, seq + 1, memory_order_relaxed);
     atomic_thread_fence(memory_order_release);
+    snap_time(&now, 0);
+    end = now > stamp ? now : stamp;
+    delta = end - stamp;
 
-    /* act was already billed and enqueued (sched_account_expose); it may be
-     * running on another hart now, so it is not ours to write.
+    /* Only the current thread is ours to bill. A closed stretch names nobody,
+     * and one whose thread kernel_exit abandoned names a thread that may be
+     * freed: compare the pointer, never dereference it.
      */
-    if (pc->pc_account_billed) {
-        pc->pc_account_billed = 0;
+    if (act != pc->pc_curthread || act == pc->pc_idle_thp)
         act = NULL;
-    }
 
-    if (delta && act && act != pc->pc_idle_thp && act->process) {
-        act->running_time += delta;
+    if (delta && act && act->process) {
+        __atomic_store_n(
+            &act->running_time,
+            __atomic_load_n(&act->running_time, __ATOMIC_RELAXED) + delta,
+            __ATOMIC_RELAXED);
         __atomic_fetch_add(&act->process->running_time, delta,
                            __ATOMIC_RELAXED);
 
@@ -570,70 +642,91 @@ void rdecl sched_account_current(uint64_t now)
             }
         }
     }
-    if (now > stamp)
-        pc->pc_account_stamp = now;
+    if (act && act != next) {
+        uint8_t st = act->state;
+
+        if (st != STATE_RUNNING && st != STATE_READY)
+            act->timestamp_last_block = end;
+    }
+    __atomic_store_n(&pc->pc_account_stamp, end, __ATOMIC_RELAXED);
+    __atomic_store_n(&pc->pc_account_thp, next, __ATOMIC_RELAXED);
 
     atomic_store_explicit(&pc->pc_account_seq, seq + 2, memory_order_release);
 }
 
-/* A thread is about to start on this hart from idle (or the hart has just come
- * up): begin its stretch now without billing the idle time.
+/* Bill the current stretch up to now without ending it (the tick, and a
+ * process-clock read banking the caller's own stretch).
  */
-void rdecl sched_account_restart(void)
+void rdecl sched_account_current(void)
+{
+    sched_account_switch(get_pcpu()->pc_account_thp);
+}
+
+/* next is about to start on this hart from idle (or the hart has just come up):
+ * begin its stretch now without billing the idle time.
+ */
+void rdecl sched_account_restart(thread_t *next)
 {
     struct pcpu *pc = get_pcpu();
     uint64_t now;
     unsigned seq =
         atomic_load_explicit(&pc->pc_account_seq, memory_order_relaxed);
 
-    snap_time(&now, 0);
     atomic_store_explicit(&pc->pc_account_seq, seq + 1, memory_order_relaxed);
     atomic_thread_fence(memory_order_release);
-    pc->pc_account_stamp = now;
+    snap_time(&now, 0);
+    if (now > pc->pc_account_stamp)
+        __atomic_store_n(&pc->pc_account_stamp, now, __ATOMIC_RELAXED);
+    __atomic_store_n(&pc->pc_account_thp, next, __ATOMIC_RELAXED);
     atomic_store_explicit(&pc->pc_account_seq, seq + 2, memory_order_release);
 }
 
 /* Return thp's running_time including, when thp is running on some hart, the
- * not-yet-billed ns of its current stretch. The banked value and the stamp are
- * sampled under the owner hart's pc_account_seq seqcount, so they are a
- * consistent pair. After three torn attempts return the banked value alone. A
- * caller on thp's own hart should bill with sched_account_current() first.
+ * not-yet-billed ns of its current stretch. The banked value, the stamp and the
+ * stretch's owner are sampled under the owner hart's pc_account_seq seqcount,
+ * so they are a consistent set. A torn sample is taken again, like
+ * arch_timer_now_ns() does: the writer's section is short, has interrupts off
+ * and takes no lock. Falling back to the banked value after a few torn samples
+ * lost the live stretch whenever the bill that banks it was still in flight,
+ * and the clock stepped back by it. A caller on thp's own hart should bill with
+ * sched_account_current() first.
  */
 uint64_t rdecl sched_account_read(thread_t *thp, uint64_t now)
 {
-    uint64_t online = cpu_online_snapshot();
-
-    for (unsigned cpu = 0; cpu < num_processors; cpu++) {
+    for (;;) {
+        unsigned cpu = __atomic_load_n(&thp->runcpu, __ATOMIC_ACQUIRE);
+        if (!cpu_online(cpu))
+            break;
         struct pcpu *pc = &pcpu_array[cpu];
 
-        if (!cpu_in_mask(online, cpu))
-            continue;
-
-        /* runcpu is set by mark_running on the hart that now runs thp, so a
-         * hart that still names thp after it was handed to another (yield/
-         * resched enqueue, then mark_running) is skipped.
+        /* Not current there, and not moved since: every stretch it ran is
+         * banked, by a bill that precedes the hart's switch away from it.
          */
-        if (__atomic_load_n(&pc->pc_curthread, __ATOMIC_ACQUIRE) != thp ||
-            thp->runcpu != cpu)
+        if (__atomic_load_n(&pc->pc_curthread, __ATOMIC_ACQUIRE) != thp) {
+            if (cpu == __atomic_load_n(&thp->runcpu, __ATOMIC_RELAXED))
+                break;
             continue;
-        for (int tries = 0; tries < 3; tries++) {
-            unsigned s1 =
-                atomic_load_explicit(&pc->pc_account_seq, memory_order_acquire);
-            uint64_t stamp = pc->pc_account_stamp;
-            uint64_t banked = thp->running_time;
-            thread_t *cur =
-                __atomic_load_n(&pc->pc_curthread, __ATOMIC_ACQUIRE);
-
-            atomic_thread_fence(memory_order_acquire);
-            if ((s1 & 1u) || cur != thp ||
-                s1 != atomic_load_explicit(&pc->pc_account_seq,
-                                           memory_order_relaxed))
-                continue;
-            return banked + (now > stamp ? now - stamp : 0);
         }
-        break;
+        unsigned seq =
+            atomic_load_explicit(&pc->pc_account_seq, memory_order_acquire);
+        uint64_t stamp =
+            __atomic_load_n(&pc->pc_account_stamp, __ATOMIC_RELAXED);
+        thread_t *owner =
+            __atomic_load_n(&pc->pc_account_thp, __ATOMIC_RELAXED);
+        uint64_t banked = __atomic_load_n(&thp->running_time, __ATOMIC_RELAXED);
+        thread_t *cur = __atomic_load_n(&pc->pc_curthread, __ATOMIC_ACQUIRE);
+
+        atomic_thread_fence(memory_order_acquire);
+        if ((seq & 1u) ||
+            seq != atomic_load_explicit(&pc->pc_account_seq,
+                                        memory_order_relaxed) ||
+            cpu != __atomic_load_n(&thp->runcpu, __ATOMIC_RELAXED))
+            continue; /* the hart is billing, or thp moved: sample again */
+        if (owner == thp && cur == thp)
+            return banked + (now > stamp ? now - stamp : 0);
+        return banked;
     }
-    return thp->running_time;
+    return __atomic_load_n(&thp->running_time, __ATOMIC_RELAXED);
 }
 
 /*** Sporadic scheduler policy functions ***/
@@ -960,13 +1053,14 @@ int rdecl sched_thread(thread_t *thp, int policy, struct sched_param *param)
             return EINVAL;
         }
 
-        LINK3_REM(DISPATCH_LST(dpp, thp->priority), &thp->link3_link, thread_t);
+        /* Within the list it is on (qprio), whose ready bit stays set. */
+        LINK3_REM(DISPATCH_LST(dpp, thp->qprio), &thp->link3_link, thread_t);
         if (policy == RTMUX_SCHED_ADJTOHEAD) {
-            LINK3_BEG(DISPATCH_LST(dpp, thp->priority), &thp->link3_link,
+            LINK3_BEG(DISPATCH_LST(dpp, thp->qprio), &thp->link3_link,
                       thread_t);
         } else {
             RR_RESET_TICK(thp);
-            LINK3_END(DISPATCH_LST(dpp, thp->priority), &thp->link3_link,
+            LINK3_END(DISPATCH_LST(dpp, thp->qprio), &thp->link3_link,
                       thread_t);
         }
 
@@ -1000,9 +1094,9 @@ int rdecl sched_thread(thread_t *thp, int policy, struct sched_param *param)
 
         /* If we lowered priority, ensure we will be head of priority list */
         if (thp->priority < old_prio && thp->state == STATE_READY) {
-            LINK3_REM(DISPATCH_LST(thp->dpp, thp->priority), &thp->link3_link,
+            LINK3_REM(DISPATCH_LST(thp->dpp, thp->qprio), &thp->link3_link,
                       thread_t);
-            LINK3_BEG(DISPATCH_LST(thp->dpp, thp->priority), &thp->link3_link,
+            LINK3_BEG(DISPATCH_LST(thp->dpp, thp->qprio), &thp->link3_link,
                       thread_t);
         }
         return EOK;
@@ -1129,7 +1223,10 @@ int rdecl sched_thread(thread_t *thp, int policy, struct sched_param *param)
  */
 static void force_ready_msgxfer(thread_t *thp, unsigned err)
 {
-    SETKSTATUS(thp, -err);
+    /* The claimer passes this back to force_ready() as it stands, error and
+     * _FORCE_* bits together: it is not negated.
+     */
+    SETKSTATUS(thp, err);
     ITF_SET(thp, RTMUX_ITF_MSG_FORCE_RDY);
 
     /* only in a CPU which is not doing msg xfer could force_ready a thread
@@ -1164,7 +1261,144 @@ static void force_ready_msgxfer(thread_t *thp, unsigned err)
         }
     }
 }
+
+/* Whether thp is claimed (MSG_DELIVERY) and its wake was therefore handed to
+ * the claimer (MSG_FORCE_RDY). The claim is taken and given up under the
+ * channel's lock, and the claimer looks for MSG_FORCE_RDY in the window in
+ * which it clears the claim, so the test and the hand-over are one step under
+ * that lock: a test made without it can see a claim that is released before the
+ * flag is set, and the wake is then nobody's. Without a channel (it is gone,
+ * and its queues with it) nothing can be claimed afresh and the plain test
+ * stands.
+ */
+static bool force_ready_deferred(thread_t *thp,
+                                 channel_t *chp,
+                                 unsigned err,
+                                 const uint32_t *seq)
+{
+    bool claimed;
+
+    if (chp)
+        kspinlock_lock(&chp->lock);
+
+    /* A caller naming a wait (force_ready_wait) hands over only that one: a
+     * thread woken since may be claimed in a later exchange.
+     */
+    claimed = (thp->internal_flags & RTMUX_ITF_MSG_DELIVERY) != 0 &&
+              !(seq && thread_wake_seq(thp) != *seq);
+    if (claimed) {
+        inject_force_ready_claimed(thp);
+        force_ready_msgxfer(thp, err);
+    }
+    if (chp)
+        kspinlock_unlock(&chp->lock);
+    return claimed;
+}
 #endif
+
+/* The channel lock a reply claims its client under; a uniprocessor kernel has
+ * no claimer to exclude.
+ */
+static inline void unblock_chp_lock(channel_t *chp)
+{
+#if CONFIG_PROCESSORS_MAX > 1 && defined(CONFIG_SMP_MSGOPT)
+    kspinlock_lock(&chp->lock);
+#else
+    (void) chp;
+#endif
+}
+
+static inline void unblock_chp_unlock(channel_t *chp)
+{
+#if CONFIG_PROCESSORS_MAX > 1 && defined(CONFIG_SMP_MSGOPT)
+    kspinlock_unlock(&chp->lock);
+#else
+    (void) chp;
+#endif
+}
+
+/* What force_ready_unblock_mark() decided. */
+enum {
+    UNBLOCK_HANDED_OVER,   /* a claimer has thp and gets the wake */
+    UNBLOCK_EXCHANGE_OVER, /* the request was answered meanwhile */
+    UNBLOCK_MARKED_BEFORE, /* a notification is queued for it already */
+    UNBLOCK_QUEUE_NOW,     /* marked: the caller queues the notification */
+};
+
+/* Decide on the unblock notification for thp's request gen, blocked on cop of
+ * chp, under the channel lock. A reply or an error claims thp under this lock
+ * and then looks for a queued notification to remove, and it unlinks thp under
+ * the lock too. A claim test made without the lock can be overtaken by such a
+ * reply; a mark made after its look outlives the exchange, and the client's
+ * next request, under the same rcvid, then finds a notification "queued" and
+ * gets none, so a server that parks it never hears of its timeout. Made here,
+ * the mark is seen by any later claimer, and a claim found here gets the wake
+ * as force_ready_deferred() hands it over.
+ */
+static int force_ready_unblock_mark(thread_t *thp,
+                                    channel_t *chp,
+                                    const connect_t *cop,
+                                    uint64_t gen,
+                                    unsigned err)
+{
+    int ret;
+
+    unblock_chp_lock(chp);
+    /* The request first: a claim on a later one is not this wake's. */
+    if (__atomic_load_n(&thp->blocked_on, __ATOMIC_ACQUIRE) != cop ||
+        thp->req_gen != gen) {
+        ret = UNBLOCK_EXCHANGE_OVER;
+#if CONFIG_PROCESSORS_MAX > 1 && defined(CONFIG_SMP_MSGOPT)
+    } else if (thp->internal_flags & RTMUX_ITF_MSG_DELIVERY) {
+        inject_force_ready_claimed(thp);
+        force_ready_msgxfer(thp, err);
+        ret = UNBLOCK_HANDED_OVER;
+#endif
+    } else {
+        /* Publish UNBLOCK_REQ before the notification can be received: a
+         * multi-threaded server may handle the notification on another worker
+         * while the original request is still being dispatched, and must be
+         * able to see this flag (msg_info RTMUX_MI_UNBLOCK_REQ) then.
+         */
+        if ((err & _FORCE_SET_ERROR) == 0)
+            atomic_or(&thp->flags, RTMUX_FLG_THR_UNBLOCK_REQ);
+        ret = (thp->internal_flags & RTMUX_ITF_UNBLOCK_QUEUED)
+                  ? UNBLOCK_MARKED_BEFORE
+                  : UNBLOCK_QUEUE_NOW;
+        if (ret == UNBLOCK_QUEUE_NOW)
+            ITF_SET(thp, RTMUX_ITF_UNBLOCK_QUEUED);
+    }
+    unblock_chp_unlock(chp);
+    return ret;
+}
+
+/* The notification for thp's request gen could not be queued: take the mark
+ * back, unless the request was answered meanwhile.
+ *
+ * Returns whether it was still the request blocked on cop.
+ */
+static bool force_ready_unblock_unmark(thread_t *thp,
+                                       channel_t *chp,
+                                       const connect_t *cop,
+                                       uint64_t gen)
+{
+    bool ours;
+
+    unblock_chp_lock(chp);
+    ours = __atomic_load_n(&thp->blocked_on, __ATOMIC_ACQUIRE) == cop &&
+           thp->req_gen == gen;
+    if (ours)
+        ITF_CLR(thp, RTMUX_ITF_UNBLOCK_QUEUED);
+    unblock_chp_unlock(chp);
+    return ours;
+}
+
+/* A kill that cannot end thp's wait now leaves thp to destroy itself. */
+static inline void force_ready_kill_self(thread_t *thp, unsigned err)
+{
+    if (err & _FORCE_KILL_SELF)
+        atomic_or(&thp->flags, RTMUX_FLG_THR_KILLSELF | RTMUX_FLG_THR_ONLYME);
+}
 
 /* Force a blocked thread out of its wait state.
  *
@@ -1178,8 +1412,32 @@ static void force_ready_msgxfer(thread_t *thp, unsigned err)
  *               unblock was deferred (e.g. awaiting an unblock notification or
  * a cross-CPU message-delivery completion).
  */
+static int force_ready_body(thread_t *thp, unsigned err, const uint32_t *seq);
+
 int rdecl force_ready(thread_t *thp, unsigned err)
 {
+    return force_ready_body(thp, err, NULL);
+}
+
+/* force_ready for the one wait the caller saw: wake_seq is thp->wake_seq as it
+ * read it while thp waited. A thread woken since is in a later wait, or none,
+ * and is left alone (returns 1). A sync wait, a receive and a send are tested
+ * again under the lock that claims them (the chain lock,
+ * sync_chain_force_ready; the channel lock), where a thread woken and waiting
+ * again on the same object looks unchanged otherwise, and a reply wait once its
+ * request is read; the other waits only here, at entry.
+ */
+int rdecl force_ready_wait(thread_t *thp, unsigned err, uint32_t wake_seq)
+{
+    if (thread_wake_seq(thp) != wake_seq)
+        return 1;
+    return force_ready_body(thp, err, &wake_seq);
+}
+
+static int force_ready_body(thread_t *thp, unsigned err, const uint32_t *seq)
+{
+    uint32_t wait_seq;
+
 #if CONFIG_PROCESSORS_MAX > 1 && defined(CONFIG_SMP_MSGOPT)
 #ifndef NDEBUG
     if (thp->internal_flags & RTMUX_ITF_MSG_DELIVERY) {
@@ -1215,9 +1473,6 @@ int rdecl force_ready(thread_t *thp, unsigned err)
      */
     bool unlinked = false;
 
-    /* Rereads of a sync waiter's state by a kill, while its wakeup settles. */
-    unsigned sync_wait_spins = 0;
-
     /* Set when control reaches the STATE_RECEIVE arm from the STATE_REPLY arm;
      * fr_chp (possibly NULL: channel gone) is then authoritative and blocked_on
      * must not be reinterpreted as a channel.
@@ -1231,6 +1486,12 @@ int rdecl force_ready(thread_t *thp, unsigned err)
     }
 
 reread_state:
+    /* The wait this call ends, named before the state that says which. A
+     * vthread soul ends before wake_seq; the lockless waits are real threads'.
+     */
+    wait_seq = seq                                   ? *seq
+               : TYPE_MASK(thp->type) == TYPE_THREAD ? thread_wake_seq(thp)
+                                                     : 0;
     switch (thp->state) {
     case STATE_READY:
 #if CONFIG_PROCESSORS_MAX > 1 && defined(CONFIG_SMP_MSGOPT)
@@ -1265,6 +1526,8 @@ reread_state:
     case STATE_REPLY: {
         connect_t *cop;
         channel_t *chp;
+        uint64_t gen;
+        bool wants_unblock;
 
         /* A sender is linked on reply_queue and in STATE_REPLY before block()
          * has restored blocked_on; WAIT_PENDING covers that window. Reading
@@ -1275,7 +1538,23 @@ reread_state:
         while (thp->internal_flags & RTMUX_ITF_WAIT_PENDING)
             __asm__ volatile("" ::: "memory");
         cpu_smp_mb();
+
+        /* The request blocked on cop: what any later step acts on. Read before
+         * cop, so a cop seen afterwards belongs to this request or a later one,
+         * which the checks under the channel lock then tell apart; read after
+         * it, a reply and a new send on the same connection in between would
+         * pair the old request's cop with the new request's identity.
+         */
+        gen = __atomic_load_n(&thp->req_gen, __ATOMIC_ACQUIRE);
         cop = __atomic_load_n(&thp->blocked_on, __ATOMIC_ACQUIRE);
+
+        /* A caller naming a wait (force_ready_wait) ends only that request: a
+         * thread woken since may be reply-blocked on a later one, whose gen the
+         * checks under the channel lock would accept. Unwoken, gen is the
+         * request of the wait it named.
+         */
+        if (seq && thread_wake_seq(thp) != *seq)
+            return 1;
 
         /* A concurrent reply on another hart can complete the exchange
          * (clearing blocked_on) between our read of thp->state and here; there
@@ -1294,26 +1573,26 @@ reread_state:
         fr_chp = chp; /* carried to the LINKPRIL_REM below */
         from_reply = true;
 
-#if CONFIG_PROCESSORS_MAX > 1 && defined(CONFIG_SMP_MSGOPT)
-        if (thp->internal_flags & RTMUX_ITF_MSG_DELIVERY) {
-            force_ready_msgxfer(thp, err);
-#ifndef NDEBUG
-            /* kprintf("try to ready STATE_REPLY.\n"); */
-#endif
-            return 0;
-        }
-#endif
-
         /* If the channel wants an unblock notification and the responsible
-         * process _isn't_ dying, we can't unblock this thread just yet.
+         * process _isn't_ dying, we can't unblock this thread just yet: the
+         * claim test is part of that decision (force_ready_unblock_mark).
          */
-        if (chp && (chp->flags & RTMUX_FLG_CHF_UNBLOCK) &&
+        wants_unblock =
+            chp && (chp->flags & RTMUX_FLG_CHF_UNBLOCK) &&
             !(err & _FORCE_NO_UNBLOCK) &&
             ((!chp->process) ||
              !(chp->process->flags &
                (RTMUX_FLG_PROC_TERMING | RTMUX_FLG_PROC_DESTROYALL))) &&
-            (thp->state == STATE_REPLY)) {
-            int rcvid;
+            (thp->state == STATE_REPLY);
+
+#if CONFIG_PROCESSORS_MAX > 1 && defined(CONFIG_SMP_MSGOPT)
+        if (!wants_unblock && force_ready_deferred(thp, chp, err, seq))
+            return 0;
+#endif
+
+        if (wants_unblock) {
+            int rcvid, mark;
+
             if (TYPE_MASK(thp->type) == TYPE_VTHREAD) {
                 rcvid = (int) ((((vthread_t *) thp)->un.remote.vtid << 16) |
                                cop->scoid);
@@ -1324,40 +1603,54 @@ reread_state:
             }
             _TRACE_COMM_EMIT_SNOTIFICATION_UN(
                 cop, cop->scoid | RTMUX_SIDE_CHANNEL, thp->priority);
+            inject_unblock_force_window(thp);
+            mark = force_ready_unblock_mark(thp, chp, cop, gen, err);
 
-            /* Publish UNBLOCK_REQ before the notification can be received: a
-             * multi-threaded server may handle the notification on another
-             * worker while the original request is still being dispatched, and
-             * must be able to see this flag (msg_info RTMUX_MI_UNBLOCK_REQ)
-             * then. Cleared below if the notification cannot be delivered.
+            /* A claimer gets err, KILL_SELF included, as from
+             * force_ready_deferred().
              */
-            if ((err & _FORCE_SET_ERROR) == 0)
-                atomic_or(&thp->flags, RTMUX_FLG_THR_UNBLOCK_REQ);
-            if (!(thp->internal_flags & RTMUX_ITF_UNBLOCK_QUEUED)) {
+            if (mark == UNBLOCK_HANDED_OVER)
+                return 0;
+            if (mark == UNBLOCK_EXCHANGE_OVER) {
+                force_ready_kill_self(thp, err);
+                return 1;
+            }
+            if (mark == UNBLOCK_QUEUE_NOW) {
                 /* Force SOUL_CRITICAL for the unblock-notification alloc via
                  * the per-CPU soul_alloc_override mechanism — no shared global
                  * mutation, no cross-CPU race. See lock.h.
                  */
                 unsigned cpu = get_cpunum();
+                int rc;
+
                 pcpu_array[cpu].pc_soul_alloc_override = SOUL_OVERRIDE_CRITICAL;
-                if (notification_deliver(
-                        chp, thp->priority, _NOTIFICATION_CODE_UNBLOCK,
-                        (uintptr_t) rcvid, cop->scoid | RTMUX_SIDE_CHANNEL,
-                        0) != EOK) {
-                    /* If there was a server fault and the notification could
-                     * not be delivered, let the client unblock as if the server
-                     * handled the notification.
-                     */
-                    err |= _FORCE_SET_ERROR;
-                } else {
-                    ITF_SET(thp, RTMUX_ITF_UNBLOCK_QUEUED);
-                }
+
+                /* The notification carries the identity of thp's request to the
+                 * server thread that takes it (msg_unblock_received). A reply
+                 * that comes first removes nothing and clears the mark; the
+                 * notification then names an answered request, which a server
+                 * takes as a stale unblock.
+                 */
+                pcpu_array[cpu].pc_unblock_gen = gen;
+                rc = notification_deliver(
+                    chp, thp->priority, _NOTIFICATION_CODE_UNBLOCK,
+                    (uintptr_t) rcvid, cop->scoid | RTMUX_SIDE_CHANNEL, 0);
+                pcpu_array[cpu].pc_unblock_gen = 0;
                 pcpu_array[cpu].pc_soul_alloc_override = SOUL_OVERRIDE_NONE;
+
+                /* If there was a server fault and the notification could not be
+                 * delivered, let the client unblock as if the server handled
+                 * the notification, if it still waits for this request.
+                 */
+                if (rc != EOK) {
+                    if (!force_ready_unblock_unmark(thp, chp, cop, gen)) {
+                        force_ready_kill_self(thp, err);
+                        return 1;
+                    }
+                    err |= _FORCE_SET_ERROR;
+                }
             }
-            if (err & _FORCE_KILL_SELF) {
-                atomic_or(&thp->flags,
-                          RTMUX_FLG_THR_KILLSELF | RTMUX_FLG_THR_ONLYME);
-            }
+            force_ready_kill_self(thp, err);
             if ((err & _FORCE_SET_ERROR) == 0)
                 return 0; /* UNBLOCK_REQ was published above */
             atomic_clr(&thp->flags, RTMUX_FLG_THR_UNBLOCK_REQ);
@@ -1382,26 +1675,40 @@ reread_state:
                 __asm__ volatile("" ::: "memory");
             cpu_smp_mb();
             kspinlock_lock(&fr_chp->lock);
+
+            /* Another force_ready or a replier may have completed the exchange
+             * since the lock-free reads above, and the client may be blocked in
+             * its next request on the same connection by now (req_gen); then
+             * thp is no longer ours to unlink, nor its claimer ours to hand the
+             * wake to.
+             */
+            if ((thp->state != STATE_REPLY && thp->state != STATE_NET_REPLY) ||
+                thp->blocked_on != cop || thp->req_gen != gen) {
+                kspinlock_unlock(&fr_chp->lock);
+                return 1;
+            }
             if (thp->internal_flags & RTMUX_ITF_MSG_DELIVERY) {
                 force_ready_msgxfer(thp, err);
                 kspinlock_unlock(&fr_chp->lock);
                 return 0;
-            }
-
-            /* Another force_ready or a replier may have completed the exchange
-             * since the lock-free reads above; then thp is no longer ours to
-             * unlink.
-             */
-            if ((thp->state != STATE_REPLY && thp->state != STATE_NET_REPLY) ||
-                thp->blocked_on != cop) {
-                kspinlock_unlock(&fr_chp->lock);
-                return 1;
             }
             LINKPRIL_REM(thp);
             thp->blocked_on = NULL; /* == cop, checked above under the lock */
             IPC_BLK(thp);
             kspinlock_unlock(&fr_chp->lock);
             unlinked = true;
+        } else {
+            /* The channel is gone, and with it the lock: claim the client by
+             * taking blocked_on from cop to NULL in one step, so a second
+             * force_ready does not drop the link and ready it again.
+             */
+            void *expected = cop;
+
+            if (!__atomic_compare_exchange_n(&thp->blocked_on, &expected, NULL,
+                                             false, __ATOMIC_ACQ_REL,
+                                             __ATOMIC_ACQUIRE))
+                return 1;
+            IPC_BLK(thp);
         }
 #endif
         if (thp->args.ms.server) {
@@ -1457,19 +1764,6 @@ reread_state:
         /* Fall Through */
 
     case STATE_RECEIVE:
-#if CONFIG_PROCESSORS_MAX > 1 && defined(CONFIG_SMP_MSGOPT)
-        /* A thread coming from the STATE_REPLY arm was already checked and
-         * unlinked under the channel lock there; a second, lock-free test here
-         * could only defer after that arm's destructive steps.
-         */
-        if (!unlinked && (thp->internal_flags & RTMUX_ITF_MSG_DELIVERY)) {
-            force_ready_msgxfer(thp, err);
-#ifndef NDEBUG
-            /* kprintf("try to ready STATE_RECEIVE.\n"); */
-#endif
-            return 0;
-        }
-#endif
 
         /* Spin-wait for any in-flight channel-waiter transition to complete
          * before observing chp->receive_queue. IPC kcalls set
@@ -1500,6 +1794,15 @@ reread_state:
                 return 1;
             if (bo && TYPE_MASK(((channel_t *) bo)->type) != TYPE_CHANNEL)
                 return 1;
+
+            /* Whoever takes a receiver off its queue to deliver to it clears
+             * blocked_on under the channel lock, in the step that unlinks it,
+             * and readies it later with the lock dropped. A receiver without a
+             * channel is that one (its own block is over: WAIT_PENDING covered
+             * it), and the wait is its deliverer's to end.
+             */
+            if (!bo)
+                return 1;
             fr_chp = (channel_t *) bo;
         }
 
@@ -1525,9 +1828,18 @@ reread_state:
         if (unlinked) {
             /* The STATE_REPLY arm unlinked thp under fr_chp->lock already. */
         } else if (fr_chp) {
+            if (!from_reply)
+                inject_force_ready_stall(thp);
             kspinlock_lock(&fr_chp->lock);
+
+            /* A receiver woken since and receiving on fr_chp again looks the
+             * same here but for its wake count (force_ready_wait): a sender or
+             * a notification takes it off the queue under this lock before it
+             * is readied and counted.
+             */
             if (!from_reply &&
-                (thp->state != STATE_RECEIVE || thp->blocked_on != fr_chp)) {
+                (thp->state != STATE_RECEIVE || thp->blocked_on != fr_chp ||
+                 (seq && thread_wake_seq(thp) != *seq))) {
                 /* Moved on between the lock-free checks and the lock. */
                 kspinlock_unlock(&fr_chp->lock);
                 return 1;
@@ -1543,7 +1855,18 @@ reread_state:
                 return 0;
             }
 #endif
+
+            /* thp is still a receiver on fr_chp, so it is on the queue: a
+             * sender or a notification that took it off cleared blocked_on
+             * under this lock, and the check above returned. (It readies thp
+             * only after dropping the lock; unlinking and readying it here too
+             * would queue it twice, for two harts to run, and override its
+             * status.) This unlink says the same of itself, to a second
+             * force_ready of thp that is waiting for the lock.
+             */
             LINKPRIL_REM(thp);
+            if (!from_reply)
+                RECEIVER_TAKEN(thp);
             kspinlock_unlock(&fr_chp->lock);
         } else {
             /* Skipped the unlink because the owning channel is freed. Null the
@@ -1580,13 +1903,11 @@ reread_state:
         cop = thp->blocked_on;
 
 #if CONFIG_PROCESSORS_MAX > 1 && defined(CONFIG_SMP_MSGOPT)
-        if (thp->internal_flags & RTMUX_ITF_MSG_DELIVERY) {
-            force_ready_msgxfer(thp, err);
-#ifndef NDEBUG
-            /* kprintf("try to ready STATE_SEND.\n"); */
-#endif
+        if (force_ready_deferred(
+                thp,
+                cop ? __atomic_load_n(&cop->channel, __ATOMIC_ACQUIRE) : NULL,
+                err, seq))
             return 0;
-        }
 #endif
 
         /* cop->channel == NULL only after channel_destroy / connect_detach have
@@ -1598,15 +1919,35 @@ reread_state:
          * keep the drain-before-null ordering to preserve this invariant.
          */
         if (!cop || !cop->channel) {
-            if (thp->blocked_on == cop) {
-                thp->blocked_on = NULL;
-                IPC_BLK(thp);
-            }
-            if (cop && connect_links_drop(cop))
+            /* No channel lock to claim the sender under: claim it by taking
+             * blocked_on from cop to NULL in one step. Two force_readys (two
+             * harts draining one detached connection) both got here, both
+             * dropped the link and both readied the sender, which then ran on
+             * two harts. A sender whose blocked_on is no longer cop was claimed
+             * under the lock below, by a receiver, or here.
+             */
+            void *expected = cop;
+
+            if (!cop ||
+                (thp->state != STATE_SEND && thp->state != STATE_NET_SEND) ||
+                !__atomic_compare_exchange_n(&thp->blocked_on, &expected, NULL,
+                                             false, __ATOMIC_ACQ_REL,
+                                             __ATOMIC_ACQUIRE))
+                return 1;
+            IPC_BLK(thp);
+            if (connect_links_drop(cop))
                 connect_detach(cop, thp->priority);
             break;
         }
         kspinlock_lock(&cop->channel->lock);
+
+        /* A caller naming a wait ends only that send: a sender woken since and
+         * sending again, claimed or queued, is not its to hand over or unlink.
+         */
+        if (seq && thread_wake_seq(thp) != *seq) {
+            kspinlock_unlock(&cop->channel->lock);
+            return 1;
+        }
 #if CONFIG_PROCESSORS_MAX > 1 && defined(CONFIG_SMP_MSGOPT)
         /* A receiver claims this sender (MSG_DELIVERY) under the same lock; the
          * lock-free test above can lose that race (see the STATE_RECEIVE arm).
@@ -1659,29 +2000,25 @@ reread_state:
             __asm__ volatile("" ::: "memory");
         cpu_smp_mb();
 
-        /* The state above was read unlocked: thp may have been woken, and be
-         * running or waiting elsewhere, by the time its chain is locked. Never
-         * ready or unlink it then. A one-shot unblock (interrupt, timeout,
-         * cancel) that lost the race to a wakeup is moot and is dropped. A kill
-         * must still take hold of the thread wherever it went, and a thread a
-         * waker unlinked has to be waited for first, or destroying it now would
-         * let the waker ready a dead thread. blocked_on is NULL for every chain
-         * waiter, so there is no other wait list to unlink it from. Test
-         * window: thp may be woken and move on before the chain is found and
-         * locked.
+        /* The waiter can be woken and move on before the chain is locked. A
+         * one-shot interrupt belongs only to the wait it observed.
          */
         inject_force_ready_stall(thp);
-        if (!sync_chain_force_ready(thp)) {
+        if (!sync_chain_force_ready(thp, seq)) {
             if (!(err & _FORCE_KILL_SELF))
                 return 1;
 
-            /* The waker may still hold thp, so never ready it from here: past
-             * the bound report that another party will (as for a message
-             * claim), and let the caller retry or defer.
+            /* KILLSELF is persistent and runs first at special return. A
+             * still-blocked waiter with an empty key belongs to its waker. If
+             * it moved to another wait, claim that wait instead.
              */
-            if (++sync_wait_spins >= FORCE_READY_WAKER_SPINS)
+            atomic_or(&thp->flags, RTMUX_FLG_THR_KILLSELF);
+            unsigned state = __atomic_load_n(&thp->state, __ATOMIC_ACQUIRE);
+            if ((state == STATE_MUTEX || state == STATE_SEM ||
+                 state == STATE_CONDVAR) &&
+                !atomic_load_explicit(&thp->sync_wait_key,
+                                      memory_order_acquire))
                 return 0;
-            cpu_smp_mb();
             goto reread_state;
         }
         break;
@@ -1690,6 +2027,7 @@ reread_state:
     case STATE_JOIN: {
         thread_t *target;
         process_t *prp;
+        bool lost = false;
 
         while (thp->internal_flags & RTMUX_ITF_WAIT_PENDING)
             __asm__ volatile("" ::: "memory");
@@ -1699,14 +2037,34 @@ reread_state:
             prp = target->process;
             if (prp)
                 kspinlock_lock(&prp->vec_slock);
-            if (thp->state == STATE_WAITTHREAD)
-                atomic_or(&target->flags,
-                          (RTMUX_FLG_THR_KILLSELF | RTMUX_FLG_THR_ONLYME));
-            if (target->join == thp)
+            if (seq) {
+                /* A caller naming a wait (force_ready_wait) ends only that one,
+                 * tested again under the lock that publishes a join: a thread
+                 * woken since may wait on another target (blocked_on read
+                 * above), whose link it must not take. One whose link its waker
+                 * took (an exit, a detach, the new thread's start) is readied
+                 * by that waker, which counts the wake only then.
+                 */
+                lost = thread_wake_seq(thp) != *seq || target->join != thp;
+            }
+            if (!lost && thp->state == STATE_WAITTHREAD) {
+                /* The new thread took the link as it started, under this lock,
+                 * and readies its creator itself (thread_specret): readying it
+                 * here too would queue it twice. That thread has started and
+                 * its create succeeded, so it is not killed either.
+                 */
+                lost = target->join != thp;
+                if (!lost)
+                    atomic_or(&target->flags,
+                              (RTMUX_FLG_THR_KILLSELF | RTMUX_FLG_THR_ONLYME));
+            }
+            if (!lost && target->join == thp)
                 target->join = NULL;
             if (prp)
                 kspinlock_unlock(&prp->vec_slock);
         }
+        if (lost)
+            return 1;
         break;
     }
 
@@ -1714,6 +2072,18 @@ reread_state:
     case STATE_SIGWAITINFO:
     case STATE_NANOSLEEP:
     case STATE_INTR:
+        /* No lock decides who ends these waits: claim this one, or leave it to
+         * the waker that did (thread_wake_claim). That waker is in the kernel
+         * and readies the thread within its own path. A caller naming a wait
+         * (force_ready_wait) ends only that one. Any other wants the thread
+         * awake whatever wait it is in: if it lost because the thread has since
+         * moved on to another wait, look again.
+         */
+        if (thread_wake_claim(thp, wait_seq))
+            break;
+        if (seq || thread_wake_seq(thp) == wait_seq)
+            return 1;
+        goto reread_state;
         break;
 
     default:
@@ -1763,29 +2133,161 @@ reread_state:
  * used to indirect to the alternate scheduler functions if needed.
  */
 
-/* block takes sched_slock around the dispatch mutation (FIND_HIGHEST,
- * mark_running, set_active_thread). The pre-mutation snap_time/ timeout_start
- * touch per-thread fields only and stay outside the lock. Callers MUST NOT hold
- * sched_slock on entry; cross-callers (unready, block_and_ready_default) drop
- * it before calling.
+/* Note a kill or a cancel posted to a thread this hart has just put into a
+ * wait, for kernel_exit to deliver (thread_block_recheck has the protocol).
+ *
+ * Called under a dispatch lock once thp has its wait state and is no longer
+ * this hart's current thread: right after the switch away from it, or from
+ * unready() for a caller that was preempted inside its kernel call. thp cannot
+ * have been freed yet: it has to run elsewhere and exit first, and its reaper
+ * then waits for a quiescent state this hart reports only at its next switch.
+ * The pin extends that to the delivery. The fence orders the displacement
+ * before the reads, against the requester's fence after it publishes.
+ *
+ * One thread is noted per pass through the kernel: a kernel call blocks its
+ * caller once, and nothing else runs on this hart before kernel_exit. A second
+ * note would be dropped, which leaves that thread as it was before this check
+ * existed.
  */
-void rdecl block(void)
+static inline void block_recheck_arm(thread_t *thp)
+{
+    struct pcpu *pc = &pcpu_array[get_cpunum()];
+
+    cpu_smp_mb();
+    if (!(thp->flags & RTMUX_FLG_THR_KILLSELF) &&
+        !(thp->internal_flags & RTMUX_ITF_CANCEL_POSTED))
+        return;
+    switch (thp->state) {
+    case STATE_RUNNING:
+    case STATE_READY:
+    case STATE_DEAD:
+    case STATE_STOPPED:
+    case STATE_STACK:
+    case STATE_WAITPAGE:
+        /* Not waiting for an event: already woken, exiting (a pin would hold up
+         * its own reap), held by job control, or waiting for roottask, which
+         * readies it whatever is pending.
+         */
+        return;
+    default:
+        break;
+    }
+    if (!pc->pc_block_recheck && tthread_pin(thp) == EOK)
+        pc->pc_block_recheck = thp;
+}
+
+/* Deliver the past-deadline timeout block_current or block_and_ready captured
+ * for thp, now that thp is no longer this hart's current thread (their wrappers
+ * call this on every exit). A thread inside an IPC or join transition
+ * (WAIT_PENDING) keeps it for its own drain once the bit is clear: force_ready
+ * would spin on that bit here.
+ */
+static inline void block_timeout_drain(const thread_t *thp)
+{
+    if (!(thp->internal_flags & RTMUX_ITF_WAIT_PENDING))
+        timeout_deferred_fire();
+}
+
+/* block takes sched_slock around the dispatch mutation (FIND_HIGHEST,
+ * mark_running, set_active_thread). The pre-mutation timeout_start touches
+ * per-thread fields only and stays outside the lock; timestamp_last_block is
+ * stamped by the switch's own bill (sched_account_switch). Callers MUST NOT
+ * hold sched_slock on entry; cross-callers (unready, block_and_ready_default)
+ * drop it before calling. Put back, at the head of its list, a thread
+ * select_thread took for this hart that will not run now. Caller holds the
+ * local dispatch lock.
+ */
+static void dispatch_requeue_head(thread_t *thp)
+{
+    kdispatch_t *dpp = LOCAL_DPP;
+
+    /* A stolen thread reads RUNNING once unlinked; one taken from this hart's
+     * own queue still reads READY (the lock was held throughout). Any other
+     * state is an unready() since the steal (it locks this dispatch: thp->dpp
+     * is already this hart's), and the thread is not ours to queue.
+     */
+    if (thp->state != STATE_RUNNING && thp->state != STATE_READY)
+        return;
+    thp->dpp = dpp;
+    thp->state = STATE_READY;
+    DISPATCH_LINK_BEG(dpp, thp->priority, thp);
+    DISPATCH_SET(dpp, thp);
+}
+
+/* An interrupt reached the IST between its interrupt_wait and the switch away
+ * from it: consume it and keep running. Called with the local dispatch lock
+ * held and the IST still this hart's active thread; drops the lock.
+ */
+static void block_interrupt_arrived(thread_t *ist)
+{
+    atomic_clr(&ist->flags, RTMUX_FLG_THR_INTR_PENDING);
+    /* The STATE_INTR wait it published ends here (force_ready_wait). */
+    thread_note_wakeup(ist);
+    ist->state = STATE_RUNNING;
+    CRITICAL_MARK_THREAD(ist);
+    _TRACE_TH_EMIT_STATE(ist, RUNNING);
+    SCHED_UNLOCK_LOCAL();
+    if (ist->timeout_flags)
+        timeout_stop(ist);
+}
+
+static void block_current(bool interrupt_wait)
 {
     thread_t *act = get_active_thread(get_cpunum()), *thp = act;
 
     chk_dispatch(0);
 
-    snap_time(&(act->timestamp_last_block), 0);
-
-    /* Check for timeout timer */
+    /* Check for timeout timer. A deadline already past fires at once, and its
+     * wakeup must not run before the switch below: act would be queued while
+     * still current here, and a hart that steals it would make it current a
+     * second time. So it is captured and delivered after the switch.
+     */
     if (act->timeout_flags & RTMUX_FLG_TIMEOUT_MASK) {
-        timeout_start(act);
+        timeout_start_deferred(act);
     }
 
+    if (interrupt_wait)
+        inject_intr_before_switch(act);
     SCHED_LOCK_LOCAL();
+
+    /* The PLIC handler sets PENDING while the IST is still this hart's active
+     * thread, even after it published STATE_INTR. Check under the dispatch
+     * lock, which masks local IRQs. This first look saves the selection below
+     * when the interrupt is already there.
+     */
+    if (interrupt_wait && (act->flags & RTMUX_FLG_THR_INTR_PENDING)) {
+        block_interrupt_arrived(act);
+        return;
+    }
 
     /* Get highest priority thread which can run on this processor. */
     FIND_HIGHEST(act);
+
+    /* select_thread drops the dispatch lock, and with it the interrupt mask,
+     * while it looks at the other harts for a thread to steal. An interrupt
+     * taken in that window still finds the IST as this hart's active thread and
+     * only sets PENDING. Look again now that the lock is held through the
+     * switch: an IST displaced with PENDING set would sleep in STATE_INTR with
+     * its source masked, and nothing would ever wake it.
+     */
+    if (interrupt_wait) {
+        inject_intr_after_select(thp, act);
+        if (thp->flags & RTMUX_FLG_THR_INTR_PENDING) {
+            /* The IST keeps the hart. A thread taken for it goes back to the
+             * head of its list; if it outranks the IST, kernel_exit switches
+             * (ksys_interrupt_wait returns through it).
+             */
+            if (act) {
+                dispatch_requeue_head(act);
+                intrevent_preemption(act->priority);
+#if CONFIG_PROCESSORS_MAX > 1
+                kick_idle_hart(act);
+#endif
+            }
+            block_interrupt_arrived(thp);
+            return;
+        }
+    }
 
     if (!act) {
         /* No runnable thread on this CPU's dispatch queue. Clear actives[cpu]
@@ -1793,9 +2295,14 @@ void rdecl block(void)
          * kernel_exit → cpu_idle.
          */
         unsigned cpu = get_cpunum();
-        sched_account_now(); /* bill before reporting the quiescent state */
+        /* bill before reporting the quiescent state */
+        sched_account_switch(NULL);
         rcu_sched_quiescent();
         set_active_thread(cpu, NULL);
+#if CONFIG_PROCESSORS_MAX > 1
+        switched_away(thp);
+#endif
+        block_recheck_arm(thp);
         SCHED_UNLOCK_LOCAL();
         return;
     }
@@ -1808,6 +2315,8 @@ void rdecl block(void)
     }
 
     mark_running(act);
+    if (thp != act)
+        block_recheck_arm(thp);
 
     switch (thp->state) {
     case STATE_STOPPED:
@@ -1829,6 +2338,22 @@ void rdecl block(void)
 }
 
 
+void rdecl block(void)
+{
+    thread_t *act = get_active_thread(get_cpunum());
+
+    block_current(false);
+    block_timeout_drain(act);
+}
+
+void block_interrupt_wait(void)
+{
+    thread_t *act = get_active_thread(get_cpunum());
+
+    block_current(true);
+    block_timeout_drain(act);
+}
+
 /* Turnstile-style block: same as block(), but releases the supplied
  * LOCK_CLASS_TURNSTILE lock at the precise moment pc_curthread on this CPU has
  * been updated to the new active (or NULL). After that release, any peer hart
@@ -1846,32 +2371,37 @@ void rdecl block(void)
  *   to_release : turnstile chain lock to drop once pc_curthread no longer
  *                points at the blocking thread
  */
-static void rdecl block_release(kspinlock_t *to_release)
+static void rdecl block_release(int newstate, kspinlock_t *to_release)
 {
     thread_t *act = get_active_thread(get_cpunum()), *thp = act;
 
     chk_dispatch(0);
 
-    snap_time(&(act->timestamp_last_block), 0);
-
-    if (act->timeout_flags & RTMUX_FLG_TIMEOUT_MASK) {
-        /* Arm deferred: we still hold to_release (the turnstile chain lock). A
-         * past-deadline timeout fired inline here would re-enter that lock via
-         * force_ready and self-deadlock; timeout_deferred_fire() below delivers
-         * it once the lock is dropped.
-         */
-        timeout_start_deferred(act);
-    }
-
+    inject_block_stall(thp);
     SCHED_LOCK_LOCAL();
+    thp->state = (uint8_t) newstate;
+    _TRACE_TH_EMIT_ANY_STATE(thp, (unsigned) newstate);
+    if (act->timeout_flags & (1U << newstate)) {
+        /* Arm outside SCHED. Keep the chain lock until displacement and deliver
+         * any past-deadline timeout only after releasing it.
+         */
+        SCHED_UNLOCK_LOCAL();
+        timeout_start_deferred(act);
+        SCHED_LOCK_LOCAL();
+    }
 
     FIND_HIGHEST(act);
 
     if (!act) {
         unsigned cpu = get_cpunum();
-        sched_account_now(); /* bill before reporting the quiescent state */
+        /* bill before reporting the quiescent state */
+        sched_account_switch(NULL);
         rcu_sched_quiescent();
         set_active_thread(cpu, NULL);
+#if CONFIG_PROCESSORS_MAX > 1
+        switched_away(thp);
+#endif
+        block_recheck_arm(thp);
 
         /* pc_curthread is now NULL on this CPU — safe for peer wakers to ready
          * us via this chain. Release the chain lock.
@@ -1889,6 +2419,8 @@ static void rdecl block_release(kspinlock_t *to_release)
     }
 
     mark_running(act);
+    if (thp != act)
+        block_recheck_arm(thp);
 
     /* pc_curthread now points at the new active. Peer wakers observing thp on
      * the chain will see pc_curthread != thp on this CPU. Release the chain
@@ -1942,12 +2474,7 @@ void rdecl unready_release(thread_t *thp, int newstate, kspinlock_t *to_release)
         crash();
     }
 
-    SCHED_LOCK_LOCAL();
-    thp->state = (uint8_t) newstate;
-    _TRACE_TH_EMIT_ANY_STATE(thp, (unsigned) newstate);
-    SCHED_UNLOCK_LOCAL();
-
-    block_release(to_release);
+    block_release(newstate, to_release);
 }
 
 void __attribute__((noreturn)) rdecl
@@ -1985,12 +2512,12 @@ static inline void ready_enqueue_client(kdispatch_t *dpp,
     if (was_sendvnc && IS_SCHED_RR(thp)) {
         RR_ADD_PREEMPT_TICK(thp);
         if (RR_GET_TICKS(thp) < RR_MAXTICKS) {
-            LINK3_BEG(DISPATCH_LST(dpp, prio), &thp->link3_link, thread_t);
+            DISPATCH_LINK_BEG(dpp, prio, thp);
             return;
         }
     }
     RR_RESET_TICK(thp);
-    LINK3_END(DISPATCH_LST(dpp, prio), &thp->link3_link, thread_t);
+    DISPATCH_LINK_END(dpp, prio, thp);
 }
 
 #if CONFIG_PROCESSORS_MAX > 1
@@ -2042,12 +2569,63 @@ static int banned_here_target(const thread_t *thp)
 }
 #endif
 
+#if CONFIG_PROCESSORS_MAX > 1
+/* How long ready() waits for a thread's hart to switch away from it before it
+ * queues the thread anyway (microseconds). The pickers never make a thread
+ * current that another hart still has (thread_current_elsewhere), so the bound
+ * only trades a late dispatch for a waker that never spins without end.
+ */
+#define READY_SWITCH_WAIT_US 100
+
+/* Wait until thp is no longer the current thread of another hart.
+ *
+ * Returns false when thp needs no wakeup: it is current there and runnable.
+ *
+ * A thread publishes its wait state before its hart switches away from it, and
+ * a waker can claim the wait in between: a timer that expires, a signal, a
+ * notification. Queued then, thp could be picked by a third hart while its own
+ * still runs block() on its behalf. Wait for that switch, as the waker side of
+ * a context switch does. The hart only has to finish block(), which takes the
+ * timer wheel lock and dispatch locks, none of which a ready() caller holds;
+ * the bound covers a hart that is itself slow or waiting on this one.
+ *
+ * A waker on thp's own hart is an interrupt that preempted the switch, or the
+ * switch itself: it cannot wait, and the pickers hold thp back until the
+ * switch. A thread seen current and RUNNING or READY has no wait to end: its
+ * waker has already been here, since every waker reads the wait state its
+ * thread published before it claims the wait, and a later read of thp->state
+ * cannot return the older RUNNING. thp->runcpu names the hart: mark_running and
+ * the pickers set it before thp is current there.
+ */
+static bool ready_wait_switch_out(const thread_t *thp)
+{
+    unsigned self = get_cpunum();
+    uint64_t end;
+
+    if (TYPE_MASK(thp->type) != TYPE_THREAD ||
+        !thread_current_elsewhere(thp, self))
+        return true;
+    end =
+        r_time() + READY_SWITCH_WAIT_US * (qtimeptr->cycles_per_sec / 1000000);
+    do {
+        uint8_t state = __atomic_load_n(&thp->state, __ATOMIC_ACQUIRE);
+
+        if (state == STATE_RUNNING || state == STATE_READY)
+            return false;
+        if (r_time() > end)
+            return true;
+        __asm__ volatile("" ::: "memory");
+    } while (thread_current_elsewhere(thp, self));
+    cpu_smp_mb(); /* the switch before anything ready() reads of thp */
+    return true;
+}
+#endif
+
 /* ready_default takes the per-CPU dispatch lock internally around the
  * dispatch-list mutation; all callers funnel through the same lock.
  *
  * Callers MUST NOT hold sched_slock on entry. Direct callers in this file:
- * force_ready, adjust_priority_default (drops its lock around the internal
- * ready() calls). External callers (sync_wakeup) drop sync_slock first per the
+ * force_ready. External callers (sync_wakeup) drop sync_slock first per the
  * SCHED < SYNC rank order.
  */
 static void rdecl ready_default(thread_t *thp)
@@ -2057,10 +2635,17 @@ static void rdecl ready_default(thread_t *thp)
     uint8_t prio = thp->priority;
     int was_sendvnc = 0;
 
+    inject_ready_stall(thp);
     chk_dispatch(1);
     chk_thread(thp);
     THR_EV(thp);
     sync_chains_assert_readied(thp);
+#if CONFIG_PROCESSORS_MAX > 1
+    if (!ready_wait_switch_out(thp))
+        return;
+#endif
+    dispatch_owner_ready(thp,
+                         __builtin_return_address(0)); /* before any lock */
 
     if (thp->timeout_flags)
         timeout_stop(thp);
@@ -2095,6 +2680,10 @@ static void rdecl ready_default(thread_t *thp)
         return;
     }
 
+    /* The wakeup is decided: the wait it ends is over (force_ready_wait). A
+     * duplicate ready() returned above without touching the count.
+     */
+    thread_note_wakeup(thp);
     thp->link3_link.next = NULL;
     thp->link3_link.prev = NULL;
 
@@ -2129,7 +2718,7 @@ static void rdecl ready_default(thread_t *thp)
         _TRACE_TH_EMIT_STATE(thp, READY);
         thp->dpp = pcpu_array[get_cpunum()].pc_dispatch;
         dpp = thp->dpp;
-        LINK3_END(DISPATCH_LST(dpp, prio), &thp->link3_link, thread_t);
+        DISPATCH_LINK_END(dpp, prio, thp);
         DISPATCH_SET(dpp, thp);
 #if CONFIG_PROCESSORS_MAX > 1
         kick_idle_hart(thp);
@@ -2260,8 +2849,7 @@ static void rdecl ready_default(thread_t *thp)
                 }
                 RR_ADD_PREEMPT_TICK(act);
                 act->state = STATE_READY;
-                LINK3_BEG(DISPATCH_LST(dpp, act->priority), &act->link3_link,
-                          thread_t);
+                DISPATCH_LINK_BEG(dpp, act->priority, act);
 
                 SS_STOP_RUNNING(act, 1);
                 goto enqueue_done;
@@ -2310,7 +2898,7 @@ static void rdecl ready_default(thread_t *thp)
          */
         RR_ADD_PREEMPT_TICK(act);
         act->state = STATE_READY;
-        LINK3_BEG(DISPATCH_LST(dpp, act->priority), &act->link3_link, thread_t);
+        DISPATCH_LINK_BEG(dpp, act->priority, act);
 
         SS_STOP_RUNNING(act, 1);
     } else {
@@ -2340,18 +2928,22 @@ static void rdecl ready_default(thread_t *thp)
  * stop, the body degrades to a plain block() — and drops the lock first so the
  * inner block() can acquire it itself.
  */
-static void rdecl block_and_ready_default(thread_t *thp)
+static void rdecl block_and_ready_switch(thread_t *thp)
 {
     thread_t *act = get_active_thread(get_cpunum());
+    thread_t *old = act; /* a sender leaves in STATE_REPLY through here */
     kdispatch_t *dpp;
     uint8_t prio;
 
     chk_dispatch(0);
     chk_thread(thp);
+    inject_block_stall(act);
 
-    /* Check for timeout timers */
+    /* Check for timeout timers. A past deadline is delivered after the switch,
+     * as in block_current.
+     */
     if (act->timeout_flags & RTMUX_FLG_TIMEOUT_MASK) {
-        timeout_start(act);
+        timeout_start_deferred(act);
     }
 
     if (thp->timeout_flags)
@@ -2371,12 +2963,14 @@ static void rdecl block_and_ready_default(thread_t *thp)
         return;
     }
 
+    dispatch_owner_ready(thp,
+                         __builtin_return_address(0)); /* before the lock */
+    /* The thread leaves its wait: force_ready_wait. */
+    thread_note_wakeup(thp);
     SCHED_LOCK_LOCAL();
 
     thp->link3_link.next = NULL;
     thp->link3_link.prev = NULL;
-
-    SNAP_TIME_INLINE(act->timestamp_last_block, 0);
 
     /* Queue on this hart's instance, the one SCHED_LOCK_LOCAL() holds, as
      * ready_default does. thp->dpp may be another hart's (a thread created for
@@ -2399,6 +2993,7 @@ static void rdecl block_and_ready_default(thread_t *thp)
     if ((thp->runmask & (1u << get_cpunum())) == 0) {
         if (prio > act->priority || prio > DISPATCH_HIGHEST_PRI(dpp)) {
             mark_running(thp);
+            block_recheck_arm(old);
             chk_dispatch(1);
             SCHED_UNLOCK_LOCAL();
             return;
@@ -2417,6 +3012,7 @@ static void rdecl block_and_ready_default(thread_t *thp)
     /* Will thp be the highest priority thread ready to run? */
     if (prio > act->priority || prio > DISPATCH_HIGHEST_PRI(dpp)) {
         mark_running(thp);
+        block_recheck_arm(old);
         chk_dispatch(1);
         SCHED_UNLOCK_LOCAL();
         return;
@@ -2429,29 +3025,46 @@ static void rdecl block_and_ready_default(thread_t *thp)
          * cause this thread to run before any other FIFO threads that are
          * runnable at this priority
          */
-        LINK3_END(DISPATCH_LST(dpp, prio), &thp->link3_link, thread_t);
+        DISPATCH_LINK_END(dpp, prio, thp);
     } else {
-        LINK3_BEG(DISPATCH_LST(dpp, prio), &thp->link3_link, thread_t);
+        DISPATCH_LINK_BEG(dpp, prio, thp);
     }
     DISPATCH_SET(dpp, thp);
     thp->state = STATE_READY;
     _TRACE_TH_EMIT_STATE(thp, READY);
     FIND_HIGHEST(act);
     if (!act) {
-        sched_account_now();
+        sched_account_switch(NULL);
         rcu_sched_quiescent();
         set_active_thread(get_cpunum(), NULL);
+#if CONFIG_PROCESSORS_MAX > 1
+        switched_away(old);
+#endif
+        block_recheck_arm(old);
         chk_dispatch(1);
         SCHED_UNLOCK_LOCAL();
         return;
     }
 
     mark_running(act);
+    if (act != old)
+        block_recheck_arm(old);
 
     chk_dispatch(1);
     SCHED_UNLOCK_LOCAL();
 }
 
+
+/* The switch above, then the past-deadline timeout it captured for the thread
+ * that blocked, once that thread is no longer current here.
+ */
+static void rdecl block_and_ready_default(thread_t *thp)
+{
+    thread_t *act = get_active_thread(get_cpunum());
+
+    block_and_ready_switch(thp);
+    block_timeout_drain(act);
+}
 
 /**
  * Remove a thread from the ready list. If the thread being make unready is the
@@ -2480,6 +3093,7 @@ void rdecl unready(thread_t *thp, int newstate)
      * this acquire onward.
      */
     if (thp == get_active_thread(get_cpunum())) {
+        inject_block_stall(thp);
         SCHED_LOCK_LOCAL();
 
         /* Relaxed invariant. In the BKL era, thp's state was always RUNNING
@@ -2511,17 +3125,14 @@ void rdecl unready(thread_t *thp, int newstate)
     if (thp->state == STATE_RUNNING) {
         thp->state = (uint8_t) newstate;
         _TRACE_TH_EMIT_ANY_STATE(thp, (unsigned) newstate);
+        block_recheck_arm(thp); /* preempted inside its call, blocks now */
         SCHED_UNLOCK(thp_dpp);
         return;
     }
 
     /* Only remove from dispatch list if READY */
     if (thp->state == STATE_READY) {
-        LINK3_REM(DISPATCH_LST(thp_dpp, thp->priority), &thp->link3_link,
-                  thread_t);
-        if (!DISPATCH_THP(thp_dpp, thp->priority)) {
-            DISPATCH_CLR(thp_dpp, thp);
-        }
+        DISPATCH_UNLINK(thp_dpp, thp);
     }
 
     SNAP_TIME_INLINE(thp->timestamp_last_block, 0);
@@ -2534,6 +3145,7 @@ void rdecl unready(thread_t *thp, int newstate)
         timeout_start(thp);
     }
 
+    block_recheck_arm(thp);
     chk_dispatch(1);
     SCHED_UNLOCK(thp_dpp);
 }
@@ -2591,7 +3203,8 @@ static void rdecl yield_default(void)
 #if CONFIG_PROCESSORS_MAX > 1
         for (thp = DISPATCH_THP(dpp, prio); thp;
              thp = link3_to_thread(thp->link3_link.next)) {
-            if ((thp->runmask & runmask) == 0)
+            if ((thp->runmask & runmask) == 0 &&
+                !thread_current_elsewhere(thp, get_cpunum()))
                 break;
         }
 #else
@@ -2601,16 +3214,17 @@ static void rdecl yield_default(void)
             SCHED_UNLOCK_LOCAL();
             return;
         }
-        LINK3_REM(DISPATCH_LST(dpp, prio), &thp->link3_link, thread_t);
-        LINK3_END(DISPATCH_LST(dpp, prio), &act->link3_link, thread_t);
+        LINK3_REM(DISPATCH_LST(dpp, thp->qprio), &thp->link3_link, thread_t);
+        DISPATCH_LINK_END(dpp, prio, act);
         RR_RESET_TICK(act);
         sched_account_expose(); /* single-writer: bill before idle_pick can
                                    steal act
                                    */
         act->state = STATE_READY;
         _TRACE_TH_EMIT_STATE(act, READY);
+        inject_switch_stall(act);
+        mark_running(thp); /* before the unlock: see resched_default */
         SCHED_UNLOCK_LOCAL();
-        mark_running(thp);
         SS_STOP_RUNNING(act, 0);
         SS_MARK_ACTIVATION(act);
         chk_dispatch(1);
@@ -2681,11 +3295,17 @@ static void rdecl resched_default(void)
      * WAIT_FOR_CLOCK_DONE() in sched_ss_cleanup() waits us out instead; the
      * atomic add/sub tolerates a timer tick nesting this window.
      */
-    __atomic_fetch_add(&act->ticker_using, 1u, __ATOMIC_RELAXED);
-    __cpu_membarrier();
-    SS_CHECK_EXPIRY(act);
-    __cpu_membarrier();
-    __atomic_fetch_sub(&act->ticker_using, 1u, __ATOMIC_RELAXED);
+    if (__atomic_load_n(&act->policy, __ATOMIC_RELAXED) == SCHED_SPORADIC) {
+        __atomic_fetch_add(&act->ticker_using, 1u, __ATOMIC_RELAXED);
+        __cpu_membarrier();
+
+        /* Recheck the policy after publishing the reader. A concurrent switch
+         * away may already have retired the old budget.
+         */
+        SS_CHECK_EXPIRY(act);
+        __cpu_membarrier();
+        __atomic_fetch_sub(&act->ticker_using, 1u, __ATOMIC_RELAXED);
+    }
 
     /* If there is a replenishment pending, then do the adjustment If actives
      * has changed above, early out.
@@ -2721,7 +3341,10 @@ static void rdecl resched_default(void)
             memset(&info, 0, sizeof info);
             info.si_signo = SIGXCPU;
             info.si_code = CLD_KILLED;
-            info.si_status = SIGXCPU;
+
+            /* No si_status: it shares storage with si_addr, which the fault
+             * report prints. The exit status is taken from si_signo.
+             */
             deliver_fault(act, &info);
 
             /* The kernel-exit loop only re-reads the thread's flags when the
@@ -2748,8 +3371,8 @@ static void rdecl resched_default(void)
                           : act->priority);
 
     /* Same dispatch-list-mutation gap as yield_default. Hold sched_slock across
-     * select_thread (which does LINK3_REM internally) and the LINK3_BEG/END for
-     * act below. Drop before mark_running (which takes its own sched_slock).
+     * select_thread (which does LINK3_REM internally), the LINK3_BEG/END for
+     * act below and the switch to thp.
      */
     SCHED_LOCK_LOCAL();
     thp = select_thread((int) get_cpunum(), prio);
@@ -2768,12 +3391,10 @@ static void rdecl resched_default(void)
         if (yield_tail ||
             (IS_SCHED_RR(act) && RR_GET_TICKS(act) >= RR_MAXTICKS)) {
             RR_RESET_TICK(act);
-            LINK3_END(DISPATCH_LST(dpp, act->priority), &act->link3_link,
-                      thread_t);
+            DISPATCH_LINK_END(dpp, act->priority, act);
         } else {
             /* otherwise keep active at the head of the queue */
-            LINK3_BEG(DISPATCH_LST(dpp, act->priority), &act->link3_link,
-                      thread_t);
+            DISPATCH_LINK_BEG(dpp, act->priority, act);
         }
         DISPATCH_SET(dpp, act);
 
@@ -2782,8 +3403,14 @@ static void rdecl resched_default(void)
                                    */
         act->state = STATE_READY;
         _TRACE_TH_EMIT_STATE(act, READY);
-        SCHED_UNLOCK_LOCAL();
+
+        /* Switch before the unlock. act is on the queue now, and a hart that
+         * steals it makes it current; until mark_running moves this hart's
+         * pc_curthread to thp, act would be current here as well.
+         */
+        inject_switch_stall(act);
         mark_running(thp);
+        SCHED_UNLOCK_LOCAL();
     } else {
         SCHED_UNLOCK_LOCAL();
 #if CONFIG_PROCESSORS_MAX > 1
@@ -2804,13 +3431,28 @@ static void rdecl resched_default(void)
  * of the ready queue. Otherwise it goes on the end of the queue and gets it's
  * round robin information reset.
  */
+#if CONFIG_PROCESSORS_MAX > 1
+/* Tell hart cpu (if any) that a thread boosted to prio on a queue it can take
+ * from may outrank what it runs: an IPI for another hart (it goes out after the
+ * dispatch lock is dropped), a reschedule at kernel_exit for this one.
+ */
+static void reprio_tell_hart(int cpu, thread_t *act, unsigned prio)
+{
+    if (cpu < 0)
+        return;
+    if ((unsigned) cpu != get_cpunum()) {
+        if (cpu_online((unsigned) cpu))
+            SENDIPI((unsigned) cpu, IPI_RESCHED);
+    } else if (act && prio > act->priority) {
+        atomic_fetch_or_explicit(&act->async_flags, RTMUX_ATF_SMP_RESCHED,
+                                 memory_order_release);
+    }
+}
+#endif
+
 /* adjust_priority_default takes sched_slock around its dispatch-list mutations.
- * It drops the lock around two sub-calls that may not be held under
- * sched_slock:
- *   - yield() — context-switches; spinlock cannot span that.
- *   - ready() — itself takes sched_slock internally; would
- *     recurse-deadlock on a non-reentrant kspinlock.
- * Callers MUST NOT hold sched_slock on entry.
+ * It does not hold it across yield(), which context-switches. Callers MUST NOT
+ * hold sched_slock on entry.
  */
 static void rdecl adjust_priority_default(thread_t *thp,
                                           unsigned prio,
@@ -2832,11 +3474,8 @@ static void rdecl adjust_priority_default(thread_t *thp,
     }
 
     /* Lock the dispatch instance thp is on (may be a remote hart's
-     * percpu_dispatch[]). The body may LINK3_REM/BEG on thp's queue or call
-     * ready(thp), so the outer lock must cover thp's dispatch. ready() drops
-     * this lock internally for its own SCHED acquire path. We use thp_dpp
-     * consistently for lock/unlock; the value snapshotted here stays the lock
-     * we release at the function tail even if ready() relocated thp.
+     * percpu_dispatch[]): the body may LINK3_REM/BEG/END on thp's queue. The
+     * value snapshotted here is the lock released at the function tail.
      */
     outer_dpp = thp->dpp;
     SCHED_LOCK(outer_dpp);
@@ -2861,30 +3500,34 @@ static void rdecl adjust_priority_default(thread_t *thp,
         chk_thread(thp);
 
         /* Unlink from the ready queue */
-        LINK3_REM(DISPATCH_LST(dpp, thp->priority), &thp->link3_link, thread_t);
-        if (!DISPATCH_THP(dpp, thp->priority)) {
-            DISPATCH_CLR(dpp, thp);
-        }
+        DISPATCH_UNLINK(dpp, thp);
+
+        bool boost = prio > thp->priority;
 
         thp->priority = (uint8_t) prio;
 #if CONFIG_PROCESSORS_MAX > 1
 
-        /* pretty hokey, but ready_default() returns at once for a thread that
-         * is already READY, and this one was just taken off its queue. Done in
-         * every build: without it the thread would be dropped here.
+        /* Requeue at the new priority on the same queue, under the same lock,
+         * so a stop meanwhile finds the thread READY on it. A boost can let thp
+         * preempt what runs on its queue's hart or on the hart select_cpu()
+         * names (any picker steals what outranks its thread, select_thread), so
+         * both are told, and an idle hart may steal it. A drop needs no one:
+         * thp outranks nothing it did not before.
          */
-        thp->state = STATE_DEAD;
+        ready_enqueue_client(dpp, thp, prio, false);
+        DISPATCH_SET(dpp, thp);
+        inject_reprio_stall(thp);
+        if (boost) {
+            int owner = dpp_owner_cpu(dpp);
+            int best = select_cpu(thp);
 
-        /* ready() takes its own per-CPU dispatch lock — drop ours around it.
-         * After ready() returns, thp may have been routed to a different hart's
-         * queue; outer_dpp is the dispatch we entered with, and re-acquiring it
-         * is OK because the function tail only chk_dispatch's (walks all dpps)
-         * and exits.
-         */
-        SCHED_UNLOCK(outer_dpp);
-        ready(thp);
-        SCHED_LOCK(outer_dpp);
+            reprio_tell_hart(owner, act, prio);
+            if (best != owner)
+                reprio_tell_hart(best, act, prio);
+            kick_idle_hart(thp);
+        }
 #else
+        (void) boost;
         if (thp->priority > act->priority) {
             sched_account_expose(); /* single-writer: bill before idle_pick can
                                        steal act
@@ -2897,8 +3540,7 @@ static void rdecl adjust_priority_default(thread_t *thp,
 
             /* This guy should go to the head of the priority list, not the tail
              */
-            LINK3_BEG(DISPATCH_LST(dpp, thp->priority), &thp->link3_link,
-                      thread_t);
+            DISPATCH_LINK_BEG(dpp, thp->priority, thp);
 
             SS_STOP_RUNNING(act, 1);
         } else {
@@ -2906,8 +3548,7 @@ static void rdecl adjust_priority_default(thread_t *thp,
              * priority
              */
             RR_RESET_TICK(thp);
-            LINK3_END(DISPATCH_LST(dpp, thp->priority), &thp->link3_link,
-                      thread_t);
+            DISPATCH_LINK_END(dpp, thp->priority, thp);
         }
 
         DISPATCH_SET(dpp, thp);
@@ -2982,12 +3623,10 @@ static void rdecl adjust_priority_default(thread_t *thp,
                 act->priority = (uint8_t) prio;
                 if (priority_inherit) {
                     RR_ADD_PREEMPT_TICK(act);
-                    LINK3_BEG(DISPATCH_LST(dpp, act->priority),
-                              &act->link3_link, thread_t);
+                    DISPATCH_LINK_BEG(dpp, act->priority, act);
                 } else {
                     RR_RESET_TICK(act);
-                    LINK3_END(DISPATCH_LST(dpp, act->priority),
-                              &act->link3_link, thread_t);
+                    DISPATCH_LINK_END(dpp, act->priority, act);
                 }
 
                 DISPATCH_SET(dpp, act);
@@ -3020,24 +3659,17 @@ static void rdecl adjust_priority_default(thread_t *thp,
             _TRACE_TH_EMIT_STATE(act, READY);
             if (priority_inherit) {
                 RR_ADD_PREEMPT_TICK(act);
-                LINK3_BEG(DISPATCH_LST(dpp, act->priority), &act->link3_link,
-                          thread_t);
+                DISPATCH_LINK_BEG(dpp, act->priority, act);
             } else {
                 RR_RESET_TICK(act);
-                LINK3_END(DISPATCH_LST(dpp, act->priority), &act->link3_link,
-                          thread_t);
+                DISPATCH_LINK_END(dpp, act->priority, act);
             }
 
             DISPATCH_SET(dpp, act);
 
             /* Get highest priority thread. */
             act = DISPATCH_THP(dpp, DISPATCH_HIGHEST_PRI(dpp));
-            LINK3_REM(DISPATCH_LST(dpp, act->priority), &act->link3_link,
-                      thread_t);
-            /* If that list is now empty, clear the readybit.   */
-            if (!DISPATCH_THP(dpp, act->priority)) {
-                DISPATCH_CLR(dpp, act);
-            }
+            DISPATCH_UNLINK(dpp, act);
 
             mark_running(act);
 
@@ -3190,11 +3822,11 @@ int rdecl set_runmask(thread_t *thp, unsigned runmask)
              * ready() queues act on a hart its runmask allows. act stays
              * STATE_RUNNING throughout, so SIGCONT, a debugger resume or
              * teardown only flag and kick it and never ready it a second time.
-             * block() updates timestamp_last_block and charges the sporadic
-             * budget when it hands the hart to another thread (not when the
-             * hart goes idle, as for any block). ready_default skips the new
-             * sporadic activation for a RUNNING thread, so start it here, as a
-             * block and ready through any other state would.
+             * block() charges the sporadic budget when it hands the hart to
+             * another thread (not when the hart goes idle, as for any block).
+             * ready_default skips the new sporadic activation for a RUNNING
+             * thread, so start it here, as a block and ready through any other
+             * state would.
              */
             block();
 

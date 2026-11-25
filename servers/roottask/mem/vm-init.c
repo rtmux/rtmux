@@ -59,6 +59,7 @@ static int vm_handler(message_context_t *mctp,
      * copied out by the kernel extension).
      */
     root_proc_info_t prp_info, peer_info;
+    path_object_t *grown = NULL;
     int status;
 
     /* We are reply-blocked on proc, so prp cannot go away */
@@ -155,7 +156,7 @@ peer_restart:
     case _MEM_MAP:
         status = proc_wlock_adp(prp_pid);
         CRASHCHECK(status == -1);
-        status = vm_map(ctp, prp_pid, prp, &msg->map);
+        status = vm_map(ctp, prp_pid, prp, &msg->map, &grown);
         break;
 
     case _MEM_CTRL:
@@ -216,6 +217,15 @@ peer_restart:
         /* We're doing a peer process manipulation */
         root_proc_unlock(prp_pid);
     }
+
+    /* A resize under the locks just dropped (the sticky-file reload in
+     * vm_open_fd) leaves the mappings of its new pages to be made now. vm_map
+     * hands back the object it grew, so the reply also waits for a growth of it
+     * whose mappings another drain is still making.
+     */
+    vm_grow_drain(grown);
+    if (grown)
+        path_object_done(grown);
 
     return proc_status(ctp, status);
 }

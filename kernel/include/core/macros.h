@@ -31,6 +31,37 @@
 #define DISPATCH_THP(dpp, pri) link3_to_thread((dpp)->ready[pri].head)
 #define DISPATCH_LST(dpp, pri) ((dpp)->ready[pri])
 
+/* Queue a thread at the head or the tail of priority list pri, recording pri as
+ * its queue priority (thread_t.qprio). Its removal, and the ready bits, go by
+ * qprio, not by its priority: that can change while the thread is queued (a
+ * waker reads it, then the thread's priority moves before the enqueue), and a
+ * removal from the list named by the new priority leaves the old list's head,
+ * tail and bit wrong.
+ */
+#define DISPATCH_LINK_END(dpp, pri, thp)                \
+    {                                                   \
+        LINK3_HDR *_dlq = &DISPATCH_LST(dpp, pri);      \
+        (thp)->qprio = (uint8_t) (pri);                 \
+        LINK3_END(*_dlq, &(thp)->link3_link, thread_t); \
+    }
+#define DISPATCH_LINK_BEG(dpp, pri, thp)                \
+    {                                                   \
+        LINK3_HDR *_dlq = &DISPATCH_LST(dpp, pri);      \
+        (thp)->qprio = (uint8_t) (pri);                 \
+        LINK3_BEG(*_dlq, &(thp)->link3_link, thread_t); \
+    }
+
+/* Take thp off the list it is queued on, clearing that list's ready bit when it
+ * empties.
+ */
+#define DISPATCH_UNLINK(dpp, thp)                                      \
+    {                                                                  \
+        LINK3_REM(DISPATCH_LST(dpp, (thp)->qprio), &(thp)->link3_link, \
+                  thread_t);                                           \
+        if (!DISPATCH_THP(dpp, (thp)->qprio))                          \
+            DISPATCH_CLR(dpp, thp);                                    \
+    }
+
 /* Per-CPU sched-lock helpers. Each per-CPU dispatch instance carries its own
  * kspinlock_t lock. Same-CPU dispatch ops use the _LOCAL form; cross-CPU ops
  * pass the target dpp explicitly. Multi-dpp sequences must acquire locks in
@@ -38,22 +69,28 @@
  * lock_debug doesn't enforce ordering across same-class locks.
  */
 #define LOCAL_DPP (get_pcpu()->pc_dispatch)
-#define SCHED_LOCK_LOCAL() kspinlock_lock(&LOCAL_DPP->lock)
-#define SCHED_UNLOCK_LOCAL() kspinlock_unlock(&LOCAL_DPP->lock)
-#define SCHED_LOCK(dpp) kspinlock_lock(&(dpp)->lock)
-#define SCHED_UNLOCK(dpp) kspinlock_unlock(&(dpp)->lock)
+
+/* Dispatch locks. sched_lock/sched_unlock (core/globals.h) also count the
+ * nesting, so IPIs sent under a dispatch lock reach SBI after the outermost
+ * unlock (send_ipi).
+ */
+#define SCHED_LOCK_LOCAL() sched_lock(&LOCAL_DPP->lock)
+#define SCHED_UNLOCK_LOCAL() sched_unlock(&LOCAL_DPP->lock)
+#define SCHED_LOCK(dpp) sched_lock(&(dpp)->lock)
+#define SCHED_UNLOCK(dpp) sched_unlock(&(dpp)->lock)
 
 #if NUM_PRI <= 8
 
 #define DISPATCH_HIGHEST_PRI(dpp) (byte_log2[(dpp)->lo])
+#define DISPATCH_ANY(dpp) __atomic_load_n(&(dpp)->lo, __ATOMIC_RELAXED)
 #define DISPATCH_ISSET(dpp, pri) ((dpp)->lo & (1 << pri))
-#define DISPATCH_SET(dpp, thp)             \
-    {                                      \
-        (dpp)->lo |= 1 << (thp)->priority; \
+#define DISPATCH_SET(dpp, thp)          \
+    {                                   \
+        (dpp)->lo |= 1 << (thp)->qprio; \
     }
-#define DISPATCH_CLR(dpp, thp)                \
-    {                                         \
-        (dpp)->lo &= ~(1 << (thp)->priority); \
+#define DISPATCH_CLR(dpp, thp)             \
+    {                                      \
+        (dpp)->lo &= ~(1 << (thp)->qprio); \
     }
 
 #elif NUM_PRI <= 8 * 8
@@ -61,20 +98,21 @@
 #define DISPATCH_HI(dpp) byte_log2[(dpp)->hi]
 #define DISPATCH_LO(dpp) byte_log2[(dpp)->lo[DISPATCH_HI(dpp)]]
 #define DISPATCH_HIGHEST_PRI(dpp) ((DISPATCH_HI(dpp) << 3) | DISPATCH_LO(dpp))
+#define DISPATCH_ANY(dpp) __atomic_load_n(&(dpp)->hi, __ATOMIC_RELAXED)
 #define DISPATCH_ISSET(dpp, pri) ((dpp)->lo[pri >> 3] & (1 << (pri & 7)))
 
-#define DISPATCH_SET(dpp, thp)                       \
-    {                                                \
-        register unsigned hi = (thp)->priority >> 3; \
-        (dpp)->hi |= 1 << hi;                        \
-        (dpp)->lo[hi] |= 1 << ((thp)->priority & 7); \
+#define DISPATCH_SET(dpp, thp)                    \
+    {                                             \
+        register unsigned hi = (thp)->qprio >> 3; \
+        (dpp)->hi |= 1 << hi;                     \
+        (dpp)->lo[hi] |= 1 << ((thp)->qprio & 7); \
     }
 
-#define DISPATCH_CLR(dpp, thp)                                     \
-    {                                                              \
-        register unsigned hi = (thp)->priority >> 3;               \
-        if (((dpp)->lo[hi] &= ~(1 << ((thp)->priority & 7))) == 0) \
-            (dpp)->hi &= ~(1 << hi);                               \
+#define DISPATCH_CLR(dpp, thp)                                  \
+    {                                                           \
+        register unsigned hi = (thp)->qprio >> 3;               \
+        if (((dpp)->lo[hi] &= ~(1 << ((thp)->qprio & 7))) == 0) \
+            (dpp)->hi &= ~(1 << hi);                            \
     }
 
 #elif NUM_PRI <= 8 * 8 * 8
@@ -85,26 +123,32 @@
     byte_log2[(dpp)->lo[DISPATCH_HI(dpp)][DISPATCH_MID(dpp)]]
 #define DISPATCH_HIGHEST_PRI(dpp) \
     ((DISPATCH_HI(dpp) << 6) | (DISPATCH_MID(dpp) << 3) | DISPATCH_LO(dpp))
+
+/* Lock-free: whether anything is queued at all, for a stealer to skip an empty
+ * remote queue without taking its lock. Racy by design: a thread queued just
+ * after the peek is found by the kick that queueing sends, or the next scan.
+ */
+#define DISPATCH_ANY(dpp) __atomic_load_n(&(dpp)->hi, __ATOMIC_RELAXED)
 #define DISPATCH_ISSET(dpp, pri) \
     ((dpp)->lo[pri >> 6][(pri >> 3) & 7] & (1 << (pri & 7)))
 
-#define DISPATCH_SET(dpp, thp)                              \
-    {                                                       \
-        register unsigned hi = (thp)->priority >> 6;        \
-        register unsigned mid = ((thp)->priority >> 3) & 7; \
-        (dpp)->hi |= 1 << hi;                               \
-        (dpp)->mid[hi] |= 1 << mid;                         \
-        (dpp)->lo[hi][mid] |= 1 << ((thp)->priority & 7);   \
+#define DISPATCH_SET(dpp, thp)                           \
+    {                                                    \
+        register unsigned hi = (thp)->qprio >> 6;        \
+        register unsigned mid = ((thp)->qprio >> 3) & 7; \
+        (dpp)->hi |= 1 << hi;                            \
+        (dpp)->mid[hi] |= 1 << mid;                      \
+        (dpp)->lo[hi][mid] |= 1 << ((thp)->qprio & 7);   \
     }
 
-#define DISPATCH_CLR(dpp, thp)                                   \
-    {                                                            \
-        register unsigned hi = (thp)->priority >> 6;             \
-        register unsigned mid = ((thp)->priority >> 3) & 7;      \
-        if (((dpp)->lo[hi][mid] &=                               \
-             (uint8_t) ~(1u << ((thp)->priority & 7))) == 0)     \
-            if (((dpp)->mid[hi] &= (uint8_t) ~(1u << mid)) == 0) \
-                (dpp)->hi &= (uint8_t) ~(1u << hi);              \
+#define DISPATCH_CLR(dpp, thp)                                               \
+    {                                                                        \
+        register unsigned hi = (thp)->qprio >> 6;                            \
+        register unsigned mid = ((thp)->qprio >> 3) & 7;                     \
+        if (((dpp)->lo[hi][mid] &= (uint8_t) ~(1u << ((thp)->qprio & 7))) == \
+            0)                                                               \
+            if (((dpp)->mid[hi] &= (uint8_t) ~(1u << mid)) == 0)             \
+                (dpp)->hi &= (uint8_t) ~(1u << hi);                          \
     }
 
 #else
@@ -160,12 +204,19 @@
 
 /* Kernel-call restart / preemption */
 
-#define KCALL_RESTART(act)                                  \
-    {                                                       \
-        CRASHCHECK(TYPE_MASK(act->type) != TYPE_THREAD);    \
-        KSYS_RESTORE_KCALL_C_ARGS(act);                     \
-        SETKTYPE((act), _TRACE_GETSYSCALL((act)->syscall)); \
-        SETKIP(act, KIP(act) - KSYS_ENTRY_SIZE);            \
+/* The call runs again from its entry. What a transfer saved to resume from
+ * (xfer_begin_call) is kept for exactly that entry, so the mark is set here,
+ * where no restart can forget it.
+ */
+#define KCALL_RESTART(act)                                                  \
+    {                                                                       \
+        CRASHCHECK(TYPE_MASK(act->type) != TYPE_THREAD);                    \
+        KSYS_RESTORE_KCALL_C_ARGS(act);                                     \
+        SETKTYPE((act), _TRACE_GETSYSCALL((act)->syscall));                 \
+        SETKIP(act, KIP(act) - KSYS_ENTRY_SIZE);                            \
+        (act)->xfer_resume =                                                \
+            (uint16_t) (_TRACE_GETSYSCALL((unsigned) (act)->syscall) + 1U); \
+        (act)->xfer_resume_sp = (uintptr_t) KSP(act);                       \
     }
 
 /* NEED_PREEMPT — mid-kernel-extension-loop yield-check.
@@ -504,21 +555,28 @@ static __inline__ void __attribute__((__unused__)) atomic_boundary()
 /* Maximum number of iov entries in one message vector */
 #define XFER_IOV_LIMIT ((4 * 1024 * 1024) / 8)
 
-/* Entries xfer_iov_check() examines in one kernel entry */
-#define XFER_IOV_CHECK_STEP 512
-
-/* Work one bounded msg_readv / msg_writev kernel entry may do (xfermsg) before
- * it saves its cursor and restarts the call: iov entries stepped over, and
- * bytes copied.
+/* How long one kernel entry of a stepped transfer may spend on its vectors and
+ * its copy before it saves where it stands and restarts the call. The prelude
+ * of the call (lookup, claim) and two pieces of work come on top, so the budget
+ * is well under the 250 us a path may take (docs/rt-budgets.md).
  */
-#define XFER_STEP_ENTRIES 128
+#define XFER_BUDGET_US 100
+
+/* Work a stepped transfer does between two looks at the clock: iov entries
+ * stepped over, bytes copied, or (XFER_SUM_ENTRIES) entries of an array
+ * totalled and checked, which is far less work each. The budget runs from the
+ * first look, so a kernel entry does one such piece before it and overruns it
+ * by one at most. map_xfer maps no more than a piece per call.
+ */
+#define XFER_STEP_ENTRIES 64
 #define XFER_STEP_BYTES (8 * 1024)
+#define XFER_SUM_ENTRIES 512
 
-/* Send, receive and reply rescan both vectors before the copy on every restart,
- * so a message of more entries than this is copied in one piece, as before: the
- * rescans would cost more than the steps save.
+/* A pending preemption is looked for at the end of every piece; the clock,
+ * which costs a trap to the SBI on some targets, only once XFER_STEP_BYTES
+ * bytes or this many entries have gone by since it was last read.
  */
-#define XFER_STEP_PARTS_MAX 4096
+#define XFER_CLOCK_ENTRIES 512
 
 /* xferiov stopped at its work budget; map_xfer stopped skipping iov entries */
 #define XFER_YIELD 0x04
@@ -538,8 +596,32 @@ static __inline__ void __attribute__((__unused__)) atomic_boundary()
 
 /* Thread internal_flags */
 
+/* MSG_DELIVERY is a claim that force_ready must defer to, and it does so only
+ * with CONFIG_SMP_MSGOPT. A kernel for several harts without it would let a
+ * timeout or a teardown unlink a thread that another hart is copying to.
+ */
+#if defined(CONFIG_SMP) && CONFIG_PROCESSORS_MAX > 1 && \
+    !defined(CONFIG_SMP_MSGOPT)
+#error \
+    "an SMP kernel needs CONFIG_SMP_MSGOPT: force_ready ignores transfer claims without it"
+#endif
+
 #define RTMUX_ITF_MSG_DELIVERY 0x01U
 #define RTMUX_ITF_MSG_FORCE_RDY 0x02U
+
+/* A deliverer (a send, a notification) that has just unlinked receiver thp from
+ * its channel's receive queue, under the channel lock, says so here: from then
+ * until the deliverer readies it, with the lock dropped, thp is still in
+ * STATE_RECEIVE but on no queue. force_ready takes a receiver's blocked_on for
+ * the channel whose queue it is on, so it must stop naming one in the step that
+ * unlinks it.
+ */
+#define RECEIVER_TAKEN(thp)                                           \
+    do {                                                              \
+        __atomic_store_n(&(thp)->blocked_on, NULL, __ATOMIC_RELEASE); \
+        IPC_BLK(thp);                                                 \
+    } while (0)
+
 #define RTMUX_ITF_NET_UNBLOCK 0x04U /* for vthread only */
 #define RTMUX_ITF_SSTEP_SUSPEND 0x08U
 
@@ -586,6 +668,23 @@ static __inline__ void __attribute__((__unused__)) atomic_boundary()
 #define RTMUX_ITF_DEFER_DISPLACE 0x400U
 #define RTMUX_ITF_YIELD_TAIL 0x800U
 
+/* CANCEL_POSTED: a cancel this thread can act on is pending in its TLS. Set by
+ * the canceller, and brought up to date from the TLS by the thread itself at
+ * the start of each kernel call while it is set (thread_cancel_posted_refresh).
+ * The TLS is user memory, which the hart that blocks the thread cannot read, so
+ * this bit is what it tests once the thread is displaced (block_recheck_arm).
+ */
+#define RTMUX_ITF_CANCEL_POSTED 0x1000U
+
+/* CREATING: thread_create has put the thread in its process's thread vector and
+ * is still setting it up. Until its creator readies it the thread is
+ * STATE_DEAD, which thread_destroy would take for an exited thread and free
+ * under the creator; it flags such a thread to kill itself instead. Set under
+ * vec_slock in the step that adds the thread, cleared by the creator once the
+ * thread is readied.
+ */
+#define RTMUX_ITF_CREATING 0x2000U
+
 /* internal_flags is a single 32-bit word whose bits are written from MULTIPLE
  * CPUs concurrently. A thread sets/clears its OWN WAIT_PENDING /
  * RCVNOTIFICATION / SPECRET_PENDING bits (e.g. ksys_msg_receivev clearing
@@ -604,6 +703,18 @@ static __inline__ void __attribute__((__unused__)) atomic_boundary()
     atomic_or((volatile unsigned *) &(thp)->internal_flags, (unsigned) (bits))
 #define ITF_CLR(thp, bits) \
     atomic_clr((volatile unsigned *) &(thp)->internal_flags, (unsigned) (bits))
+
+/* process_t.flags is written from several paths that hold no common lock: the
+ * exit marks it under vec_slock, while the end of a load (kext_process_startup)
+ * and a debugger kill write it without. A plain read-modify-write there can
+ * undo the exit's TERMING and DESTROYALL, after which nothing stops a thread
+ * from being made or started in a process whose address space is going away.
+ * These go through the same atomic helpers as the thread flags.
+ */
+#define PROC_FLG_SET(prp, bits) \
+    atomic_or((volatile unsigned *) &(prp)->flags, (unsigned) (bits))
+#define PROC_FLG_CLR(prp, bits) \
+    atomic_clr((volatile unsigned *) &(prp)->flags, (unsigned) (bits))
 
 /* Async thread flags (set by the kernel) */
 

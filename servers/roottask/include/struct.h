@@ -18,8 +18,6 @@
 #include <smpswitch.h>
 
 
-#define PROC_INIT_PRIORITY 10 /* priority to start init thread at */
-
 union proc_msg_union {
     uint16_t type;
     proc_spawn_t spawn;
@@ -82,13 +80,25 @@ struct loader_context_base {
     siginfo_t info;
     pid_t pid;
     pid_t ppid;
+    pid_t owner; /* the spawner whose share of its class this counts against */
+    uint64_t held_since; /* CLOCK_MONOTONIC ns it was handed out, 0 when free */
+    /* ns before which its loader is not interrupted again for holding it too
+     * long (a second after the last time)
+     */
+    uint64_t interrupt_after;
     int fds_done; /* fd inheritance closed: no more _PROC_SPAWN_FD keys */
     int tid;
     unsigned long flags;
     unsigned msgsize;
+    unsigned action_bytes;
+    unsigned action_source_bytes;
     int state;
     struct loader_startup start;
-    int fault_errno;
+
+    /* The proc-loader.c line of the LOADER_EXIT that gave the load up, so the
+     * log can say which step failed (see loader_exit).
+     */
+    int exit_line;
 
     /* Bootstrap capabilities the manifest grants this child, resolved by the
      * loader from the absolute path it opened. Committed at _PROC_SPAWN_DONE.
@@ -111,6 +121,16 @@ struct loader_context {
      */
     union proc_msg_union msg;
 };
+
+/* Only explicitly named sources may import a close-on-exec descriptor. */
+static inline int loader_action_source(const struct loader_context *lcp, int fd)
+{
+    unsigned index = (unsigned) fd / 8;
+    const unsigned char *bits = (const unsigned char *) &lcp->msg +
+                                lcp->ctx.msgsize + lcp->ctx.action_bytes;
+    return index < lcp->ctx.action_source_bytes &&
+           (bits[index] & (1U << ((unsigned) fd % 8)));
+}
 
 /* Make a unique inode number */
 #define PID_TO_INO(pid, subtype) \

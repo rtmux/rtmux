@@ -16,13 +16,17 @@ evidence), and the shared check list passes:
 `make check`, `make check-posix-matrix`,
 `scripts/qemu-regress.sh --mode syscall-testing --timeout 180`.
 
+The public ABI check compiles the headers under `include/` and links a reference
+to each external function against the target libc and dynamic loader. Run
+`make check-libc-abi` to check both declarations and the export baseline.
+
 ## Single-owner map
 
 | Facility | Owner (definition) | Role | Status |
 | --- | --- | --- | --- |
 | `errno` | libc owner: `__get_errno_ptr()` in `lib/libc/rtmux/tls.c:20`; `<errno.h>` is `#define errno (*__get_errno_ptr())` over `LIBC_TLS()->__errptr` | RTMux TLS seam | Single owner within libc. A separate early-boot `int errno` + fallback `__get_errno_ptr()` lives in `arch/riscv/startup/entry.c:187-209` for the pre-TLS startup path; it is not a libc duplicate but the seam should stay documented. |
 | `environ` | `char **environ` in `lib/libc/stdlib/getenv.c:11`; every other site is `extern` | C11/POSIX body | Single owner verified. |
-| stdio streams | `__sF[3]` plus `stdin`/`stdout`/`stderr` (and BSD `__std*p` aliases) in `lib/libc/stdio/findfp.c:36-47` | C11/POSIX body | Single owner verified. |
+| stdio streams | `lib/libc/stdio/findfp.c` owns the three standard streams and the expandable stream pool. A mutex protects slot reservation and release. Each `FILE` retains its recursive lock on reuse. | C11/POSIX body | `fopen` and `fdopen` report `EMFILE` for descriptors above `SHRT_MAX`. `fdopen` leaves ownership with its caller on failure. |
 | `malloc` | exactly one public `malloc()` in `lib/libc/alloc/malloc.c:18`; allocator internals in `lib/libc/alloc/malloc-core.c` | C11/POSIX body | Single owner verified. (`lib/libc/ioserv/link-alloc.c` is not a second allocator — it allocates I/O-service link records via `calloc()`.) |
 | pthread TCB / TLS | `struct _thread_local_storage` in `include/sys/storage.h:19`; accessor `__tls()` / `LIBC_TLS()` in `lib/libc/rtmux/tls.c:15` | RTMux TLS seam | Single owner verified. |
 | spawn attrs | opaque `posix_spawnattr_t` = `uintptr_t` (`include/spawn.h:29`); internal `_posix_spawnattr_t` defined once in `lib/libc/spawn/posix-spawnattr.h:80`; handle codec `set_attrp`/`get_attrp` and the storage owner `_posix_spawnattr_t_realloc` (`posix-spawnattr-support.c:145`) | C11/POSIX body | Single owner verified. |

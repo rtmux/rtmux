@@ -30,7 +30,8 @@
                                              : MEM_RESIZE_END_MAX)
 
 static int mem_handle;
-static dev_t mem_devno;
+static dev_t mem_devno, shmem_devno, tymem_devno;
+static int tymem_handle;
 
 struct mem_ocb {
     uint64_t pos;
@@ -94,12 +95,6 @@ static void mem_flock_release(path_object_t *obj, pid_t pid);
 static void mem_flock_wake(path_object_t *obj);
 static void mem_flock_purge(int scoid, int coid);
 
-static void mem_undo_grow(path_object_t *obp, uint64_t from, uint64_t to)
-{
-    if ((uint64_t) OBJECT_SIZE(obp) == to)
-        (void) root_vm_ops.resize(obp, (size_t) from);
-}
-
 static int mem_read_write(ioserv_context_t *ctp,
                           ioserv_msg_t *msg,
                           struct mem_ocb *ocb)
@@ -116,7 +111,7 @@ static int mem_read_write(ioserv_context_t *ctp,
     int combined;
     int client_locked = 0;
     int grown = 0;
-    uint64_t grown_from = 0, grown_to = 0;
+    struct vm_growth growth;
 
     if (!ocb) {
         nbytes = 0;
@@ -205,21 +200,25 @@ static int mem_read_write(ioserv_context_t *ctp,
             return EPERM;
         }
     }
-    if (*pos > size || nbytes > size - *pos) {
-        if (obp && msg->type == _IO_WRITE) {
-            int status;
+    if (obp && writing) {
+        /* Every write bumps the write generation, a growing one under the same
+         * lock as its growth, so a failed write's undo sees any writer that
+         * came after it.
+         */
+        int status = vm_grow(obp, *pos + nbytes, &growth);
 
-            grown_from = (uint64_t) OBJECT_SIZE(obp);
-            status = root_vm_ops.resize(obp, *pos + nbytes);
-            if (status != EOK) {
-                if (client_locked)
-                    proc_unlock_adp(ctp->info.pid);
-                return status;
-            }
-            grown = 1;
-            grown_to = (uint64_t) OBJECT_SIZE(obp);
-            size = (size_t) grown_to;
-        }
+        if (status != EOK)
+            return status;
+        grown = growth.to > growth.from;
+        size = (size_t) growth.to;
+
+        /* A test can hold a growing write here, before its copy, so that
+         * another write lands in the grown range first.
+         */
+        if (grown)
+            proc_pgrp_window(PGRP_WINDOW_WRITE_GROWN);
+    }
+    if (*pos > size || nbytes > size - *pos) {
         if (*pos >= size) {
             nbytes = 0;
         } else {
@@ -235,7 +234,7 @@ static int mem_read_write(ioserv_context_t *ctp,
             if (client_locked)
                 proc_unlock_adp(ctp->info.pid);
             if (grown)
-                mem_undo_grow(obp, grown_from, grown_to);
+                vm_undo_grow(obp, &growth);
             return EAGAIN;
         }
         process_bind(ROOTTASK_PID);
@@ -259,7 +258,7 @@ static int mem_read_write(ioserv_context_t *ctp,
             if (client_locked)
                 proc_unlock_adp(ctp->info.pid);
             if (grown)
-                mem_undo_grow(obp, grown_from, grown_to);
+                vm_undo_grow(obp, &growth);
             return status;
         }
 
@@ -286,7 +285,7 @@ static int mem_read_write(ioserv_context_t *ctp,
             if (client_locked)
                 proc_unlock_adp(ctp->info.pid);
             if (grown)
-                mem_undo_grow(obp, grown_from, grown_to);
+                vm_undo_grow(obp, &growth);
             return status == -1 ? err : EIO;
         }
 
@@ -405,7 +404,8 @@ static int mem_stat(ioserv_context_t *ctp, io_stat_t *msg, void *vocb)
         msg->o.st_mode =
             (obp->mem.pm.mode != 0) ? obp->mem.pm.mode : S_IFNAM | 0777;
         msg->o.st_nlink = obp->hdr.refs;
-        msg->o.st_dev = path_devno;
+        msg->o.st_dev =
+            obp->hdr.type == OBJECT_MEM_TYPED ? tymem_devno : shmem_devno;
         msg->o.st_rdev = S_ISNAM(msg->o.st_mode) ? _S_INSHD : 0;
     } else {
         /* The /dev/mem device is set to rw root only, the /dev/shmem device is
@@ -413,7 +413,9 @@ static int mem_stat(ioserv_context_t *ctp, io_stat_t *msg, void *vocb)
          */
         msg->o.st_mode = ocb ? S_IFREG | 0600 : S_IFDIR | 0777;
         msg->o.st_nlink = ocb ? 1 : 2;
-        msg->o.st_dev = mem_devno;
+        msg->o.st_dev =
+            ocb ? mem_devno
+                : (ctp->id == tymem_handle ? tymem_devno : shmem_devno);
         msg->o.st_rdev = 0;
     }
     msg->o.st_dev |= (ctp->info.srcnd << RTMUX_NODE_BITS);
@@ -586,7 +588,10 @@ static int mem_space(ioserv_context_t *ctp, io_space_t *msg, void *vocb)
     switch (msg->i.subtype) {
     case F_ALLOCSP:
         if (end > (uint64_t) OBJECT_SIZE(obj)) {
-            status = vm_resize(obj, end);
+            /* vm_resize's rule: a special object keeps its size. */
+            if (obj->mem.mm.flags & MM_SHMEM_SPECIAL)
+                return EINVAL;
+            status = vm_grow(obj, end, NULL);
             if (status != EOK) {
                 return status;
             }
@@ -1515,9 +1520,13 @@ void devmem_init(void)
     /* RUSH3: Decide if "/dev/tymem" should be a fully usable directory RUSH3:
      * structure
      */
-    ioserv_attach(dpp, NULL, "/dev/tymem", _FTYPE_TYMEM, IOSERV_FLAG_DIR,
-                  &tymem_connect_funcs, &tymem_io_funcs, 0);
-    hwres_proc_devno("dev", &mem_devno, -1, 0);
+    tymem_handle =
+        ioserv_attach(dpp, NULL, "/dev/tymem", _FTYPE_TYMEM, IOSERV_FLAG_DIR,
+                      &tymem_connect_funcs, &tymem_io_funcs, 0);
+    if (hwres_proc_devno("dev", &mem_devno, -1, 0) != EOK ||
+        hwres_proc_devno("shmem", &shmem_devno, -1, 0) != EOK ||
+        hwres_proc_devno("tymem", &tymem_devno, -1, 0) != EOK)
+        crash();
 }
 
 

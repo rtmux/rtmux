@@ -18,15 +18,16 @@
 
 #include "env-lock.h"
 
-static int parse_envvar_str(char *str, const char *token, char ***value);
+#include "exec-path-default.h"
+#include <exec-path.h>
 
 /* posix_spawnp — like posix_spawn(), except that <file> may be a bare name; in
  * that case the $PATH of the calling process is searched for the executable,
  * and posix_spawn() is then invoked with the resolved absolute path.
  *
  * Errors:
- *   ENOENT  - <file> not found in any $PATH component (or $PATH unset).
- *   ENOMEM  - couldn't strdup($PATH) for tokenisation.
+ *   ENOENT  - <file> not found in any $PATH component.
+ *   ENOMEM  - couldn't copy the search path.
  *   any errno from posix_spawn() — see posix-spawn.c.
  */
 int posix_spawnp(pid_t *restrict pid,
@@ -45,127 +46,31 @@ int posix_spawnp(pid_t *restrict pid,
     if (strchr(file, '/'))
         return posix_spawn(pid, file, file_actions, attrp, argv, envp);
 
-    int num_paths;
-    int r = -1;
-    int i;
-    char *envvar_str;
-    const char *path_env;
-    char **env_path;
-    char path[PATH_MAX + 1];
-
-    /* Copy PATH under the environment lock, so setenv cannot change it or free
-     * the vector while it is read.
-     */
     __env_lock();
-    path_env = getenv("PATH");
-    envvar_str = path_env ? strdup(path_env) : NULL;
+    const char *env = getenv("PATH");
+    bool use_default = env == NULL;
+    char *dirs = env ? strdup(env) : NULL;
     __env_unlock();
-    if (!path_env)
-        return ENOENT;
-    if (!envvar_str)
-        return ENOMEM;
+    if (use_default)
+        dirs = exec_path_default();
+    if (!dirs)
+        return use_default ? errno : ENOMEM;
 
-    if ((num_paths = parse_envvar_str(envvar_str, ":", &env_path)) <= 0) {
-        free(envvar_str);
-        return ENOENT;
-    }
-
-    for (i = 0; i < num_paths; i++) {
-        struct stat dummy;
-
-        /* Resolve a relative $PATH entry against the caller's cwd, as the
-         * stat() below does, so posix_spawn() cannot resolve it against the
-         * directory chdir file actions leave and run a different file.
-         */
-        if (env_path[i][0] != '/') {
-            char *b;
-            int trys = 5;
-
-            while (--trys >= 0 && !(b = getcwd(path, sizeof(path))) &&
-                   (r = errno) == EAGAIN)
-                ;
-            if (!b) {
-                if (r == EAGAIN)
-                    break; /* too many retries — give up */
-                continue;  /* try next $PATH entry */
-            }
-            size_t len = strlen(path);
-            size_t elen = strlen(env_path[i]);
-            int n;
-
-            while (elen > 0 && env_path[i][elen - 1] == '/')
-                elen--;
-            /* "" and "." name the cwd itself; "./" was the old special case */
-            if (elen == 1 && env_path[i][0] == '.')
-                elen = 0;
-
-            /* An entry that cannot fit is too long anyway; refusing it here
-             * also keeps the %.*s precision below from narrowing a length past
-             * INT_MAX to a smaller one and naming a truncated candidate.
-             */
-            if (elen >= sizeof(path) - len) {
-                if (r != EACCES)
-                    r = ENAMETOOLONG;
-                continue; /* a later entry may still fit */
-            }
-            n = snprintf(path + len, sizeof(path) - len, "%s%.*s%s%s",
-                         len > 1 ? "/" : "", (int) elen, env_path[i],
-                         elen ? "/" : "", file);
-
-            if (n < 0 || (size_t) n >= sizeof(path) - len) {
-                if (r != EACCES)
-                    r = ENAMETOOLONG;
-                continue; /* a later entry may still fit */
-            }
-        } else {
-            int n = snprintf(path, sizeof(path), "%s/%s", env_path[i], file);
-
-            if (n < 0 || (size_t) n >= sizeof(path)) {
-                if (r != EACCES)
-                    r = ENAMETOOLONG;
-                continue; /* a later entry may still fit */
-            }
-        }
-
-        if (stat(path, &dummy) == 0) {
-            r = posix_spawn(pid, path, file_actions, attrp, argv, envp);
-
-            /* POSIX: continue the search past EACCES, but stop on any other
-             * error (or success).
-             */
-            if (r != EACCES)
-                break;
-        } else if (r != EACCES) {
-            r = errno; /* keep an earlier EACCES over a later ENOENT */
+    const char *cursor = dirs;
+    int saved = ENOENT;
+    while (cursor) {
+        char path[PATH_MAX + 1];
+        struct stat st;
+        int rc = exec_path_candidate(&cursor, file, path, sizeof path, true);
+        if (!rc && stat(path, &st) < 0)
+            rc = errno;
+        if (!rc)
+            rc = posix_spawn(pid, path, file_actions, attrp, argv, envp);
+        if (!exec_path_continue(rc, &saved)) {
+            saved = rc;
+            break;
         }
     }
-
-    free(env_path);
-    free(envvar_str);
-    return r != -1 ? r : ENOENT;
-}
-
-/* parse_envvar_str — split <str> at <token> in place, returning the count of
- * tokens and a malloc'd array of pointers in *value. Caller frees *value on a
- * positive return.
- */
-static int parse_envvar_str(char *str, const char *token, char ***value)
-{
-    int n = 0;
-    char *saveptr;
-    char *s = strtok_r(str, token, &saveptr);
-
-    *value = NULL;
-    while (s) {
-        char **tmp = realloc(*value, (size_t) (n + 1) * sizeof(*tmp));
-        if (!tmp) {
-            free(*value);
-            *value = NULL;
-            return -1;
-        }
-        *value = tmp;
-        (*value)[n++] = s;
-        s = strtok_r(NULL, token, &saveptr);
-    }
-    return n;
+    free(dirs);
+    return saved;
 }

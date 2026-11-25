@@ -21,6 +21,7 @@ mainfs=/dev/nvme0n1p8
 rtmux_run=
 rtmux_laps=
 rtmux_spawn_procs=0
+preempt_latency_args=
 if read cmdline < /sys/cmdline; then
     for arg in $cmdline; do
         case "$arg" in
@@ -28,6 +29,9 @@ if read cmdline < /sys/cmdline; then
             rtmux.run=*) rtmux_run=${arg#rtmux.run=} ;;
             rtmux.laps=*) rtmux_laps=${arg#rtmux.laps=} ;;
             rtmux.spawn_procs=*) rtmux_spawn_procs=${arg#rtmux.spawn_procs=} ;;
+            # The host audits late wakes against its own scheduling
+            # (scripts/vcpu-steal.py).
+            rtmux.host_audit=1) preempt_latency_args=--host-audit ;;
         esac
     done
 fi
@@ -89,6 +93,26 @@ if test "$rtmux_run" = "tickless-idle"; then
     exec /bin/sh -i
 fi
 
+if test "$rtmux_run" = "crash-inject"; then
+    echo "RTMux crash-inject: BEGIN"
+
+    # Crash the kernel on purpose. The guest never reports a result; the
+    # harness's crash dump is what is under test.
+    /bin/inject crash
+    sleep 100000
+    exec /bin/sh -i
+fi
+
+if test "$rtmux_run" = "crash-inject-shutdown"; then
+    echo "RTMux crash-inject-shutdown: BEGIN"
+
+    # As crash-inject, through a crash report and the SBI power-off a
+    # roottask crash ends in; the harness keeps QEMU for the dump.
+    /bin/inject crash shutdown
+    sleep 100000
+    exec /bin/sh -i
+fi
+
 if test "$rtmux_run" = "hang-inject"; then
     echo "RTMux hang-inject: BEGIN"
 
@@ -116,103 +140,127 @@ if test "$rtmux_run" = "debug-inject"; then
             stalled=1
         fi
     done
-    ok=0
-    if test "$stalled" = 1; then
-        if /bin/inject alloc-status && echo INJECT-OK; then
-            ok=1
-        fi
-    fi
+    # Each stage runs unless an earlier one failed; the first failure is
+    # named in the verdict.
+    failed=
+    stage() {
+        test -n "$failed" || "$@" || failed="$*"
+    }
+    test "$stalled" = 1 || failed="inject spin-irqoff (no hart could be stalled)"
+    stage /bin/inject alloc-status
+    stage echo INJECT-OK
 
     # A client's disconnect notice must survive a failing notification alloc.
     # Starts once the stall is over: the test's own cross-hart traffic would
     # otherwise trip the kernel's spin watchdog on the stalled hart.
-    if test "$ok" = 1; then
-        sleep 4
-        if /bin/syscall_testing --disconnect-alloc-failure; then
-            ok=2
-        fi
-    fi
+    stage sleep 4
+    stage /bin/syscall_testing --disconnect-alloc-failure
     # A failing kcall must keep its error status when its caller was switched
     # out inside the call, also when the caller may run on every hart.
-    if test "$ok" = 2; then
-        if /bin/syscall_testing --sched-set-error &&
-            /bin/syscall_testing --sched-set-error-migrate; then
-            ok=3
-        fi
-    fi
+    stage /bin/syscall_testing --sched-set-error
+    stage /bin/syscall_testing --sched-set-error-migrate
     # A condition wait on a PI mutex must not lose the mutex to a failing
     # turnstile allocation.
-    if test "$ok" = 3; then
-        if /bin/syscall_testing --condvar-reacquire-alloc-failure; then
-            ok=4
-        fi
-    fi
+    stage /bin/syscall_testing --condvar-reacquire-alloc-failure
     # A PI mutex waiter that has published itself but not yet queued must not
     # be stranded by another unlock.
-    if test "$ok" = 4; then
-        if /bin/syscall_testing --mutex-waiting-republish; then
-            ok=5
-        fi
+    if test -z "$failed"; then
+        /bin/pipe &
     fi
-    # An interrupt of a condition wait that lost the race with the wakeup must
-    # leave the woken thread alone.
-    if test "$ok" = 5; then
-        if /bin/syscall_testing --condvar-interrupt-stale; then
-            ok=6
-        fi
-    fi
+    stage waitfor /dev/pipe 10
+    stage /bin/syscall_testing --mutex-waiting-republish
+    # An interrupt or a cancel that lost the race with the wakeup must leave
+    # the woken thread alone.
+    stage /bin/syscall_testing --condvar-interrupt-stale
+    stage /bin/syscall_testing --wait-rewait
+    # A timer fire held past the end of its sleep must not end the next one.
+    stage /bin/syscall_testing --timer-fire-stale
+    stage /bin/syscall_testing --sync-kill-handoff
+    stage /bin/syscall_testing --block-request-race
+    stage /bin/syscall_testing --dispatch-window
+    stage /bin/syscall_testing --k65-windows
+    stage /bin/syscall_testing --intr-before-switch
+    stage /bin/syscall_testing --intr-after-select
     # A request parked behind another on one namespace node must not cost the
-    # request it waited for its combined result or its connection state.
-    if test "$ok" = 6; then
-        if /bin/syscall_testing --ns-open-deferral; then
-            ok=7
-        fi
-    fi
+    # request it waited for its combined result or its connection state, nor
+    # must an unlink that lands between a request's open and its stat, nor a
+    # detach that frees the object an open is working on.
+    stage /bin/syscall_testing --ns-open-deferral
     # A MAP that meets a superpage half way must report its progress, so the
     # pages it already mapped are unmapped, and must leave no page behind.
-    if test "$ok" = 7; then
-        if /bin/syscall_testing --pte-partial-map; then
-            ok=8
-        fi
-    fi
+    stage /bin/syscall_testing --pte-partial-map
+    # A write that fails after growing its object must not give back a growth
+    # another write has used meanwhile.
+    stage /bin/syscall_testing --write-undo
+    # A loader context whose mapping fails part of the way must give its
+    # physical memory back, every time.
+    stage /bin/syscall_testing --anon-map-failure
     # A waiter that must lend its priority but is not yet queued still counts
     # when the owner hands the mutex on, and a contended lock that cannot get a
     # turnstile takes back the WAITING bit it published.
-    if test "$ok" = 8; then
-        if /bin/syscall_testing --mutex-handoff-loan; then
-            ok=9
-        fi
-    fi
-    if test "$ok" = 9; then
-        if /bin/syscall_testing --mutex-waiting-withdrawn; then
-            ok=10
-        fi
-    fi
+    stage /bin/syscall_testing --mutex-handoff-loan
+    stage /bin/syscall_testing --mutex-waiting-withdrawn
     # setpgid and tcsetsid(-1) racing a reap and a rebind, each held open at the
     # point where it has checked and not yet changed. The case spawns children
     # that wait on pipes, and binds a terminal the init session does not own.
-    if test "$ok" = 10; then
-        /bin/pipe &
+    if test -z "$failed"; then
         /sbin/logger
         /sbin/virtio-mmio
         /sbin/virtio-mmio --register-boot
         /bin/dev-serial-8250 &
-        if waitfor /dev/pipe 10 && waitfor /dev/ser1 5 &&
-            /bin/syscall_testing --pgrp-races; then
-            ok=11
-        fi
     fi
+    stage waitfor /dev/pipe 10
+    stage waitfor /dev/ser1 5
+    stage /bin/syscall_testing --pgrp-races
     # A client that leaves REPLY by timeout while its server is blocked on a
     # second server must have the server settled in thread context, along the
     # chain, and no priority work run in the departure itself.
-    if test "$ok" = 11; then
-        if /bin/syscall_testing --prio-loan-context; then
-            ok=12
-        fi
-    fi
-    if test "$ok" = 12; then
+    stage /bin/syscall_testing --prio-loan-context
+    # The wake-latency probe must report a hart held with interrupts off as a
+    # late wake: the detector behind the smp-invariants gate, tested against
+    # a real stall.
+    stage /bin/preempt-latency --inject-stall 300
+    # A reply must fail cleanly when a channel destroy detaches its connection
+    # after the rcvid lookup, and must give its claim up when it restarts after
+    # removing an unblock notification.
+    stage /bin/syscall_testing --reply-claim
+    # A stepped copy must resume where it stopped when its header peek meets a
+    # pending preemption.
+    stage /bin/syscall_testing --xfer-resume
+    # A long message with a capability header is copied in steps, and its
+    # receiver sees the header the kernel examined.
+    stage /bin/syscall_testing --cap-step
+    # A server thread that acts late on a receive id must not reach the
+    # request that is blocked under the same id by then.
+    stage /bin/syscall_testing --rcvid-reuse
+    # A service's reply is lost when its client leaves by the unblock path
+    # with the kernel unable to tell the service: the binding it made for
+    # that client must be closed.
+    stage /bin/syscall_testing --ioserv-lost-reply-unblock
+    # A process that registers as the remote IPC service reaches the
+    # kernel's remote IPC paths, with and without its service channel.
+    stage /bin/syscall_testing --remote-ipc
+    # A forced exit whose threads take a while to destroy must not keep other
+    # requests about the process waiting.
+    stage /bin/syscall_testing --slow-reap-kill
+    # A spawn whose loader faults must fail with EFAULT, not ENOMEM.
+    stage /bin/syscall_testing --loader-fault
+    # Sixteen large posix_spawn requests held inside roottask's handler at
+    # once must queue for its heap, not fail with ENOMEM.
+    stage /bin/syscall_testing --spawn-heap-gate
+    # A SIGKILL in the middle of a large MAP for the victim must not wait for
+    # the MAP to finish zeroing its pages.
+    stage /bin/syscall_testing --map-kill
+    # A SIGKILL while a thread create is held between publishing the thread and
+    # its first run must reap the victim.
+    stage /bin/syscall_testing --create-kill
+    # An exec given up in its first step must leave the caller able to start
+    # threads and exec.
+    stage /bin/syscall_testing --exec-abandon
+    if test -z "$failed"; then
         echo "RTMux debug-inject: PASS"
     else
+        echo "RTMux debug-inject: failed stage: $failed"
         echo "RTMux debug-inject: FAIL"
     fi
     shutdown -h
@@ -353,7 +401,7 @@ if test "$rtmux_run" = "preempt-latency"; then
     /sbin/virtio-mmio
     /sbin/virtio-mmio --register-boot
     echo "RTMux preempt-latency: BEGIN"
-    /bin/preempt-latency
+    /bin/preempt-latency $preempt_latency_args
     report_rc preempt-latency $?
     shutdown -h
     sleep 1
@@ -394,6 +442,18 @@ if test "$rtmux_run" = "ipc-contention"; then
     exec /bin/sh -i
 fi
 
+if test "$rtmux_run" = "lock-debug"; then
+    echo "RTMux lock-debug: BEGIN"
+    if /bin/lock-rank-stress --tickets && /bin/lock-rank-stress 100; then
+        echo "RTMux lock-debug: PASS"
+    else
+        echo "RTMux lock-debug: FAIL"
+    fi
+    shutdown -h
+    sleep 1
+    exec /bin/sh -i
+fi
+
 if test "$rtmux_run" = "smp-invariants"; then
     /sbin/virtio-mmio
     /sbin/virtio-mmio --register-boot
@@ -410,7 +470,7 @@ if test "$rtmux_run" = "smp-invariants"; then
     /bin/revoke-stress 2 8 1 || smp_fail=1
 
     echo "RTMux smp-invariants: preempt-latency"
-    /bin/preempt-latency || smp_fail=1
+    /bin/preempt-latency $preempt_latency_args || smp_fail=1
 
     echo "RTMux smp-invariants: ipc-contention"
     /bin/ipc-contention || smp_fail=1
@@ -499,7 +559,8 @@ if test "$rtmux_run" = "serial-unblock"; then
     /sbin/virtio-mmio --register-boot
     echo "RTMux serial-unblock: BEGIN"
     serial_fail=0
-    /bin/syscall_testing --console-poll || serial_fail=1
+    /bin/pipe &
+    waitfor /dev/pipe 10 && /bin/syscall_testing --console-poll || serial_fail=1
     /bin/dev-serial-8250 &
     waitfor /dev/ser1 5 && /bin/syscall_testing --serial-unblock || serial_fail=1
     if test "$serial_fail" = "0"; then
@@ -787,9 +848,9 @@ run_lkl_regress() {
         lkl-netd-iommu-fail-closed) run_lkl_selftest lkl-netd-iommu-fail-closed '/bin/not /sbin/lkl-netd --serve-net' ;;
         tracelogger) run_lkl_selftest tracelogger '/bin/tracelogger' ;;
         tracelogger-kcall) run_lkl_selftest tracelogger-kcall '/bin/tracelogger 0 0 kcall' ;;
-        tracelogger-lkl-fsd) run_lkl_selftest tracelogger-lkl-fsd 'lkl_start_fsd && /bin/cat /fs/root/hello.txt; rc=$?; test "$rc" = "0" && /bin/tracelogger 0 700 windowed & sleep 1 && test "$rc" = "0" && /bin/lkl-measure fs 3 trace split && /bin/lkl-measure fs-rt 5 trace split; rc=$?; sleep 15; test "$rc" = "0"' ;;
-        tracelogger-lkl-netd) run_lkl_selftest tracelogger-lkl-netd 'lkl_start_net && /bin/verify-lkl-net --helpers; rc=$?; test "$rc" = "0" && /bin/tracelogger 0 700 windowed & sleep 1 && test "$rc" = "0" && /bin/lkl-measure net 3 trace split && /bin/lkl-measure net-rt 5 trace split; rc=$?; sleep 15; test "$rc" = "0"' ;;
-        tracelogger-lkl-netd-default) run_lkl_selftest tracelogger-lkl-netd-default 'lkl_start_net && /bin/verify-lkl-net --helpers; rc=$?; test "$rc" = "0" && /bin/tracelogger 0 3000 windowed 1000000 & sleep 1 && test "$rc" = "0" && /bin/lkl-measure net 10 trace && /bin/lkl-measure net-rt 100 trace; rc=$?; sleep 3; test "$rc" = "0"' ;;
+        tracelogger-lkl-fsd) run_lkl_selftest tracelogger-lkl-fsd 'lkl_start_pipe && lkl_start_fsd && /bin/cat /fs/root/hello.txt; rc=$?; test "$rc" = "0" && /bin/tracelogger 0 700 windowed & sleep 1 && test "$rc" = "0" && /bin/lkl-measure fs 3 trace split && /bin/lkl-measure fs-rt 5 trace split; rc=$?; sleep 15; test "$rc" = "0"' ;;
+        tracelogger-lkl-netd) run_lkl_selftest tracelogger-lkl-netd 'lkl_start_pipe && lkl_start_net && /bin/verify-lkl-net --helpers; rc=$?; test "$rc" = "0" && /bin/tracelogger 0 700 windowed & sleep 1 && test "$rc" = "0" && /bin/lkl-measure net 3 trace split && /bin/lkl-measure net-rt 5 trace split; rc=$?; sleep 15; test "$rc" = "0"' ;;
+        tracelogger-lkl-netd-default) run_lkl_selftest tracelogger-lkl-netd-default 'lkl_start_pipe && lkl_start_net && /bin/verify-lkl-net --helpers; rc=$?; test "$rc" = "0" && /bin/tracelogger 0 3000 windowed 1000000 & sleep 1 && test "$rc" = "0" && /bin/lkl-measure net 10 trace && /bin/lkl-measure net-rt 100 trace; rc=$?; sleep 3; test "$rc" = "0"' ;;
     esac
 }
 
@@ -854,6 +915,11 @@ fi
 # Hand off. On success: /usr/sbin/sysinit/level1.sh takes over. On failure:
 # rescue shell straight from the cpio.
 if test "$mount_ok" = "1"; then
+    if test "$rtmux_run" = "serial-priority"; then
+        /bin/dev-serial-8250 &
+        waitfor /dev/ser1 5 && /sbin/getty /dev/ser1
+        exit 1
+    fi
     if test "$rtmux_run" = "rt-check"; then
         echo
         echo "RTMux rt-check: BEGIN"
@@ -1225,12 +1291,21 @@ if test "$mount_ok" = "1"; then
         sleep 1
         exec /bin/sh -i
     fi
-    echo "Sysinit: level1 running."
-    echo
-    /sbin/getty
+    /bin/pipe &
+    if waitfor /dev/pipe 10; then
+        if test -r /usr/sbin/sysinit/level1.sh; then
+            /bin/sh /usr/sbin/sysinit/level1.sh
+        else
+            echo "Missing /usr/sbin/sysinit/level1.sh, starting getty."
+            /sbin/getty
+        fi
+    else
+        echo "Pipe service unavailable."
+    fi
+else
+    echo "*** /usr unavailable — dropping to rescue shell ***"
 fi
 
-echo "*** /usr unavailable — dropping to rescue shell ***"
 echo "Use 'shutdown' to power off."
 echo
 exec /bin/sh -i

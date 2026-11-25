@@ -196,6 +196,9 @@ jobs:
           - name: spawn-storm
             run: make check-spawn-storm
             experimental: true
+          - name: spawn-storm-200
+            run: CPUS=4 ./scripts/qemu-regress.sh --mode spawn-storm --procs 200 --timeout 900
+            experimental: true
           - name: leak-gate
             run: make check-leak-gate
             experimental: true

@@ -30,11 +30,19 @@ extern int __sread(void *, char *, int) __hidden;
 extern int __swrite(void *, char const *, int) __hidden;
 extern fpos_t __sseek(void *, fpos_t, int) __hidden;
 extern int __sclose(void *) __hidden;
-extern void __sinit(void) __hidden;
+extern void __sfp_release(FILE *) __hidden;
 extern void _cleanup(void) __hidden;
 extern void __smakebuf(FILE *) __hidden;
 extern unsigned __swhatbuf(FILE *, size_t *, int *) __hidden;
-extern int _fwalk(int (*)(FILE *)) __hidden;
+
+/* _fwalk modes: wait for every stream, wait only for a held line-buffered
+ * stream in write mode (input requested), or only for a held write-mode one
+ * (exit).
+ */
+#define FWALK_WAIT 0
+#define FWALK_LBF 1
+#define FWALK_EXIT 2
+extern int _fwalk(int (*)(FILE *), int mode) __hidden;
 extern int __swsetup(FILE *) __hidden;
 extern int __sflags(const char *, int *) __hidden;
 extern int __ungetc(int, FILE *) __hidden;
@@ -46,7 +54,7 @@ extern size_t __fread(void *__restrict buf,
                       size_t size,
                       size_t count,
                       FILE *__restrict fp) __hidden;
-extern int __sdidinit __hidden;
+extern _Atomic int __sdidinit __hidden;
 
 #define __SLBF 0x0001 /* line buffered */
 #define __SNBF 0x0002 /* unbuffered */

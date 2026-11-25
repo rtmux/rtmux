@@ -20,6 +20,7 @@
 #include <stddef.h>
 #include <semaphore.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <spawn.h>
@@ -65,9 +66,12 @@ static const struct test_suite test_suites[] = {
     TEST_SUITE_NAMED("trace-negative", trace_negative),
     TEST_SUITE_NAMED("user-ptr-negative", user_ptr_negative),
     TEST_SUITE(vfs),
+    TEST_SUITE(exec),
+    TEST_SUITE_NAMED("exec-signal", exec_signal),
     TEST_SUITE_NAMED("posix-options", posix_options),
     TEST_SUITE(sysconf),
     TEST_SUITE(gauges),
+    TEST_SUITE_NAMED("kill-busy", kill_busy),
 #undef TEST_SUITE_NAMED
 #undef TEST_SUITE
 };
@@ -81,6 +85,54 @@ static int finish(int require_run)
 {
     tc_summary(&suite_counts);
     return tc_status(&suite_counts, require_run) ? EXIT_FAILURE : EXIT_SUCCESS;
+}
+
+/* An interrupt that reaches a thread on its way into interrupt_wait must end
+ * that wait. inject names the point where the kernel posts it (inject.h); a
+ * lost one shows as the 150 ms guard timeout. A second wait then has to time
+ * out: the interrupt is consumed exactly once.
+ */
+static void intr_pending_case(const char *inject, const char *where)
+{
+    char pid[16], what[96];
+    uint64_t ns = 150000000;
+    int rc;
+
+    snprintf(pid, sizeof pid, "%d", (int) getpid());
+    rc = inject_run(inject, pid, NULL);
+    if (!rc && __timer_timeout(CLOCK_MONOTONIC, RTMUX_TIMEOUT_INTR, NULL, &ns,
+                               NULL) >= 0)
+        rc = interrupt_wait(0, NULL);
+    else
+        rc = -1;
+    snprintf(what, sizeof what, "pending interrupt reaches the waiter %s", where);
+    check(rc == 0, what, "interrupt wait or injection failed");
+    rc = __timer_timeout(CLOCK_MONOTONIC, RTMUX_TIMEOUT_INTR, NULL, &ns, NULL);
+    if (rc >= 0) {
+        errno = 0;
+        rc = interrupt_wait(0, NULL);
+        check(rc == -1 && errno == ETIMEDOUT,
+              "pending interrupt consumed exactly once", "unexpected second wake");
+    } else {
+        test_fail("pending interrupt consumed exactly once", "cannot arm guard timer");
+    }
+}
+
+struct intr_spin {
+    atomic_int pinned, turns, stop, done;
+};
+
+static void *intr_spinner(void *arg)
+{
+    struct intr_spin *spin = arg;
+
+    atomic_store(&spin->pinned, test_pin_mask(2U) == 0 ? 1 : -1);
+    while (!atomic_load(&spin->stop)) {
+        atomic_fetch_add(&spin->turns, 1);
+        (void) sched_yield();
+    }
+    atomic_store(&spin->done, 1);
+    return NULL;
 }
 
 #define FAULT_RECOVERY_CHECK(name, expr, detail) \
@@ -842,6 +894,10 @@ static void test_fault_recovery_subset(void)
                              "--fault-sigsegv", SIGSEGV);
     FAULT_RECOVERY_SPAWN_SIG(readonly_write_fault, "user-page-fault",
                              "--fault-mprotect-ro", SIGSEGV);
+    /* RLIMIT_CPU: the kernel ends the spinning child with SIGXCPU. Its report
+     * names no address (the harness checks addr=0).
+     */
+    FAULT_RECOVERY_SPAWN_SIG(cpu_limit, "cpu-limit", "--rlimit-cpu-child", SIGXCPU);
 
     test_bad_syscall_enosys();
     test_crash_loop();
@@ -951,11 +1007,41 @@ static int resv_fill(void)
  */
 static int run_laps(int laps)
 {
+    struct sched_param start;
+    int start_policy;
+    int have_start;
     int total_failed = 0;
 
+    /* Suites change this thread's scheduling and some leave it changed for the
+     * cases after them in the same lap (sync leaves it at FIFO 20). Each lap
+     * starts from the state the process began with, so that a lap repeats the
+     * first: a case that spins threads at the inherited priority would
+     * otherwise run them at FIFO 20 on one hart and never get the hart back.
+     */
+    memset(&start, 0, sizeof start);
+    start_policy = __sched_get(0, 0, &start); /* the policy, or -1 */
+    have_start = start_policy != -1;
+    if (!have_start)
+        printf("laps: could not read the starting scheduling: %s\n",
+               strerror(errno));
     for (int lap = 1; lap <= laps; lap++) {
+        struct sched_param now;
+        int policy;
         int lap_failed;
 
+        /* A lap that cannot start from that state is not run: it would not
+         * repeat the first, and could hang on the inherited priority.
+         */
+        if (!have_start || __sched_set(0, 0, start_policy, &start) != EOK) {
+            printf("lap=%d could not restore the starting scheduling\n", lap);
+            printf("lap=%d FAIL\n", lap);
+            total_failed++;
+            continue;
+        }
+        policy = __sched_get(0, 0, &now);
+        if (policy != -1)
+            printf("lap=%d sched policy=%d priority=%d\n", lap, policy,
+                   now.sched_priority);
         suite_counts = (struct test_counts) {0};
         printf("lap=%d BEGIN\n", lap);
         for (size_t i = 0; i < sizeof test_suites / sizeof test_suites[0]; i++) {
@@ -987,6 +1073,8 @@ int main(int argc, char *argv[])
         return pthread_cancel_child(argv[2]);
     if (argc == 3 && !strcmp(argv[1], "--killspawn-child"))
         return killspawn_child(argv[2]);
+    if (argc == 3 && !strcmp(argv[1], "--stdio-exit-child"))
+        return stdio_exit_child(argv[2]);
     if (argc == 2 && !strcmp(argv[1], "--rlimit-cpu-child"))
         return rlimit_cpu_child();
     if (argc == 2 && !strcmp(argv[1], "--rlimit-inherit-child"))
@@ -1028,11 +1116,124 @@ int main(int argc, char *argv[])
             test_skip("disconnect_under_alloc_failure", "fault injection unavailable");
         return finish(1);
     }
+    if (argc == 2 && !strcmp(argv[1], "--reply-fault")) {
+        printf("[reply_fault]\n");
+        test_reply_fault();
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--remote-ipc")) {
+        printf("[remote_ipc]\n");
+        if (test_remote_ipc() == TC_EXIT_SKIP)
+            test_skip("remote_ipc", "fault injection unavailable");
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--rcvid-reuse")) {
+        printf("[rcvid_reuse]\n");
+        (void) test_rcvid_reuse();
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--cap-step")) {
+        printf("[cap_step]\n");
+        (void) test_cap_step();
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--xfer-resume")) {
+        printf("[xfer_resume]\n");
+        if (test_xfer_resume() == TC_EXIT_SKIP)
+            test_skip("xfer_resume", "fault injection unavailable");
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--slow-reap-kill")) {
+        printf("[kill_slow_reap]\n");
+        if (test_kill_slow_reap() == TC_EXIT_SKIP)
+            test_skip("kill_slow_reap", "fault injection unavailable");
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--slow-reap-child"))
+        return slow_reap_child();
+    if (argc == 2 && !strcmp(argv[1], "--reply-claim")) {
+        printf("[reply_claim]\n");
+        if (test_reply_claim() == TC_EXIT_SKIP)
+            test_skip("reply_claim", "fault injection unavailable");
+        return finish(1);
+    }
     if (argc == 2 && !strcmp(argv[1], "--sched-set-error")) {
         printf("[sched_set_error_after_lowering]\n");
         if (sched_set_error_after_lowering() == TC_EXIT_SKIP)
             test_skip("sched_set_error_after_lowering", "fault injection unavailable");
         return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--execvp-path")) {
+        char *args[] = {"true", NULL};
+        execvp("true", args);
+        return errno;
+    }
+    if (argc == 3 && !strcmp(argv[1], "--spawn-inherited-fchdir")) {
+        posix_spawn_file_actions_t actions;
+        if (posix_spawn_file_actions_init(&actions) ||
+            posix_spawn_file_actions_addfchdir(&actions, atoi(argv[2])))
+            return 1;
+        pid_t child;
+        char *args[] = {"syscall_testing", "--expect-cwd", "/dev/shmem", NULL};
+        int rc = posix_spawn(&child, "/bin/syscall_testing", &actions, NULL, args, NULL);
+        posix_spawn_file_actions_destroy(&actions);
+        int status;
+        return rc || waitpid(child, &status, 0) != child ||
+               !WIFEXITED(status) || WEXITSTATUS(status);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--exec-arg-max-child"))
+        return exec_arg_max_child();
+    if (argc == 2 && !strcmp(argv[1], "--loader-fault")) {
+        printf("=== RTMux Loader Fault Test ===\n\n[loader_fault]\n");
+        test_loader_fault();
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--spawn-concurrent-arg-max")) {
+        test_spawn_concurrent_arg_max();
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--spawn-heap-gate")) {
+        printf("=== RTMux Spawn Heap Gate Test ===\n\n[spawn_heap_gate]\n");
+        test_spawn_heap_gate();
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--loader-einval-log")) {
+        test_spawn_loader_einval_log();
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--sysfs-open-stress")) {
+        test_sysfs_open_stress();
+        return finish(1);
+    }
+    /* --proc-wait-stale N: the reap-then-read wait handle case, N times. */
+    if (argc == 3 && !strcmp(argv[1], "--proc-wait-stale")) {
+        for (int i = atoi(argv[2]); i > 0; i--)
+            test_proc_wait_handle_stale_after_reap();
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--spawn-arg-max")) {
+        test_spawn_arg_max();
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--spawn-actions")) {
+        test_spawn_actions();
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--spawn-contract")) {
+        test_spawn_contract();
+        return finish(1);
+    }
+    /* --suite NAME: run one suite of test_suites[] alone, for a focused run. */
+    if (argc == 3 && !strcmp(argv[1], "--suite")) {
+        for (size_t s = 0; s < sizeof test_suites / sizeof test_suites[0]; s++) {
+            if (strcmp(argv[2], test_suites[s].name))
+                continue;
+            printf("[%s]\n", test_suites[s].name);
+            test_suites[s].run();
+            return finish(1);
+        }
+        fprintf(stderr, "syscall_testing: no suite named %s\n", argv[2]);
+        return EXIT_FAILURE;
     }
     if (argc == 2 && !strcmp(argv[1], "--prio-loan-context")) {
         printf("[loan_settle_context]\n");
@@ -1051,10 +1252,57 @@ int main(int argc, char *argv[])
             test_skip("condvar_reacquire_alloc_failure", "fault injection unavailable");
         return finish(1);
     }
+    if (argc == 2 && !strcmp(argv[1], "--cputime")) {
+        printf("[cputime]\n");
+        test_cputime();
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--sync-path-cost")) {
+        sync_path_cost();
+        return finish(1);
+    }
+    if (argc == 3 && !strcmp(argv[1], "--named-sem-timedwait")) {
+        printf("[named_sem_timedwait]\n");
+        named_sem_timedwait_loop(atoi(argv[2]));
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--mutex-owner-death")) {
+        test_mutex_owner_death();
+        return finish(1);
+    }
     if (argc == 2 && !strcmp(argv[1], "--mutex-waiting-republish")) {
         printf("[mutex_waiting_republish]\n");
         if (mutex_waiting_republish() == TC_EXIT_SKIP)
             test_skip("mutex_waiting_republish", "fault injection unavailable");
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--cancel-before-block")) {
+        test_cancel_before_block();
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--block-kill-cancel")) {
+        test_block_kill_cancel();
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--k65-windows")) {
+        if (k65_windows() == TC_EXIT_SKIP)
+            test_skip("k65 windows", "four harts and fault injection required");
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--boot-tick-catch-up")) { /* opt-in */
+        printf("[boot_tick_catch_up]\n");
+        (void) boot_tick_catch_up(); /* says why it skips */
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--dispatch-window")) {
+        if (dispatch_window() == TC_EXIT_SKIP)
+            test_skip("dispatch window", "three harts and fault injection required");
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--block-request-race")) {
+        if (block_request_race() == TC_EXIT_SKIP)
+            test_skip("block request race",
+                      "three harts and fault injection required");
         return finish(1);
     }
     if (argc == 2 && !strcmp(argv[1], "--mutex-handoff-loan")) {
@@ -1069,16 +1317,117 @@ int main(int argc, char *argv[])
             test_skip("mutex_waiting_withdrawn", "fault injection unavailable");
         return finish(1);
     }
+    if (argc == 2 && !strcmp(argv[1], "--intr-before-switch")) {
+        intr_pending_case("intr-before-switch", "before its timer expires");
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--intr-after-select")) {
+        struct intr_spin spin = {0};
+        pthread_t spinner;
+        int seen;
+
+        if (sysconf(_SC_NPROCESSORS_ONLN) < 2 || test_pin_mask(2U) != 0) {
+            test_skip("intr-after-select", "needs a second hart to pin to");
+            return finish(1);
+        }
+
+        /* Alone on its hart the waiter usually finds no thread to run; one
+         * stolen from another hart is as good.
+         */
+        intr_pending_case("intr-after-select", "after the selection");
+        seen = inject_run("intr-select-seen", NULL, NULL);
+        check(seen == 11 || seen == 12, "interrupt was posted after the selection",
+              "injection point not reached");
+
+        /* A sibling that has run on this hart is on its run list when the
+         * waiter blocks: a thread has been chosen when the interrupt arrives,
+         * and has to go back on the list.
+         */
+        if (pthread_create(&spinner, NULL, intr_spinner, &spin) == 0) {
+            for (int i = 0; i < 3000 && !atomic_load(&spin.turns); i++)
+                sleep_ms(1);
+            intr_pending_case("intr-after-select", "after a thread was chosen");
+            char tid[16];
+
+            snprintf(tid, sizeof tid, "%d", (int) spinner);
+            seen = inject_run("intr-select-seen", tid, NULL);
+            check(atomic_load(&spin.pinned) == 1 && seen == 13,
+                  "the sibling had been chosen when the interrupt was posted",
+                  "sibling not pinned, not the one chosen, or injection not reached");
+            atomic_store(&spin.stop, 1);
+            for (int i = 0; i < 300 && !atomic_load(&spin.done); i++)
+                sleep_ms(10);
+            check(atomic_load(&spin.done) == 1,
+                  "thread chosen and put back still runs", "sibling lost");
+            if (atomic_load(&spin.done))
+                (void) pthread_join(spinner, NULL);
+        } else {
+            test_fail("intr-after-select fixture", "pthread_create");
+        }
+        (void) test_pin_mask(~0U);
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--sync-kill-handoff")) {
+        if (sync_kill_handoff() == TC_EXIT_SKIP)
+            test_skip("sync kill handoff", "three harts and fault injection required");
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--wait-rewait")) {
+        printf("[wait_rewait]\n");
+        if (wait_rewait() == TC_EXIT_SKIP)
+            test_skip("wait_rewait", "two harts and fault injection required");
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--timer-fire-stale")) {
+        printf("[timer_fire_stale]\n");
+        if (timer_fire_stale() == TC_EXIT_SKIP)
+            test_skip("timer_fire_stale",
+                      "three harts and fault injection required");
+        return finish(1);
+    }
     if (argc == 2 && !strcmp(argv[1], "--condvar-interrupt-stale")) {
         printf("[condvar_interrupt_stale]\n");
         if (condvar_interrupt_stale() == TC_EXIT_SKIP)
             test_skip("condvar_interrupt_stale", "fault injection unavailable");
         return finish(1);
     }
+    if (argc == 2 && !strcmp(argv[1], "--ioserv-lost-reply-unblock")) {
+        printf("[ioserv_lost_reply_unblock]\n");
+        if (test_ioserv_lost_reply_unblock() == TC_EXIT_SKIP)
+            test_skip("ioserv_lost_reply_unblock", "fault injection unavailable");
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--ioserv-lost-reply")) {
+        printf("[ioserv_lost_reply]\n");
+        test_ioserv_lost_reply_binding();
+        return finish(1);
+    }
     if (argc == 2 && !strcmp(argv[1], "--ns-open-deferral")) {
         printf("[ns_open_deferral]\n");
         if (ns_open_deferral() == TC_EXIT_SKIP)
             test_skip("ns_open_deferral", "fault injection unavailable");
+        printf("[ns_stat_unlink]\n");
+        if (ns_stat_unlink() == TC_EXIT_SKIP)
+            test_skip("ns_stat_unlink", "fault injection unavailable");
+        printf("[ns_open_detach]\n");
+        if (ns_open_detach() == TC_EXIT_SKIP)
+            test_skip("ns_open_detach", "fault injection unavailable");
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--nanosleep-1ns-storm-hog")) {
+        printf("[nanosleep_1ns_storm_hog]\n");
+        test_nanosleep_1ns_storm_hog();
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--nanosleep-1ns-storm")) {
+        printf("[nanosleep_1ns_storm]\n");
+        test_nanosleep_1ns_storm();
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--anon-map-failure")) {
+        printf("[anon_map_failure]\n");
+        if (anon_map_failure() == TC_EXIT_SKIP)
+            test_skip("anon_map_failure", "fault injection unavailable");
         return finish(1);
     }
     if (argc == 2 && !strcmp(argv[1], "--pte-partial-map")) {
@@ -1087,12 +1436,48 @@ int main(int argc, char *argv[])
             test_skip("pte_partial_map", "fault injection unavailable");
         return finish(1);
     }
+    if (argc == 2 && !strcmp(argv[1], "--shm-past-end")) {
+        printf("[shm_past_end]\n");
+        test_shm_past_end();
+        return finish(1);
+    }
+    if (argc == 3 && !strcmp(argv[1], "--shm-past-end-child"))
+        return shm_past_end_child(argv[2]);
+    if (argc == 2 && !strcmp(argv[1], "--write-undo")) {
+        printf("[write_undo]\n");
+        if (test_write_undo() == TC_EXIT_SKIP)
+            test_skip("write_undo", "no write window in this roottask");
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--sticky-reload")) {
+        printf("[sticky_reload]\n");
+        test_sticky_reload();
+        return finish(1);
+    }
+    if (argc == 3 && !strcmp(argv[1], "--sticky-reload-child"))
+        return sticky_reload_child(argv[2]);
+    if (argc == 2 && !strcmp(argv[1], "--pgrp-tty-other"))
+        return pgrp_tty_other();
+    if (argc == 2 && !strcmp(argv[1], "--pgrp-debug-access"))
+        return pgrp_debug_access();
     if (argc == 2 && !strcmp(argv[1], "--pgrp-races")) {
         printf("[pgrp_races]\n");
         if (pgrp_races() == TC_EXIT_SKIP)
             test_skip("pgrp_races", "debug window unavailable");
         return finish(1);
     }
+    if (argc == 3 && !strcmp(argv[1], "--exec-child"))
+        return exec_swap_child(argv[2]);
+    if (argc == 3 && !strcmp(argv[1], "--xsig-child"))
+        return exec_signal_child(argv[2]);
+    if (argc == 3 && !strcmp(argv[1], "--xsig-chain"))
+        return exec_signal_chain(argv[2]);
+    if (argc == 3 && !strcmp(argv[1], "--xsig-loop"))
+        return exec_signal_loop(argv[2]);
+    if (argc == 3 && !strcmp(argv[1], "--exec-chain"))
+        return exec_swap_chain(argv[2]);
+    if (argc == 3 && !strcmp(argv[1], "--exec-report"))
+        return exec_swap_report(argv[2]);
     if (argc == 2 && !strcmp(argv[1], "--pgrp-exec-hold"))
         return pgrp_exec_hold();
     if (argc == 2 && !strcmp(argv[1], "--pgrp-tty-bind"))
@@ -1101,11 +1486,27 @@ int main(int argc, char *argv[])
         return pgrp_tty_child(1);
     if (argc == 3 && !strcmp(argv[1], "--serial-unblock-child"))
         return serial_unblock_child(!strcmp(argv[2], "announce"));
+    if (argc == 2 && !strcmp(argv[1], "--ttyname")) {
+        char *name = ttyname(STDIN_FILENO);
+        if (name)
+            puts(name);
+        return name ? 0 : 1;
+    }
+    if ((argc == 2 || argc == 3) && !strcmp(argv[1], "--device-identity")) {
+        test_device_identity(argc == 3 ? argv[2] : NULL);
+        return finish(1);
+    }
     if (argc == 2 && !strcmp(argv[1], "--console-poll")) {
         printf("=== RTMux Console Poll Test ===\n\n");
         test_console_poll();
         return finish(1);
     }
+    if (argc == 2 && !strcmp(argv[1], "--signal-priority")) {
+        test_sigthread_prio_stable();
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--serial-priority-spinner"))
+        return serial_priority_spinner();
     if (argc == 2 && !strcmp(argv[1], "--serial-unblock")) {
         printf("=== RTMux Serial Unblock Test ===\n\n");
         test_serial_unblock();
@@ -1128,6 +1529,24 @@ int main(int argc, char *argv[])
         }
         printf("=== RTMux Concurrent Spawn Storm ===\n\n[spawn-storm]\n");
         test_spawn_storm((unsigned) residents);
+        return finish(1);
+    }
+    if ((argc == 2 || argc == 3) && !strcmp(argv[1], "--spawn-ocb-storm")) {
+        /* Optional lap count of spawn_concurrent, 6 by default. */
+        char *end = NULL;
+        unsigned long laps = 6;
+
+        if (argc == 3) {
+            errno = 0;
+            laps = strtoul(argv[2], &end, 10);
+            if (!isdigit((unsigned char) argv[2][0]) || *end || errno || !laps ||
+                laps > 1000) {
+                printf("--spawn-ocb-storm: bad lap count '%s'\n", argv[2]);
+                return EXIT_FAILURE;
+            }
+        }
+        printf("=== RTMux cpiofs OCB Spawn Storm ===\n\n[spawn-ocb-storm]\n");
+        test_spawn_ocb_storm((unsigned) laps);
         return finish(1);
     }
     if (argc == 2 && !strcmp(argv[1], "--trace-negative")) {
@@ -1173,6 +1592,22 @@ int main(int argc, char *argv[])
         return capgate_child_dup_attack(argc, argv);
     if (argc == 3 && !strcmp(argv[1], "--dup-replay-child"))
         return capgate_child_dup_replay(argv[2]);
+    if (argc == 2 && !strcmp(argv[1], "--cond-pi-cycle")) {
+        test_cond_reacquire_cycle();
+        return finish(0);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--cond-above-ceiling")) {
+        test_cond_reacquire_above_ceiling();
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--pi-owner-loans")) {
+        test_pi_owned_turnstiles();
+        return finish(0);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--pi-cycle")) {
+        test_pi_two_mutex_cycle_detects_deadlock();
+        return finish(1);
+    }
     if (argc == 2 && !strcmp(argv[1], "--pi-large-pid"))
         return sync_pi_large_pid_child();
     if (argc == 2 && !strcmp(argv[1], "--proc-cap-child")) {
@@ -1378,6 +1813,25 @@ int main(int argc, char *argv[])
             ;
         return EXIT_SUCCESS;
     }
+    if ((argc == 2 || argc == 3) && !strcmp(argv[1], "--loader-share-child"))
+        return loader_share_child(argc == 3 ? strtoul(argv[2], NULL, 0) : 0);
+    if (argc == 3 && !strcmp(argv[1], "--loader-hold-child"))
+        return loader_hold_child(atoi(argv[2]));
+    if (argc == 2 && !strcmp(argv[1], "--loader-context-hold")) {
+        printf("[loader_context_hold]\n");
+        test_loader_context_hold();
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--loader-share-gate")) {
+        printf("[loader_share_gate]\n");
+        test_loader_share_gate();
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--loader-context-share")) {
+        printf("[loader_context_share]\n");
+        test_loader_context_share();
+        return finish(1);
+    }
     if (argc == 2 && !strcmp(argv[1], "--getsid-hold")) {
         /* Say it is running, then stay alive until stdin reaches EOF. */
         char c;
@@ -1533,9 +1987,60 @@ int main(int argc, char *argv[])
         (void) munmap(r, sizeof *r);
         return rc;
     }
+    if (argc == 2 && !strcmp(argv[1], "--pte-kill-under-spawn")) {
+        /* a SIGKILL while roottask works for the victim */
+        printf("=== RTMux kill of a busy process ===\n\n[kill-busy]\n");
+        test_kill_busy();
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--stuck-handler-child"))
+        return kill_stuck_handler_child();
+    if (argc == 2 && !strcmp(argv[1], "--exec-signal")) {
+        /* signals sent to a process that is exec'ing */
+        printf("=== RTMux signals across exec ===\n\n[exec-signal]\n");
+        test_exec_signal();
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--busy-map-child"))
+        return kill_busy_child();
+    if (argc == 2 && !strcmp(argv[1], "--resolve-loop-child"))
+        return kill_resolve_child();
+    if (argc == 2 && !strcmp(argv[1], "--big-map-child"))
+        return kill_map_child();
+    if (argc == 2 && !strcmp(argv[1], "--map-kill")) {
+        printf("[kill_during_map]\n");
+        test_kill_map();
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--thread-loop-child"))
+        return kill_thread_loop_child();
+    if (argc == 2 && !strcmp(argv[1], "--create-once-child"))
+        return kill_create_once_child();
+    if (argc == 2 && !strcmp(argv[1], "--version-child"))
+        return 0; /* a bare start of this binary, for the spawn timings */
+    if (argc == 2 && !strcmp(argv[1], "--spawn-exec-time")) {
+        printf("[spawn_exec_time]\n");
+        test_spawn_exec_time();
+        return 0; /* measurements only: nothing to pass or fail */
+    }
+    if (argc == 2 && !strcmp(argv[1], "--exec-abandon")) {
+        printf("[exec_abandon]\n");
+        test_exec_abandon();
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--create-kill")) {
+        printf("[kill_during_thread_create]\n");
+        test_kill_create();
+        return finish(1);
+    }
     if (argc == 2 && !strcmp(argv[1], "--gauges")) { /* opt-in: just the gauge regressions */
         printf("=== RTMux gauge regressions ===\n\n[gauges]\n");
         test_gauges();
+        return finish(1);
+    }
+    if (argc == 3 && !strcmp(argv[1], "--detach-race") && atoi(argv[2]) > 0) { /* opt-in */
+        printf("=== RTMux detach-race reproducer ===\n\n[gauges]\n");
+        test_detach_race_laps(atoi(argv[2]));
         return finish(1);
     }
     if (argc == 2 && !strcmp(argv[1], "--orphan-send")) { /* opt-in reproducer, see leak.c */

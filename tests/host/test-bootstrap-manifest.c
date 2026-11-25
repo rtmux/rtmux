@@ -165,6 +165,32 @@ int main(void)
     EXPECT_GRANT_FOR(missing_server, "no-such-server", 0, EOK, 0);
     EXPECT_GRANT_FOR(null_path, NULL, 0, EOK, 0);
 
+    /* The loader hashes only a listed image (proc-loader.c), so an unlisted
+     * path must be granted nothing whatever hash it is given, and a listed one
+     * must be found by both lookups: the two must match paths the same way.
+     */
+    {
+        static const char *const unlisted[] = {
+            "dev-nvme", "/usr/dev-nvme", "/dev/shmem/dev-nvme", "/bin/true",
+            "no-such-server"};
+        static const uint64_t hashes[] = {0, 1, 2, 9, ~(uint64_t) 0};
+
+        for (size_t i = 0; i < sizeof unlisted / sizeof unlisted[0]; i++) {
+            assert(!bootstrap_cap_manifest_listed(unlisted[i]));
+            for (size_t j = 0; j < sizeof hashes / sizeof hashes[0]; j++) {
+                uint64_t caps = 1;
+
+                assert(bootstrap_cap_manifest_grant_for(unlisted[i], hashes[j],
+                                                        &caps) == EOK);
+                assert(caps == 0);
+            }
+        }
+        for (size_t i = 0; i < bootstrap_cap_manifest_len; i++)
+            if (bootstrap_cap_manifest[i].exec_path)
+                assert(bootstrap_cap_manifest_listed(
+                    bootstrap_cap_manifest[i].exec_path));
+    }
+
     assert(bootstrap_cap_manifest_validate_test(changed, 3, &diag) == EOK);
 
     assert(bootstrap_cap_manifest_validate_test(duplicate, 2, &diag) == EEXIST);

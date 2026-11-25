@@ -181,6 +181,43 @@ static void test_manifest_priv_caps_denied(void)
     }
 }
 
+/* The remote IPC paths of the kernel (a COF_NETCON connection, and a send
+ * through one on behalf of a virtual thread) are for the process that owns
+ * the remote IPC channel. A process without the IPC capability can neither
+ * register that channel nor make such a connection, so it cannot reach them.
+ */
+static void test_netcon_refused(void)
+{
+    char detail[64];
+    int chid, coid, err;
+
+    chid = channel_create(RTMUX_FLG_CHF_NET_MSG);
+    err = errno;
+    snprintf(detail, sizeof(detail), "chid=%d errno=%d", chid,
+             chid == -1 ? err : 0);
+    check(chid == -1 && err == EPERM,
+          "remote IPC channel is refused without the IPC capability", detail);
+    if (chid != -1)
+        (void) channel_destroy(chid);
+
+    chid = channel_create(0);
+    if (chid == -1) {
+        test_fail("netcon refused", "channel_create");
+        return;
+    }
+    coid = connect_attach(0, getpid(), chid, RTMUX_SIDE_CHANNEL,
+                          RTMUX_FLG_COF_NETCON);
+    err = errno;
+    snprintf(detail, sizeof(detail), "coid=%d errno=%d", coid,
+             coid == -1 ? err : 0);
+    check(coid == -1 && err == EINVAL,
+          "NETCON connection is refused outside the remote IPC service",
+          detail);
+    if (coid != -1)
+        (void) __connect_detach((uint64_t) coid);
+    (void) channel_destroy(chid);
+}
+
 /* rtmux_spawn_cap (SPAWN_PROC_CAP) delivers a process capability over the child
  * to the parent in the spawn reply. The child fixture just exits; the parent
  * only checks it received a nonzero cap handle and the spawn still returns the
@@ -1105,6 +1142,7 @@ void test_capgate(void)
     test_native_reply_opt_in();
     test_proc_cap_thread_authorized();
     test_manifest_priv_caps_denied();
+    test_netcon_refused();
     test_dup_ambient_authority();
     test_procfs_foreign_reopen();
 }

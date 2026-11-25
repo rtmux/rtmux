@@ -157,9 +157,11 @@ void reboot(void *abnormal)
 }
 
 
-/* system_reboot — kernel-internal entry used by crash() and shutdown(). U-mode
- * roottask has its own equivalent in servers/roottask/proc/kext-wrappers.c that
- * goes through syscall_priv(__KSYS_PRIV_REBOOT, ...).
+/* system_reboot — kernel-internal entry, used by the debug-inject power-off
+ * crash. A fatal kernel fault does not come here: it halts in the crash
+ * rendezvous (kprintf.c). U-mode roottask has its own equivalent in
+ * servers/roottask/proc/kext-wrappers.c that goes through
+ * syscall_priv(__KSYS_PRIV_REBOOT, ...), which root_crash() takes.
  */
 void system_reboot(int abnormal)
 {

@@ -13,12 +13,13 @@
 #include <errno.h>
 #include <sys/iomsg.h>
 #include "connect.h"
+#include <sys/loader-fd.h>
 
 #ifndef PATH_MAX
 #define PATH_MAX 1024
 #endif
 
-char *getcwd(char *buf, size_t size)
+static char *process_directory(char *buf, size_t size, int root)
 {
     struct _connect_ctrl ctrl;
     struct _io_connect msg;
@@ -51,7 +52,7 @@ char *getcwd(char *buf, size_t size)
     msg.subtype = _IO_CONNECT_COMBINE_CLOSE;
 
     saved_errno = errno;
-    if ((fd = _connect_ctrl(&ctrl, ".", 0, 0)) == -1) {
+    if ((fd = _connect_ctrl(&ctrl, root ? "/" : ".", 0, 0)) == -1) {
         if (!save)
             free(buf);
         return 0;
@@ -66,6 +67,11 @@ char *getcwd(char *buf, size_t size)
         return 0;
     }
 
+    /* Services report descriptor paths in the global namespace. The loader
+     * needs the global root prefix to interpret such a path in the child.
+     */
+    if (root)
+        return buf;
     /* Return path relative to last chroot */
     if (ctrl.chroot_len > 0) {
         len = strlen(buf);
@@ -84,4 +90,14 @@ char *getcwd(char *buf, size_t size)
     }
 
     return buf;
+}
+
+char *getcwd(char *buf, size_t size)
+{
+    return process_directory(buf, size, 0);
+}
+
+char *__loader_root(char *buf, size_t size)
+{
+    return process_directory(buf, size, 1);
 }
