@@ -415,6 +415,8 @@ void inject_sync_waker_stall(thread_t *thp);
 void inject_reply_claim_stall(const connect_t *received);
 void inject_claim_held(void);
 bool inject_exit_destroy_held(const process_t *prp);
+bool inject_exec_begin_again(const process_t *prp, pid_t shell);
+bool inject_exec_begin_gone(const process_t *prp, pid_t shell);
 void inject_cap_peek_window(const thread_t *act);
 void inject_send_pick_window(const thread_t *act);
 void inject_force_ready_claimed(thread_t *thp);
@@ -530,6 +532,18 @@ static inline void inject_reply_claim_stall(const connect_t *received)
     (void) received;
 }
 static inline void inject_claim_held(void) {}
+static inline bool inject_exec_begin_again(const process_t *prp, pid_t shell)
+{
+    (void) prp;
+    (void) shell;
+    return false;
+}
+static inline bool inject_exec_begin_gone(const process_t *prp, pid_t shell)
+{
+    (void) prp;
+    (void) shell;
+    return false;
+}
 static inline bool inject_exit_destroy_held(const process_t *prp)
 {
     (void) prp;

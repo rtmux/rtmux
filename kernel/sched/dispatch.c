@@ -2027,6 +2027,7 @@ reread_state:
     case STATE_JOIN: {
         thread_t *target;
         process_t *prp;
+        bool lost = false;
 
         while (thp->internal_flags & RTMUX_ITF_WAIT_PENDING)
             __asm__ volatile("" ::: "memory");
@@ -2036,14 +2037,34 @@ reread_state:
             prp = target->process;
             if (prp)
                 kspinlock_lock(&prp->vec_slock);
-            if (thp->state == STATE_WAITTHREAD)
-                atomic_or(&target->flags,
-                          (RTMUX_FLG_THR_KILLSELF | RTMUX_FLG_THR_ONLYME));
-            if (target->join == thp)
+            if (seq) {
+                /* A caller naming a wait (force_ready_wait) ends only that one,
+                 * tested again under the lock that publishes a join: a thread
+                 * woken since may wait on another target (blocked_on read
+                 * above), whose link it must not take. One whose link its waker
+                 * took (an exit, a detach, the new thread's start) is readied
+                 * by that waker, which counts the wake only then.
+                 */
+                lost = thread_wake_seq(thp) != *seq || target->join != thp;
+            }
+            if (!lost && thp->state == STATE_WAITTHREAD) {
+                /* The new thread took the link as it started, under this lock,
+                 * and readies its creator itself (thread_specret): readying it
+                 * here too would queue it twice. That thread has started and
+                 * its create succeeded, so it is not killed either.
+                 */
+                lost = target->join != thp;
+                if (!lost)
+                    atomic_or(&target->flags,
+                              (RTMUX_FLG_THR_KILLSELF | RTMUX_FLG_THR_ONLYME));
+            }
+            if (!lost && target->join == thp)
                 target->join = NULL;
             if (prp)
                 kspinlock_unlock(&prp->vec_slock);
         }
+        if (lost)
+            return 1;
         break;
     }
 

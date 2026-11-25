@@ -342,6 +342,14 @@ enum {
  */
 #define INJECT_OP_STALL_TIMER_FIRE 50
 
+/* ABANDON_EXEC(pid): the next exec of a thread of pid is given up in its first
+ * kernel step, as when the loader shell goes away between two calls of that
+ * step: the first call does its work and asks to be made again (EAGAIN), and
+ * the next one fails with ESRCH, so roottask answers the caller with the error
+ * and the caller carries on.
+ */
+#define INJECT_OP_ABANDON_EXEC 51
+
 enum inject_site {
     STALL_LOCK,
     STALL_LOCK_EARLY,

@@ -160,7 +160,7 @@ static const struct toolbox_applet applets[] = {
      "MS | "
      "stall-reprio PID TID MS | stall-timer-fire PID TID MS | "
      "poke PID TID ready|stop | sched-stats | as-lock-stats | serve | "
-     "hold-exit-destroy PID MS | "
+     "hold-exit-destroy PID MS | abandon-exec PID | "
      "stall-switch PID TID MS | crash [shutdown] | stall-reply-claim PID MS | "
      "preempt-reply-unblock PID | stall-unblock-race PID MS | "
      "slow-kpage-zero PID US/COUNT | stall-thread-create PID MS | "
@@ -3328,6 +3328,8 @@ static int applet_inject(int argc, char **argv)
         rc = inject_call(argv[1][6] == 'c' ? INJECT_OP_STALL_CLAIM_HELD
                                            : INJECT_OP_STALL_FORCE_CLAIMED,
                          strtoul(argv[2], NULL, 0), strtoul(argv[3], NULL, 0));
+    } else if (argc == 3 && !strcmp(argv[1], "abandon-exec")) {
+        rc = inject_call(INJECT_OP_ABANDON_EXEC, strtoul(argv[2], NULL, 0), 0);
     } else if (argc == 4 && !strcmp(argv[1], "hold-exit-destroy")) {
         rc = inject_call(INJECT_OP_HOLD_EXIT_DESTROY, strtoul(argv[2], NULL, 0),
                          strtoul(argv[3], NULL, 0));
@@ -3469,7 +3471,7 @@ static int applet_inject(int argc, char **argv)
             "stall-steal PID TID MS | stall-reprio PID TID MS | "
             "stall-timer-fire PID TID MS | "
             "poke PID TID ready|stop | "
-            "hold-exit-destroy PID MS | "
+            "hold-exit-destroy PID MS | abandon-exec PID | "
             "sched-stats | serve | "
             "stall-switch PID TID MS | crash [shutdown] | pte-superpage PID VA "
             "| "

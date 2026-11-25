@@ -294,7 +294,7 @@ int proc_exec_swap(ioserv_context_t *ctp, struct loader_context *lcp)
     /* The first step takes every other thread down; it fails, leaving the
      * caller as it was, when the caller is not where it must be.
      */
-    rc = exec_step(EXEC_BEGIN, pid, lrcvid, crcvid, 0, 0);
+    rc = exec_step(EXEC_BEGIN, pid, lrcvid, crcvid, shell, 0);
     if (rc != EOK) {
         lcp->ctx.rcvid = -1;
         exec_retire_shell(shell);

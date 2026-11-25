@@ -1361,18 +1361,24 @@ int rdecl thread_create(thread_t *act,
      * marks the process under this lock, so a thread added before the mark is
      * seen by the pass.
      *
-     * An exec under way refuses the same way, for the same pass: EXEC_BEGIN
-     * marks the process (exec_thp) under this lock and then walks the vector
-     * without it, so a vector_add here could grow the vector and free the slots
-     * the walk is reading. The mark is cleared under this lock when the new
-     * image is committed; the exec caller itself is held in roottask's reply
-     * until then and creates nothing.
+     * An exec under way refuses the same way: EXEC_BEGIN marks the process
+     * (exec_thp) under this lock and then destroys every other thread, and the
+     * commit needs the caller to be the only thread left. The mark is cleared
+     * under this lock when the new image is committed, when the exec is given
+     * up in its begin step, or when the caller dies; the exec caller itself is
+     * held in roottask's reply until then and creates nothing.
+     *
+     * A thread that is added is CREATING until it is readied below:
+     * thread_destroy only flags it to kill itself once it runs, and an exit's
+     * destroy pass leaves it alone and asks to be made again.
      */
     if ((prp->flags & (RTMUX_FLG_PROC_TERMING | RTMUX_FLG_PROC_DESTROYALL)) ||
-        prp->exec_thp)
+        prp->exec_thp) {
         tid = -2;
-    else
+    } else {
+        ITF_SET(thp, RTMUX_ITF_CREATING);
         tid = vector_add(&prp->threads, thp, 0);
+    }
     if (tid >= 0 && !prp->valid_thp) {
         prp->valid_thp = thp;
     }
@@ -1491,6 +1497,14 @@ int rdecl thread_create(thread_t *act,
     /* Make thread lookups invalid */
     vector_flag(&prp->threads, thp->tid, 1);
     _TRACE_TH_EMIT_CREATE(thp);
+
+    /* Pinned until the CREATING mark is off. Once readied the thread may run,
+     * exit and be reaped on another hart before this call goes on, and this
+     * hart may already have reported the quiescent state that reap waits for
+     * (block_and_ready can switch); the reap waits for the pin too.
+     */
+    if (tthread_pin(thp) != EOK)
+        crash();
     if (thread_create_flags & THREAD_CREATE_BLOCK_FLAG) {
         /* If the parent needs to know if the create succeeded, we block it. Set
          * join and blocked_on BEFORE block_and_ready — on single CPU,
@@ -1508,6 +1522,10 @@ int rdecl thread_create(thread_t *act,
         ready(thp);
     }
 
+    /* Readied: a destroy pass may take the thread from here. */
+    cpu_smp_mb();
+    ITF_CLR(thp, RTMUX_ITF_CREATING);
+    tthread_unpin(thp);
     return ENOERROR;
 }
 
@@ -1649,6 +1667,16 @@ void rdecl thread_destroy(thread_t *thp)
      */
     {
         unsigned self = get_cpunum();
+
+        /* A thread thread_create has added but not yet readied (CREATING) is
+         * STATE_DEAD without being a zombie, and its creator is still setting
+         * it up: leave it to kill itself once it runs, like a blocked thread.
+         * Read before the state: the creator readies the thread before it
+         * clears the mark, so a clear mark is followed by a readied state.
+         */
+        bool creating = !self_reap && (__atomic_load_n(&thp->internal_flags,
+                                                       __ATOMIC_ACQUIRE) &
+                                       RTMUX_ITF_CREATING);
         int active_hart = thread_active_hart(thp);
         int active_remote = active_hart >= 0 && active_hart != (int) self;
         unsigned dead_active_spins = 0;
@@ -1670,7 +1698,7 @@ void rdecl thread_destroy(thread_t *thp)
         }
 
         if ((thp != get_active_thread(self) && state != STATE_DEAD) ||
-            active_remote) {
+            active_remote || creating) {
             atomic_or(&thp->flags,
                       (RTMUX_FLG_THR_KILLSELF | RTMUX_FLG_THR_ONLYME));
 
@@ -2017,6 +2045,12 @@ void rdecl thread_destroy(thread_t *thp)
         uint64_t t0 = stats_enabled && join_woke ? cpu_clock_ticks() : 0;
         uint64_t t1;
         kspinlock_lock(&prp->vec_slock);
+
+        /* The exec this thread called is over with it: drop its mark, which
+         * would otherwise refuse every new thread of the process for good.
+         */
+        if (prp->exec_thp == thp)
+            prp->exec_thp = NULL;
         thp = vector_rem(&prp->threads, __tid);
 
         /* "Last thread out": the thread vector is now empty. This is the single
@@ -2455,12 +2489,24 @@ void rdecl thread_specret(thread_t *thp)
      * Clear thp->join before the ready: the parent can run on another hart at
      * once, and a pthread_join it makes while the field still names it fails
      * with EBUSY.
+     *
+     * The link is taken under vec_slock, as a force_ready of the waiting parent
+     * (a kill) takes it: whoever takes it readies the parent, and only that
+     * one. Both used to: the parent was queued twice, ran and died, and its
+     * stale queue entry dispatched it again while it was being freed.
      */
-    if (thp->join && thp->join->state == STATE_WAITTHREAD) {
-        thread_t *parent = thp->join;
+    {
+        process_t *prp = thp->process;
+        thread_t *parent = NULL;
 
-        thp->join = NULL;
-        ready(parent);
+        kspinlock_lock(&prp->vec_slock);
+        if (thp->join && thp->join->state == STATE_WAITTHREAD) {
+            parent = thp->join;
+            thp->join = NULL;
+        }
+        kspinlock_unlock(&prp->vec_slock);
+        if (parent)
+            ready(parent);
     }
 
     /* Don't change priority until parent thread freed to run again

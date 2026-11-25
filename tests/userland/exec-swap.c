@@ -25,6 +25,8 @@
  *   the whole process, and so does one while another thread keeps creating
  *   threads;
  * - the new image can start a thread of its own;
+ * - an exec given up in its first step (debug-inject kernels) leaves the
+ *   caller able to start threads and exec;
  * - setpgid on a child that has exec'd is refused with EACCES, and on one that
  *   has only been spawned it works.
  */
@@ -213,6 +215,31 @@ int exec_swap_child(const char *what)
         (void) execl("/bin", "x", (char *) NULL);
         e2 = errno;
         printf("fail1=%d fail2=%d pid=%d\n", e1, e2, (int) getpid());
+        fflush(stdout);
+        (void) execve("/bin/syscall_testing", report, envp);
+        return 97;
+    }
+    if (!strcmp(what, "abandoned")) {
+        /* An exec given up in its first step (debug-inject: the loader shell
+         * is gone at the step's second call) fails, and this thread, all that
+         * is left of the process, can still start a thread and exec. Says
+         * what it saw and then replaces itself by the report.
+         */
+        char pidarg[16];
+        int e, made;
+
+        if (pthread_create(&th, NULL, exec_idle_thread, NULL) != 0)
+            return 95;
+        snprintf(pidarg, sizeof pidarg, "%d", (int) getpid());
+        if (inject_run("abandon-exec", pidarg, NULL) != 0)
+            return 93;
+        errno = 0;
+        (void) execve("/bin/syscall_testing", report, envp);
+        e = errno;
+        made = pthread_create(&th, NULL, exec_nop_thread, NULL);
+        if (made == 0)
+            (void) pthread_join(th, NULL);
+        printf("abandoned=%d create=%d\n", e, made);
         fflush(stdout);
         (void) execve("/bin/syscall_testing", report, envp);
         return 97;
@@ -462,6 +489,45 @@ static void exec_failure_case(void)
     check(WIFEXITED(r.status) && WEXITSTATUS(r.status) == 0,
           "exec after failed execs: new image exits 0",
           "the new image runs after the failed attempts");
+}
+
+/* An exec given up in its first kernel step, after that step has marked the
+ * process and destroyed the caller's other threads, leaves the caller able to
+ * start threads and to exec: the mark that refuses new threads while an exec
+ * is under way must go with the exec. Needs a debug-inject kernel.
+ */
+static void exec_abandoned_case(void)
+{
+    struct exec_run r;
+    char detail[96];
+
+    if (inject_run("alloc-status", NULL, NULL) != 0) {
+        test_skip("exec abandoned", "fault injection unavailable");
+        return;
+    }
+    if (exec_run("abandoned", &r) != 0) {
+        test_fail("exec abandoned", "the child could not be run");
+        return;
+    }
+    snprintf(detail, sizeof detail, "abandoned=%ld, status %#x",
+             exec_field(r.out, "abandoned"), r.status);
+    check(exec_field(r.out, "abandoned") == ESRCH,
+          "exec abandoned in its first step fails with ESRCH", detail);
+    snprintf(detail, sizeof detail, "pthread_create returned %ld",
+             exec_field(r.out, "create"));
+    check(exec_field(r.out, "create") == 0,
+          "exec abandoned: the caller can still start a thread", detail);
+    check(WIFEXITED(r.status) && WEXITSTATUS(r.status) == 0 &&
+              exec_field(r.out, "pid") == (long) r.pid &&
+              exec_field(r.out, "thread") == 1,
+          "exec abandoned: the next exec runs the new image",
+          "the caller execs again and the new image starts a thread");
+}
+
+/* --exec-abandon: the debug-inject stage. */
+void test_exec_abandon(void)
+{
+    exec_abandoned_case();
 }
 
 /* A chain of execs ends in the process it started in, with the same pid. */

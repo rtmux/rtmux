@@ -356,7 +356,8 @@ struct kcall_args_process_exec {
  *   ppid      : the process that called exec
  *   lrcvid    : rcvid of the loader thread of the shell (BEGIN, COMMIT)
  *   crcvid    : rcvid of the thread that called exec (BEGIN, COMMIT)
- *   shell_pid : the shell, the child the new image was loaded into (QUIESCE)
+ *   shell_pid : the shell, the child the new image was loaded into (BEGIN,
+ *               QUIESCE)
  *   priv_caps : authority the new image starts with (COMMIT)
  * Return value: EOK on success, -1 on failure (errno set; EAGAIN means a
  *   thread has yet to leave, call again).

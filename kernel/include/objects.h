@@ -273,11 +273,18 @@ typedef struct process_entry {
     thread_t *valid_thp;
 
     /* The thread that called exec while its swap is under way (set by the begin
-     * step, cleared by the commit), compared and never dereferenced: it tells a
-     * retry of the begin step from a second exec of another thread, and while
-     * it is set thread_create refuses a new thread. Guarded by vec_slock.
+     * step, cleared by the commit, by a failed begin step or when the thread
+     * dies), compared and never dereferenced: it tells a retry of the begin
+     * step from a second exec of another thread, and while it is set
+     * thread_create refuses a new thread. exec_shell is the pid of that exec's
+     * loader shell, which names the exec itself (a pid is not reused soon: it
+     * carries a generation, unlike an rcvid, whose connection and thread slots
+     * are): a late failure of an exec whose caller died must not clear the mark
+     * of a later exec by a thread that took the caller's slot. Guarded by
+     * vec_slock.
      */
     thread_t *exec_thp;
+    pid_t exec_shell;
 
     /* conf_table and rsrc_list previously lived here but were never read by the
      * kernel — roottask-side bookkeeping (sysconf and hwres respectively).

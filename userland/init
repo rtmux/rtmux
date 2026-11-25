@@ -254,6 +254,9 @@ if test "$rtmux_run" = "debug-inject"; then
     # A SIGKILL while a thread create is held between publishing the thread and
     # its first run must reap the victim.
     stage /bin/syscall_testing --create-kill
+    # An exec given up in its first step must leave the caller able to start
+    # threads and exec.
+    stage /bin/syscall_testing --exec-abandon
     if test -z "$failed"; then
         echo "RTMux debug-inject: PASS"
     else

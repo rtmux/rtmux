@@ -181,6 +181,7 @@ void kext_process_create(void *data)
     kspinlock_init(&prp->vec_slock, LOCK_CLASS_PROCVEC, "process_t.vec_slock");
     prp->pin_count = 0;
     prp->exec_thp = NULL;
+    prp->exec_shell = -1;
     prp->as_borrowers = NULL;
     prp->as_borrow_closed = false;
     if (rtmux_cap_table_init(&prp->endpoint_caps, prp->endpoint_cap_slots,
@@ -916,7 +917,7 @@ struct kcall_args_process_exec {
     pid_t ppid;         /* BEGIN, COMMIT: the process that called exec */
     int lrcvid;         /* BEGIN, COMMIT: rcvid of the shell's loader thread */
     int crcvid;         /* BEGIN, COMMIT: rcvid of the exec caller */
-    pid_t shell_pid;    /* QUIESCE: the shell */
+    pid_t shell_pid;    /* BEGIN, QUIESCE: the shell */
     uint64_t priv_caps; /* COMMIT: authority the new image is started with */
 };
 
@@ -969,23 +970,54 @@ static int exec_parties(thread_t *act,
     return EOK;
 }
 
+/* The begin step fails, and roottask gives the exec up and answers the caller
+ * with the error. An earlier call of the step may have marked the process for
+ * this caller: clear the mark, or the caller carries on in a process where
+ * thread_create refuses every thread and any other thread's exec is refused.
+ * The mark is this exec's if it names the thread in the slot the caller's rcvid
+ * names and this exec's shell, which holds even when exec_parties no longer
+ * finds the exec whole (the loader shell gone); the mark of another exec is
+ * left alone. A caller that died took its mark with it (thread_destroy).
+ */
+static void exec_begin_fail(thread_t *act,
+                            const struct kcall_args_process_exec *kap,
+                            int rc)
+{
+    process_t *prp = lookup_pid_rcu(kap->ppid);
+
+    if (prp) {
+        kspinlock_lock(&prp->vec_slock);
+        if (prp->exec_thp && prp->exec_shell == kap->shell_pid &&
+            prp->exec_thp == vector_lookup(&prp->threads, MTINDEX(kap->crcvid)))
+            prp->exec_thp = NULL;
+        kspinlock_unlock(&prp->vec_slock);
+    }
+    rcu_read_unlock(&process_rcu);
+    if (rc != ENOERROR)
+        kcall_err(act, rc);
+}
+
 /* EXEC_BEGIN: take every thread of the process but the caller down.
  *
  * Returns EAGAIN while one is still on its way out; roottask calls again, so
  * that a thread held by a message-delivery claim or a stack release gets to run
- * on this hart. A process with an exec already under way (another thread called
- * exec first, and has since been killed) or one that is exiting refuses.
+ * on this hart. A process with an exec of another thread already under way or
+ * one that is exiting refuses. Any other answer ends the exec, and a failure
+ * clears what the step marked (exec_begin_fail).
  */
 static void exec_begin(thread_t *act, const struct kcall_args_process_exec *kap)
 {
     thread_t *lthp, *cthp;
     process_t *shell, *prp;
     unsigned nthreads;
+    pid_t shell_pid;
     int rc;
 
-    if ((rc = exec_parties(act, kap, &lthp, &cthp, &shell, &prp)) != EOK) {
-        if (rc != ENOERROR)
-            kcall_err(act, rc);
+    rc = exec_parties(act, kap, &lthp, &cthp, &shell, &prp);
+    if (rc == EOK && inject_exec_begin_gone(prp, shell->pid))
+        rc = ESRCH; /* debug-inject: as if the shell had gone */
+    if (rc != EOK) {
+        exec_begin_fail(act, kap, rc);
         return;
     }
 
@@ -993,30 +1025,34 @@ static void exec_begin(thread_t *act, const struct kcall_args_process_exec *kap)
      * every RCU reader, this call's own among them.
      */
     if ((rc = process_pin(prp)) != EOK) {
-        kcall_err(act, rc);
+        exec_begin_fail(act, kap, rc);
         return;
     }
     if ((rc = tthread_pin(cthp)) != EOK) {
         process_unpin(prp);
-        kcall_err(act, rc);
+        exec_begin_fail(act, kap, rc);
         return;
     }
     kspinlock_lock(&prp->vec_slock);
     if (prp->flags & (RTMUX_FLG_PROC_TERMING | RTMUX_FLG_PROC_DESTROYALL |
-                      RTMUX_FLG_PROC_LOADING | RTMUX_FLG_PROC_ZOMBIE))
+                      RTMUX_FLG_PROC_LOADING | RTMUX_FLG_PROC_ZOMBIE)) {
         rc = ESRCH;
-    else if (prp->exec_thp && prp->exec_thp != cthp)
+    } else if (prp->exec_thp && prp->exec_thp != cthp) {
         rc = EBUSY;
-    else
+    } else {
         prp->exec_thp = cthp;
+        prp->exec_shell = shell->pid;
+    }
     kspinlock_unlock(&prp->vec_slock);
     if (rc != EOK) {
         tthread_unpin(cthp);
         process_unpin(prp);
-        kcall_err(act, rc);
+        exec_begin_fail(act, kap, rc);
         return;
     }
 
+    /* Read before the release: the shell is not pinned. */
+    shell_pid = shell->pid;
     lookup_rcvid_release();
 
     exit_destroy_threads(prp, cthp);
@@ -1027,6 +1063,8 @@ static void exec_begin(thread_t *act, const struct kcall_args_process_exec *kap)
         if (nthreads != 1)
             kcall_err(act, EAGAIN);
     }
+    if (inject_exec_begin_again(prp, shell_pid))
+        kcall_err(act, EAGAIN);
     tthread_unpin(cthp);
     process_unpin(prp);
 }

@@ -676,6 +676,15 @@ static __inline__ void __attribute__((__unused__)) atomic_boundary()
  */
 #define RTMUX_ITF_CANCEL_POSTED 0x1000U
 
+/* CREATING: thread_create has put the thread in its process's thread vector and
+ * is still setting it up. Until its creator readies it the thread is
+ * STATE_DEAD, which thread_destroy would take for an exited thread and free
+ * under the creator; it flags such a thread to kill itself instead. Set under
+ * vec_slock in the step that adds the thread, cleared by the creator once the
+ * thread is readied.
+ */
+#define RTMUX_ITF_CREATING 0x2000U
+
 /* internal_flags is a single 32-bit word whose bits are written from MULTIPLE
  * CPUs concurrently. A thread sets/clears its OWN WAIT_PENDING /
  * RCVNOTIFICATION / SPECRET_PENDING bits (e.g. ksys_msg_receivev clearing

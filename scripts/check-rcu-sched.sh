@@ -891,7 +891,7 @@ if ! grep -q 'thread_join_wait_ready(joiner)' kernel/sched/thread.c ||
        in_join && /RTMUX_ITF_WAIT_PENDING/ { saw_wait = NR }
        in_join && /cpu_smp_mb\(\);/ { saw_mb = NR }
        in_join && /kspinlock_lock\(&prp->vec_slock\);/ { saw_lock = NR }
-       in_join && /if \(target->join == thp\)/ { saw_guard = NR }
+       in_join && /if \(!lost && target->join == thp\)/ { saw_guard = NR }
        in_join && /target->join = NULL;/ {
            saw_clear = NR
        }
@@ -2048,20 +2048,35 @@ fi
 
 if ! awk '
     /void rdecl thread_specret\(thread_t \*thp\)/ { in_specret = 1 }
-    # Both steps must sit inside the WAITTHREAD guard, the clear before the
-    # ready: a parent woken first can join on another hart while the field
-    # still names it, and get EBUSY.
-    in_wait && /^    }$/ { in_wait = 0 }
-    in_specret &&
-        /if \(thp->join && thp->join->state == STATE_WAITTHREAD\) {/ {
-        in_wait = 1
+    # The link is taken inside the WAITTHREAD guard under vec_slock, and the
+    # parent readied after: the capture and the clear inside the guard, the
+    # clear before the ready (a parent woken first can join on another hart
+    # while the field still names it, and get EBUSY), and under the lock a
+    # force_ready of the waiting parent takes the link under, so that only
+    # one of them readies it.
+    in_guard && /^        }$/ { in_guard = 0; guard_end = NR }
+    in_specret && !saw_lock && /kspinlock_lock\(&prp->vec_slock\);/ {
+        saw_lock = NR
     }
-    in_wait && /thread_t \*parent = thp->join;/ { saw_parent = NR }
-    in_wait && /thp->join = NULL;/ { saw_clear = NR }
-    in_wait && /ready\(parent\);/ { saw_ready = NR }
+    in_specret && saw_lock && !saw_guard &&
+        /if \(thp->join && thp->join->state == STATE_WAITTHREAD\) {/ {
+        saw_guard = NR
+        in_guard = 1
+    }
+    in_guard && !saw_parent && /parent = thp->join;/ { saw_parent = NR }
+    in_guard && saw_parent && !saw_clear && /thp->join = NULL;/ {
+        saw_clear = NR
+    }
+    in_specret && guard_end && !saw_unlock &&
+        /kspinlock_unlock\(&prp->vec_slock\);/ {
+        saw_unlock = NR
+    }
+    in_specret && saw_unlock && !saw_ready && /ready\(parent\);/ {
+        saw_ready = NR
+    }
     in_specret && /^}/ { in_specret = 0 }
     END {
-        exit !(saw_parent && saw_parent < saw_clear && saw_clear < saw_ready)
+        exit !(saw_clear && saw_ready)
     }
 ' kernel/thread/lifecycle.c; then
     echo "RCU-sched: thread birth must clear the temporary join handshake" >&2

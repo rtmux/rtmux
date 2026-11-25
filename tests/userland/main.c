@@ -1996,12 +1996,19 @@ int main(int argc, char *argv[])
     }
     if (argc == 2 && !strcmp(argv[1], "--thread-loop-child"))
         return kill_thread_loop_child();
+    if (argc == 2 && !strcmp(argv[1], "--create-once-child"))
+        return kill_create_once_child();
     if (argc == 2 && !strcmp(argv[1], "--version-child"))
         return 0; /* a bare start of this binary, for the spawn timings */
     if (argc == 2 && !strcmp(argv[1], "--spawn-exec-time")) {
         printf("[spawn_exec_time]\n");
         test_spawn_exec_time();
         return 0; /* measurements only: nothing to pass or fail */
+    }
+    if (argc == 2 && !strcmp(argv[1], "--exec-abandon")) {
+        printf("[exec_abandon]\n");
+        test_exec_abandon();
+        return finish(1);
     }
     if (argc == 2 && !strcmp(argv[1], "--create-kill")) {
         printf("[kill_during_thread_create]\n");

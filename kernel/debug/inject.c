@@ -519,6 +519,53 @@ bool inject_exit_destroy_held(const process_t *prp)
     return false;
 }
 
+/* ABANDON_EXEC: the process whose next exec is given up, how far that exec has
+ * got (0 armed, 1 its begin step has been asked to run again), and from stage 1
+ * the shell that names it. An exec that fails on its own once at stage 1 (its
+ * caller died) leaves the arm unmatched: a later exec has another shell.
+ */
+static atomic_int abandon_exec_pid = -1;
+static atomic_int abandon_exec_stage;
+static atomic_int abandon_exec_shell = -1;
+
+/* Whether the begin step of an exec in prp (shell its loader shell's pid), its
+ * work done, must ask to be made again: the first call of the exec ABANDON_EXEC
+ * armed.
+ */
+bool inject_exec_begin_again(const process_t *prp, pid_t shell)
+{
+    int pid = atomic_load_explicit(&abandon_exec_pid, memory_order_acquire);
+    int from = 0;
+
+    if (pid < 0 || prp->pid != pid ||
+        !atomic_compare_exchange_strong_explicit(&abandon_exec_stage, &from, 1,
+                                                 memory_order_acq_rel,
+                                                 memory_order_relaxed))
+        return false;
+    atomic_store_explicit(&abandon_exec_shell, shell, memory_order_release);
+    return true;
+}
+
+/* Whether this call of the begin step of an exec in prp must find the loader
+ * shell gone: the call after the one inject_exec_begin_again held, of the same
+ * exec. Disarms.
+ */
+bool inject_exec_begin_gone(const process_t *prp, pid_t shell)
+{
+    int pid = atomic_load_explicit(&abandon_exec_pid, memory_order_acquire);
+    int from = 1;
+
+    if (pid < 0 || prp->pid != pid ||
+        atomic_load_explicit(&abandon_exec_shell, memory_order_acquire) !=
+            shell ||
+        !atomic_compare_exchange_strong_explicit(&abandon_exec_stage, &from, 2,
+                                                 memory_order_acq_rel,
+                                                 memory_order_relaxed))
+        return false;
+    atomic_store_explicit(&abandon_exec_pid, -1, memory_order_release);
+    return true;
+}
+
 /* Called by force_ready when it finds thp claimed, before it hands its wake
  * over: let the claimer that inject_claim_held() holds go, and give it time to
  * release the claim.
@@ -1034,6 +1081,17 @@ void kext_debug_inject(void *data)
             r_time() + kap->arg1 * (qtimeptr->cycles_per_sec / 1000),
             memory_order_relaxed);
         atomic_store_explicit(&exit_hold_pid, (int) kap->arg0,
+                              memory_order_release);
+        ret = EOK;
+        break;
+    case INJECT_OP_ABANDON_EXEC:
+        if (kap->arg0 > INT32_MAX) {
+            ret = EINVAL;
+            break;
+        }
+        atomic_store_explicit(&abandon_exec_stage, 0, memory_order_relaxed);
+        atomic_store_explicit(&abandon_exec_shell, -1, memory_order_relaxed);
+        atomic_store_explicit(&abandon_exec_pid, (int) kap->arg0,
                               memory_order_release);
         ret = EOK;
         break;

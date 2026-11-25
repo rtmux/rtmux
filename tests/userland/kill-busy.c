@@ -63,8 +63,12 @@
 #define KILL_MAP_BYTES (8UL * 1024 * 1024)
 #define KILL_MAP_SLOW "2000/2048" /* 2 ms more for each of its 2048 pages */
 /* How long a held thread create spins, and how often the case runs. */
-#define KILL_CREATE_STALL_MS "300"
+#define KILL_CREATE_STALL_MS_N 2000
+#define KILL_CREATE_STALL_MS KB_STR(KILL_CREATE_STALL_MS_N)
+#define KILL_CREATE_STALL_NS (KILL_CREATE_STALL_MS_N * 1000000ULL)
 #define KILL_CREATE_ROUNDS 5
+#define KB_STR_(x) #x
+#define KB_STR(x) KB_STR_(x)
 
 static uint64_t kb_now_ns(void)
 {
@@ -630,47 +634,90 @@ out:
     (void) close(from_child[0]);
 }
 
+/* --create-once-child: wait for a byte on fd 3, start one thread, and wait for
+ * the kill.
+ */
+int kill_create_once_child(void)
+{
+    pthread_t t;
+    char go;
+
+    if (read(3, &go, 1) != 1)
+        return 4;
+    if (pthread_create(&t, NULL, kb_thread_noop, NULL) == 0)
+        (void) pthread_detach(t);
+    for (;;)
+        (void) sleep(1000);
+}
+
 /* Kill a process while one of its pthread_create calls is held in the window
- * where the new thread is published but has not run. The exit's destroy
- * pass then finds a thread that is still STATE_DEAD: it used to take it for an
- * exited zombie and free it under its creator, or finish while the thread was
- * not yet counted active and let the address space go, so the thread started
- * in a freed address space and the victim was never reaped.
+ * where the new thread is in the thread vector but has not been started: the
+ * exit's destroy pass must leave that thread to its creator, which is still
+ * setting it up, rather than take it for an exited thread (it is STATE_DEAD
+ * until it is readied) and free it. The victim must be reaped as SIGKILL once
+ * the create is over.
+ *
+ * The hold is watched by one /bin/inject that stays alive until the case is
+ * over. With /bin/inject runs ending during the hold, as site-wait does, the
+ * kill was only carried out once the create had finished, and the window was
+ * never reached.
  */
 static void test_kill_during_create(void)
 {
     const char *name = "kill_during_thread_create";
-    char *argv[] = {"syscall_testing", "--thread-loop-child", NULL};
+    char *argv[] = {"syscall_testing", "--create-once-child", NULL};
+    const uint64_t limit = KILL_CREATE_STALL_NS + KILL_BUSY_LIMIT_NS;
+    struct stall_watch watch = {.pid = -1, .events = -1, .release = -1};
+    posix_spawn_file_actions_t fa;
+    int go[2], status = 0, reaped;
     char pidarg[16], detail[128];
-    int status = 0, reaped;
+    pid_t pid = -1;
     uint64_t t0, waited;
-    pid_t pid;
 
     if (inject_run("alloc-status", NULL, NULL) != 0) {
         test_skip(name, "fault injection unavailable");
         return;
     }
-    if (posix_spawn(&pid, "/bin/syscall_testing", NULL, NULL, argv, NULL) !=
-        0) {
+    if (pipe(go) != 0 || fcntl(go[1], F_SETFD, FD_CLOEXEC) == -1) {
+        test_fail(name, "pipe failed");
+        return;
+    }
+    if (posix_spawn_file_actions_init(&fa) != 0 ||
+        posix_spawn_file_actions_adddup2(&fa, go[0], 3) != 0 ||
+        posix_spawn(&pid, "/bin/syscall_testing", &fa, NULL, argv, NULL) != 0)
+        pid = -1;
+    (void) posix_spawn_file_actions_destroy(&fa);
+    (void) close(go[0]);
+    if (pid == -1) {
         test_fail(name, "spawn failed");
+        (void) close(go[1]);
         return;
     }
     (void) snprintf(pidarg, sizeof pidarg, "%d", (int) pid);
+    /* A victim that died before reading its byte must fail the case, not
+     * raise SIGPIPE in this process.
+     */
+    (void) signal(SIGPIPE, SIG_IGN);
     if (inject_run("stall-thread-create", pidarg, KILL_CREATE_STALL_MS) != 0 ||
-        inject_run("site-wait", "thread-create", NULL) != 0) {
+        stall_watch_start(&watch, "thread-create") != 0 ||
+        write(go[1], "G", 1) != 1 || !stall_watch_entered(&watch)) {
         test_fail(name, "the victim never reached the held thread create");
         (void) kill(pid, SIGKILL);
         (void) kb_reap(pid, &status, KILL_BUSY_OUTLIVE_NS);
         goto out;
     }
+
+    /* The create is held: kill. The exit marks the victim and makes its passes
+     * while the create spins, and the victim can only go once it has.
+     */
     t0 = kb_now_ns();
     (void) kill(pid, SIGKILL);
-    reaped = kb_reap(pid, &status, KILL_BUSY_LIMIT_NS);
+    reaped = kb_reap(pid, &status, limit);
     waited = kb_now_ns() - t0;
     (void) snprintf(detail, sizeof detail,
                     "reaped=%d after %llu ms (limit %llu), status 0x%x", reaped,
                     (unsigned long long) (waited / 1000000),
-                    (unsigned long long) (KILL_BUSY_LIMIT_NS / 1000000), status);
+                    (unsigned long long) (limit / 1000000), status);
     printf("  INFO  %s: %s\n", name, detail);
     check(reaped && WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL, name,
           detail);
@@ -679,6 +726,9 @@ static void test_kill_during_create(void)
         (void) kb_reap(pid, &status, KILL_BUSY_OUTLIVE_NS);
     }
 out:
+    (void) close(go[1]);
+    (void) signal(SIGPIPE, SIG_DFL);
+    stall_watch_finish(&watch);
     (void) inject_run("site-release", "thread-create", NULL);
 }
 
