@@ -197,19 +197,13 @@ int vm_map(ioserv_context_t *ctp, pid_t prp_pid, process_t *prp, mem_map_t *msg)
     if (msg->i.len == 0) {
         return EINVAL;
     }
-    /* parm rather than prot like they should. */
     if (msg->i.prot & ~(uint32_t) PROT_MASK) {
         return EINVAL;
     }
-    /* MAP_SYSRAM is just a status indicator - not allowed to pass it in. */
-check_again:
+    /* Protection bits belong in prot, never flags (PROT_NOCACHE included);
+     * MAP_SYSRAM is a status indicator, and the reserved and page-mapping
+     * status bits are set internally. A caller may pass none of them. */
     if (msg->i.flags & (PROT_MASK | MAP_SYSRAM | MAP_RESERVMASK | MM_PG_MASK)) {
-        if (msg->i.flags & PROT_NOCACHE) {
-            /* Kludge fix for test programs that pass PROT_NOCACHE in flags */
-            msg->i.prot |= PROT_NOCACHE;
-            msg->i.flags &= ~(uint32_t) PROT_NOCACHE;
-            goto check_again;
-        }
         return EINVAL;
     }
     if (msg->i.mem_handle != 0) {
