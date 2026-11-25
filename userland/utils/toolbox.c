@@ -158,7 +158,7 @@ static const struct toolbox_applet applets[] = {
      "| "
      "stall-block PID TID [MS] | stall-ready PID TID MS | stall-steal PID TID "
      "MS | "
-     "stall-reprio PID TID MS | "
+     "stall-reprio PID TID MS | stall-timer-fire PID TID MS | "
      "poke PID TID ready|stop | sched-stats | as-lock-stats | serve | "
      "hold-exit-destroy PID MS | "
      "stall-switch PID TID MS | crash [shutdown] | stall-reply-claim PID MS | "
@@ -3227,6 +3227,7 @@ static int applet_inject(int argc, char **argv)
             [STALL_UNBLOCK_REPLY] = "unblock-reply",
             [STALL_KPAGE_ZERO] = "kpage-zero",
             [STALL_THREAD_CREATE] = "thread-create",
+            [STALL_TIMER_FIRE] = "timer-fire",
             [INJECT_SITE_TURNSTILE] = "turnstile",
             [INJECT_SITE_REPLY_DETACHED] = "reply-detached",
         };
@@ -3314,10 +3315,12 @@ static int applet_inject(int argc, char **argv)
             strtoul(argv[3], NULL, 0) << 32 |
                 (argc == 5 ? strtoul(argv[4], NULL, 0) : INJECT_SPIN_MAX_MS));
     } else if (argc == 5 && (!strcmp(argv[1], "stall-ready") ||
-                             !strcmp(argv[1], "stall-switch"))) {
+                             !strcmp(argv[1], "stall-switch") ||
+                             !strcmp(argv[1], "stall-timer-fire"))) {
         rc = inject_call(
-            !strcmp(argv[1], "stall-ready") ? INJECT_OP_STALL_READY
-                                            : INJECT_OP_STALL_SWITCH,
+            !strcmp(argv[1], "stall-ready")    ? INJECT_OP_STALL_READY
+            : !strcmp(argv[1], "stall-switch") ? INJECT_OP_STALL_SWITCH
+                                               : INJECT_OP_STALL_TIMER_FIRE,
             strtoul(argv[2], NULL, 0),
             strtoul(argv[3], NULL, 0) << 32 | strtoul(argv[4], NULL, 0));
     } else if (argc == 4 && (!strcmp(argv[1], "stall-claim-held") ||
@@ -3464,6 +3467,7 @@ static int applet_inject(int argc, char **argv)
             "intr-after-select PID | intr-select-seen [TID] | "
             "stall-block PID TID [MS] | stall-ready PID TID MS | "
             "stall-steal PID TID MS | stall-reprio PID TID MS | "
+            "stall-timer-fire PID TID MS | "
             "poke PID TID ready|stop | "
             "hold-exit-destroy PID MS | "
             "sched-stats | serve | "

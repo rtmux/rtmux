@@ -1007,11 +1007,41 @@ static int resv_fill(void)
  */
 static int run_laps(int laps)
 {
+    struct sched_param start;
+    int start_policy;
+    int have_start;
     int total_failed = 0;
 
+    /* Suites change this thread's scheduling and some leave it changed for the
+     * cases after them in the same lap (sync leaves it at FIFO 20). Each lap
+     * starts from the state the process began with, so that a lap repeats the
+     * first: a case that spins threads at the inherited priority would
+     * otherwise run them at FIFO 20 on one hart and never get the hart back.
+     */
+    memset(&start, 0, sizeof start);
+    start_policy = __sched_get(0, 0, &start); /* the policy, or -1 */
+    have_start = start_policy != -1;
+    if (!have_start)
+        printf("laps: could not read the starting scheduling: %s\n",
+               strerror(errno));
     for (int lap = 1; lap <= laps; lap++) {
+        struct sched_param now;
+        int policy;
         int lap_failed;
 
+        /* A lap that cannot start from that state is not run: it would not
+         * repeat the first, and could hang on the inherited priority.
+         */
+        if (!have_start || __sched_set(0, 0, start_policy, &start) != EOK) {
+            printf("lap=%d could not restore the starting scheduling\n", lap);
+            printf("lap=%d FAIL\n", lap);
+            total_failed++;
+            continue;
+        }
+        policy = __sched_get(0, 0, &now);
+        if (policy != -1)
+            printf("lap=%d sched policy=%d priority=%d\n", lap, policy,
+                   now.sched_priority);
         suite_counts = (struct test_counts) {0};
         printf("lap=%d BEGIN\n", lap);
         for (size_t i = 0; i < sizeof test_suites / sizeof test_suites[0]; i++) {
@@ -1173,6 +1203,12 @@ int main(int argc, char *argv[])
     }
     if (argc == 2 && !strcmp(argv[1], "--sysfs-open-stress")) {
         test_sysfs_open_stress();
+        return finish(1);
+    }
+    /* --proc-wait-stale N: the reap-then-read wait handle case, N times. */
+    if (argc == 3 && !strcmp(argv[1], "--proc-wait-stale")) {
+        for (int i = atoi(argv[2]); i > 0; i--)
+            test_proc_wait_handle_stale_after_reap();
         return finish(1);
     }
     if (argc == 2 && !strcmp(argv[1], "--spawn-arg-max")) {
@@ -1340,6 +1376,13 @@ int main(int argc, char *argv[])
         printf("[wait_rewait]\n");
         if (wait_rewait() == TC_EXIT_SKIP)
             test_skip("wait_rewait", "two harts and fault injection required");
+        return finish(1);
+    }
+    if (argc == 2 && !strcmp(argv[1], "--timer-fire-stale")) {
+        printf("[timer_fire_stale]\n");
+        if (timer_fire_stale() == TC_EXIT_SKIP)
+            test_skip("timer_fire_stale",
+                      "three harts and fault injection required");
         return finish(1);
     }
     if (argc == 2 && !strcmp(argv[1], "--condvar-interrupt-stale")) {

@@ -445,6 +445,7 @@ extern atomic_uint inject_as_slock_takes;
     } while (0)
 void inject_ready_stall(thread_t *thp);
 void inject_switch_stall(thread_t *thp);
+void inject_timer_fire_stall(thread_t *thp, const uint32_t *wait_seq);
 void ipc_blk_trace(const char *file, int line, thread_t *thp);
 #define IPC_BLK(thp) ipc_blk_trace(__FILE__, __LINE__, (thp))
 void thr_trace(const char *file, int line, thread_t *thp, void *ra);
@@ -505,6 +506,12 @@ static inline void inject_ready_stall(thread_t *thp)
 static inline void inject_switch_stall(thread_t *thp)
 {
     (void) thp;
+}
+static inline void inject_timer_fire_stall(thread_t *thp,
+                                           const uint32_t *wait_seq)
+{
+    (void) thp;
+    (void) wait_seq;
 }
 static inline void inject_sync_waker_stall(thread_t *thp)
 {

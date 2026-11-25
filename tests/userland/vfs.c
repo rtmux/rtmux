@@ -7627,16 +7627,36 @@ static void test_proc_wait_handle_shape(void)
     (void) close(fd);
 }
 
-static void test_proc_wait_handle_stale_after_reap(void)
+/* Read a /proc/<pid>/wait handle from its start and check that it reads stale,
+ * naming what it read when it does not.
+ */
+static void check_wait_handle_stale(int fd, const char *name)
+{
+    char buf[16];
+    char detail[96];
+    ssize_t n;
+
+    (void) lseek(fd, 0, SEEK_SET);
+    n = read(fd, buf, sizeof(buf) - 1);
+    if (n < 0) {
+        test_fail(name, strerror(errno));
+        return;
+    }
+    buf[n] = '\0';
+    (void) snprintf(detail, sizeof(detail),
+                    "wait handle must read stale after the reap, read \"%.*s\"",
+                    (int) strcspn(buf, "\n"), buf);
+    check(!strcmp(buf, "stale\n"), name, detail);
+}
+
+void test_proc_wait_handle_stale_after_reap(void)
 {
     char *argv[] = {"true", NULL};
     char path[64];
-    char buf[16];
     pid_t pid;
     int fd;
     int status;
     int rc;
-    ssize_t n;
 
     rc = posix_spawn(&pid, "/bin/true", NULL, NULL, argv, NULL);
     if (rc != EOK) {
@@ -7652,20 +7672,24 @@ static void test_proc_wait_handle_stale_after_reap(void)
         return;
     }
 
-    check(waitpid(pid, &status, 0) == pid && WIFEXITED(status),
-          "proc wait child reap", "spawned child must be reapable");
-
-    (void) lseek(fd, 0, SEEK_SET);
-    n = read(fd, buf, sizeof(buf) - 1);
-    if (n < 0) {
-        test_fail("proc child wait stale read", strerror(errno));
+    if (waitpid(pid, &status, 0) != pid || !WIFEXITED(status)) {
+        test_fail("proc wait child reap", "spawned child must be reapable");
         (void) close(fd);
         return;
     }
-    buf[n] = '\0';
-    check(!strcmp(buf, "stale\n"), "proc wait stale after reap",
-          "open wait handle must not target a reaped process generation");
+    test_ok("proc wait child reap");
+
+    check_wait_handle_stale(fd, "proc wait stale after reap");
     (void) close(fd);
+
+    /* A handle opened after the reap, while the child's teardown may still be
+     * running, is stale too; once the teardown ends the open fails instead.
+     */
+    fd = open(path, O_RDONLY);
+    if (fd != -1) {
+        check_wait_handle_stale(fd, "proc wait opened after reap");
+        (void) close(fd);
+    }
 }
 
 static void test_kill_zero_after_reap(void)

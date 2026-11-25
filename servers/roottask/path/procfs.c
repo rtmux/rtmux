@@ -422,8 +422,16 @@ static int procfs_read(ioserv_context_t *ctp, io_read_t *msg, void *vocb)
 
         if (!(ocb->ioflag & _IO_FLAG_RD))
             return EBADF;
+
+        /* A reaped child (WAITDONE) lingers until its teardown ends, and its
+         * pid then names no process (a later one carries a new generation):
+         * either way the handle is stale. The reap sets WAITDONE before it
+         * answers the waiter. A handle read stale stays stale, should the pid
+         * generation wrap onto a new process.
+         */
         if (!ocb->stale && ocb->pid != -1 &&
-            process_query_info(ocb->pid, &qinfo) == EOK) {
+            process_query_info(ocb->pid, &qinfo) == EOK &&
+            !(qinfo.flags & RTMUX_FLG_PROC_WAITDONE)) {
             if (qinfo.flags & RTMUX_FLG_PROC_WAITINFO) {
                 /* A SIGCHLD record holds the status. The kernel's record of a
                  * fault holds an address where the status would be: the process
@@ -439,6 +447,7 @@ static int procfs_read(ioserv_context_t *ctp, io_read_t *msg, void *vocb)
                 state = "live\n";
             }
         } else {
+            ocb->stale = true;
             state = "stale\n";
         }
         statelen = strlen(state);
@@ -873,20 +882,6 @@ static int procfs_waitstop(pid_t pid, int rcvid)
         tmp->debug_waiting = wap;
     }
     return EOK;
-}
-
-void procfs_wait_stale(pid_t pid)
-{
-    struct procfs_ocb *ocb;
-    root_proc_info_t qinfo;
-
-    if (process_query_info(pid, &qinfo) != EOK)
-        return;
-
-    for (ocb = (struct procfs_ocb *) qinfo.ocb_list; ocb; ocb = ocb->next) {
-        if (ocb->flags & PROCFS_FLAG_WAIT)
-            ocb->stale = true;
-    }
 }
 
 static int procfs_close_ocb(ioserv_context_t *ctp, void *reserved, void *vocb)

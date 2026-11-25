@@ -173,6 +173,8 @@ if test "$rtmux_run" = "debug-inject"; then
     # the woken thread alone.
     stage /bin/syscall_testing --condvar-interrupt-stale
     stage /bin/syscall_testing --wait-rewait
+    # A timer fire held past the end of its sleep must not end the next one.
+    stage /bin/syscall_testing --timer-fire-stale
     stage /bin/syscall_testing --sync-kill-handoff
     stage /bin/syscall_testing --block-request-race
     stage /bin/syscall_testing --dispatch-window

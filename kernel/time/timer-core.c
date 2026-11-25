@@ -293,9 +293,31 @@ void rdecl timer_deadline_invalidate(void)
 struct timer_fire_defer {
     struct sigevent event;
     thread_t *thp;
+    uint32_t wait_seq; /* tip->wait_seq, when wait_bound */
     uint8_t
         reserved; /* tip->nresv snapshot: allocation-free reserve delivery */
+    uint8_t wait_bound;
 };
+
+/* Snapshot tip's fire, by value, under the wheel lock. */
+static void timer_fire_record(struct timer_fire_defer *f, const ktimer_t *tip)
+{
+    f->event = tip->event;
+    f->thp = tip->thread;
+    f->wait_seq = tip->wait_seq;
+    f->reserved = tip->nresv;
+    f->wait_bound = tip->wait_bound;
+}
+
+/* Deliver a recorded fire, with the wheel lock released. A timeout's wait may
+ * have ended since the fire was recorded, and the thread be in its next wait:
+ * the fire names the wait it was armed for, so it cannot end that one.
+ */
+static void timer_fire_deliver(const struct timer_fire_defer *f)
+{
+    sigevent_deliver_wait(&f->event, f->thp, f->reserved,
+                          f->wait_bound ? &f->wait_seq : NULL);
+}
 static struct timer_fire_defer timer_fire_deferred[CONFIG_PROCESSORS_MAX]
                                                   [TIMER_FIRE_DEFER_MAX];
 static unsigned timer_fire_deferred_n[CONFIG_PROCESSORS_MAX];
@@ -350,10 +372,7 @@ static void timer_fire_deferred_flush(void)
  * own bit) and drain right after clearing it.
  */
 struct timeout_fire_defer {
-    struct sigevent event;
-    thread_t *thp;
-    uint8_t
-        reserved; /* tip->nresv snapshot: allocation-free reserve delivery */
+    struct timer_fire_defer fire;
     uint8_t valid;
 };
 static struct timeout_fire_defer timeout_fire_pending[CONFIG_PROCESSORS_MAX];
@@ -634,9 +653,7 @@ static ktimer_t *timer_fire(ktimer_t *tip)
         unsigned cpu = get_cpunum();
         unsigned slot = timer_fire_deferred_n[cpu];
         if (slot < TIMER_FIRE_DEFER_MAX) {
-            timer_fire_deferred[cpu][slot].event = tip->event;
-            timer_fire_deferred[cpu][slot].thp = thp;
-            timer_fire_deferred[cpu][slot].reserved = tip->nresv;
+            timer_fire_record(&timer_fire_deferred[cpu][slot], tip);
             timer_fire_deferred_n[cpu] = slot + 1;
         }
     } else {
@@ -816,9 +833,11 @@ capped_out:
         unsigned n = timer_fire_deferred_n[cpu];
         unsigned i;
         for (i = 0; i < n; i++) {
-            sigevent_deliver_inline(&timer_fire_deferred[cpu][i].event,
-                                    timer_fire_deferred[cpu][i].thp,
-                                    timer_fire_deferred[cpu][i].reserved);
+            const struct timer_fire_defer *f = &timer_fire_deferred[cpu][i];
+
+            inject_timer_fire_stall(f->thp,
+                                    f->wait_bound ? &f->wait_seq : NULL);
+            timer_fire_deliver(f);
         }
         timer_fire_deferred_n[cpu] = 0;
     }
@@ -1000,10 +1019,8 @@ int rdecl timer_past(int clockid, int flags, uint64_t *firetime)
 static void timer_activate_impl(ktimer_t *tip, int defer)
 {
     uint64_t tod;
-    struct sigevent fire_event;
-    const struct sigevent *fire_evp = NULL;
-    thread_t *fire_thp = NULL;
-    uint8_t fire_reserved = 0;
+    struct timer_fire_defer fire;
+    bool fired = false;
 
     WHEEL_LOCK();
 
@@ -1030,10 +1047,8 @@ static void timer_activate_impl(ktimer_t *tip, int defer)
              * non-recursive lock (same-hart self-deadlock). This matches the
              * deferred-delivery model timer_expiry already uses.
              */
-            fire_event = tip->event;
-            fire_evp = &fire_event;
-            fire_thp = tip->thread;
-            fire_reserved = tip->nresv;
+            timer_fire_record(&fire, tip);
+            fired = true;
             timer_rearm(tip, FS_ACTIVATE);
         } else {
             timer_insert(tip, FS_ACTIVATE);
@@ -1044,7 +1059,7 @@ static void timer_activate_impl(ktimer_t *tip, int defer)
 
     WHEEL_UNLOCK();
 
-    if (fire_evp) {
+    if (fired) {
         if (defer) {
             /* Caller (block_release via timeout_start_deferred) still holds the
              * turnstile chain lock that force_ready would re-acquire. Stash the
@@ -1053,16 +1068,14 @@ static void timer_activate_impl(ktimer_t *tip, int defer)
              */
             unsigned cpu = get_cpunum();
             CRASHCHECK(timeout_fire_pending[cpu].valid);
-            timeout_fire_pending[cpu].event = fire_event;
-            timeout_fire_pending[cpu].thp = fire_thp;
-            timeout_fire_pending[cpu].reserved = fire_reserved;
+            timeout_fire_pending[cpu].fire = fire;
             timeout_fire_pending[cpu].valid = 1;
         } else {
             /* Kext context has INKERNEL_NOW set, so notification_deliver's
              * inline xfer path is available and correct (the helper passes
              * straight through to sigevent_exe).
              */
-            sigevent_deliver_inline(fire_evp, fire_thp, fire_reserved);
+            timer_fire_deliver(&fire);
         }
     }
 }
@@ -1081,20 +1094,19 @@ void rdecl timeout_deferred_fire(void)
     unsigned cpu = get_cpunum();
 
     if (timeout_fire_pending[cpu].valid) {
-        struct sigevent ev = timeout_fire_pending[cpu].event;
-        thread_t *thp = timeout_fire_pending[cpu].thp;
-        uint8_t reserved = timeout_fire_pending[cpu].reserved;
+        struct timer_fire_defer fire = timeout_fire_pending[cpu].fire;
 
         timeout_fire_pending[cpu].valid = 0;
 
         /* The thread's wait may have been completed by another CPU between the
          * WAIT_PENDING clear and this drain (a real wake runs timeout_stop,
-         * which clears TIMEOUT_ACTIVE). Delivering then would time out a later
-         * wait of the same thread, so drop the stale fire.
+         * which clears TIMEOUT_ACTIVE): drop the fire at once. A later wait
+         * that armed its timeout again is left alone by the wait the fire names
+         * (timer_fire_deliver).
          */
-        if (!(thp->timeout_flags & RTMUX_FLG_TIMEOUT_ACTIVE))
+        if (!(fire.thp->timeout_flags & RTMUX_FLG_TIMEOUT_ACTIVE))
             return;
-        sigevent_deliver_inline(&ev, thp, reserved);
+        timer_fire_deliver(&fire);
     }
 }
 
@@ -1170,6 +1182,7 @@ ktimer_t *rdecl timer_alloc(process_t *prp)
          * bit from a recycled soul would double-release a reservation.
          */
         tip->nresv = 0;
+        tip->wait_bound = 0;
     }
     return tip;
 }
@@ -1316,6 +1329,14 @@ static void timeout_start_impl(thread_t *thp, int defer)
              */
             if (!(thp->timeout_flags & RTMUX_FLG_TIMEOUT_ACTIVE)) {
                 thp->timeout_flags |= RTMUX_FLG_TIMEOUT_ACTIVE;
+
+                /* The timer is for the wait thp is in now: every wake that ends
+                 * it counts wake_seq and stops the timer (ready,
+                 * block_and_ready), and a wait it spans unwoken (SEND into
+                 * REPLY) keeps the count. Bind the fire to it.
+                 */
+                thp->timeout->wait_seq = thread_wake_seq(thp);
+                thp->timeout->wait_bound = 1;
 
                 /* A thread mid-transition into an IPC/join wait has
                  * WAIT_PENDING set; force_ready spins on that bit, so a

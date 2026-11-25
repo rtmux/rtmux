@@ -326,6 +326,10 @@ int rdecl sigevent_exe(const struct sigevent *evp,
 void sigevent_deliver_inline(const struct sigevent *evp,
                              thread_t *target,
                              int reserved);
+void sigevent_deliver_wait(const struct sigevent *evp,
+                           thread_t *target,
+                           int reserved,
+                           const uint32_t *wait_seq);
 int rdecl sigevent_proc(const struct sigevent *evp);
 int rdecl sigevent_notification_roottask(int code,
                                          unsigned priority,

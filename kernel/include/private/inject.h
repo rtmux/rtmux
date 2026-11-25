@@ -329,6 +329,19 @@ enum {
  */
 #define INJECT_OP_RCU_STALL_WAITS 49
 
+/* STALL_TIMER_FIRE(pid, tid << 32 | ms): the next timer of thread tid (as
+ * pthread_t) of pid that the timer expiry (timer_expiry) finds due holds the
+ * hart that fired it, with interrupts off, between recording the fire under the
+ * wheel lock and delivering it: the window in which the wait the timer was
+ * armed for can end by another path and the thread start the next one. A fire
+ * whose deadline had passed when the timer was armed is delivered by the kernel
+ * path that armed it (timer_activate_impl, or timeout_deferred_fire after the
+ * caller drops its lock), not by the expiry, and is not held: the arm stays for
+ * the next expired timer. The hold lasts until the thread has been woken and is
+ * in a nanosleep again, or ms milliseconds.
+ */
+#define INJECT_OP_STALL_TIMER_FIRE 50
+
 enum inject_site {
     STALL_LOCK,
     STALL_LOCK_EARLY,
@@ -351,6 +364,7 @@ enum inject_site {
     STALL_UNBLOCK_REPLY,
     STALL_KPAGE_ZERO,
     STALL_THREAD_CREATE,
+    STALL_TIMER_FIRE,
     STALL_SITES,
     INJECT_SITE_TURNSTILE = STALL_SITES,
     INJECT_SITE_REPLY_DETACHED

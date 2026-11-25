@@ -1044,7 +1044,15 @@ typedef struct timer_entry {
      * it reports.
      */
     uint64_t overruns;
-    int8_t unused;
+
+    /* A thread's timeout timer (timeout_start) is armed for one wait of its
+     * thread: wait_seq is that wait's wake_seq, set with wait_bound when it is
+     * armed. Its fire is delivered after the wheel lock is dropped, by when the
+     * wait may have ended and the thread be in a later one; the fire then ends
+     * nothing. User timers leave wait_bound clear.
+     */
+    uint32_t wait_seq;
+    uint8_t wait_bound;
 
     /* Non-zero when this timer holds one notification_souls reservation for its
      * SIGEV_NOTIFICATION delivery (object_reserve at create, object_unreserve

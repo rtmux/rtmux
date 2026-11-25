@@ -37,7 +37,7 @@ struct procfs_ocb {
     pid_t pid;
     int ioflag;
     unsigned flags;
-    bool stale;
+    bool stale; /* a wait handle that once read stale */
     int tid;
     uintptr_t offset;
     int rcvid;

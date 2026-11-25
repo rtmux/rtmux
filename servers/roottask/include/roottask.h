@@ -73,7 +73,6 @@ void devmem_init(void);
 void namedsem_init(void);
 
 /* procfs.h */
-void procfs_wait_stale(pid_t pid);
 void procfs_init(void);
 
 /* devtext.c */

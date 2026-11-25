@@ -1271,13 +1271,21 @@ static void force_ready_msgxfer(thread_t *thp, unsigned err)
  * and its queues with it) nothing can be claimed afresh and the plain test
  * stands.
  */
-static bool force_ready_deferred(thread_t *thp, channel_t *chp, unsigned err)
+static bool force_ready_deferred(thread_t *thp,
+                                 channel_t *chp,
+                                 unsigned err,
+                                 const uint32_t *seq)
 {
     bool claimed;
 
     if (chp)
         kspinlock_lock(&chp->lock);
-    claimed = (thp->internal_flags & RTMUX_ITF_MSG_DELIVERY) != 0;
+
+    /* A caller naming a wait (force_ready_wait) hands over only that one: a
+     * thread woken since may be claimed in a later exchange.
+     */
+    claimed = (thp->internal_flags & RTMUX_ITF_MSG_DELIVERY) != 0 &&
+              !(seq && thread_wake_seq(thp) != *seq);
     if (claimed) {
         inject_force_ready_claimed(thp);
         force_ready_msgxfer(thp, err);
@@ -1413,10 +1421,11 @@ int rdecl force_ready(thread_t *thp, unsigned err)
 
 /* force_ready for the one wait the caller saw: wake_seq is thp->wake_seq as it
  * read it while thp waited. A thread woken since is in a later wait, or none,
- * and is left alone (returns 1). A sync wait and a receive are tested again
- * under the lock that claims them (the chain lock, sync_chain_force_ready; the
- * channel lock), where a thread woken and waiting again on the same object
- * looks unchanged otherwise; the other waits only here, at entry.
+ * and is left alone (returns 1). A sync wait, a receive and a send are tested
+ * again under the lock that claims them (the chain lock,
+ * sync_chain_force_ready; the channel lock), where a thread woken and waiting
+ * again on the same object looks unchanged otherwise, and a reply wait once its
+ * request is read; the other waits only here, at entry.
  */
 int rdecl force_ready_wait(thread_t *thp, unsigned err, uint32_t wake_seq)
 {
@@ -1539,6 +1548,14 @@ reread_state:
         gen = __atomic_load_n(&thp->req_gen, __ATOMIC_ACQUIRE);
         cop = __atomic_load_n(&thp->blocked_on, __ATOMIC_ACQUIRE);
 
+        /* A caller naming a wait (force_ready_wait) ends only that request: a
+         * thread woken since may be reply-blocked on a later one, whose gen the
+         * checks under the channel lock would accept. Unwoken, gen is the
+         * request of the wait it named.
+         */
+        if (seq && thread_wake_seq(thp) != *seq)
+            return 1;
+
         /* A concurrent reply on another hart can complete the exchange
          * (clearing blocked_on) between our read of thp->state and here; there
          * is then nothing left to unwind (observed as a NULL cop->flags load in
@@ -1569,7 +1586,7 @@ reread_state:
             (thp->state == STATE_REPLY);
 
 #if CONFIG_PROCESSORS_MAX > 1 && defined(CONFIG_SMP_MSGOPT)
-        if (!wants_unblock && force_ready_deferred(thp, chp, err))
+        if (!wants_unblock && force_ready_deferred(thp, chp, err, seq))
             return 0;
 #endif
 
@@ -1889,7 +1906,7 @@ reread_state:
         if (force_ready_deferred(
                 thp,
                 cop ? __atomic_load_n(&cop->channel, __ATOMIC_ACQUIRE) : NULL,
-                err))
+                err, seq))
             return 0;
 #endif
 
@@ -1923,6 +1940,14 @@ reread_state:
             break;
         }
         kspinlock_lock(&cop->channel->lock);
+
+        /* A caller naming a wait ends only that send: a sender woken since and
+         * sending again, claimed or queued, is not its to hand over or unlink.
+         */
+        if (seq && thread_wake_seq(thp) != *seq) {
+            kspinlock_unlock(&cop->channel->lock);
+            return 1;
+        }
 #if CONFIG_PROCESSORS_MAX > 1 && defined(CONFIG_SMP_MSGOPT)
         /* A receiver claims this sender (MSG_DELIVERY) under the same lock; the
          * lock-free test above can lose that race (see the STATE_RECEIVE arm).

@@ -2111,3 +2111,151 @@ void test_timers(void)
     test_rlimit_data();
     test_nanosleep_1ns_storm();
 }
+
+/* timer_fire_stale: the timer expiry records a due sleep's fire under the
+ * wheel lock and delivers it once the lock is released. A sleep that ends by
+ * another path in between leaves the recorded fire to reach whatever wait the
+ * thread is in by then, and its next sleep must still run its full length.
+ * The fixture holds the fire between the record and the delivery
+ * (stall-timer-fire), interrupts the first sleep meanwhile, and starts a
+ * second; the hold ends once the thread sleeps again. The expiry runs on the
+ * boot hart, which the hold keeps with interrupts off, so the test runs on the
+ * others and waits there by spinning on the clock and on semaphores, never by
+ * a timed sleep. Needs /bin/inject and three harts.
+ */
+#define FIRE_STALE_FIRST_MS 20
+#define FIRE_STALE_SECOND_MS 1000
+
+struct fire_stale {
+    sem_t go, again;
+    atomic_int woken; /* the first sleep has returned */
+    int first_rc, second_rc;
+    long long second_ms;
+};
+
+static long long fire_stale_now_ms(void)
+{
+    return (long long) (clock_ns(CLOCK_MONOTONIC) / 1000000);
+}
+
+static void *fire_stale_sleeper(void *arg)
+{
+    struct fire_stale *f = arg;
+    struct timespec first = {.tv_nsec = FIRE_STALE_FIRST_MS * 1000000L};
+    struct timespec second = {.tv_sec = FIRE_STALE_SECOND_MS / 1000};
+    long long t0;
+
+    (void) sem_wait(&f->go);
+    f->first_rc = clock_nanosleep(CLOCK_MONOTONIC, 0, &first, NULL);
+    atomic_store(&f->woken, 1);
+    (void) sem_wait(&f->again);
+    t0 = fire_stale_now_ms();
+    f->second_rc = clock_nanosleep(CLOCK_MONOTONIC, 0, &second, NULL);
+    f->second_ms = fire_stale_now_ms() - t0;
+    return NULL;
+}
+
+/* Arm the hold for thread tid of pid: /bin/inject's status. */
+static int fire_stale_arm(int pid, pthread_t tid, int ms)
+{
+    char p[16], t[16], m[16];
+    char *argv[] = {"inject", "stall-timer-fire", p, t, m, NULL};
+    pid_t child;
+    int st;
+
+    snprintf(p, sizeof p, "%d", pid);
+    snprintf(t, sizeof t, "%d", (int) tid);
+    snprintf(m, sizeof m, "%d", ms);
+    if (posix_spawn(&child, "/bin/inject", NULL, NULL, argv, NULL) != 0 ||
+        waitpid(child, &st, 0) != child || !WIFEXITED(st))
+        return -1;
+    return WEXITSTATUS(st);
+}
+
+/* One attempt: 1 when the fire was held past the first sleep's end, 0 when
+ * the window was missed, -1 when the fixture failed.
+ */
+static int fire_stale_try(void)
+{
+    struct fire_stale f = {.first_rc = -1, .second_rc = -1};
+    pthread_t sleeper;
+    long long t;
+    int held = -1;
+    char d[128];
+
+    if (sem_init(&f.go, 0, 0) || sem_init(&f.again, 0, 0)) {
+        test_fail("timer fire stale fixture", "sem_init");
+        return -1;
+    }
+    if (pthread_create(&sleeper, NULL, fire_stale_sleeper, &f)) {
+        test_fail("timer fire stale fixture", "pthread_create");
+        goto out;
+    }
+    if (!wait_thread_state(sleeper, STATE_SEM) ||
+        fire_stale_arm((int) getpid(), sleeper, 3000) != 0) {
+        test_fail("timer fire stale fixture", "cannot arm the hold");
+        (void) sem_post(&f.go);
+        (void) sem_post(&f.again);
+        (void) pthread_join(sleeper, NULL);
+        goto out;
+    }
+
+    /* Let the first sleep start, and give the boot hart time to fire it and
+     * take the hold; then end the sleep, unless it has ended already.
+     */
+    (void) sem_post(&f.go);
+    t = fire_stale_now_ms() + FIRE_STALE_FIRST_MS + 200;
+    while (fire_stale_now_ms() < t && !atomic_load(&f.woken))
+        ;
+    if (!atomic_load(&f.woken))
+        (void) thread_ctl(RTMUX_TCTL_INTERRUPT, (void *) (long) sleeper);
+    t = fire_stale_now_ms() + 3000;
+    while (fire_stale_now_ms() < t && !atomic_load(&f.woken))
+        ;
+    held = atomic_load(&f.woken) && f.first_rc == EINTR;
+    if (!held) {
+        /* The fire came first: move the hold to a pid that does not exist
+         * before the second sleep can meet it.
+         */
+        (void) fire_stale_arm(INT32_MAX, 0, 1);
+    }
+    (void) sem_post(&f.again);
+    (void) pthread_join(sleeper, NULL);
+
+    /* An interrupt that came before the boot hart fired the first sleep left
+     * the hold armed for the second sleep's own fire, which it then held for
+     * its full length: the window was missed.
+     */
+    if (held && f.second_ms >= 2500)
+        held = 0;
+    if (held) {
+        snprintf(d, sizeof d, "second sleep rc %d after %lld ms of %d",
+                 f.second_rc, f.second_ms, FIRE_STALE_SECOND_MS);
+        check(inject_run("site-wait", "timer-fire", NULL) == 0,
+              "the first sleep's fire was held", "the hold was not taken");
+        check(f.second_rc == 0 && f.second_ms >= FIRE_STALE_SECOND_MS,
+              "a stale timer fire leaves the next sleep to run its length", d);
+    }
+out:
+    (void) sem_destroy(&f.go);
+    (void) sem_destroy(&f.again);
+    return held;
+}
+
+int timer_fire_stale(void)
+{
+    int held = 0;
+
+    if (sysconf(_SC_NPROCESSORS_ONLN) < 3 ||
+        inject_run("alloc-status", NULL, NULL) != 0)
+        return TC_EXIT_SKIP;
+    (void) test_pin_mask(~1U);
+    for (int i = 0; i < 5 && held == 0; i++)
+        held = fire_stale_try();
+    (void) test_pin_mask(~0U);
+    if (held == 0)
+        test_fail("timer fire stale fixture",
+                  "no attempt held the first sleep's fire past its "
+                  "interrupt");
+    return 0;
+}

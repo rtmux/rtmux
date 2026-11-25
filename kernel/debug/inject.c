@@ -199,6 +199,7 @@ static struct {
     [STALL_UNBLOCK_REPLY] = {.pid = -1},
     [STALL_KPAGE_ZERO] = {.pid = -1},
     [STALL_THREAD_CREATE] = {.pid = -1},
+    [STALL_TIMER_FIRE] = {.pid = -1},
 };
 
 static _Atomic(thread_t *) stalled_waiter;
@@ -240,6 +241,7 @@ static int inject_poke(uint64_t pid, uint64_t arg)
 }
 static atomic_uint stall_ready_tid;  /* and the STALL_READY site */
 static atomic_uint stall_switch_tid; /* and the STALL_SWITCH site */
+static atomic_uint stall_timer_tid;  /* and the STALL_TIMER_FIRE site */
 
 /* Stand in for the PLIC handler finding thp as its hart's active thread: set
  * PENDING once for the process armed in *armed.
@@ -694,6 +696,38 @@ void inject_ready_stall(thread_t *thp)
         inject_stall_once(STALL_READY, thp->process, NULL);
 }
 
+/* Called by timer_expiry, interrupts off and the wheel lock released, before it
+ * delivers a recorded fire to thp; wait_seq is the wait the fire is bound to,
+ * or NULL. The stall also ends once thp has left that wait (the one it is in
+ * now, unbound) and sleeps again: the fire then belongs to a sleep that is
+ * over, the case the window is held open for.
+ */
+void inject_timer_fire_stall(thread_t *thp, const uint32_t *wait_seq)
+{
+    uint64_t end;
+    uint32_t seq;
+
+    if (thp->tid + 1 !=
+            atomic_load_explicit(&stall_timer_tid, memory_order_acquire) ||
+        !inject_stall_claim(STALL_TIMER_FIRE, thp->process, &end))
+        return;
+    seq = wait_seq ? *wait_seq : thread_wake_seq(thp);
+    atomic_fetch_or_explicit(&stall_harts, 1ULL << get_cpunum(),
+                             memory_order_release);
+    atomic_store_explicit(&stall_site[STALL_TIMER_FIRE].taken, true,
+                          memory_order_release);
+    inject_spin_begin();
+    while (!atomic_load_explicit(&stall_site[STALL_TIMER_FIRE].release,
+                                 memory_order_acquire) &&
+           r_time() < end &&
+           (thread_wake_seq(thp) == seq ||
+            __atomic_load_n(&thp->state, __ATOMIC_ACQUIRE) != STATE_NANOSLEEP))
+        ;
+    inject_spin_end();
+    atomic_fetch_and_explicit(&stall_harts, ~(1ULL << get_cpunum()),
+                              memory_order_release);
+}
+
 /* Called on the hart of thp, still its current thread, before the hart switches
  * away from it. Callers may hold the dispatch lock; thp may be NULL.
  */
@@ -1038,6 +1072,12 @@ void kext_debug_inject(void *data)
         atomic_store_explicit(&stall_switch_tid, (unsigned) (kap->arg1 >> 32),
                               memory_order_release);
         ret = inject_stall_arm(STALL_SWITCH, kap->arg0, (uint32_t) kap->arg1);
+        break;
+    case INJECT_OP_STALL_TIMER_FIRE:
+        atomic_store_explicit(&stall_timer_tid, (unsigned) (kap->arg1 >> 32),
+                              memory_order_release);
+        ret =
+            inject_stall_arm(STALL_TIMER_FIRE, kap->arg0, (uint32_t) kap->arg1);
         break;
     case INJECT_OP_SYNC_WAKE_CLAIMS:
         ret = atomic_load_explicit(&wake_claims, memory_order_acquire);
