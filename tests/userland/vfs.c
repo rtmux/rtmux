@@ -7829,6 +7829,23 @@ static void test_mprotect_readonly_rejects_write(void)
           "a write to an mprotect PROT_READ page must fault with SIGSEGV");
 }
 
+static void test_mmap_rejects_nocache_in_flags(void)
+{
+    char detail[64];
+    void *p = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                   MAP_ANON | MAP_SHARED | PROT_NOCACHE, NOFD, 0);
+    int err = errno;
+
+    if (p != MAP_FAILED) {
+        (void) munmap(p, 4096);
+        test_fail("mmap rejects PROT_NOCACHE in flags",
+                  "mmap succeeded, it must fail with EINVAL");
+        return;
+    }
+    snprintf(detail, sizeof detail, "errno %d, want EINVAL", err);
+    check(err == EINVAL, "mmap rejects PROT_NOCACHE in flags", detail);
+}
+
 #define SPAWN_ARGV_READABLE(name, fd) \
     char *name##_argv[] = {"syscall_testing", "--expect-fd-readable", #fd, NULL}
 #define SPAWN_ARGV_CLOSED(name, fd) \
@@ -13720,6 +13737,7 @@ void test_vfs(void)
     test_spawn_missing_binary_is_unobservable();
     test_spawn_fault_reports_sigsegv();
     test_mprotect_readonly_rejects_write();
+    test_mmap_rejects_nocache_in_flags();
     test_spawn_file_actions_addopen();
     test_spawn_file_actions_close_dup2();
     test_spawn_malformed_messages_fail_closed();
