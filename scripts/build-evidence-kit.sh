@@ -175,11 +175,19 @@ source_label = f"commit `{commit}`" if clean == "yes" else f"dirty working tree 
 cross = os.environ.get("CROSS_COMPILE", "riscv-none-elf-")
 cc = os.environ.get("CC", cross + "gcc")
 lld = shutil.which("ld.lld") or shutil.which("lld")
-qemu = shutil.which("qemu-system-riscv64")
+# Same semantics as emu.sh: an empty QEMU means the default, and a path is
+# taken relative to the tree root (emu.sh runs from there).
+qemu_cmd = os.environ.get("QEMU") or "qemu-system-riscv64"
+qemu = shutil.which(str(root / qemu_cmd) if "/" in qemu_cmd else qemu_cmd)
 opensbi = os.environ.get("BIOS")
 if not opensbi:
-    bundled = Path("/usr/lib/riscv64-linux-gnu/opensbi/generic/fw_dynamic.bin")
-    opensbi = str(bundled) if bundled.is_file() else "QEMU bundled default (-bios default)"
+    # Mirror scripts/emu.sh: the distro OpenSBI pairs only with a distro QEMU.
+    distro = Path("/usr/lib/riscv64-linux-gnu/opensbi/generic/fw_dynamic.bin")
+    qemu_real = os.path.realpath(qemu) if qemu else ""
+    if distro.is_file() and qemu_real.startswith(("/usr/bin/", "/bin/")):
+        opensbi = str(distro)
+    else:
+        opensbi = "QEMU bundled default (-bios default)"
 
 
 def version(argv):

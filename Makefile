@@ -64,11 +64,11 @@ all: $(AUTOCONF_H) $(VER_FILE) startup initramfs
 
 # Verify QEMU is available. OpenSBI ships with QEMU 11+ (and macOS
 # Homebrew packages it that way), so we only check for the QEMU binary
-# itself; scripts/emu.sh auto-detects opensbi (default = bundled, Debian path
-# when present, env BIOS=... override).
+# itself; scripts/emu.sh auto-detects opensbi (default = bundled; the Debian
+# path only for a distro QEMU under /usr/bin; env BIOS=... override).
 check-qemu-deps:
-	@command -v qemu-system-riscv64 >/dev/null 2>&1 || \
-		{ echo "Error: qemu-system-riscv64 not found in PATH."; \
+	@command -v "$${QEMU:-qemu-system-riscv64}" >/dev/null 2>&1 || \
+		{ echo "Error: $${QEMU:-qemu-system-riscv64} not found in PATH."; \
 		  echo "  Debian/Ubuntu: apt install qemu-system-misc opensbi"; \
 		  echo "  macOS:         brew install qemu"; exit 1; }
 ifeq ($(CONFIG_LKL_SERVERS),y)

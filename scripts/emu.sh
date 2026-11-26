@@ -26,15 +26,24 @@ fi
 # Number of CPUs to emulate. Default to UP for deterministic bring-up; use
 # CPUS=N ./scripts/emu.sh for SMP stress runs.
 CPUS="${CPUS:-1}"
+# QEMU binary. Resolved before the firmware choice below, because the right
+# OpenSBI depends on which QEMU will run it.
+QEMU="${QEMU:-qemu-system-riscv64}"
 # OpenSBI firmware. Set BIOS=<path> in the environment to override, or BIOS=none
 # to run without one. Otherwise auto-detect:
-#   - Debian/Ubuntu: /usr/lib/riscv64-linux-gnu/opensbi/...
-#   - macOS Homebrew QEMU: ships its own; let QEMU pick via -bios default
+#   - Distro QEMU (under /usr/bin or /bin): the distro OpenSBI package,
+#     /usr/lib/riscv64-linux-gnu/opensbi/..., which is built for that QEMU.
+#   - Any other QEMU (self-built under ~/.local, /opt, Homebrew, ...): let QEMU
+#     pick its own bundled firmware via -bios default. An older distro OpenSBI
+#     can hang right after its banner under a newer QEMU.
 if [[ -z "$BIOS" ]]; then
-    if [[ -f /usr/lib/riscv64-linux-gnu/opensbi/generic/fw_dynamic.bin ]]; then
-        BIOS=/usr/lib/riscv64-linux-gnu/opensbi/generic/fw_dynamic.bin
-    else
-        BIOS=default
+    BIOS=default
+    distro_opensbi=/usr/lib/riscv64-linux-gnu/opensbi/generic/fw_dynamic.bin
+    if [[ -f $distro_opensbi ]]; then
+        qemu_path="$(readlink -f -- "$(command -v "$QEMU")" 2>/dev/null)"
+        case "$qemu_path" in
+        /usr/bin/* | /bin/*) BIOS=$distro_opensbi ;;
+        esac
     fi
 fi
 # Initramfs archive (CPIO)
@@ -97,7 +106,6 @@ refresh_lkl_ext4_partition() {
 # on the script command line.
 MAINFS_DEV=/dev/nvme0n1p8
 
-QEMU="${QEMU:-qemu-system-riscv64}"
 QEMUOPTS=()
 BASE_QEMU_OPTS=(
     -no-user-config
