@@ -1154,8 +1154,12 @@ void crash_rendezvous(void)
          * single ksnprintf sprintf-then-write sequence. Each con_write call
          * emits a short fixed string atomically from this CPU's perspective.
          */
-        con_write("\r\n=== CRASH DUMP ===\r\n", 23);
-        for (unsigned cpu = 0; cpu < num_processors; cpu++) {
+        con_write("\r\n=== CRASH DUMP ===\r\n", 22);
+        /* Walk every row, not num_processors: that is still 0 while startup
+         * runs, so a startup crash() would print an empty dump. Rows nobody
+         * wrote are skipped below.
+         */
+        for (unsigned cpu = 0; cpu < CONFIG_PROCESSORS_MAX; cpu++) {
             unsigned u = crash_buf_used[cpu];
             if (u == 0)
                 continue;
@@ -1175,7 +1179,7 @@ void crash_rendezvous(void)
         con_write(" arrived, ", 10);
         crash_put_uint(crash_mask_count(set));
         con_write(" expected", 9);
-        con_write("\r\n=== END CRASH DUMP ===\r\n", 27);
+        con_write("\r\n=== END CRASH DUMP ===\r\n", 26);
     }
     cpu_halt();
 }
