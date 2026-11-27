@@ -38,12 +38,15 @@ env:
 jobs:
   check:
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     outputs:
       commit: ${{ steps.head.outputs.commit }}
       inputs_hash: ${{ steps.head.outputs.inputs_hash }}
       needs_build: ${{ steps.compare.outputs.needs_build }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - id: head
         env:
@@ -89,6 +92,7 @@ jobs:
   publish:
     needs: [check, build]
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     permissions:
       contents: write
     steps:

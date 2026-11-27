@@ -36,16 +36,21 @@ runs:
 
     - name: Install packages
       shell: bash
+      env:
+        QEMU: ${{ inputs.qemu }}
+        LKL: ${{ inputs.lkl }}
+        FORMAL: ${{ inputs.formal }}
+        EXTRA_PACKAGES: ${{ inputs.packages }}
       run: |
         mkdir -p ~/apt-cache
         pkgs="build-essential lld python3 git e2fsprogs clang-format-20"
-        if [ "${{ inputs.qemu }}" = "true" ]; then
+        if [ "$QEMU" = "true" ]; then
           pkgs="$pkgs qemu-system-misc opensbi ipxe-qemu"
         fi
-        if [ "${{ inputs.lkl }}" = "true" ]; then
+        if [ "$LKL" = "true" ]; then
           pkgs="$pkgs gcc-riscv64-linux-gnu binutils-riscv64-linux-gnu libc6-dev-riscv64-cross flex bison bc libelf-dev"
         fi
-        if [ "${{ inputs.formal }}" = "true" ]; then
+        if [ "$FORMAL" = "true" ]; then
           pkgs="$pkgs cbmc spin z3"
         fi
         # A stalled mirror once hung `apt-get update` for the whole job timeout,
@@ -78,7 +83,7 @@ runs:
         # fails on the missing index. Fail the update so that it is retried.
         apt update --error-on=any
         install=(install -y --no-install-recommends
-          -o "Dir::Cache::Archives=$HOME/apt-cache" $pkgs ${{ inputs.packages }})
+          -o "Dir::Cache::Archives=$HOME/apt-cache" $pkgs $EXTRA_PACKAGES)
         apt "${install[@]}" --download-only
         # Unpack outside the retry loop: a timeout would leave dpkg half done,
         # and every later attempt would fail on that. With no retry here, wait
@@ -118,7 +123,10 @@ runs:
         v=15.2.0-1
         sha=aaaa8060c914851a3e5ee1ba82cc3d6f80972f90638a05c6e823a37557a33758
         mkdir -p ~/toolchains/riscv-none-elf
-        curl -fsSL --retry 3 -o "$RUNNER_TEMP/tc.tgz" \
+        # Retry every failure, HTTP errors included, and give up on a crawling
+        # transfer instead of holding the job to its timeout.
+        curl -fsSL --retry 3 --retry-all-errors --connect-timeout 30 \
+          --speed-limit 102400 --speed-time 60 -o "$RUNNER_TEMP/tc.tgz" \
           "https://github.com/xpack-dev-tools/riscv-none-elf-gcc-xpack/releases/download/v${v}/xpack-riscv-none-elf-gcc-${v}-linux-x64.tar.gz"
         echo "$sha  $RUNNER_TEMP/tc.tgz" | sha256sum -c -
         tar -xzf "$RUNNER_TEMP/tc.tgz" -C ~/toolchains/riscv-none-elf --strip-components=1
