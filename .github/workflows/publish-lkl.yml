@@ -76,14 +76,16 @@ jobs:
           last_hash=$(printf '%s\n' "$notes" | sed -n 's/^inputs_hash=//p' | head -1)
           # A failed upload can lose an asset while the notes stay as they were.
           assets=$(gh release view "$NIGHTLY_TAG" --json assets \
-              --jq '[.assets[] | select(.state == "uploaded")] | length' 2>/dev/null) || assets=0
+              --jq '[.assets[] | select(.state == "uploaded") | .name | select(IN(
+                  "liblkl-rv64-fsd.tar.gz", "liblkl-rv64-netd.tar.gz", "sha256sums.txt"))]
+                  | length' 2>/dev/null) || assets=0
           if [ "$last_commit" = "$COMMIT" ] && [ "$last_hash" = "$INPUTS_HASH" ] &&
-             [ "$assets" -ge 3 ]; then
+             [ "$assets" -eq 3 ]; then
               echo "needs_build=false" >> "$GITHUB_OUTPUT"
               echo "Upstream $COMMIT and the build inputs are unchanged; nothing to publish."
           else
               echo "needs_build=true" >> "$GITHUB_OUTPUT"
-              echo "Publishing: commit ${last_commit:-none} -> $COMMIT, $assets asset(s) present"
+              echo "Publishing: commit ${last_commit:-none} -> $COMMIT, $assets of 3 assets present"
           fi
 
   build:
