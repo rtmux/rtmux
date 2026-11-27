@@ -124,6 +124,15 @@ void startup_entry(void)
 
     setup_cmdline();
 
+#ifdef CONFIG_DEBUG_INJECT
+    /* "rtmux.inject=startup-crash": crash() before kernel_entry() sets
+     * num_processors, for the startup-crash regress mode.
+     */
+    for (int i = 0; i < _argc; i++)
+        if (!strcmp(_argv[i], "rtmux.inject=startup-crash"))
+            crash("injected startup crash");
+#endif
+
 #define INIT_SYSPAGE_SIZE 0x600
     init_syspage_memory(ws_alloc(INIT_SYSPAGE_SIZE), INIT_SYSPAGE_SIZE);
 

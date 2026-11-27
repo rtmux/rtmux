@@ -605,6 +605,8 @@ Options:
                     power-off a roottask crash ends in; needs
                     --gdb-on-timeout, passes on a complete dump of the
                     stopped guest),
+                    startup-crash (CONFIG_DEBUG_INJECT=y; crash during startup,
+                    expect the message and "1 arrived, 1 expected" in the dump),
                     tickless-idle (quiet-hart tick drop + one-shot deadline),
                     fault-recovery (fault taxonomy smoke),
                     monotonic-time (continuous clock across a skipped-tick gap),
@@ -1827,6 +1829,16 @@ case "$MODE" in
         CPUS=6
         export CPUS
         ;;
+    startup-crash)
+
+        # A debug-inject kernel crashes in startup, before num_processors is
+        # set. The dump must keep the message and count the crashing CPU.
+        BEGIN_MARKER='Boot command line:'
+        PASS_MARKER='=== END CRASH DUMP ==='
+        FAIL_MARKER='Startup complete, entering kernel'
+        MODE_ARG="rtmux.inject=startup-crash"
+        NEEDS_DEBUG_INJECT=1
+        ;;
     smp-sparse-harts|smp-too-many-harts)
 
         # K3: 10 harts against PROCESSORS_MAX=8. sparse-harts disables cpu@1..8
@@ -2052,8 +2064,9 @@ fi
 
 BAD_RE="$RTMUX_BAD_RE"
 
-# smp-ap-crash-early crashes on purpose and checks the dump itself.
-if [ "$MODE" = "smp-ap-crash-early" ]; then
+# smp-ap-crash-early and startup-crash crash on purpose and check the dump
+# themselves.
+if [ "$MODE" = "smp-ap-crash-early" ] || [ "$MODE" = "startup-crash" ]; then
     BAD_RE="$RTMUX_FATAL_RE|$RTMUX_SETUP_RE"
 fi
 
@@ -3161,6 +3174,17 @@ print(s.getsockname()[1])' 2>/dev/null) ||
         check_smp_bringup "$log" || return 1
         ;;
     esac
+
+    if [ "$MODE" = "startup-crash" ]; then
+        require_log_patterns "$log" "startup crash dump" \
+            'CRASH: startup/[a-z]+\.c:[0-9]+ .* injected startup crash' \
+            'crash rendezvous: 1 arrived, 1 expected' \
+            '=== END CRASH DUMP ===' || return 1
+        if ! tr -d '\000' <"$log" | cmp -s - "$log"; then
+            echo "  FAIL     ${MODE} NUL byte in the console output"
+            return 1
+        fi
+    fi
 
     if [ "$MODE" = "fault-recovery" ]; then
         require_log_patterns_in_order "$log" "fault recovery probes" \
