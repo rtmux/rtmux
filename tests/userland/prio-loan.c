@@ -1543,6 +1543,7 @@ int sched_set_error_while_migrating(void)
 struct create_start {
     int chid;
     int rc;
+    const pthread_attr_t *attr;
     long create_ms;
     int child_prio, child_base; /* what the new thread runs at once started */
     atomic_int stop;
@@ -1567,9 +1568,7 @@ static void *cs_spinner(void *raw)
     return NULL;
 }
 
-/* The loan ends once the creator is running again, so the new thread is back
- * at the base it inherits.
- */
+/* The loan ends before user code, leaving the inherited or explicit base. */
 static void *cs_child(void *raw)
 {
     struct create_start *k = raw;
@@ -1589,7 +1588,7 @@ static void *cs_creator(void *raw)
     if (msg_receive(k->chid, buf, sizeof buf, NULL) != 0)
         return NULL; /* not the notification */
     clock_gettime(CLOCK_MONOTONIC, &a);
-    k->rc = pthread_create(&c, NULL, cs_child, k);
+    k->rc = pthread_create(&c, k->attr, cs_child, k);
     clock_gettime(CLOCK_MONOTONIC, &b);
     k->create_ms = ms_between(&a, &b);
     set_flag(&k->stop);
@@ -1598,14 +1597,32 @@ static void *cs_creator(void *raw)
     return NULL;
 }
 
-static void test_create_starts_at_creator_prio(void)
+/* Zero inherits the base; otherwise request an explicit FIFO priority. */
+static void test_create_starts_at_creator_prio(int priority)
 {
     struct create_start k = {
         .chid = -1, .rc = -1, .create_ms = -1, .child_prio = -1};
     pthread_t creator, spinner;
+    pthread_attr_t attr;
+    struct sched_param sp = {.sched_priority = priority};
     int coid = -1, created = 0, sent = -1;
+    int want = priority ? priority : CS_BASE;
     char detail[96];
 
+    if (pthread_attr_init(&attr) != EOK) {
+        test_fail("create_start fixture", "pthread_attr_init");
+        return;
+    }
+    if (priority) {
+        if (pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED) !=
+                EOK ||
+            pthread_attr_setschedpolicy(&attr, SCHED_FIFO) != EOK ||
+            pthread_attr_setschedparam(&attr, &sp) != EOK) {
+            test_fail("create_start fixture", "explicit FIFO attributes");
+            goto out;
+        }
+        k.attr = &attr;
+    }
     if (test_pin_mask(1U) == -1 || chan_open(&k.chid, &coid) == -1) {
         test_fail("create_start fixture", strerror(errno));
         goto out;
@@ -1652,13 +1669,12 @@ out:
               "priority until it starts",
               detail);
         snprintf(detail, sizeof detail, "new thread at %d, base %d, want %d",
-                 k.child_prio, k.child_base, CS_BASE);
-        check(k.rc == EOK && k.child_prio == CS_BASE &&
-                  k.child_base == CS_BASE,
-              "create_start: the new thread then runs at the base it inherits",
-              detail);
+                 k.child_prio, k.child_base, want);
+        check(k.rc == EOK && k.child_prio == want && k.child_base == want,
+              "create_start: the creation loan ends before user code", detail);
     }
     chan_close(k.chid, coid);
+    (void) pthread_attr_destroy(&attr);
     (void) test_pin_mask(~0U);
 }
 
@@ -1681,6 +1697,8 @@ void test_prio_loan(void)
     test_loan_ends_for_blocked_server();
     test_loan_ends_at_failed_msg_current();
     test_pending_loan_after_sender_timeout();
-    test_create_starts_at_creator_prio();
+    test_create_starts_at_creator_prio(0);
+    test_create_starts_at_creator_prio(15);
+    test_create_starts_at_creator_prio(CS_LOAN);
     (void) __sched_set(0, 0, policy, &saved);
 }
