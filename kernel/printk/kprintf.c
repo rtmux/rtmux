@@ -17,6 +17,7 @@
 
 #include <stdarg.h>
 #include <stdatomic.h>
+#include <bitops.h>
 #include <core/globals.h>
 #include <cpu-inline.h>
 #include <sbi.h> /* sbi_dbcn_write — atomic console output */
@@ -1050,18 +1051,6 @@ static uint64_t crash_participants(void)
            atomic_load_explicit(&crash_entered_mask, memory_order_acquire);
 }
 
-/* How many CPUs a crash mask names (the footer prints counts; the wait loop
- * compares masks).
- */
-static unsigned crash_mask_count(uint64_t mask)
-{
-    unsigned n = 0;
-
-    for (unsigned cpu = 0; cpu < num_processors; cpu++)
-        n += cpu_in_mask(mask, cpu) ? 1u : 0u;
-    return n;
-}
-
 /* Write a decimal number to the console. */
 static void crash_put_uint(unsigned v)
 {
@@ -1175,9 +1164,9 @@ void crash_rendezvous(void)
         }
         /* How many CPUs this wait was for, and how many had arrived */
         con_write("\r\ncrash rendezvous: ", 20);
-        crash_put_uint(crash_mask_count(arrived & set));
+        crash_put_uint(popcount64(arrived & set));
         con_write(" arrived, ", 10);
-        crash_put_uint(crash_mask_count(set));
+        crash_put_uint(popcount64(set));
         con_write(" expected", 9);
         con_write("\r\n=== END CRASH DUMP ===\r\n", 26);
     }
