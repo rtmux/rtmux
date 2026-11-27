@@ -54,6 +54,20 @@ config LKL_SERVERS
       advertise.  scripts/check-lkl-profile.py additionally rejects a stale
       hand-edited pairing that bypasses this dependency.
 
+config USR_IN_INITRAMFS
+    bool "Ship the /usr romfs image in initramfs"
+    default n
+    help
+      Build the /usr tree with scripts/mkusr.sh and add it to initramfs as
+      /usr.romfs, for boards with no NVMe to hold it.  Boot with
+      mainfs=/usr.romfs so /sbin/init mounts it on /usr; romfs reads the
+      image like any other file.
+
+config USR_ROMFS_SIZE
+    int "Size of the /usr romfs image (MiB)"
+    default 1
+    depends on USR_IN_INITRAMFS
+
 config ULOCK_DEBUG
     bool "Userspace lock-rank checker for threaded servers"
     default n
