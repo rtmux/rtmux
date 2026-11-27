@@ -906,8 +906,9 @@ static void test_fault_recovery_subset(void)
 /* fdt-reserved-memory: fill RAM and check that no frame handed out lies in a
  * range the device tree reserved. The ranges are the fixture
  * scripts/qemu-regress.sh builds for that mode (setup_fdt_resv_or_skip): two
- * no-map reg pairs in one /reserved-memory child, a plain child, and a
- * /memreserve/ entry. Keep the two in step.
+ * no-map reg pairs in one /reserved-memory child, a plain child, a reusable
+ * child, a /memreserve/ entry, and the 24 no-map rtmux-resv-nomap children.
+ * Keep the two in step.
  */
 #define RESV_FILL_CHUNK (1UL << 20)
 #define RESV_FILL_MAX_MAPS 8192
@@ -921,6 +922,27 @@ static const struct {
     {0x8c300000UL, 0x8c310000UL}, /* rtmux-resv-reusable, reusable */
     {0x8c400000UL, 0x8c410000UL}, /* /memreserve/ */
 };
+
+/* rtmux-resv-nomap0..23: 64 KiB no-map children, one every 128 KiB. */
+#define RESV_NOMAP_BASE 0x8c900000UL
+#define RESV_NOMAP_STEP 0x20000UL
+#define RESV_NOMAP_SIZE 0x10000UL
+#define RESV_NOMAP_COUNT 24
+
+/* Count a hit if the run [pa, pa + run) touches the range [start, end). */
+static void resv_note(off_t pa,
+                      size_t run,
+                      uint64_t start,
+                      uint64_t end,
+                      unsigned long *inside)
+{
+    if ((uint64_t) pa < end && (uint64_t) pa + run > start) {
+        (*inside)++;
+        if (*inside == 1)
+            printf("resv-fill: run at pa %#llx+%#zx is reserved\n",
+                   (unsigned long long) pa, run);
+    }
+}
 
 /* Count the physically contiguous runs of [p, p + len) that touch a fixture
  * range (once per range touched); a page whose physical address is unknown
@@ -948,14 +970,13 @@ static void resv_check(unsigned char *p,
         if (run > len - off)
             run = len - off;
         for (size_t r = 0; r < sizeof resv_fixture / sizeof resv_fixture[0];
-             r++) {
-            if ((uint64_t) pa < resv_fixture[r].end &&
-                (uint64_t) pa + run > resv_fixture[r].start) {
-                (*inside)++;
-                if (*inside == 1)
-                    printf("resv-fill: run at pa %#llx+%#zx is reserved\n",
-                           (unsigned long long) pa, run);
-            }
+             r++)
+            resv_note(pa, run, resv_fixture[r].start, resv_fixture[r].end,
+                      inside);
+        for (uint64_t r = 0; r < RESV_NOMAP_COUNT; r++) {
+            uint64_t start = RESV_NOMAP_BASE + r * RESV_NOMAP_STEP;
+
+            resv_note(pa, run, start, start + RESV_NOMAP_SIZE, inside);
         }
         off += (run + __PAGESIZE - 1) & ~(size_t) (__PAGESIZE - 1);
     }
