@@ -87,6 +87,7 @@ smp-sparse-harts
 smp-too-many-harts
 spawn-storm
 sporadic-budget
+startup-crash
 syscall-testing
 syscall-testing-disk
 syslog-wrap

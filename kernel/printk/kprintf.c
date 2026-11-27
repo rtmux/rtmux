@@ -17,6 +17,7 @@
 
 #include <stdarg.h>
 #include <stdatomic.h>
+#include <bitops.h>
 #include <core/globals.h>
 #include <cpu-inline.h>
 #include <sbi.h> /* sbi_dbcn_write — atomic console output */
@@ -1050,17 +1051,11 @@ static uint64_t crash_participants(void)
            atomic_load_explicit(&crash_entered_mask, memory_order_acquire);
 }
 
-/* How many CPUs a crash mask names (the footer prints counts; the wait loop
- * compares masks).
+/* con_write() and crash_buf_append() for a string literal (literals only): the
+ * compiler counts the length, so editing the string cannot leave it wrong.
  */
-static unsigned crash_mask_count(uint64_t mask)
-{
-    unsigned n = 0;
-
-    for (unsigned cpu = 0; cpu < num_processors; cpu++)
-        n += cpu_in_mask(mask, cpu) ? 1u : 0u;
-    return n;
-}
+#define CON_PUTS(s) con_write((s), sizeof(s) - 1)
+#define CRASH_BUF_PUTS(cpu, s) crash_buf_append((cpu), (s), sizeof(s) - 1)
 
 /* Write a decimal number to the console. */
 static void crash_put_uint(unsigned v)
@@ -1154,28 +1149,32 @@ void crash_rendezvous(void)
          * single ksnprintf sprintf-then-write sequence. Each con_write call
          * emits a short fixed string atomically from this CPU's perspective.
          */
-        con_write("\r\n=== CRASH DUMP ===\r\n", 23);
-        for (unsigned cpu = 0; cpu < num_processors; cpu++) {
+        CON_PUTS("\r\n=== CRASH DUMP ===\r\n");
+        /* Walk every row, not num_processors: that is still 0 while startup
+         * runs, so a startup crash() would print an empty dump. Rows nobody
+         * wrote are skipped below.
+         */
+        for (unsigned cpu = 0; cpu < CONFIG_PROCESSORS_MAX; cpu++) {
             unsigned u = crash_buf_used[cpu];
             if (u == 0)
                 continue;
 
             /* "--- cpu N (M bytes) ---\r\n" composed inline */
-            con_write("\r\n--- cpu ", 10);
+            CON_PUTS("\r\n--- cpu ");
             crash_put_uint(cpu);
-            con_write(" (", 2);
+            CON_PUTS(" (");
             crash_put_uint(u);
-            con_write(" bytes) ---\r\n", 13);
+            CON_PUTS(" bytes) ---\r\n");
 
             con_write(crash_buf[cpu], u);
         }
         /* How many CPUs this wait was for, and how many had arrived */
-        con_write("\r\ncrash rendezvous: ", 20);
-        crash_put_uint(crash_mask_count(arrived & set));
-        con_write(" arrived, ", 10);
-        crash_put_uint(crash_mask_count(set));
-        con_write(" expected", 9);
-        con_write("\r\n=== END CRASH DUMP ===\r\n", 27);
+        CON_PUTS("\r\ncrash rendezvous: ");
+        crash_put_uint(popcount64(arrived & set));
+        CON_PUTS(" arrived, ");
+        crash_put_uint(popcount64(set));
+        CON_PUTS(" expected");
+        CON_PUTS("\r\n=== END CRASH DUMP ===\r\n");
     }
     cpu_halt();
 }
@@ -1204,10 +1203,9 @@ void crash_halt(const char *fmt, ...)
         len = kvsnprintf(buffer, sizeof buffer, fmt, ap);
         va_end(ap);
         crash_buf_append(get_cpunum(), buffer, len);
-        crash_buf_append(get_cpunum(), "\r\n", 2);
+        CRASH_BUF_PUTS(get_cpunum(), "\r\n");
     } else {
-        const char *m = "CRASH (no message)\r\n";
-        crash_buf_append(get_cpunum(), m, 20);
+        CRASH_BUF_PUTS(get_cpunum(), "CRASH (no message)\r\n");
     }
 
     /* Dump the tracelogger ring buffer. Mirrors the trap-handler crash path —
