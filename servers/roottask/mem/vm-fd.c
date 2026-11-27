@@ -640,18 +640,22 @@ static int vm_fd_cleanup(message_context_t *ctp,
     time_t currtime;
     time_t mtime;
     unsigned gen;
+    int err = EOK;
 
 #define TIME_INFINITY (~(time_t) 0)
 
     nexttime = TIME_INFINITY;
     VM_FD_TALLY(vm_fd_calls);
 
-    if (atomic_or_value(&fdmem_cleanup, MMAPFD_CLEANUP_INPROGRESS) &
+    /* Record busy requests atomically with the cleanup claim. */
+    if (atomic_or_value(&fdmem_cleanup,
+                        MMAPFD_CLEANUP_INPROGRESS | MMAPFD_CLEANUP_QUEUED) &
         MMAPFD_CLEANUP_INPROGRESS) {
         /* Somebody's already in here */
         VM_FD_TALLY(vm_fd_busy);
         return EOK;
     }
+    atomic_clr(&fdmem_cleanup, MMAPFD_CLEANUP_QUEUED);
 
     VM_FD_STAGE(VM_FD_RESERVING);
     if (proc_thread_pool_reserve() == 0) {
@@ -752,10 +756,7 @@ static int vm_fd_cleanup(message_context_t *ctp,
         proc_thread_pool_reserve_done();
     }
 
-    /* Before the flags clear, so it cannot overwrite the next call's stage. */
-    VM_FD_STAGE(VM_FD_IDLE);
-    fdmem_cleanup = 0;
-
+    pthread_mutex_lock(&fdmem_mutex);
     /* wake up opener if any */
     MMAPFD_WAKEUP_OPENER if (fdmem_zombies != ZOMBIE_END)
     {
@@ -771,11 +772,25 @@ static int vm_fd_cleanup(message_context_t *ctp,
         value.interval_nsec = 0;
         if (__timer_settime((timer_t) timerid, TIMER_ABSTIME, &value, NULL) !=
             0) {
-            root_log(
-                "\nCannot arm timer (%d). Memory mapped file timed stale "
-                "cleaning may not work.",
-                errno);
+            err = errno;
         }
+    }
+
+    /* Before the flags clear, so it cannot overwrite the next call's stage. */
+    VM_FD_STAGE(VM_FD_IDLE);
+    /* Hand off requests that arrived while this pass was running. */
+    if (atomic_clr_value(&fdmem_cleanup,
+                         MMAPFD_CLEANUP_QUEUED | MMAPFD_CLEANUP_INPROGRESS) &
+        MMAPFD_CLEANUP_QUEUED) {
+        (void) vm_fd_compact();
+    }
+    pthread_mutex_unlock(&fdmem_mutex);
+
+    if (err != EOK) {
+        root_log(
+            "\nCannot arm timer (%d). Memory mapped file timed stale "
+            "cleaning may not work.",
+            err);
     }
 
     return EOK;
