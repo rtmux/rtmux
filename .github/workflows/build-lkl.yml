@@ -26,11 +26,13 @@ permissions:
 jobs:
   resolve:
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     outputs:
       commit: ${{ steps.head.outputs.commit }}
     steps:
       - uses: actions/checkout@v7
         with:
+          persist-credentials: false
           sparse-checkout: scripts/lkl
       - id: head
         env:
@@ -51,6 +53,8 @@ jobs:
       OUT: prebuilt/lkl-rv64/out-${{ matrix.personality }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       # The build inputs and the runner image (whose apt packages carry the
       # cross compiler and binutils); publish-lkl.yml uses the same hash.
@@ -72,7 +76,9 @@ jobs:
 
       - name: Fetch LKL source
         if: steps.arch-cache.outputs.cache-hit != 'true'
-        run: scripts/lkl/fetch-source.sh "$PWD/lkl-src" ${{ needs.resolve.outputs.commit }}
+        env:
+          COMMIT: ${{ needs.resolve.outputs.commit }}
+        run: scripts/lkl/fetch-source.sh "$PWD/lkl-src" "$COMMIT"
 
       - name: Build liblkl-rtmux.a (${{ matrix.personality }})
         if: steps.arch-cache.outputs.cache-hit != 'true'

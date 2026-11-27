@@ -67,6 +67,8 @@ jobs:
     name: qemu (${{ matrix.name }})
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/setup-rtmux
         with:
           lkl: 'true'
