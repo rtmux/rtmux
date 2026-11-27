@@ -197,9 +197,11 @@ extern size_t fdt_size;
 /* FDT /reserved-memory ranges marked no-map (set by board.c). They are kept out
  * of the allocator like every reservation, and init_mmu() also leaves them out
  * of the kernel's RAM mappings. More than FDT_NOMAP_MAX is a boot crash, not a
- * silent mapping.
+ * silent mapping. Each one also takes an avoid_ram() entry, and every
+ * reservation shares that list (MAX_AVOID_LIST_SIZE in kernel/startup/ram.c),
+ * so a tree with many other reservations can hit that limit first.
  */
-#define FDT_NOMAP_MAX 16
+#define FDT_NOMAP_MAX 64
 
 struct fdt_nomap_range {
     paddr_t start;

@@ -1241,7 +1241,9 @@ setup_fdt_cpu_status_or_skip()
 
 # patch_fdt_resv_dts IN OUT: add a /memreserve/ entry and a /reserved-memory
 # node holding a no-map child with two reg pairs, a plain child, a reusable
-# child and 32 more plain children, and pad the root with 64 KiB of cells.
+# child, 32 more plain children and 24 more no-map children, and pad the root
+# with 64 KiB of cells. With OpenSBI's two mmode_resv nodes that is 28 no-map
+# ranges, more than the 16 FDT_NOMAP_MAX used to allow, as on the SpacemiT K3.
 # Properties must precede subnodes, so the node goes in before the root's
 # first child.
 patch_fdt_resv_dts()
@@ -1279,6 +1281,13 @@ patch_fdt_resv_dts()
                 printf "\t\t\treg = <0x00 0x%x 0x00 0x10000>;\n", a
                 print "\t\t};"
             }
+            for (i = 0; i < 24; i++) {
+                a = 2358247424 + i * 131072
+                printf "\t\trtmux-resv-nomap%d@%x {\n", i, a
+                printf "\t\t\treg = <0x00 0x%x 0x00 0x10000>;\n", a
+                print "\t\t\tno-map;"
+                print "\t\t};"
+            }
             print "\t};"
             print; root = 1; next
         }
@@ -1303,7 +1312,9 @@ setup_fdt_resv_or_skip()
 # check_fdt_resv LOG: both reg pairs of the no-map child, the plain and the
 # reusable child, and the /memreserve/ entry are each reserved, and the no-map
 # pairs are left out of the kernel's mappings (init_mmu checks the final PTEs
-# before it prints "unmapped").
+# before it prints "unmapped"). The last of the 24 extra no-map children must
+# be reserved and unmapped too: that check fails when FDT_NOMAP_MAX is too
+# small to record them all.
 check_fdt_resv()
 {
     local line top ws used size
@@ -1317,6 +1328,8 @@ check_fdt_resv()
         'unmapped no-map \[8c000000\.\.8c010000\)' \
         'unmapped no-map \[8c100000\.\.8c110000\)' \
         'fdt: reserved rtmux-resv-extra31@8c8e0000 ' \
+        'fdt: reserved rtmux-resv-nomap23@8cbe0000 \[8cbe0000\.\.8cbf0000\) no-map' \
+        'unmapped no-map \[8cbe0000\.\.8cbf0000\)' \
         'boot: stack \[[0-9a-f]+\.\.[0-9a-f]+\) used [0-9]+ of [0-9]+ bytes, workspace \[[0-9a-f]+\.\.[0-9a-f]+\) disjoint' \
         '^  PASS  fdt-reserved-memory outside[[:space:]]*$' || return 1
     # The workspace must start at or above the stack top, and the stack must
