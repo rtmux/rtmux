@@ -218,6 +218,11 @@ ifeq ($(CONFIG_LKL_SERVERS),y)
 endif
 	$(Q)$(MAKE) -C userland install
 	$(Q)$(MAKE) -C tests/userland install
+ifeq ($(CONFIG_USR_IN_INITRAMFS),y)
+	$(msg) MKUSR $(INITRAMFS_DIR)/usr.romfs
+	$(Q)scripts/mkusr.sh -s $(CONFIG_USR_ROMFS_SIZE) $(MKROMFS) \
+	    $(INITRAMFS_DIR)/usr.romfs
+endif
 	$(msg) PLTREL $(INITRAMFS_DIR)
 	$(Q)$(PYTHON) scripts/validate-plt-relocs.py --readelf "$(READELF)" \
 	    $(INITRAMFS_DIR)
@@ -238,6 +243,10 @@ MKROMFS = $(OUT)/tools/host/mkromfs
 
 $(MKROMFS): tools/host/mkromfs.c userland/romfs/fs.h
 	$(Q)$(MAKE) -C tools/host $@
+
+ifeq ($(CONFIG_USR_IN_INITRAMFS),y)
+$(INITRAMFS_CPIO): $(MKROMFS) scripts/mkusr.sh
+endif
 
 # ---------------------------------------------------------------------
 # Self-test: boot RTMux under qemu-system-riscv64, parse the conformance

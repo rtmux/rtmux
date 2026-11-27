@@ -83,6 +83,20 @@ romfs). On a normal boot init mounts /usr, starts the pipe service, then runs
 inherited /dev/text console. The accounts are `root`/`RTMux` and
 `rtmuxuser`/`rtmux`.
 
+## /usr without NVMe
+
+A board with no NVMe can carry `/usr` in the initramfs instead.
+`CONFIG_USR_IN_INITRAMFS=y` builds the same tree with `scripts/mkusr.sh` into a
+`CONFIG_USR_ROMFS_SIZE` MiB image and adds it to the archive as `/usr.romfs`;
+boot with `mainfs=/usr.romfs` to mount it. Set it with `make menuconfig`, or
+from a script:
+
+```bash
+python3 tools/kconfig/setconfig.py --kconfig Kconfig USR_IN_INITRAMFS=y
+make -j
+./scripts/emu.sh -mainfs=/usr.romfs
+```
+
 ## Build output
 
 ```
