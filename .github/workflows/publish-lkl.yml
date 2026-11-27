@@ -74,12 +74,16 @@ jobs:
           notes=$(gh release view "$NIGHTLY_TAG" --json body --jq .body 2>/dev/null) || notes=
           last_commit=$(printf '%s\n' "$notes" | sed -n 's/^commit=//p' | head -1)
           last_hash=$(printf '%s\n' "$notes" | sed -n 's/^inputs_hash=//p' | head -1)
-          if [ "$last_commit" = "$COMMIT" ] && [ "$last_hash" = "$INPUTS_HASH" ]; then
+          # A failed upload can lose an asset while the notes stay as they were.
+          assets=$(gh release view "$NIGHTLY_TAG" --json assets \
+              --jq '[.assets[] | select(.state == "uploaded")] | length' 2>/dev/null) || assets=0
+          if [ "$last_commit" = "$COMMIT" ] && [ "$last_hash" = "$INPUTS_HASH" ] &&
+             [ "$assets" -ge 3 ]; then
               echo "needs_build=false" >> "$GITHUB_OUTPUT"
               echo "Upstream $COMMIT and the build inputs are unchanged; nothing to publish."
           else
               echo "needs_build=true" >> "$GITHUB_OUTPUT"
-              echo "Changed: commit ${last_commit:-none} -> $COMMIT"
+              echo "Publishing: commit ${last_commit:-none} -> $COMMIT, $assets asset(s) present"
           fi
 
   build:
@@ -121,9 +125,10 @@ jobs:
           } > notes.md
           files="dist/liblkl-rv64-fsd.tar.gz dist/liblkl-rv64-netd.tar.gz dist/sha256sums.txt"
           title="LKL rv64 nightly ($date)"
-          # Keep the existing release until its replacement assets are uploaded,
-          # so a failed or cancelled run never leaves the tag without archives.
-          # The notes (which the next run compares against) change last.
+          # Update the release in place.  --clobber deletes each old asset before
+          # uploading its replacement, so a failed or cancelled run can leave one
+          # missing; the check job then publishes again.  The notes (which the
+          # next run compares against) change last.
           if gh release view "$NIGHTLY_TAG" >/dev/null 2>&1; then
               gh release upload "$NIGHTLY_TAG" $files --clobber
               gh release edit "$NIGHTLY_TAG" --title "$title" --notes-file notes.md --prerelease
